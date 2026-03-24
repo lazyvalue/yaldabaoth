@@ -251,9 +251,15 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
         }
         RenderedBlock::Table { headers, rows, .. } => {
             let mut out = Vec::new();
-            // Simple rendering: join cells with " │ "
-            let header_text: Vec<String> = headers.iter().map(|h| h.text_content()).collect();
-            let col_widths: Vec<usize> = header_text.iter().map(|h| h.len().max(5)).collect();
+            // Calculate column widths from both headers and row data
+            let mut col_widths: Vec<usize> = headers.iter().map(|h| h.text_content().len().max(3)).collect();
+            for row in rows {
+                for (i, cell) in row.iter().enumerate() {
+                    if i < col_widths.len() {
+                        col_widths[i] = col_widths[i].max(cell.text_content().len());
+                    }
+                }
+            }
 
             // Header
             let header_spans: Vec<StyledSpan> = headers
