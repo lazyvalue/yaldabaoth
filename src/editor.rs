@@ -52,19 +52,22 @@ impl Editor {
     /// Begin insert mode — creates an undo boundary.
     pub fn begin_insert(&mut self) {
         self.in_insert_mode = true;
-        self.document.begin_undo_group(self.cursor.line, self.cursor.col);
+        self.document
+            .begin_undo_group(self.cursor.line, self.cursor.col);
     }
 
     /// End insert mode — closes the undo boundary.
     pub fn end_insert(&mut self) {
         self.in_insert_mode = false;
-        self.document.end_undo_group(self.cursor.line, self.cursor.col);
+        self.document
+            .end_undo_group(self.cursor.line, self.cursor.col);
         self.reparse();
     }
 
     /// Insert a character at the cursor position (insert mode).
     pub fn insert_char(&mut self, ch: char) {
-        self.document.insert_char(self.cursor.line, self.cursor.col, ch);
+        self.document
+            .insert_char(self.cursor.line, self.cursor.col, ch);
         if ch == '\n' {
             self.cursor.line += 1;
             self.cursor.col = 0;
@@ -91,36 +94,42 @@ impl Editor {
 
     /// Delete character at cursor (normal mode 'x').
     pub fn delete_char_at_cursor(&mut self) {
-        self.document.begin_undo_group(self.cursor.line, self.cursor.col);
+        self.document
+            .begin_undo_group(self.cursor.line, self.cursor.col);
         self.document.delete_char(self.cursor.line, self.cursor.col);
         // Clamp cursor if line got shorter
         let line_len = self.document.line_len_chars(self.cursor.line);
         if self.cursor.col >= line_len && line_len > 0 {
             self.cursor.col = line_len - 1;
         }
-        self.document.end_undo_group(self.cursor.line, self.cursor.col);
+        self.document
+            .end_undo_group(self.cursor.line, self.cursor.col);
         self.reparse();
     }
 
     /// Delete current line (normal mode 'dd').
     pub fn delete_current_line(&mut self) {
-        self.document.begin_undo_group(self.cursor.line, self.cursor.col);
+        self.document
+            .begin_undo_group(self.cursor.line, self.cursor.col);
         self.document.delete_line(self.cursor.line);
         // Clamp cursor
         if self.cursor.line >= self.document.line_count() {
             self.cursor.line = self.document.line_count().saturating_sub(1);
         }
         self.cursor.col = 0;
-        self.document.end_undo_group(self.cursor.line, self.cursor.col);
+        self.document
+            .end_undo_group(self.cursor.line, self.cursor.col);
         self.reparse();
     }
 
     /// Open a new line below cursor and enter insert mode.
     pub fn open_line_below(&mut self) {
-        self.document.begin_undo_group(self.cursor.line, self.cursor.col);
+        self.document
+            .begin_undo_group(self.cursor.line, self.cursor.col);
         // Insert newline at end of current line content
         let insert_col = self.document.line_len_chars(self.cursor.line);
-        self.document.insert_char(self.cursor.line, insert_col, '\n');
+        self.document
+            .insert_char(self.cursor.line, insert_col, '\n');
         self.cursor.line += 1;
         self.cursor.col = 0;
         self.in_insert_mode = true;
@@ -129,7 +138,8 @@ impl Editor {
 
     /// Open a new line above cursor and enter insert mode.
     pub fn open_line_above(&mut self) {
-        self.document.begin_undo_group(self.cursor.line, self.cursor.col);
+        self.document
+            .begin_undo_group(self.cursor.line, self.cursor.col);
         // Insert newline at the start of current line, then move cursor up
         self.document.insert_char(self.cursor.line, 0, '\n');
         // cursor.line stays the same (now points to the empty line we created)
@@ -157,7 +167,9 @@ impl Editor {
 
     /// Get the index of the active block (block containing cursor).
     pub fn active_block_index(&self) -> Option<usize> {
-        let byte_offset = self.document.line_col_to_byte(self.cursor.line, self.cursor.col);
+        let byte_offset = self
+            .document
+            .line_col_to_byte(self.cursor.line, self.cursor.col);
         self.tree_state.active_block_at_byte(byte_offset)
     }
 

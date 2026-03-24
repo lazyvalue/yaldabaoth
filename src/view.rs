@@ -358,7 +358,7 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) {
     let view_start = state.viewport.scroll_offset;
     let view_end = state.viewport.scroll_offset + viewport_height;
 
-    for (_block_idx, view_block) in state.blocks.iter().enumerate() {
+    for view_block in state.blocks.iter() {
         let h = view_block_height(view_block, state.viewport, content_width);
         let block_end = y + h;
 
@@ -399,20 +399,14 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) {
                         let cursor_area = Rect::new(cursor_x, area.y + screen_y as u16, 1, 1);
                         // Get character under cursor
                         let line_text = line.text_content();
-                        let cursor_char = line_text
-                            .chars()
-                            .nth(state.cursor_col)
-                            .unwrap_or(' ');
+                        let cursor_char = line_text.chars().nth(state.cursor_col).unwrap_or(' ');
                         if state.show_block_cursor {
                             // Normal mode: block cursor (reverse video)
                             let cursor_style = Style::default()
                                 .fg(Color::Rgb(40, 42, 54))
                                 .bg(Color::Rgb(248, 248, 242));
                             frame.render_widget(
-                                Paragraph::new(Span::styled(
-                                    cursor_char.to_string(),
-                                    cursor_style,
-                                )),
+                                Paragraph::new(Span::styled(cursor_char.to_string(), cursor_style)),
                                 cursor_area,
                             );
                         } else {
@@ -421,10 +415,7 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) {
                                 .fg(Color::Rgb(248, 248, 242))
                                 .bg(Color::Rgb(80, 80, 120));
                             frame.render_widget(
-                                Paragraph::new(Span::styled(
-                                    cursor_char.to_string(),
-                                    cursor_style,
-                                )),
+                                Paragraph::new(Span::styled(cursor_char.to_string(), cursor_style)),
                                 cursor_area,
                             );
                         }

@@ -198,9 +198,7 @@ impl Document {
         let dir = path.parent().unwrap_or(Path::new("."));
         let temp_path = dir.join(format!(
             ".{}.tmp",
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
+            path.file_name().unwrap_or_default().to_string_lossy()
         ));
         fs::write(&temp_path, self.rope.to_string())?;
         fs::rename(&temp_path, path)?;
