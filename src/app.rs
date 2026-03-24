@@ -4,26 +4,27 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use ratatui::DefaultTerminal;
 
-use sketch::blocks::RenderedBlock;
 use sketch::config::Config;
+use sketch::editor::Editor;
 use sketch::file_browser::FileBrowser;
 use sketch::keybind::{Action, KeybindManager};
 use sketch::menu::{self, MenuNode, MenuState};
 use sketch::render;
 use sketch::theme::Theme;
-use sketch::view::{self, ViewState};
+use sketch::view::{self, ViewBlock, ViewState};
 use sketch::viewport::Viewport;
 
 #[derive(Debug, PartialEq)]
 enum AppMode {
     Normal,
+    Insert,
+    Command,
     Menu,
     FileBrowser,
 }
 
 pub struct App {
-    filename: String,
-    blocks: Vec<RenderedBlock>,
+    editor: Editor,
     viewport: Viewport,
     theme: Theme,
     keybinds: KeybindManager,
@@ -31,24 +32,25 @@ pub struct App {
     search_query: String,
     search_input_mode: bool,
     search_input_buffer: String,
-    search_matches: Vec<(usize, usize)>, // (block_index, span_index)
+    search_matches: Vec<(usize, usize)>,
     search_match_index: usize,
     mode: AppMode,
     menu_state: MenuState,
     menu_tree: Vec<MenuNode>,
     file_browser: Option<FileBrowser>,
+    command_buffer: String,
+    command_error: String,
 }
 
 impl App {
     pub fn new(filename: String, markdown: String, config: &Config) -> Self {
         let theme = Theme::dark();
-        let blocks = render::render(&markdown, &theme);
+        let editor = Editor::new(markdown, std::path::PathBuf::from(&filename));
         let viewport = Viewport::new(config.max_line_width);
         let keybinds = KeybindManager::default();
 
         Self {
-            filename,
-            blocks,
+            editor,
             viewport,
             theme,
             keybinds,
@@ -62,15 +64,15 @@ impl App {
             menu_state: MenuState::new(),
             menu_tree: menu::default_menu(),
             file_browser: None,
+            command_buffer: String::new(),
+            command_error: String::new(),
         }
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
-        // Calculate initial dimensions
         let size = terminal.size()?;
         let content_width = self.effective_content_width(size.width as usize);
-        self.viewport
-            .calculate_total_lines(&self.blocks, content_width);
+        self.update_total_lines(content_width);
 
         loop {
             terminal.draw(|frame| {
@@ -128,16 +130,25 @@ impl App {
                     )
                 };
 
+                let view_blocks = self.build_view_blocks();
+                let filename_display = self.editor.document().file_path.display().to_string();
+
                 let state = ViewState {
-                    filename: &self.filename,
-                    blocks: &self.blocks,
+                    filename: &filename_display,
+                    modified: self.editor.document().is_modified(),
+                    blocks: &view_blocks,
                     viewport: &self.viewport,
                     theme: &self.theme,
                     mode_label: match self.mode {
                         AppMode::Normal => "NORMAL",
+                        AppMode::Insert => "INSERT",
+                        AppMode::Command => "NORMAL",
                         AppMode::Menu => "NORMAL",
                         AppMode::FileBrowser => "NORMAL",
                     },
+                    cursor_line: self.editor.cursor().line,
+                    cursor_col: self.editor.cursor().col,
+                    show_block_cursor: self.mode != AppMode::Insert,
                     search_query: &self.search_query,
                     search_input_mode: self.search_input_mode,
                     search_input_buffer: &self.search_input_buffer,
@@ -152,6 +163,9 @@ impl App {
                     file_browser_filter_text: fb_filter_text,
                     file_browser_panel_width: fb_panel_width,
                     file_browser_hint: fb_hint,
+                    command_mode: self.mode == AppMode::Command,
+                    command_buffer: &self.command_buffer,
+                    command_error: &self.command_error,
                 };
                 view::draw(frame, &state);
             })?;
@@ -160,7 +174,6 @@ impl App {
                 break;
             }
 
-            // Poll for events with a timeout (for multi-key sequence timeout)
             let timeout = if self.keybinds.has_pending() {
                 Duration::from_millis(100)
             } else {
@@ -172,12 +185,11 @@ impl App {
                     Event::Key(key_event) => self.handle_key(key_event, terminal)?,
                     Event::Resize(w, _h) => {
                         let cw = self.effective_content_width(w as usize);
-                        self.viewport.calculate_total_lines(&self.blocks, cw);
+                        self.update_total_lines(cw);
                     }
                     _ => {}
                 }
             } else if self.keybinds.has_pending() {
-                // Timeout with pending keys — reset
                 self.keybinds.reset_pending();
             }
         }
@@ -185,19 +197,68 @@ impl App {
         Ok(())
     }
 
+    fn update_total_lines(&mut self, content_width: usize) {
+        let view_blocks = self.build_view_blocks();
+        self.viewport.total_lines = view_blocks
+            .iter()
+            .map(|b| view_block_height(b, &self.viewport, content_width))
+            .sum();
+    }
+
+    fn build_view_blocks(&self) -> Vec<ViewBlock> {
+        let boundaries = self.editor.block_boundaries();
+        let active_idx = self.editor.active_block_index();
+
+        if boundaries.is_empty() {
+            let text = self.editor.document().full_text();
+            let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+            return vec![ViewBlock::Raw {
+                lines,
+                start_line: 0,
+            }];
+        }
+
+        let mut view_blocks = Vec::new();
+        for (i, block_info) in boundaries.iter().enumerate() {
+            if Some(i) == active_idx {
+                let block_text = self.editor.block_text(i);
+                let lines: Vec<String> = block_text.lines().map(|l| l.to_string()).collect();
+                view_blocks.push(ViewBlock::Raw {
+                    lines,
+                    start_line: block_info.start_line,
+                });
+            } else {
+                let block_text = self.editor.block_text(i);
+                let rendered = render::render(&block_text, &self.theme);
+                if let Some(rb) = rendered.into_iter().next() {
+                    view_blocks.push(ViewBlock::Rendered(rb));
+                }
+            }
+        }
+
+        view_blocks
+    }
+
     fn handle_key(&mut self, key: KeyEvent, terminal: &DefaultTerminal) -> io::Result<()> {
+        if !self.command_error.is_empty() && self.mode != AppMode::Command {
+            self.command_error.clear();
+        }
+
         let size = terminal.size()?;
         let viewport_height = (size.height as usize).saturating_sub(2);
         let content_width = self.effective_content_width(size.width as usize);
 
         match self.mode {
             AppMode::Normal => self.handle_normal_key(key, viewport_height, content_width),
+            AppMode::Insert => self.handle_insert_key(key, viewport_height),
+            AppMode::Command => self.handle_command_key(key),
             AppMode::Menu => self.handle_menu_key(key, viewport_height, content_width),
             AppMode::FileBrowser => {
                 self.handle_file_browser_key(key, size.width, viewport_height, content_width)
             }
         }
 
+        self.update_total_lines(content_width);
         Ok(())
     }
 
@@ -208,7 +269,7 @@ impl App {
                     self.search_query = self.search_input_buffer.clone();
                     self.search_input_mode = false;
                     self.perform_search();
-                    self.jump_to_match(content_width, viewport_height);
+                    self.jump_to_match(viewport_height);
                 }
                 KeyCode::Esc => {
                     self.search_input_mode = false;
@@ -230,6 +291,67 @@ impl App {
         }
     }
 
+    fn handle_insert_key(&mut self, key: KeyEvent, viewport_height: usize) {
+        match key.code {
+            KeyCode::Esc => {
+                self.editor.end_insert();
+                self.mode = AppMode::Normal;
+                if self.editor.cursor().col > 0 {
+                    self.editor.cursor_mut().move_left();
+                }
+            }
+            KeyCode::Enter => {
+                self.editor.insert_char('\n');
+            }
+            KeyCode::Backspace => {
+                self.editor.backspace();
+            }
+            KeyCode::Char(c) => {
+                self.editor.insert_char(c);
+            }
+            KeyCode::Left => {
+                self.editor.cursor_mut().move_left();
+            }
+            KeyCode::Right => {
+                self.editor.move_right_clamped(true);
+            }
+            KeyCode::Up => {
+                self.editor.cursor_mut().move_up();
+                self.editor.clamp_cursor_col(true);
+            }
+            KeyCode::Down => {
+                self.editor.move_down(true);
+            }
+            _ => {}
+        }
+        self.ensure_cursor_visible(viewport_height);
+    }
+
+    fn handle_command_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.command_buffer.clear();
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Enter => {
+                let cmd = self.command_buffer.clone();
+                self.command_buffer.clear();
+                self.mode = AppMode::Normal;
+                self.execute_command(&cmd);
+            }
+            KeyCode::Backspace => {
+                self.command_buffer.pop();
+                if self.command_buffer.is_empty() {
+                    self.mode = AppMode::Normal;
+                }
+            }
+            KeyCode::Char(c) => {
+                self.command_buffer.push(c);
+            }
+            _ => {}
+        }
+    }
+
     fn handle_menu_key(&mut self, key: KeyEvent, viewport_height: usize, content_width: usize) {
         match key.code {
             KeyCode::Esc => {
@@ -244,7 +366,7 @@ impl App {
                     self.execute_action(action, viewport_height, content_width);
                 }
             }
-            _ => {} // ignore unrecognized keys
+            _ => {}
         }
     }
 
@@ -255,7 +377,7 @@ impl App {
         _viewport_height: usize,
         content_width: usize,
     ) {
-        let _ = term_width; // reserved for future use
+        let _ = term_width;
 
         let browser = match &mut self.file_browser {
             Some(b) => b,
@@ -312,30 +434,132 @@ impl App {
         }
     }
 
-    fn execute_action(&mut self, action: Action, viewport_height: usize, content_width: usize) {
+    fn execute_action(&mut self, action: Action, viewport_height: usize, _content_width: usize) {
         match action {
             Action::Quit => self.should_quit = true,
-            Action::ScrollDown => self.viewport.scroll_down(1, viewport_height),
-            Action::ScrollUp => self.viewport.scroll_up(1),
-            Action::HalfPageDown => self
-                .viewport
-                .scroll_down(viewport_height / 2, viewport_height),
-            Action::HalfPageUp => self.viewport.scroll_up(viewport_height / 2),
-            Action::FullPageDown => self.viewport.scroll_down(viewport_height, viewport_height),
-            Action::FullPageUp => self.viewport.scroll_up(viewport_height),
-            Action::JumpTop => self.viewport.jump_top(),
-            Action::JumpBottom => self.viewport.jump_bottom(viewport_height),
-            Action::NextHeading => {
-                self.jump_to_next_heading(content_width, viewport_height);
+            Action::MoveDown => {
+                self.editor.move_down(false);
+                self.ensure_cursor_visible(viewport_height);
             }
-            Action::PrevHeading => {
-                self.jump_to_prev_heading(content_width, viewport_height);
+            Action::MoveUp => {
+                self.editor.cursor_mut().move_up();
+                self.editor.clamp_cursor_col(false);
+                self.ensure_cursor_visible(viewport_height);
             }
-            Action::NextHeadingSameLevel => {
-                self.jump_to_heading_same_level(content_width, viewport_height, true);
+            Action::MoveLeft => {
+                self.editor.cursor_mut().move_left();
             }
-            Action::PrevHeadingSameLevel => {
-                self.jump_to_heading_same_level(content_width, viewport_height, false);
+            Action::MoveRight => {
+                self.editor.move_right_clamped(false);
+            }
+            Action::MoveWordForward => {
+                self.editor.move_cursor_word_forward();
+                self.ensure_cursor_visible(viewport_height);
+            }
+            Action::MoveWordBackward => {
+                self.editor.move_cursor_word_backward();
+                self.ensure_cursor_visible(viewport_height);
+            }
+            Action::MoveWordEnd => {
+                self.editor.move_cursor_word_end();
+            }
+            Action::MoveLineStart => {
+                self.editor.cursor_mut().move_line_start();
+            }
+            Action::MoveLineEnd => {
+                self.editor.move_cursor_line_end(false);
+            }
+            Action::InsertMode => {
+                self.editor.begin_insert();
+                self.mode = AppMode::Insert;
+            }
+            Action::InsertAfter => {
+                self.editor.move_right_clamped(true);
+                self.editor.begin_insert();
+                self.mode = AppMode::Insert;
+            }
+            Action::OpenLineBelow => {
+                self.editor.open_line_below();
+                self.mode = AppMode::Insert;
+                self.ensure_cursor_visible(viewport_height);
+            }
+            Action::OpenLineAbove => {
+                self.editor.open_line_above();
+                self.mode = AppMode::Insert;
+                self.ensure_cursor_visible(viewport_height);
+            }
+            Action::DeleteChar => {
+                self.editor.delete_char_at_cursor();
+            }
+            Action::DeleteLine => {
+                self.editor.delete_current_line();
+                self.ensure_cursor_visible(viewport_height);
+            }
+            Action::Undo => {
+                self.editor.undo();
+                self.ensure_cursor_visible(viewport_height);
+            }
+            Action::Redo => {
+                self.editor.redo();
+                self.ensure_cursor_visible(viewport_height);
+            }
+            Action::EnterCommand => {
+                self.command_buffer.clear();
+                self.command_error.clear();
+                self.mode = AppMode::Command;
+            }
+            Action::ScrollDown => {
+                self.viewport.scroll_down(1, viewport_height);
+            }
+            Action::ScrollUp => {
+                self.viewport.scroll_up(1);
+            }
+            Action::HalfPageDown => {
+                self.viewport
+                    .scroll_down(viewport_height / 2, viewport_height);
+                let new_top = self.viewport.scroll_offset;
+                if self.editor.cursor().line < new_top {
+                    self.editor.cursor_mut().line = new_top;
+                    self.editor.clamp_cursor_col(false);
+                }
+            }
+            Action::HalfPageUp => {
+                self.viewport.scroll_up(viewport_height / 2);
+                let new_bottom = self.viewport.scroll_offset + viewport_height;
+                if self.editor.cursor().line >= new_bottom {
+                    self.editor.cursor_mut().line = new_bottom.saturating_sub(1);
+                    self.editor.clamp_cursor_col(false);
+                }
+            }
+            Action::FullPageDown => {
+                self.viewport.scroll_down(viewport_height, viewport_height);
+                let new_top = self.viewport.scroll_offset;
+                if self.editor.cursor().line < new_top {
+                    self.editor.cursor_mut().line = new_top;
+                    self.editor.clamp_cursor_col(false);
+                }
+            }
+            Action::FullPageUp => {
+                self.viewport.scroll_up(viewport_height);
+                let new_bottom = self.viewport.scroll_offset + viewport_height;
+                if self.editor.cursor().line >= new_bottom {
+                    self.editor.cursor_mut().line = new_bottom.saturating_sub(1);
+                    self.editor.clamp_cursor_col(false);
+                }
+            }
+            Action::JumpTop => {
+                self.editor.cursor_mut().jump_top();
+                self.viewport.jump_top();
+            }
+            Action::JumpBottom => {
+                self.editor.jump_cursor_bottom();
+                self.viewport.jump_bottom(viewport_height);
+            }
+            Action::NextHeading | Action::PrevHeading => {
+                // TODO: implement heading navigation via tree-sitter
+            }
+            Action::NextHeadingSameLevel | Action::PrevHeadingSameLevel => {
+                // TODO: implement via tree-sitter
             }
             Action::SearchForward | Action::SearchBackward => {
                 self.search_input_mode = true;
@@ -345,7 +569,7 @@ impl App {
                 if !self.search_matches.is_empty() {
                     self.search_match_index =
                         (self.search_match_index + 1) % self.search_matches.len();
-                    self.jump_to_match(content_width, viewport_height);
+                    self.jump_to_match(viewport_height);
                 }
             }
             Action::SearchPrev => {
@@ -355,25 +579,21 @@ impl App {
                     } else {
                         self.search_match_index - 1
                     };
-                    self.jump_to_match(content_width, viewport_height);
+                    self.jump_to_match(viewport_height);
                 }
             }
             Action::OpenLink => {
-                if let Some(url) = self.find_link_at_cursor(content_width) {
-                    let _ = std::process::Command::new("open") // macOS
-                        .arg(&url)
-                        .spawn();
-                }
+                // TODO: implement link finding via tree-sitter/cursor position
             }
             Action::YankLine => {
-                if let Some(text) = self.get_cursor_line_text(content_width) {
-                    use std::io::Write;
-                    use std::process::{Command, Stdio};
-                    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn()
-                        && let Some(mut stdin) = child.stdin.take()
-                    {
-                        let _ = stdin.write_all(text.as_bytes());
-                    }
+                let line_text = self.editor.document().line_text(self.editor.cursor().line);
+                let text = line_text.trim_end_matches('\n');
+                use std::io::Write;
+                use std::process::{Command, Stdio};
+                if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn()
+                    && let Some(mut stdin) = child.stdin.take()
+                {
+                    let _ = stdin.write_all(text.as_bytes());
                 }
             }
             Action::OpenMenu => {
@@ -383,25 +603,7 @@ impl App {
             Action::OpenFileBrowser => {
                 self.open_file_browser();
             }
-            Action::MoveLeft
-            | Action::MoveRight
-            | Action::MoveUp
-            | Action::MoveDown
-            | Action::MoveWordForward
-            | Action::MoveWordBackward
-            | Action::MoveWordEnd
-            | Action::MoveLineStart
-            | Action::MoveLineEnd
-            | Action::InsertMode
-            | Action::InsertAfter
-            | Action::OpenLineBelow
-            | Action::OpenLineAbove
-            | Action::DeleteChar
-            | Action::DeleteLine
-            | Action::Undo
-            | Action::Redo
-            | Action::EnterCommand
-            | Action::None
+            Action::None
             | Action::FileBrowserDown
             | Action::FileBrowserUp
             | Action::FileBrowserEnter
@@ -411,8 +613,59 @@ impl App {
         }
     }
 
+    fn execute_command(&mut self, cmd: &str) {
+        let parts: Vec<&str> = cmd.trim().splitn(2, ' ').collect();
+        match parts[0] {
+            "w" => {
+                let result = if parts.len() > 1 {
+                    let path = std::path::Path::new(parts[1]);
+                    self.editor.save_to(path)
+                } else {
+                    self.editor.save()
+                };
+                if let Err(e) = result {
+                    self.command_error = format!("Error writing file: {}", e);
+                }
+            }
+            "q" => {
+                if self.editor.document().is_modified() {
+                    self.command_error =
+                        "No write since last change (add ! to override)".to_string();
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            "q!" => {
+                self.should_quit = true;
+            }
+            "wq" => {
+                if let Err(e) = self.editor.save() {
+                    self.command_error = format!("Error writing file: {}", e);
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            _ => {
+                self.command_error = format!("Not an editor command: {}", cmd);
+            }
+        }
+    }
+
+    fn ensure_cursor_visible(&mut self, viewport_height: usize) {
+        let cursor_line = self.editor.cursor().line;
+        self.viewport
+            .ensure_cursor_visible(cursor_line, viewport_height);
+    }
+
     fn open_file_browser(&mut self) {
-        let dir = std::path::Path::new(&self.filename)
+        if self.editor.document().is_modified() {
+            self.command_error = "Save changes first (:w) before browsing files".to_string();
+            return;
+        }
+        let dir = self
+            .editor
+            .document()
+            .file_path
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -420,23 +673,18 @@ impl App {
         self.mode = AppMode::FileBrowser;
     }
 
-    /// Load a file into the viewer. Returns true on success, false on error
-    /// (browser should stay open on failure).
-    fn load_file(&mut self, path: std::path::PathBuf, content_width: usize) -> bool {
+    fn load_file(&mut self, path: std::path::PathBuf, _content_width: usize) -> bool {
         match std::fs::read(&path) {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(content) => {
-                    self.filename = path.display().to_string();
-                    self.blocks = render::render(&content, &self.theme);
+                    self.editor = Editor::new(content, path);
                     self.viewport.scroll_offset = 0;
                     self.viewport.cursor_line = 0;
-                    self.viewport
-                        .calculate_total_lines(&self.blocks, content_width);
                     true
                 }
-                Err(_) => false, // Non-UTF-8: keep browser open
+                Err(_) => false,
             },
-            Err(_) => false, // Read error: keep browser open
+            Err(_) => false,
         }
     }
 
@@ -449,40 +697,6 @@ impl App {
         self.viewport.content_width(available)
     }
 
-    fn jump_to_next_heading(&mut self, width: usize, viewport_height: usize) {
-        let mut y = 0;
-
-        for block in &self.blocks {
-            let h = self.viewport.block_height(block, width);
-            if y > self.viewport.scroll_offset && matches!(block, RenderedBlock::Heading { .. }) {
-                self.viewport.scroll_offset = y.saturating_sub(viewport_height / 3);
-                return;
-            }
-            y += h;
-        }
-    }
-
-    fn jump_to_prev_heading(&mut self, width: usize, viewport_height: usize) {
-        let mut positions = Vec::new();
-        let mut y = 0;
-
-        for block in &self.blocks {
-            if matches!(block, RenderedBlock::Heading { .. }) {
-                positions.push(y);
-            }
-            y += self.viewport.block_height(block, width);
-        }
-
-        // Find the last heading position before current scroll
-        if let Some(&pos) = positions
-            .iter()
-            .rev()
-            .find(|&&p| p < self.viewport.scroll_offset)
-        {
-            self.viewport.scroll_offset = pos.saturating_sub(viewport_height / 3);
-        }
-    }
-
     fn perform_search(&mut self) {
         self.search_matches.clear();
         let query = self.search_query.to_lowercase();
@@ -490,157 +704,28 @@ impl App {
             return;
         }
 
-        let mut matches = Vec::new();
-        for (bi, block) in self.blocks.iter().enumerate() {
-            Self::search_block_collect(&query, block, bi, &mut matches);
+        let line_count = self.editor.document().line_count();
+        for line_idx in 0..line_count {
+            let line_text = self.editor.document().line_text(line_idx);
+            if line_text.to_lowercase().contains(&query) {
+                self.search_matches.push((line_idx, 0));
+            }
         }
-        self.search_matches = matches;
         self.search_match_index = 0;
     }
 
-    fn search_block_collect(
-        query: &str,
-        block: &RenderedBlock,
-        block_index: usize,
-        matches: &mut Vec<(usize, usize)>,
-    ) {
-        match block {
-            RenderedBlock::Heading { content, .. } => {
-                if content.text_content().to_lowercase().contains(query) {
-                    matches.push((block_index, 0));
-                }
-            }
-            RenderedBlock::Paragraph { lines } | RenderedBlock::CodeBlock { lines, .. } => {
-                for (li, line) in lines.iter().enumerate() {
-                    if line.text_content().to_lowercase().contains(query) {
-                        matches.push((block_index, li));
-                    }
-                }
-            }
-            RenderedBlock::BlockQuote { blocks } => {
-                for b in blocks {
-                    Self::search_block_collect(query, b, block_index, matches);
-                }
-            }
-            RenderedBlock::List { items, .. } => {
-                for item in items {
-                    for b in &item.content {
-                        Self::search_block_collect(query, b, block_index, matches);
-                    }
-                }
-            }
-            _ => {}
+    fn jump_to_match(&mut self, viewport_height: usize) {
+        if let Some(&(line_idx, _)) = self.search_matches.get(self.search_match_index) {
+            self.editor.cursor_mut().line = line_idx;
+            self.editor.cursor_mut().col = 0;
+            self.ensure_cursor_visible(viewport_height);
         }
     }
+}
 
-    fn jump_to_match(&mut self, width: usize, viewport_height: usize) {
-        if let Some(&(block_idx, _)) = self.search_matches.get(self.search_match_index) {
-            let mut y: usize = 0;
-            for (i, block) in self.blocks.iter().enumerate() {
-                if i == block_idx {
-                    self.viewport.scroll_offset = y.saturating_sub(viewport_height / 3);
-                    return;
-                }
-                y += self.viewport.block_height(block, width);
-            }
-        }
-    }
-
-    fn find_link_at_cursor(&self, width: usize) -> Option<String> {
-        let mut y = 0;
-        for block in &self.blocks {
-            let h = self.viewport.block_height(block, width);
-            if y + h > self.viewport.cursor_line {
-                return self.find_link_in_block(block);
-            }
-            y += h;
-        }
-        None
-    }
-
-    fn find_link_in_block(&self, block: &RenderedBlock) -> Option<String> {
-        match block {
-            RenderedBlock::Heading { content, .. } => {
-                content.spans.iter().find_map(|s| s.link.clone())
-            }
-            RenderedBlock::Paragraph { lines } => lines
-                .iter()
-                .flat_map(|l| &l.spans)
-                .find_map(|s| s.link.clone()),
-            RenderedBlock::BlockQuote { blocks } => {
-                blocks.iter().find_map(|b| self.find_link_in_block(b))
-            }
-            RenderedBlock::List { items, .. } => items
-                .iter()
-                .flat_map(|i| &i.content)
-                .find_map(|b| self.find_link_in_block(b)),
-            _ => None,
-        }
-    }
-
-    fn get_cursor_line_text(&self, width: usize) -> Option<String> {
-        let mut y = 0;
-        for block in &self.blocks {
-            let h = self.viewport.block_height(block, width);
-            if y + h > self.viewport.cursor_line {
-                let line_in_block = self.viewport.cursor_line - y;
-                return self.get_block_line_text(block, line_in_block);
-            }
-            y += h;
-        }
-        None
-    }
-
-    fn get_block_line_text(&self, block: &RenderedBlock, line: usize) -> Option<String> {
-        match block {
-            RenderedBlock::Heading { content, .. } if line == 0 => Some(content.text_content()),
-            RenderedBlock::Paragraph { lines } if line < lines.len() => {
-                Some(lines[line].text_content())
-            }
-            RenderedBlock::CodeBlock { lines, .. } if line < lines.len() => {
-                Some(lines[line].text_content())
-            }
-            _ => None,
-        }
-    }
-
-    fn jump_to_heading_same_level(&mut self, width: usize, viewport_height: usize, forward: bool) {
-        // Find the current heading level (most recently passed heading)
-        let mut current_level = None;
-        let mut y = 0;
-        let mut headings: Vec<(usize, u8)> = Vec::new(); // (y_offset, level)
-
-        for block in &self.blocks {
-            let h = self.viewport.block_height(block, width);
-            if let RenderedBlock::Heading { level, .. } = block {
-                if y <= self.viewport.scroll_offset {
-                    current_level = Some(*level);
-                }
-                headings.push((y, *level));
-            }
-            y += h;
-        }
-
-        let target_level = match current_level {
-            Some(l) => l,
-            None => return,
-        };
-
-        if forward {
-            if let Some(&(pos, _)) = headings
-                .iter()
-                .find(|(y, l)| *y > self.viewport.scroll_offset && *l == target_level)
-            {
-                self.viewport.scroll_offset = pos.saturating_sub(viewport_height / 3);
-            }
-        } else {
-            if let Some(&(pos, _)) = headings
-                .iter()
-                .rev()
-                .find(|(y, l)| *y < self.viewport.scroll_offset && *l == target_level)
-            {
-                self.viewport.scroll_offset = pos.saturating_sub(viewport_height / 3);
-            }
-        }
+fn view_block_height(block: &ViewBlock, viewport: &Viewport, width: usize) -> usize {
+    match block {
+        ViewBlock::Rendered(rb) => viewport.block_height(rb, width),
+        ViewBlock::Raw { lines, .. } => lines.len() + 1,
     }
 }

@@ -185,6 +185,48 @@ impl Editor {
         self.tree_state.parse(text.as_bytes());
     }
 
+    // --- Combined cursor+document operations to avoid borrow conflicts ---
+
+    /// Move cursor down and clamp column.
+    pub fn move_down(&mut self, insert_mode: bool) {
+        self.cursor.move_down(&self.document, insert_mode);
+    }
+
+    /// Move cursor right, respecting mode.
+    pub fn move_right_clamped(&mut self, insert_mode: bool) {
+        self.cursor.move_right(&self.document, insert_mode);
+    }
+
+    /// Clamp cursor column to current line.
+    pub fn clamp_cursor_col(&mut self, insert_mode: bool) {
+        self.cursor.clamp_col(&self.document, insert_mode);
+    }
+
+    /// Move cursor to end of line.
+    pub fn move_cursor_line_end(&mut self, insert_mode: bool) {
+        self.cursor.move_line_end(&self.document, insert_mode);
+    }
+
+    /// Move cursor word forward.
+    pub fn move_cursor_word_forward(&mut self) {
+        self.cursor.move_word_forward(&self.document);
+    }
+
+    /// Move cursor word backward.
+    pub fn move_cursor_word_backward(&mut self) {
+        self.cursor.move_word_backward(&self.document);
+    }
+
+    /// Move cursor to word end.
+    pub fn move_cursor_word_end(&mut self) {
+        self.cursor.move_word_end(&self.document);
+    }
+
+    /// Jump cursor to bottom of document.
+    pub fn jump_cursor_bottom(&mut self) {
+        self.cursor.jump_bottom(&self.document);
+    }
+
     /// Save the document.
     pub fn save(&mut self) -> std::io::Result<()> {
         self.document.save()

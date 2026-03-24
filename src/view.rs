@@ -358,7 +358,7 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) {
     let view_start = state.viewport.scroll_offset;
     let view_end = state.viewport.scroll_offset + viewport_height;
 
-    for (block_idx, view_block) in state.blocks.iter().enumerate() {
+    for (_block_idx, view_block) in state.blocks.iter().enumerate() {
         let h = view_block_height(view_block, state.viewport, content_width);
         let block_end = y + h;
 
