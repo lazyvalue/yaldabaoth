@@ -3,3 +3,4 @@ pub mod blocks;
 pub mod theme;
 pub mod render;
 pub mod highlight;
+pub mod keybind;
