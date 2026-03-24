@@ -101,7 +101,7 @@ struct BrowserEntry {
 
 ### Navigation
 
-- `j`/`k` — move selection up/down, wrapping at edges
+- `j`/`k` — move selection down/up, wrapping at edges
 - `Space` — open file (loads in viewer, closes browser) or descend into directory
 - `Backspace` — go to parent directory (no-op at filesystem root)
 - `/` — enter filter mode
