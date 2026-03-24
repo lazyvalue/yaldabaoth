@@ -8,12 +8,26 @@ use crate::blocks::*;
 use crate::theme::Theme;
 use crate::viewport::Viewport;
 
+/// A block ready for view rendering — either a pre-rendered RenderedBlock
+/// or raw markdown lines for the active (editing) block.
+pub enum ViewBlock {
+    Rendered(RenderedBlock),
+    Raw {
+        lines: Vec<String>,
+        start_line: usize,
+    },
+}
+
 pub struct ViewState<'a> {
     pub filename: &'a str,
-    pub blocks: &'a [RenderedBlock],
+    pub modified: bool,
+    pub blocks: &'a [ViewBlock],
     pub viewport: &'a Viewport,
     pub theme: &'a Theme,
     pub mode_label: &'a str,
+    pub cursor_line: usize,
+    pub cursor_col: usize,
+    pub show_block_cursor: bool,
     pub search_query: &'a str,
     pub search_input_mode: bool,
     pub search_input_buffer: &'a str,
@@ -28,6 +42,9 @@ pub struct ViewState<'a> {
     pub file_browser_filter_text: String,
     pub file_browser_panel_width: u16,
     pub file_browser_hint: String,
+    pub command_mode: bool,
+    pub command_buffer: &'a str,
+    pub command_error: &'a str,
 }
 
 pub fn draw(frame: &mut Frame, state: &ViewState) {
@@ -67,23 +84,25 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
 }
 
 fn draw_top_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
-    let _viewport_height = (frame.area().height as usize).saturating_sub(2);
     let current_line = state.viewport.scroll_offset + 1;
     let total = state.viewport.total_lines.max(1);
     let percent = (state.viewport.scroll_offset * 100) / total.max(1);
 
     let position = format!("line {}/{} {}%", current_line, total, percent);
     let available = area.width as usize;
+
+    let modified_indicator = if state.modified { " [+]" } else { "" };
+    let name_with_mod = format!("{}{}", state.filename, modified_indicator);
     let name_width = available.saturating_sub(position.len() + 1);
-    let name = if state.filename.len() > name_width {
-        &state.filename[state.filename.len() - name_width..]
+    let name_display = if name_with_mod.len() > name_width {
+        &name_with_mod[name_with_mod.len() - name_width..]
     } else {
-        state.filename
+        &name_with_mod
     };
 
-    let padding = available.saturating_sub(name.len() + position.len());
+    let padding = available.saturating_sub(name_display.len() + position.len());
     let line = Line::from(vec![
-        Span::styled(format!(" {}", name), state.theme.top_bar),
+        Span::styled(format!(" {}", name_display), state.theme.top_bar),
         Span::styled(" ".repeat(padding), state.theme.top_bar),
         Span::styled(format!("{} ", position), state.theme.top_bar),
     ]);
@@ -92,6 +111,20 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
 }
 
 fn draw_bottom_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
+    // Command mode: show :buffer
+    if state.command_mode {
+        let prompt = format!(":{}", state.command_buffer);
+        let available = area.width as usize;
+        let padding = available.saturating_sub(prompt.len() + 1);
+        let line = Line::from(vec![
+            Span::styled(format!(" {}", prompt), state.theme.bottom_bar),
+            Span::styled(" ".repeat(padding), state.theme.bottom_bar),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    // Search input mode
     if state.search_input_mode {
         let prompt = format!("/{}", state.search_input_buffer);
         let available = area.width as usize;
@@ -104,7 +137,22 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
         return;
     }
 
-    let hints = "j/k scroll · {/} heading · / search · q quit";
+    // Command error display
+    if !state.command_error.is_empty() {
+        let available = area.width as usize;
+        let padding = available.saturating_sub(state.command_error.len() + 1);
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {}", state.command_error),
+                Style::default().fg(Color::Rgb(255, 85, 85)),
+            ),
+            Span::styled(" ".repeat(padding), state.theme.bottom_bar),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    let hints = "h/j/k/l move · i insert · :w save · :q quit";
     let available = area.width as usize;
     let mode_len = state.mode_label.len();
 
@@ -211,7 +259,7 @@ fn draw_file_browser_panel(frame: &mut Frame, area: Rect, state: &ViewState) {
     for y in area.y..area.y + area.height {
         let sep_area = Rect::new(area.x + area.width - 1, y, 1, 1);
         frame.render_widget(
-            Paragraph::new("│").style(Style::default().fg(Color::Rgb(98, 114, 164))),
+            Paragraph::new("\u{2502}").style(Style::default().fg(Color::Rgb(98, 114, 164))),
             sep_area,
         );
     }
@@ -221,7 +269,7 @@ fn draw_file_browser_panel(frame: &mut Frame, area: Rect, state: &ViewState) {
     // Header
     let dir_display = if state.file_browser_dir.len() > panel_width as usize - 2 {
         let start = state.file_browser_dir.len() - (panel_width as usize - 2);
-        format!(" …{}", &state.file_browser_dir[start..])
+        format!(" \u{2026}{}", &state.file_browser_dir[start..])
     } else {
         format!(" {}", state.file_browser_dir)
     };
@@ -241,7 +289,7 @@ fn draw_file_browser_panel(frame: &mut Frame, area: Rect, state: &ViewState) {
                 &state.file_browser_filter_text,
                 Style::default().fg(Color::Rgb(241, 250, 140)),
             ),
-            Span::styled("▎", Style::default().fg(Color::Rgb(102, 102, 102))),
+            Span::styled("\u{258e}", Style::default().fg(Color::Rgb(102, 102, 102))),
         ]);
         frame.render_widget(
             Paragraph::new(filter_line),
@@ -265,7 +313,7 @@ fn draw_file_browser_panel(frame: &mut Frame, area: Rect, state: &ViewState) {
             break;
         }
 
-        let marker = if *is_selected { "▸ " } else { "  " };
+        let marker = if *is_selected { "\u{25b8} " } else { "  " };
         let style = if *is_selected {
             Style::default().bg(Color::Rgb(40, 42, 54))
         } else {
@@ -305,42 +353,117 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) {
     let content_width = state.viewport.content_width(terminal_width);
     let x_offset = state.viewport.content_offset(terminal_width);
 
-    let visible = state
-        .viewport
-        .visible_blocks(state.blocks, content_width, viewport_height);
+    // Build list of (y_offset, height, block_index) for visible blocks
+    let mut y = 0usize;
+    let view_start = state.viewport.scroll_offset;
+    let view_end = state.viewport.scroll_offset + viewport_height;
 
-    for positioned in &visible {
-        let block_screen_y = (positioned.y_offset as i32) - (state.viewport.scroll_offset as i32);
+    for (block_idx, view_block) in state.blocks.iter().enumerate() {
+        let h = view_block_height(view_block, state.viewport, content_width);
+        let block_end = y + h;
 
-        // Each block type renders differently
-        let lines = render_block_to_lines(positioned.block, content_width, state.theme);
+        if block_end > view_start && y < view_end {
+            let lines = render_view_block_to_lines(view_block, content_width, state.theme);
 
-        for (line_idx, line) in lines.iter().enumerate() {
-            let screen_y = block_screen_y + line_idx as i32;
-            if screen_y < 0 || screen_y >= viewport_height as i32 {
-                continue;
+            for (line_idx, line) in lines.iter().enumerate() {
+                let doc_y = y + line_idx;
+                let screen_y = doc_y as i32 - state.viewport.scroll_offset as i32;
+                if screen_y < 0 || screen_y >= viewport_height as i32 {
+                    continue;
+                }
+
+                // Cursor line highlight
+                let is_cursor_line = doc_y == state.cursor_line;
+
+                let line_area = Rect::new(
+                    area.x + x_offset as u16,
+                    area.y + screen_y as u16,
+                    content_width.min(area.width as usize - x_offset) as u16,
+                    1,
+                );
+
+                if is_cursor_line {
+                    // Fill cursor line background
+                    let bg_area = Rect::new(area.x, area.y + screen_y as u16, area.width, 1);
+                    let bg = Paragraph::new("").style(state.theme.cursor_line);
+                    frame.render_widget(bg, bg_area);
+                }
+
+                let ratatui_line = styled_line_to_ratatui(line);
+                frame.render_widget(Paragraph::new(ratatui_line), line_area);
+
+                // Render cursor on cursor line
+                if is_cursor_line {
+                    let cursor_x = area.x + x_offset as u16 + state.cursor_col as u16;
+                    if cursor_x < area.x + area.width {
+                        let cursor_area = Rect::new(cursor_x, area.y + screen_y as u16, 1, 1);
+                        // Get character under cursor
+                        let line_text = line.text_content();
+                        let cursor_char = line_text
+                            .chars()
+                            .nth(state.cursor_col)
+                            .unwrap_or(' ');
+                        if state.show_block_cursor {
+                            // Normal mode: block cursor (reverse video)
+                            let cursor_style = Style::default()
+                                .fg(Color::Rgb(40, 42, 54))
+                                .bg(Color::Rgb(248, 248, 242));
+                            frame.render_widget(
+                                Paragraph::new(Span::styled(
+                                    cursor_char.to_string(),
+                                    cursor_style,
+                                )),
+                                cursor_area,
+                            );
+                        } else {
+                            // Insert mode: beam cursor (thin bar before character)
+                            let cursor_style = Style::default()
+                                .fg(Color::Rgb(248, 248, 242))
+                                .bg(Color::Rgb(80, 80, 120));
+                            frame.render_widget(
+                                Paragraph::new(Span::styled(
+                                    cursor_char.to_string(),
+                                    cursor_style,
+                                )),
+                                cursor_area,
+                            );
+                        }
+                    }
+                }
             }
+        }
 
-            // Cursor line highlight
-            let doc_line = state.viewport.scroll_offset + screen_y as usize;
-            let is_cursor_line = doc_line == state.viewport.cursor_line;
+        if y >= view_end {
+            break;
+        }
+        y += h;
+    }
+}
 
-            let line_area = Rect::new(
-                area.x + x_offset as u16,
-                area.y + screen_y as u16,
-                content_width.min(area.width as usize - x_offset) as u16,
-                1,
-            );
+/// Calculate the height of a ViewBlock in lines.
+fn view_block_height(block: &ViewBlock, viewport: &Viewport, width: usize) -> usize {
+    match block {
+        ViewBlock::Rendered(rb) => viewport.block_height(rb, width),
+        ViewBlock::Raw { lines, .. } => lines.len() + 1, // +1 for blank line separator
+    }
+}
 
-            if is_cursor_line {
-                // Fill cursor line background
-                let bg_area = Rect::new(area.x, area.y + screen_y as u16, area.width, 1);
-                let bg = Paragraph::new("").style(state.theme.cursor_line);
-                frame.render_widget(bg, bg_area);
+/// Convert a ViewBlock to terminal lines for display.
+fn render_view_block_to_lines(block: &ViewBlock, width: usize, theme: &Theme) -> Vec<StyledLine> {
+    match block {
+        ViewBlock::Rendered(rb) => render_block_to_lines(rb, width, theme),
+        ViewBlock::Raw { lines, .. } => {
+            let mut out = Vec::new();
+            let border_style = Style::default().fg(Color::Rgb(98, 114, 164));
+            let text_style = Style::default().fg(Color::Rgb(204, 204, 204));
+            for line in lines {
+                out.push(StyledLine::new(vec![
+                    StyledSpan::new("\u{258f} ", border_style),
+                    StyledSpan::new(line.clone(), text_style),
+                ]));
             }
-
-            let ratatui_line = styled_line_to_ratatui(line);
-            frame.render_widget(Paragraph::new(ratatui_line), line_area);
+            out.push(StyledLine::new(vec![])); // blank line separator
+            out
         }
     }
 }
@@ -352,7 +475,7 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
             let mut lines = vec![content.clone()];
             if *level == 1 {
                 // Add underline decoration for h1
-                let rule = "━".repeat(content.text_content().len().min(width));
+                let rule = "\u{2501}".repeat(content.text_content().len().min(width));
                 lines.push(StyledLine::new(vec![StyledSpan::new(
                     rule,
                     theme.horizontal_rule,
@@ -369,11 +492,11 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
         RenderedBlock::CodeBlock { lines, .. } => {
             let mut out = Vec::new();
             for line in lines {
-                // Truncate with → indicator if too wide, preserving per-span styles
+                // Truncate with arrow indicator if too wide, preserving per-span styles
                 let text = line.text_content();
                 if text.len() > width {
                     let mut truncated_spans = Vec::new();
-                    let mut remaining = width - 1; // leave room for → indicator
+                    let mut remaining = width - 1; // leave room for arrow indicator
                     for span in &line.spans {
                         if remaining == 0 {
                             break;
@@ -387,7 +510,7 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
                             remaining = 0;
                         }
                     }
-                    truncated_spans.push(StyledSpan::new("→", theme.code_block_bg));
+                    truncated_spans.push(StyledSpan::new("\u{2192}", theme.code_block_bg));
                     out.push(StyledLine::new(truncated_spans));
                 } else {
                     out.push(line.clone());
@@ -402,7 +525,7 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
                 let inner_lines =
                     render_block_to_lines(inner_block, width.saturating_sub(4), theme);
                 for line in inner_lines {
-                    let mut spans = vec![StyledSpan::new("▎ ", theme.blockquote_bar)];
+                    let mut spans = vec![StyledSpan::new("\u{258e} ", theme.blockquote_bar)];
                     spans.extend(line.spans);
                     out.push(StyledLine::new(spans));
                 }
@@ -477,7 +600,7 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
             let mut hline_spans = Vec::new();
             for (i, span) in header_spans.into_iter().enumerate() {
                 if i > 0 {
-                    hline_spans.push(StyledSpan::new(" │ ", theme.table_border));
+                    hline_spans.push(StyledSpan::new(" \u{2502} ", theme.table_border));
                 }
                 hline_spans.push(span);
             }
@@ -486,9 +609,9 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
             // Separator
             let sep: String = col_widths
                 .iter()
-                .map(|w| "─".repeat(*w))
+                .map(|w| "\u{2500}".repeat(*w))
                 .collect::<Vec<_>>()
-                .join("─┼─");
+                .join("\u{2500}\u{253c}\u{2500}");
             out.push(StyledLine::new(vec![StyledSpan::new(
                 sep,
                 theme.table_border,
@@ -499,7 +622,7 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
                 let mut row_spans = Vec::new();
                 for (i, cell) in row.iter().enumerate() {
                     if i > 0 {
-                        row_spans.push(StyledSpan::new(" │ ", theme.table_border));
+                        row_spans.push(StyledSpan::new(" \u{2502} ", theme.table_border));
                     }
                     let padded = format!(
                         "{:<width$}",
@@ -514,7 +637,7 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
             out
         }
         RenderedBlock::HorizontalRule => {
-            let rule = "─".repeat(width);
+            let rule = "\u{2500}".repeat(width);
             vec![
                 StyledLine::new(vec![StyledSpan::new(rule, theme.horizontal_rule)]),
                 StyledLine::new(vec![]),
