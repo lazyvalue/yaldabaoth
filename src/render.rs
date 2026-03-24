@@ -255,7 +255,13 @@ impl<'t> Renderer<'t> {
             match &events[i] {
                 Event::End(TagEnd::Table) => { i += 1; break; }
                 Event::Start(Tag::TableHead) => { in_head = true; i += 1; }
-                Event::End(TagEnd::TableHead) => { in_head = false; i += 1; }
+                Event::End(TagEnd::TableHead) => {
+                    if !current_row.is_empty() {
+                        headers = std::mem::take(&mut current_row);
+                    }
+                    in_head = false;
+                    i += 1;
+                }
                 Event::Start(Tag::TableRow) => { current_row = Vec::new(); i += 1; }
                 Event::End(TagEnd::TableRow) => {
                     if in_head {

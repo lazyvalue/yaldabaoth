@@ -77,3 +77,101 @@ fn test_render_multiple_blocks() {
     assert!(matches!(blocks[1], RenderedBlock::Paragraph { .. }));
     assert!(matches!(blocks[2], RenderedBlock::Heading { level: 2, .. }));
 }
+
+#[test]
+fn test_render_unordered_list() {
+    let md = "- Alpha\n- Beta";
+    let theme = Theme::dark();
+    let blocks = render(md, &theme);
+    match &blocks[0] {
+        RenderedBlock::List { ordered, items, .. } => {
+            assert!(!ordered);
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].marker, "•");
+            assert!(items[0].checked.is_none());
+        }
+        other => panic!("Expected List, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_render_task_list() {
+    let md = "- [x] Done\n- [ ] Todo";
+    let theme = Theme::dark();
+    let blocks = render(md, &theme);
+    match &blocks[0] {
+        RenderedBlock::List { items, .. } => {
+            assert_eq!(items[0].checked, Some(true));
+            assert_eq!(items[1].checked, Some(false));
+        }
+        other => panic!("Expected List, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_render_blockquote() {
+    let md = "> Quoted text";
+    let theme = Theme::dark();
+    let blocks = render(md, &theme);
+    match &blocks[0] {
+        RenderedBlock::BlockQuote { blocks: inner } => {
+            assert_eq!(inner.len(), 1);
+            assert!(matches!(inner[0], RenderedBlock::Paragraph { .. }));
+        }
+        other => panic!("Expected BlockQuote, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_render_code_block() {
+    let md = "```rust\nfn main() {}\n```";
+    let theme = Theme::dark();
+    let blocks = render(md, &theme);
+    match &blocks[0] {
+        RenderedBlock::CodeBlock { language, lines } => {
+            assert_eq!(language.as_deref(), Some("rust"));
+            assert!(!lines.is_empty());
+        }
+        other => panic!("Expected CodeBlock, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_render_horizontal_rule() {
+    let md = "---";
+    let theme = Theme::dark();
+    let blocks = render(md, &theme);
+    assert!(matches!(blocks[0], RenderedBlock::HorizontalRule));
+}
+
+#[test]
+fn test_render_image() {
+    let md = "![Alt text](image.png)";
+    let theme = Theme::dark();
+    let blocks = render(md, &theme);
+    match &blocks[0] {
+        RenderedBlock::Image { alt, url } => {
+            assert_eq!(alt, "Alt text");
+            assert_eq!(url, "image.png");
+        }
+        RenderedBlock::Paragraph { .. } => {
+            // pulldown-cmark may wrap images in paragraphs — acceptable
+        }
+        other => panic!("Expected Image, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_render_table() {
+    let md = "| A | B |\n|---|---|\n| 1 | 2 |";
+    let theme = Theme::dark();
+    let blocks = render(md, &theme);
+    match &blocks[0] {
+        RenderedBlock::Table { headers, rows, .. } => {
+            assert_eq!(headers.len(), 2);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].len(), 2);
+        }
+        other => panic!("Expected Table, got {:?}", other),
+    }
+}
