@@ -166,8 +166,26 @@ impl App {
                         self.jump_to_match(content_width, viewport_height);
                     }
                 }
-                Action::OpenLink | Action::YankLine => {
-                    // Implement in a later task
+                Action::OpenLink => {
+                    if let Some(url) = self.find_link_at_cursor(content_width) {
+                        let _ = std::process::Command::new("open") // macOS
+                            .arg(&url)
+                            .spawn();
+                    }
+                }
+                Action::YankLine => {
+                    if let Some(text) = self.get_cursor_line_text(content_width) {
+                        use std::process::{Command, Stdio};
+                        use std::io::Write;
+                        if let Ok(mut child) = Command::new("pbcopy")
+                            .stdin(Stdio::piped())
+                            .spawn()
+                        {
+                            if let Some(mut stdin) = child.stdin.take() {
+                                let _ = stdin.write_all(text.as_bytes());
+                            }
+                        }
+                    }
                 }
                 Action::None => {}
             }
@@ -255,6 +273,58 @@ impl App {
                 }
                 y += self.viewport.block_height(block, width);
             }
+        }
+    }
+
+    fn find_link_at_cursor(&self, width: usize) -> Option<String> {
+        let mut y = 0;
+        for block in &self.blocks {
+            let h = self.viewport.block_height(block, width);
+            if y + h > self.viewport.cursor_line {
+                return self.find_link_in_block(block);
+            }
+            y += h;
+        }
+        None
+    }
+
+    fn find_link_in_block(&self, block: &RenderedBlock) -> Option<String> {
+        match block {
+            RenderedBlock::Heading { content, .. } => {
+                content.spans.iter().find_map(|s| s.link.clone())
+            }
+            RenderedBlock::Paragraph { lines } => {
+                lines.iter().flat_map(|l| &l.spans).find_map(|s| s.link.clone())
+            }
+            RenderedBlock::BlockQuote { blocks } => {
+                blocks.iter().find_map(|b| self.find_link_in_block(b))
+            }
+            RenderedBlock::List { items, .. } => {
+                items.iter().flat_map(|i| &i.content).find_map(|b| self.find_link_in_block(b))
+            }
+            _ => None,
+        }
+    }
+
+    fn get_cursor_line_text(&self, width: usize) -> Option<String> {
+        let mut y = 0;
+        for block in &self.blocks {
+            let h = self.viewport.block_height(block, width);
+            if y + h > self.viewport.cursor_line {
+                let line_in_block = self.viewport.cursor_line - y;
+                return self.get_block_line_text(block, line_in_block);
+            }
+            y += h;
+        }
+        None
+    }
+
+    fn get_block_line_text(&self, block: &RenderedBlock, line: usize) -> Option<String> {
+        match block {
+            RenderedBlock::Heading { content, .. } if line == 0 => Some(content.text_content()),
+            RenderedBlock::Paragraph { lines } if line < lines.len() => Some(lines[line].text_content()),
+            RenderedBlock::CodeBlock { lines, .. } if line < lines.len() => Some(lines[line].text_content()),
+            _ => None,
         }
     }
 
