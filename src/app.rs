@@ -6,11 +6,20 @@ use ratatui::DefaultTerminal;
 
 use sketch::blocks::RenderedBlock;
 use sketch::config::Config;
+use sketch::file_browser::FileBrowser;
 use sketch::keybind::{Action, KeybindManager};
+use sketch::menu::{self, MenuNode, MenuState};
 use sketch::render;
 use sketch::theme::Theme;
 use sketch::view::{self, ViewState};
 use sketch::viewport::Viewport;
+
+#[derive(Debug, PartialEq)]
+enum AppMode {
+    Normal,
+    Menu,
+    FileBrowser,
+}
 
 pub struct App {
     filename: String,
@@ -24,6 +33,10 @@ pub struct App {
     search_input_buffer: String,
     search_matches: Vec<(usize, usize)>, // (block_index, span_index)
     search_match_index: usize,
+    mode: AppMode,
+    menu_state: MenuState,
+    menu_tree: Vec<MenuNode>,
+    file_browser: Option<FileBrowser>,
 }
 
 impl App {
@@ -45,13 +58,17 @@ impl App {
             search_input_buffer: String::new(),
             search_matches: Vec::new(),
             search_match_index: 0,
+            mode: AppMode::Normal,
+            menu_state: MenuState::new(),
+            menu_tree: menu::default_menu(),
+            file_browser: None,
         }
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         // Calculate initial dimensions
         let size = terminal.size()?;
-        let content_width = self.viewport.content_width(size.width as usize);
+        let content_width = self.effective_content_width(size.width as usize);
         self.viewport
             .calculate_total_lines(&self.blocks, content_width);
 
@@ -67,6 +84,9 @@ impl App {
                     search_input_mode: self.search_input_mode,
                     search_input_buffer: &self.search_input_buffer,
                     search_match_count: self.search_matches.len(),
+                    menu_active: false,
+                    menu_nodes: Vec::new(),
+                    menu_label: None,
                 };
                 view::draw(frame, &state);
             })?;
@@ -86,7 +106,7 @@ impl App {
                 match event::read()? {
                     Event::Key(key_event) => self.handle_key(key_event, terminal)?,
                     Event::Resize(w, _h) => {
-                        let cw = self.viewport.content_width(w as usize);
+                        let cw = self.effective_content_width(w as usize);
                         self.viewport.calculate_total_lines(&self.blocks, cw);
                     }
                     _ => {}
@@ -103,8 +123,20 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent, terminal: &DefaultTerminal) -> io::Result<()> {
         let size = terminal.size()?;
         let viewport_height = (size.height as usize).saturating_sub(2);
-        let content_width = self.viewport.content_width(size.width as usize);
+        let content_width = self.effective_content_width(size.width as usize);
 
+        match self.mode {
+            AppMode::Normal => self.handle_normal_key(key, viewport_height, content_width),
+            AppMode::Menu => self.handle_menu_key(key, viewport_height, content_width),
+            AppMode::FileBrowser => {
+                self.handle_file_browser_key(key, size.width, viewport_height, content_width)
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_normal_key(&mut self, key: KeyEvent, viewport_height: usize, content_width: usize) {
         if self.search_input_mode {
             match key.code {
                 KeyCode::Enter => {
@@ -125,86 +157,217 @@ impl App {
                 }
                 _ => {}
             }
-            return Ok(());
+            return;
         }
 
         if let Some(action) = self.keybinds.process_key(key) {
-            match action {
-                Action::Quit => self.should_quit = true,
-                Action::ScrollDown => self.viewport.scroll_down(1, viewport_height),
-                Action::ScrollUp => self.viewport.scroll_up(1),
-                Action::HalfPageDown => self
-                    .viewport
-                    .scroll_down(viewport_height / 2, viewport_height),
-                Action::HalfPageUp => self.viewport.scroll_up(viewport_height / 2),
-                Action::FullPageDown => self.viewport.scroll_down(viewport_height, viewport_height),
-                Action::FullPageUp => self.viewport.scroll_up(viewport_height),
-                Action::JumpTop => self.viewport.jump_top(),
-                Action::JumpBottom => self.viewport.jump_bottom(viewport_height),
-                Action::NextHeading => {
-                    self.jump_to_next_heading(content_width, viewport_height);
+            self.execute_action(action, viewport_height, content_width);
+        }
+    }
+
+    fn handle_menu_key(&mut self, key: KeyEvent, viewport_height: usize, content_width: usize) {
+        match key.code {
+            KeyCode::Esc => {
+                self.menu_state.handle_escape();
+                if !self.menu_state.is_active() {
+                    self.mode = AppMode::Normal;
                 }
-                Action::PrevHeading => {
-                    self.jump_to_prev_heading(content_width, viewport_height);
+            }
+            KeyCode::Char(c) => {
+                if let Some(action) = self.menu_state.process_key(c, &self.menu_tree) {
+                    self.mode = AppMode::Normal;
+                    self.execute_action(action, viewport_height, content_width);
                 }
-                Action::NextHeadingSameLevel => {
-                    self.jump_to_heading_same_level(content_width, viewport_height, true);
-                }
-                Action::PrevHeadingSameLevel => {
-                    self.jump_to_heading_same_level(content_width, viewport_height, false);
-                }
-                Action::SearchForward | Action::SearchBackward => {
-                    self.search_input_mode = true;
-                    self.search_input_buffer.clear();
-                }
-                Action::SearchNext => {
-                    if !self.search_matches.is_empty() {
-                        self.search_match_index =
-                            (self.search_match_index + 1) % self.search_matches.len();
-                        self.jump_to_match(content_width, viewport_height);
-                    }
-                }
-                Action::SearchPrev => {
-                    if !self.search_matches.is_empty() {
-                        self.search_match_index = if self.search_match_index == 0 {
-                            self.search_matches.len() - 1
-                        } else {
-                            self.search_match_index - 1
-                        };
-                        self.jump_to_match(content_width, viewport_height);
-                    }
-                }
-                Action::OpenLink => {
-                    if let Some(url) = self.find_link_at_cursor(content_width) {
-                        let _ = std::process::Command::new("open") // macOS
-                            .arg(&url)
-                            .spawn();
-                    }
-                }
-                Action::YankLine => {
-                    if let Some(text) = self.get_cursor_line_text(content_width) {
-                        use std::io::Write;
-                        use std::process::{Command, Stdio};
-                        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn()
-                            && let Some(mut stdin) = child.stdin.take()
-                        {
-                            let _ = stdin.write_all(text.as_bytes());
+            }
+            _ => {} // ignore unrecognized keys
+        }
+    }
+
+    fn handle_file_browser_key(
+        &mut self,
+        key: KeyEvent,
+        term_width: u16,
+        _viewport_height: usize,
+        content_width: usize,
+    ) {
+        let _ = term_width; // reserved for future use
+
+        let browser = match &mut self.file_browser {
+            Some(b) => b,
+            None => {
+                self.mode = AppMode::Normal;
+                return;
+            }
+        };
+
+        if browser.filter_mode {
+            match key.code {
+                KeyCode::Esc => browser.clear_filter(),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(path) = browser.enter_selected() {
+                        if self.load_file(path, content_width) {
+                            self.file_browser = None;
+                            self.mode = AppMode::Normal;
                         }
                     }
                 }
-                Action::None => {}
-                Action::OpenMenu
-                | Action::OpenFileBrowser
-                | Action::FileBrowserDown
-                | Action::FileBrowserUp
-                | Action::FileBrowserEnter
-                | Action::FileBrowserParentDir
-                | Action::FileBrowserFilter
-                | Action::FileBrowserClose => {}
+                KeyCode::Backspace => {
+                    let mut text = browser.filter_text().to_string();
+                    text.pop();
+                    browser.set_filter(&text);
+                }
+                KeyCode::Char(c) => {
+                    let mut text = browser.filter_text().to_string();
+                    text.push(c);
+                    browser.set_filter(&text);
+                }
+                _ => {}
             }
+            return;
         }
 
-        Ok(())
+        match key.code {
+            KeyCode::Char('j') => browser.move_down(),
+            KeyCode::Char('k') => browser.move_up(),
+            KeyCode::Char(' ') => {
+                if let Some(path) = browser.enter_selected() {
+                    if self.load_file(path, content_width) {
+                        self.file_browser = None;
+                        self.mode = AppMode::Normal;
+                    }
+                }
+            }
+            KeyCode::Backspace => browser.go_parent(),
+            KeyCode::Char('/') => browser.filter_mode = true,
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.file_browser = None;
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    fn execute_action(
+        &mut self,
+        action: Action,
+        viewport_height: usize,
+        content_width: usize,
+    ) {
+        match action {
+            Action::Quit => self.should_quit = true,
+            Action::ScrollDown => self.viewport.scroll_down(1, viewport_height),
+            Action::ScrollUp => self.viewport.scroll_up(1),
+            Action::HalfPageDown => self
+                .viewport
+                .scroll_down(viewport_height / 2, viewport_height),
+            Action::HalfPageUp => self.viewport.scroll_up(viewport_height / 2),
+            Action::FullPageDown => self.viewport.scroll_down(viewport_height, viewport_height),
+            Action::FullPageUp => self.viewport.scroll_up(viewport_height),
+            Action::JumpTop => self.viewport.jump_top(),
+            Action::JumpBottom => self.viewport.jump_bottom(viewport_height),
+            Action::NextHeading => {
+                self.jump_to_next_heading(content_width, viewport_height);
+            }
+            Action::PrevHeading => {
+                self.jump_to_prev_heading(content_width, viewport_height);
+            }
+            Action::NextHeadingSameLevel => {
+                self.jump_to_heading_same_level(content_width, viewport_height, true);
+            }
+            Action::PrevHeadingSameLevel => {
+                self.jump_to_heading_same_level(content_width, viewport_height, false);
+            }
+            Action::SearchForward | Action::SearchBackward => {
+                self.search_input_mode = true;
+                self.search_input_buffer.clear();
+            }
+            Action::SearchNext => {
+                if !self.search_matches.is_empty() {
+                    self.search_match_index =
+                        (self.search_match_index + 1) % self.search_matches.len();
+                    self.jump_to_match(content_width, viewport_height);
+                }
+            }
+            Action::SearchPrev => {
+                if !self.search_matches.is_empty() {
+                    self.search_match_index = if self.search_match_index == 0 {
+                        self.search_matches.len() - 1
+                    } else {
+                        self.search_match_index - 1
+                    };
+                    self.jump_to_match(content_width, viewport_height);
+                }
+            }
+            Action::OpenLink => {
+                if let Some(url) = self.find_link_at_cursor(content_width) {
+                    let _ = std::process::Command::new("open") // macOS
+                        .arg(&url)
+                        .spawn();
+                }
+            }
+            Action::YankLine => {
+                if let Some(text) = self.get_cursor_line_text(content_width) {
+                    use std::io::Write;
+                    use std::process::{Command, Stdio};
+                    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn()
+                        && let Some(mut stdin) = child.stdin.take()
+                    {
+                        let _ = stdin.write_all(text.as_bytes());
+                    }
+                }
+            }
+            Action::OpenMenu => {
+                self.menu_state.open();
+                self.mode = AppMode::Menu;
+            }
+            Action::OpenFileBrowser => {
+                self.open_file_browser();
+            }
+            Action::None
+            | Action::FileBrowserDown
+            | Action::FileBrowserUp
+            | Action::FileBrowserEnter
+            | Action::FileBrowserParentDir
+            | Action::FileBrowserFilter
+            | Action::FileBrowserClose => {}
+        }
+    }
+
+    fn open_file_browser(&mut self) {
+        let dir = std::path::Path::new(&self.filename)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        self.file_browser = Some(FileBrowser::new(dir));
+        self.mode = AppMode::FileBrowser;
+    }
+
+    /// Load a file into the viewer. Returns true on success, false on error
+    /// (browser should stay open on failure).
+    fn load_file(&mut self, path: std::path::PathBuf, content_width: usize) -> bool {
+        match std::fs::read(&path) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(content) => {
+                    self.filename = path.display().to_string();
+                    self.blocks = render::render(&content, &self.theme);
+                    self.viewport.scroll_offset = 0;
+                    self.viewport.cursor_line = 0;
+                    self.viewport.calculate_total_lines(&self.blocks, content_width);
+                    true
+                }
+                Err(_) => false, // Non-UTF-8: keep browser open
+            },
+            Err(_) => false, // Read error: keep browser open
+        }
+    }
+
+    fn effective_content_width(&self, terminal_width: usize) -> usize {
+        let available = if let Some(browser) = &self.file_browser {
+            terminal_width.saturating_sub(browser.panel_width(terminal_width as u16) as usize + 1)
+        } else {
+            terminal_width
+        };
+        self.viewport.content_width(available)
     }
 
     fn jump_to_next_heading(&mut self, width: usize, viewport_height: usize) {

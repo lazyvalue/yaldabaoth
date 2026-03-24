@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -18,6 +18,9 @@ pub struct ViewState<'a> {
     pub search_input_mode: bool,
     pub search_input_buffer: &'a str,
     pub search_match_count: usize,
+    pub menu_active: bool,
+    pub menu_nodes: Vec<(char, String, bool)>,  // (key, label, is_submenu)
+    pub menu_label: Option<String>,              // submenu breadcrumb label
 }
 
 pub fn draw(frame: &mut Frame, state: &ViewState) {
@@ -39,6 +42,9 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
 
     draw_top_bar(frame, top_bar, state);
     draw_content(frame, content_area, state);
+    if state.menu_active {
+        draw_menu_popup(frame, content_area, state);
+    }
     draw_bottom_bar(frame, bottom_bar, state);
 }
 
@@ -100,6 +106,62 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
     ]);
 
     frame.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_menu_popup(frame: &mut Frame, area: Rect, state: &ViewState) {
+    // Menu takes 2 rows: label row + entries row
+    let popup_height = 2u16;
+    let popup_area = Rect::new(area.x, area.y, area.width, popup_height.min(area.height));
+
+    // Opaque background
+    let bg = Paragraph::new("").style(Style::default().bg(Color::Rgb(30, 30, 58)));
+    frame.render_widget(bg, popup_area);
+
+    // Label row
+    let label_text = state.menu_label.as_deref().unwrap_or("Commands");
+    let label_line = Line::from(Span::styled(
+        format!("  {}", label_text.to_uppercase()),
+        Style::default().fg(Color::Rgb(98, 114, 164)),
+    ));
+    if popup_area.height >= 1 {
+        frame.render_widget(
+            Paragraph::new(label_line),
+            Rect::new(popup_area.x, popup_area.y, popup_area.width, 1),
+        );
+    }
+
+    // Entries row
+    if popup_area.height >= 2 {
+        let mut spans = vec![Span::raw("  ")];
+        for (i, (key, label, is_submenu)) in state.menu_nodes.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("   "));
+            }
+            spans.push(Span::styled(
+                key.to_string(),
+                Style::default()
+                    .fg(Color::Rgb(189, 147, 249))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+            if *is_submenu {
+                spans.push(Span::styled(
+                    format!("{} \u{25b8}", label),
+                    Style::default().fg(Color::Rgb(139, 233, 253)),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    label.clone(),
+                    Style::default().fg(Color::Rgb(204, 204, 204)),
+                ));
+            }
+        }
+        let entries_line = Line::from(spans);
+        frame.render_widget(
+            Paragraph::new(entries_line),
+            Rect::new(popup_area.x, popup_area.y + 1, popup_area.width, 1),
+        );
+    }
 }
 
 fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) {
