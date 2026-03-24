@@ -30,6 +30,8 @@ struct UndoEntry {
 - Undo/redo stacks store inverse operations per-action (not per-keystroke)
 - An "action" boundary is created when entering/leaving insert mode, and for each normal mode operation (`dd`, `x`, etc.)
 
+- `UndoEntry.old_text` copies the replaced text as a `String`. For large deletions this allocates — acceptable for this scope; a more efficient inverse-operation model is a future consideration.
+
 Dependencies: `ropey` crate.
 
 ## Cursor Model
@@ -39,7 +41,7 @@ Character-level cursor replacing the current line-only model:
 ```rust
 struct CursorPos {
     line: usize,    // 0-indexed line in the rope
-    col: usize,     // 0-indexed column (byte offset within line)
+    col: usize,     // 0-indexed column (char index within line, NOT byte offset — consistent with ropey's char-based API)
 }
 ```
 
@@ -50,7 +52,7 @@ struct CursorPos {
 - `h`/`l`: move within a line, clamped at line boundaries (no wrapping)
 - `j`/`k`: move between lines, preserving a "desired column" (sticky column) — if you move from a long line to a short line, the cursor clamps to end-of-line but remembers the original column
 - `0`: column 0. `$`: last character.
-- `w`/`b`/`e`: word motions (whitespace/punctuation boundaries, vim rules)
+- `w`/`b`/`e`: word motions per vim's `:help word` — a "word" is a sequence of keyword characters (letters, digits, underscore) or a sequence of non-blank non-keyword characters, separated by whitespace
 
 ### Cursor ↔ Viewport
 
@@ -94,7 +96,19 @@ On edit: call `tree.edit()` with the change description, then `parser.parse()` w
 
 Non-active blocks cache their `RenderedBlock` output. The cache is invalidated when tree-sitter detects a change in that block's byte range. Typing in one block doesn't re-render the entire document.
 
-Dependencies: `tree-sitter` and `tree-sitter-md` crates.
+Dependencies: `tree-sitter` 0.24+ and `tree-sitter-md` (from MDeiml/tree-sitter-markdown — the most maintained grammar).
+
+### Per-block rendering strategy
+
+To render a non-active block: extract the block's text from the rope using tree-sitter's byte range for that node, feed the substring to pulldown-cmark independently. Each block is rendered in isolation. This works for most blocks; edge cases (e.g., a list item needing surrounding context) are handled by extracting the entire parent list node's text.
+
+### Cache invalidation
+
+After each edit:
+1. Call `tree.edit()` then `parser.parse()` to get the new tree
+2. Call `new_tree.changed_ranges(&old_tree)` to identify changed byte ranges
+3. Compare changed ranges against cached block byte ranges — invalidate any block whose range overlaps a changed range
+4. Re-render only invalidated blocks via pulldown-cmark
 
 ## Editing Modes
 
@@ -121,7 +135,7 @@ Cursor movement (replaces the current scroll-only j/k behavior):
 Editing commands:
 - `i` — enter insert mode at cursor
 - `a` — enter insert mode after cursor
-- `o` — open line below, enter insert
+- `o` — open line below, enter insert (note: `o` was previously bound to OpenLink in the viewer MVP; OpenLink moves to `gx`)
 - `O` — open line above, enter insert
 - `x` — delete character under cursor
 - `dd` — delete current line
@@ -133,7 +147,7 @@ Viewport scrolling (still works):
 - `Ctrl+d`/`Ctrl+u` — half page
 - `Ctrl+f`/`Ctrl+b` — full page
 
-**Key conflict resolution:** `j`/`k` now move the cursor (which scrolls the viewport to follow). The old scroll-only behavior is covered by `Ctrl+d`/`Ctrl+u`. `q` no longer quits — quit is `:q` only (frees `q` for future use like macros).
+**Key conflict resolution:** `j`/`k` now move the cursor (which scrolls the viewport to follow). The old scroll-only behavior is covered by `Ctrl+d`/`Ctrl+u`. `q` no longer quits — quit is `:q` only (frees `q` for future use like macros). `o` moves from OpenLink to open-line-below; OpenLink reassigned to `gx` (vim convention). `gg`/`G` now move the cursor to line 0 / last line (not just scroll). The default menu tree's `q -> Quit` entry is removed (quit is `:q` only).
 
 ### Insert mode
 
@@ -179,6 +193,8 @@ The block containing the cursor shows raw markdown. All other blocks show styled
 - Cursor on an image (`![alt](url)`): shows the raw markdown
 - Multi-line blocks (code blocks, lists, blockquotes): entire block reveals when cursor enters any line
 - If an edit changes block boundaries (e.g., adding a blank line splits a paragraph), tree-sitter detects this and the active block updates
+- Tab characters in raw text display as 4 spaces
+- Search highlights (`/` search) appear in rendered blocks only, not in the raw active block. Search remains a substate of Normal mode (existing `search_input_mode: bool` approach)
 
 ### Cursor movement across blocks
 
@@ -211,7 +227,7 @@ Free movement — `h`/`j`/`k`/`l` move through the entire document. As the curso
 - `src/document.rs` — `Document` struct (rope, file path, modified flag, undo/redo), text mutation methods, save
 - `src/cursor.rs` — `CursorPos`, movement logic (h/j/k/l, w/b/e, 0/$), sticky column
 - `src/tree.rs` — `TreeState`, tree-sitter parser setup, incremental parse, block boundary queries
-- `src/editor.rs` — Orchestrates editing: handles insert/normal mode editing operations, creates undo boundaries, coordinates document + cursor + tree
+- `src/editor.rs` — Orchestrates editing: handles insert/normal mode editing operations, creates undo boundaries. `Editor` owns `Document`, `CursorPos`, and `TreeState` — `App` owns `Editor`. This gives clean borrow checker ergonomics.
 
 ### Modified Modules
 
@@ -224,7 +240,9 @@ Free movement — `h`/`j`/`k`/`l` move through the entire document. As the curso
 
 - `App.blocks` (`Vec<RenderedBlock>`) becomes a render cache, not the source of truth. Source of truth is `Document.rope`.
 - The `render::render()` function is still used but called per-block for non-active blocks, not for the whole document at once.
-- `q` removed from normal mode keybindings (quit is `:q` only).
+- `q` removed from normal mode keybindings (quit is `:q` only). `q -> Quit` removed from default menu tree.
+- `o` reassigned from OpenLink to OpenLineBelow. OpenLink moves to `gx` (multi-key sequence).
+- Opening a new file via the file browser with unsaved edits: warns like `:q` ("No write since last change"). User must save first or the open is cancelled.
 
 ### New Dependencies
 
@@ -240,6 +258,11 @@ Free movement — `h`/`j`/`k`/`l` move through the entire document. As the curso
 - **Unit tests for `editor.rs`**: Insert mode text entry + undo boundary, `dd` + undo, `x` + undo, combined operation sequences.
 - **Integration test**: Load a markdown file, make edits, save, reload, verify content matches.
 - **No TUI tests** — cursor rendering and block reveal tested manually.
+
+## Explicitly Out of Scope
+
+- New file creation (`:e newfile`, `sketch` without arguments opening an empty buffer)
+- `:e` command to open a different file
 
 ## Future Considerations (Not in This Spec)
 
