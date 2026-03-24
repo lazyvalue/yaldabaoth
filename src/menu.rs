@@ -117,10 +117,10 @@ impl MenuState {
         // Walk the tree to the current level and find the matching key
         let mut target = menu;
         for &idx in &self.path {
-            if let Some(node) = target.get(idx) {
-                if let MenuAction::Submenu(children) = &node.action {
-                    target = children;
-                }
+            if let Some(node) = target.get(idx)
+                && let MenuAction::Submenu(children) = &node.action
+            {
+                target = children;
             }
         }
         target.iter().position(|n| n.key == key)

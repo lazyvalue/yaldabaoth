@@ -29,7 +29,10 @@ fn test_directories_sorted_first() {
     let first_file_idx = entries.iter().position(|e| !e.is_dir);
     let last_dir_idx = entries.iter().rposition(|e| e.is_dir);
     if let (Some(first_file), Some(last_dir)) = (first_file_idx, last_dir_idx) {
-        assert!(last_dir < first_file, "Directories should sort before files");
+        assert!(
+            last_dir < first_file,
+            "Directories should sort before files"
+        );
     }
 }
 
@@ -64,7 +67,11 @@ fn test_enter_directory() {
     let dir = setup_test_dir();
     let mut browser = FileBrowser::new(dir.path().to_path_buf());
     // Find "src" directory
-    let src_idx = browser.entries().iter().position(|e| e.name == "src").unwrap();
+    let src_idx = browser
+        .entries()
+        .iter()
+        .position(|e| e.name == "src")
+        .unwrap();
     browser.set_selected(src_idx);
     let result = browser.enter_selected();
     assert!(result.is_none()); // entered dir, no file to open
@@ -76,7 +83,11 @@ fn test_enter_directory() {
 fn test_enter_file() {
     let dir = setup_test_dir();
     let mut browser = FileBrowser::new(dir.path().to_path_buf());
-    let file_idx = browser.entries().iter().position(|e| e.name == "README.md").unwrap();
+    let file_idx = browser
+        .entries()
+        .iter()
+        .position(|e| e.name == "README.md")
+        .unwrap();
     browser.set_selected(file_idx);
     let result = browser.enter_selected();
     assert!(result.is_some()); // returns file path to open
@@ -86,7 +97,11 @@ fn test_enter_file() {
 fn test_go_parent() {
     let dir = setup_test_dir();
     let mut browser = FileBrowser::new(dir.path().to_path_buf());
-    let src_idx = browser.entries().iter().position(|e| e.name == "src").unwrap();
+    let src_idx = browser
+        .entries()
+        .iter()
+        .position(|e| e.name == "src")
+        .unwrap();
     browser.set_selected(src_idx);
     browser.enter_selected();
     browser.go_parent();

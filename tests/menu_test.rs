@@ -10,7 +10,7 @@ fn test_menu_starts_inactive() {
 #[test]
 fn test_menu_open_close() {
     let mut state = MenuState::new();
-    let menu = default_menu();
+    let _menu = default_menu();
     state.open();
     assert!(state.is_active());
     state.close();
@@ -62,7 +62,7 @@ fn test_menu_escape_from_submenu() {
 #[test]
 fn test_menu_escape_from_root() {
     let mut state = MenuState::new();
-    let menu = default_menu();
+    let _menu = default_menu();
     state.open();
     state.handle_escape();
     assert!(!state.is_active()); // closed

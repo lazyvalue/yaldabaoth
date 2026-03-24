@@ -75,36 +75,58 @@ impl App {
         loop {
             terminal.draw(|frame| {
                 let menu_nodes: Vec<(char, String, bool)> = if self.menu_state.is_active() {
-                    self.menu_state.current_nodes(&self.menu_tree).iter().map(|n| {
-                        let is_sub = matches!(n.action, menu::MenuAction::Submenu(_));
-                        (n.key, n.label.clone(), is_sub)
-                    }).collect()
+                    self.menu_state
+                        .current_nodes(&self.menu_tree)
+                        .iter()
+                        .map(|n| {
+                            let is_sub = matches!(n.action, menu::MenuAction::Submenu(_));
+                            (n.key, n.label.clone(), is_sub)
+                        })
+                        .collect()
                 } else {
                     Vec::new()
                 };
 
-                let (fb_open, fb_dir, fb_entries, fb_filter_mode, fb_filter_text, fb_panel_width, fb_hint) =
-                    if let Some(browser) = &self.file_browser {
-                        let entries: Vec<(String, bool, bool)> = browser.visible_entries().iter().enumerate().map(|(i, e)| {
-                            (e.name.clone(), e.is_dir, i == browser.selected())
-                        }).collect();
-                        let hint = if browser.filter_mode {
-                            format!("{} matches · Space open · Esc clear", entries.len())
-                        } else {
-                            "j/k nav · Space open · / filter · Esc close".to_string()
-                        };
-                        (
-                            true,
-                            browser.current_dir().display().to_string(),
-                            entries,
-                            browser.filter_mode,
-                            browser.filter_text().to_string(),
-                            browser.panel_width(frame.area().width),
-                            hint,
-                        )
+                let (
+                    fb_open,
+                    fb_dir,
+                    fb_entries,
+                    fb_filter_mode,
+                    fb_filter_text,
+                    fb_panel_width,
+                    fb_hint,
+                ) = if let Some(browser) = &self.file_browser {
+                    let entries: Vec<(String, bool, bool)> = browser
+                        .visible_entries()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| (e.name.clone(), e.is_dir, i == browser.selected()))
+                        .collect();
+                    let hint = if browser.filter_mode {
+                        format!("{} matches · Space open · Esc clear", entries.len())
                     } else {
-                        (false, String::new(), Vec::new(), false, String::new(), 0, String::new())
+                        "j/k nav · Space open · / filter · Esc close".to_string()
                     };
+                    (
+                        true,
+                        browser.current_dir().display().to_string(),
+                        entries,
+                        browser.filter_mode,
+                        browser.filter_text().to_string(),
+                        browser.panel_width(frame.area().width),
+                        hint,
+                    )
+                } else {
+                    (
+                        false,
+                        String::new(),
+                        Vec::new(),
+                        false,
+                        String::new(),
+                        0,
+                        String::new(),
+                    )
+                };
 
                 let state = ViewState {
                     filename: &self.filename,
@@ -247,11 +269,11 @@ impl App {
             match key.code {
                 KeyCode::Esc => browser.clear_filter(),
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    if let Some(path) = browser.enter_selected() {
-                        if self.load_file(path, content_width) {
-                            self.file_browser = None;
-                            self.mode = AppMode::Normal;
-                        }
+                    if let Some(path) = browser.enter_selected()
+                        && self.load_file(path, content_width)
+                    {
+                        self.file_browser = None;
+                        self.mode = AppMode::Normal;
                     }
                 }
                 KeyCode::Backspace => {
@@ -273,11 +295,11 @@ impl App {
             KeyCode::Char('j') => browser.move_down(),
             KeyCode::Char('k') => browser.move_up(),
             KeyCode::Char(' ') => {
-                if let Some(path) = browser.enter_selected() {
-                    if self.load_file(path, content_width) {
-                        self.file_browser = None;
-                        self.mode = AppMode::Normal;
-                    }
+                if let Some(path) = browser.enter_selected()
+                    && self.load_file(path, content_width)
+                {
+                    self.file_browser = None;
+                    self.mode = AppMode::Normal;
                 }
             }
             KeyCode::Backspace => browser.go_parent(),
@@ -290,12 +312,7 @@ impl App {
         }
     }
 
-    fn execute_action(
-        &mut self,
-        action: Action,
-        viewport_height: usize,
-        content_width: usize,
-    ) {
+    fn execute_action(&mut self, action: Action, viewport_height: usize, content_width: usize) {
         match action {
             Action::Quit => self.should_quit = true,
             Action::ScrollDown => self.viewport.scroll_down(1, viewport_height),
@@ -395,7 +412,8 @@ impl App {
                     self.blocks = render::render(&content, &self.theme);
                     self.viewport.scroll_offset = 0;
                     self.viewport.cursor_line = 0;
-                    self.viewport.calculate_total_lines(&self.blocks, content_width);
+                    self.viewport
+                        .calculate_total_lines(&self.blocks, content_width);
                     true
                 }
                 Err(_) => false, // Non-UTF-8: keep browser open

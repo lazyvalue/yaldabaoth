@@ -19,11 +19,11 @@ pub struct ViewState<'a> {
     pub search_input_buffer: &'a str,
     pub search_match_count: usize,
     pub menu_active: bool,
-    pub menu_nodes: Vec<(char, String, bool)>,  // (key, label, is_submenu)
-    pub menu_label: Option<String>,              // submenu breadcrumb label
+    pub menu_nodes: Vec<(char, String, bool)>, // (key, label, is_submenu)
+    pub menu_label: Option<String>,            // submenu breadcrumb label
     pub file_browser_open: bool,
     pub file_browser_dir: String,
-    pub file_browser_entries: Vec<(String, bool, bool)>,  // (name, is_dir, is_selected)
+    pub file_browser_entries: Vec<(String, bool, bool)>, // (name, is_dir, is_selected)
     pub file_browser_filter_mode: bool,
     pub file_browser_filter_text: String,
     pub file_browser_panel_width: u16,
@@ -52,7 +52,8 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
         let [browser_area, doc_area] = Layout::horizontal([
             Constraint::Length(state.file_browser_panel_width),
             Constraint::Min(1),
-        ]).areas(content_area);
+        ])
+        .areas(content_area);
 
         draw_file_browser_panel(frame, browser_area, state);
         draw_content(frame, doc_area, state);
@@ -186,16 +187,16 @@ fn draw_file_browser_panel(frame: &mut Frame, area: Rect, state: &ViewState) {
     let has_filter = state.file_browser_filter_mode;
     let constraints = if has_filter {
         vec![
-            Constraint::Length(1),  // header
-            Constraint::Length(1),  // filter input
+            Constraint::Length(1), // header
+            Constraint::Length(1), // filter input
             Constraint::Min(1),    // file list
-            Constraint::Length(1),  // footer
+            Constraint::Length(1), // footer
         ]
     } else {
         vec![
-            Constraint::Length(1),  // header
+            Constraint::Length(1), // header
             Constraint::Min(1),    // file list
-            Constraint::Length(1),  // footer
+            Constraint::Length(1), // footer
         ]
     };
     let areas = Layout::vertical(constraints).split(area);
@@ -236,7 +237,10 @@ fn draw_file_browser_panel(frame: &mut Frame, area: Rect, state: &ViewState) {
     if let Some(filter_area) = filter_area {
         let filter_line = Line::from(vec![
             Span::styled("/", Style::default().fg(Color::Rgb(255, 184, 108))),
-            Span::styled(&state.file_browser_filter_text, Style::default().fg(Color::Rgb(241, 250, 140))),
+            Span::styled(
+                &state.file_browser_filter_text,
+                Style::default().fg(Color::Rgb(241, 250, 140)),
+            ),
             Span::styled("▎", Style::default().fg(Color::Rgb(102, 102, 102))),
         ]);
         frame.render_widget(
@@ -257,7 +261,9 @@ fn draw_file_browser_panel(frame: &mut Frame, area: Rect, state: &ViewState) {
         );
     }
     for (i, (name, is_dir, is_selected)) in state.file_browser_entries.iter().enumerate() {
-        if i >= list_height { break; }
+        if i >= list_height {
+            break;
+        }
 
         let marker = if *is_selected { "▸ " } else { "  " };
         let style = if *is_selected {
@@ -443,7 +449,10 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
         RenderedBlock::Table { headers, rows, .. } => {
             let mut out = Vec::new();
             // Calculate column widths from both headers and row data
-            let mut col_widths: Vec<usize> = headers.iter().map(|h| h.text_content().len().max(3)).collect();
+            let mut col_widths: Vec<usize> = headers
+                .iter()
+                .map(|h| h.text_content().len().max(3))
+                .collect();
             for row in rows {
                 for (i, cell) in row.iter().enumerate() {
                     if i < col_widths.len() {

@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct BrowserEntry {
@@ -9,6 +9,7 @@ pub struct BrowserEntry {
 }
 
 pub struct FileBrowser {
+    #[allow(dead_code)]
     root: PathBuf,
     current_dir: PathBuf,
     entries: Vec<BrowserEntry>,
@@ -55,7 +56,8 @@ impl FileBrowser {
         if self.filter_text.is_empty() {
             self.entries.iter().collect()
         } else {
-            self.filtered_indices.iter()
+            self.filtered_indices
+                .iter()
                 .filter_map(|&i| self.entries.get(i))
                 .collect()
         }
@@ -69,13 +71,17 @@ impl FileBrowser {
 
     pub fn move_down(&mut self) {
         let len = self.visible_entries().len();
-        if len == 0 { return; }
+        if len == 0 {
+            return;
+        }
         self.selected = (self.selected + 1) % len;
     }
 
     pub fn move_up(&mut self) {
         let len = self.visible_entries().len();
-        if len == 0 { return; }
+        if len == 0 {
+            return;
+        }
         if self.selected == 0 {
             self.selected = len - 1;
         } else {
@@ -187,7 +193,8 @@ impl FileBrowser {
             return;
         }
         let query = self.filter_text.to_lowercase();
-        self.filtered_indices = self.entries
+        self.filtered_indices = self
+            .entries
             .iter()
             .enumerate()
             .filter(|(_, e)| e.name.to_lowercase().contains(&query))

@@ -386,12 +386,24 @@ impl<'t> Renderer<'t> {
                                     state.style_stack.pop();
                                 }
                                 Event::SoftBreak | Event::HardBreak => state.push_text(" "),
-                                Event::Start(Tag::Strong) => state.style_stack.push(self.theme.bold),
-                                Event::End(TagEnd::Strong) => { state.style_stack.pop(); }
-                                Event::Start(Tag::Emphasis) => state.style_stack.push(self.theme.italic),
-                                Event::End(TagEnd::Emphasis) => { state.style_stack.pop(); }
-                                Event::Start(Tag::Strikethrough) => state.style_stack.push(self.theme.strikethrough),
-                                Event::End(TagEnd::Strikethrough) => { state.style_stack.pop(); }
+                                Event::Start(Tag::Strong) => {
+                                    state.style_stack.push(self.theme.bold)
+                                }
+                                Event::End(TagEnd::Strong) => {
+                                    state.style_stack.pop();
+                                }
+                                Event::Start(Tag::Emphasis) => {
+                                    state.style_stack.push(self.theme.italic)
+                                }
+                                Event::End(TagEnd::Emphasis) => {
+                                    state.style_stack.pop();
+                                }
+                                Event::Start(Tag::Strikethrough) => {
+                                    state.style_stack.push(self.theme.strikethrough)
+                                }
+                                Event::End(TagEnd::Strikethrough) => {
+                                    state.style_stack.pop();
+                                }
                                 Event::Start(Tag::Link { dest_url, .. }) => {
                                     state.style_stack.push(self.theme.link);
                                     state.link_stack.push(Some(dest_url.to_string()));

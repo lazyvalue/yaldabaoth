@@ -1,6 +1,6 @@
 pub mod blocks;
-pub mod file_browser;
 pub mod config;
+pub mod file_browser;
 pub mod highlight;
 pub mod keybind;
 pub mod menu;
