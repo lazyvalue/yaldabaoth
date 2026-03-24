@@ -1,0 +1,105 @@
+---
+source: tests/snapshot_test.rs
+expression: blocks
+---
+[
+    CodeBlock {
+        language: Some(
+            "rust",
+        ),
+        lines: [
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "fn",
+                        style: Style::new().fg(Color::Rgb(180, 142, 173)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "main",
+                        style: Style::new().fg(Color::Rgb(143, 161, 179)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "(",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ")",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "{",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                ],
+            },
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "    ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "println!",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "(",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "\"",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "hello",
+                        style: Style::new().fg(Color::Rgb(163, 190, 140)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "\"",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ")",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ";",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                ],
+            },
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "}",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                ],
+            },
+        ],
+    },
+]

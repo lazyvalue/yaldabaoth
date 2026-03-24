@@ -1,0 +1,956 @@
+---
+source: tests/snapshot_test.rs
+expression: blocks
+---
+[
+    Heading {
+        level: 1,
+        content: StyledLine {
+            spans: [
+                StyledSpan {
+                    text: "Sketch Showcase",
+                    style: Style::new().fg(Color::Rgb(189, 147, 249)).bold(),
+                    link: None,
+                },
+            ],
+        },
+    },
+    Paragraph {
+        lines: [
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "A demonstration of ",
+                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "all",
+                        style: Style::new().fg(Color::Rgb(248, 248, 242)).bold(),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " supported ",
+                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "markdown",
+                        style: Style::new().fg(Color::Rgb(248, 248, 242)).italic(),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " features with ",
+                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "some",
+                        style: Style::new().fg(Color::Rgb(136, 136, 136)).crossed_out(),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " style.",
+                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                        link: None,
+                    },
+                ],
+            },
+        ],
+    },
+    Heading {
+        level: 2,
+        content: StyledLine {
+            spans: [
+                StyledSpan {
+                    text: "Code Blocks",
+                    style: Style::new().fg(Color::Rgb(139, 233, 253)).bold(),
+                    link: None,
+                },
+            ],
+        },
+    },
+    CodeBlock {
+        language: Some(
+            "rust",
+        ),
+        lines: [
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "fn",
+                        style: Style::new().fg(Color::Rgb(180, 142, 173)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "main",
+                        style: Style::new().fg(Color::Rgb(143, 161, 179)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "(",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ")",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "{",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                ],
+            },
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "    ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "let",
+                        style: Style::new().fg(Color::Rgb(180, 142, 173)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " greeting ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "=",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "\"",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "Hello, world!",
+                        style: Style::new().fg(Color::Rgb(163, 190, 140)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "\"",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ";",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                ],
+            },
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "    ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "println!",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "(",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "\"",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "{}",
+                        style: Style::new().fg(Color::Rgb(208, 135, 112)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "\"",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ",",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " greeting",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ")",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ";",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                ],
+            },
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "}",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                ],
+            },
+        ],
+    },
+    CodeBlock {
+        language: Some(
+            "python",
+        ),
+        lines: [
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "def",
+                        style: Style::new().fg(Color::Rgb(180, 142, 173)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "fibonacci",
+                        style: Style::new().fg(Color::Rgb(143, 161, 179)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "(",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "n",
+                        style: Style::new().fg(Color::Rgb(191, 97, 106)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ")",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ":",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                ],
+            },
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "    ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "if",
+                        style: Style::new().fg(Color::Rgb(180, 142, 173)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "n",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "<=",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "1",
+                        style: Style::new().fg(Color::Rgb(208, 135, 112)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ":",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                ],
+            },
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "        ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "return",
+                        style: Style::new().fg(Color::Rgb(180, 142, 173)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "n",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                ],
+            },
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "    ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "return",
+                        style: Style::new().fg(Color::Rgb(180, 142, 173)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "fibonacci",
+                        style: Style::new().fg(Color::Rgb(143, 161, 179)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "(",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "n",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "-",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "1",
+                        style: Style::new().fg(Color::Rgb(208, 135, 112)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ")",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "+",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "fibonacci",
+                        style: Style::new().fg(Color::Rgb(143, 161, 179)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "(",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "n",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "-",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " ",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "2",
+                        style: Style::new().fg(Color::Rgb(208, 135, 112)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: ")",
+                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                ],
+            },
+        ],
+    },
+    CodeBlock {
+        language: None,
+        lines: [
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "Plain code block without language tag",
+                        style: Style::new().bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                ],
+            },
+        ],
+    },
+    Heading {
+        level: 2,
+        content: StyledLine {
+            spans: [
+                StyledSpan {
+                    text: "Lists",
+                    style: Style::new().fg(Color::Rgb(139, 233, 253)).bold(),
+                    link: None,
+                },
+            ],
+        },
+    },
+    List {
+        ordered: false,
+        start: None,
+        items: [
+            ListItem {
+                marker: "•",
+                checked: None,
+                content: [],
+            },
+            ListItem {
+                marker: "•",
+                checked: None,
+                content: [
+                    List {
+                        ordered: false,
+                        start: None,
+                        items: [
+                            ListItem {
+                                marker: "•",
+                                checked: None,
+                                content: [],
+                            },
+                            ListItem {
+                                marker: "•",
+                                checked: None,
+                                content: [],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ],
+    },
+    List {
+        ordered: true,
+        start: Some(
+            1,
+        ),
+        items: [
+            ListItem {
+                marker: "1.",
+                checked: None,
+                content: [],
+            },
+            ListItem {
+                marker: "2.",
+                checked: None,
+                content: [],
+            },
+            ListItem {
+                marker: "3.",
+                checked: None,
+                content: [],
+            },
+        ],
+    },
+    Heading {
+        level: 3,
+        content: StyledLine {
+            spans: [
+                StyledSpan {
+                    text: "Task Lists",
+                    style: Style::new().fg(Color::Rgb(80, 250, 123)).bold(),
+                    link: None,
+                },
+            ],
+        },
+    },
+    List {
+        ordered: false,
+        start: None,
+        items: [
+            ListItem {
+                marker: "•",
+                checked: Some(
+                    true,
+                ),
+                content: [],
+            },
+            ListItem {
+                marker: "•",
+                checked: Some(
+                    false,
+                ),
+                content: [],
+            },
+            ListItem {
+                marker: "•",
+                checked: Some(
+                    true,
+                ),
+                content: [],
+            },
+        ],
+    },
+    Heading {
+        level: 2,
+        content: StyledLine {
+            spans: [
+                StyledSpan {
+                    text: "Blockquotes",
+                    style: Style::new().fg(Color::Rgb(139, 233, 253)).bold(),
+                    link: None,
+                },
+            ],
+        },
+    },
+    BlockQuote {
+        blocks: [
+            Paragraph {
+                lines: [
+                    StyledLine {
+                        spans: [
+                            StyledSpan {
+                                text: "This is a blockquote with ",
+                                style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                link: None,
+                            },
+                            StyledSpan {
+                                text: "bold",
+                                style: Style::new().fg(Color::Rgb(248, 248, 242)).bold(),
+                                link: None,
+                            },
+                            StyledSpan {
+                                text: " and ",
+                                style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                link: None,
+                            },
+                            StyledSpan {
+                                text: "italic",
+                                style: Style::new().fg(Color::Rgb(248, 248, 242)).italic(),
+                                link: None,
+                            },
+                            StyledSpan {
+                                text: " text.",
+                                style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                link: None,
+                            },
+                        ],
+                    },
+                ],
+            },
+            Paragraph {
+                lines: [
+                    StyledLine {
+                        spans: [
+                            StyledSpan {
+                                text: "It can span multiple paragraphs.",
+                                style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                link: None,
+                            },
+                        ],
+                    },
+                ],
+            },
+        ],
+    },
+    Heading {
+        level: 2,
+        content: StyledLine {
+            spans: [
+                StyledSpan {
+                    text: "Links and Inline Code",
+                    style: Style::new().fg(Color::Rgb(139, 233, 253)).bold(),
+                    link: None,
+                },
+            ],
+        },
+    },
+    Paragraph {
+        lines: [
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "Visit ",
+                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "the Rust website",
+                        style: Style::new().fg(Color::Rgb(139, 233, 253)).underlined(),
+                        link: Some(
+                            "https://www.rust-lang.org",
+                        ),
+                    },
+                    StyledSpan {
+                        text: " or use ",
+                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "cargo build",
+                        style: Style::new().fg(Color::Rgb(241, 250, 140)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " to compile.",
+                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                        link: None,
+                    },
+                ],
+            },
+        ],
+    },
+    Paragraph {
+        lines: [
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "Some ",
+                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "inline code",
+                        style: Style::new().fg(Color::Rgb(241, 250, 140)).bg(Color::Rgb(40, 42, 54)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " mixed with regular text and ",
+                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "bold ",
+                        style: Style::new().fg(Color::Rgb(248, 248, 242)).bold(),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: "code",
+                        style: Style::new().fg(Color::Rgb(241, 250, 140)).bg(Color::Rgb(40, 42, 54)).bold(),
+                        link: None,
+                    },
+                    StyledSpan {
+                        text: " too.",
+                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                        link: None,
+                    },
+                ],
+            },
+        ],
+    },
+    Heading {
+        level: 2,
+        content: StyledLine {
+            spans: [
+                StyledSpan {
+                    text: "Tables",
+                    style: Style::new().fg(Color::Rgb(139, 233, 253)).bold(),
+                    link: None,
+                },
+            ],
+        },
+    },
+    Table {
+        headers: [
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "Feature",
+                        style: Style::new().fg(Color::Rgb(189, 147, 249)).bold(),
+                        link: None,
+                    },
+                ],
+            },
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "Status",
+                        style: Style::new().fg(Color::Rgb(189, 147, 249)).bold(),
+                        link: None,
+                    },
+                ],
+            },
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "Priority",
+                        style: Style::new().fg(Color::Rgb(189, 147, 249)).bold(),
+                        link: None,
+                    },
+                ],
+            },
+        ],
+        rows: [
+            [
+                StyledLine {
+                    spans: [
+                        StyledSpan {
+                            text: "Headings",
+                            style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                            link: None,
+                        },
+                    ],
+                },
+                StyledLine {
+                    spans: [
+                        StyledSpan {
+                            text: "Done",
+                            style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                            link: None,
+                        },
+                    ],
+                },
+                StyledLine {
+                    spans: [
+                        StyledSpan {
+                            text: "High",
+                            style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                            link: None,
+                        },
+                    ],
+                },
+            ],
+            [
+                StyledLine {
+                    spans: [
+                        StyledSpan {
+                            text: "Code blocks",
+                            style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                            link: None,
+                        },
+                    ],
+                },
+                StyledLine {
+                    spans: [
+                        StyledSpan {
+                            text: "Done",
+                            style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                            link: None,
+                        },
+                    ],
+                },
+                StyledLine {
+                    spans: [
+                        StyledSpan {
+                            text: "High",
+                            style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                            link: None,
+                        },
+                    ],
+                },
+            ],
+            [
+                StyledLine {
+                    spans: [
+                        StyledSpan {
+                            text: "Tables",
+                            style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                            link: None,
+                        },
+                    ],
+                },
+                StyledLine {
+                    spans: [
+                        StyledSpan {
+                            text: "Done",
+                            style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                            link: None,
+                        },
+                    ],
+                },
+                StyledLine {
+                    spans: [
+                        StyledSpan {
+                            text: "Medium",
+                            style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                            link: None,
+                        },
+                    ],
+                },
+            ],
+        ],
+        alignments: [
+            Left,
+            Left,
+            Left,
+        ],
+    },
+    Heading {
+        level: 2,
+        content: StyledLine {
+            spans: [
+                StyledSpan {
+                    text: "Images",
+                    style: Style::new().fg(Color::Rgb(139, 233, 253)).bold(),
+                    link: None,
+                },
+            ],
+        },
+    },
+    Paragraph {
+        lines: [
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "Sketch Logo",
+                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                        link: None,
+                    },
+                ],
+            },
+        ],
+    },
+    HorizontalRule,
+    Heading {
+        level: 3,
+        content: StyledLine {
+            spans: [
+                StyledSpan {
+                    text: "Heading Level 3",
+                    style: Style::new().fg(Color::Rgb(80, 250, 123)).bold(),
+                    link: None,
+                },
+            ],
+        },
+    },
+    Heading {
+        level: 4,
+        content: StyledLine {
+            spans: [
+                StyledSpan {
+                    text: "Heading Level 4",
+                    style: Style::new().fg(Color::Rgb(241, 250, 140)).bold(),
+                    link: None,
+                },
+            ],
+        },
+    },
+    Heading {
+        level: 5,
+        content: StyledLine {
+            spans: [
+                StyledSpan {
+                    text: "Heading Level 5",
+                    style: Style::new().fg(Color::Rgb(255, 184, 108)).bold(),
+                    link: None,
+                },
+            ],
+        },
+    },
+    Heading {
+        level: 6,
+        content: StyledLine {
+            spans: [
+                StyledSpan {
+                    text: "Heading Level 6",
+                    style: Style::new().fg(Color::Rgb(180, 180, 180)).bold(),
+                    link: None,
+                },
+            ],
+        },
+    },
+    Paragraph {
+        lines: [
+            StyledLine {
+                spans: [
+                    StyledSpan {
+                        text: "That's all the features!",
+                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                        link: None,
+                    },
+                ],
+            },
+        ],
+    },
+]
