@@ -74,19 +74,62 @@ impl App {
 
         loop {
             terminal.draw(|frame| {
+                let menu_nodes: Vec<(char, String, bool)> = if self.menu_state.is_active() {
+                    self.menu_state.current_nodes(&self.menu_tree).iter().map(|n| {
+                        let is_sub = matches!(n.action, menu::MenuAction::Submenu(_));
+                        (n.key, n.label.clone(), is_sub)
+                    }).collect()
+                } else {
+                    Vec::new()
+                };
+
+                let (fb_open, fb_dir, fb_entries, fb_filter_mode, fb_filter_text, fb_panel_width, fb_hint) =
+                    if let Some(browser) = &self.file_browser {
+                        let entries: Vec<(String, bool, bool)> = browser.visible_entries().iter().enumerate().map(|(i, e)| {
+                            (e.name.clone(), e.is_dir, i == browser.selected())
+                        }).collect();
+                        let hint = if browser.filter_mode {
+                            format!("{} matches · Space open · Esc clear", entries.len())
+                        } else {
+                            "j/k nav · Space open · / filter · Esc close".to_string()
+                        };
+                        (
+                            true,
+                            browser.current_dir().display().to_string(),
+                            entries,
+                            browser.filter_mode,
+                            browser.filter_text().to_string(),
+                            browser.panel_width(frame.area().width),
+                            hint,
+                        )
+                    } else {
+                        (false, String::new(), Vec::new(), false, String::new(), 0, String::new())
+                    };
+
                 let state = ViewState {
                     filename: &self.filename,
                     blocks: &self.blocks,
                     viewport: &self.viewport,
                     theme: &self.theme,
-                    mode_label: "NORMAL",
+                    mode_label: match self.mode {
+                        AppMode::Normal => "NORMAL",
+                        AppMode::Menu => "NORMAL",
+                        AppMode::FileBrowser => "NORMAL",
+                    },
                     search_query: &self.search_query,
                     search_input_mode: self.search_input_mode,
                     search_input_buffer: &self.search_input_buffer,
                     search_match_count: self.search_matches.len(),
-                    menu_active: false,
-                    menu_nodes: Vec::new(),
-                    menu_label: None,
+                    menu_active: self.menu_state.is_active(),
+                    menu_nodes,
+                    menu_label: self.menu_state.current_label(&self.menu_tree),
+                    file_browser_open: fb_open,
+                    file_browser_dir: fb_dir,
+                    file_browser_entries: fb_entries,
+                    file_browser_filter_mode: fb_filter_mode,
+                    file_browser_filter_text: fb_filter_text,
+                    file_browser_panel_width: fb_panel_width,
+                    file_browser_hint: fb_hint,
                 };
                 view::draw(frame, &state);
             })?;
