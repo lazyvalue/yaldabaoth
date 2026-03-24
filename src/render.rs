@@ -2,6 +2,7 @@ use pulldown_cmark::{Event, Tag, TagEnd, CodeBlockKind};
 use ratatui::style::Style;
 
 use crate::blocks::*;
+use crate::highlight::Highlighter;
 use crate::parse;
 use crate::theme::Theme;
 
@@ -13,6 +14,7 @@ pub fn render(markdown: &str, theme: &Theme) -> Vec<RenderedBlock> {
 
 struct Renderer<'t> {
     theme: &'t Theme,
+    highlighter: Highlighter,
 }
 
 struct InlineState {
@@ -55,7 +57,7 @@ impl InlineState {
 
 impl<'t> Renderer<'t> {
     fn new(theme: &'t Theme) -> Self {
-        Self { theme }
+        Self { theme, highlighter: Highlighter::new() }
     }
 
     fn render(&mut self, events: &[Event<'_>]) -> Vec<RenderedBlock> {
@@ -107,22 +109,23 @@ impl<'t> Renderer<'t> {
                         CodeBlockKind::Indented => None,
                     };
                     i += 1;
-                    let mut code_lines = Vec::new();
+                    let mut code_text = String::new();
                     while i < events.len() {
                         match &events[i] {
-                            Event::Text(t) => {
-                                for line in t.as_ref().lines() {
-                                    code_lines.push(StyledLine::new(vec![
-                                        StyledSpan::new(line, self.theme.code_block_bg),
-                                    ]));
-                                }
-                                i += 1;
-                            }
+                            Event::Text(t) => { code_text.push_str(t.as_ref()); i += 1; }
                             Event::End(TagEnd::CodeBlock) => { i += 1; break; }
                             _ => { i += 1; }
                         }
                     }
-                    blocks.push(RenderedBlock::CodeBlock { language, lines: code_lines });
+
+                    let lines = if let Some(lang) = &language {
+                        self.highlighter.highlight(lang, &code_text, self.theme.code_block_bg)
+                            .unwrap_or_else(|| self.plain_code_lines(&code_text))
+                    } else {
+                        self.plain_code_lines(&code_text)
+                    };
+
+                    blocks.push(RenderedBlock::CodeBlock { language, lines });
                 }
                 Event::Start(Tag::Table(alignments)) => {
                     let aligns: Vec<ColumnAlignment> = alignments.iter().map(|a| match a {
@@ -164,6 +167,12 @@ impl<'t> Renderer<'t> {
         }
 
         blocks
+    }
+
+    fn plain_code_lines(&self, code: &str) -> Vec<StyledLine> {
+        code.lines().map(|line| {
+            StyledLine::new(vec![StyledSpan::new(line, self.theme.code_block_bg)])
+        }).collect()
     }
 
     fn collect_inline(&self, events: &[Event<'_>], mut i: usize, end: &TagEnd, state: &mut InlineState) -> usize {

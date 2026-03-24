@@ -175,3 +175,33 @@ fn test_render_table() {
         other => panic!("Expected Table, got {:?}", other),
     }
 }
+
+#[test]
+fn test_code_block_has_multiple_styled_spans() {
+    let md = "```rust\nlet x = 42;\n```";
+    let theme = Theme::dark();
+    let blocks = render(md, &theme);
+    match &blocks[0] {
+        RenderedBlock::CodeBlock { lines, .. } => {
+            let first_line = &lines[0];
+            assert!(first_line.spans.len() > 1,
+                "Expected multiple styled spans from syntax highlighting, got {}",
+                first_line.spans.len());
+        }
+        other => panic!("Expected CodeBlock, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_code_block_unknown_language_falls_back() {
+    let md = "```unknownlang\nhello world\n```";
+    let theme = Theme::dark();
+    let blocks = render(md, &theme);
+    match &blocks[0] {
+        RenderedBlock::CodeBlock { lines, .. } => {
+            assert_eq!(lines[0].spans.len(), 1);
+            assert_eq!(lines[0].text_content(), "hello world");
+        }
+        other => panic!("Expected CodeBlock, got {:?}", other),
+    }
+}
