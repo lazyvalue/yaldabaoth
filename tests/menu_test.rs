@@ -1,4 +1,3 @@
-use sketch::keybind::Action;
 use sketch::menu::{MenuState, default_menu};
 
 #[test]
@@ -23,7 +22,7 @@ fn test_menu_command_key() {
     let menu = default_menu();
     state.open();
     let result = state.process_key('f', &menu);
-    assert_eq!(result, Some(Action::OpenFileBrowser));
+    assert_eq!(result, Some("file-browser".to_string()));
     assert!(!state.is_active()); // command closes menu
 }
 
@@ -44,7 +43,7 @@ fn test_menu_submenu_then_command() {
     state.open();
     state.process_key('g', &menu); // enter goto submenu
     let result = state.process_key('g', &menu);
-    assert_eq!(result, Some(Action::JumpTop));
+    assert_eq!(result, Some("goto-top".to_string()));
     assert!(!state.is_active());
 }
 
@@ -97,4 +96,22 @@ fn test_menu_submenu_current_nodes() {
     let nodes = state.current_nodes(&menu);
     assert!(nodes.iter().any(|n| n.key == 'g')); // goto > g = top
     assert!(nodes.iter().any(|n| n.key == 'e')); // goto > e = bottom
+}
+
+#[test]
+fn test_menu_new_entries() {
+    let mut state = MenuState::new();
+    let menu = default_menu();
+    state.open();
+    // Test new menu entries: quit, save, toggle view
+    let result = state.process_key('q', &menu);
+    assert_eq!(result, Some("quit".to_string()));
+
+    state.open();
+    let result = state.process_key('s', &menu);
+    assert_eq!(result, Some("save".to_string()));
+
+    state.open();
+    let result = state.process_key('v', &menu);
+    assert_eq!(result, Some("toggle-view".to_string()));
 }

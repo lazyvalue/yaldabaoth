@@ -5,6 +5,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use ratatui::DefaultTerminal;
 
 use sketch::blocks::RenderedBlock;
+use sketch::command::CommandRegistry;
 use sketch::config::Config;
 use sketch::editor::Editor;
 use sketch::file_browser::FileBrowser;
@@ -12,7 +13,7 @@ use sketch::keybind::{Action, KeybindManager};
 use sketch::menu::{self, MenuNode, MenuState};
 use sketch::render;
 use sketch::theme::Theme;
-use sketch::view::{self, ViewBlock, ViewState};
+use sketch::view::{self, ViewMode, ViewState};
 use sketch::viewport::Viewport;
 
 #[derive(Debug, PartialEq)]
@@ -29,6 +30,7 @@ pub struct App {
     viewport: Viewport,
     theme: Theme,
     keybinds: KeybindManager,
+    registry: CommandRegistry,
     should_quit: bool,
     search_query: String,
     search_input_mode: bool,
@@ -36,13 +38,14 @@ pub struct App {
     search_matches: Vec<(usize, usize)>,
     search_match_index: usize,
     mode: AppMode,
+    view_mode: ViewMode,
     menu_state: MenuState,
     menu_tree: Vec<MenuNode>,
     file_browser: Option<FileBrowser>,
     command_buffer: String,
     command_error: String,
-    /// Cached view blocks — rebuilt only when content changes, not every frame.
-    view_block_cache: Vec<ViewBlock>,
+    /// Cached rendered blocks — rebuilt only when content changes.
+    rendered_cache: Vec<RenderedBlock>,
     /// Whether the cache needs rebuilding (set on edits, file loads, etc.)
     view_cache_dirty: bool,
 }
@@ -53,12 +56,14 @@ impl App {
         let editor = Editor::new(markdown, std::path::PathBuf::from(&filename));
         let viewport = Viewport::new(config.max_line_width);
         let keybinds = KeybindManager::default();
+        let registry = CommandRegistry::default_registry();
 
         Self {
             editor,
             viewport,
             theme,
             keybinds,
+            registry,
             should_quit: false,
             search_query: String::new(),
             search_input_mode: false,
@@ -66,12 +71,13 @@ impl App {
             search_matches: Vec::new(),
             search_match_index: 0,
             mode: AppMode::Normal,
+            view_mode: ViewMode::Rendered,
             menu_state: MenuState::new(),
             menu_tree: menu::default_menu(),
             file_browser: None,
             command_buffer: String::new(),
             command_error: String::new(),
-            view_block_cache: Vec::new(),
+            rendered_cache: Vec::new(),
             view_cache_dirty: true,
         }
     }
@@ -79,11 +85,23 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         let size = terminal.size()?;
         let content_width = self.effective_content_width(size.width as usize);
+        self.rebuild_render_cache();
         self.update_total_lines(content_width);
 
         loop {
-            // Build view blocks outside the draw closure (may mutate cache)
-            let view_blocks = self.get_view_blocks();
+            // Rebuild render cache if needed
+            if self.view_cache_dirty {
+                self.rebuild_render_cache();
+                self.view_cache_dirty = false;
+            }
+
+            // Build raw lines for raw mode (cheap — just reads from rope)
+            let raw_lines: Vec<String> = if self.view_mode == ViewMode::Raw {
+                let text = self.editor.document().full_text();
+                text.lines().map(|l| l.to_string()).collect()
+            } else {
+                Vec::new()
+            };
 
             terminal.draw(|frame| {
                 let menu_nodes: Vec<(char, String, bool)> = if self.menu_state.is_active() {
@@ -145,11 +163,16 @@ impl App {
                 let state = ViewState {
                     filename: &filename_display,
                     modified: self.editor.document().is_modified(),
-                    blocks: &view_blocks,
+                    view_mode: self.view_mode,
+                    rendered_blocks: &self.rendered_cache,
+                    raw_lines: &raw_lines,
                     viewport: &self.viewport,
                     theme: &self.theme,
                     mode_label: match self.mode {
-                        AppMode::Normal => "NORMAL",
+                        AppMode::Normal => match self.view_mode {
+                            ViewMode::Rendered => "NORMAL",
+                            ViewMode::Raw => "RAW",
+                        },
                         AppMode::Insert => "INSERT",
                         AppMode::Command => "NORMAL",
                         AppMode::Menu => "NORMAL",
@@ -207,68 +230,24 @@ impl App {
     }
 
     fn update_total_lines(&mut self, content_width: usize) {
-        let view_blocks = self.get_view_blocks();
-        self.viewport.total_lines = view_blocks
-            .iter()
-            .map(|b| view_block_height(b, &self.viewport, content_width))
-            .sum();
-    }
-
-    /// Rebuild the render cache if dirty, then return view blocks with the
-    /// active block swapped to raw text (cheap — no re-rendering).
-    fn get_view_blocks(&mut self) -> Vec<ViewBlock> {
-        if self.view_cache_dirty {
-            self.rebuild_render_cache();
-            self.view_cache_dirty = false;
-        }
-
-        let boundaries = self.editor.block_boundaries();
-        let active_idx = self.editor.active_block_index();
-
-        if boundaries.is_empty() {
-            let text = self.editor.document().full_text();
-            let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-            return vec![ViewBlock::Raw {
-                lines,
-                start_line: 0,
-            }];
-        }
-
-        // Start from the cached rendered blocks, swap the active one to raw
-        let mut view_blocks = Vec::with_capacity(boundaries.len());
-        for (i, block_info) in boundaries.iter().enumerate() {
-            if Some(i) == active_idx {
-                let block_text = self.editor.block_text(i);
-                let lines: Vec<String> = block_text.lines().map(|l| l.to_string()).collect();
-                view_blocks.push(ViewBlock::Raw {
-                    lines,
-                    start_line: block_info.start_line,
-                });
-            } else if let Some(cached) = self.view_block_cache.get(i) {
-                view_blocks.push(cached.clone());
+        match self.view_mode {
+            ViewMode::Rendered => {
+                self.viewport.total_lines = self
+                    .rendered_cache
+                    .iter()
+                    .map(|b| self.viewport.block_height(b, content_width))
+                    .sum();
+            }
+            ViewMode::Raw => {
+                self.viewport.total_lines = self.editor.document().line_count();
             }
         }
-
-        view_blocks
     }
 
     /// Rebuild the full render cache (expensive — calls pulldown-cmark + syntect).
-    /// Only called when content actually changes.
     fn rebuild_render_cache(&mut self) {
-        let boundaries = self.editor.block_boundaries();
-        self.view_block_cache.clear();
-
-        for (i, _block_info) in boundaries.iter().enumerate() {
-            let block_text = self.editor.block_text(i);
-            let rendered = render::render(&block_text, &self.theme);
-            if let Some(rb) = rendered.into_iter().next() {
-                self.view_block_cache.push(ViewBlock::Rendered(rb));
-            } else {
-                self.view_block_cache.push(ViewBlock::Rendered(
-                    RenderedBlock::Paragraph { lines: Vec::new() },
-                ));
-            }
-        }
+        let text = self.editor.document().full_text();
+        self.rendered_cache = render::render(&text, &self.theme);
     }
 
     fn handle_key(&mut self, key: KeyEvent, terminal: &DefaultTerminal) -> io::Result<()> {
@@ -357,10 +336,6 @@ impl App {
             }
             _ => {}
         }
-        // Don't mark view_cache_dirty on every insert keystroke — that causes
-        // a full re-render (pulldown-cmark + syntect) per character. The active
-        // block shows raw text from the rope directly, so edits are visible
-        // instantly without re-rendering. The cache is rebuilt on end_insert (Esc).
         self.ensure_cursor_visible(viewport_height);
     }
 
@@ -398,9 +373,9 @@ impl App {
                 }
             }
             KeyCode::Char(c) => {
-                if let Some(action) = self.menu_state.process_key(c, &self.menu_tree) {
+                if let Some(cmd_name) = self.menu_state.process_key(c, &self.menu_tree) {
                     self.mode = AppMode::Normal;
-                    self.execute_action(action, viewport_height, content_width);
+                    self.dispatch_command(&cmd_name, viewport_height, content_width);
                 }
             }
             _ => {}
@@ -471,9 +446,38 @@ impl App {
         }
     }
 
+    /// Look up a command name in the registry and dispatch its action.
+    fn dispatch_command(
+        &mut self,
+        cmd_name: &str,
+        viewport_height: usize,
+        content_width: usize,
+    ) {
+        if let Some(cmd) = self.registry.lookup(cmd_name) {
+            let action = cmd.action;
+            self.execute_action(action, viewport_height, content_width);
+        } else {
+            self.command_error = format!("Unknown command: {}", cmd_name);
+        }
+    }
+
+    /// Auto-switch to Raw mode if we're in Rendered mode and about to edit.
+    fn ensure_raw_for_editing(&mut self) {
+        if self.view_mode == ViewMode::Rendered {
+            self.view_mode = ViewMode::Raw;
+        }
+    }
+
     fn execute_action(&mut self, action: Action, viewport_height: usize, _content_width: usize) {
         match action {
-            Action::Quit => self.should_quit = true,
+            Action::Quit => {
+                if self.editor.document().is_modified() {
+                    self.command_error =
+                        "No write since last change (add ! to override)".to_string();
+                } else {
+                    self.should_quit = true;
+                }
+            }
             Action::MoveDown => {
                 self.editor.move_down(false);
                 self.ensure_cursor_visible(viewport_height);
@@ -507,31 +511,37 @@ impl App {
                 self.editor.move_cursor_line_end(false);
             }
             Action::InsertMode => {
+                self.ensure_raw_for_editing();
                 self.editor.begin_insert();
                 self.mode = AppMode::Insert;
             }
             Action::InsertAfter => {
+                self.ensure_raw_for_editing();
                 self.editor.move_right_clamped(true);
                 self.editor.begin_insert();
                 self.mode = AppMode::Insert;
             }
             Action::OpenLineBelow => {
+                self.ensure_raw_for_editing();
                 self.editor.open_line_below();
                 self.mode = AppMode::Insert;
                 self.view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
             Action::OpenLineAbove => {
+                self.ensure_raw_for_editing();
                 self.editor.open_line_above();
                 self.mode = AppMode::Insert;
                 self.view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
             Action::DeleteChar => {
+                self.ensure_raw_for_editing();
                 self.editor.delete_char_at_cursor();
                 self.view_cache_dirty = true;
             }
             Action::DeleteLine => {
+                self.ensure_raw_for_editing();
                 self.editor.delete_current_line();
                 self.view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
@@ -646,6 +656,34 @@ impl App {
             Action::OpenFileBrowser => {
                 self.open_file_browser();
             }
+            Action::Save => {
+                if let Err(e) = self.editor.save() {
+                    self.command_error = format!("Error writing file: {}", e);
+                }
+            }
+            Action::SaveAs => {
+                // SaveAs needs a filename argument; when dispatched without one, treat as save
+                if let Err(e) = self.editor.save() {
+                    self.command_error = format!("Error writing file: {}", e);
+                }
+            }
+            Action::ForceQuit => {
+                self.should_quit = true;
+            }
+            Action::SaveQuit => {
+                if let Err(e) = self.editor.save() {
+                    self.command_error = format!("Error writing file: {}", e);
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            Action::ToggleView => {
+                self.view_mode = match self.view_mode {
+                    ViewMode::Rendered => ViewMode::Raw,
+                    ViewMode::Raw => ViewMode::Rendered,
+                };
+                self.view_cache_dirty = true;
+            }
             Action::None
             | Action::FileBrowserDown
             | Action::FileBrowserUp
@@ -658,53 +696,41 @@ impl App {
 
     fn execute_command(&mut self, cmd: &str) {
         let parts: Vec<&str> = cmd.trim().splitn(2, ' ').collect();
-        match parts[0] {
-            "w" => {
-                let result = if parts.len() > 1 {
-                    let path = std::path::Path::new(parts[1]);
-                    self.editor.save_to(path)
-                } else {
-                    self.editor.save()
-                };
-                if let Err(e) = result {
-                    self.command_error = format!("Error writing file: {}", e);
-                }
+        let cmd_name = parts[0];
+
+        // Special case: `:w filename` → save-as with filename
+        if cmd_name == "w" && parts.len() > 1 {
+            let path = std::path::Path::new(parts[1]);
+            if let Err(e) = self.editor.save_to(path) {
+                self.command_error = format!("Error writing file: {}", e);
             }
-            "q" => {
-                if self.editor.document().is_modified() {
-                    self.command_error =
-                        "No write since last change (add ! to override)".to_string();
-                } else {
-                    self.should_quit = true;
-                }
-            }
-            "q!" => {
-                self.should_quit = true;
-            }
-            "wq" => {
-                if let Err(e) = self.editor.save() {
-                    self.command_error = format!("Error writing file: {}", e);
-                } else {
-                    self.should_quit = true;
-                }
-            }
-            _ => {
-                self.command_error = format!("Not an editor command: {}", cmd);
-            }
+            return;
+        }
+
+        // Look up in registry by name or alias
+        if let Some(cmd_def) = self.registry.lookup(cmd_name) {
+            let action = cmd_def.action;
+            // Use a reasonable viewport height for dispatching
+            self.execute_action(action, 40, 80);
+        } else {
+            self.command_error = format!("Not an editor command: {}", cmd);
         }
     }
 
     fn ensure_cursor_visible(&mut self, viewport_height: usize) {
         let cursor_line = self.editor.cursor().line;
-        // Convert document line to rendered line position
-        // by walking view blocks and accumulating heights
-        let rendered_y = self.doc_line_to_rendered_y(cursor_line);
+        // In raw mode, cursor line maps directly to rendered line
+        // In rendered mode, we approximate
+        let rendered_y = match self.view_mode {
+            ViewMode::Raw => cursor_line,
+            ViewMode::Rendered => self.doc_line_to_rendered_y(cursor_line),
+        };
         self.viewport
             .ensure_cursor_visible(rendered_y, viewport_height);
     }
 
     /// Convert a document line number to its approximate rendered y position
-    /// using the cached view blocks (no re-rendering).
+    /// using the cached rendered blocks.
     fn doc_line_to_rendered_y(&self, doc_line: usize) -> usize {
         let boundaries = self.editor.block_boundaries();
         let content_width = self.viewport.content_width(200); // approximate
@@ -712,15 +738,12 @@ impl App {
         let mut rendered_y = 0;
         for (i, block_info) in boundaries.iter().enumerate() {
             if doc_line >= block_info.start_line && doc_line <= block_info.end_line {
-                // Cursor is in this block — add the offset within the block
                 let line_in_block = doc_line - block_info.start_line;
                 return rendered_y + line_in_block;
             }
-            // Use cached view block height if available
-            if let Some(vb) = self.view_block_cache.get(i) {
-                rendered_y += view_block_height(vb, &self.viewport, content_width);
+            if let Some(rb) = self.rendered_cache.get(i) {
+                rendered_y += self.viewport.block_height(rb, content_width);
             } else {
-                // Fallback: estimate 1 line per document line in the block
                 rendered_y += (block_info.end_line - block_info.start_line).max(1) + 1;
             }
         }
@@ -750,6 +773,7 @@ impl App {
                     self.editor = Editor::new(content, path);
                     self.viewport.scroll_offset = 0;
                     self.viewport.cursor_line = 0;
+                    self.view_mode = ViewMode::Rendered;
                     self.view_cache_dirty = true;
                     true
                 }
@@ -791,12 +815,5 @@ impl App {
             self.editor.cursor_mut().col = 0;
             self.ensure_cursor_visible(viewport_height);
         }
-    }
-}
-
-fn view_block_height(block: &ViewBlock, viewport: &Viewport, width: usize) -> usize {
-    match block {
-        ViewBlock::Rendered(rb) => viewport.block_height(rb, width),
-        ViewBlock::Raw { lines, .. } => lines.len() + 1,
     }
 }

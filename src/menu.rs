@@ -1,5 +1,3 @@
-use crate::keybind::Action;
-
 #[derive(Debug, Clone)]
 pub struct MenuNode {
     pub key: char,
@@ -10,7 +8,7 @@ pub struct MenuNode {
 #[derive(Debug, Clone)]
 pub enum MenuAction {
     Submenu(Vec<MenuNode>),
-    Command(Action),
+    Command(String),
 }
 
 pub struct MenuState {
@@ -40,18 +38,18 @@ impl MenuState {
         self.path.clear();
     }
 
-    /// Process a key press in the menu. Returns Some(Action) if a command was selected.
+    /// Process a key press in the menu. Returns Some(command_name) if a command was selected.
     /// Returns None if a submenu was entered or key was unrecognized.
     /// Closes the menu when a command is executed.
-    pub fn process_key(&mut self, key: char, menu: &[MenuNode]) -> Option<Action> {
+    pub fn process_key(&mut self, key: char, menu: &[MenuNode]) -> Option<String> {
         let nodes = self.current_nodes(menu);
         for node in nodes.iter() {
             if node.key == key {
                 match &node.action {
-                    MenuAction::Command(action) => {
-                        let action = *action;
+                    MenuAction::Command(cmd_name) => {
+                        let cmd_name = cmd_name.clone();
                         self.close();
-                        return Some(action);
+                        return Some(cmd_name);
                     }
                     MenuAction::Submenu(_) => {
                         // Find the index in the actual menu tree (not the slice)
@@ -112,9 +110,6 @@ impl MenuState {
     }
 
     fn resolve_node_index(&self, menu: &[MenuNode], key: char) -> Option<usize> {
-        // We need the index in the current level's node list
-        // But current_nodes returns a slice — we need to find the index
-        // Walk the tree to the current level and find the matching key
         let mut target = menu;
         for &idx in &self.path {
             if let Some(node) = target.get(idx)
@@ -139,12 +134,27 @@ pub fn default_menu() -> Vec<MenuNode> {
         MenuNode {
             key: 'f',
             label: "file browser".into(),
-            action: MenuAction::Command(Action::OpenFileBrowser),
+            action: MenuAction::Command("file-browser".into()),
         },
         MenuNode {
             key: '/',
             label: "search".into(),
-            action: MenuAction::Command(Action::SearchForward),
+            action: MenuAction::Command("search".into()),
+        },
+        MenuNode {
+            key: 'q',
+            label: "quit".into(),
+            action: MenuAction::Command("quit".into()),
+        },
+        MenuNode {
+            key: 's',
+            label: "save".into(),
+            action: MenuAction::Command("save".into()),
+        },
+        MenuNode {
+            key: 'v',
+            label: "toggle view".into(),
+            action: MenuAction::Command("toggle-view".into()),
         },
         MenuNode {
             key: 'g',
@@ -153,17 +163,17 @@ pub fn default_menu() -> Vec<MenuNode> {
                 MenuNode {
                     key: 'g',
                     label: "top".into(),
-                    action: MenuAction::Command(Action::JumpTop),
+                    action: MenuAction::Command("goto-top".into()),
                 },
                 MenuNode {
                     key: 'e',
                     label: "bottom".into(),
-                    action: MenuAction::Command(Action::JumpBottom),
+                    action: MenuAction::Command("goto-bottom".into()),
                 },
                 MenuNode {
                     key: 'h',
                     label: "next heading".into(),
-                    action: MenuAction::Command(Action::NextHeading),
+                    action: MenuAction::Command("goto-heading".into()),
                 },
             ]),
         },
