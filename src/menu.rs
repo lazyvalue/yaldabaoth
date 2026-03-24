@@ -147,11 +147,6 @@ pub fn default_menu() -> Vec<MenuNode> {
             action: MenuAction::Command(Action::SearchForward),
         },
         MenuNode {
-            key: 'q',
-            label: "quit".into(),
-            action: MenuAction::Command(Action::Quit),
-        },
-        MenuNode {
             key: 'g',
             label: "goto".into(),
             action: MenuAction::Submenu(vec![

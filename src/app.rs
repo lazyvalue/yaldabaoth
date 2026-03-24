@@ -383,7 +383,25 @@ impl App {
             Action::OpenFileBrowser => {
                 self.open_file_browser();
             }
-            Action::None
+            Action::MoveLeft
+            | Action::MoveRight
+            | Action::MoveUp
+            | Action::MoveDown
+            | Action::MoveWordForward
+            | Action::MoveWordBackward
+            | Action::MoveWordEnd
+            | Action::MoveLineStart
+            | Action::MoveLineEnd
+            | Action::InsertMode
+            | Action::InsertAfter
+            | Action::OpenLineBelow
+            | Action::OpenLineAbove
+            | Action::DeleteChar
+            | Action::DeleteLine
+            | Action::Undo
+            | Action::Redo
+            | Action::EnterCommand
+            | Action::None
             | Action::FileBrowserDown
             | Action::FileBrowserUp
             | Action::FileBrowserEnter

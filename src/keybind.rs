@@ -26,6 +26,24 @@ pub enum Action {
     OpenLink,
     YankLine,
     OpenMenu,
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown,
+    MoveWordForward,
+    MoveWordBackward,
+    MoveWordEnd,
+    MoveLineStart,
+    MoveLineEnd,
+    InsertMode,
+    InsertAfter,
+    OpenLineBelow,
+    OpenLineAbove,
+    DeleteChar,
+    DeleteLine,
+    Undo,
+    Redo,
+    EnterCommand,
     OpenFileBrowser,
     FileBrowserDown,
     FileBrowserUp,
@@ -118,8 +136,23 @@ impl Default for KeybindManager {
         let mut single = HashMap::new();
         let mut multi = HashMap::new();
 
-        single.insert(key('j'), Action::ScrollDown);
-        single.insert(key('k'), Action::ScrollUp);
+        single.insert(key('h'), Action::MoveLeft);
+        single.insert(key('j'), Action::MoveDown);
+        single.insert(key('k'), Action::MoveUp);
+        single.insert(key('l'), Action::MoveRight);
+        single.insert(key('w'), Action::MoveWordForward);
+        single.insert(key('b'), Action::MoveWordBackward);
+        single.insert(key('e'), Action::MoveWordEnd);
+        single.insert(key('0'), Action::MoveLineStart);
+        single.insert(key('$'), Action::MoveLineEnd);
+        single.insert(key('i'), Action::InsertMode);
+        single.insert(key('a'), Action::InsertAfter);
+        single.insert(key('o'), Action::OpenLineBelow);
+        single.insert(key('O'), Action::OpenLineAbove);
+        single.insert(key('x'), Action::DeleteChar);
+        single.insert(key('u'), Action::Undo);
+        single.insert(key(':'), Action::EnterCommand);
+        single.insert(ctrl('r'), Action::Redo);
         single.insert(ctrl('d'), Action::HalfPageDown);
         single.insert(ctrl('u'), Action::HalfPageUp);
         single.insert(ctrl('f'), Action::FullPageDown);
@@ -131,12 +164,12 @@ impl Default for KeybindManager {
         single.insert(key('?'), Action::SearchBackward);
         single.insert(key('n'), Action::SearchNext);
         single.insert(key('N'), Action::SearchPrev);
-        single.insert(key('q'), Action::Quit);
-        single.insert(key('o'), Action::OpenLink);
         single.insert(key('y'), Action::YankLine);
         single.insert(key(' '), Action::OpenMenu);
 
         multi.insert(vec![key('g'), key('g')], Action::JumpTop);
+        multi.insert(vec![key('g'), key('x')], Action::OpenLink);
+        multi.insert(vec![key('d'), key('d')], Action::DeleteLine);
         multi.insert(vec![key(']'), key(']')], Action::NextHeadingSameLevel);
         multi.insert(vec![key('['), key('[')], Action::PrevHeadingSameLevel);
 
