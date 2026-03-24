@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use ratatui::DefaultTerminal;
 
 use sketch::blocks::RenderedBlock;
@@ -19,6 +19,11 @@ pub struct App {
     theme: Theme,
     keybinds: KeybindManager,
     should_quit: bool,
+    search_query: String,
+    search_input_mode: bool,
+    search_input_buffer: String,
+    search_matches: Vec<(usize, usize)>, // (block_index, span_index)
+    search_match_index: usize,
 }
 
 impl App {
@@ -35,6 +40,11 @@ impl App {
             theme,
             keybinds,
             should_quit: false,
+            search_query: String::new(),
+            search_input_mode: false,
+            search_input_buffer: String::new(),
+            search_matches: Vec::new(),
+            search_match_index: 0,
         }
     }
 
@@ -52,6 +62,10 @@ impl App {
                     viewport: &self.viewport,
                     theme: &self.theme,
                     mode_label: "NORMAL",
+                    search_query: &self.search_query,
+                    search_input_mode: self.search_input_mode,
+                    search_input_buffer: &self.search_input_buffer,
+                    search_match_count: self.search_matches.len(),
                 };
                 view::draw(frame, &state);
             })?;
@@ -90,6 +104,25 @@ impl App {
         let viewport_height = (size.height as usize).saturating_sub(2);
         let content_width = self.viewport.content_width(size.width as usize);
 
+        if self.search_input_mode {
+            match key.code {
+                KeyCode::Enter => {
+                    self.search_query = self.search_input_buffer.clone();
+                    self.search_input_mode = false;
+                    self.perform_search();
+                    self.jump_to_match(content_width, viewport_height);
+                }
+                KeyCode::Esc => {
+                    self.search_input_mode = false;
+                    self.search_input_buffer.clear();
+                }
+                KeyCode::Backspace => { self.search_input_buffer.pop(); }
+                KeyCode::Char(c) => { self.search_input_buffer.push(c); }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         if let Some(action) = self.keybinds.process_key(key) {
             match action {
                 Action::Quit => self.should_quit = true,
@@ -113,9 +146,25 @@ impl App {
                 Action::PrevHeadingSameLevel => {
                     self.jump_to_heading_same_level(content_width, viewport_height, false);
                 }
-                Action::SearchForward | Action::SearchBackward
-                | Action::SearchNext | Action::SearchPrev => {
-                    // Search — implement in a later task
+                Action::SearchForward | Action::SearchBackward => {
+                    self.search_input_mode = true;
+                    self.search_input_buffer.clear();
+                }
+                Action::SearchNext => {
+                    if !self.search_matches.is_empty() {
+                        self.search_match_index = (self.search_match_index + 1) % self.search_matches.len();
+                        self.jump_to_match(content_width, viewport_height);
+                    }
+                }
+                Action::SearchPrev => {
+                    if !self.search_matches.is_empty() {
+                        self.search_match_index = if self.search_match_index == 0 {
+                            self.search_matches.len() - 1
+                        } else {
+                            self.search_match_index - 1
+                        };
+                        self.jump_to_match(content_width, viewport_height);
+                    }
                 }
                 Action::OpenLink | Action::YankLine => {
                     // Implement in a later task
@@ -154,6 +203,58 @@ impl App {
         // Find the last heading position before current scroll
         if let Some(&pos) = positions.iter().rev().find(|&&p| p < self.viewport.scroll_offset) {
             self.viewport.scroll_offset = pos.saturating_sub(viewport_height / 3);
+        }
+    }
+
+    fn perform_search(&mut self) {
+        self.search_matches.clear();
+        let query = self.search_query.to_lowercase();
+        if query.is_empty() { return; }
+
+        let mut matches = Vec::new();
+        for (bi, block) in self.blocks.iter().enumerate() {
+            Self::search_block_collect(&query, block, bi, &mut matches);
+        }
+        self.search_matches = matches;
+        self.search_match_index = 0;
+    }
+
+    fn search_block_collect(query: &str, block: &RenderedBlock, block_index: usize, matches: &mut Vec<(usize, usize)>) {
+        match block {
+            RenderedBlock::Heading { content, .. } => {
+                if content.text_content().to_lowercase().contains(query) {
+                    matches.push((block_index, 0));
+                }
+            }
+            RenderedBlock::Paragraph { lines } | RenderedBlock::CodeBlock { lines, .. } => {
+                for (li, line) in lines.iter().enumerate() {
+                    if line.text_content().to_lowercase().contains(query) {
+                        matches.push((block_index, li));
+                    }
+                }
+            }
+            RenderedBlock::BlockQuote { blocks } => {
+                for b in blocks { Self::search_block_collect(query, b, block_index, matches); }
+            }
+            RenderedBlock::List { items, .. } => {
+                for item in items {
+                    for b in &item.content { Self::search_block_collect(query, b, block_index, matches); }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn jump_to_match(&mut self, width: usize, viewport_height: usize) {
+        if let Some(&(block_idx, _)) = self.search_matches.get(self.search_match_index) {
+            let mut y: usize = 0;
+            for (i, block) in self.blocks.iter().enumerate() {
+                if i == block_idx {
+                    self.viewport.scroll_offset = y.saturating_sub(viewport_height / 3);
+                    return;
+                }
+                y += self.viewport.block_height(block, width);
+            }
         }
     }
 

@@ -14,6 +14,10 @@ pub struct ViewState<'a> {
     pub viewport: &'a Viewport,
     pub theme: &'a Theme,
     pub mode_label: &'a str,
+    pub search_query: &'a str,
+    pub search_input_mode: bool,
+    pub search_input_buffer: &'a str,
+    pub search_match_count: usize,
 }
 
 pub fn draw(frame: &mut Frame, state: &ViewState) {
@@ -63,13 +67,33 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
 }
 
 fn draw_bottom_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
+    if state.search_input_mode {
+        let prompt = format!("/{}", state.search_input_buffer);
+        let available = area.width as usize;
+        let padding = available.saturating_sub(prompt.len() + 1);
+        let line = Line::from(vec![
+            Span::styled(format!(" {}", prompt), state.theme.bottom_bar),
+            Span::styled(" ".repeat(padding), state.theme.bottom_bar),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     let hints = "j/k scroll · {/} heading · / search · q quit";
     let available = area.width as usize;
     let mode_len = state.mode_label.len();
-    let padding = available.saturating_sub(mode_len + hints.len() + 3);
+
+    let match_info = if state.search_match_count > 0 && !state.search_query.is_empty() {
+        format!(" [{}] ", state.search_match_count)
+    } else {
+        String::new()
+    };
+
+    let padding = available.saturating_sub(mode_len + match_info.len() + hints.len() + 3);
 
     let line = Line::from(vec![
         Span::styled(format!(" {}", state.mode_label), state.theme.mode_indicator),
+        Span::styled(match_info, state.theme.mode_indicator),
         Span::styled(" ".repeat(padding), state.theme.bottom_bar),
         Span::styled(format!("{} ", hints), state.theme.bottom_bar),
     ]);
