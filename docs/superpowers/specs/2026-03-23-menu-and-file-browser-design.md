@@ -41,7 +41,12 @@ Space (leader)
 ```rust
 struct MenuState {
     active: bool,
-    path: Vec<usize>,  // indices into tree for current submenu depth
+    path: Vec<usize>,  // breadcrumb trail of indices — each entry is the index of the
+                        // MenuNode we descended into at that level of the tree.
+                        // To resolve the current submenu: walk the root menu tree
+                        // following path[0], then path[1], etc.
+                        // Escape pops the last entry (go up one level).
+                        // Empty path = root menu.
 }
 ```
 
@@ -67,9 +72,9 @@ When entering a submenu, the popup header updates to show the path (e.g., "goto"
 
 ```rust
 struct FileBrowser {
-    root: PathBuf,
-    current_dir: PathBuf,
-    entries: Vec<DirEntry>,
+    root: PathBuf,              // starting directory — the dir of the currently viewed file, or cwd
+    current_dir: PathBuf,       // directory being displayed — initialized to root
+    entries: Vec<BrowserEntry>,
     selected: usize,
     filter_mode: bool,
     filter_text: String,
@@ -77,7 +82,7 @@ struct FileBrowser {
     width_percent: u16,            // panel width as % of terminal, default 30
 }
 
-struct DirEntry {
+struct BrowserEntry {
     name: String,
     is_dir: bool,
     path: PathBuf,
@@ -86,7 +91,7 @@ struct DirEntry {
 
 ### Layout
 
-- Left side panel, ~30% of terminal width
+- Left side panel, ~30% of terminal width (clamped to min 20, max 60 columns)
 - Border separator between panel and content
 - Panel header shows current directory path
 - File list with `▸` selection marker
@@ -98,12 +103,12 @@ struct DirEntry {
 
 - `j`/`k` — move selection up/down, wrapping at edges
 - `Space` — open file (loads in viewer, closes browser) or descend into directory
-- `Backspace` — go to parent directory
+- `Backspace` — go to parent directory (no-op at filesystem root)
 - `/` — enter filter mode
 - `Escape` — when filtering: clear filter; when not filtering: close panel
 - `q` — close panel
 
-All file browser keys are configurable.
+All file browser keys are designed to be configurable. KDL config parsing for file browser keys is deferred — MVP uses hardcoded defaults.
 
 ### Fuzzy Filter
 
@@ -129,6 +134,8 @@ When a file is selected:
 - Permission denied on a directory: show inline error message, stay in current directory
 - Empty directory: show "empty" placeholder text
 - File read errors: show error in content area, browser stays open for another selection
+- Hidden files (dotfiles): hidden by default
+- Symlinks: followed; broken symlinks are silently excluded from the listing
 
 ## Architecture Changes
 
@@ -140,8 +147,23 @@ When a file is selected:
 ### Modified Modules
 
 - `src/app.rs` — New app modes: `Normal`, `Menu`, `FileBrowser`. Event loop routes key events based on current mode. Menu mode handles popup. FileBrowser mode handles side panel. File loading extracted into a reusable method.
-- `src/view.rs` — `draw()` gains menu popup rendering (top-anchored overlay) and file browser panel rendering (left split layout). Menu popup is rendered after content so it overlays.
+- `src/view.rs` — `draw()` gains menu popup rendering (top-anchored overlay with opaque background) and file browser panel rendering (left split layout). Menu popup is rendered after content so it overlays. When the file browser panel is open, the content area shrinks to the remaining width; `max_line_width` and content centering apply within the reduced area; `total_lines` is recalculated for the new width on panel open/close.
 - `src/keybind.rs` — New actions: `OpenMenu`, `OpenFileBrowser`, `FileBrowserDown`, `FileBrowserUp`, `FileBrowserEnter`, `FileBrowserParentDir`, `FileBrowserFilter`, `FileBrowserClose`.
+
+### New Action Variants (Complete List)
+
+All new variants added to the existing `Action` enum in `keybind.rs`:
+
+- `OpenMenu` — enters menu mode (bound to Space in normal mode)
+- `OpenFileBrowser` — opens the file browser side panel
+- `FileBrowserDown` — move selection down in file list
+- `FileBrowserUp` — move selection up in file list
+- `FileBrowserEnter` — open selected file or descend into directory
+- `FileBrowserParentDir` — navigate to parent directory
+- `FileBrowserFilter` — enter filter mode
+- `FileBrowserClose` — close the file browser panel
+
+Note: In file browser mode, Space maps to `FileBrowserEnter`, NOT `OpenMenu`. Each mode has independent key bindings.
 
 ### Mode Flow
 
