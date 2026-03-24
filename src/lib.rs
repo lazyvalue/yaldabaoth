@@ -1,5 +1,6 @@
 pub mod blocks;
 pub mod config;
+pub mod document;
 pub mod file_browser;
 pub mod highlight;
 pub mod keybind;
