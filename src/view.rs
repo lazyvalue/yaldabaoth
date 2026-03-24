@@ -10,6 +10,7 @@ use crate::viewport::Viewport;
 
 /// A block ready for view rendering — either a pre-rendered RenderedBlock
 /// or raw markdown lines for the active (editing) block.
+#[derive(Clone)]
 pub enum ViewBlock {
     Rendered(RenderedBlock),
     Raw {

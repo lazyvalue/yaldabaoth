@@ -4,6 +4,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use ratatui::DefaultTerminal;
 
+use sketch::blocks::RenderedBlock;
 use sketch::config::Config;
 use sketch::editor::Editor;
 use sketch::file_browser::FileBrowser;
@@ -40,6 +41,10 @@ pub struct App {
     file_browser: Option<FileBrowser>,
     command_buffer: String,
     command_error: String,
+    /// Cached view blocks — rebuilt only when content changes, not every frame.
+    view_block_cache: Vec<ViewBlock>,
+    /// Whether the cache needs rebuilding (set on edits, file loads, etc.)
+    view_cache_dirty: bool,
 }
 
 impl App {
@@ -66,6 +71,8 @@ impl App {
             file_browser: None,
             command_buffer: String::new(),
             command_error: String::new(),
+            view_block_cache: Vec::new(),
+            view_cache_dirty: true,
         }
     }
 
@@ -75,6 +82,9 @@ impl App {
         self.update_total_lines(content_width);
 
         loop {
+            // Build view blocks outside the draw closure (may mutate cache)
+            let view_blocks = self.get_view_blocks();
+
             terminal.draw(|frame| {
                 let menu_nodes: Vec<(char, String, bool)> = if self.menu_state.is_active() {
                     self.menu_state
@@ -130,7 +140,6 @@ impl App {
                     )
                 };
 
-                let view_blocks = self.build_view_blocks();
                 let filename_display = self.editor.document().file_path.display().to_string();
 
                 let state = ViewState {
@@ -198,14 +207,21 @@ impl App {
     }
 
     fn update_total_lines(&mut self, content_width: usize) {
-        let view_blocks = self.build_view_blocks();
+        let view_blocks = self.get_view_blocks();
         self.viewport.total_lines = view_blocks
             .iter()
             .map(|b| view_block_height(b, &self.viewport, content_width))
             .sum();
     }
 
-    fn build_view_blocks(&self) -> Vec<ViewBlock> {
+    /// Rebuild the render cache if dirty, then return view blocks with the
+    /// active block swapped to raw text (cheap — no re-rendering).
+    fn get_view_blocks(&mut self) -> Vec<ViewBlock> {
+        if self.view_cache_dirty {
+            self.rebuild_render_cache();
+            self.view_cache_dirty = false;
+        }
+
         let boundaries = self.editor.block_boundaries();
         let active_idx = self.editor.active_block_index();
 
@@ -218,7 +234,8 @@ impl App {
             }];
         }
 
-        let mut view_blocks = Vec::new();
+        // Start from the cached rendered blocks, swap the active one to raw
+        let mut view_blocks = Vec::with_capacity(boundaries.len());
         for (i, block_info) in boundaries.iter().enumerate() {
             if Some(i) == active_idx {
                 let block_text = self.editor.block_text(i);
@@ -227,16 +244,31 @@ impl App {
                     lines,
                     start_line: block_info.start_line,
                 });
-            } else {
-                let block_text = self.editor.block_text(i);
-                let rendered = render::render(&block_text, &self.theme);
-                if let Some(rb) = rendered.into_iter().next() {
-                    view_blocks.push(ViewBlock::Rendered(rb));
-                }
+            } else if let Some(cached) = self.view_block_cache.get(i) {
+                view_blocks.push(cached.clone());
             }
         }
 
         view_blocks
+    }
+
+    /// Rebuild the full render cache (expensive — calls pulldown-cmark + syntect).
+    /// Only called when content actually changes.
+    fn rebuild_render_cache(&mut self) {
+        let boundaries = self.editor.block_boundaries();
+        self.view_block_cache.clear();
+
+        for (i, _block_info) in boundaries.iter().enumerate() {
+            let block_text = self.editor.block_text(i);
+            let rendered = render::render(&block_text, &self.theme);
+            if let Some(rb) = rendered.into_iter().next() {
+                self.view_block_cache.push(ViewBlock::Rendered(rb));
+            } else {
+                self.view_block_cache.push(ViewBlock::Rendered(
+                    RenderedBlock::Paragraph { lines: Vec::new() },
+                ));
+            }
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent, terminal: &DefaultTerminal) -> io::Result<()> {
@@ -324,6 +356,8 @@ impl App {
             }
             _ => {}
         }
+        // Any insert mode keystroke may change content — mark cache dirty
+        self.view_cache_dirty = true;
         self.ensure_cursor_visible(viewport_height);
     }
 
@@ -481,26 +515,32 @@ impl App {
             Action::OpenLineBelow => {
                 self.editor.open_line_below();
                 self.mode = AppMode::Insert;
+                self.view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
             Action::OpenLineAbove => {
                 self.editor.open_line_above();
                 self.mode = AppMode::Insert;
+                self.view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
             Action::DeleteChar => {
                 self.editor.delete_char_at_cursor();
+                self.view_cache_dirty = true;
             }
             Action::DeleteLine => {
                 self.editor.delete_current_line();
+                self.view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
             Action::Undo => {
                 self.editor.undo();
+                self.view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
             Action::Redo => {
                 self.editor.redo();
+                self.view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
             Action::EnterCommand => {
@@ -680,6 +720,7 @@ impl App {
                     self.editor = Editor::new(content, path);
                     self.viewport.scroll_offset = 0;
                     self.viewport.cursor_line = 0;
+                    self.view_cache_dirty = true;
                     true
                 }
                 Err(_) => false,
