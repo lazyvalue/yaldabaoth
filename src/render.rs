@@ -1,4 +1,4 @@
-use pulldown_cmark::{Event, Tag, TagEnd, CodeBlockKind};
+use pulldown_cmark::{CodeBlockKind, Event, Tag, TagEnd};
 use ratatui::style::Style;
 
 use crate::blocks::*;
@@ -47,7 +47,11 @@ impl InlineState {
     fn push_text(&mut self, text: &str) {
         let style = self.current_style();
         let link = self.current_link();
-        self.spans.push(StyledSpan { text: text.to_string(), style, link });
+        self.spans.push(StyledSpan {
+            text: text.to_string(),
+            style,
+            link,
+        });
     }
 
     fn into_line(self) -> StyledLine {
@@ -57,7 +61,10 @@ impl InlineState {
 
 impl<'t> Renderer<'t> {
     fn new(theme: &'t Theme) -> Self {
-        Self { theme, highlighter: Highlighter::new() }
+        Self {
+            theme,
+            highlighter: Highlighter::new(),
+        }
     }
 
     fn render(&mut self, events: &[Event<'_>]) -> Vec<RenderedBlock> {
@@ -88,7 +95,8 @@ impl<'t> Renderer<'t> {
                 Event::Start(Tag::BlockQuote(kind)) => {
                     let kind = *kind;
                     i += 1;
-                    let (sub_blocks, new_i) = self.collect_block(events, i, &TagEnd::BlockQuote(kind));
+                    let (sub_blocks, new_i) =
+                        self.collect_block(events, i, &TagEnd::BlockQuote(kind));
                     i = new_i;
                     blocks.push(RenderedBlock::BlockQuote { blocks: sub_blocks });
                 }
@@ -98,7 +106,11 @@ impl<'t> Renderer<'t> {
                     i += 1;
                     let (items, new_i) = self.collect_list_items(events, i, ordered, start_num);
                     i = new_i;
-                    blocks.push(RenderedBlock::List { ordered, start: start_num, items });
+                    blocks.push(RenderedBlock::List {
+                        ordered,
+                        start: start_num,
+                        items,
+                    });
                 }
                 Event::Start(Tag::CodeBlock(kind)) => {
                     let language = match kind {
@@ -112,14 +124,23 @@ impl<'t> Renderer<'t> {
                     let mut code_text = String::new();
                     while i < events.len() {
                         match &events[i] {
-                            Event::Text(t) => { code_text.push_str(t.as_ref()); i += 1; }
-                            Event::End(TagEnd::CodeBlock) => { i += 1; break; }
-                            _ => { i += 1; }
+                            Event::Text(t) => {
+                                code_text.push_str(t.as_ref());
+                                i += 1;
+                            }
+                            Event::End(TagEnd::CodeBlock) => {
+                                i += 1;
+                                break;
+                            }
+                            _ => {
+                                i += 1;
+                            }
                         }
                     }
 
                     let lines = if let Some(lang) = &language {
-                        self.highlighter.highlight(lang, &code_text, self.theme.code_block_bg)
+                        self.highlighter
+                            .highlight(lang, &code_text, self.theme.code_block_bg)
                             .unwrap_or_else(|| self.plain_code_lines(&code_text))
                     } else {
                         self.plain_code_lines(&code_text)
@@ -128,30 +149,49 @@ impl<'t> Renderer<'t> {
                     blocks.push(RenderedBlock::CodeBlock { language, lines });
                 }
                 Event::Start(Tag::Table(alignments)) => {
-                    let aligns: Vec<ColumnAlignment> = alignments.iter().map(|a| match a {
-                        pulldown_cmark::Alignment::None | pulldown_cmark::Alignment::Left => ColumnAlignment::Left,
-                        pulldown_cmark::Alignment::Center => ColumnAlignment::Center,
-                        pulldown_cmark::Alignment::Right => ColumnAlignment::Right,
-                    }).collect();
+                    let aligns: Vec<ColumnAlignment> = alignments
+                        .iter()
+                        .map(|a| match a {
+                            pulldown_cmark::Alignment::None | pulldown_cmark::Alignment::Left => {
+                                ColumnAlignment::Left
+                            }
+                            pulldown_cmark::Alignment::Center => ColumnAlignment::Center,
+                            pulldown_cmark::Alignment::Right => ColumnAlignment::Right,
+                        })
+                        .collect();
                     i += 1;
                     let (headers, rows, new_i) = self.collect_table(events, i);
                     i = new_i;
-                    blocks.push(RenderedBlock::Table { headers, rows, alignments: aligns });
+                    blocks.push(RenderedBlock::Table {
+                        headers,
+                        rows,
+                        alignments: aligns,
+                    });
                 }
                 Event::Rule => {
                     blocks.push(RenderedBlock::HorizontalRule);
                     i += 1;
                 }
-                Event::Start(Tag::Image { dest_url, title, .. }) => {
+                Event::Start(Tag::Image {
+                    dest_url, title, ..
+                }) => {
                     let url = dest_url.to_string();
                     let title_str = title.to_string();
                     i += 1;
                     let mut alt = String::new();
                     while i < events.len() {
                         match &events[i] {
-                            Event::Text(t) => { alt.push_str(t.as_ref()); i += 1; }
-                            Event::End(TagEnd::Image) => { i += 1; break; }
-                            _ => { i += 1; }
+                            Event::Text(t) => {
+                                alt.push_str(t.as_ref());
+                                i += 1;
+                            }
+                            Event::End(TagEnd::Image) => {
+                                i += 1;
+                                break;
+                            }
+                            _ => {
+                                i += 1;
+                            }
                         }
                     }
                     if alt.is_empty() && !title_str.is_empty() {
@@ -162,7 +202,9 @@ impl<'t> Renderer<'t> {
                     }
                     blocks.push(RenderedBlock::Image { alt, url });
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
 
@@ -170,29 +212,62 @@ impl<'t> Renderer<'t> {
     }
 
     fn plain_code_lines(&self, code: &str) -> Vec<StyledLine> {
-        code.lines().map(|line| {
-            StyledLine::new(vec![StyledSpan::new(line, self.theme.code_block_bg)])
-        }).collect()
+        code.lines()
+            .map(|line| StyledLine::new(vec![StyledSpan::new(line, self.theme.code_block_bg)]))
+            .collect()
     }
 
-    fn collect_inline(&self, events: &[Event<'_>], mut i: usize, end: &TagEnd, state: &mut InlineState) -> usize {
+    fn collect_inline(
+        &self,
+        events: &[Event<'_>],
+        mut i: usize,
+        end: &TagEnd,
+        state: &mut InlineState,
+    ) -> usize {
         while i < events.len() {
             match &events[i] {
-                Event::End(e) if e == end => { i += 1; break; }
-                Event::Text(t) => { state.push_text(t.as_ref()); i += 1; }
+                Event::End(e) if e == end => {
+                    i += 1;
+                    break;
+                }
+                Event::Text(t) => {
+                    state.push_text(t.as_ref());
+                    i += 1;
+                }
                 Event::Code(t) => {
                     state.style_stack.push(self.theme.code_inline);
                     state.push_text(t.as_ref());
                     state.style_stack.pop();
                     i += 1;
                 }
-                Event::SoftBreak | Event::HardBreak => { state.push_text(" "); i += 1; }
-                Event::Start(Tag::Strong) => { state.style_stack.push(self.theme.bold); i += 1; }
-                Event::End(TagEnd::Strong) => { state.style_stack.pop(); i += 1; }
-                Event::Start(Tag::Emphasis) => { state.style_stack.push(self.theme.italic); i += 1; }
-                Event::End(TagEnd::Emphasis) => { state.style_stack.pop(); i += 1; }
-                Event::Start(Tag::Strikethrough) => { state.style_stack.push(self.theme.strikethrough); i += 1; }
-                Event::End(TagEnd::Strikethrough) => { state.style_stack.pop(); i += 1; }
+                Event::SoftBreak | Event::HardBreak => {
+                    state.push_text(" ");
+                    i += 1;
+                }
+                Event::Start(Tag::Strong) => {
+                    state.style_stack.push(self.theme.bold);
+                    i += 1;
+                }
+                Event::End(TagEnd::Strong) => {
+                    state.style_stack.pop();
+                    i += 1;
+                }
+                Event::Start(Tag::Emphasis) => {
+                    state.style_stack.push(self.theme.italic);
+                    i += 1;
+                }
+                Event::End(TagEnd::Emphasis) => {
+                    state.style_stack.pop();
+                    i += 1;
+                }
+                Event::Start(Tag::Strikethrough) => {
+                    state.style_stack.push(self.theme.strikethrough);
+                    i += 1;
+                }
+                Event::End(TagEnd::Strikethrough) => {
+                    state.style_stack.pop();
+                    i += 1;
+                }
                 Event::Start(Tag::Link { dest_url, .. }) => {
                     state.style_stack.push(self.theme.link);
                     state.link_stack.push(Some(dest_url.to_string()));
@@ -203,67 +278,170 @@ impl<'t> Renderer<'t> {
                     state.link_stack.pop();
                     i += 1;
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
         i
     }
 
-    fn collect_block(&mut self, events: &[Event<'_>], mut i: usize, end: &TagEnd) -> (Vec<RenderedBlock>, usize) {
+    fn collect_block(
+        &mut self,
+        events: &[Event<'_>],
+        mut i: usize,
+        end: &TagEnd,
+    ) -> (Vec<RenderedBlock>, usize) {
         let mut inner_events = Vec::new();
         let mut depth = 0;
         while i < events.len() {
             match &events[i] {
-                Event::End(e) if e == end && depth == 0 => { i += 1; break; }
-                Event::Start(_) => { depth += 1; inner_events.push(events[i].clone()); i += 1; }
-                Event::End(_) => { depth -= 1; inner_events.push(events[i].clone()); i += 1; }
-                _ => { inner_events.push(events[i].clone()); i += 1; }
+                Event::End(e) if e == end && depth == 0 => {
+                    i += 1;
+                    break;
+                }
+                Event::Start(_) => {
+                    depth += 1;
+                    inner_events.push(events[i].clone());
+                    i += 1;
+                }
+                Event::End(_) => {
+                    depth -= 1;
+                    inner_events.push(events[i].clone());
+                    i += 1;
+                }
+                _ => {
+                    inner_events.push(events[i].clone());
+                    i += 1;
+                }
             }
         }
         let blocks = self.render(&inner_events);
         (blocks, i)
     }
 
-    fn collect_list_items(&mut self, events: &[Event<'_>], mut i: usize, ordered: bool, start: Option<u64>) -> (Vec<ListItem>, usize) {
+    fn collect_list_items(
+        &mut self,
+        events: &[Event<'_>],
+        mut i: usize,
+        ordered: bool,
+        start: Option<u64>,
+    ) -> (Vec<ListItem>, usize) {
         let mut items = Vec::new();
         let mut item_index = start.unwrap_or(1);
         while i < events.len() {
             match &events[i] {
-                Event::End(TagEnd::List(_)) => { i += 1; break; }
+                Event::End(TagEnd::List(_)) => {
+                    i += 1;
+                    break;
+                }
                 Event::Start(Tag::Item) => {
                     i += 1;
-                    let marker = if ordered { format!("{}.", item_index) } else { "\u{2022}".to_string() };
+                    let marker = if ordered {
+                        format!("{}.", item_index)
+                    } else {
+                        "\u{2022}".to_string()
+                    };
                     let mut checked = None;
                     let mut item_events = Vec::new();
                     let mut depth = 0;
                     while i < events.len() {
                         match &events[i] {
-                            Event::End(TagEnd::Item) if depth == 0 => { i += 1; break; }
-                            Event::TaskListMarker(c) => { checked = Some(*c); i += 1; }
-                            Event::Start(_) => { depth += 1; item_events.push(events[i].clone()); i += 1; }
-                            Event::End(_) => { depth -= 1; item_events.push(events[i].clone()); i += 1; }
-                            _ => { item_events.push(events[i].clone()); i += 1; }
+                            Event::End(TagEnd::Item) if depth == 0 => {
+                                i += 1;
+                                break;
+                            }
+                            Event::TaskListMarker(c) => {
+                                checked = Some(*c);
+                                i += 1;
+                            }
+                            Event::Start(_) => {
+                                depth += 1;
+                                item_events.push(events[i].clone());
+                                i += 1;
+                            }
+                            Event::End(_) => {
+                                depth -= 1;
+                                item_events.push(events[i].clone());
+                                i += 1;
+                            }
+                            _ => {
+                                item_events.push(events[i].clone());
+                                i += 1;
+                            }
                         }
                     }
-                    let content = self.render(&item_events);
-                    items.push(ListItem { marker, checked, content });
+                    let mut content = self.render(&item_events);
+                    // Handle tight lists: pulldown-cmark omits Paragraph wrappers
+                    // in tight lists, leaving bare Text events that self.render() ignores.
+                    // Collect them into a paragraph manually.
+                    if content.is_empty() && !item_events.is_empty() {
+                        let mut state = InlineState::new(self.theme.paragraph);
+                        for event in &item_events {
+                            match event {
+                                Event::Text(t) => state.push_text(t.as_ref()),
+                                Event::Code(t) => {
+                                    state.style_stack.push(self.theme.code_inline);
+                                    state.push_text(t.as_ref());
+                                    state.style_stack.pop();
+                                }
+                                Event::SoftBreak | Event::HardBreak => state.push_text(" "),
+                                Event::Start(Tag::Strong) => state.style_stack.push(self.theme.bold),
+                                Event::End(TagEnd::Strong) => { state.style_stack.pop(); }
+                                Event::Start(Tag::Emphasis) => state.style_stack.push(self.theme.italic),
+                                Event::End(TagEnd::Emphasis) => { state.style_stack.pop(); }
+                                Event::Start(Tag::Strikethrough) => state.style_stack.push(self.theme.strikethrough),
+                                Event::End(TagEnd::Strikethrough) => { state.style_stack.pop(); }
+                                Event::Start(Tag::Link { dest_url, .. }) => {
+                                    state.style_stack.push(self.theme.link);
+                                    state.link_stack.push(Some(dest_url.to_string()));
+                                }
+                                Event::End(TagEnd::Link) => {
+                                    state.style_stack.pop();
+                                    state.link_stack.pop();
+                                }
+                                _ => {}
+                            }
+                        }
+                        let line = state.into_line();
+                        if !line.spans.is_empty() {
+                            content.push(RenderedBlock::Paragraph { lines: vec![line] });
+                        }
+                    }
+                    items.push(ListItem {
+                        marker,
+                        checked,
+                        content,
+                    });
                     item_index += 1;
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
         (items, i)
     }
 
-    fn collect_table(&mut self, events: &[Event<'_>], mut i: usize) -> (Vec<StyledLine>, Vec<Vec<StyledLine>>, usize) {
+    fn collect_table(
+        &mut self,
+        events: &[Event<'_>],
+        mut i: usize,
+    ) -> (Vec<StyledLine>, Vec<Vec<StyledLine>>, usize) {
         let mut headers = Vec::new();
         let mut rows: Vec<Vec<StyledLine>> = Vec::new();
         let mut current_row: Vec<StyledLine> = Vec::new();
         let mut in_head = false;
         while i < events.len() {
             match &events[i] {
-                Event::End(TagEnd::Table) => { i += 1; break; }
-                Event::Start(Tag::TableHead) => { in_head = true; i += 1; }
+                Event::End(TagEnd::Table) => {
+                    i += 1;
+                    break;
+                }
+                Event::Start(Tag::TableHead) => {
+                    in_head = true;
+                    i += 1;
+                }
                 Event::End(TagEnd::TableHead) => {
                     if !current_row.is_empty() {
                         headers = std::mem::take(&mut current_row);
@@ -271,7 +449,10 @@ impl<'t> Renderer<'t> {
                     in_head = false;
                     i += 1;
                 }
-                Event::Start(Tag::TableRow) => { current_row = Vec::new(); i += 1; }
+                Event::Start(Tag::TableRow) => {
+                    current_row = Vec::new();
+                    i += 1;
+                }
                 Event::End(TagEnd::TableRow) => {
                     if in_head {
                         headers = std::mem::take(&mut current_row);
@@ -281,13 +462,19 @@ impl<'t> Renderer<'t> {
                     i += 1;
                 }
                 Event::Start(Tag::TableCell) => {
-                    let style = if in_head { self.theme.table_header } else { self.theme.paragraph };
+                    let style = if in_head {
+                        self.theme.table_header
+                    } else {
+                        self.theme.paragraph
+                    };
                     i += 1;
                     let mut state = InlineState::new(style);
                     i = self.collect_inline(events, i, &TagEnd::TableCell, &mut state);
                     current_row.push(state.into_line());
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
         (headers, rows, i)

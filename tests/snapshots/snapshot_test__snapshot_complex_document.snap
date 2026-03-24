@@ -494,7 +494,21 @@ expression: blocks
             ListItem {
                 marker: "•",
                 checked: None,
-                content: [],
+                content: [
+                    Paragraph {
+                        lines: [
+                            StyledLine {
+                                spans: [
+                                    StyledSpan {
+                                        text: "Unordered item one",
+                                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                        link: None,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
             },
             ListItem {
                 marker: "•",
@@ -507,12 +521,40 @@ expression: blocks
                             ListItem {
                                 marker: "•",
                                 checked: None,
-                                content: [],
+                                content: [
+                                    Paragraph {
+                                        lines: [
+                                            StyledLine {
+                                                spans: [
+                                                    StyledSpan {
+                                                        text: "Nested item",
+                                                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                                        link: None,
+                                                    },
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                ],
                             },
                             ListItem {
                                 marker: "•",
                                 checked: None,
-                                content: [],
+                                content: [
+                                    Paragraph {
+                                        lines: [
+                                            StyledLine {
+                                                spans: [
+                                                    StyledSpan {
+                                                        text: "Another nested item",
+                                                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                                        link: None,
+                                                    },
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                ],
                             },
                         ],
                     },
@@ -529,17 +571,59 @@ expression: blocks
             ListItem {
                 marker: "1.",
                 checked: None,
-                content: [],
+                content: [
+                    Paragraph {
+                        lines: [
+                            StyledLine {
+                                spans: [
+                                    StyledSpan {
+                                        text: "First ordered item",
+                                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                        link: None,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
             },
             ListItem {
                 marker: "2.",
                 checked: None,
-                content: [],
+                content: [
+                    Paragraph {
+                        lines: [
+                            StyledLine {
+                                spans: [
+                                    StyledSpan {
+                                        text: "Second ordered item",
+                                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                        link: None,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
             },
             ListItem {
                 marker: "3.",
                 checked: None,
-                content: [],
+                content: [
+                    Paragraph {
+                        lines: [
+                            StyledLine {
+                                spans: [
+                                    StyledSpan {
+                                        text: "Third ordered item",
+                                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                        link: None,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
             },
         ],
     },
@@ -564,21 +648,63 @@ expression: blocks
                 checked: Some(
                     true,
                 ),
-                content: [],
+                content: [
+                    Paragraph {
+                        lines: [
+                            StyledLine {
+                                spans: [
+                                    StyledSpan {
+                                        text: "Completed task",
+                                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                        link: None,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
             },
             ListItem {
                 marker: "•",
                 checked: Some(
                     false,
                 ),
-                content: [],
+                content: [
+                    Paragraph {
+                        lines: [
+                            StyledLine {
+                                spans: [
+                                    StyledSpan {
+                                        text: "Pending task",
+                                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                        link: None,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
             },
             ListItem {
                 marker: "•",
                 checked: Some(
                     true,
                 ),
-                content: [],
+                content: [
+                    Paragraph {
+                        lines: [
+                            StyledLine {
+                                spans: [
+                                    StyledSpan {
+                                        text: "Another done task",
+                                        style: Style::new().fg(Color::Rgb(204, 204, 204)),
+                                        link: None,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
             },
         ],
     },

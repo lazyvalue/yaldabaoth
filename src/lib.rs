@@ -1,9 +1,9 @@
-pub mod parse;
 pub mod blocks;
-pub mod theme;
-pub mod render;
+pub mod config;
 pub mod highlight;
 pub mod keybind;
-pub mod viewport;
+pub mod parse;
+pub mod render;
+pub mod theme;
 pub mod view;
-pub mod config;
+pub mod viewport;

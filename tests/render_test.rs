@@ -184,9 +184,11 @@ fn test_code_block_has_multiple_styled_spans() {
     match &blocks[0] {
         RenderedBlock::CodeBlock { lines, .. } => {
             let first_line = &lines[0];
-            assert!(first_line.spans.len() > 1,
+            assert!(
+                first_line.spans.len() > 1,
                 "Expected multiple styled spans from syntax highlighting, got {}",
-                first_line.spans.len());
+                first_line.spans.len()
+            );
         }
         other => panic!("Expected CodeBlock, got {:?}", other),
     }

@@ -1,8 +1,8 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::blocks::*;
 use crate::theme::Theme;
@@ -34,7 +34,8 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
-    ]).areas(area);
+    ])
+    .areas(area);
 
     draw_top_bar(frame, top_bar, state);
     draw_content(frame, content_area, state);
@@ -107,7 +108,9 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) {
     let content_width = state.viewport.content_width(terminal_width);
     let x_offset = state.viewport.content_offset(terminal_width);
 
-    let visible = state.viewport.visible_blocks(state.blocks, content_width, viewport_height);
+    let visible = state
+        .viewport
+        .visible_blocks(state.blocks, content_width, viewport_height);
 
     for positioned in &visible {
         let block_screen_y = (positioned.y_offset as i32) - (state.viewport.scroll_offset as i32);
@@ -153,9 +156,10 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
             if *level == 1 {
                 // Add underline decoration for h1
                 let rule = "━".repeat(content.text_content().len().min(width));
-                lines.push(StyledLine::new(vec![
-                    StyledSpan::new(rule, theme.horizontal_rule),
-                ]));
+                lines.push(StyledLine::new(vec![StyledSpan::new(
+                    rule,
+                    theme.horizontal_rule,
+                )]));
             }
             lines.push(StyledLine::new(vec![])); // blank line
             lines
@@ -174,14 +178,15 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
                     let mut truncated_spans = Vec::new();
                     let mut remaining = width - 1; // leave room for → indicator
                     for span in &line.spans {
-                        if remaining == 0 { break; }
+                        if remaining == 0 {
+                            break;
+                        }
                         if span.text.len() <= remaining {
                             truncated_spans.push(span.clone());
                             remaining -= span.text.len();
                         } else {
-                            truncated_spans.push(StyledSpan::new(
-                                &span.text[..remaining], span.style,
-                            ));
+                            truncated_spans
+                                .push(StyledSpan::new(&span.text[..remaining], span.style));
                             remaining = 0;
                         }
                     }
@@ -197,11 +202,10 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
         RenderedBlock::BlockQuote { blocks } => {
             let mut out = Vec::new();
             for inner_block in blocks {
-                let inner_lines = render_block_to_lines(inner_block, width.saturating_sub(4), theme);
+                let inner_lines =
+                    render_block_to_lines(inner_block, width.saturating_sub(4), theme);
                 for line in inner_lines {
-                    let mut spans = vec![
-                        StyledSpan::new("▎ ", theme.blockquote_bar),
-                    ];
+                    let mut spans = vec![StyledSpan::new("▎ ", theme.blockquote_bar)];
                     spans.extend(line.spans);
                     out.push(StyledLine::new(spans));
                 }
@@ -223,13 +227,20 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
 
                 let mut first = true;
                 for content_block in &item.content {
-                    let inner_lines = render_block_to_lines(content_block, width.saturating_sub(marker_display.len()), theme);
+                    let inner_lines = render_block_to_lines(
+                        content_block,
+                        width.saturating_sub(marker_display.len()),
+                        theme,
+                    );
                     for line in inner_lines {
                         let mut spans = if first {
                             first = false;
                             vec![StyledSpan::new(&marker_display, theme.list_marker)]
                         } else {
-                            vec![StyledSpan::new(" ".repeat(marker_display.len()), Style::default())]
+                            vec![StyledSpan::new(
+                                " ".repeat(marker_display.len()),
+                                Style::default(),
+                            )]
                         };
                         spans.extend(line.spans);
                         out.push(StyledLine::new(spans));
@@ -245,27 +256,50 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
             let col_widths: Vec<usize> = header_text.iter().map(|h| h.len().max(5)).collect();
 
             // Header
-            let header_spans: Vec<StyledSpan> = headers.iter().enumerate().map(|(i, h)| {
-                let padded = format!("{:<width$}", h.text_content(), width = col_widths.get(i).copied().unwrap_or(5));
-                StyledSpan::new(padded, theme.table_header)
-            }).collect();
+            let header_spans: Vec<StyledSpan> = headers
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    let padded = format!(
+                        "{:<width$}",
+                        h.text_content(),
+                        width = col_widths.get(i).copied().unwrap_or(5)
+                    );
+                    StyledSpan::new(padded, theme.table_header)
+                })
+                .collect();
             let mut hline_spans = Vec::new();
             for (i, span) in header_spans.into_iter().enumerate() {
-                if i > 0 { hline_spans.push(StyledSpan::new(" │ ", theme.table_border)); }
+                if i > 0 {
+                    hline_spans.push(StyledSpan::new(" │ ", theme.table_border));
+                }
                 hline_spans.push(span);
             }
             out.push(StyledLine::new(hline_spans));
 
             // Separator
-            let sep: String = col_widths.iter().map(|w| "─".repeat(*w)).collect::<Vec<_>>().join("─┼─");
-            out.push(StyledLine::new(vec![StyledSpan::new(sep, theme.table_border)]));
+            let sep: String = col_widths
+                .iter()
+                .map(|w| "─".repeat(*w))
+                .collect::<Vec<_>>()
+                .join("─┼─");
+            out.push(StyledLine::new(vec![StyledSpan::new(
+                sep,
+                theme.table_border,
+            )]));
 
             // Rows
             for row in rows {
                 let mut row_spans = Vec::new();
                 for (i, cell) in row.iter().enumerate() {
-                    if i > 0 { row_spans.push(StyledSpan::new(" │ ", theme.table_border)); }
-                    let padded = format!("{:<width$}", cell.text_content(), width = col_widths.get(i).copied().unwrap_or(5));
+                    if i > 0 {
+                        row_spans.push(StyledSpan::new(" │ ", theme.table_border));
+                    }
+                    let padded = format!(
+                        "{:<width$}",
+                        cell.text_content(),
+                        width = col_widths.get(i).copied().unwrap_or(5)
+                    );
                     row_spans.push(StyledSpan::new(padded, theme.paragraph));
                 }
                 out.push(StyledLine::new(row_spans));
@@ -292,8 +326,9 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
 
 fn styled_line_to_ratatui(line: &StyledLine) -> Line<'static> {
     Line::from(
-        line.spans.iter().map(|s| {
-            Span::styled(s.text.clone(), s.style)
-        }).collect::<Vec<_>>()
+        line.spans
+            .iter()
+            .map(|s| Span::styled(s.text.clone(), s.style))
+            .collect::<Vec<_>>(),
     )
 }
