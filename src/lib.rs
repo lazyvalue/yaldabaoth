@@ -2,6 +2,7 @@ pub mod blocks;
 pub mod config;
 pub mod highlight;
 pub mod keybind;
+pub mod menu;
 pub mod parse;
 pub mod render;
 pub mod theme;
