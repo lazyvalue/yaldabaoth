@@ -9,5 +9,6 @@ pub mod menu;
 pub mod parse;
 pub mod render;
 pub mod theme;
+pub mod tree;
 pub mod view;
 pub mod viewport;
