@@ -19,8 +19,9 @@ struct Document {
 
 struct UndoEntry {
     old_text: String,
-    range: (usize, usize),    // byte range in rope that was modified
+    range: (usize, usize),    // byte range in rope — stored in byte coordinates for tree_sitter::InputEdit; convert from CursorPos char indices before storing
     cursor_before: CursorPos,
+    cursor_after: CursorPos,
 }
 ```
 
@@ -231,7 +232,7 @@ Free movement — `h`/`j`/`k`/`l` move through the entire document. As the curso
 
 ### Modified Modules
 
-- `src/app.rs` — Add `Insert` and `Command` modes. Normal mode now moves cursor instead of scrolling. Holds `Document`, `CursorPos`, `TreeState`, `Editor`. Command mode input handling.
+- `src/app.rs` — Add `Insert` and `Command` modes. Normal mode now moves cursor instead of scrolling. Holds `Editor` (which owns `Document`, `CursorPos`, and `TreeState`). Command mode input handling.
 - `src/view.rs` — Active block detection and raw text rendering. Cursor rendering (block/beam). Modified indicator `[+]` in top bar. Command bar rendering.
 - `src/keybind.rs` — New actions: `MoveLeft`, `MoveRight`, `MoveUp`, `MoveDown`, `MoveWordForward`, `MoveWordBackward`, `MoveWordEnd`, `MoveLineStart`, `MoveLineEnd`, `InsertMode`, `InsertAfter`, `OpenLineBelow`, `OpenLineAbove`, `DeleteChar`, `DeleteLine`, `Undo`, `Redo`, `EnterCommand`.
 - `src/viewport.rs` — Cursor-following scroll (auto-adjust `scroll_offset` to keep cursor visible with scrolloff margin).
