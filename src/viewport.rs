@@ -1,5 +1,7 @@
 use crate::blocks::*;
 
+pub const SCROLLOFF: usize = 3;
+
 pub struct Viewport {
     pub scroll_offset: usize,
     pub cursor_line: usize,
@@ -142,6 +144,18 @@ impl Viewport {
             y += h;
         }
         result
+    }
+
+    /// Ensure the cursor line is visible with scrolloff margin.
+    pub fn ensure_cursor_visible(&mut self, cursor_line: usize, viewport_height: usize) {
+        if viewport_height == 0 {
+            return;
+        }
+        if cursor_line < self.scroll_offset + SCROLLOFF {
+            self.scroll_offset = cursor_line.saturating_sub(SCROLLOFF);
+        } else if cursor_line >= self.scroll_offset + viewport_height.saturating_sub(SCROLLOFF) {
+            self.scroll_offset = cursor_line + SCROLLOFF + 1 - viewport_height;
+        }
     }
 
     pub fn find_heading_offset(
