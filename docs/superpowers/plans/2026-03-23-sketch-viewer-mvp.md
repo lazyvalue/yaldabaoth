@@ -1495,7 +1495,7 @@ impl Viewport {
     /// Estimate the height of a block in terminal lines.
     pub fn block_height(&self, block: &RenderedBlock, width: usize) -> usize {
         match block {
-            RenderedBlock::Heading { .. } => 2, // heading + blank line
+            RenderedBlock::Heading { level, .. } => if *level == 1 { 3 } else { 2 }, // h1: heading + underline + blank; h2-h6: heading + blank
             RenderedBlock::Paragraph { lines } => {
                 let text_lines: usize = lines.iter()
                     .map(|l| self.wrapped_line_count(l, width))
@@ -2226,10 +2226,10 @@ impl App {
                 Action::JumpTop => self.viewport.jump_top(),
                 Action::JumpBottom => self.viewport.jump_bottom(viewport_height),
                 Action::NextHeading => {
-                    self.jump_to_next_heading(content_width, viewport_height, false);
+                    self.jump_to_next_heading(content_width, viewport_height);
                 }
                 Action::PrevHeading => {
-                    self.jump_to_prev_heading(content_width, viewport_height, false);
+                    self.jump_to_prev_heading(content_width, viewport_height);
                 }
                 Action::NextHeadingSameLevel => {
                     self.jump_to_heading_same_level(content_width, viewport_height, true);
@@ -2251,25 +2251,20 @@ impl App {
         Ok(())
     }
 
-    fn jump_to_next_heading(&mut self, width: usize, viewport_height: usize, _same_level: bool) {
+    fn jump_to_next_heading(&mut self, width: usize, viewport_height: usize) {
         let mut y = 0;
-        let mut found_current = false;
 
         for block in &self.blocks {
             let h = self.viewport.block_height(block, width);
             if y > self.viewport.scroll_offset && matches!(block, RenderedBlock::Heading { .. }) {
-                // Center this heading
                 self.viewport.scroll_offset = y.saturating_sub(viewport_height / 3);
                 return;
-            }
-            if y >= self.viewport.scroll_offset {
-                found_current = true;
             }
             y += h;
         }
     }
 
-    fn jump_to_prev_heading(&mut self, width: usize, viewport_height: usize, _same_level: bool) {
+    fn jump_to_prev_heading(&mut self, width: usize, viewport_height: usize) {
         let mut positions = Vec::new();
         let mut y = 0;
 
@@ -2428,14 +2423,24 @@ git commit -m "feat: app layer with event loop, CLI, panic hook, and navigation"
 
 - [ ] **Step 1: Add search state to App**
 
-Add fields to the `App` struct:
+Add fields to the `App` struct and initialize them in `App::new`:
 
 ```rust
+// Add to App struct:
 search_query: String,
 search_input_mode: bool,
 search_input_buffer: String,
 search_matches: Vec<(usize, usize)>, // (block_index, span_index)
 search_match_index: usize,
+```
+
+```rust
+// Add to App::new, in the Self { ... } block:
+search_query: String::new(),
+search_input_mode: false,
+search_input_buffer: String::new(),
+search_matches: Vec::new(),
+search_match_index: 0,
 ```
 
 - [ ] **Step 2: Implement search input mode**
@@ -2527,6 +2532,25 @@ Action::SearchPrev => {
 }
 ```
 
+Add the `jump_to_match` helper:
+
+```rust
+fn jump_to_match(&mut self, width: usize, viewport_height: usize) {
+    if let Some(&(block_idx, _)) = self.search_matches.get(self.search_match_index) {
+        // Calculate y offset of the matching block
+        let mut y = 0;
+        for (i, block) in self.blocks.iter().enumerate() {
+            if i == block_idx {
+                // Center the match on screen
+                self.viewport.scroll_offset = y.saturating_sub(viewport_height / 3);
+                return;
+            }
+            y += self.viewport.block_height(block, width);
+        }
+    }
+}
+```
+
 - [ ] **Step 5: Update bottom bar to show search input and match count**
 
 In `view.rs`, update the `ViewState` to include search state and render the `/query` prompt when in search input mode, and `[N/M]` match indicator when matches exist.
@@ -2550,9 +2574,70 @@ git commit -m "feat: forward/backward search with match navigation"
 **Files:**
 - Modify: `src/app.rs`
 
-- [ ] **Step 1: Implement OpenLink action**
+- [ ] **Step 1: Implement helper methods**
 
-Find the nearest link under/near the cursor position. Use `std::process::Command` to open it:
+Add `find_link_at_cursor` and `get_cursor_line_text` to `App`:
+
+```rust
+/// Find the first link URL in the block under the cursor.
+fn find_link_at_cursor(&self, width: usize) -> Option<String> {
+    let mut y = 0;
+    for block in &self.blocks {
+        let h = self.viewport.block_height(block, width);
+        if y + h > self.viewport.cursor_line {
+            // Cursor is in this block — scan for links
+            return self.find_link_in_block(block);
+        }
+        y += h;
+    }
+    None
+}
+
+fn find_link_in_block(&self, block: &RenderedBlock) -> Option<String> {
+    match block {
+        RenderedBlock::Heading { content, .. } => {
+            content.spans.iter().find_map(|s| s.link.clone())
+        }
+        RenderedBlock::Paragraph { lines } => {
+            lines.iter().flat_map(|l| &l.spans).find_map(|s| s.link.clone())
+        }
+        RenderedBlock::BlockQuote { blocks } => {
+            blocks.iter().find_map(|b| self.find_link_in_block(b))
+        }
+        RenderedBlock::List { items, .. } => {
+            items.iter().flat_map(|i| &i.content).find_map(|b| self.find_link_in_block(b))
+        }
+        _ => None,
+    }
+}
+
+/// Get the text content of the line at the cursor position.
+fn get_cursor_line_text(&self, width: usize) -> Option<String> {
+    let mut y = 0;
+    for block in &self.blocks {
+        let h = self.viewport.block_height(block, width);
+        if y + h > self.viewport.cursor_line {
+            let line_in_block = self.viewport.cursor_line - y;
+            return self.get_block_line_text(block, line_in_block, width);
+        }
+        y += h;
+    }
+    None
+}
+
+fn get_block_line_text(&self, block: &RenderedBlock, line: usize, _width: usize) -> Option<String> {
+    match block {
+        RenderedBlock::Heading { content, .. } if line == 0 => Some(content.text_content()),
+        RenderedBlock::Paragraph { lines } if line < lines.len() => Some(lines[line].text_content()),
+        RenderedBlock::CodeBlock { lines, .. } if line < lines.len() => Some(lines[line].text_content()),
+        _ => None,
+    }
+}
+```
+
+- [ ] **Step 2: Implement OpenLink action**
+
+Note: `open` is macOS-only. For cross-platform support, use `xdg-open` on Linux or `start` on Windows. MVP targets macOS.
 
 ```rust
 Action::OpenLink => {
@@ -2564,7 +2649,7 @@ Action::OpenLink => {
 }
 ```
 
-- [ ] **Step 2: Implement YankLine action**
+- [ ] **Step 3: Implement YankLine action**
 
 Copy the current line's text content to the system clipboard. Shell out to `pbcopy` on macOS (no extra dependency):
 
@@ -2585,11 +2670,11 @@ Action::YankLine => {
 }
 ```
 
-- [ ] **Step 3: Manual test**
+- [ ] **Step 4: Manual test**
 
 Test `o` on a link opens the browser. Test `y` yanks a line (paste somewhere to verify).
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/app.rs
