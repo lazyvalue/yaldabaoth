@@ -52,7 +52,8 @@ impl App {
         // Calculate initial dimensions
         let size = terminal.size()?;
         let content_width = self.viewport.content_width(size.width as usize);
-        self.viewport.calculate_total_lines(&self.blocks, content_width);
+        self.viewport
+            .calculate_total_lines(&self.blocks, content_width);
 
         loop {
             terminal.draw(|frame| {
@@ -116,8 +117,12 @@ impl App {
                     self.search_input_mode = false;
                     self.search_input_buffer.clear();
                 }
-                KeyCode::Backspace => { self.search_input_buffer.pop(); }
-                KeyCode::Char(c) => { self.search_input_buffer.push(c); }
+                KeyCode::Backspace => {
+                    self.search_input_buffer.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.search_input_buffer.push(c);
+                }
                 _ => {}
             }
             return Ok(());
@@ -128,7 +133,9 @@ impl App {
                 Action::Quit => self.should_quit = true,
                 Action::ScrollDown => self.viewport.scroll_down(1, viewport_height),
                 Action::ScrollUp => self.viewport.scroll_up(1),
-                Action::HalfPageDown => self.viewport.scroll_down(viewport_height / 2, viewport_height),
+                Action::HalfPageDown => self
+                    .viewport
+                    .scroll_down(viewport_height / 2, viewport_height),
                 Action::HalfPageUp => self.viewport.scroll_up(viewport_height / 2),
                 Action::FullPageDown => self.viewport.scroll_down(viewport_height, viewport_height),
                 Action::FullPageUp => self.viewport.scroll_up(viewport_height),
@@ -152,7 +159,8 @@ impl App {
                 }
                 Action::SearchNext => {
                     if !self.search_matches.is_empty() {
-                        self.search_match_index = (self.search_match_index + 1) % self.search_matches.len();
+                        self.search_match_index =
+                            (self.search_match_index + 1) % self.search_matches.len();
                         self.jump_to_match(content_width, viewport_height);
                     }
                 }
@@ -175,15 +183,12 @@ impl App {
                 }
                 Action::YankLine => {
                     if let Some(text) = self.get_cursor_line_text(content_width) {
-                        use std::process::{Command, Stdio};
                         use std::io::Write;
-                        if let Ok(mut child) = Command::new("pbcopy")
-                            .stdin(Stdio::piped())
-                            .spawn()
+                        use std::process::{Command, Stdio};
+                        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn()
+                            && let Some(mut stdin) = child.stdin.take()
                         {
-                            if let Some(mut stdin) = child.stdin.take() {
-                                let _ = stdin.write_all(text.as_bytes());
-                            }
+                            let _ = stdin.write_all(text.as_bytes());
                         }
                     }
                 }
@@ -219,7 +224,11 @@ impl App {
         }
 
         // Find the last heading position before current scroll
-        if let Some(&pos) = positions.iter().rev().find(|&&p| p < self.viewport.scroll_offset) {
+        if let Some(&pos) = positions
+            .iter()
+            .rev()
+            .find(|&&p| p < self.viewport.scroll_offset)
+        {
             self.viewport.scroll_offset = pos.saturating_sub(viewport_height / 3);
         }
     }
@@ -227,7 +236,9 @@ impl App {
     fn perform_search(&mut self) {
         self.search_matches.clear();
         let query = self.search_query.to_lowercase();
-        if query.is_empty() { return; }
+        if query.is_empty() {
+            return;
+        }
 
         let mut matches = Vec::new();
         for (bi, block) in self.blocks.iter().enumerate() {
@@ -237,7 +248,12 @@ impl App {
         self.search_match_index = 0;
     }
 
-    fn search_block_collect(query: &str, block: &RenderedBlock, block_index: usize, matches: &mut Vec<(usize, usize)>) {
+    fn search_block_collect(
+        query: &str,
+        block: &RenderedBlock,
+        block_index: usize,
+        matches: &mut Vec<(usize, usize)>,
+    ) {
         match block {
             RenderedBlock::Heading { content, .. } => {
                 if content.text_content().to_lowercase().contains(query) {
@@ -252,11 +268,15 @@ impl App {
                 }
             }
             RenderedBlock::BlockQuote { blocks } => {
-                for b in blocks { Self::search_block_collect(query, b, block_index, matches); }
+                for b in blocks {
+                    Self::search_block_collect(query, b, block_index, matches);
+                }
             }
             RenderedBlock::List { items, .. } => {
                 for item in items {
-                    for b in &item.content { Self::search_block_collect(query, b, block_index, matches); }
+                    for b in &item.content {
+                        Self::search_block_collect(query, b, block_index, matches);
+                    }
                 }
             }
             _ => {}
@@ -293,15 +313,17 @@ impl App {
             RenderedBlock::Heading { content, .. } => {
                 content.spans.iter().find_map(|s| s.link.clone())
             }
-            RenderedBlock::Paragraph { lines } => {
-                lines.iter().flat_map(|l| &l.spans).find_map(|s| s.link.clone())
-            }
+            RenderedBlock::Paragraph { lines } => lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .find_map(|s| s.link.clone()),
             RenderedBlock::BlockQuote { blocks } => {
                 blocks.iter().find_map(|b| self.find_link_in_block(b))
             }
-            RenderedBlock::List { items, .. } => {
-                items.iter().flat_map(|i| &i.content).find_map(|b| self.find_link_in_block(b))
-            }
+            RenderedBlock::List { items, .. } => items
+                .iter()
+                .flat_map(|i| &i.content)
+                .find_map(|b| self.find_link_in_block(b)),
             _ => None,
         }
     }
@@ -322,8 +344,12 @@ impl App {
     fn get_block_line_text(&self, block: &RenderedBlock, line: usize) -> Option<String> {
         match block {
             RenderedBlock::Heading { content, .. } if line == 0 => Some(content.text_content()),
-            RenderedBlock::Paragraph { lines } if line < lines.len() => Some(lines[line].text_content()),
-            RenderedBlock::CodeBlock { lines, .. } if line < lines.len() => Some(lines[line].text_content()),
+            RenderedBlock::Paragraph { lines } if line < lines.len() => {
+                Some(lines[line].text_content())
+            }
+            RenderedBlock::CodeBlock { lines, .. } if line < lines.len() => {
+                Some(lines[line].text_content())
+            }
             _ => None,
         }
     }
@@ -351,11 +377,18 @@ impl App {
         };
 
         if forward {
-            if let Some(&(pos, _)) = headings.iter().find(|(y, l)| *y > self.viewport.scroll_offset && *l == target_level) {
+            if let Some(&(pos, _)) = headings
+                .iter()
+                .find(|(y, l)| *y > self.viewport.scroll_offset && *l == target_level)
+            {
                 self.viewport.scroll_offset = pos.saturating_sub(viewport_height / 3);
             }
         } else {
-            if let Some(&(pos, _)) = headings.iter().rev().find(|(y, l)| *y < self.viewport.scroll_offset && *l == target_level) {
+            if let Some(&(pos, _)) = headings
+                .iter()
+                .rev()
+                .find(|(y, l)| *y < self.viewport.scroll_offset && *l == target_level)
+            {
                 self.viewport.scroll_offset = pos.saturating_sub(viewport_height / 3);
             }
         }

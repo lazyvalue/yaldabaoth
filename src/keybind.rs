@@ -29,7 +29,7 @@ pub enum Action {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct KeyPress {
+pub(crate) struct KeyPress {
     code: KeyCode,
     modifiers: KeyModifiers,
 }
@@ -51,16 +51,24 @@ pub struct KeybindManager {
 }
 
 impl KeybindManager {
-    pub fn new(single: HashMap<KeyPress, Action>, multi: HashMap<Vec<KeyPress>, Action>) -> Self {
-        Self { single, multi, pending: Vec::new(), pending_since: None }
+    pub(crate) fn new(
+        single: HashMap<KeyPress, Action>,
+        multi: HashMap<Vec<KeyPress>, Action>,
+    ) -> Self {
+        Self {
+            single,
+            multi,
+            pending: Vec::new(),
+            pending_since: None,
+        }
     }
 
     pub fn process_key(&mut self, event: KeyEvent) -> Option<Action> {
-        if let Some(since) = self.pending_since {
-            if since.elapsed() > MULTI_KEY_TIMEOUT {
-                self.pending.clear();
-                self.pending_since = None;
-            }
+        if let Some(since) = self.pending_since
+            && since.elapsed() > MULTI_KEY_TIMEOUT
+        {
+            self.pending.clear();
+            self.pending_since = None;
         }
 
         let press: KeyPress = event.into();
@@ -73,9 +81,10 @@ impl KeybindManager {
             return Some(action);
         }
 
-        let is_prefix = self.multi.keys().any(|seq| {
-            seq.len() > self.pending.len() && seq.starts_with(&self.pending)
-        });
+        let is_prefix = self
+            .multi
+            .keys()
+            .any(|seq| seq.len() > self.pending.len() && seq.starts_with(&self.pending));
 
         if is_prefix {
             return None;
@@ -127,9 +136,15 @@ impl Default for KeybindManager {
 }
 
 fn key(c: char) -> KeyPress {
-    KeyPress { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE }
+    KeyPress {
+        code: KeyCode::Char(c),
+        modifiers: KeyModifiers::NONE,
+    }
 }
 
 fn ctrl(c: char) -> KeyPress {
-    KeyPress { code: KeyCode::Char(c), modifiers: KeyModifiers::CONTROL }
+    KeyPress {
+        code: KeyCode::Char(c),
+        modifiers: KeyModifiers::CONTROL,
+    }
 }

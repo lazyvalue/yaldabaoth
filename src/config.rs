@@ -38,14 +38,12 @@ impl Config {
 
         let mut config = Self::default();
 
-        if let Some(display) = doc.get("display") {
-            if let Some(children) = display.children() {
-                if let Some(node) = children.get("max-line-width") {
-                    if let Some(val) = node.get(0).and_then(|v| v.as_integer()) {
-                        config.max_line_width = val as usize;
-                    }
-                }
-            }
+        if let Some(display) = doc.get("display")
+            && let Some(children) = display.children()
+            && let Some(node) = children.get("max-line-width")
+            && let Some(val) = node.get(0).and_then(|v| v.as_integer())
+        {
+            config.max_line_width = val as usize;
         }
 
         config
