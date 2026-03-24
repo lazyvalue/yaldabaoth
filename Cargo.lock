@@ -1054,6 +1054,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "syntect",
+ "tempfile",
 ]
 
 [[package]]
