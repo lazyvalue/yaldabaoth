@@ -328,6 +328,7 @@ impl App {
             KeyCode::Esc => {
                 self.editor.end_insert();
                 self.mode = AppMode::Normal;
+                self.view_cache_dirty = true; // re-render all blocks now that editing is done
                 if self.editor.cursor().col > 0 {
                     self.editor.cursor_mut().move_left();
                 }
@@ -356,8 +357,10 @@ impl App {
             }
             _ => {}
         }
-        // Any insert mode keystroke may change content — mark cache dirty
-        self.view_cache_dirty = true;
+        // Don't mark view_cache_dirty on every insert keystroke — that causes
+        // a full re-render (pulldown-cmark + syntect) per character. The active
+        // block shows raw text from the rope directly, so edits are visible
+        // instantly without re-rendering. The cache is rebuilt on end_insert (Esc).
         self.ensure_cursor_visible(viewport_height);
     }
 
@@ -693,8 +696,35 @@ impl App {
 
     fn ensure_cursor_visible(&mut self, viewport_height: usize) {
         let cursor_line = self.editor.cursor().line;
+        // Convert document line to rendered line position
+        // by walking view blocks and accumulating heights
+        let rendered_y = self.doc_line_to_rendered_y(cursor_line);
         self.viewport
-            .ensure_cursor_visible(cursor_line, viewport_height);
+            .ensure_cursor_visible(rendered_y, viewport_height);
+    }
+
+    /// Convert a document line number to its approximate rendered y position
+    /// using the cached view blocks (no re-rendering).
+    fn doc_line_to_rendered_y(&self, doc_line: usize) -> usize {
+        let boundaries = self.editor.block_boundaries();
+        let content_width = self.viewport.content_width(200); // approximate
+
+        let mut rendered_y = 0;
+        for (i, block_info) in boundaries.iter().enumerate() {
+            if doc_line >= block_info.start_line && doc_line <= block_info.end_line {
+                // Cursor is in this block — add the offset within the block
+                let line_in_block = doc_line - block_info.start_line;
+                return rendered_y + line_in_block;
+            }
+            // Use cached view block height if available
+            if let Some(vb) = self.view_block_cache.get(i) {
+                rendered_y += view_block_height(vb, &self.viewport, content_width);
+            } else {
+                // Fallback: estimate 1 line per document line in the block
+                rendered_y += (block_info.end_line - block_info.start_line).max(1) + 1;
+            }
+        }
+        rendered_y
     }
 
     fn open_file_browser(&mut self) {

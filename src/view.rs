@@ -366,15 +366,25 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) {
         if block_end > view_start && y < view_end {
             let lines = render_view_block_to_lines(view_block, content_width, state.theme);
 
+            // For Raw blocks, we know the document line number (start_line + line_idx).
+            // For Rendered blocks, we don't — but the cursor only appears in Raw blocks.
+            let raw_start_line = match view_block {
+                ViewBlock::Raw { start_line, .. } => Some(*start_line),
+                ViewBlock::Rendered(_) => None,
+            };
+
             for (line_idx, line) in lines.iter().enumerate() {
-                let doc_y = y + line_idx;
-                let screen_y = doc_y as i32 - state.viewport.scroll_offset as i32;
+                let render_y = y + line_idx; // position in rendered terminal line space
+                let screen_y = render_y as i32 - state.viewport.scroll_offset as i32;
                 if screen_y < 0 || screen_y >= viewport_height as i32 {
                     continue;
                 }
 
-                // Cursor line highlight
-                let is_cursor_line = doc_y == state.cursor_line;
+                // Determine if cursor is on this line
+                // Only Raw blocks can contain the cursor
+                let is_cursor_line = raw_start_line
+                    .map(|sl| sl + line_idx == state.cursor_line)
+                    .unwrap_or(false);
 
                 let line_area = Rect::new(
                     area.x + x_offset as u16,
@@ -398,28 +408,23 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) {
                     let cursor_x = area.x + x_offset as u16 + state.cursor_col as u16;
                     if cursor_x < area.x + area.width {
                         let cursor_area = Rect::new(cursor_x, area.y + screen_y as u16, 1, 1);
-                        // Get character under cursor
                         let line_text = line.text_content();
                         let cursor_char = line_text.chars().nth(state.cursor_col).unwrap_or(' ');
-                        if state.show_block_cursor {
+                        let cursor_style = if state.show_block_cursor {
                             // Normal mode: block cursor (reverse video)
-                            let cursor_style = Style::default()
+                            Style::default()
                                 .fg(Color::Rgb(40, 42, 54))
-                                .bg(Color::Rgb(248, 248, 242));
-                            frame.render_widget(
-                                Paragraph::new(Span::styled(cursor_char.to_string(), cursor_style)),
-                                cursor_area,
-                            );
+                                .bg(Color::Rgb(248, 248, 242))
                         } else {
-                            // Insert mode: beam cursor (thin bar before character)
-                            let cursor_style = Style::default()
+                            // Insert mode: beam cursor
+                            Style::default()
                                 .fg(Color::Rgb(248, 248, 242))
-                                .bg(Color::Rgb(80, 80, 120));
-                            frame.render_widget(
-                                Paragraph::new(Span::styled(cursor_char.to_string(), cursor_style)),
-                                cursor_area,
-                            );
-                        }
+                                .bg(Color::Rgb(80, 80, 120))
+                        };
+                        frame.render_widget(
+                            Paragraph::new(Span::styled(cursor_char.to_string(), cursor_style)),
+                            cursor_area,
+                        );
                     }
                 }
             }
@@ -433,7 +438,7 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) {
 }
 
 /// Calculate the height of a ViewBlock in lines.
-fn view_block_height(block: &ViewBlock, viewport: &Viewport, width: usize) -> usize {
+pub fn view_block_height(block: &ViewBlock, viewport: &Viewport, width: usize) -> usize {
     match block {
         ViewBlock::Rendered(rb) => viewport.block_height(rb, width),
         ViewBlock::Raw { lines, .. } => lines.len() + 1, // +1 for blank line separator
