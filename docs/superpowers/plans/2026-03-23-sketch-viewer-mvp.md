@@ -346,10 +346,6 @@ pub mod theme;
 Update `src/main.rs` — remove the `mod blocks` and `mod theme` lines, replace with:
 
 ```rust
-use sketch::blocks;
-use sketch::theme;
-use sketch::parse;
-
 fn main() {
     println!("sketch - TUI markdown viewer");
 }
@@ -2123,7 +2119,7 @@ Create `src/app.rs`:
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use ratatui::DefaultTerminal;
 
 use sketch::blocks::RenderedBlock;
@@ -2194,7 +2190,6 @@ impl App {
                 match event::read()? {
                     Event::Key(key_event) => self.handle_key(key_event, terminal)?,
                     Event::Resize(w, h) => {
-                        let vp_height = (h as usize).saturating_sub(2);
                         let cw = self.viewport.content_width(w as usize);
                         self.viewport.calculate_total_lines(&self.blocks, cw);
                     }
