@@ -193,6 +193,14 @@ impl App {
                     }
                 }
                 Action::None => {}
+                Action::OpenMenu
+                | Action::OpenFileBrowser
+                | Action::FileBrowserDown
+                | Action::FileBrowserUp
+                | Action::FileBrowserEnter
+                | Action::FileBrowserParentDir
+                | Action::FileBrowserFilter
+                | Action::FileBrowserClose => {}
             }
         }
 

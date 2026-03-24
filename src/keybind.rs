@@ -25,6 +25,14 @@ pub enum Action {
     Quit,
     OpenLink,
     YankLine,
+    OpenMenu,
+    OpenFileBrowser,
+    FileBrowserDown,
+    FileBrowserUp,
+    FileBrowserEnter,
+    FileBrowserParentDir,
+    FileBrowserFilter,
+    FileBrowserClose,
     None,
 }
 
@@ -126,6 +134,7 @@ impl Default for KeybindManager {
         single.insert(key('q'), Action::Quit);
         single.insert(key('o'), Action::OpenLink);
         single.insert(key('y'), Action::YankLine);
+        single.insert(key(' '), Action::OpenMenu);
 
         multi.insert(vec![key('g'), key('g')], Action::JumpTop);
         multi.insert(vec![key(']'), key(']')], Action::NextHeadingSameLevel);

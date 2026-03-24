@@ -46,3 +46,10 @@ fn test_unknown_key() {
     let result = mgr.process_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
     assert_eq!(result, None);
 }
+
+#[test]
+fn test_space_opens_menu() {
+    let mut mgr = KeybindManager::default();
+    let result = mgr.process_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert_eq!(result, Some(Action::OpenMenu));
+}
