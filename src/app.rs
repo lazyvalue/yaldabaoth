@@ -8,6 +8,7 @@ use sketch::blocks::RenderedBlock;
 use sketch::command::CommandRegistry;
 use sketch::config::Config;
 use sketch::editor::Editor;
+use sketch::highlight::Highlighter;
 use sketch::file_browser::FileBrowser;
 use sketch::keybind::{Action, KeybindManager};
 use sketch::menu::{self, MenuNode, MenuState};
@@ -44,6 +45,8 @@ pub struct App {
     file_browser: Option<FileBrowser>,
     command_buffer: String,
     command_error: String,
+    /// Reusable highlighter — avoids re-loading syntax definitions on every render.
+    highlighter: Highlighter,
     /// Cached rendered blocks — rebuilt only when content changes.
     rendered_cache: Vec<RenderedBlock>,
     /// Whether the cache needs rebuilding (set on edits, file loads, etc.)
@@ -77,6 +80,7 @@ impl App {
             file_browser: None,
             command_buffer: String::new(),
             command_error: String::new(),
+            highlighter: Highlighter::new(),
             rendered_cache: Vec::new(),
             view_cache_dirty: true,
         }
@@ -247,7 +251,7 @@ impl App {
     /// Rebuild the full render cache (expensive — calls pulldown-cmark + syntect).
     fn rebuild_render_cache(&mut self) {
         let text = self.editor.document().full_text();
-        self.rendered_cache = render::render(&text, &self.theme);
+        self.rendered_cache = render::render_with_highlighter(&text, &self.theme, &self.highlighter);
     }
 
     fn handle_key(&mut self, key: KeyEvent, terminal: &DefaultTerminal) -> io::Result<()> {

@@ -7,14 +7,24 @@ use crate::parse;
 use crate::theme::Theme;
 
 pub fn render(markdown: &str, theme: &Theme) -> Vec<RenderedBlock> {
+    let highlighter = Highlighter::new();
+    render_with_highlighter(markdown, theme, &highlighter)
+}
+
+/// Render using an existing Highlighter (avoids re-loading syntax definitions).
+pub fn render_with_highlighter(
+    markdown: &str,
+    theme: &Theme,
+    highlighter: &Highlighter,
+) -> Vec<RenderedBlock> {
     let events: Vec<_> = parse::parse(markdown).collect();
-    let mut renderer = Renderer::new(theme);
+    let mut renderer = Renderer::new(theme, highlighter);
     renderer.render(&events)
 }
 
-struct Renderer<'t> {
+struct Renderer<'a, 't> {
     theme: &'t Theme,
-    highlighter: Highlighter,
+    highlighter: &'a Highlighter,
 }
 
 struct InlineState {
@@ -59,11 +69,11 @@ impl InlineState {
     }
 }
 
-impl<'t> Renderer<'t> {
-    fn new(theme: &'t Theme) -> Self {
+impl<'a, 't> Renderer<'a, 't> {
+    fn new(theme: &'t Theme, highlighter: &'a Highlighter) -> Self {
         Self {
             theme,
-            highlighter: Highlighter::new(),
+            highlighter,
         }
     }
 
