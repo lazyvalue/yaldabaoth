@@ -483,36 +483,44 @@ impl App {
                 }
             }
             Action::MoveDown => {
-                self.editor.move_down(false);
-                self.ensure_cursor_visible(viewport_height);
+                if self.view_mode == ViewMode::Rendered {
+                    self.viewport.scroll_down(1, viewport_height);
+                } else {
+                    self.editor.move_down(false);
+                    self.ensure_cursor_visible(viewport_height);
+                }
             }
             Action::MoveUp => {
-                self.editor.cursor_mut().move_up();
-                self.editor.clamp_cursor_col(false);
-                self.ensure_cursor_visible(viewport_height);
+                if self.view_mode == ViewMode::Rendered {
+                    self.viewport.scroll_up(1);
+                } else {
+                    self.editor.cursor_mut().move_up();
+                    self.editor.clamp_cursor_col(false);
+                    self.ensure_cursor_visible(viewport_height);
+                }
             }
-            Action::MoveLeft => {
-                self.editor.cursor_mut().move_left();
-            }
-            Action::MoveRight => {
-                self.editor.move_right_clamped(false);
-            }
-            Action::MoveWordForward => {
-                self.editor.move_cursor_word_forward();
-                self.ensure_cursor_visible(viewport_height);
-            }
-            Action::MoveWordBackward => {
-                self.editor.move_cursor_word_backward();
-                self.ensure_cursor_visible(viewport_height);
-            }
-            Action::MoveWordEnd => {
-                self.editor.move_cursor_word_end();
-            }
-            Action::MoveLineStart => {
-                self.editor.cursor_mut().move_line_start();
-            }
-            Action::MoveLineEnd => {
-                self.editor.move_cursor_line_end(false);
+            Action::MoveLeft | Action::MoveRight
+            | Action::MoveWordForward | Action::MoveWordBackward | Action::MoveWordEnd
+            | Action::MoveLineStart | Action::MoveLineEnd => {
+                if self.view_mode == ViewMode::Raw {
+                    match action {
+                        Action::MoveLeft => self.editor.cursor_mut().move_left(),
+                        Action::MoveRight => self.editor.move_right_clamped(false),
+                        Action::MoveWordForward => {
+                            self.editor.move_cursor_word_forward();
+                            self.ensure_cursor_visible(viewport_height);
+                        }
+                        Action::MoveWordBackward => {
+                            self.editor.move_cursor_word_backward();
+                            self.ensure_cursor_visible(viewport_height);
+                        }
+                        Action::MoveWordEnd => self.editor.move_cursor_word_end(),
+                        Action::MoveLineStart => self.editor.cursor_mut().move_line_start(),
+                        Action::MoveLineEnd => self.editor.move_cursor_line_end(false),
+                        _ => {}
+                    }
+                }
+                // In Rendered mode, horizontal movement is a no-op (no visible cursor)
             }
             Action::InsertMode => {
                 self.ensure_raw_for_editing();
