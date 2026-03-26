@@ -476,7 +476,10 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
             lines
         }
         RenderedBlock::Paragraph { lines } => {
-            let mut out = lines.clone();
+            let mut out = Vec::new();
+            for line in lines {
+                wrap_styled_line(line, width, &mut out);
+            }
             out.push(StyledLine::new(vec![])); // blank line
             out
         }
@@ -641,6 +644,89 @@ fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> 
                 StyledLine::new(vec![]),
             ]
         }
+    }
+}
+
+/// Word-wrap a StyledLine into multiple lines that fit within `width` chars.
+/// Tries to break at word boundaries (spaces); falls back to hard break if a
+/// single word exceeds the width.
+fn wrap_styled_line(line: &StyledLine, width: usize, out: &mut Vec<StyledLine>) {
+    if width == 0 {
+        out.push(line.clone());
+        return;
+    }
+
+    let total_len: usize = line.spans.iter().map(|s| s.text.len()).sum();
+    if total_len <= width {
+        out.push(line.clone());
+        return;
+    }
+
+    // Flatten all spans into a list of (char, style, link) for wrapping
+    let mut chars: Vec<(char, Style, Option<String>)> = Vec::new();
+    for span in &line.spans {
+        for ch in span.text.chars() {
+            chars.push((ch, span.style, span.link.clone()));
+        }
+    }
+
+    let mut pos = 0;
+    while pos < chars.len() {
+        let remaining = chars.len() - pos;
+        let line_len = remaining.min(width);
+        let end = pos + line_len;
+
+        // Try to find a word boundary (space) to break at
+        let break_at = if end < chars.len() {
+            // Look backwards from end for a space
+            let mut best = end;
+            for i in (pos..end).rev() {
+                if chars[i].0 == ' ' {
+                    best = i + 1; // break after the space
+                    break;
+                }
+            }
+            if best == end && end < chars.len() {
+                // No space found — hard break at width
+                end
+            } else {
+                best
+            }
+        } else {
+            end
+        };
+
+        // Build a StyledLine from chars[pos..break_at]
+        let mut spans: Vec<StyledSpan> = Vec::new();
+        let mut current_text = String::new();
+        let mut current_style = if pos < chars.len() { chars[pos].1 } else { Style::default() };
+        let mut current_link = if pos < chars.len() { chars[pos].2.clone() } else { None };
+
+        for &(ch, style, ref link) in &chars[pos..break_at] {
+            if style != current_style || *link != current_link {
+                if !current_text.is_empty() {
+                    spans.push(StyledSpan {
+                        text: current_text.clone(),
+                        style: current_style,
+                        link: current_link.clone(),
+                    });
+                    current_text.clear();
+                }
+                current_style = style;
+                current_link = link.clone();
+            }
+            current_text.push(ch);
+        }
+        if !current_text.is_empty() {
+            spans.push(StyledSpan {
+                text: current_text,
+                style: current_style,
+                link: current_link,
+            });
+        }
+
+        out.push(StyledLine::new(spans));
+        pos = break_at;
     }
 }
 
