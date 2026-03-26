@@ -432,7 +432,7 @@ impl App {
         match key.code {
             KeyCode::Char('j') => browser.move_down(),
             KeyCode::Char('k') => browser.move_up(),
-            KeyCode::Char(' ') => {
+            KeyCode::Char('l') | KeyCode::Char(' ') => {
                 if let Some(path) = browser.enter_selected()
                     && self.load_file(path, content_width)
                 {
@@ -440,7 +440,7 @@ impl App {
                     self.mode = AppMode::Normal;
                 }
             }
-            KeyCode::Backspace => browser.go_parent(),
+            KeyCode::Char('h') | KeyCode::Backspace => browser.go_parent(),
             KeyCode::Char('/') => browser.filter_mode = true,
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.file_browser = None;
