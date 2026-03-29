@@ -45,26 +45,52 @@ pub struct ViewState<'a> {
     pub command_mode: bool,
     pub command_buffer: &'a str,
     pub command_error: &'a str,
+    pub buffer_list_open: bool,
+    pub buffer_list_entries: Vec<(String, bool, bool, bool)>, // (path, is_modified, is_active, is_selected)
+    pub buffer_list_filter_mode: bool,
+    pub buffer_list_filter_text: String,
+    pub buffer_count: usize,
+    pub active_buffer_index: usize,
 }
 
 pub fn draw(frame: &mut Frame, state: &ViewState) {
     let area = frame.area();
 
-    // Check minimum terminal size
     if area.width < 40 || area.height < 5 {
         let msg = Paragraph::new("Terminal too small (min 40x5)");
         frame.render_widget(msg, area);
         return;
     }
 
-    let [top_bar, content_area, bottom_bar] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
+    // Calculate buffer list height
+    let buffer_list_height = if state.buffer_list_open {
+        let max_height = (area.height as usize) / 3;
+        let entry_rows = state.buffer_list_entries.len()
+            + if state.buffer_list_filter_mode { 1 } else { 0 };
+        entry_rows.min(max_height).max(1) as u16
+    } else {
+        0
+    };
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1),                      // top bar
+        Constraint::Length(buffer_list_height),      // buffer list (0 when hidden)
+        Constraint::Min(1),                         // content
+        Constraint::Length(1),                       // bottom bar
     ])
-    .areas(area);
+    .split(area);
+
+    let top_bar = chunks[0];
+    let buffer_list_area = chunks[1];
+    let content_area = chunks[2];
+    let bottom_bar = chunks[3];
 
     draw_top_bar(frame, top_bar, state);
+
+    if state.buffer_list_open && buffer_list_height > 0 {
+        draw_buffer_list(frame, buffer_list_area, state);
+    }
+
     if state.file_browser_open {
         let [browser_area, doc_area] = Layout::horizontal([
             Constraint::Length(state.file_browser_panel_width),
@@ -88,7 +114,13 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
     let total = state.viewport.total_lines.max(1);
     let percent = (state.viewport.scroll_offset * 100) / total.max(1);
 
-    let position = format!("line {}/{} {}%", current_line, total, percent);
+    let buffer_info = if state.buffer_count > 1 {
+        format!(" [{}/{}]", state.active_buffer_index + 1, state.buffer_count)
+    } else {
+        String::new()
+    };
+
+    let position = format!("line {}/{} {}%{}", current_line, total, percent, buffer_info);
     let available = area.width as usize;
 
     let modified_indicator = if state.modified { " [+]" } else { "" };
@@ -366,6 +398,67 @@ fn draw_file_browser_panel(frame: &mut Frame, area: Rect, state: &ViewState) {
         ))),
         Rect::new(footer_area.x, footer_area.y, panel_width, 1),
     );
+}
+
+fn draw_buffer_list(frame: &mut Frame, area: Rect, state: &ViewState) {
+    // Background
+    let bg = Paragraph::new("").style(Style::default().bg(Color::Rgb(30, 30, 48)));
+    frame.render_widget(bg, area);
+
+    let mut y = 0u16;
+
+    // Filter input row
+    if state.buffer_list_filter_mode {
+        if y < area.height {
+            let filter_line = Line::from(vec![
+                Span::styled(" / ", Style::default().fg(Color::Rgb(255, 184, 108))),
+                Span::styled(
+                    &state.buffer_list_filter_text,
+                    Style::default().fg(Color::Rgb(241, 250, 140)),
+                ),
+                Span::styled("\u{258e}", Style::default().fg(Color::Rgb(102, 102, 102))),
+            ]);
+            frame.render_widget(
+                Paragraph::new(filter_line),
+                Rect::new(area.x, area.y + y, area.width, 1),
+            );
+            y += 1;
+        }
+    }
+
+    // Buffer entries
+    for (path, is_modified, is_active, is_selected) in &state.buffer_list_entries {
+        if y >= area.height {
+            break;
+        }
+
+        let marker = if *is_selected { "\u{25b8} " } else { "  " };
+        let modified_indicator = if *is_modified { " [+]" } else { "" };
+
+        let bg_style = if *is_selected {
+            Style::default().bg(Color::Rgb(40, 42, 54))
+        } else {
+            Style::default()
+        };
+
+        let path_style = if *is_active {
+            bg_style.fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD)
+        } else {
+            bg_style.fg(Color::Rgb(204, 204, 204))
+        };
+
+        let line = Line::from(vec![
+            Span::styled(marker, bg_style.fg(Color::Rgb(189, 147, 249))),
+            Span::styled(path.clone(), path_style),
+            Span::styled(modified_indicator.to_string(), bg_style.fg(Color::Rgb(255, 184, 108))),
+        ]);
+
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(area.x, area.y + y, area.width, 1),
+        );
+        y += 1;
+    }
 }
 
 fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) {

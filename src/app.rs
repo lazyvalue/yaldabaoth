@@ -193,6 +193,19 @@ impl App {
                     )
                 };
 
+                let buffer_list_entries: Vec<(String, bool, bool, bool)> = if self.mode == AppMode::BufferList {
+                    let filtered = self.filtered_buffer_indices();
+                    filtered.iter().enumerate().map(|(i, &buf_idx)| {
+                        let path = self.buffers[buf_idx].file_path().display().to_string();
+                        let modified = self.buffers[buf_idx].editor.document().is_modified();
+                        let is_active = buf_idx == self.active_buffer;
+                        let selected = i == self.buffer_list_selected;
+                        (path, modified, is_active, selected)
+                    }).collect()
+                } else {
+                    Vec::new()
+                };
+
                 let buf = &self.buffers[self.active_buffer];
                 let filename_display = buf.editor.document().file_path.display().to_string();
 
@@ -235,6 +248,12 @@ impl App {
                     command_mode: self.mode == AppMode::Command,
                     command_buffer: &self.command_buffer,
                     command_error: &self.command_error,
+                    buffer_list_open: self.mode == AppMode::BufferList,
+                    buffer_list_entries,
+                    buffer_list_filter_mode: self.buffer_list_filter_mode,
+                    buffer_list_filter_text: self.buffer_list_filter_text.clone(),
+                    buffer_count: self.buffers.len(),
+                    active_buffer_index: self.active_buffer,
                 };
                 view::draw(frame, &state);
             })?;
