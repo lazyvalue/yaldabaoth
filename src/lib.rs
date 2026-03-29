@@ -7,6 +7,7 @@ pub mod editor;
 pub mod file_browser;
 pub mod highlight;
 pub mod keybind;
+pub mod keys;
 pub mod menu;
 pub mod parse;
 pub mod render;
