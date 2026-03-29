@@ -177,20 +177,19 @@ fn parse_key_name_lower(name: &str, position: usize) -> Result<KeyCode, KeyParse
     }
 
     // Function keys: f1-f12
-    if let Some(rest) = name.strip_prefix('f') {
-        if let Ok(n) = rest.parse::<u8>() {
-            if n >= 1 && n <= 12 {
-                return Ok(KeyCode::F(n));
-            }
-        }
+    if let Some(rest) = name.strip_prefix('f')
+        && let Ok(n) = rest.parse::<u8>()
+        && (1..=12).contains(&n)
+    {
+        return Ok(KeyCode::F(n));
     }
 
     // Single character
     let mut chars = name.chars();
-    if let Some(c) = chars.next() {
-        if chars.next().is_none() {
-            return Ok(KeyCode::Char(c));
-        }
+    if let Some(c) = chars.next()
+        && chars.next().is_none()
+    {
+        return Ok(KeyCode::Char(c));
     }
 
     Err(KeyParseError {
@@ -222,20 +221,19 @@ fn parse_key_name_original(token: &str, position: usize) -> Result<KeyCode, KeyP
     }
 
     // Function keys
-    if let Some(rest) = lower.strip_prefix('f') {
-        if let Ok(n) = rest.parse::<u8>() {
-            if n >= 1 && n <= 12 {
-                return Ok(KeyCode::F(n));
-            }
-        }
+    if let Some(rest) = lower.strip_prefix('f')
+        && let Ok(n) = rest.parse::<u8>()
+        && (1..=12).contains(&n)
+    {
+        return Ok(KeyCode::F(n));
     }
 
     // Single character — use original to preserve case
     let mut chars = token.chars();
-    if let Some(c) = chars.next() {
-        if chars.next().is_none() {
-            return Ok(KeyCode::Char(c));
-        }
+    if let Some(c) = chars.next()
+        && chars.next().is_none()
+    {
+        return Ok(KeyCode::Char(c));
     }
 
     Err(KeyParseError {

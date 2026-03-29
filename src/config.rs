@@ -94,7 +94,7 @@ impl Config {
         if let Some(node) = doc.get("theme")
             && let Some(val) = node.get(0).and_then(|v| v.as_string())
         {
-            config.theme = ThemeName::from_str(val).ok_or_else(|| ConfigError {
+            config.theme = ThemeName::parse(val).ok_or_else(|| ConfigError {
                 message: format!("unknown theme \"{}\"", val),
             })?;
         }

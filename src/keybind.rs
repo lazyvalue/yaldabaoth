@@ -66,6 +66,12 @@ pub struct KeySequenceMatcher {
     pending_since: Option<Instant>,
 }
 
+impl Default for KeySequenceMatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeySequenceMatcher {
     pub fn new() -> Self {
         Self {
@@ -83,11 +89,11 @@ impl KeySequenceMatcher {
         multi: &HashMap<Vec<KeyPress>, V>,
     ) -> Option<Vec<KeyPress>> {
         // Check timeout, clear if expired
-        if let Some(since) = self.pending_since {
-            if since.elapsed() > MULTI_KEY_TIMEOUT {
-                self.pending.clear();
-                self.pending_since = None;
-            }
+        if let Some(since) = self.pending_since
+            && since.elapsed() > MULTI_KEY_TIMEOUT
+        {
+            self.pending.clear();
+            self.pending_since = None;
         }
 
         let press = KeyPress::from_event(event);

@@ -69,7 +69,7 @@ fn main() {
     };
 
     if let Some(ref theme_str) = cli.theme {
-        match sketch::theme::ThemeName::from_str(theme_str) {
+        match sketch::theme::ThemeName::parse(theme_str) {
             Some(name) => config.theme = name,
             None => {
                 eprintln!("Unknown theme: {}", theme_str);
