@@ -5,17 +5,14 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use ratatui::DefaultTerminal;
 
 use sketch::blocks::RenderedBlock;
+use sketch::buffer::Buffer;
 use sketch::command::CommandRegistry;
 use sketch::config::Config;
-use sketch::editor::Editor;
-use sketch::highlight::Highlighter;
 use sketch::file_browser::FileBrowser;
 use sketch::keybind::{Action, KeybindManager};
 use sketch::menu::{self, MenuNode, MenuState};
-use sketch::render;
 use sketch::theme::Theme;
 use sketch::view::{self, ViewMode, ViewState};
-use sketch::viewport::Viewport;
 
 #[derive(Debug, PartialEq)]
 enum AppMode {
@@ -27,8 +24,9 @@ enum AppMode {
 }
 
 pub struct App {
-    editor: Editor,
-    viewport: Viewport,
+    buffers: Vec<Buffer>,
+    active_buffer: usize,
+    max_line_width: usize,
     theme: Theme,
     keybinds: KeybindManager,
     registry: CommandRegistry,
@@ -39,26 +37,16 @@ pub struct App {
     search_matches: Vec<(usize, usize)>,
     search_match_index: usize,
     mode: AppMode,
-    view_mode: ViewMode,
     menu_state: MenuState,
     menu_tree: Vec<MenuNode>,
     file_browser: Option<FileBrowser>,
     command_buffer: String,
     command_error: String,
-    /// Reusable highlighter — avoids re-loading syntax definitions on every render.
-    highlighter: Highlighter,
-    /// Cached rendered blocks — rebuilt only when content changes.
-    rendered_cache: Vec<RenderedBlock>,
-    /// Whether the cache needs rebuilding (set on edits, file loads, etc.)
-    view_cache_dirty: bool,
 }
 
 impl App {
     pub fn new(filename: String, markdown: String, config: &Config) -> Self {
         let theme = Theme::from_name(config.theme);
-        let syntect_theme = theme.name.syntect_theme();
-        let editor = Editor::new(markdown, std::path::PathBuf::from(&filename));
-        let viewport = Viewport::new(config.max_line_width);
         // Build keybinds from config
         let mut keybinds = if let Some(kb_config) = &config.keybinds {
             if kb_config.reset_defaults {
@@ -88,10 +76,12 @@ impl App {
         };
 
         let registry = CommandRegistry::default_registry();
+        let buffer = Buffer::new(filename, markdown, config.max_line_width, &theme);
 
         Self {
-            editor,
-            viewport,
+            buffers: vec![buffer],
+            active_buffer: 0,
+            max_line_width: config.max_line_width,
             theme,
             keybinds,
             registry,
@@ -102,34 +92,40 @@ impl App {
             search_matches: Vec::new(),
             search_match_index: 0,
             mode: AppMode::Normal,
-            view_mode: ViewMode::Rendered,
             menu_state: MenuState::new(),
             menu_tree,
             file_browser: None,
             command_buffer: String::new(),
             command_error: String::new(),
-            highlighter: Highlighter::with_syntect_theme(syntect_theme),
-            rendered_cache: Vec::new(),
-            view_cache_dirty: true,
         }
+    }
+
+    #[allow(dead_code)]
+    fn active(&self) -> &Buffer {
+        &self.buffers[self.active_buffer]
+    }
+
+    #[allow(dead_code)]
+    fn active_mut(&mut self) -> &mut Buffer {
+        &mut self.buffers[self.active_buffer]
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         let size = terminal.size()?;
         let content_width = self.effective_content_width(size.width as usize);
-        self.rebuild_render_cache();
-        self.update_total_lines(content_width);
+        self.buffers[self.active_buffer].rebuild_render_cache(&self.theme);
+        self.buffers[self.active_buffer].update_total_lines(content_width);
 
         loop {
             // Rebuild render cache if needed
-            if self.view_cache_dirty {
-                self.rebuild_render_cache();
-                self.view_cache_dirty = false;
+            if self.buffers[self.active_buffer].view_cache_dirty {
+                self.buffers[self.active_buffer].rebuild_render_cache(&self.theme);
+                self.buffers[self.active_buffer].view_cache_dirty = false;
             }
 
             // Build raw lines for raw mode (cheap — just reads from rope)
-            let raw_lines: Vec<String> = if self.view_mode == ViewMode::Raw {
-                let text = self.editor.document().full_text();
+            let raw_lines: Vec<String> = if self.buffers[self.active_buffer].view_mode == ViewMode::Raw {
+                let text = self.buffers[self.active_buffer].editor.document().full_text();
                 text.lines().map(|l| l.to_string()).collect()
             } else {
                 Vec::new()
@@ -190,18 +186,19 @@ impl App {
                     )
                 };
 
-                let filename_display = self.editor.document().file_path.display().to_string();
+                let buf = &self.buffers[self.active_buffer];
+                let filename_display = buf.editor.document().file_path.display().to_string();
 
                 let state = ViewState {
                     filename: &filename_display,
-                    modified: self.editor.document().is_modified(),
-                    view_mode: self.view_mode,
-                    rendered_blocks: &self.rendered_cache,
+                    modified: buf.editor.document().is_modified(),
+                    view_mode: buf.view_mode,
+                    rendered_blocks: &buf.rendered_cache,
                     raw_lines: &raw_lines,
-                    viewport: &self.viewport,
+                    viewport: &buf.viewport,
                     theme: &self.theme,
                     mode_label: match self.mode {
-                        AppMode::Normal => match self.view_mode {
+                        AppMode::Normal => match buf.view_mode {
                             ViewMode::Rendered => "NORMAL",
                             ViewMode::Raw => "RAW",
                         },
@@ -210,8 +207,8 @@ impl App {
                         AppMode::Menu => "NORMAL",
                         AppMode::FileBrowser => "NORMAL",
                     },
-                    cursor_line: self.editor.cursor().line,
-                    cursor_col: self.editor.cursor().col,
+                    cursor_line: buf.editor.cursor().line,
+                    cursor_col: buf.editor.cursor().col,
                     show_block_cursor: self.mode != AppMode::Insert,
                     search_query: &self.search_query,
                     search_input_mode: self.search_input_mode,
@@ -249,7 +246,7 @@ impl App {
                     Event::Key(key_event) => self.handle_key(key_event, terminal)?,
                     Event::Resize(w, _h) => {
                         let cw = self.effective_content_width(w as usize);
-                        self.update_total_lines(cw);
+                        self.buffers[self.active_buffer].update_total_lines(cw);
                     }
                     _ => {}
                 }
@@ -261,26 +258,6 @@ impl App {
         Ok(())
     }
 
-    fn update_total_lines(&mut self, content_width: usize) {
-        match self.view_mode {
-            ViewMode::Rendered => {
-                self.viewport.total_lines = self
-                    .rendered_cache
-                    .iter()
-                    .map(|b| self.viewport.block_height(b, content_width))
-                    .sum();
-            }
-            ViewMode::Raw => {
-                self.viewport.total_lines = self.editor.document().line_count();
-            }
-        }
-    }
-
-    /// Rebuild the full render cache (expensive — calls pulldown-cmark + syntect).
-    fn rebuild_render_cache(&mut self) {
-        let text = self.editor.document().full_text();
-        self.rendered_cache = render::render_with_highlighter(&text, &self.theme, &self.highlighter);
-    }
 
     fn handle_key(&mut self, key: KeyEvent, terminal: &DefaultTerminal) -> io::Result<()> {
         if !self.command_error.is_empty() && self.mode != AppMode::Command {
@@ -301,7 +278,7 @@ impl App {
             }
         }
 
-        self.update_total_lines(content_width);
+        self.buffers[self.active_buffer].update_total_lines(content_width);
         Ok(())
     }
 
@@ -337,34 +314,34 @@ impl App {
     fn handle_insert_key(&mut self, key: KeyEvent, viewport_height: usize) {
         match key.code {
             KeyCode::Esc => {
-                self.editor.end_insert();
+                self.buffers[self.active_buffer].editor.end_insert();
                 self.mode = AppMode::Normal;
-                self.view_cache_dirty = true; // re-render all blocks now that editing is done
-                if self.editor.cursor().col > 0 {
-                    self.editor.cursor_mut().move_left();
+                self.buffers[self.active_buffer].view_cache_dirty = true;
+                if self.buffers[self.active_buffer].editor.cursor().col > 0 {
+                    self.buffers[self.active_buffer].editor.cursor_mut().move_left();
                 }
             }
             KeyCode::Enter => {
-                self.editor.insert_char('\n');
+                self.buffers[self.active_buffer].editor.insert_char('\n');
             }
             KeyCode::Backspace => {
-                self.editor.backspace();
+                self.buffers[self.active_buffer].editor.backspace();
             }
             KeyCode::Char(c) => {
-                self.editor.insert_char(c);
+                self.buffers[self.active_buffer].editor.insert_char(c);
             }
             KeyCode::Left => {
-                self.editor.cursor_mut().move_left();
+                self.buffers[self.active_buffer].editor.cursor_mut().move_left();
             }
             KeyCode::Right => {
-                self.editor.move_right_clamped(true);
+                self.buffers[self.active_buffer].editor.move_right_clamped(true);
             }
             KeyCode::Up => {
-                self.editor.cursor_mut().move_up();
-                self.editor.clamp_cursor_col(true);
+                self.buffers[self.active_buffer].editor.cursor_mut().move_up();
+                self.buffers[self.active_buffer].editor.clamp_cursor_col(true);
             }
             KeyCode::Down => {
-                self.editor.move_down(true);
+                self.buffers[self.active_buffer].editor.move_down(true);
             }
             _ => {}
         }
@@ -418,7 +395,7 @@ impl App {
         key: KeyEvent,
         term_width: u16,
         _viewport_height: usize,
-        content_width: usize,
+        _content_width: usize,
     ) {
         let _ = term_width;
 
@@ -435,7 +412,7 @@ impl App {
                 KeyCode::Esc => browser.clear_filter(),
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     if let Some(path) = browser.enter_selected()
-                        && self.load_file(path, content_width)
+                        && self.open_buffer(path)
                     {
                         self.file_browser = None;
                         self.mode = AppMode::Normal;
@@ -461,7 +438,7 @@ impl App {
             KeyCode::Char('k') => browser.move_up(),
             KeyCode::Char('l') | KeyCode::Char(' ') => {
                 if let Some(path) = browser.enter_selected()
-                    && self.load_file(path, content_width)
+                    && self.open_buffer(path)
                 {
                     self.file_browser = None;
                     self.mode = AppMode::Normal;
@@ -493,15 +470,15 @@ impl App {
 
     /// Auto-switch to Raw mode if we're in Rendered mode and about to edit.
     fn ensure_raw_for_editing(&mut self) {
-        if self.view_mode == ViewMode::Rendered {
-            self.view_mode = ViewMode::Raw;
+        if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
+            self.buffers[self.active_buffer].view_mode = ViewMode::Raw;
         }
     }
 
     fn execute_action(&mut self, action: Action, viewport_height: usize, _content_width: usize) {
         match action {
             Action::Quit => {
-                if self.editor.document().is_modified() {
+                if self.buffers[self.active_buffer].editor.document().is_modified() {
                     self.command_error =
                         "No write since last change (add ! to override)".to_string();
                 } else {
@@ -509,89 +486,88 @@ impl App {
                 }
             }
             Action::MoveDown => {
-                if self.view_mode == ViewMode::Rendered {
-                    self.viewport.scroll_down(1, viewport_height);
+                if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
+                    self.buffers[self.active_buffer].viewport.scroll_down(1, viewport_height);
                 } else {
-                    self.editor.move_down(false);
+                    self.buffers[self.active_buffer].editor.move_down(false);
                     self.ensure_cursor_visible(viewport_height);
                 }
             }
             Action::MoveUp => {
-                if self.view_mode == ViewMode::Rendered {
-                    self.viewport.scroll_up(1);
+                if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
+                    self.buffers[self.active_buffer].viewport.scroll_up(1);
                 } else {
-                    self.editor.cursor_mut().move_up();
-                    self.editor.clamp_cursor_col(false);
+                    self.buffers[self.active_buffer].editor.cursor_mut().move_up();
+                    self.buffers[self.active_buffer].editor.clamp_cursor_col(false);
                     self.ensure_cursor_visible(viewport_height);
                 }
             }
             Action::MoveLeft | Action::MoveRight
             | Action::MoveWordForward | Action::MoveWordBackward | Action::MoveWordEnd
             | Action::MoveLineStart | Action::MoveLineEnd => {
-                if self.view_mode == ViewMode::Raw {
+                if self.buffers[self.active_buffer].view_mode == ViewMode::Raw {
                     match action {
-                        Action::MoveLeft => self.editor.cursor_mut().move_left(),
-                        Action::MoveRight => self.editor.move_right_clamped(false),
+                        Action::MoveLeft => self.buffers[self.active_buffer].editor.cursor_mut().move_left(),
+                        Action::MoveRight => self.buffers[self.active_buffer].editor.move_right_clamped(false),
                         Action::MoveWordForward => {
-                            self.editor.move_cursor_word_forward();
+                            self.buffers[self.active_buffer].editor.move_cursor_word_forward();
                             self.ensure_cursor_visible(viewport_height);
                         }
                         Action::MoveWordBackward => {
-                            self.editor.move_cursor_word_backward();
+                            self.buffers[self.active_buffer].editor.move_cursor_word_backward();
                             self.ensure_cursor_visible(viewport_height);
                         }
-                        Action::MoveWordEnd => self.editor.move_cursor_word_end(),
-                        Action::MoveLineStart => self.editor.cursor_mut().move_line_start(),
-                        Action::MoveLineEnd => self.editor.move_cursor_line_end(false),
+                        Action::MoveWordEnd => self.buffers[self.active_buffer].editor.move_cursor_word_end(),
+                        Action::MoveLineStart => self.buffers[self.active_buffer].editor.cursor_mut().move_line_start(),
+                        Action::MoveLineEnd => self.buffers[self.active_buffer].editor.move_cursor_line_end(false),
                         _ => {}
                     }
                 }
-                // In Rendered mode, horizontal movement is a no-op (no visible cursor)
             }
             Action::InsertMode => {
                 self.ensure_raw_for_editing();
-                self.editor.begin_insert();
+                self.buffers[self.active_buffer].editor.begin_insert();
                 self.mode = AppMode::Insert;
             }
             Action::InsertAfter => {
                 self.ensure_raw_for_editing();
-                self.editor.move_right_clamped(true);
-                self.editor.begin_insert();
+                self.buffers[self.active_buffer].editor.move_right_clamped(true);
+                self.buffers[self.active_buffer].editor.begin_insert();
                 self.mode = AppMode::Insert;
             }
             Action::OpenLineBelow => {
                 self.ensure_raw_for_editing();
-                self.editor.open_line_below();
+                self.buffers[self.active_buffer].editor.open_line_below();
                 self.mode = AppMode::Insert;
-                self.view_cache_dirty = true;
+                self.buffers[self.active_buffer].view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
             Action::OpenLineAbove => {
                 self.ensure_raw_for_editing();
-                self.editor.open_line_above();
+                self.buffers[self.active_buffer].editor.open_line_above();
                 self.mode = AppMode::Insert;
-                self.view_cache_dirty = true;
+                self.buffers[self.active_buffer].view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
             Action::DeleteChar => {
                 self.ensure_raw_for_editing();
-                self.editor.delete_char_at_cursor();
-                self.view_cache_dirty = true;
+                self.buffers[self.active_buffer].editor.delete_char_at_cursor();
+                self.buffers[self.active_buffer].view_cache_dirty = true;
             }
             Action::DeleteLine => {
                 self.ensure_raw_for_editing();
-                self.editor.delete_current_line();
-                self.view_cache_dirty = true;
+                self.buffers[self.active_buffer].editor.delete_current_line();
+                self.buffers[self.active_buffer].view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
             Action::Undo => {
-                self.editor.undo();
-                self.view_cache_dirty = true;
+                self.buffers[self.active_buffer].editor.undo();
+                self.buffers[self.active_buffer].view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
             Action::Redo => {
-                self.editor.redo();
-                self.view_cache_dirty = true;
+                self.buffers[self.active_buffer].editor.redo();
+                self.buffers[self.active_buffer].view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
             Action::EnterCommand => {
@@ -600,57 +576,81 @@ impl App {
                 self.mode = AppMode::Command;
             }
             Action::ScrollDown => {
-                self.viewport.scroll_down(1, viewport_height);
+                self.buffers[self.active_buffer].viewport.scroll_down(1, viewport_height);
             }
             Action::ScrollUp => {
-                self.viewport.scroll_up(1);
+                self.buffers[self.active_buffer].viewport.scroll_up(1);
             }
             Action::HalfPageDown => {
-                self.viewport
+                self.buffers[self.active_buffer].viewport
                     .scroll_down(viewport_height / 2, viewport_height);
-                let new_top = self.viewport.scroll_offset;
-                if self.editor.cursor().line < new_top {
-                    self.editor.cursor_mut().line = new_top;
-                    self.editor.clamp_cursor_col(false);
+                let new_top = self.buffers[self.active_buffer].viewport.scroll_offset;
+                if self.buffers[self.active_buffer].editor.cursor().line < new_top {
+                    self.buffers[self.active_buffer].editor.cursor_mut().line = new_top;
+                    self.buffers[self.active_buffer].editor.clamp_cursor_col(false);
                 }
             }
             Action::HalfPageUp => {
-                self.viewport.scroll_up(viewport_height / 2);
-                let new_bottom = self.viewport.scroll_offset + viewport_height;
-                if self.editor.cursor().line >= new_bottom {
-                    self.editor.cursor_mut().line = new_bottom.saturating_sub(1);
-                    self.editor.clamp_cursor_col(false);
+                self.buffers[self.active_buffer].viewport.scroll_up(viewport_height / 2);
+                let new_bottom = self.buffers[self.active_buffer].viewport.scroll_offset + viewport_height;
+                if self.buffers[self.active_buffer].editor.cursor().line >= new_bottom {
+                    self.buffers[self.active_buffer].editor.cursor_mut().line = new_bottom.saturating_sub(1);
+                    self.buffers[self.active_buffer].editor.clamp_cursor_col(false);
                 }
             }
             Action::FullPageDown => {
-                self.viewport.scroll_down(viewport_height, viewport_height);
-                let new_top = self.viewport.scroll_offset;
-                if self.editor.cursor().line < new_top {
-                    self.editor.cursor_mut().line = new_top;
-                    self.editor.clamp_cursor_col(false);
+                self.buffers[self.active_buffer].viewport.scroll_down(viewport_height, viewport_height);
+                let new_top = self.buffers[self.active_buffer].viewport.scroll_offset;
+                if self.buffers[self.active_buffer].editor.cursor().line < new_top {
+                    self.buffers[self.active_buffer].editor.cursor_mut().line = new_top;
+                    self.buffers[self.active_buffer].editor.clamp_cursor_col(false);
                 }
             }
             Action::FullPageUp => {
-                self.viewport.scroll_up(viewport_height);
-                let new_bottom = self.viewport.scroll_offset + viewport_height;
-                if self.editor.cursor().line >= new_bottom {
-                    self.editor.cursor_mut().line = new_bottom.saturating_sub(1);
-                    self.editor.clamp_cursor_col(false);
+                self.buffers[self.active_buffer].viewport.scroll_up(viewport_height);
+                let new_bottom = self.buffers[self.active_buffer].viewport.scroll_offset + viewport_height;
+                if self.buffers[self.active_buffer].editor.cursor().line >= new_bottom {
+                    self.buffers[self.active_buffer].editor.cursor_mut().line = new_bottom.saturating_sub(1);
+                    self.buffers[self.active_buffer].editor.clamp_cursor_col(false);
                 }
             }
             Action::JumpTop => {
-                self.editor.cursor_mut().jump_top();
-                self.viewport.jump_top();
+                self.buffers[self.active_buffer].editor.cursor_mut().jump_top();
+                self.buffers[self.active_buffer].viewport.jump_top();
             }
             Action::JumpBottom => {
-                self.editor.jump_cursor_bottom();
-                self.viewport.jump_bottom(viewport_height);
+                self.buffers[self.active_buffer].editor.jump_cursor_bottom();
+                self.buffers[self.active_buffer].viewport.jump_bottom(viewport_height);
             }
-            Action::NextHeading | Action::PrevHeading => {
-                // TODO: implement heading navigation via tree-sitter
+            Action::NextHeading => {
+                if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
+                    if let Some(y) = self.find_next_heading(None) {
+                        self.buffers[self.active_buffer].viewport.scroll_offset = y;
+                    }
+                }
             }
-            Action::NextHeadingSameLevel | Action::PrevHeadingSameLevel => {
-                // TODO: implement via tree-sitter
+            Action::PrevHeading => {
+                if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
+                    if let Some(y) = self.find_prev_heading(None) {
+                        self.buffers[self.active_buffer].viewport.scroll_offset = y;
+                    }
+                }
+            }
+            Action::NextHeadingSameLevel => {
+                if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
+                    let current_level = self.heading_level_at_offset();
+                    if let Some(y) = self.find_next_heading(current_level) {
+                        self.buffers[self.active_buffer].viewport.scroll_offset = y;
+                    }
+                }
+            }
+            Action::PrevHeadingSameLevel => {
+                if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
+                    let current_level = self.heading_level_at_offset();
+                    if let Some(y) = self.find_prev_heading(current_level) {
+                        self.buffers[self.active_buffer].viewport.scroll_offset = y;
+                    }
+                }
             }
             Action::SearchForward | Action::SearchBackward => {
                 self.search_input_mode = true;
@@ -677,7 +677,8 @@ impl App {
                 // TODO: implement link finding via tree-sitter/cursor position
             }
             Action::YankLine => {
-                let line_text = self.editor.document().line_text(self.editor.cursor().line);
+                let buf = &self.buffers[self.active_buffer];
+                let line_text = buf.editor.document().line_text(buf.editor.cursor().line);
                 let text = line_text.trim_end_matches('\n');
                 use std::io::Write;
                 use std::process::{Command, Stdio};
@@ -695,13 +696,12 @@ impl App {
                 self.open_file_browser();
             }
             Action::Save => {
-                if let Err(e) = self.editor.save() {
+                if let Err(e) = self.buffers[self.active_buffer].editor.save() {
                     self.command_error = format!("Error writing file: {}", e);
                 }
             }
             Action::SaveAs => {
-                // SaveAs needs a filename argument; when dispatched without one, treat as save
-                if let Err(e) = self.editor.save() {
+                if let Err(e) = self.buffers[self.active_buffer].editor.save() {
                     self.command_error = format!("Error writing file: {}", e);
                 }
             }
@@ -709,18 +709,19 @@ impl App {
                 self.should_quit = true;
             }
             Action::SaveQuit => {
-                if let Err(e) = self.editor.save() {
+                if let Err(e) = self.buffers[self.active_buffer].editor.save() {
                     self.command_error = format!("Error writing file: {}", e);
                 } else {
                     self.should_quit = true;
                 }
             }
             Action::ToggleView => {
-                self.view_mode = match self.view_mode {
+                let buf = &mut self.buffers[self.active_buffer];
+                buf.view_mode = match buf.view_mode {
                     ViewMode::Rendered => ViewMode::Raw,
                     ViewMode::Raw => ViewMode::Rendered,
                 };
-                self.view_cache_dirty = true;
+                buf.view_cache_dirty = true;
             }
             Action::None
             | Action::FileBrowserDown
@@ -739,7 +740,7 @@ impl App {
         // Special case: `:w filename` → save-as with filename
         if cmd_name == "w" && parts.len() > 1 {
             let path = std::path::Path::new(parts[1]);
-            if let Err(e) = self.editor.save_to(path) {
+            if let Err(e) = self.buffers[self.active_buffer].editor.save_to(path) {
                 self.command_error = format!("Error writing file: {}", e);
             }
             return;
@@ -756,22 +757,22 @@ impl App {
     }
 
     fn ensure_cursor_visible(&mut self, viewport_height: usize) {
-        let cursor_line = self.editor.cursor().line;
-        // In raw mode, cursor line maps directly to rendered line
-        // In rendered mode, we approximate
-        let rendered_y = match self.view_mode {
+        let buf = &self.buffers[self.active_buffer];
+        let cursor_line = buf.editor.cursor().line;
+        let rendered_y = match buf.view_mode {
             ViewMode::Raw => cursor_line,
             ViewMode::Rendered => self.doc_line_to_rendered_y(cursor_line),
         };
-        self.viewport
+        self.buffers[self.active_buffer].viewport
             .ensure_cursor_visible(rendered_y, viewport_height);
     }
 
     /// Convert a document line number to its approximate rendered y position
     /// using the cached rendered blocks.
     fn doc_line_to_rendered_y(&self, doc_line: usize) -> usize {
-        let boundaries = self.editor.block_boundaries();
-        let content_width = self.viewport.content_width(200); // approximate
+        let buf = &self.buffers[self.active_buffer];
+        let boundaries = buf.editor.block_boundaries();
+        let content_width = buf.viewport.content_width(200); // approximate
 
         let mut rendered_y = 0;
         for (i, block_info) in boundaries.iter().enumerate() {
@@ -779,8 +780,8 @@ impl App {
                 let line_in_block = doc_line - block_info.start_line;
                 return rendered_y + line_in_block;
             }
-            if let Some(rb) = self.rendered_cache.get(i) {
-                rendered_y += self.viewport.block_height(rb, content_width);
+            if let Some(rb) = buf.rendered_cache.get(i) {
+                rendered_y += buf.viewport.block_height(rb, content_width);
             } else {
                 rendered_y += (block_info.end_line - block_info.start_line).max(1) + 1;
             }
@@ -789,14 +790,7 @@ impl App {
     }
 
     fn open_file_browser(&mut self) {
-        if self.editor.document().is_modified() {
-            self.command_error = "Save changes first (:w) before browsing files".to_string();
-            return;
-        }
-        let dir = self
-            .editor
-            .document()
-            .file_path
+        let dir = self.buffers[self.active_buffer].editor.document().file_path
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -804,15 +798,29 @@ impl App {
         self.mode = AppMode::FileBrowser;
     }
 
-    fn load_file(&mut self, path: std::path::PathBuf, _content_width: usize) -> bool {
+    fn open_buffer(&mut self, path: std::path::PathBuf) -> bool {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        // Check if already open
+        for (i, buf) in self.buffers.iter().enumerate() {
+            let buf_path = buf.file_path().canonicalize()
+                .unwrap_or_else(|_| buf.file_path().to_path_buf());
+            if buf_path == canonical {
+                self.active_buffer = i;
+                return true;
+            }
+        }
+        // Open new
         match std::fs::read(&path) {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(content) => {
-                    self.editor = Editor::new(content, path);
-                    self.viewport.scroll_offset = 0;
-                    self.viewport.cursor_line = 0;
-                    self.view_mode = ViewMode::Rendered;
-                    self.view_cache_dirty = true;
+                    let buffer = Buffer::new(
+                        canonical.display().to_string(),
+                        content,
+                        self.max_line_width,
+                        &self.theme,
+                    );
+                    self.buffers.push(buffer);
+                    self.active_buffer = self.buffers.len() - 1;
                     true
                 }
                 Err(_) => false,
@@ -827,7 +835,7 @@ impl App {
         } else {
             terminal_width
         };
-        self.viewport.content_width(available)
+        self.buffers[self.active_buffer].viewport.content_width(available)
     }
 
     fn perform_search(&mut self) {
@@ -837,9 +845,10 @@ impl App {
             return;
         }
 
-        let line_count = self.editor.document().line_count();
+        let buf = &self.buffers[self.active_buffer];
+        let line_count = buf.editor.document().line_count();
         for line_idx in 0..line_count {
-            let line_text = self.editor.document().line_text(line_idx);
+            let line_text = buf.editor.document().line_text(line_idx);
             if line_text.to_lowercase().contains(&query) {
                 self.search_matches.push((line_idx, 0));
             }
@@ -849,10 +858,78 @@ impl App {
 
     fn jump_to_match(&mut self, viewport_height: usize) {
         if let Some(&(line_idx, _)) = self.search_matches.get(self.search_match_index) {
-            self.editor.cursor_mut().line = line_idx;
-            self.editor.cursor_mut().col = 0;
+            self.buffers[self.active_buffer].editor.cursor_mut().line = line_idx;
+            self.buffers[self.active_buffer].editor.cursor_mut().col = 0;
             self.ensure_cursor_visible(viewport_height);
         }
+    }
+
+    /// Find the y offset of the next heading after current scroll position.
+    /// If `level_filter` is Some, only match headings at that level.
+    fn find_next_heading(&self, level_filter: Option<u8>) -> Option<usize> {
+        let buf = &self.buffers[self.active_buffer];
+        let content_width = buf.viewport.content_width(200);
+        let current = buf.viewport.scroll_offset;
+        let mut y = 0;
+
+        for block in &buf.rendered_cache {
+            let h = buf.viewport.block_height(block, content_width);
+            if y > current {
+                if let RenderedBlock::Heading { level, .. } = block {
+                    if level_filter.is_none() || level_filter == Some(*level) {
+                        return Some(y);
+                    }
+                }
+            }
+            y += h;
+        }
+        None
+    }
+
+    /// Find the y offset of the previous heading before current scroll position.
+    /// If `level_filter` is Some, only match headings at that level.
+    fn find_prev_heading(&self, level_filter: Option<u8>) -> Option<usize> {
+        let buf = &self.buffers[self.active_buffer];
+        let content_width = buf.viewport.content_width(200);
+        let current = buf.viewport.scroll_offset;
+        let mut y = 0;
+        let mut last_match = None;
+
+        for block in &buf.rendered_cache {
+            let h = buf.viewport.block_height(block, content_width);
+            if y >= current {
+                break;
+            }
+            if let RenderedBlock::Heading { level, .. } = block {
+                if level_filter.is_none() || level_filter == Some(*level) {
+                    last_match = Some(y);
+                }
+            }
+            y += h;
+        }
+        last_match
+    }
+
+    /// Get the heading level at the current scroll offset, if any.
+    fn heading_level_at_offset(&self) -> Option<u8> {
+        let buf = &self.buffers[self.active_buffer];
+        let content_width = buf.viewport.content_width(200);
+        let current = buf.viewport.scroll_offset;
+        let mut y = 0;
+
+        for block in &buf.rendered_cache {
+            let h = buf.viewport.block_height(block, content_width);
+            if y == current {
+                if let RenderedBlock::Heading { level, .. } = block {
+                    return Some(*level);
+                }
+            }
+            if y > current {
+                break;
+            }
+            y += h;
+        }
+        None
     }
 }
 

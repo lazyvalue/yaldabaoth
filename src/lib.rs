@@ -1,4 +1,5 @@
 pub mod blocks;
+pub mod buffer;
 pub mod command;
 pub mod config;
 pub mod cursor;
