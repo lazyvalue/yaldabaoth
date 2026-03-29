@@ -10,6 +10,10 @@ mod app;
 struct Cli {
     /// Markdown file to view
     file: Option<String>,
+
+    /// Color theme (dracula, nightfox)
+    #[arg(long)]
+    theme: Option<String>,
 }
 
 fn main() {
@@ -56,7 +60,24 @@ fn main() {
         .display()
         .to_string();
 
-    let config = sketch::config::Config::load();
+    let mut config = match sketch::config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    if let Some(ref theme_str) = cli.theme {
+        match sketch::theme::ThemeName::from_str(theme_str) {
+            Some(name) => config.theme = name,
+            None => {
+                eprintln!("Unknown theme: {}", theme_str);
+                process::exit(1);
+            }
+        }
+    }
+
     let mut app = app::App::new(abs_path, content, &config);
 
     let mut terminal = ratatui::init();
