@@ -55,7 +55,8 @@ pub struct App {
 
 impl App {
     pub fn new(filename: String, markdown: String, config: &Config) -> Self {
-        let theme = Theme::dark();
+        let theme = Theme::from_name(config.theme);
+        let syntect_theme = theme.name.syntect_theme();
         let editor = Editor::new(markdown, std::path::PathBuf::from(&filename));
         let viewport = Viewport::new(config.max_line_width);
         let keybinds = KeybindManager::default();
@@ -80,7 +81,7 @@ impl App {
             file_browser: None,
             command_buffer: String::new(),
             command_error: String::new(),
-            highlighter: Highlighter::new(),
+            highlighter: Highlighter::with_syntect_theme(syntect_theme),
             rendered_cache: Vec::new(),
             view_cache_dirty: true,
         }
@@ -301,8 +302,8 @@ impl App {
             return;
         }
 
-        if let Some(action) = self.keybinds.process_key(key) {
-            self.execute_action(action, viewport_height, content_width);
+        if let Some(cmd_string) = self.keybinds.process_key(key) {
+            self.dispatch_command(&cmd_string, viewport_height, content_width);
         }
     }
 
@@ -453,15 +454,14 @@ impl App {
     /// Look up a command name in the registry and dispatch its action.
     fn dispatch_command(
         &mut self,
-        cmd_name: &str,
+        cmd_input: &str,
         viewport_height: usize,
         content_width: usize,
     ) {
-        if let Some(cmd) = self.registry.lookup(cmd_name) {
-            let action = cmd.action;
+        if let Some((action, _args)) = self.registry.resolve(cmd_input) {
             self.execute_action(action, viewport_height, content_width);
         } else {
-            self.command_error = format!("Unknown command: {}", cmd_name);
+            self.command_error = format!("Unknown command: {}", cmd_input);
         }
     }
 

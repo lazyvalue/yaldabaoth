@@ -2,6 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use crate::keys::KeyPress;
+
 const MULTI_KEY_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,74 +61,67 @@ pub enum Action {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct KeyPress {
-    code: KeyCode,
-    modifiers: KeyModifiers,
-}
-
-impl From<KeyEvent> for KeyPress {
-    fn from(event: KeyEvent) -> Self {
-        Self {
-            code: event.code,
-            modifiers: event.modifiers & !KeyModifiers::SHIFT,
-        }
-    }
-}
-
-pub struct KeybindManager {
-    single: HashMap<KeyPress, Action>,
-    multi: HashMap<Vec<KeyPress>, Action>,
+pub struct KeySequenceMatcher {
     pending: Vec<KeyPress>,
     pending_since: Option<Instant>,
 }
 
-impl KeybindManager {
-    pub(crate) fn new(
-        single: HashMap<KeyPress, Action>,
-        multi: HashMap<Vec<KeyPress>, Action>,
-    ) -> Self {
+impl KeySequenceMatcher {
+    pub fn new() -> Self {
         Self {
-            single,
-            multi,
             pending: Vec::new(),
             pending_since: None,
         }
     }
 
-    pub fn process_key(&mut self, event: KeyEvent) -> Option<Action> {
-        if let Some(since) = self.pending_since
-            && since.elapsed() > MULTI_KEY_TIMEOUT
-        {
-            self.pending.clear();
-            self.pending_since = None;
+    /// Feed a key event. Returns Some(matched_sequence) if a match was found,
+    /// None if still accumulating or no match.
+    pub fn feed<V>(
+        &mut self,
+        event: KeyEvent,
+        single: &HashMap<KeyPress, V>,
+        multi: &HashMap<Vec<KeyPress>, V>,
+    ) -> Option<Vec<KeyPress>> {
+        // Check timeout, clear if expired
+        if let Some(since) = self.pending_since {
+            if since.elapsed() > MULTI_KEY_TIMEOUT {
+                self.pending.clear();
+                self.pending_since = None;
+            }
         }
 
-        let press: KeyPress = event.into();
+        let press = KeyPress::from_event(event);
         self.pending.push(press.clone());
         self.pending_since = Some(Instant::now());
 
-        if let Some(&action) = self.multi.get(&self.pending) {
+        // Check multi-key match
+        if multi.contains_key(&self.pending) {
+            let matched = self.pending.clone();
             self.pending.clear();
             self.pending_since = None;
-            return Some(action);
+            return Some(matched);
         }
 
-        let is_prefix = self
-            .multi
+        // Check if prefix of any multi-key sequence
+        let is_prefix = multi
             .keys()
             .any(|seq| seq.len() > self.pending.len() && seq.starts_with(&self.pending));
 
         if is_prefix {
-            return None;
+            return Option::None;
         }
 
+        // No multi-key match or prefix — check single
         self.pending.clear();
         self.pending_since = None;
-        self.single.get(&press).copied()
+        if single.contains_key(&press) {
+            Some(vec![press])
+        } else {
+            Option::None
+        }
     }
 
-    pub fn reset_pending(&mut self) {
+    pub fn reset(&mut self) {
         self.pending.clear();
         self.pending_since = None;
     }
@@ -136,62 +131,102 @@ impl KeybindManager {
     }
 }
 
+pub struct KeybindManager {
+    single: HashMap<KeyPress, String>,
+    multi: HashMap<Vec<KeyPress>, String>,
+    matcher: KeySequenceMatcher,
+}
+
+impl KeybindManager {
+    pub fn new(
+        single: HashMap<KeyPress, String>,
+        multi: HashMap<Vec<KeyPress>, String>,
+    ) -> Self {
+        Self {
+            single,
+            multi,
+            matcher: KeySequenceMatcher::new(),
+        }
+    }
+
+    pub fn process_key(&mut self, event: KeyEvent) -> Option<String> {
+        let matched = self.matcher.feed(event, &self.single, &self.multi)?;
+        if matched.len() == 1 {
+            self.single.get(&matched[0]).cloned()
+        } else {
+            self.multi.get(&matched).cloned()
+        }
+    }
+
+    pub fn reset_pending(&mut self) {
+        self.matcher.reset();
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.matcher.has_pending()
+    }
+
+    pub fn apply_bindings(&mut self, bindings: &[(Vec<KeyPress>, String)]) {
+        for (key_seq, cmd) in bindings {
+            if key_seq.len() == 1 {
+                self.single.insert(key_seq[0].clone(), cmd.clone());
+            } else {
+                self.multi.insert(key_seq.clone(), cmd.clone());
+            }
+        }
+    }
+}
+
 impl Default for KeybindManager {
     fn default() -> Self {
         let mut single = HashMap::new();
         let mut multi = HashMap::new();
 
-        single.insert(key('h'), Action::MoveLeft);
-        single.insert(key('j'), Action::MoveDown);
-        single.insert(key('k'), Action::MoveUp);
-        single.insert(key('l'), Action::MoveRight);
-        single.insert(key('w'), Action::MoveWordForward);
-        single.insert(key('b'), Action::MoveWordBackward);
-        single.insert(key('e'), Action::MoveWordEnd);
-        single.insert(key('0'), Action::MoveLineStart);
-        single.insert(key('$'), Action::MoveLineEnd);
-        single.insert(key('i'), Action::InsertMode);
-        single.insert(key('a'), Action::InsertAfter);
-        single.insert(key('o'), Action::OpenLineBelow);
-        single.insert(key('O'), Action::OpenLineAbove);
-        single.insert(key('x'), Action::DeleteChar);
-        single.insert(key('u'), Action::Undo);
-        single.insert(key(':'), Action::EnterCommand);
-        single.insert(ctrl('r'), Action::Redo);
-        single.insert(ctrl('d'), Action::HalfPageDown);
-        single.insert(ctrl('u'), Action::HalfPageUp);
-        single.insert(ctrl('f'), Action::FullPageDown);
-        single.insert(ctrl('b'), Action::FullPageUp);
-        single.insert(key('G'), Action::JumpBottom);
-        single.insert(key('}'), Action::NextHeading);
-        single.insert(key('{'), Action::PrevHeading);
-        single.insert(key('/'), Action::SearchForward);
-        single.insert(key('?'), Action::SearchBackward);
-        single.insert(key('n'), Action::SearchNext);
-        single.insert(key('N'), Action::SearchPrev);
-        single.insert(key('y'), Action::YankLine);
-        single.insert(key(' '), Action::OpenMenu);
+        single.insert(key('h'), "move-left".into());
+        single.insert(key('j'), "move-down".into());
+        single.insert(key('k'), "move-up".into());
+        single.insert(key('l'), "move-right".into());
+        single.insert(key('w'), "move-word-forward".into());
+        single.insert(key('b'), "move-word-backward".into());
+        single.insert(key('e'), "move-word-end".into());
+        single.insert(key('0'), "move-line-start".into());
+        single.insert(key('$'), "move-line-end".into());
+        single.insert(key('i'), "insert-mode".into());
+        single.insert(key('a'), "insert-after".into());
+        single.insert(key('o'), "open-line-below".into());
+        single.insert(key('O'), "open-line-above".into());
+        single.insert(key('x'), "delete-char".into());
+        single.insert(key('u'), "undo".into());
+        single.insert(key(':'), "enter-command".into());
+        single.insert(ctrl('r'), "redo".into());
+        single.insert(ctrl('d'), "half-page-down".into());
+        single.insert(ctrl('u'), "half-page-up".into());
+        single.insert(ctrl('f'), "full-page-down".into());
+        single.insert(ctrl('b'), "full-page-up".into());
+        single.insert(key('G'), "goto-bottom".into());
+        single.insert(key('}'), "goto-heading".into());
+        single.insert(key('{'), "prev-heading".into());
+        single.insert(key('/'), "search-forward".into());
+        single.insert(key('?'), "search-backward".into());
+        single.insert(key('n'), "search-next".into());
+        single.insert(key('N'), "search-prev".into());
+        single.insert(key('y'), "yank-line".into());
+        single.insert(key(' '), "open-menu".into());
 
-        multi.insert(vec![key('g'), key('g')], Action::JumpTop);
-        multi.insert(vec![key('g'), key('x')], Action::OpenLink);
-        multi.insert(vec![key('d'), key('d')], Action::DeleteLine);
-        multi.insert(vec![key(']'), key(']')], Action::NextHeadingSameLevel);
-        multi.insert(vec![key('['), key('[')], Action::PrevHeadingSameLevel);
+        multi.insert(vec![key('g'), key('g')], "goto-top".into());
+        multi.insert(vec![key('g'), key('x')], "open-link".into());
+        multi.insert(vec![key('d'), key('d')], "delete-line".into());
+        multi.insert(vec![key(']'), key(']')], "next-heading-same-level".into());
+        multi.insert(vec![key('['), key('[')], "prev-heading-same-level".into());
 
         Self::new(single, multi)
     }
 }
 
 fn key(c: char) -> KeyPress {
-    KeyPress {
-        code: KeyCode::Char(c),
-        modifiers: KeyModifiers::NONE,
-    }
+    KeyPress::new(KeyCode::Char(c), KeyModifiers::NONE)
 }
 
 fn ctrl(c: char) -> KeyPress {
-    KeyPress {
-        code: KeyCode::Char(c),
-        modifiers: KeyModifiers::CONTROL,
-    }
+    KeyPress::new(KeyCode::Char(c), KeyModifiers::CONTROL)
 }
