@@ -59,7 +59,34 @@ impl App {
         let syntect_theme = theme.name.syntect_theme();
         let editor = Editor::new(markdown, std::path::PathBuf::from(&filename));
         let viewport = Viewport::new(config.max_line_width);
-        let keybinds = KeybindManager::default();
+        // Build keybinds from config
+        let mut keybinds = if let Some(kb_config) = &config.keybinds {
+            if kb_config.reset_defaults {
+                KeybindManager::new(
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                )
+            } else {
+                KeybindManager::default()
+            }
+        } else {
+            KeybindManager::default()
+        };
+        if let Some(kb_config) = &config.keybinds {
+            keybinds.apply_bindings(&kb_config.bindings);
+        }
+
+        // Build menu from config
+        let menu_tree = if let Some(menu_config) = &config.menu {
+            if menu_config.reset_defaults {
+                menu_config.nodes.clone()
+            } else {
+                merge_menu(menu::default_menu(), &menu_config.nodes)
+            }
+        } else {
+            menu::default_menu()
+        };
+
         let registry = CommandRegistry::default_registry();
 
         Self {
@@ -77,7 +104,7 @@ impl App {
             mode: AppMode::Normal,
             view_mode: ViewMode::Rendered,
             menu_state: MenuState::new(),
-            menu_tree: menu::default_menu(),
+            menu_tree,
             file_browser: None,
             command_buffer: String::new(),
             command_error: String::new(),
@@ -827,4 +854,23 @@ impl App {
             self.ensure_cursor_visible(viewport_height);
         }
     }
+}
+
+/// Merge user menu nodes on top of defaults.
+/// User entries with the same key at the same level replace the default entry.
+/// New entries are appended.
+fn merge_menu(mut defaults: Vec<MenuNode>, user_nodes: &[MenuNode]) -> Vec<MenuNode> {
+    for user_node in user_nodes {
+        if user_node.key.is_empty() {
+            // Separator or label — just append
+            defaults.push(user_node.clone());
+            continue;
+        }
+        if let Some(pos) = defaults.iter().position(|d| d.key == user_node.key) {
+            defaults[pos] = user_node.clone();
+        } else {
+            defaults.push(user_node.clone());
+        }
+    }
+    defaults
 }
