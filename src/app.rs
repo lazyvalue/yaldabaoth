@@ -21,6 +21,7 @@ enum AppMode {
     Command,
     Menu,
     FileBrowser,
+    BufferList,
 }
 
 pub struct App {
@@ -42,6 +43,9 @@ pub struct App {
     file_browser: Option<FileBrowser>,
     command_buffer: String,
     command_error: String,
+    buffer_list_selected: usize,
+    buffer_list_filter_mode: bool,
+    buffer_list_filter_text: String,
 }
 
 impl App {
@@ -97,6 +101,9 @@ impl App {
             file_browser: None,
             command_buffer: String::new(),
             command_error: String::new(),
+            buffer_list_selected: 0,
+            buffer_list_filter_mode: false,
+            buffer_list_filter_text: String::new(),
         }
     }
 
@@ -206,6 +213,7 @@ impl App {
                         AppMode::Command => "NORMAL",
                         AppMode::Menu => "NORMAL",
                         AppMode::FileBrowser => "NORMAL",
+                        AppMode::BufferList => "BUFFERS",
                     },
                     cursor_line: buf.editor.cursor().line,
                     cursor_col: buf.editor.cursor().col,
@@ -276,6 +284,7 @@ impl App {
             AppMode::FileBrowser => {
                 self.handle_file_browser_key(key, size.width, viewport_height, content_width)
             }
+            AppMode::BufferList => self.handle_buffer_list_key(key, viewport_height, content_width),
         }
 
         self.buffers[self.active_buffer].update_total_lines(content_width);
@@ -723,6 +732,29 @@ impl App {
                 };
                 buf.view_cache_dirty = true;
             }
+            Action::NextBuffer => {
+                if self.buffers.len() > 1 {
+                    self.active_buffer = (self.active_buffer + 1) % self.buffers.len();
+                }
+            }
+            Action::PrevBuffer => {
+                if self.buffers.len() > 1 {
+                    self.active_buffer = if self.active_buffer == 0 {
+                        self.buffers.len() - 1
+                    } else {
+                        self.active_buffer - 1
+                    };
+                }
+            }
+            Action::BufferList => {
+                self.buffer_list_selected = self.active_buffer;
+                self.buffer_list_filter_mode = false;
+                self.buffer_list_filter_text.clear();
+                self.mode = AppMode::BufferList;
+            }
+            Action::CloseBuffer => {
+                self.close_current_buffer();
+            }
             Action::None
             | Action::FileBrowserDown
             | Action::FileBrowserUp
@@ -910,6 +942,123 @@ impl App {
         last_match
     }
 
+    fn close_current_buffer(&mut self) {
+        if self.buffers[self.active_buffer].editor.document().is_modified() {
+            self.command_error = "No write since last change (add ! to override)".to_string();
+            return;
+        }
+        if self.buffers.len() == 1 {
+            self.should_quit = true;
+            return;
+        }
+        self.buffers.remove(self.active_buffer);
+        if self.active_buffer >= self.buffers.len() {
+            self.active_buffer = self.buffers.len() - 1;
+        }
+    }
+
+    fn handle_buffer_list_key(&mut self, key: KeyEvent, _viewport_height: usize, _content_width: usize) {
+        if self.buffer_list_filter_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.buffer_list_filter_mode = false;
+                    self.buffer_list_filter_text.clear();
+                    self.buffer_list_selected = 0;
+                }
+                KeyCode::Enter => {
+                    let filtered = self.filtered_buffer_indices();
+                    if let Some(&buf_idx) = filtered.get(self.buffer_list_selected) {
+                        self.active_buffer = buf_idx;
+                        self.mode = AppMode::Normal;
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.buffer_list_filter_text.pop();
+                    self.buffer_list_selected = 0;
+                }
+                KeyCode::Char(c) => {
+                    self.buffer_list_filter_text.push(c);
+                    self.buffer_list_selected = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = self.filtered_buffer_indices().len();
+                if count > 0 {
+                    self.buffer_list_selected = (self.buffer_list_selected + 1) % count;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let count = self.filtered_buffer_indices().len();
+                if count > 0 {
+                    self.buffer_list_selected = if self.buffer_list_selected == 0 {
+                        count - 1
+                    } else {
+                        self.buffer_list_selected - 1
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                let filtered = self.filtered_buffer_indices();
+                if let Some(&buf_idx) = filtered.get(self.buffer_list_selected) {
+                    self.active_buffer = buf_idx;
+                    self.mode = AppMode::Normal;
+                }
+            }
+            KeyCode::Char('d') => {
+                let filtered = self.filtered_buffer_indices();
+                if let Some(&buf_idx) = filtered.get(self.buffer_list_selected) {
+                    self.close_buffer_at(buf_idx);
+                }
+            }
+            KeyCode::Char('/') => {
+                self.buffer_list_filter_mode = true;
+                self.buffer_list_filter_text.clear();
+                self.buffer_list_selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn close_buffer_at(&mut self, index: usize) {
+        if self.buffers[index].editor.document().is_modified() {
+            self.command_error = "No write since last change (add ! to override)".to_string();
+            return;
+        }
+        if self.buffers.len() == 1 {
+            self.should_quit = true;
+            return;
+        }
+        self.buffers.remove(index);
+        if self.active_buffer >= self.buffers.len() {
+            self.active_buffer = self.buffers.len() - 1;
+        }
+        let count = self.filtered_buffer_indices().len();
+        if self.buffer_list_selected >= count && count > 0 {
+            self.buffer_list_selected = count - 1;
+        }
+    }
+
+    fn filtered_buffer_indices(&self) -> Vec<usize> {
+        if self.buffer_list_filter_text.is_empty() {
+            return (0..self.buffers.len()).collect();
+        }
+        let query = self.buffer_list_filter_text.to_lowercase();
+        (0..self.buffers.len())
+            .filter(|&i| {
+                let path = self.buffers[i].file_path().display().to_string().to_lowercase();
+                fuzzy_match(&path, &query)
+            })
+            .collect()
+    }
+
     /// Get the heading level at the current scroll offset, if any.
     fn heading_level_at_offset(&self) -> Option<u8> {
         let buf = &self.buffers[self.active_buffer];
@@ -931,6 +1080,20 @@ impl App {
         }
         None
     }
+}
+
+fn fuzzy_match(text: &str, query: &str) -> bool {
+    let mut text_chars = text.chars();
+    for qc in query.chars() {
+        loop {
+            match text_chars.next() {
+                Some(tc) if tc == qc => break,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    }
+    true
 }
 
 /// Merge user menu nodes on top of defaults.

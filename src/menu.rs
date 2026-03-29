@@ -202,6 +202,7 @@ pub fn default_menu() -> Vec<MenuNode> {
         MenuNode::entry("q", "quit", "quit"),
         MenuNode::entry("s", "save", "save"),
         MenuNode::entry("v", "toggle view", "toggle-view"),
+        MenuNode::entry("b", "buffers", "buffer-list"),
         MenuNode::submenu("g", "goto", vec![
             MenuNode::entry("g", "top", "goto-top"),
             MenuNode::entry("e", "bottom", "goto-bottom"),

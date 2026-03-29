@@ -303,6 +303,30 @@ impl CommandRegistry {
                 action: Action::EnterCommand,
                 description: "Enter command mode".into(),
             },
+            CommandDef {
+                name: "next-buffer".into(),
+                aliases: vec!["bn".into()],
+                action: Action::NextBuffer,
+                description: "Switch to next buffer".into(),
+            },
+            CommandDef {
+                name: "prev-buffer".into(),
+                aliases: vec!["bp".into()],
+                action: Action::PrevBuffer,
+                description: "Switch to previous buffer".into(),
+            },
+            CommandDef {
+                name: "buffer-list".into(),
+                aliases: vec!["buffers".into(), "ls".into()],
+                action: Action::BufferList,
+                description: "Show buffer list".into(),
+            },
+            CommandDef {
+                name: "close-buffer".into(),
+                aliases: vec!["bd".into()],
+                action: Action::CloseBuffer,
+                description: "Close current buffer".into(),
+            },
         ])
     }
 }
@@ -354,6 +378,7 @@ mod tests {
             "delete-char", "delete-line", "undo", "redo", "enter-command",
             "save", "quit", "force-quit", "save-quit", "save-as",
             "goto-top", "goto-bottom", "goto-heading", "file-browser",
+            "next-buffer", "prev-buffer", "buffer-list", "close-buffer",
         ];
         for name in &expected {
             assert!(reg.lookup(name).is_some(), "missing command: {}", name);

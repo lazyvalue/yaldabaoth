@@ -58,6 +58,10 @@ pub enum Action {
     FileBrowserParentDir,
     FileBrowserFilter,
     FileBrowserClose,
+    NextBuffer,
+    PrevBuffer,
+    BufferList,
+    CloseBuffer,
     None,
 }
 
@@ -218,6 +222,15 @@ impl Default for KeybindManager {
         single.insert(key('N'), "search-prev".into());
         single.insert(key('y'), "yank-line".into());
         single.insert(key(' '), "open-menu".into());
+
+        single.insert(
+            KeyPress::new(KeyCode::Tab, KeyModifiers::NONE),
+            "next-buffer".into(),
+        );
+        single.insert(
+            KeyPress::new(KeyCode::BackTab, KeyModifiers::NONE),
+            "prev-buffer".into(),
+        );
 
         multi.insert(vec![key('g'), key('g')], "goto-top".into());
         multi.insert(vec![key('g'), key('x')], "open-link".into());
