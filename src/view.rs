@@ -40,8 +40,6 @@ pub struct ViewState<'a> {
     pub file_browser_entries: Vec<(String, bool, bool)>, // (name, is_dir, is_selected)
     pub file_browser_filter_mode: bool,
     pub file_browser_filter_text: String,
-    pub file_browser_panel_width: u16,
-    pub file_browser_hint: String,
     pub command_mode: bool,
     pub command_buffer: &'a str,
     pub command_error: &'a str,
@@ -72,18 +70,31 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
         0
     };
 
+    // Calculate file browser height
+    let file_browser_height = if state.file_browser_open {
+        let max_height = (area.height as usize) / 3;
+        let header_rows = 1; // dir header
+        let filter_rows = if state.file_browser_filter_mode { 1 } else { 0 };
+        let entry_rows = state.file_browser_entries.len();
+        (header_rows + filter_rows + entry_rows).min(max_height).max(1) as u16
+    } else {
+        0
+    };
+
     let chunks = Layout::vertical([
-        Constraint::Length(1),                      // top bar
-        Constraint::Length(buffer_list_height),      // buffer list (0 when hidden)
-        Constraint::Min(1),                         // content
-        Constraint::Length(1),                       // bottom bar
+        Constraint::Length(1),                        // top bar
+        Constraint::Length(buffer_list_height),        // buffer list (0 when hidden)
+        Constraint::Length(file_browser_height),       // file browser (0 when hidden)
+        Constraint::Min(1),                           // content
+        Constraint::Length(1),                         // bottom bar
     ])
     .split(area);
 
     let top_bar = chunks[0];
     let buffer_list_area = chunks[1];
-    let content_area = chunks[2];
-    let bottom_bar = chunks[3];
+    let file_browser_area = chunks[2];
+    let content_area = chunks[3];
+    let bottom_bar = chunks[4];
 
     draw_top_bar(frame, top_bar, state);
 
@@ -91,18 +102,10 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
         draw_buffer_list(frame, buffer_list_area, state);
     }
 
-    if state.file_browser_open {
-        let [browser_area, doc_area] = Layout::horizontal([
-            Constraint::Length(state.file_browser_panel_width),
-            Constraint::Min(1),
-        ])
-        .areas(content_area);
-
-        draw_file_browser_panel(frame, browser_area, state);
-        draw_content(frame, doc_area, state);
-    } else {
-        draw_content(frame, content_area, state);
+    if state.file_browser_open && file_browser_height > 0 {
+        draw_file_browser_panel(frame, file_browser_area, state);
     }
+    draw_content(frame, content_area, state);
     if state.menu_active {
         draw_menu_popup(frame, content_area, state);
     }
@@ -284,60 +287,35 @@ fn draw_menu_popup(frame: &mut Frame, area: Rect, state: &ViewState) {
 }
 
 fn draw_file_browser_panel(frame: &mut Frame, area: Rect, state: &ViewState) {
-    // Split panel into: header (1), optional filter (1), file list (fill), footer (1)
-    let has_filter = state.file_browser_filter_mode;
-    let constraints = if has_filter {
-        vec![
-            Constraint::Length(1), // header
-            Constraint::Length(1), // filter input
-            Constraint::Min(1),    // file list
-            Constraint::Length(1), // footer
-        ]
-    } else {
-        vec![
-            Constraint::Length(1), // header
-            Constraint::Min(1),    // file list
-            Constraint::Length(1), // footer
-        ]
-    };
-    let areas = Layout::vertical(constraints).split(area);
+    // Background
+    let bg = Paragraph::new("").style(Style::default().bg(Color::Rgb(30, 30, 48)));
+    frame.render_widget(bg, area);
 
-    let (header_area, filter_area, list_area, footer_area) = if has_filter {
-        (areas[0], Some(areas[1]), areas[2], areas[3])
-    } else {
-        (areas[0], None, areas[1], areas[2])
-    };
+    let mut y = 0u16;
 
-    // Border separator on right edge
-    for y in area.y..area.y + area.height {
-        let sep_area = Rect::new(area.x + area.width - 1, y, 1, 1);
-        frame.render_widget(
-            Paragraph::new("\u{2502}").style(Style::default().fg(Color::Rgb(98, 114, 164))),
-            sep_area,
-        );
-    }
-
-    let panel_width = area.width.saturating_sub(1); // exclude border
-
-    // Header
-    let dir_display = if state.file_browser_dir.len() > panel_width as usize - 2 {
-        let start = state.file_browser_dir.len() - (panel_width as usize - 2);
-        format!(" \u{2026}{}", &state.file_browser_dir[start..])
-    } else {
-        format!(" {}", state.file_browser_dir)
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
+    // Directory header
+    if y < area.height {
+        let dir_display = if state.file_browser_dir.len() > area.width as usize - 3 {
+            let start = state.file_browser_dir.len() - (area.width as usize - 3);
+            format!(" \u{2026}{}", &state.file_browser_dir[start..])
+        } else {
+            format!(" {}", state.file_browser_dir)
+        };
+        let header_line = Line::from(Span::styled(
             dir_display,
             Style::default().fg(Color::Rgb(98, 114, 164)),
-        ))),
-        Rect::new(header_area.x, header_area.y, panel_width, 1),
-    );
+        ));
+        frame.render_widget(
+            Paragraph::new(header_line),
+            Rect::new(area.x, area.y + y, area.width, 1),
+        );
+        y += 1;
+    }
 
     // Filter input
-    if let Some(filter_area) = filter_area {
+    if state.file_browser_filter_mode && y < area.height {
         let filter_line = Line::from(vec![
-            Span::styled("/", Style::default().fg(Color::Rgb(255, 184, 108))),
+            Span::styled(" / ", Style::default().fg(Color::Rgb(255, 184, 108))),
             Span::styled(
                 &state.file_browser_filter_text,
                 Style::default().fg(Color::Rgb(241, 250, 140)),
@@ -346,58 +324,52 @@ fn draw_file_browser_panel(frame: &mut Frame, area: Rect, state: &ViewState) {
         ]);
         frame.render_widget(
             Paragraph::new(filter_line),
-            Rect::new(filter_area.x + 1, filter_area.y, panel_width - 1, 1),
+            Rect::new(area.x, area.y + y, area.width, 1),
         );
+        y += 1;
     }
 
-    // File list
-    let list_height = list_area.height as usize;
-    if state.file_browser_entries.is_empty() {
+    // File entries
+    if state.file_browser_entries.is_empty() && y < area.height {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "  (empty)",
                 Style::default().fg(Color::Rgb(102, 102, 102)),
             ))),
-            Rect::new(list_area.x + 1, list_area.y, panel_width - 1, 1),
+            Rect::new(area.x, area.y + y, area.width, 1),
         );
+        return;
     }
-    for (i, (name, is_dir, is_selected)) in state.file_browser_entries.iter().enumerate() {
-        if i >= list_height {
+
+    for (name, is_dir, is_selected) in &state.file_browser_entries {
+        if y >= area.height {
             break;
         }
 
         let marker = if *is_selected { "\u{25b8} " } else { "  " };
-        let style = if *is_selected {
+        let bg_style = if *is_selected {
             Style::default().bg(Color::Rgb(40, 42, 54))
         } else {
             Style::default()
         };
         let name_style = if *is_dir {
-            style.fg(Color::Rgb(139, 233, 253))
+            bg_style.fg(Color::Rgb(139, 233, 253))
         } else {
-            style.fg(Color::Rgb(204, 204, 204))
+            bg_style.fg(Color::Rgb(204, 204, 204))
         };
+        let suffix = if *is_dir { "/" } else { "" };
 
         let line = Line::from(vec![
-            Span::styled(marker, style),
-            Span::styled(name.clone(), name_style),
+            Span::styled(marker, bg_style.fg(Color::Rgb(189, 147, 249))),
+            Span::styled(format!("{}{}", name, suffix), name_style),
         ]);
 
         frame.render_widget(
             Paragraph::new(line),
-            Rect::new(list_area.x + 1, list_area.y + i as u16, panel_width - 1, 1),
+            Rect::new(area.x, area.y + y, area.width, 1),
         );
+        y += 1;
     }
-
-    // Footer
-    let hint = &state.file_browser_hint;
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(" {}", hint),
-            Style::default().fg(Color::Rgb(102, 102, 102)),
-        ))),
-        Rect::new(footer_area.x, footer_area.y, panel_width, 1),
-    );
 }
 
 fn draw_buffer_list(frame: &mut Frame, area: Rect, state: &ViewState) {

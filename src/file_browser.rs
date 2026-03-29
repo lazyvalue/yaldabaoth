@@ -132,12 +132,6 @@ impl FileBrowser {
         &self.filter_text
     }
 
-    /// Calculate panel width in columns.
-    pub fn panel_width(&self, terminal_width: u16) -> u16 {
-        let raw = (terminal_width as u32 * 30 / 100) as u16;
-        raw.clamp(20, 60).min(terminal_width / 2)
-    }
-
     fn refresh(&mut self) {
         self.entries = Self::list_directory(&self.current_dir);
         self.update_filtered();

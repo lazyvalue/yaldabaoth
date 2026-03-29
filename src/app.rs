@@ -152,46 +152,24 @@ impl App {
                     Vec::new()
                 };
 
-                let (
-                    fb_open,
-                    fb_dir,
-                    fb_entries,
-                    fb_filter_mode,
-                    fb_filter_text,
-                    fb_panel_width,
-                    fb_hint,
-                ) = if let Some(browser) = &self.file_browser {
-                    let entries: Vec<(String, bool, bool)> = browser
-                        .visible_entries()
-                        .iter()
-                        .enumerate()
-                        .map(|(i, e)| (e.name.clone(), e.is_dir, i == browser.selected()))
-                        .collect();
-                    let hint = if browser.filter_mode {
-                        format!("{} matches · Space open · Esc clear", entries.len())
+                let (fb_open, fb_dir, fb_entries, fb_filter_mode, fb_filter_text) =
+                    if let Some(browser) = &self.file_browser {
+                        let entries: Vec<(String, bool, bool)> = browser
+                            .visible_entries()
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| (e.name.clone(), e.is_dir, i == browser.selected()))
+                            .collect();
+                        (
+                            true,
+                            browser.current_dir().display().to_string(),
+                            entries,
+                            browser.filter_mode,
+                            browser.filter_text().to_string(),
+                        )
                     } else {
-                        "j/k nav · Space open · / filter · Esc close".to_string()
+                        (false, String::new(), Vec::new(), false, String::new())
                     };
-                    (
-                        true,
-                        browser.current_dir().display().to_string(),
-                        entries,
-                        browser.filter_mode,
-                        browser.filter_text().to_string(),
-                        browser.panel_width(frame.area().width),
-                        hint,
-                    )
-                } else {
-                    (
-                        false,
-                        String::new(),
-                        Vec::new(),
-                        false,
-                        String::new(),
-                        0,
-                        String::new(),
-                    )
-                };
 
                 let buffer_list_entries: Vec<(String, bool, bool, bool)> = if self.mode == AppMode::BufferList {
                     let filtered = self.filtered_buffer_indices();
@@ -243,8 +221,6 @@ impl App {
                     file_browser_entries: fb_entries,
                     file_browser_filter_mode: fb_filter_mode,
                     file_browser_filter_text: fb_filter_text,
-                    file_browser_panel_width: fb_panel_width,
-                    file_browser_hint: fb_hint,
                     command_mode: self.mode == AppMode::Command,
                     command_buffer: &self.command_buffer,
                     command_error: &self.command_error,
@@ -881,12 +857,7 @@ impl App {
     }
 
     fn effective_content_width(&self, terminal_width: usize) -> usize {
-        let available = if let Some(browser) = &self.file_browser {
-            terminal_width.saturating_sub(browser.panel_width(terminal_width as u16) as usize + 1)
-        } else {
-            terminal_width
-        };
-        self.buffers[self.active_buffer].viewport.content_width(available)
+        self.buffers[self.active_buffer].viewport.content_width(terminal_width)
     }
 
     fn perform_search(&mut self) {
