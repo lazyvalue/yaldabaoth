@@ -1,14 +1,75 @@
+use crossterm::event::KeyEvent;
+
+use crate::keys::KeyPress;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuNodeKind {
+    Command,
+    Submenu,
+    Separator,
+    Label,
+}
+
 #[derive(Debug, Clone)]
 pub struct MenuNode {
-    pub key: char,
+    pub key: Vec<KeyPress>,
     pub label: String,
     pub action: MenuAction,
+}
+
+impl MenuNode {
+    pub fn entry(key_str: &str, label: &str, action: &str) -> Self {
+        let key = crate::keys::parse_key_sequence(key_str)
+            .unwrap_or_else(|e| panic!("invalid menu key \"{}\": {}", key_str, e));
+        Self {
+            key,
+            label: label.into(),
+            action: MenuAction::Command(action.into()),
+        }
+    }
+
+    pub fn submenu(key_str: &str, label: &str, children: Vec<MenuNode>) -> Self {
+        let key = crate::keys::parse_key_sequence(key_str)
+            .unwrap_or_else(|e| panic!("invalid menu key \"{}\": {}", key_str, e));
+        Self {
+            key,
+            label: label.into(),
+            action: MenuAction::Submenu(children),
+        }
+    }
+
+    pub fn separator() -> Self {
+        Self {
+            key: Vec::new(),
+            label: String::new(),
+            action: MenuAction::Separator,
+        }
+    }
+
+    pub fn label(text: &str) -> Self {
+        Self {
+            key: Vec::new(),
+            label: text.into(),
+            action: MenuAction::Label(text.into()),
+        }
+    }
+
+    pub fn kind(&self) -> MenuNodeKind {
+        match &self.action {
+            MenuAction::Command(_) => MenuNodeKind::Command,
+            MenuAction::Submenu(_) => MenuNodeKind::Submenu,
+            MenuAction::Separator => MenuNodeKind::Separator,
+            MenuAction::Label(_) => MenuNodeKind::Label,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum MenuAction {
     Submenu(Vec<MenuNode>),
     Command(String),
+    Separator,
+    Label(String),
 }
 
 pub struct MenuState {
@@ -38,27 +99,32 @@ impl MenuState {
         self.path.clear();
     }
 
-    /// Process a key press in the menu. Returns Some(command_name) if a command was selected.
+    /// Process a key event in the menu. Returns Some(command_name) if a command was selected.
     /// Returns None if a submenu was entered or key was unrecognized.
     /// Closes the menu when a command is executed.
-    pub fn process_key(&mut self, key: char, menu: &[MenuNode]) -> Option<String> {
+    pub fn process_key_event(&mut self, event: KeyEvent, menu: &[MenuNode]) -> Option<String> {
+        let press = KeyPress::from_event(event);
         let nodes = self.current_nodes(menu);
+
         for node in nodes.iter() {
-            if node.key == key {
+            if matches!(node.action, MenuAction::Separator | MenuAction::Label(_)) {
+                continue;
+            }
+            if node.key.len() == 1 && node.key[0] == press {
                 match &node.action {
-                    MenuAction::Command(cmd_name) => {
-                        let cmd_name = cmd_name.clone();
+                    MenuAction::Command(cmd) => {
+                        let cmd = cmd.clone();
                         self.close();
-                        return Some(cmd_name);
+                        return Some(cmd);
                     }
                     MenuAction::Submenu(_) => {
-                        // Find the index in the actual menu tree (not the slice)
-                        let idx = self.resolve_node_index(menu, key);
+                        let idx = self.resolve_node_index(menu, &press);
                         if let Some(idx) = idx {
                             self.path.push(idx);
                         }
                         return None;
                     }
+                    _ => {}
                 }
             }
         }
@@ -109,7 +175,7 @@ impl MenuState {
         label
     }
 
-    fn resolve_node_index(&self, menu: &[MenuNode], key: char) -> Option<usize> {
+    fn resolve_node_index(&self, menu: &[MenuNode], press: &KeyPress) -> Option<usize> {
         let mut target = menu;
         for &idx in &self.path {
             if let Some(node) = target.get(idx)
@@ -118,7 +184,7 @@ impl MenuState {
                 target = children;
             }
         }
-        target.iter().position(|n| n.key == key)
+        target.iter().position(|n| n.key.len() == 1 && n.key[0] == *press)
     }
 }
 
@@ -131,51 +197,15 @@ impl Default for MenuState {
 /// Build the default menu tree.
 pub fn default_menu() -> Vec<MenuNode> {
     vec![
-        MenuNode {
-            key: 'f',
-            label: "file browser".into(),
-            action: MenuAction::Command("file-browser".into()),
-        },
-        MenuNode {
-            key: '/',
-            label: "search".into(),
-            action: MenuAction::Command("search".into()),
-        },
-        MenuNode {
-            key: 'q',
-            label: "quit".into(),
-            action: MenuAction::Command("quit".into()),
-        },
-        MenuNode {
-            key: 's',
-            label: "save".into(),
-            action: MenuAction::Command("save".into()),
-        },
-        MenuNode {
-            key: 'v',
-            label: "toggle view".into(),
-            action: MenuAction::Command("toggle-view".into()),
-        },
-        MenuNode {
-            key: 'g',
-            label: "goto".into(),
-            action: MenuAction::Submenu(vec![
-                MenuNode {
-                    key: 'g',
-                    label: "top".into(),
-                    action: MenuAction::Command("goto-top".into()),
-                },
-                MenuNode {
-                    key: 'e',
-                    label: "bottom".into(),
-                    action: MenuAction::Command("goto-bottom".into()),
-                },
-                MenuNode {
-                    key: 'h',
-                    label: "next heading".into(),
-                    action: MenuAction::Command("goto-heading".into()),
-                },
-            ]),
-        },
+        MenuNode::entry("f", "file browser", "file-browser"),
+        MenuNode::entry("/", "search", "search-forward"),
+        MenuNode::entry("q", "quit", "quit"),
+        MenuNode::entry("s", "save", "save"),
+        MenuNode::entry("v", "toggle view", "toggle-view"),
+        MenuNode::submenu("g", "goto", vec![
+            MenuNode::entry("g", "top", "goto-top"),
+            MenuNode::entry("e", "bottom", "goto-bottom"),
+            MenuNode::entry("h", "next heading", "goto-heading"),
+        ]),
     ]
 }

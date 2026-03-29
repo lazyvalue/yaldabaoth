@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::blocks::*;
+use crate::menu::MenuNodeKind;
 use crate::theme::Theme;
 use crate::viewport::Viewport;
 
@@ -32,7 +33,7 @@ pub struct ViewState<'a> {
     pub search_input_buffer: &'a str,
     pub search_match_count: usize,
     pub menu_active: bool,
-    pub menu_nodes: Vec<(char, String, bool)>, // (key, label, is_submenu)
+    pub menu_nodes: Vec<(String, String, MenuNodeKind)>, // (key_display, label, kind)
     pub menu_label: Option<String>,            // submenu breadcrumb label
     pub file_browser_open: bool,
     pub file_browser_dir: String,
@@ -198,18 +199,39 @@ fn draw_menu_popup(frame: &mut Frame, area: Rect, state: &ViewState) {
     // Entries row
     if popup_area.height >= 2 {
         let mut spans = vec![Span::raw("  ")];
-        for (i, (key, label, is_submenu)) in state.menu_nodes.iter().enumerate() {
+        for (i, (key_display, label, kind)) in state.menu_nodes.iter().enumerate() {
+            match kind {
+                MenuNodeKind::Separator => {
+                    spans.push(Span::styled(
+                        " \u{2502} ",
+                        Style::default().fg(Color::Rgb(98, 114, 164)),
+                    ));
+                    continue;
+                }
+                MenuNodeKind::Label => {
+                    if i > 0 {
+                        spans.push(Span::raw("   "));
+                    }
+                    spans.push(Span::styled(
+                        label.clone(),
+                        Style::default().fg(Color::Rgb(98, 114, 164)),
+                    ));
+                    continue;
+                }
+                _ => {}
+            }
+
             if i > 0 {
                 spans.push(Span::raw("   "));
             }
             spans.push(Span::styled(
-                key.to_string(),
+                key_display.clone(),
                 Style::default()
                     .fg(Color::Rgb(189, 147, 249))
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(" "));
-            if *is_submenu {
+            if *kind == MenuNodeKind::Submenu {
                 spans.push(Span::styled(
                     format!("{} \u{25b8}", label),
                     Style::default().fg(Color::Rgb(139, 233, 253)),
@@ -358,6 +380,21 @@ fn draw_content_rendered(frame: &mut Frame, area: Rect, state: &ViewState) {
     let viewport_height = area.height as usize;
     let content_width = state.viewport.content_width(terminal_width);
     let x_offset = state.viewport.content_offset(terminal_width);
+
+    // Draw midpoint marker in the left margin
+    let mid_y = viewport_height / 2;
+    if mid_y < viewport_height {
+        let marker_x = if x_offset >= 2 {
+            area.x + x_offset as u16 - 2
+        } else {
+            area.x
+        };
+        let marker_area = Rect::new(marker_x, area.y + mid_y as u16, 1, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled("\u{2192}", state.theme.midpoint_marker)),
+            marker_area,
+        );
+    }
 
     let mut y = 0usize;
     let view_start = state.viewport.scroll_offset;

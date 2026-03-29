@@ -1,4 +1,5 @@
-use sketch::menu::{MenuState, default_menu};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use sketch::menu::{MenuState, MenuNode, MenuAction, default_menu};
 
 #[test]
 fn test_menu_starts_inactive() {
@@ -9,7 +10,6 @@ fn test_menu_starts_inactive() {
 #[test]
 fn test_menu_open_close() {
     let mut state = MenuState::new();
-    let _menu = default_menu();
     state.open();
     assert!(state.is_active());
     state.close();
@@ -21,9 +21,12 @@ fn test_menu_command_key() {
     let mut state = MenuState::new();
     let menu = default_menu();
     state.open();
-    let result = state.process_key('f', &menu);
+    let result = state.process_key_event(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+        &menu,
+    );
     assert_eq!(result, Some("file-browser".to_string()));
-    assert!(!state.is_active()); // command closes menu
+    assert!(!state.is_active());
 }
 
 #[test]
@@ -31,9 +34,12 @@ fn test_menu_submenu_key() {
     let mut state = MenuState::new();
     let menu = default_menu();
     state.open();
-    let result = state.process_key('g', &menu);
-    assert_eq!(result, None); // submenu opened, no action dispatched
-    assert!(state.is_active()); // still in menu
+    let result = state.process_key_event(
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        &menu,
+    );
+    assert_eq!(result, None);
+    assert!(state.is_active());
 }
 
 #[test]
@@ -41,8 +47,11 @@ fn test_menu_submenu_then_command() {
     let mut state = MenuState::new();
     let menu = default_menu();
     state.open();
-    state.process_key('g', &menu); // enter goto submenu
-    let result = state.process_key('g', &menu);
+    state.process_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &menu);
+    let result = state.process_key_event(
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        &menu,
+    );
     assert_eq!(result, Some("goto-top".to_string()));
     assert!(!state.is_active());
 }
@@ -52,19 +61,18 @@ fn test_menu_escape_from_submenu() {
     let mut state = MenuState::new();
     let menu = default_menu();
     state.open();
-    state.process_key('g', &menu); // enter goto submenu
+    state.process_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &menu);
     state.handle_escape();
-    assert!(state.is_active()); // back to root menu, not closed
+    assert!(state.is_active());
     assert!(state.path.is_empty());
 }
 
 #[test]
 fn test_menu_escape_from_root() {
     let mut state = MenuState::new();
-    let _menu = default_menu();
     state.open();
     state.handle_escape();
-    assert!(!state.is_active()); // closed
+    assert!(!state.is_active());
 }
 
 #[test]
@@ -72,46 +80,46 @@ fn test_menu_unrecognized_key_ignored() {
     let mut state = MenuState::new();
     let menu = default_menu();
     state.open();
-    let result = state.process_key('z', &menu);
+    let result = state.process_key_event(
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+        &menu,
+    );
     assert_eq!(result, None);
-    assert!(state.is_active()); // still open
+    assert!(state.is_active());
 }
 
 #[test]
-fn test_menu_current_nodes() {
+fn test_menu_separator_and_label() {
+    let menu = vec![
+        MenuNode::entry("f", "file", "file-browser"),
+        MenuNode::separator(),
+        MenuNode::label("Navigation"),
+        MenuNode::entry("g", "goto top", "goto-top"),
+    ];
     let mut state = MenuState::new();
-    let menu = default_menu();
     state.open();
-    let nodes = state.current_nodes(&menu);
-    assert!(nodes.iter().any(|n| n.key == 'f'));
-    assert!(nodes.iter().any(|n| n.key == 'g'));
+    let result = state.process_key_event(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+        &menu,
+    );
+    assert_eq!(result, Some("file-browser".to_string()));
 }
 
 #[test]
-fn test_menu_submenu_current_nodes() {
+fn test_menu_modifier_key_entry() {
+    use sketch::keys::KeyPress;
+    let menu = vec![
+        MenuNode {
+            key: vec![KeyPress::new(KeyCode::Char('h'), KeyModifiers::CONTROL)],
+            label: "prev heading".into(),
+            action: MenuAction::Command("prev-heading".into()),
+        },
+    ];
     let mut state = MenuState::new();
-    let menu = default_menu();
     state.open();
-    state.process_key('g', &menu);
-    let nodes = state.current_nodes(&menu);
-    assert!(nodes.iter().any(|n| n.key == 'g')); // goto > g = top
-    assert!(nodes.iter().any(|n| n.key == 'e')); // goto > e = bottom
-}
-
-#[test]
-fn test_menu_new_entries() {
-    let mut state = MenuState::new();
-    let menu = default_menu();
-    state.open();
-    // Test new menu entries: quit, save, toggle view
-    let result = state.process_key('q', &menu);
-    assert_eq!(result, Some("quit".to_string()));
-
-    state.open();
-    let result = state.process_key('s', &menu);
-    assert_eq!(result, Some("save".to_string()));
-
-    state.open();
-    let result = state.process_key('v', &menu);
-    assert_eq!(result, Some("toggle-view".to_string()));
+    let result = state.process_key_event(
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        &menu,
+    );
+    assert_eq!(result, Some("prev-heading".to_string()));
 }

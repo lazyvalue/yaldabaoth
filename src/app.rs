@@ -109,13 +109,13 @@ impl App {
             };
 
             terminal.draw(|frame| {
-                let menu_nodes: Vec<(char, String, bool)> = if self.menu_state.is_active() {
+                let menu_nodes: Vec<(String, String, sketch::menu::MenuNodeKind)> = if self.menu_state.is_active() {
                     self.menu_state
                         .current_nodes(&self.menu_tree)
                         .iter()
                         .map(|n| {
-                            let is_sub = matches!(n.action, menu::MenuAction::Submenu(_));
-                            (n.key, n.label.clone(), is_sub)
+                            let key_display = sketch::keys::format_key_sequence(&n.key);
+                            (key_display, n.label.clone(), n.kind())
                         })
                         .collect()
                 } else {
@@ -377,13 +377,12 @@ impl App {
                     self.mode = AppMode::Normal;
                 }
             }
-            KeyCode::Char(c) => {
-                if let Some(cmd_name) = self.menu_state.process_key(c, &self.menu_tree) {
+            _ => {
+                if let Some(cmd_string) = self.menu_state.process_key_event(key, &self.menu_tree) {
                     self.mode = AppMode::Normal;
-                    self.dispatch_command(&cmd_name, viewport_height, content_width);
+                    self.dispatch_command(&cmd_string, viewport_height, content_width);
                 }
             }
-            _ => {}
         }
     }
 
