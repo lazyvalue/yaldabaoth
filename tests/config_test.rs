@@ -1,4 +1,6 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sketch::config::Config;
+use sketch::keybind::KeybindManager;
 use sketch::theme::ThemeName;
 
 fn parse_config(content: &str) -> Config {
@@ -142,4 +144,82 @@ fn test_unknown_theme_fails() {
         theme "nonexistent"
     "#);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_config_keybinds_override_default() {
+    let config = Config::load_from_str(r#"
+        keybindings {
+            "j" "scroll-up"
+        }
+    "#).unwrap();
+
+    let kb = config.keybinds.unwrap();
+    let mut mgr = KeybindManager::default();
+    mgr.apply_bindings(&kb.bindings);
+
+    // j should now be scroll-up instead of move-down
+    let result = mgr.process_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(result, Some("scroll-up".to_string()));
+
+    // k should still be the default
+    let result = mgr.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+    assert_eq!(result, Some("move-up".to_string()));
+}
+
+#[test]
+fn test_config_keybinds_reset_defaults() {
+    let config = Config::load_from_str(r#"
+        keybindings {
+            reset-defaults #true
+            "j" "move-down"
+        }
+    "#).unwrap();
+
+    let kb = config.keybinds.unwrap();
+    let mut mgr = if kb.reset_defaults {
+        KeybindManager::new(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        )
+    } else {
+        KeybindManager::default()
+    };
+    mgr.apply_bindings(&kb.bindings);
+
+    // j works
+    let result = mgr.process_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(result, Some("move-down".to_string()));
+
+    // k should NOT work (defaults were reset)
+    let result = mgr.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+    assert_eq!(result, None);
+}
+
+#[test]
+fn test_config_full_round_trip() {
+    let config = Config::load_from_str(r#"
+        theme "nightfox"
+
+        display {
+            max-line-width 120
+        }
+
+        keybindings {
+            "ctrl-d" "half-page-down"
+            "g g" "goto-top"
+        }
+
+        menu {
+            entry key="f" label="files" action="file-browser"
+            submenu key="g" label="goto" {
+                entry key="g" label="top" action="goto-top"
+            }
+        }
+    "#).unwrap();
+
+    assert_eq!(config.theme, ThemeName::Nightfox);
+    assert_eq!(config.max_line_width, 120);
+    assert!(config.keybinds.is_some());
+    assert!(config.menu.is_some());
 }
