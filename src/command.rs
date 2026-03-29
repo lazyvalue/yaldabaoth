@@ -23,6 +23,18 @@ impl CommandRegistry {
         })
     }
 
+    /// Resolve a full command string (optionally prefixed with ':') into an
+    /// Action and optional argument string.
+    pub fn resolve(&self, input: &str) -> Option<(Action, Option<String>)> {
+        let input = input.strip_prefix(':').unwrap_or(input).trim();
+        let (cmd_name, args) = match input.split_once(' ') {
+            Some((name, rest)) => (name, Some(rest.to_string())),
+            None => (input, None),
+        };
+        let cmd = self.lookup(cmd_name)?;
+        Some((cmd.action, args))
+    }
+
     /// Build the default registry with all built-in commands.
     pub fn default_registry() -> Self {
         Self::new(vec![
@@ -69,8 +81,8 @@ impl CommandRegistry {
                 description: "Open file browser".into(),
             },
             CommandDef {
-                name: "search".into(),
-                aliases: vec![],
+                name: "search-forward".into(),
+                aliases: vec!["search".into()],
                 action: Action::SearchForward,
                 description: "Search forward".into(),
             },
@@ -88,9 +100,208 @@ impl CommandRegistry {
             },
             CommandDef {
                 name: "goto-heading".into(),
-                aliases: vec![],
+                aliases: vec!["next-heading".into()],
                 action: Action::NextHeading,
                 description: "Next heading".into(),
+            },
+            // New commands
+            CommandDef {
+                name: "scroll-down".into(),
+                aliases: vec![],
+                action: Action::ScrollDown,
+                description: "Scroll down".into(),
+            },
+            CommandDef {
+                name: "scroll-up".into(),
+                aliases: vec![],
+                action: Action::ScrollUp,
+                description: "Scroll up".into(),
+            },
+            CommandDef {
+                name: "half-page-down".into(),
+                aliases: vec![],
+                action: Action::HalfPageDown,
+                description: "Scroll half page down".into(),
+            },
+            CommandDef {
+                name: "half-page-up".into(),
+                aliases: vec![],
+                action: Action::HalfPageUp,
+                description: "Scroll half page up".into(),
+            },
+            CommandDef {
+                name: "full-page-down".into(),
+                aliases: vec![],
+                action: Action::FullPageDown,
+                description: "Scroll full page down".into(),
+            },
+            CommandDef {
+                name: "full-page-up".into(),
+                aliases: vec![],
+                action: Action::FullPageUp,
+                description: "Scroll full page up".into(),
+            },
+            CommandDef {
+                name: "prev-heading".into(),
+                aliases: vec![],
+                action: Action::PrevHeading,
+                description: "Previous heading".into(),
+            },
+            CommandDef {
+                name: "next-heading-same-level".into(),
+                aliases: vec![],
+                action: Action::NextHeadingSameLevel,
+                description: "Next heading at same level".into(),
+            },
+            CommandDef {
+                name: "prev-heading-same-level".into(),
+                aliases: vec![],
+                action: Action::PrevHeadingSameLevel,
+                description: "Previous heading at same level".into(),
+            },
+            CommandDef {
+                name: "search-backward".into(),
+                aliases: vec![],
+                action: Action::SearchBackward,
+                description: "Search backward".into(),
+            },
+            CommandDef {
+                name: "search-next".into(),
+                aliases: vec![],
+                action: Action::SearchNext,
+                description: "Next search result".into(),
+            },
+            CommandDef {
+                name: "search-prev".into(),
+                aliases: vec![],
+                action: Action::SearchPrev,
+                description: "Previous search result".into(),
+            },
+            CommandDef {
+                name: "open-link".into(),
+                aliases: vec![],
+                action: Action::OpenLink,
+                description: "Open link under cursor".into(),
+            },
+            CommandDef {
+                name: "yank-line".into(),
+                aliases: vec![],
+                action: Action::YankLine,
+                description: "Yank current line".into(),
+            },
+            CommandDef {
+                name: "open-menu".into(),
+                aliases: vec![],
+                action: Action::OpenMenu,
+                description: "Open command menu".into(),
+            },
+            CommandDef {
+                name: "move-left".into(),
+                aliases: vec![],
+                action: Action::MoveLeft,
+                description: "Move cursor left".into(),
+            },
+            CommandDef {
+                name: "move-right".into(),
+                aliases: vec![],
+                action: Action::MoveRight,
+                description: "Move cursor right".into(),
+            },
+            CommandDef {
+                name: "move-up".into(),
+                aliases: vec![],
+                action: Action::MoveUp,
+                description: "Move cursor up".into(),
+            },
+            CommandDef {
+                name: "move-down".into(),
+                aliases: vec![],
+                action: Action::MoveDown,
+                description: "Move cursor down".into(),
+            },
+            CommandDef {
+                name: "move-word-forward".into(),
+                aliases: vec![],
+                action: Action::MoveWordForward,
+                description: "Move forward by word".into(),
+            },
+            CommandDef {
+                name: "move-word-backward".into(),
+                aliases: vec![],
+                action: Action::MoveWordBackward,
+                description: "Move backward by word".into(),
+            },
+            CommandDef {
+                name: "move-word-end".into(),
+                aliases: vec![],
+                action: Action::MoveWordEnd,
+                description: "Move to end of word".into(),
+            },
+            CommandDef {
+                name: "move-line-start".into(),
+                aliases: vec![],
+                action: Action::MoveLineStart,
+                description: "Move to start of line".into(),
+            },
+            CommandDef {
+                name: "move-line-end".into(),
+                aliases: vec![],
+                action: Action::MoveLineEnd,
+                description: "Move to end of line".into(),
+            },
+            CommandDef {
+                name: "insert-mode".into(),
+                aliases: vec![],
+                action: Action::InsertMode,
+                description: "Enter insert mode".into(),
+            },
+            CommandDef {
+                name: "insert-after".into(),
+                aliases: vec![],
+                action: Action::InsertAfter,
+                description: "Insert after cursor".into(),
+            },
+            CommandDef {
+                name: "open-line-below".into(),
+                aliases: vec![],
+                action: Action::OpenLineBelow,
+                description: "Open new line below".into(),
+            },
+            CommandDef {
+                name: "open-line-above".into(),
+                aliases: vec![],
+                action: Action::OpenLineAbove,
+                description: "Open new line above".into(),
+            },
+            CommandDef {
+                name: "delete-char".into(),
+                aliases: vec![],
+                action: Action::DeleteChar,
+                description: "Delete character under cursor".into(),
+            },
+            CommandDef {
+                name: "delete-line".into(),
+                aliases: vec![],
+                action: Action::DeleteLine,
+                description: "Delete current line".into(),
+            },
+            CommandDef {
+                name: "undo".into(),
+                aliases: vec![],
+                action: Action::Undo,
+                description: "Undo last change".into(),
+            },
+            CommandDef {
+                name: "redo".into(),
+                aliases: vec![],
+                action: Action::Redo,
+                description: "Redo last undone change".into(),
+            },
+            CommandDef {
+                name: "enter-command".into(),
+                aliases: vec![],
+                action: Action::EnterCommand,
+                description: "Enter command mode".into(),
             },
         ])
     }
@@ -125,5 +336,65 @@ mod tests {
         let reg = CommandRegistry::default_registry();
         let cmd = reg.lookup("q!").unwrap();
         assert_eq!(cmd.action, Action::ForceQuit);
+    }
+
+    #[test]
+    fn test_all_actions_have_commands() {
+        let reg = CommandRegistry::default_registry();
+        let expected = vec![
+            "scroll-down", "scroll-up", "half-page-down", "half-page-up",
+            "full-page-down", "full-page-up", "next-heading", "prev-heading",
+            "next-heading-same-level", "prev-heading-same-level",
+            "search-forward", "search-backward", "search-next", "search-prev",
+            "toggle-view", "open-link", "yank-line", "open-menu",
+            "move-left", "move-right", "move-up", "move-down",
+            "move-word-forward", "move-word-backward", "move-word-end",
+            "move-line-start", "move-line-end",
+            "insert-mode", "insert-after", "open-line-below", "open-line-above",
+            "delete-char", "delete-line", "undo", "redo", "enter-command",
+            "save", "quit", "force-quit", "save-quit", "save-as",
+            "goto-top", "goto-bottom", "goto-heading", "file-browser",
+        ];
+        for name in &expected {
+            assert!(reg.lookup(name).is_some(), "missing command: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_resolve_bare_command() {
+        let reg = CommandRegistry::default_registry();
+        let (action, args) = reg.resolve("save").unwrap();
+        assert_eq!(action, Action::Save);
+        assert!(args.is_none());
+    }
+
+    #[test]
+    fn test_resolve_command_with_args() {
+        let reg = CommandRegistry::default_registry();
+        let (action, args) = reg.resolve("goto-heading 2").unwrap();
+        assert_eq!(action, Action::NextHeading);
+        assert_eq!(args.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn test_resolve_colon_prefix_stripped() {
+        let reg = CommandRegistry::default_registry();
+        let (action, args) = reg.resolve(":goto-heading 2").unwrap();
+        assert_eq!(action, Action::NextHeading);
+        assert_eq!(args.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn test_resolve_alias() {
+        let reg = CommandRegistry::default_registry();
+        let (action, args) = reg.resolve("w").unwrap();
+        assert_eq!(action, Action::Save);
+        assert!(args.is_none());
+    }
+
+    #[test]
+    fn test_resolve_unknown() {
+        let reg = CommandRegistry::default_registry();
+        assert!(reg.resolve("nonexistent").is_none());
     }
 }
