@@ -327,6 +327,60 @@ impl CommandRegistry {
                 action: Action::CloseBuffer,
                 description: "Close current buffer".into(),
             },
+            CommandDef {
+                name: "reload".into(),
+                aliases: vec!["e".into(), "edit".into()],
+                action: Action::Reload,
+                description: "Reload current file from disk".into(),
+            },
+            CommandDef {
+                name: "outline".into(),
+                aliases: vec!["toc".into()],
+                action: Action::Outline,
+                description: "Show document outline".into(),
+            },
+            CommandDef {
+                name: "nav-cycle".into(),
+                aliases: vec![],
+                action: Action::NavCycle,
+                description: "Cycle navigation mode".into(),
+            },
+            CommandDef {
+                name: "nav-character".into(),
+                aliases: vec![],
+                action: Action::NavCharacter,
+                description: "Character navigation mode".into(),
+            },
+            CommandDef {
+                name: "nav-links".into(),
+                aliases: vec![],
+                action: Action::NavLinks,
+                description: "Link navigation mode".into(),
+            },
+            CommandDef {
+                name: "nav-headings".into(),
+                aliases: vec![],
+                action: Action::NavHeadings,
+                description: "Heading navigation mode".into(),
+            },
+            CommandDef {
+                name: "nav-list-items".into(),
+                aliases: vec![],
+                action: Action::NavListItems,
+                description: "List item navigation mode".into(),
+            },
+            CommandDef {
+                name: "nav-code-blocks".into(),
+                aliases: vec![],
+                action: Action::NavCodeBlocks,
+                description: "Code block navigation mode".into(),
+            },
+            CommandDef {
+                name: "nav-activate".into(),
+                aliases: vec![],
+                action: Action::NavActivate,
+                description: "Activate selected nav object".into(),
+            },
         ])
     }
 }
@@ -379,6 +433,8 @@ mod tests {
             "save", "quit", "force-quit", "save-quit", "save-as",
             "goto-top", "goto-bottom", "goto-heading", "file-browser",
             "next-buffer", "prev-buffer", "buffer-list", "close-buffer",
+            "nav-cycle", "nav-character", "nav-links", "nav-headings",
+            "nav-list-items", "nav-code-blocks", "nav-activate",
         ];
         for name in &expected {
             assert!(reg.lookup(name).is_some(), "missing command: {}", name);

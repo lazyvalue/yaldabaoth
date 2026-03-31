@@ -58,10 +58,19 @@ pub enum Action {
     FileBrowserParentDir,
     FileBrowserFilter,
     FileBrowserClose,
+    Reload,
+    Outline,
     NextBuffer,
     PrevBuffer,
     BufferList,
     CloseBuffer,
+    NavCycle,
+    NavCharacter,
+    NavLinks,
+    NavHeadings,
+    NavListItems,
+    NavCodeBlocks,
+    NavActivate,
     None,
 }
 
@@ -222,6 +231,11 @@ impl Default for KeybindManager {
         single.insert(key('N'), "search-prev".into());
         single.insert(key('y'), "yank-line".into());
         single.insert(key(' '), "open-menu".into());
+        single.insert(key('m'), "nav-cycle".into());
+        single.insert(
+            KeyPress::new(KeyCode::Enter, KeyModifiers::NONE),
+            "nav-activate".into(),
+        );
 
         single.insert(
             KeyPress::new(KeyCode::Tab, KeyModifiers::NONE),
@@ -237,6 +251,10 @@ impl Default for KeybindManager {
         multi.insert(vec![key('d'), key('d')], "delete-line".into());
         multi.insert(vec![key(']'), key(']')], "next-heading-same-level".into());
         multi.insert(vec![key('['), key('[')], "prev-heading-same-level".into());
+        multi.insert(vec![key('g'), key('l')], "nav-links".into());
+        multi.insert(vec![key('g'), key('h')], "nav-headings".into());
+        multi.insert(vec![key('g'), key('i')], "nav-list-items".into());
+        multi.insert(vec![key('g'), key('c')], "nav-code-blocks".into());
 
         Self::new(single, multi)
     }

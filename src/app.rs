@@ -22,6 +22,7 @@ enum AppMode {
     Menu,
     FileBrowser,
     BufferList,
+    Outline,
 }
 
 pub struct App {
@@ -46,6 +47,15 @@ pub struct App {
     buffer_list_selected: usize,
     buffer_list_filter_mode: bool,
     buffer_list_filter_text: String,
+    outline_selected: usize,
+    outline_filter_mode: bool,
+    outline_filter_text: String,
+    /// The heading level currently being viewed (None = show all top-level)
+    outline_parent_level: Option<u8>,
+    /// Y offset of the parent heading (to scope children)
+    outline_parent_y: Option<usize>,
+    /// Saved scroll offset to restore if Esc without selecting
+    outline_saved_scroll: usize,
 }
 
 impl App {
@@ -104,6 +114,12 @@ impl App {
             buffer_list_selected: 0,
             buffer_list_filter_mode: false,
             buffer_list_filter_text: String::new(),
+            outline_selected: 0,
+            outline_filter_mode: false,
+            outline_filter_text: String::new(),
+            outline_parent_level: None,
+            outline_parent_y: None,
+            outline_saved_scroll: 0,
         }
     }
 
@@ -205,6 +221,7 @@ impl App {
                         AppMode::Menu => "NORMAL",
                         AppMode::FileBrowser => "NORMAL",
                         AppMode::BufferList => "BUFFERS",
+                        AppMode::Outline => "OUTLINE",
                     },
                     cursor_line: buf.editor.cursor().line,
                     cursor_col: buf.editor.cursor().col,
@@ -213,6 +230,10 @@ impl App {
                     search_input_mode: self.search_input_mode,
                     search_input_buffer: &self.search_input_buffer,
                     search_match_count: self.search_matches.len(),
+                    search_matches: &self.search_matches,
+                    search_current_match: self.search_match_index,
+                    rendered_cursor_row: self.buffers[self.active_buffer].rendered_cursor_row,
+                    rendered_cursor_col: self.buffers[self.active_buffer].rendered_cursor_col,
                     menu_active: self.menu_state.is_active(),
                     menu_nodes,
                     menu_label: self.menu_state.current_label(&self.menu_tree),
@@ -230,6 +251,29 @@ impl App {
                     buffer_list_filter_text: self.buffer_list_filter_text.clone(),
                     buffer_count: self.buffers.len(),
                     active_buffer_index: self.active_buffer,
+                    outline_open: self.mode == AppMode::Outline,
+                    outline_entries: if self.mode == AppMode::Outline {
+                        let entries = self.filtered_outline_entries();
+                        entries.iter().enumerate().map(|(i, e)| {
+                            (e.title.clone(), e.level, i == self.outline_selected)
+                        }).collect()
+                    } else {
+                        Vec::new()
+                    },
+                    outline_filter_mode: self.outline_filter_mode,
+                    outline_filter_text: self.outline_filter_text.clone(),
+                    outline_breadcrumb: if self.outline_parent_level.is_some() {
+                        // Find parent title
+                        if let Some(parent_y) = self.outline_parent_y {
+                            self.outline_entries().iter()
+                                .find(|e| e.y_offset == parent_y)
+                                .map(|e| e.title.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    },
                 };
                 view::draw(frame, &state);
             })?;
@@ -238,11 +282,7 @@ impl App {
                 break;
             }
 
-            let timeout = if self.keybinds.has_pending() {
-                Duration::from_millis(100)
-            } else {
-                Duration::from_millis(250)
-            };
+            let timeout = Duration::from_millis(100);
 
             if event::poll(timeout)? {
                 match event::read()? {
@@ -253,8 +293,6 @@ impl App {
                     }
                     _ => {}
                 }
-            } else if self.keybinds.has_pending() {
-                self.keybinds.reset_pending();
             }
         }
 
@@ -280,6 +318,7 @@ impl App {
                 self.handle_file_browser_key(key, size.width, viewport_height, content_width)
             }
             AppMode::BufferList => self.handle_buffer_list_key(key, viewport_height, content_width),
+            AppMode::Outline => self.handle_outline_key(key, viewport_height, content_width),
         }
 
         self.buffers[self.active_buffer].update_total_lines(content_width);
@@ -413,14 +452,27 @@ impl App {
 
         if browser.filter_mode {
             match key.code {
-                KeyCode::Esc => browser.clear_filter(),
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    if let Some(path) = browser.enter_selected()
-                        && self.open_buffer(path)
-                    {
-                        self.file_browser = None;
-                        self.mode = AppMode::Normal;
+                KeyCode::Esc => {
+                    // Exit file browser entirely
+                    self.file_browser = None;
+                    self.mode = AppMode::Normal;
+                    return;
+                }
+                KeyCode::Enter => {
+                    let count = browser.visible_entries().len();
+                    if count == 1 {
+                        // Single result — open it directly
+                        if let Some(path) = browser.enter_selected()
+                            && self.open_buffer(path)
+                        {
+                            self.file_browser = None;
+                            self.mode = AppMode::Normal;
+                        }
+                    } else if count > 0 {
+                        // Multiple results — exit filter mode, navigate the list
+                        browser.filter_mode = false;
                     }
+                    return;
                 }
                 KeyCode::Backspace => {
                     let mut text = browser.filter_text().to_string();
@@ -449,6 +501,7 @@ impl App {
                 }
             }
             KeyCode::Char('h') | KeyCode::Backspace => browser.go_parent(),
+            KeyCode::Char('.') => browser.toggle_hidden(),
             KeyCode::Char('/') => browser.filter_mode = true,
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.file_browser = None;
@@ -491,7 +544,11 @@ impl App {
             }
             Action::MoveDown => {
                 if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
-                    self.buffers[self.active_buffer].viewport.scroll_down(1, viewport_height);
+                    let total = self.buffers[self.active_buffer].viewport.total_lines;
+                    if self.buffers[self.active_buffer].rendered_cursor_row + 1 < total {
+                        self.buffers[self.active_buffer].rendered_cursor_row += 1;
+                    }
+                    self.ensure_rendered_cursor_visible(viewport_height);
                 } else {
                     self.buffers[self.active_buffer].editor.move_down(false);
                     self.ensure_cursor_visible(viewport_height);
@@ -499,7 +556,9 @@ impl App {
             }
             Action::MoveUp => {
                 if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
-                    self.buffers[self.active_buffer].viewport.scroll_up(1);
+                    self.buffers[self.active_buffer].rendered_cursor_row =
+                        self.buffers[self.active_buffer].rendered_cursor_row.saturating_sub(1);
+                    self.ensure_rendered_cursor_visible(viewport_height);
                 } else {
                     self.buffers[self.active_buffer].editor.cursor_mut().move_up();
                     self.buffers[self.active_buffer].editor.clamp_cursor_col(false);
@@ -509,7 +568,21 @@ impl App {
             Action::MoveLeft | Action::MoveRight
             | Action::MoveWordForward | Action::MoveWordBackward | Action::MoveWordEnd
             | Action::MoveLineStart | Action::MoveLineEnd => {
-                if self.buffers[self.active_buffer].view_mode == ViewMode::Raw {
+                if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
+                    match action {
+                        Action::MoveLeft => {
+                            self.buffers[self.active_buffer].rendered_cursor_col =
+                                self.buffers[self.active_buffer].rendered_cursor_col.saturating_sub(1);
+                        }
+                        Action::MoveRight => {
+                            self.buffers[self.active_buffer].rendered_cursor_col += 1;
+                        }
+                        Action::MoveLineStart => {
+                            self.buffers[self.active_buffer].rendered_cursor_col = 0;
+                        }
+                        _ => {}
+                    }
+                } else {
                     match action {
                         Action::MoveLeft => self.buffers[self.active_buffer].editor.cursor_mut().move_left(),
                         Action::MoveRight => self.buffers[self.active_buffer].editor.move_right_clamped(false),
@@ -678,7 +751,9 @@ impl App {
                 }
             }
             Action::OpenLink => {
-                // TODO: implement link finding via tree-sitter/cursor position
+                if let Some(url) = self.link_under_rendered_cursor() {
+                    self.open_link(&url);
+                }
             }
             Action::YankLine => {
                 let buf = &self.buffers[self.active_buffer];
@@ -750,13 +825,43 @@ impl App {
             Action::CloseBuffer => {
                 self.close_current_buffer();
             }
+            Action::Reload => {
+                self.reload_current_buffer();
+            }
+            Action::Outline => {
+                self.outline_filter_mode = false;
+                self.outline_filter_text.clear();
+                self.outline_parent_level = None;
+                self.outline_parent_y = None;
+                self.outline_saved_scroll =
+                    self.buffers[self.active_buffer].viewport.scroll_offset;
+                self.mode = AppMode::Outline;
+                // Select the heading closest to current scroll position
+                let scroll = self.buffers[self.active_buffer].viewport.scroll_offset;
+                let entries = self.filtered_outline_entries();
+                self.outline_selected = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.y_offset <= scroll)
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.scroll_to_outline_entry();
+            }
             Action::None
             | Action::FileBrowserDown
             | Action::FileBrowserUp
             | Action::FileBrowserEnter
             | Action::FileBrowserParentDir
             | Action::FileBrowserFilter
-            | Action::FileBrowserClose => {}
+            | Action::FileBrowserClose
+            | Action::NavCycle
+            | Action::NavCharacter
+            | Action::NavLinks
+            | Action::NavHeadings
+            | Action::NavListItems
+            | Action::NavCodeBlocks
+            | Action::NavActivate => {}
         }
     }
 
@@ -781,6 +886,68 @@ impl App {
         } else {
             self.command_error = format!("Not an editor command: {}", cmd);
         }
+    }
+
+    fn open_link(&mut self, url: &str) {
+        // Check if it's a local file path (relative or absolute, no scheme)
+        let is_url = url.contains("://");
+        if !is_url {
+            // Resolve relative to the current file's directory
+            let base_dir = self.buffers[self.active_buffer]
+                .file_path()
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let path = base_dir.join(url);
+            if path.exists() {
+                self.open_buffer(path);
+                return;
+            }
+        }
+        // External URL or file not found — open with system handler
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+
+    /// Find the link URL under the rendered cursor, if any.
+    fn link_under_rendered_cursor(&self) -> Option<String> {
+        let buf = &self.buffers[self.active_buffer];
+        if buf.view_mode != ViewMode::Rendered {
+            return None;
+        }
+        let content_width = buf.viewport.content_width(200);
+        let target_row = buf.rendered_cursor_row;
+        let target_col = buf.rendered_cursor_col;
+
+        let mut row = 0;
+        for block in &buf.rendered_cache {
+            let h = buf.viewport.block_height(block, content_width);
+            if row + h > target_row {
+                // Target is in this block — get rendered lines
+                let lines = sketch::view::render_block_to_lines(block, content_width, &self.theme);
+                let line_idx = target_row - row;
+                if let Some(line) = lines.get(line_idx) {
+                    // Walk spans to find which one the cursor col falls in
+                    let mut col = 0;
+                    for span in &line.spans {
+                        let span_len = span.text.chars().count();
+                        if target_col >= col && target_col < col + span_len {
+                            return span.link.clone();
+                        }
+                        col += span_len;
+                    }
+                }
+                return None;
+            }
+            row += h;
+        }
+        None
+    }
+
+    fn ensure_rendered_cursor_visible(&mut self, viewport_height: usize) {
+        let buf = &self.buffers[self.active_buffer];
+        let row = buf.rendered_cursor_row;
+        self.buffers[self.active_buffer].viewport
+            .ensure_cursor_visible(row, viewport_height);
     }
 
     fn ensure_cursor_visible(&mut self, viewport_height: usize) {
@@ -817,10 +984,7 @@ impl App {
     }
 
     fn open_file_browser(&mut self) {
-        let dir = self.buffers[self.active_buffer].editor.document().file_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let dir = std::env::current_dir().unwrap_or_default();
         self.file_browser = Some(FileBrowser::new(dir));
         self.mode = AppMode::FileBrowser;
     }
@@ -871,19 +1035,76 @@ impl App {
         let line_count = buf.editor.document().line_count();
         for line_idx in 0..line_count {
             let line_text = buf.editor.document().line_text(line_idx);
-            if line_text.to_lowercase().contains(&query) {
-                self.search_matches.push((line_idx, 0));
+            let line_lower = line_text.to_lowercase();
+            let mut start = 0;
+            while let Some(pos) = line_lower[start..].find(&query) {
+                self.search_matches.push((line_idx, start + pos));
+                start += pos + query.len();
             }
         }
-        self.search_match_index = 0;
+
+        // Jump to the first match at or after the current cursor position
+        let buf = &self.buffers[self.active_buffer];
+        let cursor_line = buf.editor.cursor().line;
+        let cursor_col = buf.editor.cursor().col;
+        self.search_match_index = self
+            .search_matches
+            .iter()
+            .position(|&(line, col)| line > cursor_line || (line == cursor_line && col >= cursor_col))
+            .unwrap_or(0);
     }
 
     fn jump_to_match(&mut self, viewport_height: usize) {
-        if let Some(&(line_idx, _)) = self.search_matches.get(self.search_match_index) {
-            self.buffers[self.active_buffer].editor.cursor_mut().line = line_idx;
-            self.buffers[self.active_buffer].editor.cursor_mut().col = 0;
-            self.ensure_cursor_visible(viewport_height);
+        if let Some(&(line_idx, col_idx)) = self.search_matches.get(self.search_match_index) {
+            let buf = &mut self.buffers[self.active_buffer];
+            buf.editor.cursor_mut().line = line_idx;
+            buf.editor.cursor_mut().col = col_idx;
+            if buf.view_mode == ViewMode::Rendered {
+                // Find rendered position by counting matches (same as view does)
+                if let Some((row, col)) = self.find_rendered_match_position(self.search_match_index) {
+                    self.buffers[self.active_buffer].rendered_cursor_row = row;
+                    self.buffers[self.active_buffer].rendered_cursor_col = col;
+                }
+                self.ensure_rendered_cursor_visible(viewport_height);
+            } else {
+                self.ensure_cursor_visible(viewport_height);
+            }
         }
+    }
+
+    /// Find the rendered (row, col) of the Nth search match by scanning
+    /// rendered lines the same way the view does.
+    fn find_rendered_match_position(&self, match_index: usize) -> Option<(usize, usize)> {
+        let buf = &self.buffers[self.active_buffer];
+        let content_width = buf.viewport.content_width(200);
+        let query: Vec<char> = self.search_query.to_lowercase().chars().collect();
+        let qlen = query.len();
+        if qlen == 0 {
+            return None;
+        }
+
+        let mut counter = 0;
+        let mut row = 0;
+        for block in &buf.rendered_cache {
+            let lines = sketch::view::render_block_to_lines(block, content_width, &self.theme);
+            for line in &lines {
+                let lower: Vec<char> = line.text_content().to_lowercase().chars().collect();
+                let mut ci = 0;
+                while ci + qlen <= lower.len() {
+                    if lower[ci..ci + qlen] == query[..] {
+                        if counter == match_index {
+                            return Some((row, ci));
+                        }
+                        counter += 1;
+                        ci += qlen;
+                    } else {
+                        ci += 1;
+                    }
+                }
+                row += 1;
+            }
+        }
+        None
     }
 
     /// Find the y offset of the next heading after current scroll position.
@@ -932,6 +1153,29 @@ impl App {
         last_match
     }
 
+    fn reload_current_buffer(&mut self) {
+        let buf = &self.buffers[self.active_buffer];
+        if buf.editor.document().is_modified() {
+            self.command_error = "No write since last change (add ! to override)".to_string();
+            return;
+        }
+        let path = buf.file_path().to_path_buf();
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let new_buf = Buffer::new(
+                    path.display().to_string(),
+                    content,
+                    self.max_line_width,
+                    &self.theme,
+                );
+                self.buffers[self.active_buffer] = new_buf;
+            }
+            Err(e) => {
+                self.command_error = format!("Error reading file: {}", e);
+            }
+        }
+    }
+
     fn close_current_buffer(&mut self) {
         if self.buffers[self.active_buffer].editor.document().is_modified() {
             self.command_error = "No write since last change (add ! to override)".to_string();
@@ -951,16 +1195,21 @@ impl App {
         if self.buffer_list_filter_mode {
             match key.code {
                 KeyCode::Esc => {
-                    self.buffer_list_filter_mode = false;
-                    self.buffer_list_filter_text.clear();
-                    self.buffer_list_selected = 0;
+                    // Exit buffer list entirely
+                    self.mode = AppMode::Normal;
+                    return;
                 }
                 KeyCode::Enter => {
                     let filtered = self.filtered_buffer_indices();
-                    if let Some(&buf_idx) = filtered.get(self.buffer_list_selected) {
-                        self.active_buffer = buf_idx;
+                    if filtered.len() == 1 {
+                        // Single result — select it directly
+                        self.active_buffer = filtered[0];
                         self.mode = AppMode::Normal;
+                    } else if !filtered.is_empty() {
+                        // Multiple results — exit filter mode, navigate
+                        self.buffer_list_filter_mode = false;
                     }
+                    return;
                 }
                 KeyCode::Backspace => {
                     self.buffer_list_filter_text.pop();
@@ -1070,6 +1319,193 @@ impl App {
         }
         None
     }
+
+    // --- Outline (TOC) ---
+
+    fn handle_outline_key(&mut self, key: KeyEvent, _viewport_height: usize, _content_width: usize) {
+        if self.outline_filter_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    // Exit outline entirely, restore scroll
+                    self.buffers[self.active_buffer].viewport.scroll_offset =
+                        self.outline_saved_scroll;
+                    self.mode = AppMode::Normal;
+                    return;
+                }
+                KeyCode::Enter => {
+                    let entries = self.filtered_outline_entries();
+                    if entries.len() == 1 {
+                        // Single result — jump to it
+                        self.buffers[self.active_buffer].viewport.scroll_offset =
+                            entries[0].y_offset;
+                        self.mode = AppMode::Normal;
+                    } else if !entries.is_empty() {
+                        // Multiple results — exit filter mode, navigate
+                        self.outline_filter_mode = false;
+                        self.scroll_to_outline_entry();
+                    }
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.outline_filter_text.pop();
+                    self.outline_selected = 0;
+                    self.scroll_to_outline_entry();
+                }
+                KeyCode::Char(c) => {
+                    self.outline_filter_text.push(c);
+                    self.outline_selected = 0;
+                    self.scroll_to_outline_entry();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                // Restore saved scroll position
+                self.buffers[self.active_buffer].viewport.scroll_offset =
+                    self.outline_saved_scroll;
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let count = self.filtered_outline_entries().len();
+                if count > 0 {
+                    self.outline_selected = (self.outline_selected + 1) % count;
+                    self.scroll_to_outline_entry();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let count = self.filtered_outline_entries().len();
+                if count > 0 {
+                    self.outline_selected = if self.outline_selected == 0 {
+                        count - 1
+                    } else {
+                        self.outline_selected - 1
+                    };
+                    self.scroll_to_outline_entry();
+                }
+            }
+            KeyCode::Enter => {
+                let entries = self.filtered_outline_entries();
+                if let Some(entry) = entries.get(self.outline_selected) {
+                    self.buffers[self.active_buffer].viewport.scroll_offset = entry.y_offset;
+                    self.mode = AppMode::Normal;
+                }
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                // Descend: show children of the selected heading
+                let entries = self.filtered_outline_entries();
+                if let Some(entry) = entries.get(self.outline_selected) {
+                    self.outline_parent_level = Some(entry.level);
+                    self.outline_parent_y = Some(entry.y_offset);
+                    self.outline_selected = 0;
+                    self.outline_filter_text.clear();
+                    self.outline_filter_mode = false;
+                    // If no children, don't descend
+                    if self.filtered_outline_entries().is_empty() {
+                        self.outline_parent_level = None;
+                        self.outline_parent_y = None;
+                    } else {
+                        self.scroll_to_outline_entry();
+                    }
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                // Ascend: go back to parent level
+                if self.outline_parent_level.is_some() {
+                    // Find the parent heading and restore to its level
+                    let parent_y = self.outline_parent_y;
+                    self.outline_parent_level = None;
+                    self.outline_parent_y = None;
+                    self.outline_filter_text.clear();
+                    self.outline_filter_mode = false;
+                    // Try to select the entry we came from
+                    let entries = self.filtered_outline_entries();
+                    self.outline_selected = entries
+                        .iter()
+                        .position(|e| Some(e.y_offset) == parent_y)
+                        .unwrap_or(0);
+                    self.scroll_to_outline_entry();
+                }
+            }
+            KeyCode::Char('/') => {
+                self.outline_filter_mode = true;
+                self.outline_filter_text.clear();
+                self.outline_selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// Scroll the document to the currently selected outline entry.
+    fn scroll_to_outline_entry(&mut self) {
+        let entries = self.filtered_outline_entries();
+        if let Some(entry) = entries.get(self.outline_selected) {
+            self.buffers[self.active_buffer].viewport.scroll_offset = entry.y_offset;
+        }
+    }
+
+    /// Get all headings with their rendered y offsets.
+    fn outline_entries(&self) -> Vec<OutlineEntry> {
+        let buf = &self.buffers[self.active_buffer];
+        let content_width = buf.viewport.content_width(200);
+        let mut entries = Vec::new();
+        let mut y = 0;
+
+        for block in &buf.rendered_cache {
+            let h = buf.viewport.block_height(block, content_width);
+            if let RenderedBlock::Heading { level, content } = block {
+                entries.push(OutlineEntry {
+                    level: *level,
+                    title: content.text_content(),
+                    y_offset: y,
+                });
+            }
+            y += h;
+        }
+        entries
+    }
+
+    /// Get outline entries filtered by current hierarchy level and search text.
+    fn filtered_outline_entries(&self) -> Vec<OutlineEntry> {
+        let all = self.outline_entries();
+
+        // Apply hierarchy filter
+        let scoped: Vec<OutlineEntry> = if let Some(parent_level) = self.outline_parent_level {
+            let parent_y = self.outline_parent_y.unwrap_or(0);
+            let child_level = parent_level + 1;
+            // Show headings at child_level that come after parent_y
+            // and before the next heading at parent_level or above
+            all.into_iter()
+                .skip_while(|e| e.y_offset <= parent_y)
+                .take_while(|e| e.level > parent_level)
+                .filter(|e| e.level == child_level)
+                .collect()
+        } else {
+            // Show top-level: find the minimum heading level and show only those
+            let min_level = all.iter().map(|e| e.level).min().unwrap_or(1);
+            all.into_iter().filter(|e| e.level == min_level).collect()
+        };
+
+        // Apply text filter
+        if self.outline_filter_text.is_empty() {
+            scoped
+        } else {
+            let query = self.outline_filter_text.to_lowercase();
+            scoped
+                .into_iter()
+                .filter(|e| fuzzy_match(&e.title.to_lowercase(), &query))
+                .collect()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OutlineEntry {
+    level: u8,
+    title: String,
+    y_offset: usize,
 }
 
 fn fuzzy_match(text: &str, query: &str) -> bool {
