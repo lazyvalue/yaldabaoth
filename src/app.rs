@@ -12,6 +12,7 @@ use sketch::file_browser::FileBrowser;
 use sketch::keybind::{Action, KeybindManager};
 use sketch::menu::{self, MenuNode, MenuState};
 use sketch::theme::Theme;
+use sketch::buffer::NavMode;
 use sketch::view::{self, ViewMode, ViewState};
 
 #[derive(Debug, PartialEq)]
@@ -274,6 +275,18 @@ impl App {
                     } else {
                         None
                     },
+                    nav_mode_label: self.buffers[self.active_buffer].nav_mode.label()
+                        .map(|s| s.to_string()),
+                    nav_highlight: {
+                        let buf = &self.buffers[self.active_buffer];
+                        if buf.nav_mode != NavMode::Character {
+                            buf.nav_objects.get(buf.nav_object_index).map(|obj| {
+                                (obj.rendered_row, obj.col_start, obj.col_end)
+                            })
+                        } else {
+                            None
+                        }
+                    },
                 };
                 view::draw(frame, &state);
             })?;
@@ -346,6 +359,14 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        if key.code == KeyCode::Esc
+            && self.buffers[self.active_buffer].nav_mode != NavMode::Character
+            && self.buffers[self.active_buffer].view_mode == ViewMode::Rendered
+        {
+            self.buffers[self.active_buffer].nav_mode = NavMode::Character;
             return;
         }
 
@@ -544,9 +565,13 @@ impl App {
             }
             Action::MoveDown => {
                 if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
-                    let total = self.buffers[self.active_buffer].viewport.total_lines;
-                    if self.buffers[self.active_buffer].rendered_cursor_row + 1 < total {
-                        self.buffers[self.active_buffer].rendered_cursor_row += 1;
+                    if self.buffers[self.active_buffer].nav_mode != NavMode::Character {
+                        self.nav_move_next();
+                    } else {
+                        let total = self.buffers[self.active_buffer].viewport.total_lines;
+                        if self.buffers[self.active_buffer].rendered_cursor_row + 1 < total {
+                            self.buffers[self.active_buffer].rendered_cursor_row += 1;
+                        }
                     }
                     self.ensure_rendered_cursor_visible(viewport_height);
                 } else {
@@ -556,8 +581,12 @@ impl App {
             }
             Action::MoveUp => {
                 if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
-                    self.buffers[self.active_buffer].rendered_cursor_row =
-                        self.buffers[self.active_buffer].rendered_cursor_row.saturating_sub(1);
+                    if self.buffers[self.active_buffer].nav_mode != NavMode::Character {
+                        self.nav_move_prev();
+                    } else {
+                        self.buffers[self.active_buffer].rendered_cursor_row =
+                            self.buffers[self.active_buffer].rendered_cursor_row.saturating_sub(1);
+                    }
                     self.ensure_rendered_cursor_visible(viewport_height);
                 } else {
                     self.buffers[self.active_buffer].editor.cursor_mut().move_up();
@@ -569,19 +598,30 @@ impl App {
             | Action::MoveWordForward | Action::MoveWordBackward | Action::MoveWordEnd
             | Action::MoveLineStart | Action::MoveLineEnd => {
                 if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
-                    match action {
-                        Action::MoveLeft => {
-                            self.buffers[self.active_buffer].rendered_cursor_col =
-                                self.buffers[self.active_buffer].rendered_cursor_col.saturating_sub(1);
+                    let nav = self.buffers[self.active_buffer].nav_mode;
+                    if nav == NavMode::Link || nav == NavMode::ListItem {
+                        match action {
+                            Action::MoveLeft => self.nav_move_prev(),
+                            Action::MoveRight => self.nav_move_next(),
+                            _ => {}
                         }
-                        Action::MoveRight => {
-                            self.buffers[self.active_buffer].rendered_cursor_col += 1;
+                        self.ensure_rendered_cursor_visible(viewport_height);
+                    } else if nav == NavMode::Character {
+                        match action {
+                            Action::MoveLeft => {
+                                self.buffers[self.active_buffer].rendered_cursor_col =
+                                    self.buffers[self.active_buffer].rendered_cursor_col.saturating_sub(1);
+                            }
+                            Action::MoveRight => {
+                                self.buffers[self.active_buffer].rendered_cursor_col += 1;
+                            }
+                            Action::MoveLineStart => {
+                                self.buffers[self.active_buffer].rendered_cursor_col = 0;
+                            }
+                            _ => {}
                         }
-                        Action::MoveLineStart => {
-                            self.buffers[self.active_buffer].rendered_cursor_col = 0;
-                        }
-                        _ => {}
                     }
+                    // Heading and CodeBlock modes: h/l are no-ops
                 } else {
                     match action {
                         Action::MoveLeft => self.buffers[self.active_buffer].editor.cursor_mut().move_left(),
@@ -854,14 +894,35 @@ impl App {
             | Action::FileBrowserEnter
             | Action::FileBrowserParentDir
             | Action::FileBrowserFilter
-            | Action::FileBrowserClose
-            | Action::NavCycle
-            | Action::NavCharacter
-            | Action::NavLinks
-            | Action::NavHeadings
-            | Action::NavListItems
-            | Action::NavCodeBlocks
-            | Action::NavActivate => {}
+            | Action::FileBrowserClose => {}
+            Action::NavCycle => {
+                let current = self.buffers[self.active_buffer].nav_mode;
+                let next = current.next();
+                self.enter_nav_mode(next);
+                self.ensure_rendered_cursor_visible(viewport_height);
+            }
+            Action::NavCharacter => {
+                self.buffers[self.active_buffer].nav_mode = NavMode::Character;
+            }
+            Action::NavLinks => {
+                self.enter_nav_mode(NavMode::Link);
+                self.ensure_rendered_cursor_visible(viewport_height);
+            }
+            Action::NavHeadings => {
+                self.enter_nav_mode(NavMode::Heading);
+                self.ensure_rendered_cursor_visible(viewport_height);
+            }
+            Action::NavListItems => {
+                self.enter_nav_mode(NavMode::ListItem);
+                self.ensure_rendered_cursor_visible(viewport_height);
+            }
+            Action::NavCodeBlocks => {
+                self.enter_nav_mode(NavMode::CodeBlock);
+                self.ensure_rendered_cursor_visible(viewport_height);
+            }
+            Action::NavActivate => {
+                self.nav_activate();
+            }
         }
     }
 
@@ -886,6 +947,105 @@ impl App {
         } else {
             self.command_error = format!("Not an editor command: {}", cmd);
         }
+    }
+
+    fn enter_nav_mode(&mut self, mode: NavMode) {
+        let buf = &mut self.buffers[self.active_buffer];
+        if buf.view_mode != ViewMode::Rendered {
+            return;
+        }
+        buf.nav_mode = mode;
+        if mode == NavMode::Character {
+            return;
+        }
+        buf.rebuild_nav_objects(&self.theme);
+        let current_row = buf.rendered_cursor_row;
+        if let Some(idx) = buf.nearest_object_index(current_row) {
+            buf.nav_object_index = idx;
+            let obj = &buf.nav_objects[idx];
+            buf.rendered_cursor_row = obj.rendered_row;
+            buf.rendered_cursor_col = obj.col_start;
+        }
+    }
+
+    fn nav_activate(&mut self) {
+        let buf = &self.buffers[self.active_buffer];
+        if buf.view_mode != ViewMode::Rendered || buf.nav_mode == NavMode::Character {
+            return;
+        }
+        let obj = match buf.nav_objects.get(buf.nav_object_index) {
+            Some(o) => o.clone(),
+            None => return,
+        };
+        match obj.kind {
+            NavMode::Link => {
+                self.open_link(&obj.action_data);
+            }
+            NavMode::Heading => {
+                let buf = &mut self.buffers[self.active_buffer];
+                buf.rendered_cursor_row = obj.rendered_row;
+                buf.nav_mode = NavMode::Character;
+            }
+            NavMode::CodeBlock => {
+                use std::io::Write;
+                use std::process::{Command, Stdio};
+                if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(obj.action_data.as_bytes());
+                    }
+                }
+            }
+            NavMode::ListItem => {
+                // No-op for now
+            }
+            NavMode::Character => {}
+        }
+    }
+
+    fn nav_move_next(&mut self) {
+        let buf = &self.buffers[self.active_buffer];
+        let mode = buf.nav_mode;
+        let filtered: Vec<usize> = buf.nav_objects
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.kind == mode)
+            .map(|(i, _)| i)
+            .collect();
+        if filtered.is_empty() {
+            return;
+        }
+        let current_idx = buf.nav_object_index;
+        let pos = filtered.iter().position(|&i| i == current_idx).unwrap_or(0);
+        let next_pos = (pos + 1) % filtered.len();
+        let next_idx = filtered[next_pos];
+        let buf = &mut self.buffers[self.active_buffer];
+        buf.nav_object_index = next_idx;
+        let obj = &buf.nav_objects[next_idx];
+        buf.rendered_cursor_row = obj.rendered_row;
+        buf.rendered_cursor_col = obj.col_start;
+    }
+
+    fn nav_move_prev(&mut self) {
+        let buf = &self.buffers[self.active_buffer];
+        let mode = buf.nav_mode;
+        let filtered: Vec<usize> = buf.nav_objects
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.kind == mode)
+            .map(|(i, _)| i)
+            .collect();
+        if filtered.is_empty() {
+            return;
+        }
+        let current_idx = buf.nav_object_index;
+        let pos = filtered.iter().position(|&i| i == current_idx).unwrap_or(0);
+        let prev_pos = if pos == 0 { filtered.len() - 1 } else { pos - 1 };
+        let prev_idx = filtered[prev_pos];
+        let buf = &mut self.buffers[self.active_buffer];
+        buf.nav_object_index = prev_idx;
+        let obj = &buf.nav_objects[prev_idx];
+        buf.rendered_cursor_row = obj.rendered_row;
+        buf.rendered_cursor_col = obj.col_start;
     }
 
     fn open_link(&mut self, url: &str) {

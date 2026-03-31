@@ -32,6 +32,10 @@ pub struct ViewState<'a> {
     pub search_input_mode: bool,
     pub search_input_buffer: &'a str,
     pub search_match_count: usize,
+    pub search_matches: &'a [(usize, usize)], // (line, col) pairs
+    pub search_current_match: usize,
+    pub rendered_cursor_row: usize,
+    pub rendered_cursor_col: usize,
     pub menu_active: bool,
     pub menu_nodes: Vec<(String, String, MenuNodeKind)>, // (key_display, label, kind)
     pub menu_label: Option<String>,            // submenu breadcrumb label
@@ -49,6 +53,13 @@ pub struct ViewState<'a> {
     pub buffer_list_filter_text: String,
     pub buffer_count: usize,
     pub active_buffer_index: usize,
+    pub outline_open: bool,
+    pub outline_entries: Vec<(String, u8, bool)>, // (title, level, is_selected)
+    pub outline_filter_mode: bool,
+    pub outline_filter_text: String,
+    pub outline_breadcrumb: Option<String>,
+    pub nav_mode_label: Option<String>,
+    pub nav_highlight: Option<(usize, usize, usize)>, // (rendered_row, col_start, col_end)
 }
 
 pub fn draw(frame: &mut Frame, state: &ViewState) {
@@ -72,8 +83,8 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
 
     // Calculate file browser height
     let file_browser_height = if state.file_browser_open {
-        let max_height = (area.height as usize) / 3;
-        let header_rows = 1; // dir header
+        let max_height = (area.height as usize) / 2;
+        let header_rows = 1;
         let filter_rows = if state.file_browser_filter_mode { 1 } else { 0 };
         let entry_rows = state.file_browser_entries.len();
         (header_rows + filter_rows + entry_rows).min(max_height).max(1) as u16
@@ -81,10 +92,22 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
         0
     };
 
+    // Calculate outline height
+    let outline_height = if state.outline_open {
+        let max_height = (area.height as usize) / 3;
+        let header_rows = if state.outline_breadcrumb.is_some() { 1 } else { 0 };
+        let filter_rows = if state.outline_filter_mode { 1 } else { 0 };
+        let entry_rows = state.outline_entries.len().max(1);
+        (header_rows + filter_rows + entry_rows).min(max_height).max(1) as u16
+    } else {
+        0
+    };
+
     let chunks = Layout::vertical([
         Constraint::Length(1),                        // top bar
-        Constraint::Length(buffer_list_height),        // buffer list (0 when hidden)
-        Constraint::Length(file_browser_height),       // file browser (0 when hidden)
+        Constraint::Length(buffer_list_height),        // buffer list
+        Constraint::Length(file_browser_height),       // file browser
+        Constraint::Length(outline_height),            // outline
         Constraint::Min(1),                           // content
         Constraint::Length(1),                         // bottom bar
     ])
@@ -93,8 +116,9 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
     let top_bar = chunks[0];
     let buffer_list_area = chunks[1];
     let file_browser_area = chunks[2];
-    let content_area = chunks[3];
-    let bottom_bar = chunks[4];
+    let outline_area = chunks[3];
+    let content_area = chunks[4];
+    let bottom_bar = chunks[5];
 
     draw_top_bar(frame, top_bar, state);
 
@@ -105,6 +129,11 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
     if state.file_browser_open && file_browser_height > 0 {
         draw_file_browser_panel(frame, file_browser_area, state);
     }
+
+    if state.outline_open && outline_height > 0 {
+        draw_outline(frame, outline_area, state);
+    }
+
     draw_content(frame, content_area, state);
     if state.menu_active {
         draw_menu_popup(frame, content_area, state);
@@ -123,7 +152,14 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
         String::new()
     };
 
-    let position = format!("line {}/{} {}%{}", current_line, total, percent, buffer_info);
+    let nav_info = state.nav_mode_label.as_deref().unwrap_or("");
+    let nav_display = if !nav_info.is_empty() {
+        format!(" [{}]", nav_info)
+    } else {
+        String::new()
+    };
+
+    let position = format!("line {}/{} {}%{}{}", current_line, total, percent, buffer_info, nav_display);
     let available = area.width as usize;
 
     let modified_indicator = if state.modified { " [+]" } else { "" };
@@ -341,7 +377,15 @@ fn draw_file_browser_panel(frame: &mut Frame, area: Rect, state: &ViewState) {
         return;
     }
 
-    for (name, is_dir, is_selected) in &state.file_browser_entries {
+    // Compute scroll offset to keep selected entry visible
+    let visible_rows = (area.height - y) as usize;
+    let selected_idx = state.file_browser_entries.iter().position(|(_, _, sel)| *sel).unwrap_or(0);
+    let scroll_offset = scroll_to_keep_visible(selected_idx, visible_rows);
+
+    for (i, (name, is_dir, is_selected)) in state.file_browser_entries.iter().enumerate() {
+        if i < scroll_offset {
+            continue;
+        }
         if y >= area.height {
             break;
         }
@@ -398,8 +442,15 @@ fn draw_buffer_list(frame: &mut Frame, area: Rect, state: &ViewState) {
         }
     }
 
-    // Buffer entries
-    for (path, is_modified, is_active, is_selected) in &state.buffer_list_entries {
+    // Buffer entries — scroll to keep selection visible
+    let visible_rows = (area.height - y) as usize;
+    let selected_idx = state.buffer_list_entries.iter().position(|(_, _, _, sel)| *sel).unwrap_or(0);
+    let scroll_offset = scroll_to_keep_visible(selected_idx, visible_rows);
+
+    for (i, (path, is_modified, is_active, is_selected)) in state.buffer_list_entries.iter().enumerate() {
+        if i < scroll_offset {
+            continue;
+        }
         if y >= area.height {
             break;
         }
@@ -423,6 +474,107 @@ fn draw_buffer_list(frame: &mut Frame, area: Rect, state: &ViewState) {
             Span::styled(marker, bg_style.fg(Color::Rgb(189, 147, 249))),
             Span::styled(path.clone(), path_style),
             Span::styled(modified_indicator.to_string(), bg_style.fg(Color::Rgb(255, 184, 108))),
+        ]);
+
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(area.x, area.y + y, area.width, 1),
+        );
+        y += 1;
+    }
+}
+
+fn draw_outline(frame: &mut Frame, area: Rect, state: &ViewState) {
+    let bg = Paragraph::new("").style(Style::default().bg(Color::Rgb(30, 30, 48)));
+    frame.render_widget(bg, area);
+
+    let mut y = 0u16;
+
+    // Breadcrumb header (when descended into a level)
+    if let Some(ref breadcrumb) = state.outline_breadcrumb {
+        if y < area.height {
+            let header_line = Line::from(vec![
+                Span::styled(" \u{25c2} ", Style::default().fg(Color::Rgb(98, 114, 164))),
+                Span::styled(
+                    breadcrumb.clone(),
+                    Style::default()
+                        .fg(Color::Rgb(98, 114, 164))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]);
+            frame.render_widget(
+                Paragraph::new(header_line),
+                Rect::new(area.x, area.y + y, area.width, 1),
+            );
+            y += 1;
+        }
+    }
+
+    // Filter input
+    if state.outline_filter_mode && y < area.height {
+        let filter_line = Line::from(vec![
+            Span::styled(" / ", Style::default().fg(Color::Rgb(255, 184, 108))),
+            Span::styled(
+                &state.outline_filter_text,
+                Style::default().fg(Color::Rgb(241, 250, 140)),
+            ),
+            Span::styled("\u{258e}", Style::default().fg(Color::Rgb(102, 102, 102))),
+        ]);
+        frame.render_widget(
+            Paragraph::new(filter_line),
+            Rect::new(area.x, area.y + y, area.width, 1),
+        );
+        y += 1;
+    }
+
+    // Outline entries
+    if state.outline_entries.is_empty() && y < area.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  (no headings)",
+                Style::default().fg(Color::Rgb(102, 102, 102)),
+            ))),
+            Rect::new(area.x, area.y + y, area.width, 1),
+        );
+        return;
+    }
+
+    let visible_rows = (area.height - y) as usize;
+    let selected_idx = state
+        .outline_entries
+        .iter()
+        .position(|(_, _, sel)| *sel)
+        .unwrap_or(0);
+    let scroll_offset = scroll_to_keep_visible(selected_idx, visible_rows);
+
+    for (i, (title, level, is_selected)) in state.outline_entries.iter().enumerate() {
+        if i < scroll_offset {
+            continue;
+        }
+        if y >= area.height {
+            break;
+        }
+
+        let marker = if *is_selected { "\u{25b8} " } else { "  " };
+        let bg_style = if *is_selected {
+            Style::default().bg(Color::Rgb(40, 42, 54))
+        } else {
+            Style::default()
+        };
+
+        // Color by heading level
+        let level_style = match level {
+            1 => bg_style.fg(Color::Rgb(189, 147, 249)).add_modifier(Modifier::BOLD),
+            2 => bg_style.fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD),
+            3 => bg_style.fg(Color::Rgb(80, 250, 123)),
+            4 => bg_style.fg(Color::Rgb(241, 250, 140)),
+            5 => bg_style.fg(Color::Rgb(255, 184, 108)),
+            _ => bg_style.fg(Color::Rgb(204, 204, 204)),
+        };
+
+        let line = Line::from(vec![
+            Span::styled(marker, bg_style.fg(Color::Rgb(189, 147, 249))),
+            Span::styled(title.clone(), level_style),
         ]);
 
         frame.render_widget(
@@ -464,30 +616,170 @@ fn draw_content_rendered(frame: &mut Frame, area: Rect, state: &ViewState) {
     let mut y = 0usize;
     let view_start = state.viewport.scroll_offset;
     let view_end = state.viewport.scroll_offset + viewport_height;
+    // Global match counter — the Nth match found scanning rendered text
+    // top-to-bottom corresponds to search_matches[N].
+    let mut rendered_match_counter = 0usize;
 
     for block in state.rendered_blocks.iter() {
         let h = state.viewport.block_height(block, content_width);
         let block_end = y + h;
 
-        if block_end > view_start && y < view_end {
+        let is_visible = block_end > view_start && y < view_end;
+        let has_search = !state.search_query.is_empty();
+
+        // We must process all blocks (not just visible) to keep the match counter correct
+        if is_visible || has_search {
+            let is_code_block = matches!(block, RenderedBlock::CodeBlock { .. });
             let lines = render_block_to_lines(block, content_width, state.theme);
+
+            let query_lower: Vec<char> = if has_search {
+                state.search_query.to_lowercase().chars().collect()
+            } else {
+                Vec::new()
+            };
+            let qlen = query_lower.len();
 
             for (line_idx, line) in lines.iter().enumerate() {
                 let render_y = y + line_idx;
                 let screen_y = render_y as i32 - state.viewport.scroll_offset as i32;
-                if screen_y < 0 || screen_y >= viewport_height as i32 {
-                    continue;
+                let on_screen = screen_y >= 0 && screen_y < viewport_height as i32;
+
+                if on_screen {
+                    let line_area = Rect::new(
+                        area.x + x_offset as u16,
+                        area.y + screen_y as u16,
+                        content_width.min(area.width as usize - x_offset) as u16,
+                        1,
+                    );
+
+                    if is_code_block && line_idx < lines.len() - 1 {
+                        let bg = Paragraph::new("").style(state.theme.code_block_bg);
+                        frame.render_widget(bg, line_area);
+                    }
+
+                    let ratatui_line = styled_line_to_ratatui(line);
+                    frame.render_widget(Paragraph::new(ratatui_line), line_area);
+
+                    // Draw rendered-mode cursor / nav object highlight
+                    if state.view_mode == ViewMode::Rendered && state.show_block_cursor {
+                        if let Some((obj_row, obj_col_start, obj_col_end)) = state.nav_highlight {
+                            // Object mode: highlight full span
+                            if render_y == obj_row {
+                                let line_text = line.text_content();
+                                let line_chars: Vec<char> = line_text.chars().collect();
+                                let start = obj_col_start.min(line_chars.len());
+                                let end = obj_col_end.min(line_chars.len());
+                                if start < end {
+                                    let highlight_text: String = line_chars[start..end].iter().collect();
+                                    let highlight_x = area.x + x_offset as u16 + start as u16;
+                                    let w = (end - start) as u16;
+                                    if highlight_x < area.x + area.width {
+                                        let clamped_w = w.min(area.x + area.width - highlight_x);
+                                        let highlight_style = Style::default()
+                                            .fg(Color::Rgb(40, 42, 54))
+                                            .bg(Color::Rgb(248, 248, 242));
+                                        let highlight_area = Rect::new(
+                                            highlight_x,
+                                            area.y + screen_y as u16,
+                                            clamped_w,
+                                            1,
+                                        );
+                                        frame.render_widget(
+                                            Paragraph::new(Span::styled(
+                                                highlight_text,
+                                                highlight_style,
+                                            )),
+                                            highlight_area,
+                                        );
+                                    }
+                                }
+                            }
+                        } else if render_y == state.rendered_cursor_row {
+                            // Character mode: single char cursor
+                            let line_text = line.text_content();
+                            let line_chars: Vec<char> = line_text.chars().collect();
+                            let col = state.rendered_cursor_col.min(
+                                line_chars.len().saturating_sub(1),
+                            );
+                            let cursor_char = line_chars.get(col).copied().unwrap_or(' ');
+                            let cursor_x = area.x + x_offset as u16 + col as u16;
+                            if cursor_x < area.x + area.width {
+                                let mut span_col = 0;
+                                let mut on_link = false;
+                                for span in &line.spans {
+                                    let span_len = span.text.chars().count();
+                                    if col >= span_col && col < span_col + span_len {
+                                        on_link = span.link.is_some();
+                                        break;
+                                    }
+                                    span_col += span_len;
+                                }
+                                let cursor_style = if on_link {
+                                    Style::default()
+                                        .fg(Color::Rgb(40, 42, 54))
+                                        .bg(Color::Rgb(139, 233, 253))
+                                        .add_modifier(Modifier::UNDERLINED)
+                                } else {
+                                    Style::default()
+                                        .fg(Color::Rgb(40, 42, 54))
+                                        .bg(Color::Rgb(248, 248, 242))
+                                };
+                                let cursor_area = Rect::new(
+                                    cursor_x,
+                                    area.y + screen_y as u16,
+                                    1,
+                                    1,
+                                );
+                                frame.render_widget(
+                                    Paragraph::new(Span::styled(
+                                        cursor_char.to_string(),
+                                        cursor_style,
+                                    )),
+                                    cursor_area,
+                                );
+                            }
+                        }
+                    }
                 }
 
-                let line_area = Rect::new(
-                    area.x + x_offset as u16,
-                    area.y + screen_y as u16,
-                    content_width.min(area.width as usize - x_offset) as u16,
-                    1,
-                );
+                // Count and highlight search matches (count even off-screen)
+                if has_search && qlen > 0 {
+                    let line_text = line.text_content();
+                    let line_chars: Vec<char> = line_text.chars().collect();
+                    let lower_chars: Vec<char> = line_text.to_lowercase().chars().collect();
 
-                let ratatui_line = styled_line_to_ratatui(line);
-                frame.render_widget(Paragraph::new(ratatui_line), line_area);
+                    let mut ci = 0;
+                    while ci + qlen <= lower_chars.len() {
+                        if lower_chars[ci..ci + qlen] == query_lower[..] {
+                            if on_screen {
+                                let style = if rendered_match_counter == state.search_current_match {
+                                    state.theme.search_match_current
+                                } else {
+                                    state.theme.search_match
+                                };
+                                let highlight_x = area.x + x_offset as u16 + ci as u16;
+                                if highlight_x < area.x + area.width {
+                                    let w = qlen.min((area.x + area.width - highlight_x) as usize) as u16;
+                                    let match_text: String = line_chars[ci..ci + w as usize].iter().collect();
+                                    let highlight_area = Rect::new(
+                                        highlight_x,
+                                        area.y + screen_y as u16,
+                                        w,
+                                        1,
+                                    );
+                                    frame.render_widget(
+                                        Paragraph::new(Span::styled(match_text, style)),
+                                        highlight_area,
+                                    );
+                                }
+                            }
+                            rendered_match_counter += 1;
+                            ci += qlen;
+                        } else {
+                            ci += 1;
+                        }
+                    }
+                }
             }
         }
 
@@ -534,7 +826,12 @@ fn draw_content_raw(frame: &mut Frame, area: Rect, state: &ViewState) {
             frame.render_widget(bg, bg_area);
         }
 
-        let ratatui_line = Line::from(Span::styled(raw_line.clone(), text_style));
+        // Build line with search highlights
+        let ratatui_line = if !state.search_query.is_empty() {
+            build_highlighted_line(raw_line, doc_line, state, text_style)
+        } else {
+            Line::from(Span::styled(raw_line.clone(), text_style))
+        };
         frame.render_widget(Paragraph::new(ratatui_line), line_area);
 
         // Render cursor
@@ -561,8 +858,54 @@ fn draw_content_raw(frame: &mut Frame, area: Rect, state: &ViewState) {
     }
 }
 
+/// Build a line with search match highlighting.
+fn build_highlighted_line<'a>(
+    raw_line: &str,
+    doc_line: usize,
+    state: &ViewState<'a>,
+    base_style: Style,
+) -> Line<'static> {
+    let query_len = state.search_query.len();
+    if query_len == 0 {
+        return Line::from(Span::styled(raw_line.to_string(), base_style));
+    }
+
+    // Collect match columns on this line
+    let mut match_cols: Vec<(usize, bool)> = Vec::new(); // (col, is_current)
+    for (i, &(line, col)) in state.search_matches.iter().enumerate() {
+        if line == doc_line {
+            match_cols.push((col, i == state.search_current_match));
+        }
+    }
+
+    if match_cols.is_empty() {
+        return Line::from(Span::styled(raw_line.to_string(), base_style));
+    }
+
+    let mut spans = Vec::new();
+    let mut pos = 0;
+    for (col, is_current) in &match_cols {
+        if *col > pos {
+            spans.push(Span::styled(raw_line[pos..*col].to_string(), base_style));
+        }
+        let end = (*col + query_len).min(raw_line.len());
+        let match_style = if *is_current {
+            state.theme.search_match_current
+        } else {
+            state.theme.search_match
+        };
+        spans.push(Span::styled(raw_line[*col..end].to_string(), match_style));
+        pos = end;
+    }
+    if pos < raw_line.len() {
+        spans.push(Span::styled(raw_line[pos..].to_string(), base_style));
+    }
+
+    Line::from(spans)
+}
+
 /// Convert a RenderedBlock to terminal lines for display.
-fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> Vec<StyledLine> {
+pub fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> Vec<StyledLine> {
     match block {
         RenderedBlock::Heading { level, content } => {
             let mut lines = vec![content.clone()];
@@ -829,6 +1172,18 @@ fn wrap_styled_line(line: &StyledLine, width: usize, out: &mut Vec<StyledLine>) 
 
         out.push(StyledLine::new(spans));
         pos = break_at;
+    }
+}
+
+/// Compute scroll offset so that `selected` is visible within `visible_rows`.
+fn scroll_to_keep_visible(selected: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 {
+        return 0;
+    }
+    if selected >= visible_rows {
+        selected - visible_rows + 1
+    } else {
+        0
     }
 }
 
