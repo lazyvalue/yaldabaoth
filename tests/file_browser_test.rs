@@ -2,6 +2,18 @@ use sketch::file_browser::FileBrowser;
 use std::fs;
 use tempfile::TempDir;
 
+#[test]
+fn test_entries_have_metadata() {
+    let dir = setup_test_dir();
+    let browser = FileBrowser::new(dir.path().to_path_buf());
+    let file_entry = browser.entries().iter().find(|e| e.name == "README.md").unwrap();
+    assert!(file_entry.size.is_some());
+    assert!(file_entry.modified.is_some());
+    // Dirs should also have modified time
+    let dir_entry = browser.entries().iter().find(|e| e.name == "src").unwrap();
+    assert!(dir_entry.modified.is_some());
+}
+
 fn setup_test_dir() -> TempDir {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("README.md"), "hello").unwrap();
@@ -40,7 +52,7 @@ fn test_directories_sorted_first() {
 fn test_hidden_files_excluded() {
     let dir = setup_test_dir();
     let browser = FileBrowser::new(dir.path().to_path_buf());
-    assert!(!browser.entries().iter().any(|e| e.name.starts_with('.')));
+    assert!(!browser.entries().iter().any(|e| e.name.starts_with('.') && e.name != ".."));
 }
 
 #[test]

@@ -1,11 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const MAX_SEARCH_RESULTS: usize = 200;
+const MAX_SEARCH_DEPTH: usize = 8;
+
 #[derive(Debug, Clone)]
 pub struct BrowserEntry {
     pub name: String,
     pub is_dir: bool,
     pub path: PathBuf,
+    pub size: Option<u64>,
+    pub modified: Option<std::time::SystemTime>,
 }
 
 pub struct FileBrowser {
@@ -16,7 +21,10 @@ pub struct FileBrowser {
     selected: usize,
     filter_text: String,
     filtered_indices: Vec<usize>,
+    /// Recursive search results (populated when filter is non-empty).
+    search_results: Vec<BrowserEntry>,
     pub filter_mode: bool,
+    pub show_hidden: bool,
 }
 
 impl FileBrowser {
@@ -28,7 +36,9 @@ impl FileBrowser {
             selected: 0,
             filter_text: String::new(),
             filtered_indices: Vec::new(),
+            search_results: Vec::new(),
             filter_mode: false,
+            show_hidden: false,
         };
         browser.refresh();
         browser
@@ -56,10 +66,7 @@ impl FileBrowser {
         if self.filter_text.is_empty() {
             self.entries.iter().collect()
         } else {
-            self.filtered_indices
-                .iter()
-                .filter_map(|&i| self.entries.get(i))
-                .collect()
+            self.search_results.iter().collect()
         }
     }
 
@@ -116,14 +123,14 @@ impl FileBrowser {
 
     pub fn set_filter(&mut self, text: &str) {
         self.filter_text = text.to_string();
-        self.update_filtered();
-        // Reset selection to 0 when filter changes
+        self.update_search();
         self.selected = 0;
     }
 
     pub fn clear_filter(&mut self) {
         self.filter_text.clear();
         self.filtered_indices.clear();
+        self.search_results.clear();
         self.filter_mode = false;
         self.selected = 0;
     }
@@ -132,12 +139,20 @@ impl FileBrowser {
         &self.filter_text
     }
 
-    fn refresh(&mut self) {
-        self.entries = Self::list_directory(&self.current_dir);
-        self.update_filtered();
+    pub fn toggle_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.refresh();
+        if !self.filter_text.is_empty() {
+            self.update_search();
+        }
+        self.selected = 0;
     }
 
-    fn list_directory(dir: &Path) -> Vec<BrowserEntry> {
+    fn refresh(&mut self) {
+        self.entries = Self::list_directory(&self.current_dir, self.show_hidden);
+    }
+
+    fn list_directory(dir: &Path, show_hidden: bool) -> Vec<BrowserEntry> {
         let read_dir = match fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(_) => return Vec::new(),
@@ -149,8 +164,8 @@ impl FileBrowser {
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
 
-            // Skip hidden files
-            if name.starts_with('.') {
+            // Skip hidden files unless toggled on
+            if !show_hidden && name.starts_with('.') {
                 continue;
             }
 
@@ -163,7 +178,9 @@ impl FileBrowser {
             };
 
             let is_dir = metadata.is_dir();
-            let browser_entry = BrowserEntry { name, is_dir, path };
+            let size = if metadata.is_file() { Some(metadata.len()) } else { None };
+            let modified = metadata.modified().ok();
+            let browser_entry = BrowserEntry { name, is_dir, path, size, modified };
 
             if is_dir {
                 dirs.push(browser_entry);
@@ -176,23 +193,121 @@ impl FileBrowser {
         dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
-        // Directories first, then files
-        dirs.extend(files);
-        dirs
+        // Parent entry first, then directories, then files
+        let mut result = Vec::new();
+        if let Some(parent) = dir.parent() {
+            result.push(BrowserEntry {
+                name: "..".to_string(),
+                is_dir: true,
+                path: parent.to_path_buf(),
+                size: None,
+                modified: None,
+            });
+        }
+        result.extend(dirs);
+        result.extend(files);
+        result
     }
 
-    fn update_filtered(&mut self) {
+    /// Recursively search for files matching the query.
+    fn update_search(&mut self) {
+        self.search_results.clear();
         if self.filter_text.is_empty() {
-            self.filtered_indices.clear();
             return;
         }
         let query = self.filter_text.to_lowercase();
-        self.filtered_indices = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.name.to_lowercase().contains(&query))
-            .map(|(i, _)| i)
-            .collect();
+        Self::search_recursive(
+            &self.current_dir,
+            &self.current_dir,
+            &query,
+            &mut self.search_results,
+            0,
+            self.show_hidden,
+        );
+        // Sort by match quality: exact filename > starts-with > shorter path > alphabetical
+        let q = query.clone();
+        self.search_results.sort_by(|a, b| {
+            fn score(name: &str, query: &str) -> u8 {
+                let lower = name.to_lowercase();
+                // Extract just the filename from the relative path
+                let filename = name.rsplit('/').next().unwrap_or(name).to_lowercase();
+                if filename == query {
+                    0 // exact filename match
+                } else if filename.starts_with(query) {
+                    1 // filename starts with query
+                } else if lower == query {
+                    2 // exact path match
+                } else if filename.contains(query) {
+                    3 // filename contains query
+                } else {
+                    4 // path contains query
+                }
+            }
+            let sa = score(&a.name, &q);
+            let sb = score(&b.name, &q);
+            sa.cmp(&sb)
+                .then_with(|| a.name.len().cmp(&b.name.len()))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+    }
+
+    fn search_recursive(
+        base: &Path,
+        dir: &Path,
+        query: &str,
+        results: &mut Vec<BrowserEntry>,
+        depth: usize,
+        show_hidden: bool,
+    ) {
+        if depth > MAX_SEARCH_DEPTH || results.len() >= MAX_SEARCH_RESULTS {
+            return;
+        }
+
+        let read_dir = match fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => return,
+        };
+
+        for entry in read_dir.flatten() {
+            if results.len() >= MAX_SEARCH_RESULTS {
+                return;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+
+            let path = entry.path();
+            let metadata = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let is_dir = metadata.is_dir();
+
+            // Show relative path from the current directory
+            let relative = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+
+            if relative.to_lowercase().contains(query) {
+                let size = if metadata.is_file() { Some(metadata.len()) } else { None };
+                let modified = metadata.modified().ok();
+                results.push(BrowserEntry {
+                    name: relative,
+                    is_dir,
+                    path: path.clone(),
+                    size,
+                    modified,
+                });
+            }
+
+            if is_dir {
+                Self::search_recursive(base, &path, query, results, depth + 1, show_hidden);
+            }
+        }
     }
 }
