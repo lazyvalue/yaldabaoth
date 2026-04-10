@@ -64,6 +64,7 @@ pub struct App {
     outline_parent_y: Option<usize>,
     /// Saved scroll offset to restore if Esc without selecting
     outline_saved_scroll: usize,
+    full_browser_pending_g: bool,
 }
 
 impl App {
@@ -129,6 +130,7 @@ impl App {
             outline_parent_level: None,
             outline_parent_y: None,
             outline_saved_scroll: 0,
+            full_browser_pending_g: false,
         }
     }
 
@@ -585,12 +587,99 @@ impl App {
         _viewport_height: usize,
         _content_width: usize,
     ) {
-        // Close on q/Esc for now — full implementation in Task 5
+        let browser = match &mut self.file_browser {
+            Some(b) => b,
+            None => {
+                self.screen = AppScreen::Editor;
+                self.mode = AppMode::Normal;
+                return;
+            }
+        };
+
+        if browser.filter_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.close_full_browser();
+                    return;
+                }
+                KeyCode::Enter => {
+                    let count = browser.visible_entries().len();
+                    if count == 1 {
+                        if let Some(path) = browser.enter_selected() {
+                            if self.open_buffer(path) {
+                                self.screen = AppScreen::Editor;
+                                self.mode = AppMode::Normal;
+                            }
+                        }
+                    } else if count > 0 {
+                        browser.filter_mode = false;
+                    }
+                    return;
+                }
+                KeyCode::Backspace => {
+                    let mut text = browser.filter_text().to_string();
+                    text.pop();
+                    browser.set_filter(&text);
+                }
+                KeyCode::Char(c) => {
+                    let mut text = browser.filter_text().to_string();
+                    text.push(c);
+                    browser.set_filter(&text);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Normal mode
         match key.code {
+            KeyCode::Char('j') | KeyCode::Down => browser.move_down(),
+            KeyCode::Char('k') | KeyCode::Up => browser.move_up(),
+            KeyCode::Char('l') | KeyCode::Enter => {
+                if let Some(path) = browser.enter_selected() {
+                    if self.open_buffer(path) {
+                        self.screen = AppScreen::Editor;
+                        self.mode = AppMode::Normal;
+                    }
+                }
+            }
+            KeyCode::Char('o') => {
+                // Open file but stay in browser
+                if let Some(path) = browser.enter_selected() {
+                    let _ = self.open_buffer(path);
+                    // Stay in full browser screen
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Char('-') | KeyCode::Backspace => browser.go_parent(),
+            KeyCode::Char('.') => browser.toggle_hidden(),
+            KeyCode::Char('/') => browser.filter_mode = true,
+            KeyCode::Char('G') => {
+                let len = browser.visible_entries().len();
+                if len > 0 {
+                    browser.set_selected(len - 1);
+                }
+            }
+            KeyCode::Char('g') => {
+                if self.full_browser_pending_g {
+                    // gg — jump to first entry
+                    browser.set_selected(0);
+                    self.full_browser_pending_g = false;
+                } else {
+                    self.full_browser_pending_g = true;
+                    return; // wait for next key
+                }
+            }
+            KeyCode::Tab => {
+                if let AppScreen::FileBrowser { came_from_dropdown: true } = self.screen {
+                    self.close_full_browser();
+                }
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.close_full_browser();
             }
-            _ => {}
+            _ => {
+                self.full_browser_pending_g = false;
+            }
         }
     }
 
