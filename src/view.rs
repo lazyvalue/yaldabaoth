@@ -1222,8 +1222,189 @@ fn styled_line_to_ratatui(line: &StyledLine) -> Line<'static> {
     )
 }
 
-fn draw_full_file_browser(frame: &mut Frame, area: Rect, _fb: &FullBrowserViewState, _theme: &Theme) {
-    // Placeholder — filled in Task 4
-    let bg = Paragraph::new("FILE BROWSER").style(Style::default().fg(Color::White));
+fn format_file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}K", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn format_mtime(time: std::time::SystemTime) -> String {
+    let duration = time.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = duration.as_secs();
+    let days = secs / 86400;
+    let (_year, month, day) = days_to_ymd(days);
+    let months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    let mon = months.get(month as usize).unwrap_or(&"???");
+    format!("{} {:2}", mon, day)
+}
+
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m - 1, d) // month 0-indexed for array lookup
+}
+
+fn draw_full_file_browser(frame: &mut Frame, area: Rect, fb: &FullBrowserViewState, _theme: &Theme) {
+    // Background
+    let bg = Paragraph::new("").style(Style::default().bg(Color::Rgb(30, 30, 48)));
     frame.render_widget(bg, area);
+
+    // Layout: header(1) + entries(fill) + filter(0 or 1) + hints(1)
+    let filter_height = if fb.filter_mode { 1u16 } else { 0 };
+    let chunks = Layout::vertical([
+        Constraint::Length(1),                // header
+        Constraint::Min(1),                   // entry list
+        Constraint::Length(filter_height),     // filter input
+        Constraint::Length(1),                // hint bar
+    ])
+    .split(area);
+
+    let header_area = chunks[0];
+    let list_area = chunks[1];
+    let filter_area = chunks[2];
+    let hint_area = chunks[3];
+
+    // --- Header: breadcrumb path ---
+    let max_dir_width = header_area.width as usize - 3;
+    let dir_display = if fb.dir.len() > max_dir_width {
+        let start = fb.dir.len() - max_dir_width;
+        format!(" \u{25b8} \u{2026}{}", &fb.dir[start..])
+    } else {
+        format!(" \u{25b8} {}", fb.dir)
+    };
+    let header_line = Line::from(Span::styled(
+        dir_display,
+        Style::default().fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(
+        Paragraph::new(header_line).style(Style::default().bg(Color::Rgb(40, 42, 54))),
+        header_area,
+    );
+
+    // --- Entry list ---
+    let visible_rows = list_area.height as usize;
+    let selected_idx = fb.entries.iter().position(|e| e.is_selected).unwrap_or(0);
+    let scroll_offset = scroll_to_keep_visible(selected_idx, visible_rows);
+
+    // Column widths: 2 marker + name(fill) + 2 pad + 6 size + 2 pad + 7 mtime
+    let size_col_width: u16 = 6;
+    let mtime_col_width: u16 = 7;
+    let padding: u16 = 2;
+    let metadata_width = padding + size_col_width + padding + mtime_col_width;
+
+    if fb.entries.is_empty() {
+        let empty_line = Line::from(Span::styled(
+            "  (empty)",
+            Style::default().fg(Color::Rgb(102, 102, 102)),
+        ));
+        frame.render_widget(
+            Paragraph::new(empty_line),
+            Rect::new(list_area.x, list_area.y, list_area.width, 1),
+        );
+    } else {
+        let mut y = 0u16;
+        for (i, entry) in fb.entries.iter().enumerate() {
+            if i < scroll_offset {
+                continue;
+            }
+            if y >= list_area.height {
+                break;
+            }
+
+            let row_area = Rect::new(list_area.x, list_area.y + y, list_area.width, 1);
+
+            let marker = if entry.is_selected { "\u{25b8} " } else { "  " };
+            let bg_style = if entry.is_selected {
+                Style::default().bg(Color::Rgb(50, 52, 68))
+            } else {
+                Style::default().bg(Color::Rgb(30, 30, 48))
+            };
+
+            // Fill row background
+            let bg_fill = Paragraph::new("").style(bg_style);
+            frame.render_widget(bg_fill, row_area);
+
+            let name_style = if entry.is_dir {
+                bg_style.fg(Color::Rgb(139, 233, 253))
+            } else {
+                bg_style.fg(Color::Rgb(204, 204, 204))
+            };
+            let suffix = if entry.is_dir { "/" } else { "" };
+
+            let name_max = (list_area.width - metadata_width - 2) as usize; // 2 for marker
+            let name_text = format!("{}{}", entry.name, suffix);
+            let name_display = if name_text.len() > name_max {
+                format!("\u{2026}{}", &name_text[name_text.len() - name_max + 1..])
+            } else {
+                name_text.clone()
+            };
+
+            let size_str = match entry.size {
+                Some(s) => format_file_size(s),
+                None => "\u{2014}".to_string(),
+            };
+            let mtime_str = match entry.modified {
+                Some(t) => format_mtime(t),
+                None => "\u{2014}".to_string(),
+            };
+
+            let name_padding = name_max.saturating_sub(name_display.len());
+
+            let spans = vec![
+                Span::styled(marker, bg_style.fg(Color::Rgb(189, 147, 249))),
+                Span::styled(name_display, name_style),
+                Span::styled(" ".repeat(name_padding), bg_style),
+                Span::styled("  ", bg_style),
+                Span::styled(format!("{:>width$}", size_str, width = size_col_width as usize), bg_style.fg(Color::Rgb(98, 114, 164))),
+                Span::styled("  ", bg_style),
+                Span::styled(format!("{:>width$}", mtime_str, width = mtime_col_width as usize), bg_style.fg(Color::Rgb(98, 114, 164))),
+            ];
+
+            frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
+            y += 1;
+        }
+    }
+
+    // --- Filter input ---
+    if fb.filter_mode {
+        let filter_line = Line::from(vec![
+            Span::styled(" / ", Style::default().fg(Color::Rgb(255, 184, 108)).bg(Color::Rgb(30, 30, 48))),
+            Span::styled(
+                &fb.filter_text,
+                Style::default().fg(Color::Rgb(241, 250, 140)).bg(Color::Rgb(30, 30, 48)),
+            ),
+            Span::styled("\u{258e}", Style::default().fg(Color::Rgb(102, 102, 102)).bg(Color::Rgb(30, 30, 48))),
+        ]);
+        frame.render_widget(Paragraph::new(filter_line), filter_area);
+    }
+
+    // --- Hint bar ---
+    let mut hints = String::from(" enter:open  o:open+stay  -:parent  .:hidden  /:filter");
+    if fb.came_from_dropdown {
+        hints.push_str("  tab:collapse");
+    }
+    hints.push_str("  q:close");
+    let hint_line = Line::from(Span::styled(
+        hints,
+        Style::default().fg(Color::Rgb(98, 114, 164)).bg(Color::Rgb(25, 25, 40)),
+    ));
+    frame.render_widget(
+        Paragraph::new(hint_line).style(Style::default().bg(Color::Rgb(25, 25, 40))),
+        hint_area,
+    );
 }
