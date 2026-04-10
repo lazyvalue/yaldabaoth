@@ -209,6 +209,34 @@ impl App {
                     Vec::new()
                 };
 
+                let full_browser_state = if let AppScreen::FileBrowser { came_from_dropdown } = self.screen {
+                    if let Some(browser) = &self.file_browser {
+                        let entries: Vec<view::FullBrowserEntry> = browser
+                            .visible_entries()
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| view::FullBrowserEntry {
+                                name: e.name.clone(),
+                                is_dir: e.is_dir,
+                                is_selected: i == browser.selected(),
+                                size: e.size,
+                                modified: e.modified,
+                            })
+                            .collect();
+                        Some(view::FullBrowserViewState {
+                            dir: browser.current_dir().display().to_string(),
+                            entries,
+                            filter_mode: browser.filter_mode,
+                            filter_text: browser.filter_text().to_string(),
+                            came_from_dropdown,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 let buf = &self.buffers[self.active_buffer];
                 let filename_display = buf.editor.document().file_path.display().to_string();
 
@@ -295,6 +323,7 @@ impl App {
                             None
                         }
                     },
+                    full_browser: full_browser_state,
                 };
                 view::draw(frame, &state);
             })?;
@@ -329,6 +358,12 @@ impl App {
         let size = terminal.size()?;
         let viewport_height = (size.height as usize).saturating_sub(2);
         let content_width = self.effective_content_width(size.width as usize);
+
+        if let AppScreen::FileBrowser { .. } = self.screen {
+            self.handle_full_browser_key(key, size.width, viewport_height, content_width);
+            self.buffers[self.active_buffer].update_total_lines(content_width);
+            return Ok(());
+        }
 
         match self.mode {
             AppMode::Normal => self.handle_normal_key(key, viewport_height, content_width),
@@ -534,6 +569,40 @@ impl App {
             KeyCode::Char('/') => browser.filter_mode = true,
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.file_browser = None;
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Tab => {
+                self.open_file_browser_full(true);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_full_browser_key(
+        &mut self,
+        key: KeyEvent,
+        _term_width: u16,
+        _viewport_height: usize,
+        _content_width: usize,
+    ) {
+        // Close on q/Esc for now — full implementation in Task 5
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.close_full_browser();
+            }
+            _ => {}
+        }
+    }
+
+    fn close_full_browser(&mut self) {
+        match self.screen {
+            AppScreen::FileBrowser { came_from_dropdown: true } => {
+                self.screen = AppScreen::Editor;
+                // file_browser stays Some, mode stays FileBrowser for dropdown
+                self.mode = AppMode::FileBrowser;
+            }
+            AppScreen::FileBrowser { came_from_dropdown: false } => {
+                self.screen = AppScreen::Editor;
                 self.mode = AppMode::Normal;
             }
             _ => {}

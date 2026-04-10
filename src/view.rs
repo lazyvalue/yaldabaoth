@@ -16,6 +16,22 @@ pub enum ViewMode {
     Raw,
 }
 
+pub struct FullBrowserEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub is_selected: bool,
+    pub size: Option<u64>,
+    pub modified: Option<std::time::SystemTime>,
+}
+
+pub struct FullBrowserViewState {
+    pub dir: String,
+    pub entries: Vec<FullBrowserEntry>,
+    pub filter_mode: bool,
+    pub filter_text: String,
+    pub came_from_dropdown: bool,
+}
+
 pub struct ViewState<'a> {
     pub filename: &'a str,
     pub modified: bool,
@@ -60,6 +76,7 @@ pub struct ViewState<'a> {
     pub outline_breadcrumb: Option<String>,
     pub nav_mode_label: Option<String>,
     pub nav_highlight: Option<(usize, usize, usize)>, // (rendered_row, col_start, col_end)
+    pub full_browser: Option<FullBrowserViewState>,
 }
 
 pub fn draw(frame: &mut Frame, state: &ViewState) {
@@ -68,6 +85,11 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
     if area.width < 40 || area.height < 5 {
         let msg = Paragraph::new("Terminal too small (min 40x5)");
         frame.render_widget(msg, area);
+        return;
+    }
+
+    if let Some(ref fb_state) = state.full_browser {
+        draw_full_file_browser(frame, area, fb_state, state.theme);
         return;
     }
 
@@ -661,7 +683,7 @@ fn draw_content_rendered(frame: &mut Frame, area: Rect, state: &ViewState) {
                     frame.render_widget(Paragraph::new(ratatui_line), line_area);
 
                     // Draw rendered-mode cursor / nav object highlight
-                    if state.view_mode == ViewMode::Rendered && state.show_block_cursor {
+                    if state.view_mode == ViewMode::Rendered {
                         if let Some((obj_row, obj_col_start, obj_col_end)) = state.nav_highlight {
                             // Object mode: highlight full span
                             if render_y == obj_row {
@@ -714,7 +736,11 @@ fn draw_content_rendered(frame: &mut Frame, area: Rect, state: &ViewState) {
                                     }
                                     span_col += span_len;
                                 }
-                                let cursor_style = if on_link {
+                                let cursor_style = if !state.show_block_cursor {
+                                    Style::default()
+                                        .fg(Color::Rgb(248, 248, 242))
+                                        .bg(Color::Rgb(80, 80, 120))
+                                } else if on_link {
                                     Style::default()
                                         .fg(Color::Rgb(40, 42, 54))
                                         .bg(Color::Rgb(139, 233, 253))
@@ -1194,4 +1220,10 @@ fn styled_line_to_ratatui(line: &StyledLine) -> Line<'static> {
             .map(|s| Span::styled(s.text.clone(), s.style))
             .collect::<Vec<_>>(),
     )
+}
+
+fn draw_full_file_browser(frame: &mut Frame, area: Rect, _fb: &FullBrowserViewState, _theme: &Theme) {
+    // Placeholder — filled in Task 4
+    let bg = Paragraph::new("FILE BROWSER").style(Style::default().fg(Color::White));
+    frame.render_widget(bg, area);
 }
