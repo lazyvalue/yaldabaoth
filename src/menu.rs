@@ -198,6 +198,7 @@ impl Default for MenuState {
 pub fn default_menu() -> Vec<MenuNode> {
     vec![
         MenuNode::entry("f", "file browser", "file-browser"),
+        MenuNode::entry("F", "file browser (full)", "file-browser-full"),
         MenuNode::entry("/", "search", "search-forward"),
         MenuNode::entry("q", "quit", "quit"),
         MenuNode::entry("s", "save", "save"),

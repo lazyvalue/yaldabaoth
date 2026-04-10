@@ -381,6 +381,12 @@ impl CommandRegistry {
                 action: Action::NavActivate,
                 description: "Activate selected nav object".into(),
             },
+            CommandDef {
+                name: "file-browser-full".into(),
+                aliases: vec![],
+                action: Action::OpenFileBrowserFull,
+                description: "Open full-screen file browser".into(),
+            },
         ])
     }
 }
@@ -435,6 +441,7 @@ mod tests {
             "next-buffer", "prev-buffer", "buffer-list", "close-buffer",
             "nav-cycle", "nav-character", "nav-links", "nav-headings",
             "nav-list-items", "nav-code-blocks", "nav-activate",
+            "reload", "outline", "file-browser-full",
         ];
         for name in &expected {
             assert!(reg.lookup(name).is_some(), "missing command: {}", name);

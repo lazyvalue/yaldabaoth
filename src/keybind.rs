@@ -71,6 +71,7 @@ pub enum Action {
     NavListItems,
     NavCodeBlocks,
     NavActivate,
+    OpenFileBrowserFull,
     None,
 }
 

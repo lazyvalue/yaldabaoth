@@ -16,6 +16,12 @@ use sketch::buffer::NavMode;
 use sketch::view::{self, ViewMode, ViewState};
 
 #[derive(Debug, PartialEq)]
+enum AppScreen {
+    Editor,
+    FileBrowser { came_from_dropdown: bool },
+}
+
+#[derive(Debug, PartialEq)]
 enum AppMode {
     Normal,
     Insert,
@@ -34,6 +40,7 @@ pub struct App {
     keybinds: KeybindManager,
     registry: CommandRegistry,
     should_quit: bool,
+    screen: AppScreen,
     search_query: String,
     search_input_mode: bool,
     search_input_buffer: String,
@@ -101,6 +108,7 @@ impl App {
             keybinds,
             registry,
             should_quit: false,
+            screen: AppScreen::Editor,
             search_query: String::new(),
             search_input_mode: false,
             search_input_buffer: String::new(),
@@ -553,7 +561,7 @@ impl App {
         }
     }
 
-    fn execute_action(&mut self, action: Action, viewport_height: usize, _content_width: usize) {
+    fn execute_action(&mut self, action: Action, viewport_height: usize, content_width: usize) {
         match action {
             Action::Quit => {
                 if self.buffers[self.active_buffer].editor.document().is_modified() {
@@ -888,6 +896,9 @@ impl App {
                     .unwrap_or(0);
                 self.scroll_to_outline_entry();
             }
+            Action::OpenFileBrowserFull => {
+                self.open_file_browser_full(false);
+            }
             Action::None
             | Action::FileBrowserDown
             | Action::FileBrowserUp
@@ -898,26 +909,26 @@ impl App {
             Action::NavCycle => {
                 let current = self.buffers[self.active_buffer].nav_mode;
                 let next = current.next();
-                self.enter_nav_mode(next);
+                self.enter_nav_mode(next, content_width);
                 self.ensure_rendered_cursor_visible(viewport_height);
             }
             Action::NavCharacter => {
                 self.buffers[self.active_buffer].nav_mode = NavMode::Character;
             }
             Action::NavLinks => {
-                self.enter_nav_mode(NavMode::Link);
+                self.enter_nav_mode(NavMode::Link, content_width);
                 self.ensure_rendered_cursor_visible(viewport_height);
             }
             Action::NavHeadings => {
-                self.enter_nav_mode(NavMode::Heading);
+                self.enter_nav_mode(NavMode::Heading, content_width);
                 self.ensure_rendered_cursor_visible(viewport_height);
             }
             Action::NavListItems => {
-                self.enter_nav_mode(NavMode::ListItem);
+                self.enter_nav_mode(NavMode::ListItem, content_width);
                 self.ensure_rendered_cursor_visible(viewport_height);
             }
             Action::NavCodeBlocks => {
-                self.enter_nav_mode(NavMode::CodeBlock);
+                self.enter_nav_mode(NavMode::CodeBlock, content_width);
                 self.ensure_rendered_cursor_visible(viewport_height);
             }
             Action::NavActivate => {
@@ -949,7 +960,7 @@ impl App {
         }
     }
 
-    fn enter_nav_mode(&mut self, mode: NavMode) {
+    fn enter_nav_mode(&mut self, mode: NavMode, content_width: usize) {
         let buf = &mut self.buffers[self.active_buffer];
         if buf.view_mode != ViewMode::Rendered {
             return;
@@ -958,7 +969,7 @@ impl App {
         if mode == NavMode::Character {
             return;
         }
-        buf.rebuild_nav_objects(&self.theme);
+        buf.rebuild_nav_objects(&self.theme, content_width);
         let current_row = buf.rendered_cursor_row;
         if let Some(idx) = buf.nearest_object_index(current_row) {
             buf.nav_object_index = idx;
@@ -1147,6 +1158,14 @@ impl App {
         let dir = std::env::current_dir().unwrap_or_default();
         self.file_browser = Some(FileBrowser::new(dir));
         self.mode = AppMode::FileBrowser;
+    }
+
+    fn open_file_browser_full(&mut self, came_from_dropdown: bool) {
+        if self.file_browser.is_none() {
+            let dir = std::env::current_dir().unwrap_or_default();
+            self.file_browser = Some(FileBrowser::new(dir));
+        }
+        self.screen = AppScreen::FileBrowser { came_from_dropdown };
     }
 
     fn open_buffer(&mut self, path: std::path::PathBuf) -> bool {
