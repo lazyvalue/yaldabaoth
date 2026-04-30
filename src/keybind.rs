@@ -42,6 +42,10 @@ pub enum Action {
     MoveWordEnd,
     MoveLineStart,
     MoveLineEnd,
+    FindCharForward,
+    FindCharBackward,
+    TillCharForward,
+    TillCharBackward,
     InsertMode,
     InsertAfter,
     OpenLineBelow,
@@ -72,6 +76,30 @@ pub enum Action {
     NavCodeBlocks,
     NavActivate,
     OpenFileBrowserFull,
+    SetHeading1,
+    SetHeading2,
+    SetHeading3,
+    SetHeading4,
+    SetHeading5,
+    SetHeading6,
+    ClearHeading,
+    SetMaxLineWidth,
+    // --- Helix-style selection actions ---
+    DeleteSelection,
+    ChangeSelection,
+    YankSelection,
+    CollapseSelection,
+    FlipSelection,
+    SelectAll,
+    ExtendByLine,
+    ToggleExtendMode,
+    // --- Claude Code channel actions ---
+    ClaudeAttach,
+    ClaudeDetach,
+    ClaudeSend,
+    ClaudeSendSelection,
+    ClaudeStatus,
+    ClaudeTest,
     None,
 }
 
@@ -209,13 +237,24 @@ impl Default for KeybindManager {
         single.insert(key('w'), "move-word-forward".into());
         single.insert(key('b'), "move-word-backward".into());
         single.insert(key('e'), "move-word-end".into());
+        single.insert(key('f'), "find-char-forward".into());
+        single.insert(key('F'), "find-char-backward".into());
+        single.insert(key('t'), "till-char-forward".into());
+        single.insert(key('T'), "till-char-backward".into());
         single.insert(key('0'), "move-line-start".into());
         single.insert(key('$'), "move-line-end".into());
         single.insert(key('i'), "insert-mode".into());
         single.insert(key('a'), "insert-after".into());
         single.insert(key('o'), "open-line-below".into());
         single.insert(key('O'), "open-line-above".into());
-        single.insert(key('x'), "delete-char".into());
+        // Helix-style selection bindings
+        single.insert(key('d'), "delete-selection".into());
+        single.insert(key('c'), "change-selection".into());
+        single.insert(key('x'), "extend-line".into());
+        single.insert(key(';'), "collapse-selection".into());
+        single.insert(key(','), "flip-selection".into());
+        single.insert(key('%'), "select-all".into());
+        single.insert(key('v'), "toggle-extend-mode".into());
         single.insert(key('u'), "undo".into());
         single.insert(key(':'), "enter-command".into());
         single.insert(ctrl('r'), "redo".into());
@@ -230,7 +269,7 @@ impl Default for KeybindManager {
         single.insert(key('?'), "search-backward".into());
         single.insert(key('n'), "search-next".into());
         single.insert(key('N'), "search-prev".into());
-        single.insert(key('y'), "yank-line".into());
+        single.insert(key('y'), "yank-selection".into());
         single.insert(key(' '), "open-menu".into());
         single.insert(key('m'), "nav-cycle".into());
         single.insert(
@@ -249,13 +288,22 @@ impl Default for KeybindManager {
 
         multi.insert(vec![key('g'), key('g')], "goto-top".into());
         multi.insert(vec![key('g'), key('x')], "open-link".into());
-        multi.insert(vec![key('d'), key('d')], "delete-line".into());
+        // Helix-style goto bindings on g
+        multi.insert(vec![key('g'), key('h')], "move-line-start".into());
+        multi.insert(vec![key('g'), key('l')], "move-line-end".into());
+        multi.insert(vec![key('g'), key('e')], "goto-bottom".into());
         multi.insert(vec![key(']'), key(']')], "next-heading-same-level".into());
         multi.insert(vec![key('['), key('[')], "prev-heading-same-level".into());
-        multi.insert(vec![key('g'), key('l')], "nav-links".into());
-        multi.insert(vec![key('g'), key('h')], "nav-headings".into());
-        multi.insert(vec![key('g'), key('i')], "nav-list-items".into());
-        multi.insert(vec![key('g'), key('c')], "nav-code-blocks".into());
+
+        // Heading level shortcuts (Alt+N)
+        let alt = |c: char| KeyPress::new(KeyCode::Char(c), KeyModifiers::ALT);
+        single.insert(alt('1'), "set-heading-1".into());
+        single.insert(alt('2'), "set-heading-2".into());
+        single.insert(alt('3'), "set-heading-3".into());
+        single.insert(alt('4'), "set-heading-4".into());
+        single.insert(alt('5'), "set-heading-5".into());
+        single.insert(alt('6'), "set-heading-6".into());
+        single.insert(alt('0'), "clear-heading".into());
 
         Self::new(single, multi)
     }

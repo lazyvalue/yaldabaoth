@@ -30,6 +30,21 @@ pub struct FullBrowserViewState {
     pub filter_mode: bool,
     pub filter_text: String,
     pub came_from_dropdown: bool,
+    pub sort_label: String,
+}
+
+pub struct FullBufferListEntry {
+    pub path: String,
+    pub is_modified: bool,
+    pub is_active: bool,
+    pub is_selected: bool,
+}
+
+pub struct FullBufferListViewState {
+    pub entries: Vec<FullBufferListEntry>,
+    pub filter_mode: bool,
+    pub filter_text: String,
+    pub total_count: usize,
 }
 
 pub struct ViewState<'a> {
@@ -38,6 +53,7 @@ pub struct ViewState<'a> {
     pub view_mode: ViewMode,
     pub rendered_blocks: &'a [RenderedBlock],
     pub raw_lines: &'a [String],
+    pub raw_highlights: &'a [Vec<(String, Style)>],
     pub viewport: &'a Viewport,
     pub theme: &'a Theme,
     pub mode_label: &'a str,
@@ -77,6 +93,18 @@ pub struct ViewState<'a> {
     pub nav_mode_label: Option<String>,
     pub nav_highlight: Option<(usize, usize, usize)>, // (rendered_row, col_start, col_end)
     pub full_browser: Option<FullBrowserViewState>,
+    pub full_buffer_list: Option<FullBufferListViewState>,
+    /// Active selection range in raw mode as ((start_line, start_col), (end_line, end_col))
+    pub selection: Option<((usize, usize), (usize, usize))>,
+    /// Whether the editor is in extend (selection-growing) mode
+    pub extend_mode: bool,
+    /// Char ranges in the rope where Claude's prose lives (only meaningful in
+    /// the *claude* buffer). Used to render Claude's text differently from
+    /// the user's inline insertions.
+    pub frozen_ranges: Vec<(usize, usize)>,
+    /// Char index of the locked-prefix boundary. Chars below this are styled
+    /// muted (older locked turns).
+    pub lockable_through_char: usize,
 }
 
 pub fn draw(frame: &mut Frame, state: &ViewState) {
@@ -90,6 +118,11 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
 
     if let Some(ref fb_state) = state.full_browser {
         draw_full_file_browser(frame, area, fb_state, state.theme);
+        return;
+    }
+
+    if let Some(ref bl_state) = state.full_buffer_list {
+        draw_full_buffer_list(frame, area, bl_state, state.theme);
         return;
     }
 
@@ -125,13 +158,18 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
         0
     };
 
+    let needs_bottom_bar = state.command_mode
+        || state.search_input_mode
+        || !state.command_error.is_empty();
+    let bottom_bar_height = if needs_bottom_bar { 1u16 } else { 0 };
+
     let chunks = Layout::vertical([
         Constraint::Length(1),                        // top bar
         Constraint::Length(buffer_list_height),        // buffer list
         Constraint::Length(file_browser_height),       // file browser
         Constraint::Length(outline_height),            // outline
         Constraint::Min(1),                           // content
-        Constraint::Length(1),                         // bottom bar
+        Constraint::Length(bottom_bar_height),         // bottom bar (conditional)
     ])
     .split(area);
 
@@ -160,7 +198,9 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
     if state.menu_active {
         draw_menu_popup(frame, content_area, state);
     }
-    draw_bottom_bar(frame, bottom_bar, state);
+    if needs_bottom_bar {
+        draw_bottom_bar(frame, bottom_bar, state);
+    }
 }
 
 fn draw_top_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
@@ -180,22 +220,26 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
     } else {
         String::new()
     };
+    let extend_display = if state.extend_mode { " [SEL]" } else { "" };
+    let nav_display = format!("{}{}", nav_display, extend_display);
 
+    let mode_display = format!(" {}", state.mode_label);
     let position = format!("line {}/{} {}%{}{}", current_line, total, percent, buffer_info, nav_display);
     let available = area.width as usize;
 
     let modified_indicator = if state.modified { " [+]" } else { "" };
     let name_with_mod = format!("{}{}", state.filename, modified_indicator);
-    let name_width = available.saturating_sub(position.len() + 1);
+    let name_width = available.saturating_sub(position.len() + mode_display.len() + 2);
     let name_display = if name_with_mod.len() > name_width {
         &name_with_mod[name_with_mod.len() - name_width..]
     } else {
         &name_with_mod
     };
 
-    let padding = available.saturating_sub(name_display.len() + position.len());
+    let padding = available.saturating_sub(name_display.len() + mode_display.len() + position.len() + 1);
     let line = Line::from(vec![
         Span::styled(format!(" {}", name_display), state.theme.top_bar),
+        Span::styled(mode_display, state.theme.top_bar_mode),
         Span::styled(" ".repeat(padding), state.theme.top_bar),
         Span::styled(format!("{} ", position), state.theme.top_bar),
     ]);
@@ -242,46 +286,50 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
             Span::styled(" ".repeat(padding), state.theme.bottom_bar),
         ]);
         frame.render_widget(Paragraph::new(line), area);
-        return;
     }
-
-    let hints = "h/j/k/l move · i insert · :w save · :q quit";
-    let available = area.width as usize;
-    let mode_len = state.mode_label.len();
-
-    let match_info = if state.search_match_count > 0 && !state.search_query.is_empty() {
-        format!(" [{}] ", state.search_match_count)
-    } else {
-        String::new()
-    };
-
-    let padding = available.saturating_sub(mode_len + match_info.len() + hints.len() + 3);
-
-    let line = Line::from(vec![
-        Span::styled(format!(" {}", state.mode_label), state.theme.mode_indicator),
-        Span::styled(match_info, state.theme.mode_indicator),
-        Span::styled(" ".repeat(padding), state.theme.bottom_bar),
-        Span::styled(format!("{} ", hints), state.theme.bottom_bar),
-    ]);
-
-    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_menu_popup(frame: &mut Frame, area: Rect, state: &ViewState) {
-    // Menu takes 2 rows: label row + entries row
-    let popup_height = 2u16;
-    let popup_area = Rect::new(area.x, area.y, area.width, popup_height.min(area.height));
+    let menu_bg = Style::default().bg(Color::Rgb(30, 30, 58));
 
-    // Opaque background
-    let bg = Paragraph::new("").style(Style::default().bg(Color::Rgb(30, 30, 58)));
-    frame.render_widget(bg, popup_area);
+    // Build displayable entries (skip separators for column layout)
+    let entries: Vec<(&str, &str, &MenuNodeKind)> = state
+        .menu_nodes
+        .iter()
+        .filter(|(_, _, kind)| !matches!(kind, MenuNodeKind::Separator))
+        .map(|(k, l, kind)| (k.as_str(), l.as_str(), kind))
+        .collect();
 
-    // Label row
+    // Determine column layout: use 2 columns if width >= 50 and we have > 1 entry
+    let entry_count = entries.len();
+    let use_two_cols = area.width >= 50 && entry_count > 1;
+    let rows_needed = if use_two_cols {
+        (entry_count + 1) / 2
+    } else {
+        entry_count
+    };
+
+    // Total popup height: 1 label row + entry rows
+    let popup_height = (1 + rows_needed as u16).min(area.height);
+    let popup_area = Rect::new(area.x, area.y, area.width, popup_height);
+
+    // Opaque background for the whole popup — fill every row with spaces
+    for row in 0..popup_area.height {
+        let fill = " ".repeat(popup_area.width as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(fill, menu_bg))),
+            Rect::new(popup_area.x, popup_area.y + row, popup_area.width, 1),
+        );
+    }
+
+    // Label row — fill full width
     let label_text = state.menu_label.as_deref().unwrap_or("Commands");
-    let label_line = Line::from(Span::styled(
-        format!("  {}", label_text.to_uppercase()),
-        Style::default().fg(Color::Rgb(98, 114, 164)),
-    ));
+    let label_str = format!("  {}", label_text.to_uppercase());
+    let label_padding = (popup_area.width as usize).saturating_sub(label_str.len());
+    let label_line = Line::from(vec![
+        Span::styled(label_str, menu_bg.fg(Color::Rgb(98, 114, 164))),
+        Span::styled(" ".repeat(label_padding), menu_bg),
+    ]);
     if popup_area.height >= 1 {
         frame.render_widget(
             Paragraph::new(label_line),
@@ -289,57 +337,64 @@ fn draw_menu_popup(frame: &mut Frame, area: Rect, state: &ViewState) {
         );
     }
 
-    // Entries row
-    if popup_area.height >= 2 {
-        let mut spans = vec![Span::raw("  ")];
-        for (i, (key_display, label, kind)) in state.menu_nodes.iter().enumerate() {
-            match kind {
-                MenuNodeKind::Separator => {
-                    spans.push(Span::styled(
-                        " \u{2502} ",
-                        Style::default().fg(Color::Rgb(98, 114, 164)),
-                    ));
-                    continue;
-                }
-                MenuNodeKind::Label => {
-                    if i > 0 {
-                        spans.push(Span::raw("   "));
-                    }
-                    spans.push(Span::styled(
-                        label.clone(),
-                        Style::default().fg(Color::Rgb(98, 114, 164)),
-                    ));
-                    continue;
-                }
-                _ => {}
-            }
+    // Entry rows
+    let col_width = if use_two_cols {
+        popup_area.width / 2
+    } else {
+        popup_area.width
+    };
 
-            if i > 0 {
-                spans.push(Span::raw("   "));
-            }
-            spans.push(Span::styled(
-                key_display.clone(),
-                Style::default()
-                    .fg(Color::Rgb(189, 147, 249))
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::raw(" "));
-            if *kind == MenuNodeKind::Submenu {
+    for (idx, (key_display, label, kind)) in entries.iter().enumerate() {
+        let (row, col) = if use_two_cols {
+            (idx / 2, idx % 2)
+        } else {
+            (idx, 0)
+        };
+        let y = popup_area.y + 1 + row as u16;
+        if y >= popup_area.y + popup_area.height {
+            break;
+        }
+        let x = popup_area.x + col as u16 * col_width;
+
+        let entry_text = if **kind == MenuNodeKind::Label {
+            vec![
+                Span::styled("  ", menu_bg),
+                Span::styled((*label).to_string(), menu_bg.fg(Color::Rgb(98, 114, 164))),
+            ]
+        } else {
+            let mut spans = vec![
+                Span::styled("  ", menu_bg),
+                Span::styled(
+                    (*key_display).to_string(),
+                    menu_bg
+                        .fg(Color::Rgb(189, 147, 249))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ", menu_bg),
+            ];
+            if **kind == MenuNodeKind::Submenu {
                 spans.push(Span::styled(
                     format!("{} \u{25b8}", label),
-                    Style::default().fg(Color::Rgb(139, 233, 253)),
+                    menu_bg.fg(Color::Rgb(139, 233, 253)),
                 ));
             } else {
                 spans.push(Span::styled(
-                    label.clone(),
-                    Style::default().fg(Color::Rgb(204, 204, 204)),
+                    (*label).to_string(),
+                    menu_bg.fg(Color::Rgb(204, 204, 204)),
                 ));
             }
-        }
-        let entries_line = Line::from(spans);
+            spans
+        };
+
+        // Pad the entry to fill its column width
+        let text_len: usize = entry_text.iter().map(|s| s.content.len()).sum();
+        let pad = (col_width as usize).saturating_sub(text_len);
+        let mut spans = entry_text;
+        spans.push(Span::styled(" ".repeat(pad), menu_bg));
+
         frame.render_widget(
-            Paragraph::new(entries_line),
-            Rect::new(popup_area.x, popup_area.y + 1, popup_area.width, 1),
+            Paragraph::new(Line::from(spans)),
+            Rect::new(x, y, col_width, 1),
         );
     }
 }
@@ -816,72 +871,536 @@ fn draw_content_rendered(frame: &mut Frame, area: Rect, state: &ViewState) {
     }
 }
 
+fn draw_splash(frame: &mut Frame, area: Rect, theme: &Theme) {
+    const LOGO: &[&str] = &[
+        "  ___ _        _      _    ",
+        " / __| |_____ | |_ __| |_  ",
+        " \\__ \\ / / -_)|  _/ _| ' \\ ",
+        " |___/_\\_\\___| \\__\\__|_||_|",
+    ];
+
+    let logo_h = LOGO.len();
+    let block_h = (logo_h + 4) as u16; // logo + blank + version + build
+    if area.height < block_h || area.width < 32 {
+        return;
+    }
+
+    let logo_w = LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let top = area.y + (area.height.saturating_sub(block_h)) / 2;
+
+    let logo_style = Style::default()
+        .fg(Color::Rgb(189, 147, 249))
+        .add_modifier(Modifier::BOLD);
+    for (i, row) in LOGO.iter().enumerate() {
+        let y = top + i as u16;
+        let row_w = row.chars().count() as u16;
+        let x = area.x + (area.width.saturating_sub(row_w)) / 2;
+        let rect = Rect::new(x, y, row_w.min(area.width), 1);
+        frame.render_widget(Paragraph::new(Span::styled(*row, logo_style)), rect);
+    }
+
+    let version_line = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let build_line = crate::BUILD_INFO;
+
+    let center_x = area.x + area.width / 2;
+
+    let v_w = version_line.chars().count() as u16;
+    let v_y = top + logo_h as u16 + 1;
+    let v_rect = Rect::new(
+        center_x.saturating_sub(v_w / 2),
+        v_y,
+        v_w.min(area.width),
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            version_line,
+            Style::default()
+                .fg(Color::Rgb(248, 248, 242))
+                .add_modifier(Modifier::BOLD),
+        )),
+        v_rect,
+    );
+
+    let b_w = build_line.chars().count() as u16;
+    let b_y = v_y + 1;
+    let b_rect = Rect::new(
+        center_x.saturating_sub(b_w / 2),
+        b_y,
+        b_w.min(area.width),
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            build_line,
+            theme.line_number,
+        )),
+        b_rect,
+    );
+
+    let _ = logo_w; // reserved for future centering refinements
+}
+
 fn draw_content_raw(frame: &mut Frame, area: Rect, state: &ViewState) {
     let terminal_width = area.width as usize;
     let viewport_height = area.height as usize;
-    let content_width = state.viewport.content_width(terminal_width);
-    let x_offset = state.viewport.content_offset(terminal_width);
-
     let view_start = state.viewport.scroll_offset;
-    let view_end = state.viewport.scroll_offset + viewport_height;
+
+    // Splash screen: a fresh, empty, never-typed-into buffer (one empty line)
+    // shows the logo + version. Disappears the moment the user types.
+    if state.raw_lines.len() <= 1
+        && state.raw_lines.first().map(|s| s.is_empty()).unwrap_or(true)
+    {
+        draw_splash(frame, area, state.theme);
+        return;
+    }
+
+    let total_lines = state.raw_lines.len();
+    let line_num_digits = if total_lines == 0 { 1 } else { total_lines.ilog10() as usize + 1 };
+    let gutter_width = line_num_digits + 2; // digits + space + separator
+
+    let text_area_width = terminal_width.saturating_sub(gutter_width + 1); // +1 for gap after gutter
+    let content_width = state.viewport.content_width(text_area_width);
+    let text_x = area.x + gutter_width as u16 + 1;
+
+    let wrap_width = content_width.max(1);
 
     let text_style = Style::default().fg(Color::Rgb(204, 204, 204));
+    let selection_bg = Color::Rgb(68, 71, 90);
+    // Range styling (Claude buffer): frozen ranges = Claude's prose, render
+    // with the default text colour. Everything else (the user's typed text,
+    // whether in the active turn or locked into history) renders bright green.
+    let editable_fg = Color::Rgb(80, 250, 123); // Dracula green — user replies
+    let prefix_fg = Color::Rgb(255, 121, 198); // Dracula pink — `> ` quote marker
+    const REPLY_PREFIX: &str = "> ";
+    const REPLY_PREFIX_LEN: usize = 2;
 
+    // Precompute char offset of each doc line's start, for projecting frozen
+    // ranges (which are rope-char indices) onto visual rows.
+    let mut line_char_starts: Vec<usize> = Vec::with_capacity(state.raw_lines.len() + 1);
+    let mut acc = 0usize;
+    line_char_starts.push(0);
+    for line in state.raw_lines.iter() {
+        acc += line.chars().count() + 1; // +1 for the implicit newline
+        line_char_starts.push(acc);
+    }
+    let has_range_styling = !state.frozen_ranges.is_empty()
+        || state.lockable_through_char > 0;
+
+    let mut screen_y: usize = 0;
+    let mut visual_row_counter: usize = 0;
     for (doc_line, raw_line) in state.raw_lines.iter().enumerate() {
-        if doc_line >= view_end {
+        if screen_y >= viewport_height {
             break;
         }
-        if doc_line < view_start {
+
+        let is_cursor_line = doc_line == state.cursor_line;
+        // Compute the selection's [start_col, end_col) range projected onto this line, if any.
+        let line_char_count = raw_line.chars().count();
+        let sel_on_line: Option<(usize, usize)> = state.selection.and_then(|((sl, sc), (el, ec))| {
+            if doc_line < sl || doc_line > el {
+                None
+            } else {
+                let s = if doc_line == sl { sc } else { 0 };
+                let e = if doc_line == el {
+                    ec.min(line_char_count)
+                } else {
+                    line_char_count
+                };
+                if s <= e { Some((s, e)) } else { None }
+            }
+        });
+
+        let empty_segments: Vec<(String, Style)>;
+        let segments: &[(String, Style)] = if !state.search_query.is_empty() {
+            let line = build_highlighted_line(raw_line, doc_line, state, text_style);
+            empty_segments = line
+                .spans
+                .iter()
+                .map(|s| (s.content.to_string(), s.style))
+                .collect();
+            &empty_segments
+        } else if let Some(segs) = state.raw_highlights.get(doc_line) {
+            segs.as_slice()
+        } else {
+            empty_segments = vec![(raw_line.clone(), text_style)];
+            &empty_segments
+        };
+
+        // Treat a doc line as a "user line" iff it contains at least one
+        // non-whitespace char and none of those non-whitespace chars are inside
+        // a frozen (Claude) range. User lines get a `> ` prefix.
+        let user_line = is_user_line(
+            line_char_starts[doc_line],
+            raw_line,
+            &state.frozen_ranges,
+            state.lockable_through_char,
+        );
+        let line_wrap_width = if user_line {
+            wrap_width.saturating_sub(REPLY_PREFIX_LEN).max(1)
+        } else {
+            wrap_width
+        };
+        let wrapped = wrap_styled_segments(segments, line_wrap_width);
+        let line_visual_rows = wrapped.rows.len();
+        // Doc line entirely above the viewport — skip without rendering.
+        if visual_row_counter + line_visual_rows <= view_start {
+            visual_row_counter += line_visual_rows;
             continue;
         }
+        let skip_rows_in_line = view_start.saturating_sub(visual_row_counter);
 
-        let screen_y = doc_line - view_start;
-        let is_cursor_line = doc_line == state.cursor_line;
-
-        let line_area = Rect::new(
-            area.x + x_offset as u16,
-            area.y + screen_y as u16,
-            content_width.min(area.width as usize - x_offset) as u16,
-            1,
-        );
-
-        if is_cursor_line {
-            // Fill cursor line background
-            let bg_area = Rect::new(area.x, area.y + screen_y as u16, area.width, 1);
-            let bg = Paragraph::new("").style(state.theme.cursor_line);
-            frame.render_widget(bg, bg_area);
-        }
-
-        // Build line with search highlights
-        let ratatui_line = if !state.search_query.is_empty() {
-            build_highlighted_line(raw_line, doc_line, state, text_style)
+        let (cursor_visual_row, cursor_visual_col) = if is_cursor_line {
+            locate_cursor_in_wrapped(&wrapped.row_char_starts, state.cursor_col, line_wrap_width)
         } else {
-            Line::from(Span::styled(raw_line.clone(), text_style))
+            (0, 0)
         };
-        frame.render_widget(Paragraph::new(ratatui_line), line_area);
 
-        // Render cursor
-        if is_cursor_line {
-            let cursor_x = area.x + x_offset as u16 + state.cursor_col as u16;
-            if cursor_x < area.x + area.width {
-                let cursor_area = Rect::new(cursor_x, area.y + screen_y as u16, 1, 1);
-                let cursor_char = raw_line.chars().nth(state.cursor_col).unwrap_or(' ');
-                let cursor_style = if state.show_block_cursor {
-                    Style::default()
-                        .fg(Color::Rgb(40, 42, 54))
-                        .bg(Color::Rgb(248, 248, 242))
+        for (visual_idx, row_segs) in wrapped.rows.iter().enumerate() {
+            if visual_idx < skip_rows_in_line {
+                continue;
+            }
+            if screen_y >= viewport_height {
+                break;
+            }
+            let y = area.y + screen_y as u16;
+
+            // No row-wide background fill on the cursor line — the bright
+            // gutter marker below carries the indication. Painting the row bg
+            // was too easy to confuse with selection highlight.
+
+            // Render the line number on the first VISIBLE visual row of this
+            // doc line. When scroll splits a wrapped line, that's the first
+            // row past `skip_rows_in_line`, not necessarily visual_idx 0.
+            let marker_style = Style::default()
+                .fg(Color::Rgb(255, 215, 0))
+                .add_modifier(Modifier::BOLD);
+            if visual_idx == skip_rows_in_line {
+                let num_style = if is_cursor_line {
+                    state
+                        .theme
+                        .line_number_current
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
-                        .fg(Color::Rgb(248, 248, 242))
-                        .bg(Color::Rgb(80, 80, 120))
+                    state.theme.line_number
                 };
+                let num_str = format!("{:>width$} ", doc_line + 1, width = line_num_digits);
+                let marker_span = if is_cursor_line {
+                    Span::styled("▎", marker_style)
+                } else {
+                    Span::raw(" ")
+                };
+                let spans = vec![marker_span, Span::styled(num_str, num_style)];
+                let gutter_area = Rect::new(area.x, y, gutter_width as u16, 1);
+                frame.render_widget(Paragraph::new(Line::from(spans)), gutter_area);
+            } else if is_cursor_line {
+                // Continuation row of a wrapped cursor line: still paint the
+                // leftmost cell so the indicator runs the full visual height.
+                let gutter_area = Rect::new(area.x, y, 1, 1);
                 frame.render_widget(
-                    Paragraph::new(Span::styled(cursor_char.to_string(), cursor_style)),
-                    cursor_area,
+                    Paragraph::new(Span::styled("▎", marker_style)),
+                    gutter_area,
                 );
             }
+
+            let line_area = Rect::new(
+                text_x,
+                y,
+                wrap_width.min(area.width as usize - gutter_width - 1) as u16,
+                1,
+            );
+
+            // Apply selection background if this row overlaps the selection.
+            let row_start_col = wrapped.row_char_starts[visual_idx];
+            let row_end_col = wrapped
+                .row_char_starts
+                .get(visual_idx + 1)
+                .copied()
+                .unwrap_or(row_start_col);
+
+            // Step 1: range styling. Chars inside a frozen range render with
+            // their default style (Claude's prose); everything else gets the
+            // user-edit foreground (green) — applied uniformly across the
+            // active turn AND prior-turn user replies in the locked prefix.
+            let mut styled_row_segs = if has_range_styling {
+                apply_range_styles(
+                    row_segs,
+                    line_char_starts[doc_line] + row_start_col,
+                    &state.frozen_ranges,
+                    editable_fg,
+                )
+            } else {
+                row_segs.clone()
+            };
+
+            // Step 2: selection bg overlays everything.
+            if let Some((sel_s, sel_e)) = sel_on_line {
+                let local_s = sel_s.saturating_sub(row_start_col);
+                let local_e = sel_e.saturating_sub(row_start_col).min(row_end_col - row_start_col);
+                if local_s < local_e {
+                    styled_row_segs =
+                        apply_selection_bg(&styled_row_segs, local_s, local_e, selection_bg);
+                }
+            }
+
+            // Build the final span list, prepending `> ` on user lines.
+            let mut spans: Vec<Span> = Vec::with_capacity(styled_row_segs.len() + 1);
+            if user_line {
+                spans.push(Span::styled(
+                    REPLY_PREFIX,
+                    Style::default()
+                        .fg(prefix_fg)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            for (t, s) in styled_row_segs.iter() {
+                spans.push(Span::styled(t.clone(), *s));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), line_area);
+
+            let row_indent = if user_line { REPLY_PREFIX_LEN as u16 } else { 0 };
+            if is_cursor_line && visual_idx == cursor_visual_row {
+                let cursor_x = text_x + row_indent + cursor_visual_col as u16;
+                if cursor_x < area.x + area.width {
+                    let cursor_char = row_text_char_at(row_segs, cursor_visual_col).unwrap_or(' ');
+                    let cursor_style = if state.show_block_cursor {
+                        Style::default()
+                            .fg(Color::Rgb(40, 42, 54))
+                            .bg(Color::Rgb(248, 248, 242))
+                    } else {
+                        Style::default()
+                            .fg(Color::Rgb(248, 248, 242))
+                            .bg(Color::Rgb(80, 80, 120))
+                    };
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(cursor_char.to_string(), cursor_style)),
+                        Rect::new(cursor_x, y, 1, 1),
+                    );
+                }
+            }
+
+            screen_y += 1;
+        }
+        visual_row_counter += line_visual_rows;
+    }
+}
+
+/// Restyle a row's segments per the *claude* buffer's range model:
+///   - chars IN a frozen range  → unchanged (Claude prose, default colour)
+///   - chars OUTSIDE all frozen → bright fg (user reply, active or locked)
+fn apply_range_styles(
+    segs: &[(String, Style)],
+    row_first_char: usize,
+    frozen: &[(usize, usize)],
+    editable_fg: Color,
+) -> Vec<(String, Style)> {
+    let mut out: Vec<(String, Style)> = Vec::with_capacity(segs.len());
+    let mut idx = row_first_char;
+    for (text, style) in segs {
+        let mut current = String::new();
+        let mut current_style = *style;
+        let mut started = false;
+        for ch in text.chars() {
+            let new_style = if frozen.iter().any(|&(s, e)| idx >= s && idx < e) {
+                *style
+            } else {
+                style.fg(editable_fg)
+            };
+            if started && new_style != current_style {
+                out.push((std::mem::take(&mut current), current_style));
+                current_style = new_style;
+            } else if !started {
+                current_style = new_style;
+                started = true;
+            }
+            current.push(ch);
+            idx += 1;
+        }
+        if !current.is_empty() {
+            out.push((current, current_style));
         }
     }
+    out
+}
+
+/// A doc line counts as a "user reply line" iff it has at least one
+/// non-whitespace char, none of those non-whitespace chars are inside a frozen
+/// range, AND it's not the turn-delimiter HR (`---`).
+fn is_user_line(
+    line_first_char: usize,
+    line_text: &str,
+    frozen: &[(usize, usize)],
+    lockable_through_char: usize,
+) -> bool {
+    if line_text.trim_end_matches('\n').trim() == "---" {
+        return false;
+    }
+    let mut idx = line_first_char;
+    let mut had_non_ws = false;
+    for ch in line_text.chars() {
+        if !ch.is_whitespace() {
+            had_non_ws = true;
+            if frozen.iter().any(|&(s, e)| idx >= s && idx < e) {
+                return false;
+            }
+        }
+        idx += 1;
+    }
+    if had_non_ws {
+        return true;
+    }
+    // Empty/whitespace-only line: treat as a user line if it sits in the
+    // editable draft region (past the locked prefix and not inside any frozen
+    // Claude range). This makes `> ` appear the instant you press Enter on a
+    // fresh draft line, before you've typed anything.
+    let line_end = idx;
+    if line_first_char < lockable_through_char {
+        return false;
+    }
+    !frozen
+        .iter()
+        .any(|&(s, e)| line_first_char < e && s < line_end.max(line_first_char + 1))
+}
+
+/// Apply a background color to chars in `[start_col, end_col)` of a row's segments.
+/// Returns a new segment list where the styled range has the bg overridden.
+fn apply_selection_bg(
+    segs: &[(String, Style)],
+    start_col: usize,
+    end_col: usize,
+    bg: Color,
+) -> Vec<(String, Style)> {
+    let mut result: Vec<(String, Style)> = Vec::new();
+    let mut col = 0usize;
+    for (text, style) in segs {
+        let mut current_text = String::new();
+        let mut current_style = *style;
+        let mut started = false;
+        for ch in text.chars() {
+            let is_selected = col >= start_col && col < end_col;
+            let new_style = if is_selected {
+                style.bg(bg)
+            } else {
+                *style
+            };
+            if started && new_style != current_style {
+                result.push((std::mem::take(&mut current_text), current_style));
+                current_style = new_style;
+            } else if !started {
+                current_style = new_style;
+                started = true;
+            }
+            current_text.push(ch);
+            col += 1;
+        }
+        if !current_text.is_empty() {
+            result.push((current_text, current_style));
+        }
+    }
+    result
+}
+
+struct WrappedLine {
+    rows: Vec<Vec<(String, Style)>>,
+    /// For each row index, the character offset into the original line where it starts.
+    /// Has `rows.len() + 1` entries; last entry is total char length of the line.
+    row_char_starts: Vec<usize>,
+}
+
+fn wrap_styled_segments(segments: &[(String, Style)], width: usize) -> WrappedLine {
+    let mut flat: Vec<(char, Style)> = Vec::new();
+    for (text, style) in segments {
+        for ch in text.chars() {
+            flat.push((ch, *style));
+        }
+    }
+
+    if flat.is_empty() {
+        return WrappedLine {
+            rows: vec![Vec::new()],
+            row_char_starts: vec![0, 0],
+        };
+    }
+
+    let total = flat.len();
+    let mut rows: Vec<Vec<(String, Style)>> = Vec::new();
+    let mut row_starts: Vec<usize> = Vec::new();
+    let mut pos = 0;
+
+    while pos < total {
+        row_starts.push(pos);
+        let hard_end = (pos + width).min(total);
+        let break_at = if hard_end < total {
+            // Prefer a word boundary: split AFTER the last space in [pos, hard_end].
+            (pos..hard_end)
+                .rev()
+                .find(|&i| flat[i].0 == ' ')
+                .map(|i| i + 1)
+                .unwrap_or(hard_end)
+        } else {
+            hard_end
+        };
+        let end = break_at.max(pos + 1);
+
+        let mut row: Vec<(String, Style)> = Vec::new();
+        let mut cur_text = String::new();
+        let mut cur_style = flat[pos].1;
+        for (ch, st) in flat[pos..end].iter().copied() {
+            if st != cur_style {
+                if !cur_text.is_empty() {
+                    row.push((std::mem::take(&mut cur_text), cur_style));
+                }
+                cur_style = st;
+            }
+            cur_text.push(ch);
+        }
+        if !cur_text.is_empty() {
+            row.push((cur_text, cur_style));
+        }
+        rows.push(row);
+        pos = end;
+    }
+
+    row_starts.push(total);
+    WrappedLine {
+        rows,
+        row_char_starts: row_starts,
+    }
+}
+
+fn locate_cursor_in_wrapped(
+    row_starts: &[usize],
+    cursor_col: usize,
+    wrap_width: usize,
+) -> (usize, usize) {
+    if row_starts.len() < 2 {
+        return (0, cursor_col);
+    }
+    // Find the row such that row_starts[i] <= cursor_col < row_starts[i+1].
+    let mut row = 0;
+    for i in 0..row_starts.len() - 1 {
+        if cursor_col >= row_starts[i] && cursor_col < row_starts[i + 1] {
+            row = i;
+            break;
+        }
+        if i + 1 == row_starts.len() - 1 && cursor_col >= row_starts[i + 1] {
+            row = i; // cursor past end → stick to last row
+        }
+    }
+    let col_in_row = cursor_col.saturating_sub(row_starts[row]);
+    (row, col_in_row.min(wrap_width))
+}
+
+fn row_text_char_at(row: &[(String, Style)], col: usize) -> Option<char> {
+    let mut remaining = col;
+    for (t, _) in row {
+        let n = t.chars().count();
+        if remaining < n {
+            return t.chars().nth(remaining);
+        }
+        remaining -= n;
+    }
+    None
 }
 
 /// Build a line with search match highlighting.
@@ -934,10 +1453,14 @@ fn build_highlighted_line<'a>(
 pub fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> Vec<StyledLine> {
     match block {
         RenderedBlock::Heading { level, content } => {
-            let mut lines = vec![content.clone()];
+            let prefix = "#".repeat(*level as usize);
+            let style = theme.heading[(*level as usize).saturating_sub(1).min(5)];
+            let mut spans = vec![StyledSpan::new(format!("{} ", prefix), style)];
+            spans.extend(content.spans.iter().cloned());
+            let prefixed = StyledLine::new(spans);
+            let mut lines = vec![prefixed.clone()];
             if *level == 1 {
-                // Add underline decoration for h1
-                let rule = "\u{2501}".repeat(content.text_content().len().min(width));
+                let rule = "\u{2501}".repeat(prefixed.text_content().len().min(width));
                 lines.push(StyledLine::new(vec![StyledSpan::new(
                     rule,
                     theme.horizontal_rule,
@@ -959,19 +1482,24 @@ pub fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme)
             for line in lines {
                 // Truncate with arrow indicator if too wide, preserving per-span styles
                 let text = line.text_content();
-                if text.len() > width {
+                if text.chars().count() > width {
                     let mut truncated_spans = Vec::new();
-                    let mut remaining = width - 1; // leave room for arrow indicator
+                    let mut remaining = width - 1;
                     for span in &line.spans {
                         if remaining == 0 {
                             break;
                         }
-                        if span.text.len() <= remaining {
+                        let span_chars = span.text.chars().count();
+                        if span_chars <= remaining {
                             truncated_spans.push(span.clone());
-                            remaining -= span.text.len();
+                            remaining -= span_chars;
                         } else {
+                            let byte_end = span.text.char_indices()
+                                .nth(remaining)
+                                .map(|(i, _)| i)
+                                .unwrap_or(span.text.len());
                             truncated_spans
-                                .push(StyledSpan::new(&span.text[..remaining], span.style));
+                                .push(StyledSpan::new(&span.text[..byte_end], span.style));
                             remaining = 0;
                         }
                     }
@@ -1035,41 +1563,29 @@ pub fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme)
             out
         }
         RenderedBlock::Table { headers, rows, .. } => {
+            let col_widths = table_column_widths(headers, rows, width);
             let mut out = Vec::new();
-            // Calculate column widths from both headers and row data
-            let mut col_widths: Vec<usize> = headers
-                .iter()
-                .map(|h| h.text_content().len().max(3))
-                .collect();
-            for row in rows {
-                for (i, cell) in row.iter().enumerate() {
-                    if i < col_widths.len() {
-                        col_widths[i] = col_widths[i].max(cell.text_content().len());
-                    }
-                }
-            }
 
-            // Header
-            let header_spans: Vec<StyledSpan> = headers
+            // Header (wrapped)
+            let header_texts: Vec<String> = headers.iter().map(|h| h.text_content()).collect();
+            let header_wrapped: Vec<Vec<String>> = header_texts
                 .iter()
                 .enumerate()
-                .map(|(i, h)| {
-                    let padded = format!(
-                        "{:<width$}",
-                        h.text_content(),
-                        width = col_widths.get(i).copied().unwrap_or(5)
-                    );
-                    StyledSpan::new(padded, theme.table_header)
-                })
+                .map(|(i, t)| wrap_text(t, col_widths[i]))
                 .collect();
-            let mut hline_spans = Vec::new();
-            for (i, span) in header_spans.into_iter().enumerate() {
-                if i > 0 {
-                    hline_spans.push(StyledSpan::new(" \u{2502} ", theme.table_border));
+            let header_height = header_wrapped.iter().map(|w| w.len()).max().unwrap_or(1);
+            for line_idx in 0..header_height {
+                let mut spans = Vec::new();
+                for (i, wrapped) in header_wrapped.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(StyledSpan::new(" \u{2502} ", theme.table_border));
+                    }
+                    let text = wrapped.get(line_idx).cloned().unwrap_or_default();
+                    let padded = format!("{:<width$}", text, width = col_widths[i]);
+                    spans.push(StyledSpan::new(padded, theme.table_header));
                 }
-                hline_spans.push(span);
+                out.push(StyledLine::new(spans));
             }
-            out.push(StyledLine::new(hline_spans));
 
             // Separator
             let sep: String = col_widths
@@ -1082,21 +1598,28 @@ pub fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme)
                 theme.table_border,
             )]));
 
-            // Rows
+            // Rows (wrapped)
             for row in rows {
-                let mut row_spans = Vec::new();
-                for (i, cell) in row.iter().enumerate() {
-                    if i > 0 {
-                        row_spans.push(StyledSpan::new(" \u{2502} ", theme.table_border));
+                let cell_texts: Vec<String> = row.iter().map(|c| c.text_content()).collect();
+                let cell_wrapped: Vec<Vec<String>> = cell_texts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| wrap_text(t, *col_widths.get(i).unwrap_or(&5)))
+                    .collect();
+                let row_height = cell_wrapped.iter().map(|w| w.len()).max().unwrap_or(1);
+                for line_idx in 0..row_height {
+                    let mut spans = Vec::new();
+                    for (i, wrapped) in cell_wrapped.iter().enumerate() {
+                        if i > 0 {
+                            spans.push(StyledSpan::new(" \u{2502} ", theme.table_border));
+                        }
+                        let text = wrapped.get(line_idx).cloned().unwrap_or_default();
+                        let cw = *col_widths.get(i).unwrap_or(&5);
+                        let padded = format!("{:<width$}", text, width = cw);
+                        spans.push(StyledSpan::new(padded, theme.paragraph));
                     }
-                    let padded = format!(
-                        "{:<width$}",
-                        cell.text_content(),
-                        width = col_widths.get(i).copied().unwrap_or(5)
-                    );
-                    row_spans.push(StyledSpan::new(padded, theme.paragraph));
+                    out.push(StyledLine::new(spans));
                 }
-                out.push(StyledLine::new(row_spans));
             }
             out.push(StyledLine::new(vec![])); // blank line
             out
@@ -1199,6 +1722,169 @@ fn wrap_styled_line(line: &StyledLine, width: usize, out: &mut Vec<StyledLine>) 
         out.push(StyledLine::new(spans));
         pos = break_at;
     }
+}
+
+/// Calculate column widths for a table, fitting within the available width.
+/// Each column gets at least 3 chars. If the natural widths exceed the available
+/// space, columns are shrunk proportionally (widest columns shrink first).
+pub fn table_column_widths(
+    headers: &[StyledLine],
+    rows: &[Vec<StyledLine>],
+    available_width: usize,
+) -> Vec<usize> {
+    let ncols = headers.len();
+    if ncols == 0 {
+        return Vec::new();
+    }
+
+    // Natural widths (unconstrained)
+    let mut widths: Vec<usize> = headers
+        .iter()
+        .map(|h| h.text_content().len().max(3))
+        .collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < widths.len() {
+                widths[i] = widths[i].max(cell.text_content().len());
+            }
+        }
+    }
+
+    // Borders take 3 chars each (" │ ")
+    let border_space = if ncols > 1 { (ncols - 1) * 3 } else { 0 };
+    let usable = available_width.saturating_sub(border_space);
+
+    let total: usize = widths.iter().sum();
+    if total <= usable {
+        return widths;
+    }
+
+    let min_per_col = 3usize;
+    let min_total = ncols * min_per_col;
+    if usable <= min_total {
+        return vec![min_per_col; ncols];
+    }
+
+    // Cap-and-redistribute: columns that fit within an equal share keep their
+    // natural width; remaining space goes proportionally to wider columns.
+    let mut result = vec![0usize; ncols];
+    let mut settled = vec![false; ncols];
+    let mut remaining_space = usable;
+    let mut unsettled_count = ncols;
+
+    loop {
+        let fair_share = remaining_space / unsettled_count.max(1);
+        let mut changed = false;
+        for i in 0..ncols {
+            if settled[i] {
+                continue;
+            }
+            if widths[i] <= fair_share {
+                result[i] = widths[i];
+                settled[i] = true;
+                remaining_space -= widths[i];
+                unsettled_count -= 1;
+                changed = true;
+            }
+        }
+        if !changed || unsettled_count == 0 {
+            break;
+        }
+    }
+
+    if unsettled_count > 0 {
+        // Distribute remaining space proportionally among unsettled columns
+        let unsettled_natural: usize = (0..ncols)
+            .filter(|&i| !settled[i])
+            .map(|i| widths[i])
+            .sum();
+        for i in 0..ncols {
+            if settled[i] {
+                continue;
+            }
+            let allocated = if unsettled_natural > 0 {
+                (widths[i] as f64 / unsettled_natural as f64 * remaining_space as f64).floor()
+                    as usize
+            } else {
+                remaining_space / unsettled_count
+            };
+            result[i] = allocated.max(min_per_col);
+        }
+
+        // Fix rounding: distribute leftover or trim excess
+        let mut result_total: usize = result.iter().sum();
+        while result_total < usable {
+            if let Some(idx) = result
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| !settled[i])
+                .min_by_key(|&(i, &w)| (w as isize - widths[i] as isize).abs())
+                .map(|(i, _)| i)
+            {
+                result[idx] += 1;
+                result_total += 1;
+            } else {
+                break;
+            }
+        }
+        while result_total > usable {
+            if let Some(idx) = result
+                .iter()
+                .enumerate()
+                .filter(|&(_, &w)| w > min_per_col)
+                .max_by_key(|&(_, &w)| w)
+                .map(|(i, _)| i)
+            {
+                result[idx] -= 1;
+                result_total -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    result
+}
+
+/// Wrap text to fit within a given width (in chars), breaking at word boundaries when possible.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    if text.chars().count() <= width {
+        return vec![text.to_string()];
+    }
+
+    let mut lines = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        if remaining.chars().count() <= width {
+            lines.push(remaining.to_string());
+            break;
+        }
+
+        // Byte index of the (width)th char — safe split point.
+        let hard_byte = remaining
+            .char_indices()
+            .nth(width)
+            .map(|(i, _)| i)
+            .unwrap_or(remaining.len());
+
+        // Look for the last space at or before the hard split point.
+        let break_at = remaining[..hard_byte]
+            .rfind(' ')
+            .unwrap_or(hard_byte);
+
+        let (chunk, rest) = remaining.split_at(break_at);
+        lines.push(chunk.to_string());
+        remaining = rest.trim_start();
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 /// Compute scroll offset so that `selected` is visible within `visible_rows`.
@@ -1394,7 +2080,7 @@ fn draw_full_file_browser(frame: &mut Frame, area: Rect, fb: &FullBrowserViewSta
     }
 
     // --- Hint bar ---
-    let mut hints = String::from(" enter:open  o:open+stay  -:parent  .:hidden  /:filter");
+    let mut hints = format!(" enter:open  o:open+stay  -:parent  .:hidden  s:sort({})  /:filter", fb.sort_label);
     if fb.came_from_dropdown {
         hints.push_str("  tab:collapse");
     }
@@ -1402,6 +2088,153 @@ fn draw_full_file_browser(frame: &mut Frame, area: Rect, fb: &FullBrowserViewSta
     let hint_line = Line::from(Span::styled(
         hints,
         Style::default().fg(Color::Rgb(98, 114, 164)).bg(Color::Rgb(25, 25, 40)),
+    ));
+    frame.render_widget(
+        Paragraph::new(hint_line).style(Style::default().bg(Color::Rgb(25, 25, 40))),
+        hint_area,
+    );
+}
+
+fn draw_full_buffer_list(frame: &mut Frame, area: Rect, bl: &FullBufferListViewState, _theme: &Theme) {
+    // Background
+    let bg = Paragraph::new("").style(Style::default().bg(Color::Rgb(30, 30, 48)));
+    frame.render_widget(bg, area);
+
+    let filter_height = if bl.filter_mode { 1u16 } else { 0 };
+    let chunks = Layout::vertical([
+        Constraint::Length(1),                 // header
+        Constraint::Min(1),                    // entry list
+        Constraint::Length(filter_height),     // filter input
+        Constraint::Length(1),                 // hint bar
+    ])
+    .split(area);
+
+    let header_area = chunks[0];
+    let list_area = chunks[1];
+    let filter_area = chunks[2];
+    let hint_area = chunks[3];
+
+    // --- Header ---
+    let visible_count = bl.entries.len();
+    let header_text = if bl.filter_text.is_empty() {
+        format!(" \u{25b8} buffers ({})", bl.total_count)
+    } else {
+        format!(
+            " \u{25b8} buffers ({}/{}) — \"{}\"",
+            visible_count, bl.total_count, bl.filter_text
+        )
+    };
+    let header_line = Line::from(Span::styled(
+        header_text,
+        Style::default()
+            .fg(Color::Rgb(139, 233, 253))
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(
+        Paragraph::new(header_line).style(Style::default().bg(Color::Rgb(40, 42, 54))),
+        header_area,
+    );
+
+    // --- Entry list ---
+    let visible_rows = list_area.height as usize;
+    let selected_idx = bl.entries.iter().position(|e| e.is_selected).unwrap_or(0);
+    let scroll_offset = scroll_to_keep_visible(selected_idx, visible_rows);
+
+    if bl.entries.is_empty() {
+        let empty_line = Line::from(Span::styled(
+            "  (no buffers match)",
+            Style::default().fg(Color::Rgb(102, 102, 102)),
+        ));
+        frame.render_widget(
+            Paragraph::new(empty_line),
+            Rect::new(list_area.x, list_area.y, list_area.width, 1),
+        );
+    } else {
+        let mut y = 0u16;
+        for (i, entry) in bl.entries.iter().enumerate() {
+            if i < scroll_offset {
+                continue;
+            }
+            if y >= list_area.height {
+                break;
+            }
+
+            let row_area = Rect::new(list_area.x, list_area.y + y, list_area.width, 1);
+
+            let marker = if entry.is_selected { "\u{25b8} " } else { "  " };
+            let bg_style = if entry.is_selected {
+                Style::default().bg(Color::Rgb(50, 52, 68))
+            } else {
+                Style::default().bg(Color::Rgb(30, 30, 48))
+            };
+
+            // Fill row background
+            let bg_fill = Paragraph::new("").style(bg_style);
+            frame.render_widget(bg_fill, row_area);
+
+            let active_indicator = if entry.is_active { "\u{25cf} " } else { "  " };
+            let active_style = if entry.is_active {
+                bg_style.fg(Color::Rgb(80, 250, 123))
+            } else {
+                bg_style
+            };
+
+            let path_style = if entry.is_active {
+                bg_style
+                    .fg(Color::Rgb(139, 233, 253))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                bg_style.fg(Color::Rgb(204, 204, 204))
+            };
+
+            let modified_indicator = if entry.is_modified { " [+]" } else { "" };
+            let modified_style = bg_style.fg(Color::Rgb(255, 184, 108));
+
+            let line = Line::from(vec![
+                Span::styled(marker, bg_style.fg(Color::Rgb(189, 147, 249))),
+                Span::styled(active_indicator, active_style),
+                Span::styled(entry.path.clone(), path_style),
+                Span::styled(modified_indicator.to_string(), modified_style),
+            ]);
+
+            frame.render_widget(Paragraph::new(line), row_area);
+            y += 1;
+        }
+    }
+
+    // --- Filter input ---
+    if bl.filter_mode {
+        let filter_line = Line::from(vec![
+            Span::styled(
+                " / ",
+                Style::default()
+                    .fg(Color::Rgb(255, 184, 108))
+                    .bg(Color::Rgb(30, 30, 48)),
+            ),
+            Span::styled(
+                &bl.filter_text,
+                Style::default()
+                    .fg(Color::Rgb(241, 250, 140))
+                    .bg(Color::Rgb(30, 30, 48)),
+            ),
+            Span::styled(
+                "\u{258e}",
+                Style::default()
+                    .fg(Color::Rgb(102, 102, 102))
+                    .bg(Color::Rgb(30, 30, 48)),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(filter_line), filter_area);
+    }
+
+    // --- Hint bar ---
+    let hints =
+        " enter/l:switch  d:close  /:filter  g/G:top/bottom  q:close ";
+    let hint_line = Line::from(Span::styled(
+        hints,
+        Style::default()
+            .fg(Color::Rgb(98, 114, 164))
+            .bg(Color::Rgb(25, 25, 40)),
     ));
     frame.render_widget(
         Paragraph::new(hint_line).style(Style::default().bg(Color::Rgb(25, 25, 40))),

@@ -1,11 +1,12 @@
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
 
 use sketch::blocks::RenderedBlock;
 use sketch::buffer::Buffer;
+use sketch::claude_channel::ChannelClient;
 use sketch::command::CommandRegistry;
 use sketch::config::Config;
 use sketch::file_browser::FileBrowser;
@@ -19,6 +20,7 @@ use sketch::view::{self, ViewMode, ViewState};
 enum AppScreen {
     Editor,
     FileBrowser { came_from_dropdown: bool },
+    BufferList,
 }
 
 #[derive(Debug, PartialEq)]
@@ -28,7 +30,6 @@ enum AppMode {
     Command,
     Menu,
     FileBrowser,
-    BufferList,
     Outline,
 }
 
@@ -58,13 +59,29 @@ pub struct App {
     outline_selected: usize,
     outline_filter_mode: bool,
     outline_filter_text: String,
-    /// The heading level currently being viewed (None = show all top-level)
-    outline_parent_level: Option<u8>,
-    /// Y offset of the parent heading (to scope children)
-    outline_parent_y: Option<usize>,
+    /// Stack of (heading_level, y_offset) for descended headings.
+    /// Empty = top-level view. Last entry = current parent.
+    outline_stack: Vec<(u8, usize)>,
     /// Saved scroll offset to restore if Esc without selecting
     outline_saved_scroll: usize,
     full_browser_pending_g: bool,
+    pending_count: Option<usize>,
+    /// Set after pressing f/F/t/T — the next keypress is consumed as the
+    /// target character and the corresponding find motion is executed.
+    pending_find_char: Option<Action>,
+    /// Cached viewport height from the most recent input/draw cycle, so helper
+    /// methods that don't take it as a parameter (like programmatic edits to
+    /// the *claude* buffer) can still scroll the viewport.
+    last_viewport_height: usize,
+    /// Cached raw-mode wrap width (terminal width minus the gutter and
+    /// max_line_width cap). Used by visual-row cursor math.
+    last_wrap_width: usize,
+    /// Live MCP channel connection to a `sketch-channel` server. When attached,
+    /// `:claude-send` and `:claude-send-selection` push payloads to the server,
+    /// which forwards them to Claude Code as `notifications/claude/channel`.
+    /// Replies come back via the `reply` MCP tool and are appended to a
+    /// `*claude*` buffer.
+    claude_channel: Option<ChannelClient>,
 }
 
 impl App {
@@ -127,11 +144,27 @@ impl App {
             outline_selected: 0,
             outline_filter_mode: false,
             outline_filter_text: String::new(),
-            outline_parent_level: None,
-            outline_parent_y: None,
+            outline_stack: Vec::new(),
             outline_saved_scroll: 0,
             full_browser_pending_g: false,
+            pending_count: None,
+            pending_find_char: None,
+            claude_channel: None,
+            last_viewport_height: 24,
+            last_wrap_width: 80,
         }
+    }
+
+    /// Compute the wrap width currently used for raw-mode rendering. Mirrors
+    /// the formula in `view::draw_content_raw`: terminal width minus the
+    /// gutter (line numbers + space) and capped to `max_line_width`.
+    fn compute_wrap_width(&self, terminal_width: usize) -> usize {
+        let buf = &self.buffers[self.active_buffer];
+        let total = buf.editor.document().line_count().max(1);
+        let line_num_digits = total.ilog10() as usize + 1;
+        let gutter_width = line_num_digits + 2;
+        let text_area_width = terminal_width.saturating_sub(gutter_width + 1);
+        buf.viewport.content_width(text_area_width).max(1)
     }
 
     #[allow(dead_code)]
@@ -151,6 +184,15 @@ impl App {
         self.buffers[self.active_buffer].update_total_lines(content_width);
 
         loop {
+            // Refresh viewport_height/wrap_width each tick (survives resize).
+            let cur_size = terminal.size()?;
+            let viewport_height = (cur_size.height as usize).saturating_sub(2);
+            self.last_viewport_height = viewport_height;
+            self.last_wrap_width = self.compute_wrap_width(cur_size.width as usize);
+
+            // Drain any pending Claude replies into *claude* buffer.
+            self.pump_claude_replies(viewport_height);
+
             // Rebuild render cache if needed
             if self.buffers[self.active_buffer].view_cache_dirty {
                 self.buffers[self.active_buffer].rebuild_render_cache(&self.theme);
@@ -159,11 +201,25 @@ impl App {
 
             // Build raw lines for raw mode (cheap — just reads from rope)
             let raw_lines: Vec<String> = if self.buffers[self.active_buffer].view_mode == ViewMode::Raw {
-                let text = self.buffers[self.active_buffer].editor.document().full_text();
-                text.lines().map(|l| l.to_string()).collect()
+                let doc = self.buffers[self.active_buffer].editor.document();
+                (0..doc.line_count())
+                    .map(|i| {
+                        let mut s = doc.line_text(i);
+                        if s.ends_with('\n') {
+                            s.pop();
+                        }
+                        s.replace('\t', "    ")
+                    })
+                    .collect()
             } else {
                 Vec::new()
             };
+            let raw_highlights: Vec<Vec<(String, ratatui::style::Style)>> =
+                if self.buffers[self.active_buffer].view_mode == ViewMode::Raw {
+                    sketch::md_highlight::highlight_markdown_lines(&raw_lines, &self.theme)
+                } else {
+                    Vec::new()
+                };
 
             terminal.draw(|frame| {
                 let menu_nodes: Vec<(String, String, sketch::menu::MenuNodeKind)> = if self.menu_state.is_active() {
@@ -180,7 +236,7 @@ impl App {
                 };
 
                 let (fb_open, fb_dir, fb_entries, fb_filter_mode, fb_filter_text) =
-                    if let Some(browser) = &self.file_browser {
+                    if self.mode == AppMode::FileBrowser && let Some(browser) = &self.file_browser {
                         let entries: Vec<(String, bool, bool)> = browser
                             .visible_entries()
                             .iter()
@@ -198,17 +254,24 @@ impl App {
                         (false, String::new(), Vec::new(), false, String::new())
                     };
 
-                let buffer_list_entries: Vec<(String, bool, bool, bool)> = if self.mode == AppMode::BufferList {
+                let full_buffer_list_state = if self.screen == AppScreen::BufferList {
                     let filtered = self.filtered_buffer_indices();
-                    filtered.iter().enumerate().map(|(i, &buf_idx)| {
-                        let path = self.buffers[buf_idx].file_path().display().to_string();
-                        let modified = self.buffers[buf_idx].editor.document().is_modified();
-                        let is_active = buf_idx == self.active_buffer;
-                        let selected = i == self.buffer_list_selected;
-                        (path, modified, is_active, selected)
-                    }).collect()
+                    let entries: Vec<view::FullBufferListEntry> = filtered.iter().enumerate().map(|(i, &buf_idx)| {
+                        view::FullBufferListEntry {
+                            path: self.buffers[buf_idx].file_path().display().to_string(),
+                            is_modified: self.buffers[buf_idx].editor.document().is_modified(),
+                            is_active: buf_idx == self.active_buffer,
+                            is_selected: i == self.buffer_list_selected,
+                        }
+                    }).collect();
+                    Some(view::FullBufferListViewState {
+                        entries,
+                        filter_mode: self.buffer_list_filter_mode,
+                        filter_text: self.buffer_list_filter_text.clone(),
+                        total_count: self.buffers.len(),
+                    })
                 } else {
-                    Vec::new()
+                    None
                 };
 
                 let full_browser_state = if let AppScreen::FileBrowser { came_from_dropdown } = self.screen {
@@ -231,6 +294,7 @@ impl App {
                             filter_mode: browser.filter_mode,
                             filter_text: browser.filter_text().to_string(),
                             came_from_dropdown,
+                            sort_label: browser.sort_order.label().to_string(),
                         })
                     } else {
                         None
@@ -248,6 +312,7 @@ impl App {
                     view_mode: buf.view_mode,
                     rendered_blocks: &buf.rendered_cache,
                     raw_lines: &raw_lines,
+                    raw_highlights: &raw_highlights,
                     viewport: &buf.viewport,
                     theme: &self.theme,
                     mode_label: match self.mode {
@@ -259,7 +324,6 @@ impl App {
                         AppMode::Command => "NORMAL",
                         AppMode::Menu => "NORMAL",
                         AppMode::FileBrowser => "NORMAL",
-                        AppMode::BufferList => "BUFFERS",
                         AppMode::Outline => "OUTLINE",
                     },
                     cursor_line: buf.editor.cursor().line,
@@ -284,10 +348,10 @@ impl App {
                     command_mode: self.mode == AppMode::Command,
                     command_buffer: &self.command_buffer,
                     command_error: &self.command_error,
-                    buffer_list_open: self.mode == AppMode::BufferList,
-                    buffer_list_entries,
-                    buffer_list_filter_mode: self.buffer_list_filter_mode,
-                    buffer_list_filter_text: self.buffer_list_filter_text.clone(),
+                    buffer_list_open: false,
+                    buffer_list_entries: Vec::new(),
+                    buffer_list_filter_mode: false,
+                    buffer_list_filter_text: String::new(),
                     buffer_count: self.buffers.len(),
                     active_buffer_index: self.active_buffer,
                     outline_open: self.mode == AppMode::Outline,
@@ -301,18 +365,7 @@ impl App {
                     },
                     outline_filter_mode: self.outline_filter_mode,
                     outline_filter_text: self.outline_filter_text.clone(),
-                    outline_breadcrumb: if self.outline_parent_level.is_some() {
-                        // Find parent title
-                        if let Some(parent_y) = self.outline_parent_y {
-                            self.outline_entries().iter()
-                                .find(|e| e.y_offset == parent_y)
-                                .map(|e| e.title.clone())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    },
+                    outline_breadcrumb: self.outline_breadcrumb(),
                     nav_mode_label: self.buffers[self.active_buffer].nav_mode.label()
                         .map(|s| s.to_string()),
                     nav_highlight: {
@@ -326,6 +379,16 @@ impl App {
                         }
                     },
                     full_browser: full_browser_state,
+                    full_buffer_list: full_buffer_list_state,
+                    selection: self.buffers[self.active_buffer].editor.selection_range(),
+                    extend_mode: self.buffers[self.active_buffer].editor.extend_mode(),
+                    frozen_ranges: self.buffers[self.active_buffer]
+                        .editor
+                        .frozen_ranges()
+                        .to_vec(),
+                    lockable_through_char: self.buffers[self.active_buffer]
+                        .editor
+                        .lockable_through_char(),
                 };
                 view::draw(frame, &state);
             })?;
@@ -360,9 +423,16 @@ impl App {
         let size = terminal.size()?;
         let viewport_height = (size.height as usize).saturating_sub(2);
         let content_width = self.effective_content_width(size.width as usize);
+        self.last_viewport_height = viewport_height;
+        self.last_wrap_width = self.compute_wrap_width(size.width as usize);
 
         if let AppScreen::FileBrowser { .. } = self.screen {
             self.handle_full_browser_key(key, size.width, viewport_height, content_width);
+            self.buffers[self.active_buffer].update_total_lines(content_width);
+            return Ok(());
+        }
+        if let AppScreen::BufferList = self.screen {
+            self.handle_full_buffer_list_key(key, viewport_height, content_width);
             self.buffers[self.active_buffer].update_total_lines(content_width);
             return Ok(());
         }
@@ -375,7 +445,6 @@ impl App {
             AppMode::FileBrowser => {
                 self.handle_file_browser_key(key, size.width, viewport_height, content_width)
             }
-            AppMode::BufferList => self.handle_buffer_list_key(key, viewport_height, content_width),
             AppMode::Outline => self.handle_outline_key(key, viewport_height, content_width),
         }
 
@@ -407,13 +476,52 @@ impl App {
             return;
         }
 
-        if key.code == KeyCode::Esc
-            && self.buffers[self.active_buffer].nav_mode != NavMode::Character
-            && self.buffers[self.active_buffer].view_mode == ViewMode::Rendered
-        {
-            self.buffers[self.active_buffer].nav_mode = NavMode::Character;
+        // Pending f/F/t/T — consume the next character as the target.
+        if let Some(pending) = self.pending_find_char.take() {
+            if let KeyCode::Char(c) = key.code {
+                self.execute_find_char(pending, c, viewport_height);
+                return;
+            }
+            // Any non-Char key cancels the pending find and falls through.
+        }
+
+        if key.code == KeyCode::Esc {
+            self.pending_count = None;
+            // Clear selection / exit extend mode in raw mode
+            let editor = &mut self.buffers[self.active_buffer].editor;
+            editor.set_extend_mode(false);
+            editor.clear_selection();
+            if self.buffers[self.active_buffer].nav_mode != NavMode::Character
+                && self.buffers[self.active_buffer].view_mode == ViewMode::Rendered
+            {
+                self.buffers[self.active_buffer].nav_mode = NavMode::Character;
+            }
             return;
         }
+
+        // Accumulate numeric prefix (1-9 start, 0 appends)
+        if let KeyCode::Char(c) = key.code {
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                if c.is_ascii_digit() && (self.pending_count.is_some() || c != '0') {
+                    let digit = c as usize - '0' as usize;
+                    self.pending_count = Some(self.pending_count.unwrap_or(0) * 10 + digit);
+                    return;
+                }
+            }
+        }
+
+        // G with a count = go to line N
+        if let KeyCode::Char('G') = key.code {
+            if let Some(n) = self.pending_count.take() {
+                let target = n.saturating_sub(1);
+                self.goto_line(target, viewport_height);
+                self.keybinds.reset_pending();
+                return;
+            }
+        }
+
+        let count = self.pending_count.take();
+        let _ = count; // future: pass count to repeated motions
 
         if let Some(cmd_string) = self.keybinds.process_key(key) {
             self.dispatch_command(&cmd_string, viewport_height, content_width);
@@ -423,21 +531,49 @@ impl App {
     fn handle_insert_key(&mut self, key: KeyEvent, viewport_height: usize) {
         match key.code {
             KeyCode::Esc => {
-                self.buffers[self.active_buffer].editor.end_insert();
-                self.mode = AppMode::Normal;
-                self.buffers[self.active_buffer].view_cache_dirty = true;
-                if self.buffers[self.active_buffer].editor.cursor().col > 0 {
-                    self.buffers[self.active_buffer].editor.cursor_mut().move_left();
-                }
+                self.leave_insert_mode();
             }
             KeyCode::Enter => {
+                let indent = self.current_line_indent();
                 self.buffers[self.active_buffer].editor.insert_char('\n');
+                for _ in 0..indent.len() {
+                    self.buffers[self.active_buffer].editor.insert_char(' ');
+                }
+            }
+            KeyCode::Tab => {
+                for _ in 0..2 {
+                    self.buffers[self.active_buffer].editor.insert_char(' ');
+                }
+            }
+            KeyCode::BackTab => {
+                self.dedent_at_cursor();
             }
             KeyCode::Backspace => {
-                self.buffers[self.active_buffer].editor.backspace();
+                self.backspace_smart();
             }
             KeyCode::Char(c) => {
-                self.buffers[self.active_buffer].editor.insert_char(c);
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    match c {
+                        '0' => self.set_heading_level(0),
+                        '1' => self.set_heading_level(1),
+                        '2' => self.set_heading_level(2),
+                        '3' => self.set_heading_level(3),
+                        '4' => self.set_heading_level(4),
+                        '5' => self.set_heading_level(5),
+                        '6' => self.set_heading_level(6),
+                        _ => {}
+                    }
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'v' {
+                    self.leave_insert_mode();
+                    let buf = &mut self.buffers[self.active_buffer];
+                    buf.view_mode = match buf.view_mode {
+                        ViewMode::Rendered => ViewMode::Raw,
+                        ViewMode::Raw => ViewMode::Rendered,
+                    };
+                    self.buffers[self.active_buffer].view_cache_dirty = true;
+                } else {
+                    self.buffers[self.active_buffer].editor.insert_char(c);
+                }
             }
             KeyCode::Left => {
                 self.buffers[self.active_buffer].editor.cursor_mut().move_left();
@@ -652,6 +788,7 @@ impl App {
             }
             KeyCode::Char('h') | KeyCode::Char('-') | KeyCode::Backspace => browser.go_parent(),
             KeyCode::Char('.') => browser.toggle_hidden(),
+            KeyCode::Char('s') => browser.cycle_sort(),
             KeyCode::Char('/') => browser.filter_mode = true,
             KeyCode::Char('G') => {
                 let len = browser.visible_entries().len();
@@ -699,20 +836,441 @@ impl App {
     }
 
     /// Look up a command name in the registry and dispatch its action.
+    /// Execute a pending f/F/t/T motion with the captured target character.
+    fn execute_find_char(&mut self, action: Action, ch: char, viewport_height: usize) {
+        let editor = &mut self.buffers[self.active_buffer].editor;
+        editor.pre_move(false);
+        match action {
+            Action::FindCharForward => {
+                editor.find_char_forward(ch);
+            }
+            Action::FindCharBackward => {
+                editor.find_char_backward(ch);
+            }
+            Action::TillCharForward => {
+                editor.till_char_forward(ch);
+            }
+            Action::TillCharBackward => {
+                editor.till_char_backward(ch);
+            }
+            _ => {}
+        }
+        self.ensure_cursor_visible(viewport_height);
+    }
+
     fn dispatch_command(
         &mut self,
         cmd_input: &str,
         viewport_height: usize,
         content_width: usize,
     ) {
-        if let Some((action, _args)) = self.registry.resolve(cmd_input) {
+        if let Some((action, args)) = self.registry.resolve(cmd_input) {
+            if action == Action::Reload {
+                if let Some(path_arg) = args.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    self.edit_path(path_arg);
+                    return;
+                }
+            }
+            if action == Action::SetMaxLineWidth {
+                let arg = args.as_deref().map(str::trim).unwrap_or("");
+                match arg.parse::<usize>() {
+                    Ok(n) => self.set_max_line_width(n),
+                    Err(_) => {
+                        self.command_error = format!("set-width: expected number, got '{arg}'");
+                    }
+                }
+                return;
+            }
+            if action == Action::ClaudeAttach {
+                let arg = args.as_deref().map(str::trim).unwrap_or("");
+                self.attach_claude_channel(arg);
+                return;
+            }
             self.execute_action(action, viewport_height, content_width);
         } else {
             self.command_error = format!("Unknown command: {}", cmd_input);
         }
     }
 
-    /// Auto-switch to Raw mode if we're in Rendered mode and about to edit.
+    fn attach_claude_channel(&mut self, path_str: &str) {
+        // Always drop any existing connection so re-running :claude-attach is
+        // a clean recovery from staleness (e.g. after Claude restart, sketch
+        // is talking to a now-dead sketch-channel that the kernel hasn't
+        // bubbled up as broken yet).
+        let had_existing = self.claude_channel.take().is_some();
+
+        // Empty string → use the default socket path.
+        let path = if path_str.is_empty() {
+            ChannelClient::default_socket_path()
+        } else {
+            self.resolve_user_path(path_str)
+        };
+        match ChannelClient::connect(&path) {
+            Ok(client) => {
+                self.claude_channel = Some(client);
+                let idx = self.or_create_claude_buffer();
+                self.active_buffer = idx;
+                self.command_error = if had_existing {
+                    format!(
+                        "Re-attached to Claude channel: {} (replaced previous connection)",
+                        path.display()
+                    )
+                } else {
+                    format!("Attached to Claude channel: {}", path.display())
+                };
+            }
+            Err(e) => {
+                self.command_error = format!(
+                    "claude-attach: connect failed for {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    fn resolve_user_path(&self, path_str: &str) -> std::path::PathBuf {
+        let expanded = if let Some(rest) = path_str.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                home.join(rest)
+            } else {
+                std::path::PathBuf::from(path_str)
+            }
+        } else {
+            std::path::PathBuf::from(path_str)
+        };
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&expanded))
+                .unwrap_or(expanded)
+        }
+    }
+
+    /// Returns `true` iff the payload reached the channel server.
+    fn claude_send_text(&mut self, text: &str, label: &str) -> bool {
+        let buffer_path = self.buffers[self.active_buffer]
+            .file_path()
+            .display()
+            .to_string();
+        let mut meta = std::collections::HashMap::new();
+        // meta keys must be alphanumeric/underscore (Claude Code constraint).
+        meta.insert("label".to_string(), label.to_string());
+        meta.insert("file".to_string(), buffer_path.clone());
+        let len = text.len();
+        let outcome = match &mut self.claude_channel {
+            Some(client) => match client.send(text, meta) {
+                Ok(()) => Ok(len),
+                Err(e) => Err(format!("send error: {}", e)),
+            },
+            None => Err("No Claude channel attached. Use :claude-attach first.".to_string()),
+        };
+        match outcome {
+            Ok(n) => {
+                self.command_error =
+                    format!("Sent {} ({} chars) to Claude channel", label, n);
+                true
+            }
+            Err(msg) => {
+                if msg.contains("send error") {
+                    // Drop the broken connection so the user can re-attach.
+                    self.claude_channel = None;
+                }
+                self.command_error = msg;
+                false
+            }
+        }
+    }
+
+    fn claude_send_buffer(&mut self) {
+        let buf = &self.buffers[self.active_buffer];
+        let is_claude_buffer = buf.file_path().to_string_lossy() == CLAUDE_BUFFER_NAME;
+
+        let payload = if is_claude_buffer {
+            // Walk the active region (>= lockable) and collect contiguous runs
+            // of editable chars (those NOT inside any frozen range). These are
+            // the user's inline insertions — Claude's text is excluded.
+            buf.editor.extract_editable_inserts()
+        } else {
+            buf.editor.document().full_text().trim().to_string()
+        };
+
+        if payload.is_empty() {
+            self.command_error = if is_claude_buffer {
+                "Nothing to send (no inline edits in this turn).".into()
+            } else {
+                "Nothing to send (buffer is empty).".into()
+            };
+            return;
+        }
+
+        let sent = self.claude_send_text(&payload, "buffer");
+
+        if is_claude_buffer && sent {
+            // Lock the turn: append HR and bump lockable to past it.
+            self.lock_active_turn();
+            self.ensure_cursor_visible(self.last_viewport_height);
+        }
+    }
+
+    fn claude_send_selection(&mut self) {
+        let sel = self.buffers[self.active_buffer]
+            .editor
+            .selection_text();
+        match sel {
+            Some(t) if !t.is_empty() => {
+                self.claude_send_text(&t, "selection");
+            }
+            _ => {
+                self.command_error =
+                    "No selection. Make one first (e.g. `v` then a motion).".to_string();
+            }
+        }
+    }
+
+    /// Drain any pending replies from the Claude channel into the *claude* buffer.
+    fn pump_claude_replies(&mut self, viewport_height: usize) {
+        // If the reader thread saw EOF since last tick, the server is gone.
+        // Drop the handle and surface a one-shot status message so the user
+        // knows to `:claude-attach` again.
+        let stale = self
+            .claude_channel
+            .as_ref()
+            .map(|c| !c.is_connected())
+            .unwrap_or(false);
+        if stale {
+            self.claude_channel = None;
+            self.command_error =
+                "Claude channel went stale (server gone). Run :claude-attach to recover."
+                    .into();
+        }
+
+        let mut received: Vec<String> = Vec::new();
+        if let Some(client) = &self.claude_channel {
+            while let Some(text) = client.try_recv() {
+                received.push(text);
+            }
+        }
+        if received.is_empty() {
+            return;
+        }
+        for text in received {
+            self.append_to_claude_buffer(&text);
+        }
+        // Scroll the *claude* buffer's viewport to follow the new content,
+        // even if the user is currently editing a different buffer.
+        if let Some(idx) = self
+            .buffers
+            .iter()
+            .position(|b| b.file_path().to_string_lossy() == CLAUDE_BUFFER_NAME)
+        {
+            self.ensure_buffer_cursor_visible(idx, viewport_height);
+        }
+    }
+
+    /// Locate (or lazily create) the special *claude* buffer.
+    fn or_create_claude_buffer(&mut self) -> usize {
+        if let Some(i) = self
+            .buffers
+            .iter()
+            .position(|b| b.file_path().to_string_lossy() == CLAUDE_BUFFER_NAME)
+        {
+            return i;
+        }
+        let mut buf = Buffer::new(
+            CLAUDE_BUFFER_NAME.to_string(),
+            String::new(),
+            self.max_line_width,
+            &self.theme,
+        );
+        // Default new buffers to Rendered, but the *claude* transcript is a
+        // chat-style raw editor — viewport scrolling tracks doc lines there.
+        buf.view_mode = ViewMode::Raw;
+        self.buffers.push(buf);
+        self.buffers.len() - 1
+    }
+
+    /// Ensure the cursor of buffer `buf_idx` is visible in its own viewport.
+    /// Works for non-active buffers too, so a Claude reply landing in *claude*
+    /// while the user is in another buffer still scrolls *claude* into place.
+    fn ensure_buffer_cursor_visible(&mut self, buf_idx: usize, viewport_height: usize) {
+        let wrap_width = self.last_wrap_width.max(1);
+        let buf = &mut self.buffers[buf_idx];
+        let rendered_y = match buf.view_mode {
+            ViewMode::Raw => sketch::buffer::raw_cursor_visual_row(&buf.editor, wrap_width),
+            // Skip for Rendered mode — it uses rendered_cursor_row which we
+            // don't update for programmatic edits.
+            ViewMode::Rendered => return,
+        };
+        // Also keep the buffer's own total_lines fresh so the scroll math is
+        // correct for buffers that aren't currently active (we only update the
+        // active one in the main loop).
+        buf.update_total_lines(wrap_width);
+        buf.viewport
+            .ensure_cursor_visible(rendered_y, viewport_height);
+    }
+
+    /// Splice a Claude reply into the *claude* buffer above any pending draft.
+    ///
+    /// Buffer layout we maintain:
+    /// ```text
+    /// [turn 1]              ← frozen
+    /// \n---\n               ← frozen (the HR line)
+    /// [turn 2]              ← frozen
+    /// \n---\n               ← frozen
+    /// [draft]               ← editable
+    /// ```
+    /// On reply: take the current draft (everything past the frozen HR), and
+    /// rewrite the editable region to `claude_text + HR + draft`. Advance the
+    /// frozen line to the new HR. The user's pending draft is preserved.
+    /// A new Claude reply landed. Append it to the *claude* buffer:
+    ///  - If this is the very first turn, just append the text.
+    ///  - Otherwise, ensure a paragraph break, append the text.
+    /// Register the inserted text as a frozen range so the user can split it
+    /// with inline edits but cannot delete Claude's words.
+    fn append_to_claude_buffer(&mut self, text: &str) {
+        let trimmed = text.trim_end_matches('\n');
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let buf_idx = self.or_create_claude_buffer();
+        let buf = &mut self.buffers[buf_idx];
+        let editor = &mut buf.editor;
+
+        let pre_len = editor.document().rope().len_chars();
+        let buffer_was_empty = pre_len == 0;
+
+        // Pad with newlines so the new turn starts on its own line(s).
+        let pad = if buffer_was_empty {
+            String::new()
+        } else {
+            // Already ends with content; need at least \n\n before the new turn.
+            // Compute current trailing newline count.
+            let s = editor.document().full_text();
+            let trailing_nl = s.chars().rev().take_while(|c| *c == '\n').count();
+            "\n".repeat(2usize.saturating_sub(trailing_nl))
+        };
+
+        // Ensure the Claude payload occupies whole lines: pad to a line
+        // boundary above and ensure a trailing '\n' so the frozen range covers
+        // complete lines only.
+        let trailing_pad = if trimmed.ends_with('\n') { "" } else { "\n" };
+        let payload = format!("{}{}{}", pad, trimmed, trailing_pad);
+        editor.programmatic_insert(pre_len, &payload);
+
+        // The Claude text starts at the line containing `pre_len + pad.len()`
+        // and ends just before the line containing the post-payload position.
+        let claude_start_char = pre_len + pad.chars().count();
+        let claude_end_char = claude_start_char + trimmed.chars().count() + trailing_pad.len();
+        let start_line = char_to_line_col(editor.document(), claude_start_char).0;
+        let end_line = char_to_line_col(editor.document(), claude_end_char).0;
+        editor.add_frozen_lines(start_line, end_line);
+
+        // Place cursor at the end so the user can immediately type a response
+        // below, or navigate up into the turn to insert inline.
+        let post_len_chars = editor.document().rope().len_chars();
+        let (cl, cc) = char_to_line_col(editor.document(), post_len_chars);
+        editor.cursor_mut().line = cl;
+        editor.cursor_mut().col = cc;
+        editor.clear_selection();
+        buf.view_cache_dirty = true;
+    }
+
+    /// Lock the active turn: append `\n\n---\n\n` and bump `lockable_through_char`
+    /// to the new EOF. After this, the user can't edit the just-sent content.
+    fn lock_active_turn(&mut self) {
+        let buf_idx = self.active_buffer;
+        let buf = &mut self.buffers[buf_idx];
+        let editor = &mut buf.editor;
+
+        let pre_len = editor.document().rope().len_chars();
+        // Always end with exactly two newlines after the HR for clean spacing.
+        let s = editor.document().full_text();
+        let trailing_nl = s.chars().rev().take_while(|c| *c == '\n').count();
+        let lead = "\n".repeat(2usize.saturating_sub(trailing_nl));
+        let separator = format!("{}---\n\n", lead);
+        editor.programmatic_insert(pre_len, &separator);
+
+        // Lock through every line currently in the buffer — the next user
+        // turn starts on the new line that comes after the separator.
+        let new_lockable_line = editor.document().line_count();
+        editor.set_lockable_through_line(new_lockable_line);
+
+        // Cursor goes to EOF (start of next active turn — empty until reply).
+        let eof = editor.document().rope().len_chars();
+        let (cl, cc) = char_to_line_col(editor.document(), eof);
+        editor.cursor_mut().line = cl;
+        editor.cursor_mut().col = cc;
+        editor.clear_selection();
+        buf.view_cache_dirty = true;
+    }
+
+    fn leave_insert_mode(&mut self) {
+        self.buffers[self.active_buffer].editor.end_insert();
+        self.mode = AppMode::Normal;
+        self.buffers[self.active_buffer].view_cache_dirty = true;
+        if self.buffers[self.active_buffer].editor.cursor().col > 0 {
+            self.buffers[self.active_buffer].editor.cursor_mut().move_left();
+        }
+    }
+
+    fn current_line_indent(&self) -> String {
+        let editor = &self.buffers[self.active_buffer].editor;
+        let line = editor.document().line_text(editor.cursor().line);
+        let indent_len = line.len() - line.trim_start().len();
+        line[..indent_len].replace('\t', "  ")
+    }
+
+    fn backspace_smart(&mut self) {
+        let editor = &self.buffers[self.active_buffer].editor;
+        let col = editor.cursor().col;
+        if col == 0 {
+            self.buffers[self.active_buffer].editor.backspace();
+            return;
+        }
+        let line = editor.document().line_text(editor.cursor().line);
+        let before_cursor = &line[..col.min(line.len())];
+        // If everything before cursor is whitespace, remove up to 4 spaces
+        if before_cursor.chars().all(|c| c == ' ') {
+            let remove = if col % 2 == 0 { 2 } else { 1 };
+            let remove = remove.min(col);
+            for _ in 0..remove {
+                self.buffers[self.active_buffer].editor.backspace();
+            }
+        } else {
+            self.buffers[self.active_buffer].editor.backspace();
+        }
+    }
+
+    fn dedent_at_cursor(&mut self) {
+        let editor = &self.buffers[self.active_buffer].editor;
+        let line = editor.document().line_text(editor.cursor().line);
+        let indent_len = line.chars().take_while(|c| *c == ' ').count();
+        let remove = if indent_len % 2 == 0 { 2.min(indent_len) } else { 1 };
+        if remove == 0 {
+            return;
+        }
+        // Move cursor to the beginning of indent and delete spaces
+        let orig_col = editor.cursor().col;
+        let editor = &mut self.buffers[self.active_buffer].editor;
+        editor.cursor_mut().col = remove;
+        for _ in 0..remove {
+            editor.backspace();
+        }
+        editor.cursor_mut().col = orig_col.saturating_sub(remove);
+    }
+
+    fn goto_line(&mut self, line: usize, viewport_height: usize) {
+        let doc = self.buffers[self.active_buffer].editor.document();
+        let max_line = doc.line_count().saturating_sub(1);
+        let target = line.min(max_line);
+        self.buffers[self.active_buffer].editor.cursor_mut().line = target;
+        self.buffers[self.active_buffer].editor.cursor_mut().col = 0;
+        self.ensure_cursor_visible(viewport_height);
+    }
+
     fn ensure_raw_for_editing(&mut self) {
         if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
             self.buffers[self.active_buffer].view_mode = ViewMode::Raw;
@@ -741,6 +1299,7 @@ impl App {
                     }
                     self.ensure_rendered_cursor_visible(viewport_height);
                 } else {
+                    self.buffers[self.active_buffer].editor.pre_move(false);
                     self.buffers[self.active_buffer].editor.move_down(false);
                     self.ensure_cursor_visible(viewport_height);
                 }
@@ -755,6 +1314,7 @@ impl App {
                     }
                     self.ensure_rendered_cursor_visible(viewport_height);
                 } else {
+                    self.buffers[self.active_buffer].editor.pre_move(false);
                     self.buffers[self.active_buffer].editor.cursor_mut().move_up();
                     self.buffers[self.active_buffer].editor.clamp_cursor_col(false);
                     self.ensure_cursor_visible(viewport_height);
@@ -789,33 +1349,81 @@ impl App {
                     }
                     // Heading and CodeBlock modes: h/l are no-ops
                 } else {
+                    let editor = &mut self.buffers[self.active_buffer].editor;
                     match action {
-                        Action::MoveLeft => self.buffers[self.active_buffer].editor.cursor_mut().move_left(),
-                        Action::MoveRight => self.buffers[self.active_buffer].editor.move_right_clamped(false),
+                        Action::MoveLeft => {
+                            editor.pre_move(false);
+                            editor.cursor_mut().move_left();
+                        }
+                        Action::MoveRight => {
+                            editor.pre_move(false);
+                            editor.move_right_clamped(false);
+                        }
                         Action::MoveWordForward => {
-                            self.buffers[self.active_buffer].editor.move_cursor_word_forward();
+                            editor.pre_move(true);
+                            editor.move_cursor_word_forward();
                             self.ensure_cursor_visible(viewport_height);
                         }
                         Action::MoveWordBackward => {
-                            self.buffers[self.active_buffer].editor.move_cursor_word_backward();
+                            editor.pre_move(true);
+                            editor.move_cursor_word_backward();
                             self.ensure_cursor_visible(viewport_height);
                         }
-                        Action::MoveWordEnd => self.buffers[self.active_buffer].editor.move_cursor_word_end(),
-                        Action::MoveLineStart => self.buffers[self.active_buffer].editor.cursor_mut().move_line_start(),
-                        Action::MoveLineEnd => self.buffers[self.active_buffer].editor.move_cursor_line_end(false),
+                        Action::MoveWordEnd => {
+                            editor.pre_move(true);
+                            editor.move_cursor_word_end();
+                        }
+                        Action::MoveLineStart => {
+                            editor.pre_move(false);
+                            editor.cursor_mut().move_line_start();
+                        }
+                        Action::MoveLineEnd => {
+                            editor.pre_move(false);
+                            editor.move_cursor_line_end(false);
+                        }
                         _ => {}
                     }
                 }
             }
+            Action::FindCharForward
+            | Action::FindCharBackward
+            | Action::TillCharForward
+            | Action::TillCharBackward => {
+                // Only meaningful in raw (Edit) mode against real document text.
+                if self.buffers[self.active_buffer].view_mode != ViewMode::Rendered {
+                    self.pending_find_char = Some(action);
+                }
+            }
             Action::InsertMode => {
                 self.ensure_raw_for_editing();
-                self.buffers[self.active_buffer].editor.begin_insert();
+                let editor = &mut self.buffers[self.active_buffer].editor;
+                // Helix-style: i inserts at selection start
+                if let Some(((sl, sc), _)) = editor.selection_range() {
+                    editor.cursor_mut().line = sl;
+                    editor.cursor_mut().col = sc;
+                    editor.clear_selection();
+                }
+                editor.set_extend_mode(false);
+                editor.begin_insert();
                 self.mode = AppMode::Insert;
             }
             Action::InsertAfter => {
                 self.ensure_raw_for_editing();
-                self.buffers[self.active_buffer].editor.move_right_clamped(true);
-                self.buffers[self.active_buffer].editor.begin_insert();
+                let editor = &mut self.buffers[self.active_buffer].editor;
+                // Helix-style: a inserts after selection end
+                if let Some((_, (el, ec))) = editor.selection_range() {
+                    editor.cursor_mut().line = el;
+                    editor.cursor_mut().col = ec;
+                    let line_len = editor.document().line_len_chars(el);
+                    if editor.cursor().col < line_len {
+                        editor.cursor_mut().col += 1;
+                    }
+                    editor.clear_selection();
+                } else {
+                    editor.move_right_clamped(true);
+                }
+                editor.set_extend_mode(false);
+                editor.begin_insert();
                 self.mode = AppMode::Insert;
             }
             Action::OpenLineBelow => {
@@ -1026,7 +1634,7 @@ impl App {
                 self.buffer_list_selected = self.active_buffer;
                 self.buffer_list_filter_mode = false;
                 self.buffer_list_filter_text.clear();
-                self.mode = AppMode::BufferList;
+                self.screen = AppScreen::BufferList;
             }
             Action::CloseBuffer => {
                 self.close_current_buffer();
@@ -1037,8 +1645,7 @@ impl App {
             Action::Outline => {
                 self.outline_filter_mode = false;
                 self.outline_filter_text.clear();
-                self.outline_parent_level = None;
-                self.outline_parent_y = None;
+                self.outline_stack.clear();
                 self.outline_saved_scroll =
                     self.buffers[self.active_buffer].viewport.scroll_offset;
                 self.mode = AppMode::Outline;
@@ -1092,7 +1699,187 @@ impl App {
             Action::NavActivate => {
                 self.nav_activate();
             }
+            Action::SetHeading1 => self.set_heading_level(1),
+            Action::SetHeading2 => self.set_heading_level(2),
+            Action::SetHeading3 => self.set_heading_level(3),
+            Action::SetHeading4 => self.set_heading_level(4),
+            Action::SetHeading5 => self.set_heading_level(5),
+            Action::SetHeading6 => self.set_heading_level(6),
+            Action::ClearHeading => self.set_heading_level(0),
+            Action::SetMaxLineWidth => {
+                // No argument supplied — tell the user how to use it.
+                self.command_error = "Usage: :set-width <n>  (0 = full terminal)".to_string();
+            }
+            Action::DeleteSelection => {
+                self.ensure_raw_for_editing();
+                let editor = &mut self.buffers[self.active_buffer].editor;
+                if editor.selection_anchor().is_some() {
+                    editor.delete_selection();
+                } else {
+                    editor.delete_char_at_cursor();
+                }
+                self.buffers[self.active_buffer].view_cache_dirty = true;
+                self.ensure_cursor_visible(viewport_height);
+            }
+            Action::ChangeSelection => {
+                self.ensure_raw_for_editing();
+                let editor = &mut self.buffers[self.active_buffer].editor;
+                if editor.selection_anchor().is_some() {
+                    editor.delete_selection();
+                } else {
+                    editor.delete_char_at_cursor();
+                }
+                self.buffers[self.active_buffer].view_cache_dirty = true;
+                self.buffers[self.active_buffer].editor.begin_insert();
+                self.mode = AppMode::Insert;
+            }
+            Action::YankSelection => {
+                let buf = &self.buffers[self.active_buffer];
+                let text = match buf.editor.yank_selection() {
+                    Some(t) if !t.is_empty() => t,
+                    _ => {
+                        // Fallback: yank current line
+                        let line_text = buf.editor.document().line_text(buf.editor.cursor().line);
+                        line_text.trim_end_matches('\n').to_string()
+                    }
+                };
+                use std::io::Write;
+                use std::process::{Command, Stdio};
+                if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn()
+                    && let Some(mut stdin) = child.stdin.take()
+                {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+            }
+            Action::CollapseSelection => {
+                self.buffers[self.active_buffer].editor.collapse_selection();
+            }
+            Action::FlipSelection => {
+                self.buffers[self.active_buffer].editor.flip_selection();
+                self.ensure_cursor_visible(viewport_height);
+            }
+            Action::SelectAll => {
+                self.ensure_raw_for_editing();
+                self.buffers[self.active_buffer].editor.select_all();
+                self.ensure_cursor_visible(viewport_height);
+            }
+            Action::ExtendByLine => {
+                self.ensure_raw_for_editing();
+                self.buffers[self.active_buffer].editor.extend_by_line();
+                self.ensure_cursor_visible(viewport_height);
+            }
+            Action::ToggleExtendMode => {
+                let editor = &mut self.buffers[self.active_buffer].editor;
+                editor.toggle_extend_mode();
+                if editor.extend_mode() && editor.selection_anchor().is_none() {
+                    editor.anchor_at_cursor();
+                }
+            }
+            Action::ClaudeAttach => {
+                // Bare invocation (no arg) → connect to default socket path.
+                self.attach_claude_channel("");
+            }
+            Action::ClaudeDetach => {
+                let was = self.claude_channel.take().is_some();
+                self.command_error = if was {
+                    "Detached from Claude channel".to_string()
+                } else {
+                    "Not attached".to_string()
+                };
+            }
+            Action::ClaudeSend => {
+                self.claude_send_buffer();
+            }
+            Action::ClaudeSendSelection => {
+                self.claude_send_selection();
+            }
+            Action::ClaudeStatus => {
+                self.command_error = match &self.claude_channel {
+                    Some(c) => {
+                        let live = if c.is_connected() {
+                            "alive"
+                        } else {
+                            "STALE — re-run :claude-attach"
+                        };
+                        format!(
+                            "Claude channel: {} ({})",
+                            c.socket_path().display(),
+                            live
+                        )
+                    }
+                    None => format!(
+                        "Not attached. Default socket: {}",
+                        ChannelClient::default_socket_path().display()
+                    ),
+                };
+            }
+            Action::ClaudeTest => {
+                // Inject a synthetic reply to verify the local *claude*-buffer
+                // path independent of Claude / sketch-channel.
+                self.append_to_claude_buffer(
+                    "Hello from :claude-test.\n\nThis is paragraph two.\n\nThis is paragraph three.",
+                );
+                self.command_error =
+                    "Injected synthetic Claude reply into *claude* buffer.".into();
+            }
         }
+    }
+
+    /// Update the soft right-margin wrap width. `0` disables the cap (use full terminal width).
+    fn set_max_line_width(&mut self, n: usize) {
+        self.max_line_width = n;
+        for buf in &mut self.buffers {
+            buf.viewport.max_line_width = n;
+            buf.view_cache_dirty = true;
+        }
+    }
+
+    /// Rewrite the current line with `level` hashes (0 = remove heading markers).
+    fn set_heading_level(&mut self, level: u8) {
+        self.ensure_raw_for_editing();
+        let buf = &mut self.buffers[self.active_buffer];
+        let line_idx = buf.editor.cursor().line;
+        let existing = buf.editor.document().line_text(line_idx);
+        let existing = existing.strip_suffix('\n').unwrap_or(&existing);
+
+        // Strip any existing leading `#`s + single space.
+        let trimmed = {
+            let without_hashes = existing.trim_start_matches('#');
+            if without_hashes.len() != existing.len() {
+                without_hashes.strip_prefix(' ').unwrap_or(without_hashes)
+            } else {
+                existing
+            }
+        };
+
+        let new_line = if level == 0 {
+            trimmed.to_string()
+        } else {
+            let hashes: String = "#".repeat(level as usize);
+            if trimmed.is_empty() {
+                format!("{hashes} ")
+            } else {
+                format!("{hashes} {trimmed}")
+            }
+        };
+
+        let cursor_col_before = buf.editor.cursor().col;
+        buf.editor
+            .document_mut()
+            .begin_undo_group(line_idx, cursor_col_before);
+        buf.editor
+            .document_mut()
+            .replace_line_text(line_idx, &new_line);
+
+        // Keep cursor on the same line, clamp to new length.
+        let new_len = buf.editor.document().line_len_chars(line_idx);
+        let new_col = cursor_col_before.min(new_len);
+        buf.editor.cursor_mut().line = line_idx;
+        buf.editor.cursor_mut().col = new_col;
+        buf.editor
+            .document_mut()
+            .end_undo_group(line_idx, new_col);
+        buf.view_cache_dirty = true;
     }
 
     fn execute_command(&mut self, cmd: &str) {
@@ -1108,11 +1895,9 @@ impl App {
             return;
         }
 
-        // Look up in registry by name or alias
-        if let Some(cmd_def) = self.registry.lookup(cmd_name) {
-            let action = cmd_def.action;
-            // Use a reasonable viewport height for dispatching
-            self.execute_action(action, 40, 80);
+        // Resolve via registry (parses args) so commands like `:edit <path>` work.
+        if self.registry.resolve(cmd).is_some() {
+            self.dispatch_command(cmd, 40, 80);
         } else {
             self.command_error = format!("Not an editor command: {}", cmd);
         }
@@ -1139,7 +1924,14 @@ impl App {
 
     fn nav_activate(&mut self) {
         let buf = &self.buffers[self.active_buffer];
-        if buf.view_mode != ViewMode::Rendered || buf.nav_mode == NavMode::Character {
+        if buf.view_mode != ViewMode::Rendered {
+            return;
+        }
+        // In Character mode, try to open a link under the cursor
+        if buf.nav_mode == NavMode::Character {
+            if let Some(url) = self.link_under_rendered_cursor() {
+                self.open_link(&url);
+            }
             return;
         }
         let obj = match buf.nav_objects.get(buf.nav_object_index) {
@@ -1283,10 +2075,14 @@ impl App {
         let buf = &self.buffers[self.active_buffer];
         let cursor_line = buf.editor.cursor().line;
         let rendered_y = match buf.view_mode {
-            ViewMode::Raw => cursor_line,
+            ViewMode::Raw => sketch::buffer::raw_cursor_visual_row(
+                &buf.editor,
+                self.last_wrap_width.max(1),
+            ),
             ViewMode::Rendered => self.doc_line_to_rendered_y(cursor_line),
         };
-        self.buffers[self.active_buffer].viewport
+        self.buffers[self.active_buffer]
+            .viewport
             .ensure_cursor_visible(rendered_y, viewport_height);
     }
 
@@ -1490,6 +2286,59 @@ impl App {
         last_match
     }
 
+    /// Open `path` as a buffer, creating a new empty buffer if the file doesn't exist yet.
+    fn edit_path(&mut self, path_str: &str) {
+        let expanded = if let Some(rest) = path_str.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                home.join(rest)
+            } else {
+                std::path::PathBuf::from(path_str)
+            }
+        } else {
+            std::path::PathBuf::from(path_str)
+        };
+
+        let path = if expanded.is_absolute() {
+            expanded
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&expanded))
+                .unwrap_or(expanded)
+        };
+
+        if path.exists() {
+            if !self.open_buffer(path.clone()) {
+                self.command_error = format!("Error opening: {}", path.display());
+            }
+            return;
+        }
+
+        // Check parent directory exists before creating an unsaved buffer.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                self.command_error = format!("No such directory: {}", parent.display());
+                return;
+            }
+        }
+
+        // Already open with this target path? Switch to it.
+        for (i, buf) in self.buffers.iter().enumerate() {
+            if buf.file_path() == path {
+                self.active_buffer = i;
+                return;
+            }
+        }
+
+        let buffer = Buffer::new(
+            path.display().to_string(),
+            String::new(),
+            self.max_line_width,
+            &self.theme,
+        );
+        self.buffers.push(buffer);
+        self.active_buffer = self.buffers.len() - 1;
+    }
+
     fn reload_current_buffer(&mut self) {
         let buf = &self.buffers[self.active_buffer];
         if buf.editor.document().is_modified() {
@@ -1528,22 +2377,19 @@ impl App {
         }
     }
 
-    fn handle_buffer_list_key(&mut self, key: KeyEvent, _viewport_height: usize, _content_width: usize) {
+    fn handle_full_buffer_list_key(&mut self, key: KeyEvent, _viewport_height: usize, _content_width: usize) {
         if self.buffer_list_filter_mode {
             match key.code {
                 KeyCode::Esc => {
-                    // Exit buffer list entirely
-                    self.mode = AppMode::Normal;
+                    self.close_buffer_list();
                     return;
                 }
                 KeyCode::Enter => {
                     let filtered = self.filtered_buffer_indices();
                     if filtered.len() == 1 {
-                        // Single result — select it directly
                         self.active_buffer = filtered[0];
-                        self.mode = AppMode::Normal;
+                        self.close_buffer_list();
                     } else if !filtered.is_empty() {
-                        // Multiple results — exit filter mode, navigate
                         self.buffer_list_filter_mode = false;
                     }
                     return;
@@ -1563,7 +2409,7 @@ impl App {
 
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.mode = AppMode::Normal;
+                self.close_buffer_list();
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 let count = self.filtered_buffer_indices().len();
@@ -1581,11 +2427,20 @@ impl App {
                     };
                 }
             }
-            KeyCode::Enter => {
+            KeyCode::Char('g') => {
+                self.buffer_list_selected = 0;
+            }
+            KeyCode::Char('G') => {
+                let count = self.filtered_buffer_indices().len();
+                if count > 0 {
+                    self.buffer_list_selected = count - 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('l') => {
                 let filtered = self.filtered_buffer_indices();
                 if let Some(&buf_idx) = filtered.get(self.buffer_list_selected) {
                     self.active_buffer = buf_idx;
-                    self.mode = AppMode::Normal;
+                    self.close_buffer_list();
                 }
             }
             KeyCode::Char('d') => {
@@ -1601,6 +2456,12 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn close_buffer_list(&mut self) {
+        self.screen = AppScreen::Editor;
+        self.buffer_list_filter_mode = false;
+        self.buffer_list_filter_text.clear();
     }
 
     fn close_buffer_at(&mut self, index: usize) {
@@ -1734,34 +2595,28 @@ impl App {
                 // Descend: show children of the selected heading
                 let entries = self.filtered_outline_entries();
                 if let Some(entry) = entries.get(self.outline_selected) {
-                    self.outline_parent_level = Some(entry.level);
-                    self.outline_parent_y = Some(entry.y_offset);
-                    self.outline_selected = 0;
-                    self.outline_filter_text.clear();
-                    self.outline_filter_mode = false;
-                    // If no children, don't descend
+                    let new_parent = (entry.level, entry.y_offset);
+                    self.outline_stack.push(new_parent);
+                    // Check if descent has any children. If not, undo it.
                     if self.filtered_outline_entries().is_empty() {
-                        self.outline_parent_level = None;
-                        self.outline_parent_y = None;
+                        self.outline_stack.pop();
                     } else {
+                        self.outline_selected = 0;
+                        self.outline_filter_text.clear();
+                        self.outline_filter_mode = false;
                         self.scroll_to_outline_entry();
                     }
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                // Ascend: go back to parent level
-                if self.outline_parent_level.is_some() {
-                    // Find the parent heading and restore to its level
-                    let parent_y = self.outline_parent_y;
-                    self.outline_parent_level = None;
-                    self.outline_parent_y = None;
+                // Ascend: pop the stack, restoring the previous level.
+                if let Some((_old_level, old_y)) = self.outline_stack.pop() {
                     self.outline_filter_text.clear();
                     self.outline_filter_mode = false;
-                    // Try to select the entry we came from
                     let entries = self.filtered_outline_entries();
                     self.outline_selected = entries
                         .iter()
-                        .position(|e| Some(e.y_offset) == parent_y)
+                        .position(|e| e.y_offset == old_y)
                         .unwrap_or(0);
                     self.scroll_to_outline_entry();
                 }
@@ -1808,9 +2663,8 @@ impl App {
     fn filtered_outline_entries(&self) -> Vec<OutlineEntry> {
         let all = self.outline_entries();
 
-        // Apply hierarchy filter
-        let scoped: Vec<OutlineEntry> = if let Some(parent_level) = self.outline_parent_level {
-            let parent_y = self.outline_parent_y.unwrap_or(0);
+        // Apply hierarchy filter via stack
+        let scoped: Vec<OutlineEntry> = if let Some(&(parent_level, parent_y)) = self.outline_stack.last() {
             let child_level = parent_level + 1;
             // Show headings at child_level that come after parent_y
             // and before the next heading at parent_level or above
@@ -1836,6 +2690,25 @@ impl App {
                 .collect()
         }
     }
+
+    /// Build a breadcrumb showing the descent path (e.g. "A › B › C").
+    fn outline_breadcrumb(&self) -> Option<String> {
+        if self.outline_stack.is_empty() {
+            return None;
+        }
+        let all = self.outline_entries();
+        let parts: Vec<String> = self.outline_stack
+            .iter()
+            .filter_map(|(_, y)| {
+                all.iter().find(|e| e.y_offset == *y).map(|e| e.title.clone())
+            })
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" \u{203a} "))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1843,6 +2716,21 @@ struct OutlineEntry {
     level: u8,
     title: String,
     y_offset: usize,
+}
+
+/// Special filename used for the in-editor *claude* buffer that holds the
+/// transcript with horizontal rules between turns. Recognised by send/reply
+/// helpers to apply the inline-reply semantics.
+const CLAUDE_BUFFER_NAME: &str = "*claude*";
+
+/// Convert a rope char index to (line, col).
+fn char_to_line_col(doc: &sketch::document::Document, char_idx: usize) -> (usize, usize) {
+    let rope = doc.rope();
+    let len = rope.len_chars();
+    let i = char_idx.min(len);
+    let line = rope.char_to_line(i);
+    let line_start = rope.line_to_char(line);
+    (line, i - line_start)
 }
 
 fn fuzzy_match(text: &str, query: &str) -> bool {
@@ -1876,4 +2764,64 @@ fn merge_menu(mut defaults: Vec<MenuNode>, user_nodes: &[MenuNode]) -> Vec<MenuN
         }
     }
     defaults
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sketch::config::Config;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    fn fresh_socket() -> std::path::PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "sketch-attach-test-{}-{}.sock",
+            std::process::id(),
+            n
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn attach_creates_and_switches_to_claude_buffer() {
+        let sock = fresh_socket();
+        let listener = UnixListener::bind(&sock).expect("bind");
+        // Accept-and-park so the client connect succeeds without immediate EOF.
+        let sock_for_thread = sock.clone();
+        let _accept = thread::spawn(move || {
+            let _ = listener.accept();
+            // Hold the connection open until the test ends.
+            thread::sleep(Duration::from_secs(2));
+            let _ = std::fs::remove_file(&sock_for_thread);
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let cfg = Config::default();
+        let mut app = App::new("untitled.md".into(), String::new(), &cfg);
+        assert_eq!(app.buffers.len(), 1, "starts with one buffer");
+        assert_eq!(app.active_buffer, 0);
+
+        app.attach_claude_channel(sock.to_str().unwrap());
+
+        assert!(
+            app.command_error.starts_with("Attached to Claude channel:"),
+            "expected success status, got: {}",
+            app.command_error
+        );
+        assert_eq!(app.buffers.len(), 2, "claude buffer should be created");
+        let claude_idx = app
+            .buffers
+            .iter()
+            .position(|b| b.file_path().to_string_lossy() == CLAUDE_BUFFER_NAME)
+            .expect("claude buffer must exist");
+        assert_eq!(
+            app.active_buffer, claude_idx,
+            "active_buffer must switch to claude buffer"
+        );
+    }
 }

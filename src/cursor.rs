@@ -188,6 +188,79 @@ impl CursorPos {
         self.desired_col = None;
     }
 
+    /// Find next occurrence of `ch` on the current line after the cursor.
+    /// Returns true if found and cursor moved.
+    pub fn find_char_forward(&mut self, doc: &Document, ch: char) -> bool {
+        let text = doc.line_text(self.line);
+        let chars: Vec<char> = text.chars().collect();
+        let start = self.col + 1;
+        for (offset, &c) in chars.iter().enumerate().skip(start) {
+            if c == '\n' {
+                break;
+            }
+            if c == ch {
+                self.col = offset;
+                self.desired_col = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Find previous occurrence of `ch` on the current line before the cursor.
+    pub fn find_char_backward(&mut self, doc: &Document, ch: char) -> bool {
+        if self.col == 0 {
+            return false;
+        }
+        let text = doc.line_text(self.line);
+        let chars: Vec<char> = text.chars().collect();
+        for i in (0..self.col).rev() {
+            if chars[i] == ch {
+                self.col = i;
+                self.desired_col = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Move forward to the position just before the next occurrence of `ch`
+    /// on the current line. No movement if the immediately-next char is `ch`.
+    pub fn till_char_forward(&mut self, doc: &Document, ch: char) -> bool {
+        let text = doc.line_text(self.line);
+        let chars: Vec<char> = text.chars().collect();
+        let start = self.col + 1;
+        for (offset, &c) in chars.iter().enumerate().skip(start) {
+            if c == '\n' {
+                break;
+            }
+            if c == ch {
+                self.col = offset.saturating_sub(1);
+                self.desired_col = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Move backward to the position just after the previous occurrence of
+    /// `ch` on the current line.
+    pub fn till_char_backward(&mut self, doc: &Document, ch: char) -> bool {
+        if self.col == 0 {
+            return false;
+        }
+        let text = doc.line_text(self.line);
+        let chars: Vec<char> = text.chars().collect();
+        for i in (0..self.col).rev() {
+            if chars[i] == ch {
+                self.col = i + 1;
+                self.desired_col = None;
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn jump_top(&mut self) {
         self.line = 0;
         self.col = 0;

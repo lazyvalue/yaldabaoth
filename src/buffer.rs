@@ -97,7 +97,8 @@ impl Buffer {
                     .sum();
             }
             ViewMode::Raw => {
-                self.viewport.total_lines = self.editor.document().line_count();
+                self.viewport.total_lines =
+                    raw_visual_row_count(&self.editor, content_width.max(1));
             }
         }
     }
@@ -106,9 +107,8 @@ impl Buffer {
         &self.editor.document().file_path
     }
 
-    pub fn rebuild_nav_objects(&mut self, theme: &Theme) {
+    pub fn rebuild_nav_objects(&mut self, theme: &Theme, content_width: usize) {
         self.nav_objects.clear();
-        let content_width = self.viewport.content_width(200);
         let mut rendered_row = 0;
 
         for block in &self.rendered_cache {
@@ -204,7 +204,8 @@ impl Buffer {
                 }
             }
 
-            rendered_row += lines.len();
+            // Use block_height (not lines.len()) to match the view's row accumulation
+            rendered_row += self.viewport.block_height(block, content_width);
         }
 
         self.nav_objects.sort_by(|a, b| {
@@ -234,4 +235,90 @@ impl Buffer {
             })?;
         Some(filtered[best_filtered_idx].0)
     }
+}
+
+/// True iff the `*claude*`-style line owned-by-the-user heuristic considers
+/// this line a "user reply line": at least one non-whitespace char, none of
+/// the non-whitespace chars are inside a frozen range, and it isn't the turn
+/// delimiter `---`. Mirrors view::is_user_line so total-row counting and
+/// rendering agree on which lines wrap at the prefixed (narrower) width.
+fn classify_user_line(line_first_char: usize, line_text: &str, frozen: &[(usize, usize)]) -> bool {
+    if line_text.trim_end_matches('\n').trim() == "---" {
+        return false;
+    }
+    let mut idx = line_first_char;
+    let mut had_non_ws = false;
+    for ch in line_text.chars() {
+        if !ch.is_whitespace() {
+            had_non_ws = true;
+            if frozen.iter().any(|&(s, e)| idx >= s && idx < e) {
+                return false;
+            }
+        }
+        idx += 1;
+    }
+    had_non_ws
+}
+
+const REPLY_PREFIX_LEN: usize = 2;
+
+fn line_wrap_width(is_user: bool, base: usize) -> usize {
+    if is_user {
+        base.saturating_sub(REPLY_PREFIX_LEN).max(1)
+    } else {
+        base
+    }
+}
+
+fn line_visual_rows(line_len_chars: usize, wrap_width: usize) -> usize {
+    if line_len_chars == 0 {
+        1
+    } else if wrap_width == 0 {
+        1
+    } else {
+        line_len_chars.div_ceil(wrap_width)
+    }
+}
+
+/// Total visual rows when rendering `editor`'s document in raw mode at the
+/// given `wrap_width`.
+pub fn raw_visual_row_count(editor: &Editor, wrap_width: usize) -> usize {
+    let doc = editor.document();
+    let frozen = editor.frozen_ranges();
+    let mut total = 0usize;
+    let mut char_idx = 0usize;
+    for l in 0..doc.line_count() {
+        let line_text = doc.line_text(l);
+        let line_len = doc.line_len_chars(l);
+        let is_user = classify_user_line(char_idx, &line_text, &frozen);
+        let lw = line_wrap_width(is_user, wrap_width);
+        total += line_visual_rows(line_len, lw);
+        char_idx += line_text.chars().count();
+    }
+    total
+}
+
+/// Compute the cursor's visual-row index in raw mode (sum of visual rows for
+/// every doc line above the cursor's line, plus the cursor's row within its
+/// own line at `cursor.col / line_wrap_width`).
+pub fn raw_cursor_visual_row(editor: &Editor, wrap_width: usize) -> usize {
+    let doc = editor.document();
+    let frozen = editor.frozen_ranges();
+    let cursor = editor.cursor();
+    let target_line = cursor.line;
+    let target_col = cursor.col;
+    let mut total = 0usize;
+    let mut char_idx = 0usize;
+    for l in 0..doc.line_count() {
+        let line_text = doc.line_text(l);
+        let line_len = doc.line_len_chars(l);
+        let is_user = classify_user_line(char_idx, &line_text, &frozen);
+        let lw = line_wrap_width(is_user, wrap_width);
+        if l == target_line {
+            return total + target_col / lw;
+        }
+        total += line_visual_rows(line_len, lw);
+        char_idx += line_text.chars().count();
+    }
+    total
 }

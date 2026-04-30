@@ -250,6 +250,30 @@ impl CommandRegistry {
                 description: "Move to end of line".into(),
             },
             CommandDef {
+                name: "find-char-forward".into(),
+                aliases: vec![],
+                action: Action::FindCharForward,
+                description: "Find next character on line (f<char>)".into(),
+            },
+            CommandDef {
+                name: "find-char-backward".into(),
+                aliases: vec![],
+                action: Action::FindCharBackward,
+                description: "Find previous character on line (F<char>)".into(),
+            },
+            CommandDef {
+                name: "till-char-forward".into(),
+                aliases: vec![],
+                action: Action::TillCharForward,
+                description: "Move till next character on line (t<char>)".into(),
+            },
+            CommandDef {
+                name: "till-char-backward".into(),
+                aliases: vec![],
+                action: Action::TillCharBackward,
+                description: "Move till previous character on line (T<char>)".into(),
+            },
+            CommandDef {
                 name: "insert-mode".into(),
                 aliases: vec![],
                 action: Action::InsertMode,
@@ -387,6 +411,140 @@ impl CommandRegistry {
                 action: Action::OpenFileBrowserFull,
                 description: "Open full-screen file browser".into(),
             },
+            CommandDef {
+                name: "set-heading-1".into(),
+                aliases: vec!["h1".into()],
+                action: Action::SetHeading1,
+                description: "Set current line to H1".into(),
+            },
+            CommandDef {
+                name: "set-heading-2".into(),
+                aliases: vec!["h2".into()],
+                action: Action::SetHeading2,
+                description: "Set current line to H2".into(),
+            },
+            CommandDef {
+                name: "set-heading-3".into(),
+                aliases: vec!["h3".into()],
+                action: Action::SetHeading3,
+                description: "Set current line to H3".into(),
+            },
+            CommandDef {
+                name: "set-heading-4".into(),
+                aliases: vec!["h4".into()],
+                action: Action::SetHeading4,
+                description: "Set current line to H4".into(),
+            },
+            CommandDef {
+                name: "set-heading-5".into(),
+                aliases: vec!["h5".into()],
+                action: Action::SetHeading5,
+                description: "Set current line to H5".into(),
+            },
+            CommandDef {
+                name: "set-heading-6".into(),
+                aliases: vec!["h6".into()],
+                action: Action::SetHeading6,
+                description: "Set current line to H6".into(),
+            },
+            CommandDef {
+                name: "clear-heading".into(),
+                aliases: vec!["h0".into()],
+                action: Action::ClearHeading,
+                description: "Remove heading markers from current line".into(),
+            },
+            CommandDef {
+                name: "set-width".into(),
+                aliases: vec!["width".into(), "set-line-width".into()],
+                action: Action::SetMaxLineWidth,
+                description: "Set max line width (0 = full terminal)".into(),
+            },
+            // --- Helix-style selection commands ---
+            CommandDef {
+                name: "delete-selection".into(),
+                aliases: vec!["delete".into()],
+                action: Action::DeleteSelection,
+                description: "Delete current selection (or current line)".into(),
+            },
+            CommandDef {
+                name: "change-selection".into(),
+                aliases: vec!["change".into()],
+                action: Action::ChangeSelection,
+                description: "Delete selection and enter insert mode".into(),
+            },
+            CommandDef {
+                name: "yank-selection".into(),
+                aliases: vec!["yank".into()],
+                action: Action::YankSelection,
+                description: "Yank current selection (or line) to clipboard".into(),
+            },
+            CommandDef {
+                name: "collapse-selection".into(),
+                aliases: vec![],
+                action: Action::CollapseSelection,
+                description: "Collapse selection to cursor".into(),
+            },
+            CommandDef {
+                name: "flip-selection".into(),
+                aliases: vec![],
+                action: Action::FlipSelection,
+                description: "Swap cursor and selection anchor".into(),
+            },
+            CommandDef {
+                name: "select-all".into(),
+                aliases: vec![],
+                action: Action::SelectAll,
+                description: "Select the whole buffer".into(),
+            },
+            CommandDef {
+                name: "extend-line".into(),
+                aliases: vec![],
+                action: Action::ExtendByLine,
+                description: "Extend selection by one line".into(),
+            },
+            CommandDef {
+                name: "toggle-extend-mode".into(),
+                aliases: vec!["select-mode".into()],
+                action: Action::ToggleExtendMode,
+                description: "Toggle extend (select) mode".into(),
+            },
+            // --- Claude Code channel commands ---
+            CommandDef {
+                name: "claude-attach".into(),
+                aliases: vec!["cattach".into()],
+                action: Action::ClaudeAttach,
+                description: "Attach to a Claude Code channel (path)".into(),
+            },
+            CommandDef {
+                name: "claude-detach".into(),
+                aliases: vec!["cdetach".into()],
+                action: Action::ClaudeDetach,
+                description: "Detach from the current Claude Code channel".into(),
+            },
+            CommandDef {
+                name: "claude-send".into(),
+                aliases: vec!["csend".into()],
+                action: Action::ClaudeSend,
+                description: "Send the entire buffer to the Claude channel".into(),
+            },
+            CommandDef {
+                name: "claude-send-selection".into(),
+                aliases: vec!["csendsel".into()],
+                action: Action::ClaudeSendSelection,
+                description: "Send the current selection to the Claude channel".into(),
+            },
+            CommandDef {
+                name: "claude-status".into(),
+                aliases: vec!["cstatus".into()],
+                action: Action::ClaudeStatus,
+                description: "Show the current Claude channel attachment".into(),
+            },
+            CommandDef {
+                name: "claude-test".into(),
+                aliases: vec!["ctest".into()],
+                action: Action::ClaudeTest,
+                description: "Inject a fake Claude reply (for diagnostics)".into(),
+            },
         ])
     }
 }
@@ -434,6 +592,8 @@ mod tests {
             "move-left", "move-right", "move-up", "move-down",
             "move-word-forward", "move-word-backward", "move-word-end",
             "move-line-start", "move-line-end",
+            "find-char-forward", "find-char-backward",
+            "till-char-forward", "till-char-backward",
             "insert-mode", "insert-after", "open-line-below", "open-line-above",
             "delete-char", "delete-line", "undo", "redo", "enter-command",
             "save", "quit", "force-quit", "save-quit", "save-as",
@@ -442,6 +602,14 @@ mod tests {
             "nav-cycle", "nav-character", "nav-links", "nav-headings",
             "nav-list-items", "nav-code-blocks", "nav-activate",
             "reload", "outline", "file-browser-full",
+            "set-heading-1", "set-heading-2", "set-heading-3",
+            "set-heading-4", "set-heading-5", "set-heading-6",
+            "clear-heading", "set-width",
+            "delete-selection", "change-selection", "yank-selection",
+            "collapse-selection", "flip-selection", "select-all",
+            "extend-line", "toggle-extend-mode",
+            "claude-attach", "claude-detach", "claude-send",
+            "claude-send-selection", "claude-status", "claude-test",
         ];
         for name in &expected {
             assert!(reg.lookup(name).is_some(), "missing command: {}", name);
