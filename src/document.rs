@@ -91,8 +91,10 @@ impl Document {
 
     /// Convert (line, char_col) to a char offset in the rope.
     pub fn line_col_to_char(&self, line: usize, col: usize) -> usize {
-        let line_start = self.rope.line_to_char(line);
-        line_start + col
+        let clamped_line = line.min(self.rope.len_lines().saturating_sub(1));
+        let line_start = self.rope.line_to_char(clamped_line);
+        let line_len = self.line_len_chars(clamped_line);
+        line_start + col.min(line_len)
     }
 
     pub fn insert_char(&mut self, line: usize, col: usize, ch: char) {
@@ -109,6 +111,36 @@ impl Document {
             self.modified = true;
             self.redo_stack.clear();
         }
+    }
+
+    /// Delete the character range `[start_char, end_char)` (rope char indices).
+    pub fn delete_range(&mut self, start_char: usize, end_char: usize) {
+        let len = self.rope.len_chars();
+        let s = start_char.min(len);
+        let e = end_char.min(len);
+        if s < e {
+            self.rope.remove(s..e);
+            self.modified = true;
+            self.redo_stack.clear();
+        }
+    }
+
+    /// Insert a string at a (line, col) position.
+    pub fn insert_str(&mut self, line: usize, col: usize, text: &str) {
+        let char_idx = self.line_col_to_char(line, col);
+        self.rope.insert(char_idx, text);
+        self.modified = true;
+        self.redo_stack.clear();
+    }
+
+    /// Insert a string at a rope char index. Used when splicing a precomputed
+    /// region — see `app.rs::append_to_claude_buffer`.
+    pub fn insert_str_at_char(&mut self, char_idx: usize, text: &str) {
+        let len = self.rope.len_chars();
+        let idx = char_idx.min(len);
+        self.rope.insert(idx, text);
+        self.modified = true;
+        self.redo_stack.clear();
     }
 
     pub fn delete_line(&mut self, line: usize) {
@@ -130,6 +162,23 @@ impl Document {
                 self.rope.remove(prev_end - 1..prev_end);
             }
         }
+        self.modified = true;
+        self.redo_stack.clear();
+    }
+
+    /// Replace the text of `line` (excluding its trailing newline) with `new_text`.
+    pub fn replace_line_text(&mut self, line: usize, new_text: &str) {
+        if line >= self.rope.len_lines() {
+            return;
+        }
+        let start = self.rope.line_to_char(line);
+        let line_slice = self.rope.line(line);
+        let mut end_char = start + line_slice.len_chars();
+        if line_slice.len_chars() > 0 && line_slice.char(line_slice.len_chars() - 1) == '\n' {
+            end_char -= 1;
+        }
+        self.rope.remove(start..end_char);
+        self.rope.insert(start, new_text);
         self.modified = true;
         self.redo_stack.clear();
     }

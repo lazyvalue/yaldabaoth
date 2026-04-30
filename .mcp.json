@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "sketch": {
+      "command": "/Users/scott/ws/sketch/target/release/sketch-channel"
+    }
+  }
+}

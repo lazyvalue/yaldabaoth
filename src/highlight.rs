@@ -12,15 +12,19 @@ pub struct Highlighter {
 
 impl Default for Highlighter {
     fn default() -> Self {
-        Self::new()
+        Self::with_syntect_theme("base16-ocean.dark")
     }
 }
 
 impl Highlighter {
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_syntect_theme(name: &str) -> Self {
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let theme_set = ThemeSet::load_defaults();
-        let theme = theme_set.themes["base16-ocean.dark"].clone();
+        let theme = theme_set.themes[name].clone();
         Self { syntax_set, theme }
     }
 

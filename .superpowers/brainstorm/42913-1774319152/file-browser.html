@@ -1,0 +1,118 @@
+<h2>File Browser — Side Panel</h2>
+<p class="subtitle">Opened via Space → f, closes with Escape or q</p>
+
+<div class="mockup">
+  <div class="mockup-header">sketch — file browser open</div>
+  <div class="mockup-body" style="background: #1a1a2e; color: #e0e0e0; font-family: monospace; font-size: 13px; padding: 0; min-height: 400px; display: flex; flex-direction: column;">
+
+    <!-- Top bar -->
+    <div style="background: #16213e; padding: 6px 12px; display: flex; justify-content: space-between; border-bottom: 1px solid #333;">
+      <span style="color: #88c0d0;">README.md</span>
+      <span style="color: #666;">line 1/186 0%</span>
+    </div>
+
+    <!-- Main area: side panel + content -->
+    <div style="flex: 1; display: flex;">
+
+      <!-- File browser panel -->
+      <div style="width: 240px; border-right: 1px solid #6272a4; display: flex; flex-direction: column;">
+        <!-- Panel header -->
+        <div style="padding: 6px 10px; color: #6272a4; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #333;">
+          ~/ws/sketch
+        </div>
+
+        <!-- File list -->
+        <div style="flex: 1; padding: 4px 0;">
+          <div style="padding: 2px 10px; color: #8be9fd;">  📁 docs/</div>
+          <div style="padding: 2px 10px; color: #8be9fd;">  📁 src/</div>
+          <div style="padding: 2px 10px; color: #8be9fd;">  📁 tests/</div>
+          <div style="padding: 2px 10px; color: #666;">  .gitignore</div>
+          <div style="padding: 2px 10px; color: #ccc; background: rgba(98, 114, 164, 0.3);">▸ Cargo.toml</div>
+          <div style="padding: 2px 10px; color: #ccc;">  README.md</div>
+        </div>
+
+        <!-- Panel footer with hints -->
+        <div style="padding: 4px 10px; color: #666; font-size: 11px; border-top: 1px solid #333;">
+          j/k nav · Enter open · / filter · Esc close
+        </div>
+      </div>
+
+      <!-- Content area -->
+      <div style="flex: 1; padding: 16px 24px; line-height: 1.7;">
+        <div style="margin-bottom: 16px;">
+          <span style="color: #bd93f9; font-weight: bold; font-size: 15px;">Sketch</span>
+          <div style="color: #6272a4; margin-top: 2px;">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</div>
+        </div>
+        <div style="margin-bottom: 12px; color: #ccc;">
+          A beautiful TUI markdown viewer and editor built in Rust.
+        </div>
+        <div style="margin-bottom: 12px; margin-top: 20px;">
+          <span style="color: #8be9fd; font-weight: bold;">Installation</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Bottom bar -->
+    <div style="background: #16213e; padding: 6px 12px; display: flex; justify-content: space-between; border-top: 1px solid #333;">
+      <span style="color: #50fa7b;">NORMAL</span>
+      <span style="color: #666;">j/k scroll · {/} heading · / search · q quit</span>
+    </div>
+
+  </div>
+</div>
+
+<h3 style="margin-top: 32px;">With Fuzzy Filter Active</h3>
+
+<div class="mockup">
+  <div class="mockup-header">sketch — file browser filtering</div>
+  <div class="mockup-body" style="background: #1a1a2e; color: #e0e0e0; font-family: monospace; font-size: 13px; padding: 0; min-height: 300px; display: flex; flex-direction: column;">
+
+    <!-- Top bar -->
+    <div style="background: #16213e; padding: 6px 12px; display: flex; justify-content: space-between; border-bottom: 1px solid #333;">
+      <span style="color: #88c0d0;">README.md</span>
+      <span style="color: #666;">line 1/186 0%</span>
+    </div>
+
+    <!-- Main area -->
+    <div style="flex: 1; display: flex;">
+
+      <!-- File browser panel with filter -->
+      <div style="width: 240px; border-right: 1px solid #6272a4; display: flex; flex-direction: column;">
+        <div style="padding: 6px 10px; color: #6272a4; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #333;">
+          ~/ws/sketch
+        </div>
+
+        <!-- Filter input -->
+        <div style="padding: 4px 10px; border-bottom: 1px solid #333;">
+          <span style="color: #ffb86c;">/</span><span style="color: #f1fa8c;">ren</span><span style="color: #666; animation: blink 1s infinite;">▎</span>
+        </div>
+
+        <!-- Filtered results -->
+        <div style="flex: 1; padding: 4px 0;">
+          <div style="padding: 2px 10px; color: #ccc; background: rgba(98, 114, 164, 0.3);">▸ <span style="color: #f1fa8c;">ren</span>der.rs</div>
+          <div style="padding: 2px 10px; color: #ccc;">  <span style="color: #f1fa8c;">ren</span>der_test.rs</div>
+        </div>
+
+        <div style="padding: 4px 10px; color: #666; font-size: 11px; border-top: 1px solid #333;">
+          2 matches · Enter open · Esc clear filter
+        </div>
+      </div>
+
+      <!-- Content area -->
+      <div style="flex: 1; padding: 16px 24px; line-height: 1.7; opacity: 0.9;">
+        <div style="margin-bottom: 16px;">
+          <span style="color: #bd93f9; font-weight: bold;">Sketch</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Bottom bar -->
+    <div style="background: #16213e; padding: 6px 12px; display: flex; justify-content: space-between; border-top: 1px solid #333;">
+      <span style="color: #50fa7b;">NORMAL</span>
+      <span style="color: #666;">j/k scroll · {/} heading · / search · q quit</span>
+    </div>
+
+  </div>
+</div>

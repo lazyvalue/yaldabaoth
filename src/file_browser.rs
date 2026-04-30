@@ -4,6 +4,31 @@ use std::path::{Path, PathBuf};
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_SEARCH_DEPTH: usize = 8;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    Name,
+    DateDesc,
+    DateAsc,
+}
+
+impl SortOrder {
+    pub fn cycle(self) -> Self {
+        match self {
+            SortOrder::Name => SortOrder::DateDesc,
+            SortOrder::DateDesc => SortOrder::DateAsc,
+            SortOrder::DateAsc => SortOrder::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortOrder::Name => "name",
+            SortOrder::DateDesc => "date \u{2193}",
+            SortOrder::DateAsc => "date \u{2191}",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BrowserEntry {
     pub name: String,
@@ -25,6 +50,7 @@ pub struct FileBrowser {
     search_results: Vec<BrowserEntry>,
     pub filter_mode: bool,
     pub show_hidden: bool,
+    pub sort_order: SortOrder,
 }
 
 impl FileBrowser {
@@ -39,6 +65,7 @@ impl FileBrowser {
             search_results: Vec::new(),
             filter_mode: false,
             show_hidden: false,
+            sort_order: SortOrder::Name,
         };
         browser.refresh();
         browser
@@ -148,11 +175,20 @@ impl FileBrowser {
         self.selected = 0;
     }
 
-    fn refresh(&mut self) {
-        self.entries = Self::list_directory(&self.current_dir, self.show_hidden);
+    pub fn cycle_sort(&mut self) {
+        self.sort_order = self.sort_order.cycle();
+        self.refresh();
+        if !self.filter_text.is_empty() {
+            self.update_search();
+        }
+        self.selected = 0;
     }
 
-    fn list_directory(dir: &Path, show_hidden: bool) -> Vec<BrowserEntry> {
+    fn refresh(&mut self) {
+        self.entries = Self::list_directory(&self.current_dir, self.show_hidden, self.sort_order);
+    }
+
+    fn list_directory(dir: &Path, show_hidden: bool, sort_order: SortOrder) -> Vec<BrowserEntry> {
         let read_dir = match fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(_) => return Vec::new(),
@@ -189,9 +225,20 @@ impl FileBrowser {
             }
         }
 
-        // Sort each group alphabetically
-        dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        // Sort each group
+        let sort_entries = |entries: &mut Vec<BrowserEntry>| match sort_order {
+            SortOrder::Name => {
+                entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            }
+            SortOrder::DateDesc => {
+                entries.sort_by(|a, b| b.modified.cmp(&a.modified));
+            }
+            SortOrder::DateAsc => {
+                entries.sort_by(|a, b| a.modified.cmp(&b.modified));
+            }
+        };
+        sort_entries(&mut dirs);
+        sort_entries(&mut files);
 
         // Parent entry first, then directories, then files
         let mut result = Vec::new();

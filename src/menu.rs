@@ -217,5 +217,21 @@ pub fn default_menu() -> Vec<MenuNode> {
             MenuNode::entry("e", "bottom", "goto-bottom"),
             MenuNode::entry("h", "next heading", "goto-heading"),
         ]),
+        MenuNode::submenu("c", "claude", vec![
+            MenuNode::entry("a", "attach", "claude-attach"),
+            MenuNode::entry("d", "detach", "claude-detach"),
+            MenuNode::entry("s", "send buffer", "claude-send"),
+            MenuNode::entry("S", "send selection", "claude-send-selection"),
+            MenuNode::entry("?", "status", "claude-status"),
+        ]),
+        MenuNode::submenu("e", "edit", vec![
+            MenuNode::entry("a", "select all", "select-all"),
+            MenuNode::entry("v", "extend mode", "toggle-extend-mode"),
+            MenuNode::entry(";", "collapse selection", "collapse-selection"),
+            MenuNode::entry(",", "flip selection", "flip-selection"),
+            MenuNode::entry("x", "extend by line", "extend-line"),
+            MenuNode::entry("y", "yank", "yank-selection"),
+            MenuNode::entry("d", "delete", "delete-selection"),
+        ]),
     ]
 }

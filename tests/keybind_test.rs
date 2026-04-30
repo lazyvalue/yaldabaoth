@@ -55,12 +55,10 @@ fn test_insert_mode_key() {
 }
 
 #[test]
-fn test_dd_delete_line() {
+fn test_d_delete_selection() {
     let mut mgr = KeybindManager::default();
-    let result1 = mgr.process_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
-    assert_eq!(result1, None);
-    let result2 = mgr.process_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
-    assert_eq!(result2, Some("delete-line".to_string()));
+    let result = mgr.process_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+    assert_eq!(result, Some("delete-selection".to_string()));
 }
 
 #[test]

@@ -31,35 +31,6 @@ fn main() {
 
     let cli = Cli::parse();
 
-    let file_path = match cli.file {
-        Some(f) => f,
-        None => {
-            eprintln!("Usage: sketch <file.md>");
-            process::exit(1);
-        }
-    };
-
-    // Read file
-    let content = match std::fs::read(&file_path) {
-        Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("Error: {} is not valid UTF-8", file_path);
-                process::exit(1);
-            }
-        },
-        Err(e) => {
-            eprintln!("Error: cannot open {}: {}", file_path, e);
-            process::exit(1);
-        }
-    };
-
-    let abs_path = std::path::Path::new(&file_path)
-        .canonicalize()
-        .unwrap_or_else(|_| file_path.clone().into())
-        .display()
-        .to_string();
-
     let mut config = match sketch::config::Config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -78,7 +49,37 @@ fn main() {
         }
     }
 
-    let mut app = app::App::new(abs_path, content, &config);
+    let (filename, content) = match cli.file {
+        Some(f) => {
+            let content = match std::fs::read(&f) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        eprintln!("Error: {} is not valid UTF-8", f);
+                        process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Error: cannot open {}: {}", f, e);
+                    process::exit(1);
+                }
+            };
+            let abs_path = std::path::Path::new(&f)
+                .canonicalize()
+                .unwrap_or_else(|_| f.clone().into())
+                .display()
+                .to_string();
+            (abs_path, content)
+        }
+        None => {
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .join("untitled.md");
+            (cwd.display().to_string(), String::new())
+        }
+    };
+
+    let mut app = app::App::new(filename, content, &config);
 
     let mut terminal = ratatui::init();
     let result = app.run(&mut terminal);

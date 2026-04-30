@@ -44,10 +44,14 @@ pub struct Theme {
     pub image_label: Style,
     pub cursor_line: Style,
     pub top_bar: Style,
+    pub top_bar_mode: Style,
     pub bottom_bar: Style,
     pub mode_indicator: Style,
     pub search_match: Style,
+    pub search_match_current: Style,
     pub midpoint_marker: Style,
+    pub line_number: Style,
+    pub line_number_current: Style,
 }
 
 impl Theme {
@@ -113,6 +117,10 @@ impl Theme {
             top_bar: Style::default()
                 .fg(Color::Rgb(139, 233, 253))
                 .bg(Color::Rgb(22, 33, 62)),
+            top_bar_mode: Style::default()
+                .fg(Color::Rgb(80, 250, 123))
+                .bg(Color::Rgb(22, 33, 62))
+                .add_modifier(Modifier::BOLD),
             bottom_bar: Style::default()
                 .fg(Color::Rgb(102, 102, 102))
                 .bg(Color::Rgb(22, 33, 62)),
@@ -121,8 +129,14 @@ impl Theme {
                 .add_modifier(Modifier::BOLD),
             search_match: Style::default()
                 .fg(Color::Rgb(40, 42, 54))
-                .bg(Color::Rgb(241, 250, 140)),
+                .bg(Color::Rgb(98, 114, 164)),
+            search_match_current: Style::default()
+                .fg(Color::Rgb(40, 42, 54))
+                .bg(Color::Rgb(80, 250, 123))
+                .add_modifier(Modifier::BOLD),
             midpoint_marker: Style::default().fg(Color::Rgb(98, 114, 164)),
+            line_number: Style::default().fg(Color::Rgb(98, 114, 164)),
+            line_number_current: Style::default().fg(Color::Rgb(248, 248, 242)),
         }
     }
 
@@ -211,6 +225,10 @@ impl Theme {
             top_bar: Style::default()
                 .fg(Color::Rgb(0x63, 0xcd, 0xcf))
                 .bg(Color::Rgb(0x13, 0x1a, 0x24)),
+            top_bar_mode: Style::default()
+                .fg(Color::Rgb(0xa9, 0xdc, 0x76))
+                .bg(Color::Rgb(0x13, 0x1a, 0x24))
+                .add_modifier(Modifier::BOLD),
             // fg3 on bg0
             bottom_bar: Style::default()
                 .fg(Color::Rgb(0x71, 0x83, 0x9b))
@@ -219,12 +237,19 @@ impl Theme {
             mode_indicator: Style::default()
                 .fg(Color::Rgb(0x81, 0xb2, 0x9a))
                 .add_modifier(Modifier::BOLD),
-            // bg1 on yellow
+            // bg1 on bg4 (muted)
             search_match: Style::default()
+                .fg(Color::Rgb(0xcd, 0xce, 0xcf))
+                .bg(Color::Rgb(0x39, 0x50, 0x6d)),
+            // bg1 on green (bright)
+            search_match_current: Style::default()
                 .fg(Color::Rgb(0x19, 0x23, 0x30))
-                .bg(Color::Rgb(0xdb, 0xc0, 0x74)),
+                .bg(Color::Rgb(0x81, 0xb2, 0x9a))
+                .add_modifier(Modifier::BOLD),
             // bg4
             midpoint_marker: Style::default().fg(Color::Rgb(0x39, 0x50, 0x6d)),
+            line_number: Style::default().fg(Color::Rgb(0x39, 0x50, 0x6d)),
+            line_number_current: Style::default().fg(Color::Rgb(0xd8, 0xde, 0xe9)),
         }
     }
 

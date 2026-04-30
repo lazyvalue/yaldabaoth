@@ -22,11 +22,12 @@ fn test_content_width_respects_max() {
 }
 
 #[test]
-fn test_content_offset_centers() {
+fn test_content_offset_left_pads() {
     let vp = Viewport::new(80);
-    assert_eq!(vp.content_offset(120), 20);
-    assert_eq!(vp.content_offset(80), 0);
-    assert_eq!(vp.content_offset(60), 0);
+    assert_eq!(vp.content_offset(120), 4);
+    assert_eq!(vp.content_offset(80), 4);
+    assert_eq!(vp.content_offset(60), 4);
+    assert_eq!(vp.content_offset(2), 0);
 }
 
 #[test]

@@ -34,9 +34,9 @@ impl Viewport {
     }
 
     pub fn content_offset(&self, terminal_width: usize) -> usize {
-        let cw = self.content_width(terminal_width);
-        if terminal_width > cw {
-            (terminal_width - cw) / 2
+        const LEFT_PAD: usize = 4;
+        if terminal_width > LEFT_PAD {
+            LEFT_PAD
         } else {
             0
         }
@@ -79,7 +79,19 @@ impl Viewport {
                     .sum();
                 item_lines + 1
             }
-            RenderedBlock::Table { rows, .. } => rows.len() + 3,
+            RenderedBlock::Table { headers, rows, .. } => {
+                let col_widths = crate::view::table_column_widths(headers, rows, width);
+                let wrap_height = |cells: &[StyledLine]| -> usize {
+                    cells.iter().enumerate().map(|(i, c)| {
+                        let cw = col_widths.get(i).copied().unwrap_or(5);
+                        let len = c.text_content().len();
+                        if cw == 0 || len <= cw { 1 } else { len.div_ceil(cw) }
+                    }).max().unwrap_or(1)
+                };
+                let header_h = wrap_height(headers);
+                let rows_h: usize = rows.iter().map(|r| wrap_height(r)).sum();
+                header_h + 1 + rows_h + 1 // header + separator + rows + blank
+            }
             RenderedBlock::HorizontalRule => 2,
             RenderedBlock::Image { .. } => 2,
         }
@@ -101,8 +113,7 @@ impl Viewport {
     }
 
     pub fn scroll_down(&mut self, n: usize, viewport_height: usize) {
-        let max = self.total_lines.saturating_sub(viewport_height);
-        self.scroll_offset = (self.scroll_offset + n).min(max);
+        self.scroll_offset = (self.scroll_offset + n).min(self.max_scroll(viewport_height));
     }
 
     pub fn scroll_up(&mut self, n: usize) {
@@ -115,7 +126,18 @@ impl Viewport {
     }
 
     pub fn jump_bottom(&mut self, viewport_height: usize) {
-        self.scroll_offset = self.total_lines.saturating_sub(viewport_height);
+        self.scroll_offset = self.max_scroll(viewport_height);
+    }
+
+    /// Maximum permissible `scroll_offset`. Reserves `SCROLLOFF` rows of
+    /// whitespace below the last content row, so jumping/paging to the end of
+    /// the buffer still leaves a small gutter at the bottom of the viewport.
+    fn max_scroll(&self, viewport_height: usize) -> usize {
+        if self.total_lines + SCROLLOFF > viewport_height {
+            self.total_lines + SCROLLOFF - viewport_height
+        } else {
+            0
+        }
     }
 
     pub fn visible_blocks<'a>(

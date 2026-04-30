@@ -1,0 +1,86 @@
+<h2>Which-Key Popup — Top-Anchored</h2>
+<p class="subtitle">How the menu looks when Space is pressed</p>
+
+<div class="mockup">
+  <div class="mockup-header">sketch — menu popup</div>
+  <div class="mockup-body" style="background: #1a1a2e; color: #e0e0e0; font-family: monospace; font-size: 13px; padding: 0; min-height: 400px; display: flex; flex-direction: column;">
+
+    <!-- Top bar -->
+    <div style="background: #16213e; padding: 6px 12px; display: flex; justify-content: space-between; border-bottom: 1px solid #333;">
+      <span style="color: #88c0d0;">README.md</span>
+      <span style="color: #666;">line 1/186 0%</span>
+    </div>
+
+    <!-- Menu popup - top anchored -->
+    <div style="background: #1e1e3a; border-bottom: 2px solid #6272a4; padding: 10px 16px;">
+      <div style="color: #6272a4; font-size: 11px; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px;">Commands</div>
+      <div style="display: flex; gap: 24px; flex-wrap: wrap;">
+        <div><span style="color: #bd93f9; font-weight: bold;">f</span> <span style="color: #ccc;">file browser</span></div>
+        <div><span style="color: #bd93f9; font-weight: bold;">/</span> <span style="color: #ccc;">search</span></div>
+        <div><span style="color: #bd93f9; font-weight: bold;">g</span> <span style="color: #8be9fd;">goto ▸</span></div>
+        <div><span style="color: #bd93f9; font-weight: bold;">q</span> <span style="color: #ccc;">quit</span></div>
+      </div>
+    </div>
+
+    <!-- Content area (dimmed to show popup is active) -->
+    <div style="flex: 1; padding: 16px 24px; line-height: 1.7; opacity: 0.5;">
+      <div style="margin-bottom: 16px;">
+        <span style="color: #bd93f9; font-weight: bold; font-size: 15px;">Sketch</span>
+        <div style="color: #6272a4; margin-top: 2px;">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</div>
+      </div>
+      <div style="margin-bottom: 12px; color: #ccc;">
+        A beautiful TUI markdown viewer and editor built in Rust.
+      </div>
+      <div style="margin-bottom: 12px; margin-top: 20px;">
+        <span style="color: #8be9fd; font-weight: bold;">Installation</span>
+      </div>
+      <div style="background: #282a36; border-radius: 4px; padding: 12px; margin-bottom: 12px; border-left: 3px solid #6272a4;">
+        <div><span style="color: #ff79c6;">cargo</span> <span style="color: #f1fa8c;">install</span> sketch</div>
+      </div>
+    </div>
+
+    <!-- Bottom bar -->
+    <div style="background: #16213e; padding: 6px 12px; display: flex; justify-content: space-between; border-top: 1px solid #333;">
+      <span style="color: #ffb86c;">MENU</span>
+      <span style="color: #666;">ESC to close</span>
+    </div>
+
+  </div>
+</div>
+
+<h3 style="margin-top: 32px;">Submenu Example (Space → g → goto)</h3>
+
+<div class="mockup">
+  <div class="mockup-header">sketch — submenu</div>
+  <div class="mockup-body" style="background: #1a1a2e; color: #e0e0e0; font-family: monospace; font-size: 13px; padding: 0; min-height: 200px; display: flex; flex-direction: column;">
+
+    <!-- Top bar -->
+    <div style="background: #16213e; padding: 6px 12px; display: flex; justify-content: space-between; border-bottom: 1px solid #333;">
+      <span style="color: #88c0d0;">README.md</span>
+      <span style="color: #666;">line 1/186 0%</span>
+    </div>
+
+    <!-- Submenu popup -->
+    <div style="background: #1e1e3a; border-bottom: 2px solid #6272a4; padding: 10px 16px;">
+      <div style="color: #6272a4; font-size: 11px; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px;">goto</div>
+      <div style="display: flex; gap: 24px; flex-wrap: wrap;">
+        <div><span style="color: #bd93f9; font-weight: bold;">g</span> <span style="color: #ccc;">top of file</span></div>
+        <div><span style="color: #bd93f9; font-weight: bold;">e</span> <span style="color: #ccc;">end of file</span></div>
+        <div><span style="color: #bd93f9; font-weight: bold;">l</span> <span style="color: #ccc;">line number</span></div>
+        <div><span style="color: #bd93f9; font-weight: bold;">h</span> <span style="color: #ccc;">next heading</span></div>
+      </div>
+    </div>
+
+    <!-- Content (dimmed) -->
+    <div style="flex: 1; padding: 16px 24px; opacity: 0.5;">
+      <span style="color: #bd93f9; font-weight: bold;">Sketch</span>
+    </div>
+
+    <!-- Bottom bar -->
+    <div style="background: #16213e; padding: 6px 12px; display: flex; justify-content: space-between; border-top: 1px solid #333;">
+      <span style="color: #ffb86c;">MENU › goto</span>
+      <span style="color: #666;">ESC to close</span>
+    </div>
+
+  </div>
+</div>

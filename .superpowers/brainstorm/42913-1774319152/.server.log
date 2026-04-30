@@ -1,0 +1,5 @@
+{"type":"server-started","port":53836,"host":"127.0.0.1","url_host":"localhost","url":"http://localhost:53836","screen_dir":"/Users/scott/ws/sketch/.superpowers/brainstorm/42913-1774319152"}
+{"type":"screen-added","file":"/Users/scott/ws/sketch/.superpowers/brainstorm/42913-1774319152/approaches.html"}
+{"type":"screen-added","file":"/Users/scott/ws/sketch/.superpowers/brainstorm/42913-1774319152/menu-popup.html"}
+{"type":"screen-added","file":"/Users/scott/ws/sketch/.superpowers/brainstorm/42913-1774319152/file-browser.html"}
+{"type":"server-stopped","reason":"idle timeout"}

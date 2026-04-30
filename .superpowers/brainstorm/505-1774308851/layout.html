@@ -1,0 +1,100 @@
+<h2>Viewer Layout & Navigation</h2>
+<p class="subtitle">MVP viewer layout with keybinding scheme</p>
+
+<div class="mockup">
+  <div class="mockup-header">sketch — viewer mode</div>
+  <div class="mockup-body" style="background: #1a1a2e; color: #e0e0e0; font-family: monospace; font-size: 13px; padding: 0; min-height: 400px; display: flex; flex-direction: column;">
+
+    <!-- Top bar -->
+    <div style="background: #16213e; padding: 6px 12px; display: flex; justify-content: space-between; border-bottom: 1px solid #333;">
+      <span style="color: #88c0d0;">README.md</span>
+      <span style="color: #666;">line 24/186 · 13%</span>
+    </div>
+
+    <!-- Main content -->
+    <div style="flex: 1; padding: 16px 24px; line-height: 1.7;">
+      <!-- H1 -->
+      <div style="margin-bottom: 16px;">
+        <span style="color: #bd93f9; font-weight: bold; font-size: 15px;">Sketch</span>
+        <div style="color: #6272a4; margin-top: 2px;">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</div>
+      </div>
+
+      <!-- Paragraph -->
+      <div style="margin-bottom: 12px; color: #ccc;">
+        A beautiful TUI markdown viewer and editor built in Rust. Designed for
+        <span style="font-weight: bold; color: #f8f8f2;">speed</span>,
+        <span style="font-style: italic; color: #f8f8f2;">elegance</span>, and
+        <span style="text-decoration: line-through; color: #888;">complexity</span> simplicity.
+      </div>
+
+      <!-- H2 -->
+      <div style="margin-bottom: 12px; margin-top: 20px;">
+        <span style="color: #8be9fd; font-weight: bold;">Installation</span>
+      </div>
+
+      <!-- Code block -->
+      <div style="background: #282a36; border-radius: 4px; padding: 12px; margin-bottom: 12px; border-left: 3px solid #6272a4;">
+        <div style="color: #6272a4; font-size: 11px; margin-bottom: 6px;">rust</div>
+        <div><span style="color: #ff79c6;">cargo</span> <span style="color: #f1fa8c;">install</span> sketch</div>
+      </div>
+
+      <!-- Blockquote -->
+      <div style="border-left: 3px solid #ffb86c; padding-left: 12px; margin-bottom: 12px;">
+        <span style="color: #ffb86c;">Note:</span>
+        <span style="color: #aaa;"> Requires Rust 1.75 or later</span>
+      </div>
+
+      <!-- List -->
+      <div style="margin-bottom: 12px;">
+        <div><span style="color: #50fa7b;">  •</span> <span style="color: #ccc;">Fast rendering with ratatui</span></div>
+        <div><span style="color: #50fa7b;">  •</span> <span style="color: #ccc;">Syntax highlighting via syntect</span></div>
+        <div><span style="color: #50fa7b;">  •</span> <span style="color: #ccc;">Inline image support (Kitty protocol)</span></div>
+      </div>
+
+      <!-- Link -->
+      <div style="margin-bottom: 12px;">
+        See the <span style="color: #8be9fd; text-decoration: underline;">documentation</span> for more details.
+      </div>
+    </div>
+
+    <!-- Bottom bar -->
+    <div style="background: #16213e; padding: 6px 12px; display: flex; justify-content: space-between; border-top: 1px solid #333;">
+      <span style="color: #50fa7b;">NORMAL</span>
+      <span style="color: #666;">j/k scroll · gg/G top/bottom · / search · q quit</span>
+    </div>
+
+  </div>
+</div>
+
+<h3 style="margin-top: 32px;">Keybindings (MVP)</h3>
+
+<div class="options">
+  <div class="option" style="cursor: default;">
+    <div class="letter" style="background: #2d4a3e; color: #50fa7b;">↕</div>
+    <div class="content">
+      <h3>Scrolling</h3>
+      <p><code>j</code>/<code>k</code> — line up/down &nbsp;·&nbsp; <code>d</code>/<code>u</code> — half-page &nbsp;·&nbsp; <code>gg</code>/<code>G</code> — top/bottom &nbsp;·&nbsp; <code>Ctrl+f</code>/<code>Ctrl+b</code> — full page</p>
+    </div>
+  </div>
+  <div class="option" style="cursor: default;">
+    <div class="letter" style="background: #4a2d4a; color: #bd93f9;">§</div>
+    <div class="content">
+      <h3>Structure Navigation</h3>
+      <p><code>{</code>/<code>}</code> — prev/next heading &nbsp;·&nbsp; <code>[[</code>/<code>]]</code> — prev/next heading (same level)</p>
+    </div>
+  </div>
+  <div class="option" style="cursor: default;">
+    <div class="letter" style="background: #4a3d2d; color: #ffb86c;">🔍</div>
+    <div class="content">
+      <h3>Search</h3>
+      <p><code>/</code> — search forward &nbsp;·&nbsp; <code>?</code> — search backward &nbsp;·&nbsp; <code>n</code>/<code>N</code> — next/prev match</p>
+    </div>
+  </div>
+  <div class="option" style="cursor: default;">
+    <div class="letter" style="background: #2d3a4a; color: #8be9fd;">⌘</div>
+    <div class="content">
+      <h3>Actions</h3>
+      <p><code>q</code> — quit &nbsp;·&nbsp; <code>o</code> — open link under cursor in browser &nbsp;·&nbsp; <code>y</code> — yank current line</p>
+    </div>
+  </div>
+</div>
