@@ -69,6 +69,10 @@ pub struct App {
     /// Set after pressing f/F/t/T — the next keypress is consumed as the
     /// target character and the corresponding find motion is executed.
     pending_find_char: Option<Action>,
+    /// SKETCH_DEBUG=1 state: dedupe identical frames so the log only grows
+    /// when something changes (or when off-screen, which is always logged).
+    debug_last_off_screen: bool,
+    debug_last_signature: u64,
     /// Cached viewport height from the most recent input/draw cycle, so helper
     /// methods that don't take it as a parameter (like programmatic edits to
     /// the *claude* buffer) can still scroll the viewport.
@@ -149,10 +153,166 @@ impl App {
             full_browser_pending_g: false,
             pending_count: None,
             pending_find_char: None,
+            debug_last_off_screen: false,
+            debug_last_signature: 0,
             claude_channel: None,
             last_viewport_height: 24,
             last_wrap_width: 80,
         }
+    }
+
+    /// When SKETCH_DEBUG=1, append one line of JSON to ~/.cache/sketch/debug.log
+    /// for routine frames (1-in-5) plus EVERY frame where the cursor was off
+    /// screen, plus EVERY frame where off-screen status flipped. Use to chase
+    /// viewport mismatches:
+    ///
+    ///   tail -f ~/.cache/sketch/debug.log | jq .
+    ///
+    /// Compare `cursor_screen_y` (where it was painted, or null = off-screen)
+    /// against `expected_cursor_visual_row + content_area_y`.
+    fn write_debug_log(&mut self, report: &view::DrawReport, term_size: ratatui::prelude::Size) {
+        if std::env::var("SKETCH_DEBUG").ok().as_deref() != Some("1") {
+            return;
+        }
+        // Splash mode intentionally doesn't paint a cursor — never treat it
+        // as "off-screen". Skip it entirely (don't even sample) so the log
+        // isn't dominated by startup frames before the user opens a file.
+        if report.is_splash {
+            return;
+        }
+        let off_screen_now = report.cursor_screen_y.is_none();
+        let flipped = self.debug_last_off_screen != off_screen_now;
+        self.debug_last_off_screen = off_screen_now;
+        // Build a cheap signature of the state-of-interest. Skip the write if
+        // nothing actionable changed since last frame — but always log when
+        // cursor is off-screen, or when off-screen status flipped.
+        let buf = &self.buffers[self.active_buffer];
+        let cursor_line = buf.editor.cursor().line;
+        let cursor_col = buf.editor.cursor().col;
+        let scroll_offset = buf.viewport.scroll_offset;
+        let total_lines = buf.viewport.total_lines;
+        let mut sig = 0u64;
+        sig ^= (term_size.width as u64).wrapping_mul(0x9E3779B97F4A7C15);
+        sig ^= (term_size.height as u64).wrapping_mul(0xBF58476D1CE4E5B9);
+        sig ^= (scroll_offset as u64).wrapping_mul(0x94D049BB133111EB);
+        sig ^= (cursor_line as u64).wrapping_mul(0xD6E8FEB86659FD93);
+        sig ^= (cursor_col as u64).wrapping_mul(0x165667B19E3779F9);
+        sig ^= (total_lines as u64).wrapping_mul(0x85EBCA77C2B2AE63);
+        sig ^= (report.cursor_screen_y.unwrap_or(u16::MAX) as u64)
+            .wrapping_mul(0xC2B2AE3D27D4EB4F);
+        sig ^= (report.painted_rows as u64).wrapping_mul(0x27D4EB2F165667C5);
+        let force = off_screen_now || flipped;
+        if !force && sig == self.debug_last_signature {
+            return;
+        }
+        self.debug_last_signature = sig;
+        let expected_visual_row = match buf.view_mode {
+            ViewMode::Raw => sketch::buffer::raw_cursor_visual_row(
+                &buf.editor,
+                self.last_wrap_width.max(1),
+            ),
+            ViewMode::Rendered => buf.rendered_cursor_row,
+        };
+        let off_screen = off_screen_now;
+        let cursor_y_str = match report.cursor_screen_y {
+            Some(y) => y.to_string(),
+            None => "null".to_string(),
+        };
+        let mode_str = format!("{:?}", self.mode);
+        let view_mode_str = format!("{:?}", buf.view_mode);
+        let line = format!(
+            "{{\"ts\":{},\"term_w\":{},\"term_h\":{},\"computed_vh\":{},\"content_area_h\":{},\"scroll_offset\":{},\"total_lines\":{},\"cursor_line\":{},\"cursor_col\":{},\"expected_visual_row\":{},\"cursor_screen_y\":{},\"first_visible_doc_line\":{},\"last_visible_doc_line\":{},\"painted_rows\":{},\"off_screen\":{},\"mode\":\"{}\",\"view_mode\":\"{}\",\"frozen_lines\":{},\"lockable_through_line\":{}}}\n",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+            term_size.width,
+            term_size.height,
+            self.last_viewport_height,
+            report.content_area_height,
+            scroll_offset,
+            total_lines,
+            cursor_line,
+            cursor_col,
+            expected_visual_row,
+            cursor_y_str,
+            report
+                .first_visible_doc_line
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            report
+                .last_visible_doc_line
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            report.painted_rows,
+            off_screen,
+            mode_str,
+            view_mode_str,
+            buf.editor.frozen_lines().len(),
+            buf.editor.lockable_through_line(),
+        );
+        // Best-effort write; never panic during render.
+        let log_path = match dirs::cache_dir() {
+            Some(d) => d.join("sketch").join("debug.log"),
+            None => return,
+        };
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
+    /// Compute the content-area height the same way `view::draw` computes
+    /// it. Returning the wrong value here is the single biggest cause of
+    /// "cursor off the bottom" bugs — `ensure_cursor_visible` runs against
+    /// this height with SCROLLOFF margin, so any mismatch with what the
+    /// renderer actually paints lets the cursor sit outside the visible area.
+    fn compute_viewport_height(&self, total_height: usize) -> usize {
+        let top_bar = 1usize;
+        let needs_bottom_bar = self.mode == AppMode::Command
+            || self.search_input_mode
+            || !self.command_error.is_empty();
+        let bottom_bar = if needs_bottom_bar { 1 } else { 0 };
+        // Buffer list panel
+        let buffer_list = if self.mode == AppMode::FileBrowser {
+            // BufferList isn't shown in file browser mode; treat as 0.
+            0
+        } else {
+            0 // We never render buffer_list inline currently (full-screen variant).
+        };
+        // File browser inline panel
+        let file_browser = if self.file_browser.is_some() {
+            let max_height = total_height / 2;
+            let header_rows = 1;
+            let filter_rows = 0; // approximation; off in normal flow
+            let entry_rows = self.file_browser.as_ref().map(|fb| fb.entries().len()).unwrap_or(0);
+            (header_rows + filter_rows + entry_rows).min(max_height).max(1)
+        } else {
+            0
+        };
+        // Outline inline panel
+        let outline = if self.mode == AppMode::Outline {
+            let max_height = total_height / 3;
+            let header_rows = 1; // breadcrumb (approximation)
+            let filter_rows = if self.outline_filter_mode { 1 } else { 0 };
+            let entry_rows = self.filtered_outline_entries().len().max(1);
+            (header_rows + filter_rows + entry_rows).min(max_height).max(1)
+        } else {
+            0
+        };
+        total_height
+            .saturating_sub(top_bar)
+            .saturating_sub(buffer_list)
+            .saturating_sub(file_browser)
+            .saturating_sub(outline)
+            .saturating_sub(bottom_bar)
     }
 
     /// Compute the wrap width currently used for raw-mode rendering. Mirrors
@@ -183,10 +343,12 @@ impl App {
         self.buffers[self.active_buffer].rebuild_render_cache(&self.theme);
         self.buffers[self.active_buffer].update_total_lines(content_width);
 
+        let mut last_draw_report = view::DrawReport::default();
+
         loop {
             // Refresh viewport_height/wrap_width each tick (survives resize).
             let cur_size = terminal.size()?;
-            let viewport_height = (cur_size.height as usize).saturating_sub(2);
+            let viewport_height = self.compute_viewport_height(cur_size.height as usize);
             self.last_viewport_height = viewport_height;
             self.last_wrap_width = self.compute_wrap_width(cur_size.width as usize);
 
@@ -390,8 +552,12 @@ impl App {
                         .editor
                         .lockable_through_char(),
                 };
-                view::draw(frame, &state);
+                let mut report = view::DrawReport::default();
+                view::draw(frame, &state, &mut report);
+                last_draw_report = report;
             })?;
+
+            self.write_debug_log(&last_draw_report, cur_size);
 
             if self.should_quit {
                 break;
@@ -402,9 +568,21 @@ impl App {
             if event::poll(timeout)? {
                 match event::read()? {
                     Event::Key(key_event) => self.handle_key(key_event, terminal)?,
-                    Event::Resize(w, _h) => {
+                    Event::Resize(w, h) => {
                         let cw = self.effective_content_width(w as usize);
-                        self.buffers[self.active_buffer].update_total_lines(cw);
+                        // Refresh cached dims and re-flow every buffer (not
+                        // just the active one — others get stale totals
+                        // otherwise, breaking scroll math when the user
+                        // switches to them).
+                        let new_viewport_height = self.compute_viewport_height(h as usize);
+                        self.last_viewport_height = new_viewport_height;
+                        self.last_wrap_width = self.compute_wrap_width(w as usize);
+                        for buf in self.buffers.iter_mut() {
+                            buf.update_total_lines(cw);
+                        }
+                        // Re-pin the cursor inside the (possibly smaller)
+                        // viewport so it doesn't end up off-screen.
+                        self.ensure_cursor_visible(new_viewport_height);
                     }
                     _ => {}
                 }
@@ -421,7 +599,7 @@ impl App {
         }
 
         let size = terminal.size()?;
-        let viewport_height = (size.height as usize).saturating_sub(2);
+        let viewport_height = self.compute_viewport_height(size.height as usize);
         let content_width = self.effective_content_width(size.width as usize);
         self.last_viewport_height = viewport_height;
         self.last_wrap_width = self.compute_wrap_width(size.width as usize);
@@ -448,7 +626,22 @@ impl App {
             AppMode::Outline => self.handle_outline_key(key, viewport_height, content_width),
         }
 
+        // Recompute the active buffer's wrapped row total after the edit
+        // so the scroll math sees the fresh state, then re-pin the cursor.
+        // This is the structural guarantee that the cursor stays on-screen
+        // after EVERY key — individual handlers used to call
+        // ensure_cursor_visible inline, which was easy to miss
+        // (handle_insert_key, leave_insert_mode, etc. didn't, and that's
+        // how Enter / typing past the wrap edge ended up off the bottom).
         self.buffers[self.active_buffer].update_total_lines(content_width);
+        // Only meaningful when there's a real document on screen — file
+        // browser / buffer list / outline modes manage their own scroll.
+        match self.mode {
+            AppMode::Normal | AppMode::Insert | AppMode::Command => {
+                self.ensure_cursor_visible(viewport_height);
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -1142,6 +1335,14 @@ impl App {
         let pre_len = editor.document().rope().len_chars();
         let buffer_was_empty = pre_len == 0;
 
+        // Was the user parked at the prior EOF? If yes, follow the new
+        // content; if not, they navigated up to insert mid-turn and we MUST
+        // leave them where they are — yanking them to the bottom on every
+        // reply destroys inline edits in progress.
+        let (pre_eof_line, pre_eof_col) = char_to_line_col(editor.document(), pre_len);
+        let cursor_was_at_eof =
+            editor.cursor().line == pre_eof_line && editor.cursor().col == pre_eof_col;
+
         // Pad with newlines so the new turn starts on its own line(s).
         let pad = if buffer_was_empty {
             String::new()
@@ -1168,12 +1369,14 @@ impl App {
         let end_line = char_to_line_col(editor.document(), claude_end_char).0;
         editor.add_frozen_lines(start_line, end_line);
 
-        // Place cursor at the end so the user can immediately type a response
-        // below, or navigate up into the turn to insert inline.
-        let post_len_chars = editor.document().rope().len_chars();
-        let (cl, cc) = char_to_line_col(editor.document(), post_len_chars);
-        editor.cursor_mut().line = cl;
-        editor.cursor_mut().col = cc;
+        if cursor_was_at_eof {
+            let post_len_chars = editor.document().rope().len_chars();
+            let (cl, cc) = char_to_line_col(editor.document(), post_len_chars);
+            editor.cursor_mut().line = cl;
+            editor.cursor_mut().col = cc;
+        }
+        // Otherwise: leave cursor alone. programmatic_insert appended past
+        // the cursor's line, so its (line, col) stays valid.
         editor.clear_selection();
         buf.view_cache_dirty = true;
     }
@@ -1193,14 +1396,12 @@ impl App {
         let separator = format!("{}---\n\n", lead);
         editor.programmatic_insert(pre_len, &separator);
 
-        // Lock through every line currently in the buffer — the next user
-        // turn starts on the new line that comes after the separator.
-        let new_lockable_line = editor.document().line_count();
-        editor.set_lockable_through_line(new_lockable_line);
-
         // Cursor goes to EOF (start of next active turn — empty until reply).
+        // Lock everything ABOVE the cursor's line; the cursor's own line stays
+        // editable so the user can immediately keep typing.
         let eof = editor.document().rope().len_chars();
         let (cl, cc) = char_to_line_col(editor.document(), eof);
+        editor.set_lockable_through_line(cl);
         editor.cursor_mut().line = cl;
         editor.cursor_mut().col = cc;
         editor.clear_selection();
@@ -1404,7 +1605,15 @@ impl App {
                     editor.clear_selection();
                 }
                 editor.set_extend_mode(false);
-                editor.begin_insert();
+                // If we'd land on a frozen line, auto-open an editable line
+                // ABOVE it. The user never wants to type into Claude's prose;
+                // their text always goes on its own line between frozen lines.
+                let line = editor.cursor().line;
+                if editor.is_frozen_line(line) {
+                    editor.open_line_above();
+                } else {
+                    editor.begin_insert();
+                }
                 self.mode = AppMode::Insert;
             }
             Action::InsertAfter => {
@@ -1423,7 +1632,14 @@ impl App {
                     editor.move_right_clamped(true);
                 }
                 editor.set_extend_mode(false);
-                editor.begin_insert();
+                // Frozen-line guard: open a new editable line BELOW so the
+                // user's typing lands between frozen lines, not on one.
+                let line = editor.cursor().line;
+                if editor.is_frozen_line(line) {
+                    editor.open_line_below();
+                } else {
+                    editor.begin_insert();
+                }
                 self.mode = AppMode::Insert;
             }
             Action::OpenLineBelow => {
@@ -1473,37 +1689,20 @@ impl App {
                 self.buffers[self.active_buffer].viewport.scroll_up(1);
             }
             Action::HalfPageDown => {
-                self.buffers[self.active_buffer].viewport
-                    .scroll_down(viewport_height / 2, viewport_height);
-                let new_top = self.buffers[self.active_buffer].viewport.scroll_offset;
-                if self.buffers[self.active_buffer].editor.cursor().line < new_top {
-                    self.buffers[self.active_buffer].editor.cursor_mut().line = new_top;
-                    self.buffers[self.active_buffer].editor.clamp_cursor_col(false);
-                }
+                // vim semantics: scroll AND move the cursor by the same
+                // amount, so it stays in the same screen position. (If we
+                // only scrolled, the end-of-handle_key ensure_cursor_visible
+                // would snap the viewport back to the cursor.)
+                self.page_move_cursor(viewport_height / 2, true);
             }
             Action::HalfPageUp => {
-                self.buffers[self.active_buffer].viewport.scroll_up(viewport_height / 2);
-                let new_bottom = self.buffers[self.active_buffer].viewport.scroll_offset + viewport_height;
-                if self.buffers[self.active_buffer].editor.cursor().line >= new_bottom {
-                    self.buffers[self.active_buffer].editor.cursor_mut().line = new_bottom.saturating_sub(1);
-                    self.buffers[self.active_buffer].editor.clamp_cursor_col(false);
-                }
+                self.page_move_cursor(viewport_height / 2, false);
             }
             Action::FullPageDown => {
-                self.buffers[self.active_buffer].viewport.scroll_down(viewport_height, viewport_height);
-                let new_top = self.buffers[self.active_buffer].viewport.scroll_offset;
-                if self.buffers[self.active_buffer].editor.cursor().line < new_top {
-                    self.buffers[self.active_buffer].editor.cursor_mut().line = new_top;
-                    self.buffers[self.active_buffer].editor.clamp_cursor_col(false);
-                }
+                self.page_move_cursor(viewport_height, true);
             }
             Action::FullPageUp => {
-                self.buffers[self.active_buffer].viewport.scroll_up(viewport_height);
-                let new_bottom = self.buffers[self.active_buffer].viewport.scroll_offset + viewport_height;
-                if self.buffers[self.active_buffer].editor.cursor().line >= new_bottom {
-                    self.buffers[self.active_buffer].editor.cursor_mut().line = new_bottom.saturating_sub(1);
-                    self.buffers[self.active_buffer].editor.clamp_cursor_col(false);
-                }
+                self.page_move_cursor(viewport_height, false);
             }
             Action::JumpTop => {
                 self.buffers[self.active_buffer].editor.cursor_mut().jump_top();
@@ -1864,9 +2063,14 @@ impl App {
         };
 
         let cursor_col_before = buf.editor.cursor().col;
-        buf.editor
-            .document_mut()
-            .begin_undo_group(line_idx, cursor_col_before);
+        let frozen_snapshot: Vec<(usize, usize)> = buf.editor.frozen_lines().to_vec();
+        let lockable_snapshot = buf.editor.lockable_through_line();
+        buf.editor.document_mut().begin_undo_group(
+            line_idx,
+            cursor_col_before,
+            &frozen_snapshot,
+            lockable_snapshot,
+        );
         buf.editor
             .document_mut()
             .replace_line_text(line_idx, &new_line);
@@ -2071,41 +2275,61 @@ impl App {
             .ensure_cursor_visible(row, viewport_height);
     }
 
+    /// Move the cursor by `n` rows (down if `down`, else up), clamped to
+    /// the visible content. Used by ctrl-d / ctrl-u / page motions —
+    /// viewport scrolling then follows naturally via ensure_cursor_visible
+    /// at the end of handle_key.
+    ///
+    /// Rendered and Raw modes track cursors in different coordinate spaces,
+    /// so we move the appropriate one. Mixing them up (e.g. moving the doc
+    /// cursor while in Rendered mode) leaves the visible cursor unchanged
+    /// and ctrl-d/u looks like a no-op.
+    fn page_move_cursor(&mut self, n: usize, down: bool) {
+        let buf = &mut self.buffers[self.active_buffer];
+        match buf.view_mode {
+            ViewMode::Raw => {
+                let editor = &mut buf.editor;
+                let cur_line = editor.cursor().line;
+                let max_line = editor.document().line_count().saturating_sub(1);
+                let new_line = if down {
+                    (cur_line + n).min(max_line)
+                } else {
+                    cur_line.saturating_sub(n)
+                };
+                editor.pre_move(false);
+                editor.cursor_mut().line = new_line;
+                editor.clamp_cursor_col(false);
+            }
+            ViewMode::Rendered => {
+                let max_row = buf.viewport.total_lines.saturating_sub(1);
+                let cur = buf.rendered_cursor_row;
+                buf.rendered_cursor_row = if down {
+                    (cur + n).min(max_row)
+                } else {
+                    cur.saturating_sub(n)
+                };
+            }
+        }
+    }
+
     fn ensure_cursor_visible(&mut self, viewport_height: usize) {
         let buf = &self.buffers[self.active_buffer];
-        let cursor_line = buf.editor.cursor().line;
+        // Rendered mode tracks its cursor in its OWN coordinate space
+        // (`rendered_cursor_row`); the doc cursor doesn't move on j/k/page
+        // motions there. Translating doc line → rendered y is lossy and
+        // contradicts whatever the rendered handlers just computed, so the
+        // outer auto-pin would scroll the viewport back and leave the
+        // rendered cursor off-screen.
         let rendered_y = match buf.view_mode {
             ViewMode::Raw => sketch::buffer::raw_cursor_visual_row(
                 &buf.editor,
                 self.last_wrap_width.max(1),
             ),
-            ViewMode::Rendered => self.doc_line_to_rendered_y(cursor_line),
+            ViewMode::Rendered => buf.rendered_cursor_row,
         };
         self.buffers[self.active_buffer]
             .viewport
             .ensure_cursor_visible(rendered_y, viewport_height);
-    }
-
-    /// Convert a document line number to its approximate rendered y position
-    /// using the cached rendered blocks.
-    fn doc_line_to_rendered_y(&self, doc_line: usize) -> usize {
-        let buf = &self.buffers[self.active_buffer];
-        let boundaries = buf.editor.block_boundaries();
-        let content_width = buf.viewport.content_width(200); // approximate
-
-        let mut rendered_y = 0;
-        for (i, block_info) in boundaries.iter().enumerate() {
-            if doc_line >= block_info.start_line && doc_line <= block_info.end_line {
-                let line_in_block = doc_line - block_info.start_line;
-                return rendered_y + line_in_block;
-            }
-            if let Some(rb) = buf.rendered_cache.get(i) {
-                rendered_y += buf.viewport.block_height(rb, content_width);
-            } else {
-                rendered_y += (block_info.end_line - block_info.start_line).max(1) + 1;
-            }
-        }
-        rendered_y
     }
 
     fn open_file_browser(&mut self) {
@@ -2822,6 +3046,99 @@ mod tests {
         assert_eq!(
             app.active_buffer, claude_idx,
             "active_buffer must switch to claude buffer"
+        );
+    }
+
+    /// Build an app with enough rendered content to exercise scrolling.
+    fn rendered_app() -> App {
+        let md = (0..200)
+            .map(|i| format!("Line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg = Config::default();
+        let mut app = App::new("/tmp/scroll.md".into(), md, &cfg);
+        app.last_viewport_height = 24;
+        app.last_wrap_width = 80;
+        app.buffers[app.active_buffer].rebuild_render_cache(&app.theme);
+        app.buffers[app.active_buffer].update_total_lines(80);
+        assert_eq!(app.buffers[app.active_buffer].view_mode, ViewMode::Rendered);
+        app
+    }
+
+    /// Regression: in Rendered mode, the post-keystroke auto-pin used to
+    /// translate the (stale) doc cursor into a rendered y, snapping
+    /// `scroll_offset` back to 0 on every j/k and pushing the visible
+    /// cursor off the bottom. It must follow `rendered_cursor_row`.
+    #[test]
+    fn ensure_cursor_visible_in_rendered_mode_follows_rendered_cursor_row() {
+        let mut app = rendered_app();
+        // Walk the rendered cursor below the initial viewport.
+        app.buffers[app.active_buffer].rendered_cursor_row = 100;
+        // Doc cursor untouched — exactly the divergence that triggered the bug.
+        assert_eq!(app.buffers[app.active_buffer].editor.cursor().line, 0);
+
+        let vh = 24;
+        app.ensure_cursor_visible(vh);
+
+        let off = app.buffers[app.active_buffer].viewport.scroll_offset;
+        assert!(
+            100 >= off && 100 < off + vh,
+            "rendered cursor at row 100 must sit inside viewport [{off}, {}); got scroll_offset {off}",
+            off + vh
+        );
+    }
+
+    /// Regression: ctrl-d / ctrl-u in Rendered mode used to move only
+    /// `editor.cursor().line` (the raw-mode doc cursor), which isn't
+    /// displayed there — the visible cursor stayed put and the action
+    /// looked dead. Must move `rendered_cursor_row` instead.
+    #[test]
+    fn page_move_cursor_in_rendered_mode_moves_rendered_cursor_row() {
+        let mut app = rendered_app();
+        let pre_doc = app.buffers[app.active_buffer].editor.cursor().line;
+        let pre_row = app.buffers[app.active_buffer].rendered_cursor_row;
+
+        app.page_move_cursor(12, true);
+
+        let post_doc = app.buffers[app.active_buffer].editor.cursor().line;
+        let post_row = app.buffers[app.active_buffer].rendered_cursor_row;
+        assert_eq!(
+            post_doc, pre_doc,
+            "doc cursor must stay put in Rendered mode (was {pre_doc}, now {post_doc})"
+        );
+        assert_eq!(
+            post_row,
+            pre_row + 12,
+            "rendered_cursor_row must advance by N on ctrl-d"
+        );
+
+        // ctrl-u walks back.
+        app.page_move_cursor(12, false);
+        assert_eq!(
+            app.buffers[app.active_buffer].rendered_cursor_row, pre_row,
+            "ctrl-u must reverse the move"
+        );
+    }
+
+    /// Raw mode keeps moving the doc cursor — page motions there must NOT
+    /// regress to touching `rendered_cursor_row`.
+    #[test]
+    fn page_move_cursor_in_raw_mode_moves_doc_cursor() {
+        let mut app = rendered_app();
+        app.buffers[app.active_buffer].view_mode = ViewMode::Raw;
+        app.buffers[app.active_buffer].update_total_lines(80);
+        let pre_row = app.buffers[app.active_buffer].rendered_cursor_row;
+
+        app.page_move_cursor(12, true);
+
+        assert_eq!(
+            app.buffers[app.active_buffer].editor.cursor().line,
+            12,
+            "doc cursor must advance by N in Raw mode"
+        );
+        assert_eq!(
+            app.buffers[app.active_buffer].rendered_cursor_row, pre_row,
+            "rendered_cursor_row must stay put in Raw mode"
         );
     }
 }
