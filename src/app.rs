@@ -4,6 +4,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
 
+use sketch::acp_channel::AcpChannelClient;
 use sketch::blocks::RenderedBlock;
 use sketch::buffer::Buffer;
 use sketch::claude_channel::ChannelClient;
@@ -86,6 +87,12 @@ pub struct App {
     /// Replies come back via the `reply` MCP tool and are appended to a
     /// `*claude*` buffer.
     claude_channel: Option<ChannelClient>,
+    /// Alternative path: a Claude (or any ACP-compliant) agent spawned as a
+    /// local subprocess and driven over the Agent Client Protocol over stdio.
+    /// Coexists with `claude_channel` — both write into the same `*claude*`
+    /// buffer; the user picks which one to attach. Replies are streamed in
+    /// chunks and spliced via `append_to_claude_buffer`.
+    acp_channel: Option<AcpChannelClient>,
 }
 
 impl App {
@@ -156,6 +163,7 @@ impl App {
             debug_last_off_screen: false,
             debug_last_signature: 0,
             claude_channel: None,
+            acp_channel: None,
             last_viewport_height: 24,
             last_wrap_width: 80,
         }
@@ -354,6 +362,7 @@ impl App {
 
             // Drain any pending Claude replies into *claude* buffer.
             self.pump_claude_replies(viewport_height);
+            self.pump_acp_replies(viewport_height);
 
             // Rebuild render cache if needed
             if self.buffers[self.active_buffer].view_cache_dirty {
@@ -1079,6 +1088,11 @@ impl App {
                 self.attach_claude_channel(arg);
                 return;
             }
+            if action == Action::ClaudeAcpAttach {
+                let arg = args.as_deref().map(str::trim).unwrap_or("");
+                self.attach_acp_channel(arg);
+                return;
+            }
             self.execute_action(action, viewport_height, content_width);
         } else {
             self.command_error = format!("Unknown command: {}", cmd_input);
@@ -1253,6 +1267,146 @@ impl App {
         }
         // Scroll the *claude* buffer's viewport to follow the new content,
         // even if the user is currently editing a different buffer.
+        if let Some(idx) = self
+            .buffers
+            .iter()
+            .position(|b| b.file_path().to_string_lossy() == CLAUDE_BUFFER_NAME)
+        {
+            self.ensure_buffer_cursor_visible(idx, viewport_height);
+        }
+    }
+
+    /// Spawn an ACP agent subprocess and complete the handshake. Mirrors
+    /// `attach_claude_channel` for the UNIX-socket path: any existing
+    /// connection is dropped first, the *claude* buffer is created/focused
+    /// on success, and `command_error` is used as a status line.
+    ///
+    /// `command_str` is shell-parsed; empty means "use the default agent
+    /// (`claude-agent-acp`)". The `SKETCH_ACP_AGENT` env var is honoured if
+    /// no command is given.
+    fn attach_acp_channel(&mut self, command_str: &str) {
+        let had_existing = self.acp_channel.take().is_some();
+        let resolved = if command_str.is_empty() {
+            std::env::var("SKETCH_ACP_AGENT").unwrap_or_default()
+        } else {
+            command_str.to_string()
+        };
+        let cwd = std::env::current_dir().ok();
+        match AcpChannelClient::spawn(&resolved, cwd) {
+            Ok(client) => {
+                let label = client.description();
+                self.acp_channel = Some(client);
+                let idx = self.or_create_claude_buffer();
+                self.active_buffer = idx;
+                self.command_error = if had_existing {
+                    format!("Re-attached to {label} (replaced previous)")
+                } else {
+                    format!("Attached to {label}")
+                };
+            }
+            Err(e) => {
+                self.command_error = format!("claude-acp-attach failed: {e}");
+            }
+        }
+    }
+
+    /// Send `text` as an ACP prompt. Returns true on success.
+    fn acp_send_text(&mut self, text: &str, label: &str) -> bool {
+        let outcome = match &mut self.acp_channel {
+            Some(client) => match client.send(text) {
+                Ok(()) => Ok(text.len()),
+                Err(e) => Err(format!("ACP send error: {e}")),
+            },
+            None => Err(
+                "No ACP agent attached. Use :claude-acp-attach first.".to_string(),
+            ),
+        };
+        match outcome {
+            Ok(n) => {
+                self.command_error =
+                    format!("Sent {label} ({n} chars) to ACP agent");
+                true
+            }
+            Err(msg) => {
+                if msg.contains("ACP send error") {
+                    self.acp_channel = None;
+                }
+                self.command_error = msg;
+                false
+            }
+        }
+    }
+
+    fn acp_send_buffer(&mut self) {
+        let buf = &self.buffers[self.active_buffer];
+        let is_claude_buffer = buf.file_path().to_string_lossy() == CLAUDE_BUFFER_NAME;
+
+        let payload = if is_claude_buffer {
+            buf.editor.extract_editable_inserts()
+        } else {
+            buf.editor.document().full_text().trim().to_string()
+        };
+
+        if payload.is_empty() {
+            self.command_error = if is_claude_buffer {
+                "Nothing to send (no inline edits in this turn).".into()
+            } else {
+                "Nothing to send (buffer is empty).".into()
+            };
+            return;
+        }
+
+        let sent = self.acp_send_text(&payload, "buffer");
+
+        if is_claude_buffer && sent {
+            // Same lock-and-advance behaviour as the UNIX-socket path so
+            // the user can keep typing while Claude works on the prior turn.
+            self.lock_active_turn();
+            self.ensure_cursor_visible(self.last_viewport_height);
+        }
+    }
+
+    fn acp_send_selection(&mut self) {
+        let sel = self.buffers[self.active_buffer]
+            .editor
+            .selection_text();
+        match sel {
+            Some(t) if !t.is_empty() => {
+                self.acp_send_text(&t, "selection");
+            }
+            _ => {
+                self.command_error =
+                    "No selection. Make one first (e.g. `v` then a motion).".to_string();
+            }
+        }
+    }
+
+    /// Drain any streamed reply chunks from the ACP worker into the
+    /// *claude* buffer. Identical splice behaviour to `pump_claude_replies`.
+    fn pump_acp_replies(&mut self, viewport_height: usize) {
+        let stale = self
+            .acp_channel
+            .as_ref()
+            .map(|c| !c.is_connected())
+            .unwrap_or(false);
+        if stale {
+            self.acp_channel = None;
+            self.command_error =
+                "ACP agent went away. Run :claude-acp-attach to recover.".into();
+        }
+
+        let mut received: Vec<String> = Vec::new();
+        if let Some(client) = &self.acp_channel {
+            while let Some(text) = client.try_recv() {
+                received.push(text);
+            }
+        }
+        if received.is_empty() {
+            return;
+        }
+        for text in received {
+            self.append_to_claude_buffer(&text);
+        }
         if let Some(idx) = self
             .buffers
             .iter()
@@ -2063,6 +2217,40 @@ impl App {
                 self.command_error =
                     "Injected synthetic Claude reply into *claude* buffer.".into();
             }
+            Action::ClaudeAcpAttach => {
+                // Bare keybinding invocation (no arg) → use default command.
+                self.attach_acp_channel("");
+            }
+            Action::ClaudeAcpDetach => {
+                let was = self.acp_channel.take().is_some();
+                self.command_error = if was {
+                    "Detached from ACP agent (subprocess terminated)".to_string()
+                } else {
+                    "No ACP agent attached".to_string()
+                };
+            }
+            Action::ClaudeAcpSend => {
+                self.acp_send_buffer();
+            }
+            Action::ClaudeAcpSendSelection => {
+                self.acp_send_selection();
+            }
+            Action::ClaudeAcpStatus => {
+                self.command_error = match &self.acp_channel {
+                    Some(c) => {
+                        let live = if c.is_connected() {
+                            "alive"
+                        } else {
+                            "dead — re-run :claude-acp-attach"
+                        };
+                        format!("{} ({live})", c.description())
+                    }
+                    None => format!(
+                        "No ACP agent. Default cmd: {}",
+                        sketch::acp_channel::DEFAULT_AGENT_COMMAND
+                    ),
+                };
+            }
         }
     }
 
@@ -2105,14 +2293,9 @@ impl App {
         };
 
         let cursor_col_before = buf.editor.cursor().col;
-        let frozen_snapshot: Vec<(usize, usize)> = buf.editor.frozen_lines().to_vec();
-        let lockable_snapshot = buf.editor.lockable_through_line();
-        buf.editor.document_mut().begin_undo_group(
-            line_idx,
-            cursor_col_before,
-            &frozen_snapshot,
-            lockable_snapshot,
-        );
+        buf.editor
+            .document_mut()
+            .begin_undo_group(line_idx, cursor_col_before);
         buf.editor
             .document_mut()
             .replace_line_text(line_idx, &new_line);

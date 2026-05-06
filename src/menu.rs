@@ -223,6 +223,13 @@ pub fn default_menu() -> Vec<MenuNode> {
             MenuNode::entry("s", "send buffer", "claude-send"),
             MenuNode::entry("S", "send selection", "claude-send-selection"),
             MenuNode::entry("?", "status", "claude-status"),
+            MenuNode::submenu("p", "ACP (subprocess)", vec![
+                MenuNode::entry("a", "attach", "claude-acp-attach"),
+                MenuNode::entry("d", "detach", "claude-acp-detach"),
+                MenuNode::entry("s", "send buffer", "claude-acp-send"),
+                MenuNode::entry("S", "send selection", "claude-acp-send-selection"),
+                MenuNode::entry("?", "status", "claude-acp-status"),
+            ]),
         ]),
         MenuNode::submenu("e", "edit", vec![
             MenuNode::entry("a", "select all", "select-all"),

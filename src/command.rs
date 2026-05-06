@@ -545,6 +545,38 @@ impl CommandRegistry {
                 action: Action::ClaudeTest,
                 description: "Inject a fake Claude reply (for diagnostics)".into(),
             },
+            // --- Claude Code via ACP commands (spawns local subprocess) ---
+            CommandDef {
+                name: "claude-acp-attach".into(),
+                aliases: vec!["acp-attach".into(), "acpattach".into()],
+                action: Action::ClaudeAcpAttach,
+                description:
+                    "Spawn an ACP agent (default claude-agent-acp; arg = custom cmd)".into(),
+            },
+            CommandDef {
+                name: "claude-acp-detach".into(),
+                aliases: vec!["acp-detach".into(), "acpdetach".into()],
+                action: Action::ClaudeAcpDetach,
+                description: "Kill the ACP agent subprocess".into(),
+            },
+            CommandDef {
+                name: "claude-acp-send".into(),
+                aliases: vec!["acp-send".into(), "acpsend".into()],
+                action: Action::ClaudeAcpSend,
+                description: "Send the buffer / draft to the ACP agent as a prompt".into(),
+            },
+            CommandDef {
+                name: "claude-acp-send-selection".into(),
+                aliases: vec!["acp-send-selection".into(), "acpsendsel".into()],
+                action: Action::ClaudeAcpSendSelection,
+                description: "Send the selection to the ACP agent as a prompt".into(),
+            },
+            CommandDef {
+                name: "claude-acp-status".into(),
+                aliases: vec!["acp-status".into(), "acpstatus".into()],
+                action: Action::ClaudeAcpStatus,
+                description: "Show the current ACP agent attachment".into(),
+            },
         ])
     }
 }
