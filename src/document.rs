@@ -11,6 +11,11 @@ pub struct UndoEntry {
     cursor_before_col: usize,
     cursor_after_line: usize,
     cursor_after_col: usize,
+    /// Snapshot of the editor's frozen-line ranges + lockable-through-line
+    /// taken at begin_undo_group; restored on undo so frozen state stays in
+    /// sync with the rope content. Empty + 0 if the editor never set them.
+    frozen_lines_before: Vec<(usize, usize)>,
+    lockable_through_line_before: usize,
 }
 
 pub struct Document {
@@ -183,14 +188,26 @@ impl Document {
         self.redo_stack.clear();
     }
 
-    /// Begin an undo group. Call before a sequence of edits that should undo as one.
-    pub fn begin_undo_group(&mut self, cursor_line: usize, cursor_col: usize) {
+    /// Begin an undo group. Call before a sequence of edits that should undo
+    /// as one. `frozen_lines` and `lockable_through_line` are snapshotted so
+    /// the editor's frozen-region state is restored on undo alongside the
+    /// rope text — otherwise undo can desynchronize them, leaving stale
+    /// indices that misclassify frozen vs. editable lines.
+    pub fn begin_undo_group(
+        &mut self,
+        cursor_line: usize,
+        cursor_col: usize,
+        frozen_lines: &[(usize, usize)],
+        lockable_through_line: usize,
+    ) {
         self.pending_undo = Some(UndoEntry {
             before_text: self.rope.to_string(),
             cursor_before_line: cursor_line,
             cursor_before_col: cursor_col,
             cursor_after_line: 0,
             cursor_after_col: 0,
+            frozen_lines_before: frozen_lines.to_vec(),
+            lockable_through_line_before: lockable_through_line,
         });
     }
 
@@ -203,26 +220,43 @@ impl Document {
         }
     }
 
-    /// Undo the last action. Returns the cursor position to restore, if any.
-    pub fn undo(&mut self) -> Option<(usize, usize)> {
+    /// Undo the last action. Returns the cursor position to restore, plus the
+    /// frozen-line snapshot and lockable-through-line value to restore.
+    pub fn undo(
+        &mut self,
+        current_frozen_lines: &[(usize, usize)],
+        current_lockable_through_line: usize,
+    ) -> Option<(usize, usize, Vec<(usize, usize)>, usize)> {
         let entry = self.undo_stack.pop()?;
-        // Save current state for redo
+        // Save current state for redo (snapshot the editor's CURRENT frozen
+        // state so a future redo can restore what we're about to undo away).
         let redo_entry = UndoEntry {
             before_text: self.rope.to_string(),
             cursor_before_line: entry.cursor_after_line,
             cursor_before_col: entry.cursor_after_col,
             cursor_after_line: entry.cursor_before_line,
             cursor_after_col: entry.cursor_before_col,
+            frozen_lines_before: current_frozen_lines.to_vec(),
+            lockable_through_line_before: current_lockable_through_line,
         };
         self.redo_stack.push(redo_entry);
         // Restore previous text
         self.rope = Rope::from_str(&entry.before_text);
         self.modified = !self.undo_stack.is_empty();
-        Some((entry.cursor_before_line, entry.cursor_before_col))
+        Some((
+            entry.cursor_before_line,
+            entry.cursor_before_col,
+            entry.frozen_lines_before,
+            entry.lockable_through_line_before,
+        ))
     }
 
-    /// Redo the last undone action. Returns cursor position to restore.
-    pub fn redo(&mut self) -> Option<(usize, usize)> {
+    /// Redo the last undone action. Returns cursor + frozen state to restore.
+    pub fn redo(
+        &mut self,
+        current_frozen_lines: &[(usize, usize)],
+        current_lockable_through_line: usize,
+    ) -> Option<(usize, usize, Vec<(usize, usize)>, usize)> {
         let entry = self.redo_stack.pop()?;
         let undo_entry = UndoEntry {
             before_text: self.rope.to_string(),
@@ -230,11 +264,18 @@ impl Document {
             cursor_before_col: entry.cursor_after_col,
             cursor_after_line: entry.cursor_before_line,
             cursor_after_col: entry.cursor_before_col,
+            frozen_lines_before: current_frozen_lines.to_vec(),
+            lockable_through_line_before: current_lockable_through_line,
         };
         self.undo_stack.push(undo_entry);
         self.rope = Rope::from_str(&entry.before_text);
         self.modified = true;
-        Some((entry.cursor_before_line, entry.cursor_before_col))
+        Some((
+            entry.cursor_before_line,
+            entry.cursor_before_col,
+            entry.frozen_lines_before,
+            entry.lockable_through_line_before,
+        ))
     }
 
     /// Save the document to disk atomically.

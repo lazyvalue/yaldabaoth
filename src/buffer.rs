@@ -270,18 +270,43 @@ fn line_wrap_width(is_user: bool, base: usize) -> usize {
     }
 }
 
-fn line_visual_rows(line_len_chars: usize, wrap_width: usize) -> usize {
-    if line_len_chars == 0 {
-        1
-    } else if wrap_width == 0 {
-        1
-    } else {
-        line_len_chars.div_ceil(wrap_width)
-    }
-}
+// (line_visual_rows replaced by view::wrap_row_count; the renderer's
+// word-boundary wrap is the only source of truth.)
 
 /// Total visual rows when rendering `editor`'s document in raw mode at the
 /// given `wrap_width`.
+/// Build the same line text the renderer sees: trailing newline stripped,
+/// tabs expanded to four spaces. The wrap width counts MUST be computed
+/// against this exact string or scroll math will desync from the renderer
+/// (each tab is 1 doc char but 4 visual cols, so a line with several tabs
+/// can wrap to many more rows than `line_len_chars / wrap_width` predicts).
+fn render_line_text(doc: &crate::document::Document, line: usize) -> String {
+    let mut s = doc.line_text(line);
+    if s.ends_with('\n') {
+        s.pop();
+    }
+    s.replace('\t', "    ")
+}
+
+/// Adjust `cursor_col` (a doc-char column) to the equivalent column in the
+/// tab-expanded render text. Each tab counts as 4 cells, so a doc-col that
+/// sits past N tabs maps to render-col cursor_col + 3*N.
+fn render_col_for_cursor(doc: &crate::document::Document, line: usize, cursor_col: usize) -> usize {
+    let line_text = doc.line_text(line);
+    let mut render_col = 0usize;
+    for (i, ch) in line_text.chars().enumerate() {
+        if i >= cursor_col {
+            break;
+        }
+        if ch == '\t' {
+            render_col += 4;
+        } else {
+            render_col += 1;
+        }
+    }
+    render_col
+}
+
 pub fn raw_visual_row_count(editor: &Editor, wrap_width: usize) -> usize {
     let doc = editor.document();
     let frozen = editor.frozen_ranges();
@@ -289,18 +314,21 @@ pub fn raw_visual_row_count(editor: &Editor, wrap_width: usize) -> usize {
     let mut char_idx = 0usize;
     for l in 0..doc.line_count() {
         let line_text = doc.line_text(l);
-        let line_len = doc.line_len_chars(l);
         let is_user = classify_user_line(char_idx, &line_text, &frozen);
         let lw = line_wrap_width(is_user, wrap_width);
-        total += line_visual_rows(line_len, lw);
+        let render_text = render_line_text(doc, l);
+        // Use the SAME word-boundary wrap the renderer uses.
+        total += crate::view::wrap_row_count(&render_text, lw);
         char_idx += line_text.chars().count();
     }
     total
 }
 
-/// Compute the cursor's visual-row index in raw mode (sum of visual rows for
-/// every doc line above the cursor's line, plus the cursor's row within its
-/// own line at `cursor.col / line_wrap_width`).
+/// Compute the cursor's visual-row index in raw mode. Uses the same word-
+/// boundary wrapping the renderer applies, against the same tab-expanded
+/// text — otherwise the renderer paints the cursor at row R but scroll
+/// math thinks it's at row R+N (for some N depending on lines above), and
+/// the cursor ends up off-screen.
 pub fn raw_cursor_visual_row(editor: &Editor, wrap_width: usize) -> usize {
     let doc = editor.document();
     let frozen = editor.frozen_ranges();
@@ -311,13 +339,16 @@ pub fn raw_cursor_visual_row(editor: &Editor, wrap_width: usize) -> usize {
     let mut char_idx = 0usize;
     for l in 0..doc.line_count() {
         let line_text = doc.line_text(l);
-        let line_len = doc.line_len_chars(l);
         let is_user = classify_user_line(char_idx, &line_text, &frozen);
         let lw = line_wrap_width(is_user, wrap_width);
+        let render_text = render_line_text(doc, l);
         if l == target_line {
-            return total + target_col / lw;
+            let render_cursor_col = render_col_for_cursor(doc, l, target_col);
+            let (_, cursor_row) =
+                crate::view::wrap_row_count_with_cursor(&render_text, lw, render_cursor_col);
+            return total + cursor_row;
         }
-        total += line_visual_rows(line_len, lw);
+        total += crate::view::wrap_row_count(&render_text, lw);
         char_idx += line_text.chars().count();
     }
     total

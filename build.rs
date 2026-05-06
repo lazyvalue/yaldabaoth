@@ -2,9 +2,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
-    println!("cargo:rerun-if-changed=build.rs");
+    // Intentionally NO `cargo:rerun-if-changed` lines — that makes cargo treat
+    // every file in the package as a build-script dependency, so the SHA +
+    // timestamp embedded in SKETCH_BUILD_INFO refreshes on any source change.
 
     let sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])

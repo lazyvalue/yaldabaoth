@@ -209,39 +209,72 @@ impl Editor {
     }
 
     /// Recompute frozen line ranges after inserting `text` at `(line, col)`.
-    /// Lines strictly after the insertion shift by the number of inserted
-    /// newlines. A line being inserted INTO (mid-line) keeps its identity;
-    /// inserting newlines mid-editable-line splits that editable line into
-    /// multiple editable lines (frozen ranges below shift down accordingly).
+    ///
+    /// The hard case: `(line, col)` falls *inside* a multi-line frozen range
+    /// at `col == 0`, which means the user pressed Enter at the start of a
+    /// middle/last line of the range. The range must SPLIT around the new
+    /// empty line(s), not just be passed through unchanged.
+    ///
+    /// We first normalize "end-of-line" positions to the equivalent
+    /// "start-of-next-line" position, since the rope treats them identically.
+    /// After normalization, only `eff_col == 0` insertions can affect range
+    /// boundaries — mid-line insertions on a frozen line are rejected by
+    /// `can_insert_char_at` and so should never reach this function.
     fn shift_frozen_lines_for_insert(&mut self, line: usize, col: usize, text: &str) {
         let inserted_nl = text.chars().filter(|c| *c == '\n').count();
         if inserted_nl == 0 {
             return;
         }
-        // The insertion is at (line, col). Frozen ranges entirely above `line`
-        // are unchanged. Ranges starting at line `line+1` or later shift down.
-        // A range that contains `line` (the line we're inserting into): only
-        // possible when col == 0 with text ending in `\n` (per can_insert_*),
-        // i.e., we're inserting whole lines above the frozen range — shift the
-        // whole range down.
-        for (s, e) in self.frozen_lines.iter_mut() {
-            if *s > line {
-                *s += inserted_nl;
-                *e += inserted_nl;
-            } else if *s == line && col == 0 {
-                // Insertion is exactly at the start of this frozen range; the
-                // new lines come ABOVE the range — shift it down.
-                *s += inserted_nl;
-                *e += inserted_nl;
+
+        // Normalize: inserting at-or-past the visible end of a line is
+        // identical (in the rope) to inserting at the start of the next line.
+        // Folding to a canonical form makes the range update straightforward.
+        let line_text = self.document.line_text(line);
+        let visible_len = line_text.trim_end_matches('\n').chars().count();
+        let line_count = self.document.line_count();
+        let (eff_line, eff_col) = if col >= visible_len && line + 1 < line_count {
+            (line + 1, 0)
+        } else {
+            (line, col)
+        };
+
+        let mut new_ranges: Vec<(usize, usize)> = Vec::with_capacity(self.frozen_lines.len() + 1);
+        for &(s, e) in self.frozen_lines.iter() {
+            if e <= eff_line {
+                // Range is entirely above the insertion point — unchanged.
+                new_ranges.push((s, e));
+            } else if s >= eff_line {
+                // Range is entirely at-or-below the insertion point — shift
+                // the whole range down by `inserted_nl`.
+                new_ranges.push((s + inserted_nl, e + inserted_nl));
+            } else if eff_col == 0 {
+                // Range straddles the insertion point at a line boundary.
+                // Split into the part above and the (shifted) part below.
+                // [s, eff_line) stays put; [eff_line, e) becomes
+                // [eff_line + inserted_nl, e + inserted_nl).
+                if s < eff_line {
+                    new_ranges.push((s, eff_line));
+                }
+                let new_below = (eff_line + inserted_nl, e + inserted_nl);
+                if new_below.0 < new_below.1 {
+                    new_ranges.push(new_below);
+                }
+            } else {
+                // Mid-line insert (eff_col > 0) on a line within a frozen
+                // range. `can_insert_char_at` rejects this; we leave the range
+                // alone defensively if we somehow get here.
+                new_ranges.push((s, e));
             }
-            // Else: insertion is mid-line on an editable line (`line` not in
-            // any frozen range) — frozen ranges below have already been shifted
-            // by the iteration logic above for any `s > line`, so we're done.
         }
-        // lockable_through_line shifts the same way.
-        if self.lockable_through_line > line
-            || (self.lockable_through_line == line && col == 0)
-        {
+        self.frozen_lines = new_ranges;
+
+        // lockable_through_line marks the first editable line. Only shift it
+        // if the insertion is STRICTLY ABOVE that line (i.e., into the locked
+        // prefix). When the insertion lands at lockable_through_line itself,
+        // the new empty lines go INTO the editable region above the original
+        // first-editable-line content — lockable still points to the new
+        // first-editable-line index.
+        if self.lockable_through_line > eff_line {
             self.lockable_through_line += inserted_nl;
         }
     }
@@ -486,8 +519,12 @@ impl Editor {
             self.selection_anchor = None;
             return false;
         }
-        self.document
-            .begin_undo_group(self.cursor.line, self.cursor.col);
+        self.document.begin_undo_group(
+            self.cursor.line,
+            self.cursor.col,
+            &self.frozen_lines,
+            self.lockable_through_line,
+        );
         self.shift_frozen_lines_for_delete(start, end);
         self.document.delete_range(start, end);
         self.cursor.line = sl;
@@ -555,8 +592,12 @@ impl Editor {
     /// Begin insert mode — creates an undo boundary.
     pub fn begin_insert(&mut self) {
         self.in_insert_mode = true;
-        self.document
-            .begin_undo_group(self.cursor.line, self.cursor.col);
+        self.document.begin_undo_group(
+            self.cursor.line,
+            self.cursor.col,
+            &self.frozen_lines,
+            self.lockable_through_line,
+        );
     }
 
     /// End insert mode — closes the undo boundary.
@@ -629,8 +670,12 @@ impl Editor {
         if !self.can_delete_range(del_s, del_e) {
             return;
         }
-        self.document
-            .begin_undo_group(self.cursor.line, self.cursor.col);
+        self.document.begin_undo_group(
+            self.cursor.line,
+            self.cursor.col,
+            &self.frozen_lines,
+            self.lockable_through_line,
+        );
         self.shift_frozen_lines_for_delete(del_s, del_e);
         self.document.delete_char(self.cursor.line, self.cursor.col);
         // Clamp cursor if line got shorter
@@ -655,8 +700,12 @@ impl Editor {
         if !self.can_delete_range(line_start, line_end) {
             return;
         }
-        self.document
-            .begin_undo_group(self.cursor.line, self.cursor.col);
+        self.document.begin_undo_group(
+            self.cursor.line,
+            self.cursor.col,
+            &self.frozen_lines,
+            self.lockable_through_line,
+        );
         self.shift_frozen_lines_for_delete(line_start, line_end);
         self.document.delete_line(self.cursor.line);
         // Clamp cursor
@@ -676,8 +725,12 @@ impl Editor {
         if !self.can_insert_char_at(line, insert_col, '\n') {
             return;
         }
-        self.document
-            .begin_undo_group(self.cursor.line, self.cursor.col);
+        self.document.begin_undo_group(
+            self.cursor.line,
+            self.cursor.col,
+            &self.frozen_lines,
+            self.lockable_through_line,
+        );
         self.shift_frozen_lines_for_insert(line, insert_col, "\n");
         self.document.insert_char(line, insert_col, '\n');
         self.cursor.line += 1;
@@ -691,17 +744,29 @@ impl Editor {
         if !self.can_insert_char_at(self.cursor.line, 0, '\n') {
             return;
         }
-        self.document
-            .begin_undo_group(self.cursor.line, self.cursor.col);
+        self.document.begin_undo_group(
+            self.cursor.line,
+            self.cursor.col,
+            &self.frozen_lines,
+            self.lockable_through_line,
+        );
         self.shift_frozen_lines_for_insert(self.cursor.line, 0, "\n");
         self.document.insert_char(self.cursor.line, 0, '\n');
         self.cursor.col = 0;
         self.in_insert_mode = true;
     }
 
-    /// Undo last action.
+    /// Undo last action. Restores rope text AND the editor's frozen-line
+    /// snapshot taken at begin_undo_group, so `frozen_lines` /
+    /// `lockable_through_line` stay in sync with the document content.
     pub fn undo(&mut self) {
-        if let Some((line, col)) = self.document.undo() {
+        let cur_frozen = self.frozen_lines.clone();
+        let cur_lockable = self.lockable_through_line;
+        if let Some((line, col, frozen, lockable)) =
+            self.document.undo(&cur_frozen, cur_lockable)
+        {
+            self.frozen_lines = frozen;
+            self.lockable_through_line = lockable;
             self.cursor.line = line.min(self.document.line_count().saturating_sub(1));
             self.cursor.col = col;
             self.clamp_cursor_col(false);
@@ -709,9 +774,15 @@ impl Editor {
         }
     }
 
-    /// Redo last undone action.
+    /// Redo last undone action. Restores frozen-line state alongside text.
     pub fn redo(&mut self) {
-        if let Some((line, col)) = self.document.redo() {
+        let cur_frozen = self.frozen_lines.clone();
+        let cur_lockable = self.lockable_through_line;
+        if let Some((line, col, frozen, lockable)) =
+            self.document.redo(&cur_frozen, cur_lockable)
+        {
+            self.frozen_lines = frozen;
+            self.lockable_through_line = lockable;
             self.cursor.line = line.min(self.document.line_count().saturating_sub(1));
             self.cursor.col = col;
             self.clamp_cursor_col(false);

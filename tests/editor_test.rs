@@ -301,6 +301,320 @@ fn non_newline_at_frozen_line_boundary_is_rejected() {
 }
 
 #[test]
+fn undo_restores_frozen_lines_state() {
+    // Press `i` on a middle frozen line (open_line_above + insert), then
+    // undo. After undo the frozen range MUST be back to its original shape
+    // so the previously-frozen content is still classified as frozen.
+    let mut ed = editor("Foo\nBar\nBaz\n");
+    ed.add_frozen_lines(0, 3);
+    let frozen_before: Vec<(usize, usize)> = ed.frozen_lines().to_vec();
+    let lockable_before = ed.lockable_through_line();
+    let text_before = ed.document().full_text();
+
+    ed.cursor_mut().line = 1;
+    ed.cursor_mut().col = 0;
+    ed.open_line_above();
+    ed.insert_char('X');
+    // open_line_above started an undo group; close it as end_insert would.
+    ed.end_insert();
+
+    // After the edit: range was split.
+    assert_ne!(ed.frozen_lines(), frozen_before.as_slice());
+    assert_ne!(ed.document().full_text(), text_before);
+
+    // Undo should fully restore both the document AND the frozen state.
+    ed.undo();
+    assert_eq!(ed.document().full_text(), text_before, "text restored");
+    assert_eq!(
+        ed.frozen_lines(),
+        frozen_before.as_slice(),
+        "frozen ranges restored"
+    );
+    assert_eq!(ed.lockable_through_line(), lockable_before);
+    // Bar must be frozen again.
+    assert!(ed.is_frozen_line(1), "Bar must be re-frozen after undo");
+}
+
+#[test]
+fn redo_restores_frozen_lines_state_post_split() {
+    let mut ed = editor("Foo\nBar\nBaz\n");
+    ed.add_frozen_lines(0, 3);
+    ed.cursor_mut().line = 1;
+    ed.cursor_mut().col = 0;
+    ed.open_line_above();
+    ed.insert_char('X');
+    ed.end_insert();
+
+    let after_split_frozen: Vec<(usize, usize)> = ed.frozen_lines().to_vec();
+    let after_split_text = ed.document().full_text();
+
+    ed.undo();
+    ed.redo();
+
+    assert_eq!(ed.document().full_text(), after_split_text);
+    assert_eq!(ed.frozen_lines(), after_split_frozen.as_slice());
+}
+
+#[test]
+fn enter_on_middle_line_of_multi_line_frozen_range_splits_it() {
+    // Three frozen lines: Foo, Bar, Baz. User puts cursor at start of Bar
+    // and presses Enter — should produce an empty editable line BETWEEN
+    // Foo and Bar, splitting the frozen range.
+    let mut ed = editor("Foo\nBar\nBaz\n");
+    ed.add_frozen_lines(0, 3);
+    ed.cursor_mut().line = 1;
+    ed.cursor_mut().col = 0;
+    ed.begin_insert();
+    ed.insert_char('\n');
+    ed.end_insert();
+    assert_eq!(ed.document().line_text(0), "Foo\n");
+    assert_eq!(ed.document().line_text(1), "\n");
+    assert_eq!(ed.document().line_text(2), "Bar\n");
+    assert_eq!(ed.document().line_text(3), "Baz\n");
+    // Range splits: Foo stays frozen at 0; Bar+Baz frozen at 2..4.
+    assert_eq!(ed.frozen_lines(), &[(0, 1), (2, 4)]);
+}
+
+#[test]
+fn enter_on_last_line_of_multi_line_frozen_range_splits_it() {
+    let mut ed = editor("Foo\nBar\nBaz\n");
+    ed.add_frozen_lines(0, 3);
+    ed.cursor_mut().line = 2; // Baz
+    ed.cursor_mut().col = 0;
+    ed.begin_insert();
+    ed.insert_char('\n');
+    ed.end_insert();
+    assert_eq!(ed.document().line_text(0), "Foo\n");
+    assert_eq!(ed.document().line_text(1), "Bar\n");
+    assert_eq!(ed.document().line_text(2), "\n");
+    assert_eq!(ed.document().line_text(3), "Baz\n");
+    assert_eq!(ed.frozen_lines(), &[(0, 2), (3, 4)]);
+}
+
+#[test]
+fn open_line_above_on_middle_frozen_line_creates_editable_line_user_can_type_into() {
+    // The exact user scenario: Claude wrote 3 lines, user wants to insert
+    // their text between Foo and Bar via `i` (which auto-calls
+    // open_line_above on a frozen line).
+    let mut ed = editor("Foo\nBar\nBaz\n");
+    ed.add_frozen_lines(0, 3);
+    ed.cursor_mut().line = 1; // on Bar
+    ed.cursor_mut().col = 0;
+
+    ed.open_line_above();
+    // After: cursor on the new empty line at index 1; Bar moved to 2.
+    assert_eq!(ed.document().line_text(0), "Foo\n");
+    assert_eq!(ed.document().line_text(1), "\n");
+    assert_eq!(ed.document().line_text(2), "Bar\n");
+    assert_eq!(ed.cursor().line, 1);
+    assert_eq!(ed.cursor().col, 0);
+    // Range split — line 1 must NOT be frozen.
+    assert!(!ed.is_frozen_line(1), "new empty line must be editable");
+    assert!(ed.is_frozen_line(0), "Foo stays frozen");
+    assert!(ed.is_frozen_line(2), "Bar stays frozen");
+    assert!(ed.is_frozen_line(3), "Baz stays frozen");
+
+    // Now type — characters MUST appear on line 1.
+    ed.insert_char('X');
+    ed.insert_char('Y');
+    assert_eq!(ed.document().line_text(1), "XY\n");
+    assert_eq!(ed.cursor().line, 1);
+    assert_eq!(ed.cursor().col, 2);
+}
+
+#[test]
+fn open_line_below_on_middle_frozen_line_creates_editable_line_user_can_type_into() {
+    // Same scenario via `a` (which auto-calls open_line_below).
+    let mut ed = editor("Foo\nBar\nBaz\n");
+    ed.add_frozen_lines(0, 3);
+    ed.cursor_mut().line = 1; // on Bar
+    ed.cursor_mut().col = 0;
+
+    ed.open_line_below();
+    // After: cursor on the new empty line at index 2; Baz moved to 3.
+    assert_eq!(ed.document().line_text(0), "Foo\n");
+    assert_eq!(ed.document().line_text(1), "Bar\n");
+    assert_eq!(ed.document().line_text(2), "\n");
+    assert_eq!(ed.document().line_text(3), "Baz\n");
+    assert_eq!(ed.cursor().line, 2);
+    assert_eq!(ed.cursor().col, 0);
+    assert!(!ed.is_frozen_line(2), "new empty line must be editable");
+    assert!(ed.is_frozen_line(0));
+    assert!(ed.is_frozen_line(1));
+    assert!(ed.is_frozen_line(3));
+
+    ed.insert_char('Z');
+    assert_eq!(ed.document().line_text(2), "Z\n");
+}
+
+#[test]
+fn open_line_above_on_first_line_of_frozen_range_shifts_range_down() {
+    // Cursor on the first line of a multi-line frozen range — Enter should
+    // shift the entire range down and put cursor on a fresh editable line.
+    let mut ed = editor("Foo\nBar\nBaz\n");
+    ed.add_frozen_lines(0, 3);
+    ed.cursor_mut().line = 0;
+    ed.cursor_mut().col = 0;
+
+    ed.open_line_above();
+    assert_eq!(ed.document().line_text(0), "\n");
+    assert_eq!(ed.document().line_text(1), "Foo\n");
+    assert_eq!(ed.document().line_text(2), "Bar\n");
+    assert_eq!(ed.document().line_text(3), "Baz\n");
+    assert_eq!(ed.cursor().line, 0);
+    assert_eq!(ed.cursor().col, 0);
+    assert!(!ed.is_frozen_line(0), "new empty line at top must be editable");
+    assert_eq!(ed.frozen_lines(), &[(1, 4)]);
+
+    ed.insert_char('Q');
+    assert_eq!(ed.document().line_text(0), "Q\n");
+}
+
+#[test]
+fn realistic_claude_buffer_flow_user_can_insert_between_claude_lines() {
+    // Mirrors the actual app flow:
+    //  1. user types "hi" + send
+    //  2. lock_active_turn appends "\n\n---\n\n" and bumps lockable_through_line
+    //     to the cursor's destination line (the new empty editable line)
+    //  3. append_to_claude_buffer appends "Foo\nBar\nBaz\n" and registers the
+    //     three frozen lines, parking the cursor on the new trailing empty line
+    //  4. user navigates up to the middle frozen line and presses `i` (which
+    //     in app.rs becomes open_line_above when on a frozen line)
+    //  5. user types "X" and "Y"
+    //
+    // Expected final result: Bar's frozen line is preserved, an editable line
+    // containing "XY" sits between Foo and Bar, the user can keep typing.
+    let mut ed = editor("");
+
+    // Step 1: type "hi"
+    ed.cursor_mut().line = 0;
+    ed.cursor_mut().col = 0;
+    ed.begin_insert();
+    ed.insert_char('h');
+    ed.insert_char('i');
+    ed.end_insert();
+    assert_eq!(ed.document().full_text(), "hi");
+
+    // Step 2: lock_active_turn equivalent
+    {
+        let pre_len = ed.document().rope().len_chars();
+        let s = ed.document().full_text();
+        let trailing_nl = s.chars().rev().take_while(|c| *c == '\n').count();
+        let lead = "\n".repeat(2usize.saturating_sub(trailing_nl));
+        let separator = format!("{}---\n\n", lead);
+        ed.programmatic_insert(pre_len, &separator);
+        let eof = ed.document().rope().len_chars();
+        // emulate char_to_line_col(eof)
+        let (cl, cc) = {
+            let rope = ed.document().rope();
+            let len = rope.len_chars();
+            let i = eof.min(len);
+            let line = rope.char_to_line(i);
+            let line_start = rope.line_to_char(line);
+            (line, i - line_start)
+        };
+        ed.set_lockable_through_line(cl);
+        ed.cursor_mut().line = cl;
+        ed.cursor_mut().col = cc;
+    }
+    // Buffer should now be "hi\n\n---\n\n"; cursor on the trailing empty line.
+    assert_eq!(ed.document().full_text(), "hi\n\n---\n\n");
+    let lock_line = ed.lockable_through_line();
+    assert_eq!(ed.cursor().line, lock_line);
+
+    // Step 3: append Claude reply "Foo\nBar\nBaz"
+    {
+        let pre_len = ed.document().rope().len_chars();
+        let trimmed = "Foo\nBar\nBaz";
+        let s = ed.document().full_text();
+        let trailing_nl = s.chars().rev().take_while(|c| *c == '\n').count();
+        let pad = "\n".repeat(2usize.saturating_sub(trailing_nl));
+        let trailing_pad = if trimmed.ends_with('\n') { "" } else { "\n" };
+        let payload = format!("{}{}{}", pad, trimmed, trailing_pad);
+        ed.programmatic_insert(pre_len, &payload);
+        let claude_start_char = pre_len + pad.chars().count();
+        let claude_end_char =
+            claude_start_char + trimmed.chars().count() + trailing_pad.chars().count();
+        let line_of = |idx: usize| -> usize {
+            let rope = ed.document().rope();
+            let i = idx.min(rope.len_chars());
+            rope.char_to_line(i)
+        };
+        let start_line = line_of(claude_start_char);
+        let end_line = line_of(claude_end_char);
+        ed.add_frozen_lines(start_line, end_line);
+        let post = ed.document().rope().len_chars();
+        let (cl, cc) = {
+            let rope = ed.document().rope();
+            let line = rope.char_to_line(post);
+            let line_start = rope.line_to_char(line);
+            (line, post - line_start)
+        };
+        ed.cursor_mut().line = cl;
+        ed.cursor_mut().col = cc;
+    }
+    // Document now ends with the Claude reply on its own three lines.
+    assert!(ed.document().full_text().ends_with("Foo\nBar\nBaz\n"));
+    // Find Bar's line index.
+    let bar_line = (0..ed.document().line_count())
+        .find(|&l| ed.document().line_text(l) == "Bar\n")
+        .expect("Bar must be present");
+    assert!(ed.is_frozen_line(bar_line), "Bar must be frozen");
+
+    // Step 4: navigate to Bar and press `i` (== open_line_above on frozen).
+    ed.cursor_mut().line = bar_line;
+    ed.cursor_mut().col = 0;
+    ed.open_line_above();
+
+    // The new empty line replaces Bar's old index; Bar shifts down by 1.
+    let new_empty_line = bar_line;
+    let new_bar_line = bar_line + 1;
+    assert_eq!(ed.document().line_text(new_empty_line), "\n");
+    assert_eq!(ed.document().line_text(new_bar_line), "Bar\n");
+    assert!(
+        !ed.is_frozen_line(new_empty_line),
+        "new empty line must NOT be frozen (got is_frozen=true)"
+    );
+    assert!(
+        ed.is_frozen_line(new_bar_line),
+        "Bar must remain frozen after the split"
+    );
+    assert_eq!(ed.cursor().line, new_empty_line);
+    assert_eq!(ed.cursor().col, 0);
+
+    // Step 5: type "XY" — must land on the new empty line.
+    ed.insert_char('X');
+    ed.insert_char('Y');
+    assert_eq!(ed.document().line_text(new_empty_line), "XY\n");
+    assert_eq!(ed.cursor().line, new_empty_line);
+    assert_eq!(ed.cursor().col, 2);
+}
+
+#[test]
+fn lockable_through_line_unchanged_when_inserting_at_first_editable_line() {
+    // lockable_through_line points to the first editable line. Inserting
+    // empty lines at that position pushes the original first-editable
+    // content down BUT the new empty lines are themselves editable, so
+    // lockable_through_line must NOT shift.
+    let mut ed = editor("locked\neditable\n");
+    ed.set_lockable_through_line(1);
+    assert!(!ed.is_frozen_line(1));
+    ed.cursor_mut().line = 1;
+    ed.cursor_mut().col = 0;
+    ed.begin_insert();
+    ed.insert_char('\n');
+    ed.end_insert();
+    assert_eq!(ed.lockable_through_line(), 1, "lockable must stay at 1");
+    // Line 1 (the new empty) must be editable.
+    ed.cursor_mut().line = 1;
+    ed.cursor_mut().col = 0;
+    ed.begin_insert();
+    ed.insert_char('A');
+    ed.end_insert();
+    assert_eq!(ed.document().line_text(1), "A\n");
+}
+
+#[test]
 fn insert_on_editable_line_below_frozen_works() {
     // The realistic shape: a frozen line followed by an editable line. The
     // user types freely on the editable line.

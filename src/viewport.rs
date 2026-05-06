@@ -1,6 +1,6 @@
 use crate::blocks::*;
 
-pub const SCROLLOFF: usize = 3;
+pub const SCROLLOFF: usize = 5;
 
 pub struct Viewport {
     pub scroll_offset: usize,
