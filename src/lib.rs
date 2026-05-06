@@ -1,3 +1,4 @@
+pub mod acp_channel;
 pub mod blocks;
 pub mod buffer;
 pub mod claude_channel;

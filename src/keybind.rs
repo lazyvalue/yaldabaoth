@@ -100,6 +100,18 @@ pub enum Action {
     ClaudeSendSelection,
     ClaudeStatus,
     ClaudeTest,
+    // --- Claude Code via ACP (Agent Client Protocol) actions ---
+    /// Spawn an ACP agent subprocess (default `claude-agent-acp`) and connect.
+    /// Argument (optional) is a shell command to spawn instead.
+    ClaudeAcpAttach,
+    /// Tear down the ACP agent (kills the subprocess).
+    ClaudeAcpDetach,
+    /// Send the active buffer / draft to the ACP agent as a prompt.
+    ClaudeAcpSend,
+    /// Send the current selection to the ACP agent as a prompt.
+    ClaudeAcpSendSelection,
+    /// Show the current ACP agent attachment.
+    ClaudeAcpStatus,
     None,
 }
 
