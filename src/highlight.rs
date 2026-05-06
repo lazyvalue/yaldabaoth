@@ -1,9 +1,9 @@
-use ratatui::style::{Color, Style};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme as SynTheme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
 use crate::blocks::{StyledLine, StyledSpan};
+use crate::style::{Color, Style};
 
 pub struct Highlighter {
     syntax_set: SyntaxSet,

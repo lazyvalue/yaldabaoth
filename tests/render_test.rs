@@ -1,7 +1,7 @@
 use pretty_assertions::assert_eq;
-use ratatui::style::Modifier;
 use sketch::blocks::RenderedBlock;
 use sketch::render::render;
+use sketch::style::Modifier;
 use sketch::theme::Theme;
 
 #[test]
@@ -32,7 +32,7 @@ fn test_render_paragraph_with_bold() {
             assert_eq!(spans.len(), 2);
             assert_eq!(spans[0].text, "Hello ");
             assert_eq!(spans[1].text, "world");
-            assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+            assert!(spans[1].style.modifier.contains(Modifier::BOLD));
         }
         other => panic!("Expected Paragraph, got {:?}", other),
     }

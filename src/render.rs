@@ -1,9 +1,9 @@
 use pulldown_cmark::{CodeBlockKind, Event, Tag, TagEnd};
-use ratatui::style::Style;
 
 use crate::blocks::*;
 use crate::highlight::Highlighter;
 use crate::parse;
+use crate::style::Style;
 use crate::theme::Theme;
 
 pub fn render(markdown: &str, theme: &Theme) -> Vec<RenderedBlock> {

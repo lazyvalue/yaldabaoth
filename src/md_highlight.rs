@@ -1,5 +1,4 @@
-use ratatui::style::Style;
-
+use crate::style::Style;
 use crate::theme::Theme;
 
 /// A highlighted chunk of text: owned string + style.

@@ -1,5 +1,6 @@
 ---
 source: tests/snapshot_test.rs
+assertion_line: 9
 expression: blocks
 ---
 [
@@ -9,7 +10,19 @@ expression: blocks
             spans: [
                 StyledSpan {
                     text: "H1",
-                    style: Style::new().fg(Color::Rgb(189, 147, 249)).bold(),
+                    style: Style {
+                        fg: Some(
+                            Rgb(
+                                189,
+                                147,
+                                249,
+                            ),
+                        ),
+                        bg: None,
+                        modifier: Modifier(
+                            1,
+                        ),
+                    },
                     link: None,
                 },
             ],
@@ -21,7 +34,19 @@ expression: blocks
             spans: [
                 StyledSpan {
                     text: "H2",
-                    style: Style::new().fg(Color::Rgb(139, 233, 253)).bold(),
+                    style: Style {
+                        fg: Some(
+                            Rgb(
+                                139,
+                                233,
+                                253,
+                            ),
+                        ),
+                        bg: None,
+                        modifier: Modifier(
+                            1,
+                        ),
+                    },
                     link: None,
                 },
             ],
@@ -33,7 +58,19 @@ expression: blocks
             spans: [
                 StyledSpan {
                     text: "H3",
-                    style: Style::new().fg(Color::Rgb(80, 250, 123)).bold(),
+                    style: Style {
+                        fg: Some(
+                            Rgb(
+                                80,
+                                250,
+                                123,
+                            ),
+                        ),
+                        bg: None,
+                        modifier: Modifier(
+                            1,
+                        ),
+                    },
                     link: None,
                 },
             ],
@@ -45,7 +82,19 @@ expression: blocks
             spans: [
                 StyledSpan {
                     text: "H4",
-                    style: Style::new().fg(Color::Rgb(241, 250, 140)).bold(),
+                    style: Style {
+                        fg: Some(
+                            Rgb(
+                                241,
+                                250,
+                                140,
+                            ),
+                        ),
+                        bg: None,
+                        modifier: Modifier(
+                            1,
+                        ),
+                    },
                     link: None,
                 },
             ],
@@ -57,7 +106,19 @@ expression: blocks
             spans: [
                 StyledSpan {
                     text: "H5",
-                    style: Style::new().fg(Color::Rgb(255, 184, 108)).bold(),
+                    style: Style {
+                        fg: Some(
+                            Rgb(
+                                255,
+                                184,
+                                108,
+                            ),
+                        ),
+                        bg: None,
+                        modifier: Modifier(
+                            1,
+                        ),
+                    },
                     link: None,
                 },
             ],
@@ -69,7 +130,19 @@ expression: blocks
             spans: [
                 StyledSpan {
                     text: "H6",
-                    style: Style::new().fg(Color::Rgb(180, 180, 180)).bold(),
+                    style: Style {
+                        fg: Some(
+                            Rgb(
+                                180,
+                                180,
+                                180,
+                            ),
+                        ),
+                        bg: None,
+                        modifier: Modifier(
+                            1,
+                        ),
+                    },
                     link: None,
                 },
             ],

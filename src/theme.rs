@@ -1,4 +1,4 @@
-use ratatui::style::{Color, Modifier, Style};
+use crate::style::{Color, Modifier, Style};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemeName {

@@ -376,7 +376,7 @@ impl App {
             } else {
                 Vec::new()
             };
-            let raw_highlights: Vec<Vec<(String, ratatui::style::Style)>> =
+            let raw_highlights: Vec<Vec<(String, sketch::style::Style)>> =
                 if self.buffers[self.active_buffer].view_mode == ViewMode::Raw {
                     sketch::md_highlight::highlight_markdown_lines(&raw_lines, &self.theme)
                 } else {
@@ -1317,11 +1317,18 @@ impl App {
     /// On reply: take the current draft (everything past the frozen HR), and
     /// rewrite the editable region to `claude_text + HR + draft`. Advance the
     /// frozen line to the new HR. The user's pending draft is preserved.
-    /// A new Claude reply landed. Append it to the *claude* buffer:
-    ///  - If this is the very first turn, just append the text.
-    ///  - Otherwise, ensure a paragraph break, append the text.
-    /// Register the inserted text as a frozen range so the user can split it
-    /// with inline edits but cannot delete Claude's words.
+    /// A new Claude reply landed. Splice it into the *claude* buffer ABOVE
+    /// any pending user draft, so the user can keep typing while Claude is
+    /// working and have the reply slot in above without disrupting them.
+    ///
+    /// Layout maintained:
+    /// ```text
+    /// [prior turns]      ← locked (lockable_through_line + frozen ranges)
+    /// [new reply]        ← inserted here, marked frozen
+    /// [user draft]       ← preserved verbatim, cursor stays on same char
+    /// ```
+    /// Streaming-safe: each chunk re-finds the splice point so subsequent
+    /// chunks slot in just after the prior chunk, not below the draft.
     fn append_to_claude_buffer(&mut self, text: &str) {
         let trimmed = text.trim_end_matches('\n');
         if trimmed.is_empty() {
@@ -1332,51 +1339,86 @@ impl App {
         let buf = &mut self.buffers[buf_idx];
         let editor = &mut buf.editor;
 
+        let total_len = editor.document().rope().len_chars();
+        let buffer_was_empty = total_len == 0;
+
+        // Splice point: end of all locked content. Below this is the user's
+        // editable draft (possibly empty). Take the max of lockable_through
+        // and the end of the last frozen range — either can be further down.
+        let lockable = editor.lockable_through_char();
+        let frozen_end_line = editor
+            .frozen_lines()
+            .iter()
+            .map(|&(_, e)| e)
+            .max()
+            .unwrap_or(0);
+        let frozen_end_char = if frozen_end_line == 0 {
+            0
+        } else if frozen_end_line >= editor.document().line_count() {
+            total_len
+        } else {
+            editor.document().line_col_to_char(frozen_end_line, 0)
+        };
+        let splice_at = lockable.max(frozen_end_char).min(total_len);
+
+        // Capture the draft and where the cursor sits relative to it.
+        let draft_text: String = editor
+            .document()
+            .rope()
+            .slice(splice_at..total_len)
+            .to_string();
+        let cursor_char = editor
+            .document()
+            .line_col_to_char(editor.cursor().line, editor.cursor().col);
+        let cursor_in_draft = cursor_char.saturating_sub(splice_at);
+        let cursor_was_in_draft = cursor_char >= splice_at;
+
+        // Strip the draft so the reply can append at end-of-locked-region;
+        // we re-attach it after the reply is in place and frozen.
+        if !draft_text.is_empty() {
+            editor.programmatic_delete(splice_at, total_len);
+        }
+
+        // Pad so the reply starts on its own line(s).
         let pre_len = editor.document().rope().len_chars();
-        let buffer_was_empty = pre_len == 0;
-
-        // Was the user parked at the prior EOF? If yes, follow the new
-        // content; if not, they navigated up to insert mid-turn and we MUST
-        // leave them where they are — yanking them to the bottom on every
-        // reply destroys inline edits in progress.
-        let (pre_eof_line, pre_eof_col) = char_to_line_col(editor.document(), pre_len);
-        let cursor_was_at_eof =
-            editor.cursor().line == pre_eof_line && editor.cursor().col == pre_eof_col;
-
-        // Pad with newlines so the new turn starts on its own line(s).
-        let pad = if buffer_was_empty {
+        let pad = if buffer_was_empty || pre_len == 0 {
             String::new()
         } else {
-            // Already ends with content; need at least \n\n before the new turn.
-            // Compute current trailing newline count.
             let s = editor.document().full_text();
             let trailing_nl = s.chars().rev().take_while(|c| *c == '\n').count();
             "\n".repeat(2usize.saturating_sub(trailing_nl))
         };
-
-        // Ensure the Claude payload occupies whole lines: pad to a line
-        // boundary above and ensure a trailing '\n' so the frozen range covers
-        // complete lines only.
         let trailing_pad = if trimmed.ends_with('\n') { "" } else { "\n" };
         let payload = format!("{}{}{}", pad, trimmed, trailing_pad);
         editor.programmatic_insert(pre_len, &payload);
 
-        // The Claude text starts at the line containing `pre_len + pad.len()`
-        // and ends just before the line containing the post-payload position.
+        // Freeze whole lines covering the reply.
         let claude_start_char = pre_len + pad.chars().count();
         let claude_end_char = claude_start_char + trimmed.chars().count() + trailing_pad.len();
         let start_line = char_to_line_col(editor.document(), claude_start_char).0;
         let end_line = char_to_line_col(editor.document(), claude_end_char).0;
         editor.add_frozen_lines(start_line, end_line);
 
-        if cursor_was_at_eof {
-            let post_len_chars = editor.document().rope().len_chars();
-            let (cl, cc) = char_to_line_col(editor.document(), post_len_chars);
+        // Re-attach the draft below the freshly-frozen reply and re-pin the
+        // cursor onto the same character of the draft it was on before.
+        let draft_reattach_at = editor.document().rope().len_chars();
+        if !draft_text.is_empty() {
+            editor.programmatic_insert(draft_reattach_at, &draft_text);
+        }
+
+        if cursor_was_in_draft {
+            let new_cursor_char = if draft_text.is_empty() {
+                editor.document().rope().len_chars()
+            } else {
+                draft_reattach_at + cursor_in_draft
+            };
+            let (cl, cc) = char_to_line_col(editor.document(), new_cursor_char);
             editor.cursor_mut().line = cl;
             editor.cursor_mut().col = cc;
         }
-        // Otherwise: leave cursor alone. programmatic_insert appended past
-        // the cursor's line, so its (line, col) stays valid.
+        // else: cursor was inside locked content (e.g. user navigated up to
+        // inline-edit a prior turn). Leave it where it is — programmatic
+        // splice happened below the cursor's line.
         editor.clear_selection();
         buf.view_cache_dirty = true;
     }
@@ -3140,5 +3182,106 @@ mod tests {
             app.buffers[app.active_buffer].rendered_cursor_row, pre_row,
             "rendered_cursor_row must stay put in Raw mode"
         );
+    }
+
+    /// Build an App with a *claude* buffer that already contains:
+    ///   prior locked turn -> "\n\n---\n\n" -> caret position (lockable_through here)
+    /// then drops a user draft into the editable region. Returns (app, buf_idx,
+    /// draft_start_char). After this the layout looks like:
+    ///   "old turn\n\n---\n\n[draft]"
+    /// with everything up through the HR locked.
+    fn claude_app_with_draft(draft: &str) -> (App, usize, usize) {
+        let cfg = Config::default();
+        let mut app = App::new("untitled.md".into(), String::new(), &cfg);
+        let buf_idx = app.or_create_claude_buffer();
+        app.active_buffer = buf_idx;
+
+        // Seed prior turn + HR + lock through it.
+        let pre = "old turn\n\n---\n\n";
+        {
+            let editor = &mut app.buffers[buf_idx].editor;
+            editor.programmatic_insert(0, pre);
+            let eof = editor.document().rope().len_chars();
+            let (cl, _) = char_to_line_col(editor.document(), eof);
+            editor.set_lockable_through_line(cl);
+            editor.cursor_mut().line = cl;
+            editor.cursor_mut().col = 0;
+        }
+        // Now type a draft.
+        let draft_start = {
+            let editor = &mut app.buffers[buf_idx].editor;
+            let s = editor.document().rope().len_chars();
+            editor.programmatic_insert(s, draft);
+            s
+        };
+        // Cursor at end of draft (most realistic mid-typing position).
+        {
+            let editor = &mut app.buffers[buf_idx].editor;
+            let eof = editor.document().rope().len_chars();
+            let (cl, cc) = char_to_line_col(editor.document(), eof);
+            editor.cursor_mut().line = cl;
+            editor.cursor_mut().col = cc;
+        }
+        (app, buf_idx, draft_start)
+    }
+
+    /// Regression: a Claude reply landing while the user has a draft typed
+    /// must splice ABOVE the draft — not append at EOF below it. This is the
+    /// "interleaving" behavior promised by the doc-comment on
+    /// `append_to_claude_buffer`.
+    #[test]
+    fn claude_reply_splices_above_pending_draft() {
+        let (mut app, buf_idx, _) = claude_app_with_draft("my draft text");
+        app.append_to_claude_buffer("REPLY LINE 1\nREPLY LINE 2");
+
+        let text = app.buffers[buf_idx].editor.document().full_text();
+        let reply_pos = text.find("REPLY LINE 1").expect("reply must be present");
+        let draft_pos = text.find("my draft text").expect("draft must be preserved");
+        assert!(
+            reply_pos < draft_pos,
+            "reply must land ABOVE the draft\n--- buffer ---\n{text}\n--------------"
+        );
+    }
+
+    /// Regression: after splicing a reply above the draft, the cursor must
+    /// stay at the same character offset within the draft — so the user's
+    /// in-progress sentence "follows" the text down rather than getting
+    /// stranded inside the new frozen reply.
+    #[test]
+    fn claude_reply_keeps_cursor_on_same_draft_character() {
+        let (mut app, buf_idx, _) = claude_app_with_draft("my draft text");
+
+        // Cursor was placed at end of draft; capture the character it sits on
+        // (well, the one just before — end-of-text).
+        let before_text = app.buffers[buf_idx].editor.document().full_text();
+        let before_cursor_char = {
+            let e = &app.buffers[buf_idx].editor;
+            e.document().line_col_to_char(e.cursor().line, e.cursor().col)
+        };
+        assert_eq!(&before_text[before_cursor_char.saturating_sub(4)..before_cursor_char], "text");
+
+        app.append_to_claude_buffer("REPLY");
+
+        let after_text = app.buffers[buf_idx].editor.document().full_text();
+        let after_cursor_char = {
+            let e = &app.buffers[buf_idx].editor;
+            e.document().line_col_to_char(e.cursor().line, e.cursor().col)
+        };
+        assert_eq!(
+            &after_text[after_cursor_char.saturating_sub(4)..after_cursor_char],
+            "text",
+            "cursor must still be sitting just past 'text' in the draft\n--- buffer ---\n{after_text}\n--------------"
+        );
+    }
+
+    /// Pre-existing behavior must still work: when there's no draft, the
+    /// reply just lands at EOF and the cursor follows.
+    #[test]
+    fn claude_reply_with_no_draft_lands_at_eof() {
+        let (mut app, buf_idx, _) = claude_app_with_draft("");
+        app.append_to_claude_buffer("REPLY");
+        let text = app.buffers[buf_idx].editor.document().full_text();
+        assert!(text.contains("REPLY"));
+        assert!(!text.contains("my draft"));
     }
 }

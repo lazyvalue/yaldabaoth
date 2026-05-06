@@ -1,4 +1,4 @@
-use ratatui::style::Style;
+use crate::style::Style;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnAlignment {

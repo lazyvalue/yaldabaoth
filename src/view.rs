@@ -1,11 +1,11 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::blocks::*;
 use crate::menu::MenuNodeKind;
+use crate::style::{Color, Modifier, Style};
 use crate::theme::Theme;
 use crate::viewport::Viewport;
 
@@ -107,7 +107,30 @@ pub struct ViewState<'a> {
     pub lockable_through_char: usize,
 }
 
-pub fn draw(frame: &mut Frame, state: &ViewState) {
+/// Ground-truth feedback from the renderer back to App, populated during
+/// `draw` so callers (and the debug overlay) can detect when scroll math
+/// disagrees with what was actually painted.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DrawReport {
+    /// Height of the content_area chunk the renderer used (the real number
+    /// of doc rows it can paint).
+    pub content_area_height: u16,
+    /// Y coordinate (in screen rows) where the cursor was painted, or None
+    /// if the cursor wasn't on-screen this frame.
+    pub cursor_screen_y: Option<u16>,
+    /// First and last doc-line indices that had any visual row painted.
+    pub first_visible_doc_line: Option<usize>,
+    pub last_visible_doc_line: Option<usize>,
+    /// Number of visual rows the renderer actually painted (excludes the
+    /// rows it skipped past scroll_offset and the rows below viewport).
+    pub painted_rows: usize,
+    /// True if the splash screen was shown instead of buffer content. The
+    /// cursor is intentionally not drawn in this case — debug logging should
+    /// ignore "off-screen" status here.
+    pub is_splash: bool,
+}
+
+pub fn draw(frame: &mut Frame, state: &ViewState, report: &mut DrawReport) {
     let area = frame.area();
 
     if area.width < 40 || area.height < 5 {
@@ -194,7 +217,8 @@ pub fn draw(frame: &mut Frame, state: &ViewState) {
         draw_outline(frame, outline_area, state);
     }
 
-    draw_content(frame, content_area, state);
+    report.content_area_height = content_area.height;
+    draw_content(frame, content_area, state, report);
     if state.menu_active {
         draw_menu_popup(frame, content_area, state);
     }
@@ -662,10 +686,28 @@ fn draw_outline(frame: &mut Frame, area: Rect, state: &ViewState) {
     }
 }
 
-fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState) {
+fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState, report: &mut DrawReport) {
+    if is_buffer_empty(state) {
+        draw_splash(frame, area, state.theme);
+        report.is_splash = true;
+        return;
+    }
     match state.view_mode {
         ViewMode::Rendered => draw_content_rendered(frame, area, state),
-        ViewMode::Raw => draw_content_raw(frame, area, state),
+        ViewMode::Raw => draw_content_raw(frame, area, state, report),
+    }
+}
+
+/// Empty buffer = no rendered blocks AND no non-empty raw lines. Holds
+/// regardless of which view mode the buffer is currently in (raw_lines is
+/// only populated in Raw mode, rendered_blocks only in Rendered mode).
+fn is_buffer_empty(state: &ViewState) -> bool {
+    let rendered_empty = state.rendered_blocks.is_empty();
+    let raw_empty = state.raw_lines.is_empty()
+        || (state.raw_lines.len() == 1 && state.raw_lines[0].is_empty());
+    match state.view_mode {
+        ViewMode::Rendered => rendered_empty,
+        ViewMode::Raw => raw_empty,
     }
 }
 
@@ -941,19 +983,15 @@ fn draw_splash(frame: &mut Frame, area: Rect, theme: &Theme) {
     let _ = logo_w; // reserved for future centering refinements
 }
 
-fn draw_content_raw(frame: &mut Frame, area: Rect, state: &ViewState) {
+fn draw_content_raw(
+    frame: &mut Frame,
+    area: Rect,
+    state: &ViewState,
+    report: &mut DrawReport,
+) {
     let terminal_width = area.width as usize;
     let viewport_height = area.height as usize;
     let view_start = state.viewport.scroll_offset;
-
-    // Splash screen: a fresh, empty, never-typed-into buffer (one empty line)
-    // shows the logo + version. Disappears the moment the user types.
-    if state.raw_lines.len() <= 1
-        && state.raw_lines.first().map(|s| s.is_empty()).unwrap_or(true)
-    {
-        draw_splash(frame, area, state.theme);
-        return;
-    }
 
     let total_lines = state.raw_lines.len();
     let line_num_digits = if total_lines == 0 { 1 } else { total_lines.ilog10() as usize + 1 };
@@ -1017,7 +1055,7 @@ fn draw_content_raw(frame: &mut Frame, area: Rect, state: &ViewState) {
             empty_segments = line
                 .spans
                 .iter()
-                .map(|s| (s.content.to_string(), s.style))
+                .map(|s| (s.content.to_string(), s.style.into()))
                 .collect();
             &empty_segments
         } else if let Some(segs) = state.raw_highlights.get(doc_line) {
@@ -1176,8 +1214,17 @@ fn draw_content_raw(frame: &mut Frame, area: Rect, state: &ViewState) {
                         Paragraph::new(Span::styled(cursor_char.to_string(), cursor_style)),
                         Rect::new(cursor_x, y, 1, 1),
                     );
+                    // Ground truth: this is where the cursor actually was painted.
+                    report.cursor_screen_y = Some(y);
                 }
             }
+
+            // Track first/last visible doc lines for the debug overlay.
+            if report.first_visible_doc_line.is_none() {
+                report.first_visible_doc_line = Some(doc_line);
+            }
+            report.last_visible_doc_line = Some(doc_line);
+            report.painted_rows += 1;
 
             screen_y += 1;
         }
@@ -1307,6 +1354,83 @@ struct WrappedLine {
     row_char_starts: Vec<usize>,
 }
 
+/// Count how many visual rows `text` will occupy when wrapped at `width`
+/// using the SAME word-boundary rule as `wrap_styled_segments`. This MUST
+/// stay byte-for-byte equivalent to the renderer's wrap, otherwise scroll
+/// math (which calls this) and the renderer disagree on cumulative row
+/// counts and the cursor ends up off-screen near the bottom of the viewport.
+pub fn wrap_row_count(text: &str, width: usize) -> usize {
+    if text.is_empty() {
+        return 1;
+    }
+    if width == 0 {
+        return 1;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    let mut rows = 0usize;
+    let mut pos = 0usize;
+    while pos < total {
+        let hard_end = (pos + width).min(total);
+        let break_at = if hard_end < total {
+            (pos..hard_end)
+                .rev()
+                .find(|&i| chars[i] == ' ')
+                .map(|i| i + 1)
+                .unwrap_or(hard_end)
+        } else {
+            hard_end
+        };
+        let end = break_at.max(pos + 1);
+        rows += 1;
+        pos = end;
+    }
+    rows.max(1)
+}
+
+/// Like `wrap_row_count` but ALSO returns the visual row offset within the
+/// wrapped line at character column `target_col`. Used by scroll math to
+/// place the cursor on the right visual row when the line wraps.
+pub fn wrap_row_count_with_cursor(
+    text: &str,
+    width: usize,
+    target_col: usize,
+) -> (usize, usize) {
+    if text.is_empty() || width == 0 {
+        return (1, 0);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    let mut rows = 0usize;
+    let mut cursor_row = 0usize;
+    let mut found = false;
+    let mut pos = 0usize;
+    while pos < total {
+        let hard_end = (pos + width).min(total);
+        let break_at = if hard_end < total {
+            (pos..hard_end)
+                .rev()
+                .find(|&i| chars[i] == ' ')
+                .map(|i| i + 1)
+                .unwrap_or(hard_end)
+        } else {
+            hard_end
+        };
+        let end = break_at.max(pos + 1);
+        if !found && target_col >= pos && target_col < end {
+            cursor_row = rows;
+            found = true;
+        }
+        rows += 1;
+        pos = end;
+    }
+    if !found {
+        // target_col is at or past end-of-text — stick to the last row.
+        cursor_row = rows.saturating_sub(1);
+    }
+    (rows.max(1), cursor_row)
+}
+
 fn wrap_styled_segments(segments: &[(String, Style)], width: usize) -> WrappedLine {
     let mut flat: Vec<(char, Style)> = Vec::new();
     for (text, style) in segments {
@@ -1427,23 +1551,48 @@ fn build_highlighted_line<'a>(
         return Line::from(Span::styled(raw_line.to_string(), base_style));
     }
 
-    let mut spans = Vec::new();
-    let mut pos = 0;
-    for (col, is_current) in &match_cols {
-        if *col > pos {
-            spans.push(Span::styled(raw_line[pos..*col].to_string(), base_style));
+    // `col` and `query_len` are CHARACTER indices; `raw_line[..]` slicing is
+    // byte-indexed. Convert via char_indices to a safe byte boundary and
+    // clamp to the line's char count — search matches can be stale relative
+    // to the line's current content (e.g. after edits) so we never index out
+    // of bounds.
+    let line_char_count = raw_line.chars().count();
+    let char_to_byte = |c: usize| -> usize {
+        if c >= line_char_count {
+            return raw_line.len();
         }
-        let end = (*col + query_len).min(raw_line.len());
-        let match_style = if *is_current {
-            state.theme.search_match_current
-        } else {
-            state.theme.search_match
-        };
-        spans.push(Span::styled(raw_line[*col..end].to_string(), match_style));
-        pos = end;
+        raw_line
+            .char_indices()
+            .nth(c)
+            .map(|(b, _)| b)
+            .unwrap_or(raw_line.len())
+    };
+
+    let mut spans = Vec::new();
+    let mut pos_b = 0usize;
+    for (col, is_current) in &match_cols {
+        let col_clamped = (*col).min(line_char_count);
+        let end_clamped = (col_clamped + query_len).min(line_char_count);
+        let col_b = char_to_byte(col_clamped);
+        let end_b = char_to_byte(end_clamped);
+        if col_b > pos_b {
+            spans.push(Span::styled(raw_line[pos_b..col_b].to_string(), base_style));
+        }
+        if end_b > col_b {
+            let match_style = if *is_current {
+                state.theme.search_match_current
+            } else {
+                state.theme.search_match
+            };
+            spans.push(Span::styled(
+                raw_line[col_b..end_b].to_string(),
+                match_style,
+            ));
+        }
+        pos_b = end_b;
     }
-    if pos < raw_line.len() {
-        spans.push(Span::styled(raw_line[pos..].to_string(), base_style));
+    if pos_b < raw_line.len() {
+        spans.push(Span::styled(raw_line[pos_b..].to_string(), base_style));
     }
 
     Line::from(spans)

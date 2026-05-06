@@ -1,5 +1,6 @@
 ---
 source: tests/snapshot_test.rs
+assertion_line: 23
 expression: blocks
 ---
 [
@@ -12,37 +13,163 @@ expression: blocks
                 spans: [
                     StyledSpan {
                         text: "fn",
-                        style: Style::new().fg(Color::Rgb(180, 142, 173)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    180,
+                                    142,
+                                    173,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: " ",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: "main",
-                        style: Style::new().fg(Color::Rgb(143, 161, 179)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    143,
+                                    161,
+                                    179,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: "(",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: ")",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: " ",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: "{",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                 ],
@@ -51,42 +178,186 @@ expression: blocks
                 spans: [
                     StyledSpan {
                         text: "    ",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: "println!",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: "(",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: "\"",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: "hello",
-                        style: Style::new().fg(Color::Rgb(163, 190, 140)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    163,
+                                    190,
+                                    140,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: "\"",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: ")",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                     StyledSpan {
                         text: ";",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                 ],
@@ -95,7 +366,25 @@ expression: blocks
                 spans: [
                     StyledSpan {
                         text: "}",
-                        style: Style::new().fg(Color::Rgb(192, 197, 206)).bg(Color::Rgb(40, 42, 54)),
+                        style: Style {
+                            fg: Some(
+                                Rgb(
+                                    192,
+                                    197,
+                                    206,
+                                ),
+                            ),
+                            bg: Some(
+                                Rgb(
+                                    40,
+                                    42,
+                                    54,
+                                ),
+                            ),
+                            modifier: Modifier(
+                                0,
+                            ),
+                        },
                         link: None,
                     },
                 ],
