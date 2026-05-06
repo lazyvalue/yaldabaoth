@@ -34,9 +34,9 @@ use std::process;
 use gpui::{
     actions, div, point, prelude::*, px, rgb, rgba, size, AnyElement, App, AppContext,
     Application, Bounds, Context, FocusHandle, Focusable, Font, FontFeatures, FontStyle,
-    FontWeight, Hsla, IntoElement, KeyBinding, ParentElement, Render, SharedString,
-    StrikethroughStyle, Styled, StyledText, TextRun, UnderlineStyle, Window, WindowBounds,
-    WindowOptions,
+    FontWeight, Hsla, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
+    ScrollHandle, SharedString, StrikethroughStyle, Styled, StyledText, TextRun,
+    UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 
 use sketch::blocks::{ColumnAlignment, ListItem, RenderedBlock, StyledLine};
@@ -556,8 +556,13 @@ struct DocState {
     blocks: Vec<RenderedBlock>,
     file_label: SharedString,
     cursor_block: usize,
-    /// Number of blocks scrolled past the top of the viewport.
-    scroll_block: usize,
+    /// Native scroll handle for the body. Renders all blocks into one
+    /// overflow-y-scroll container — j/k/ctrl-d/u/g/G drive
+    /// `scroll_handle.scroll_to_item(idx)` instead of slicing the block
+    /// list, which lets users actually reach the bottom of long files
+    /// (the prior block-skip approach couldn't reveal content below the
+    /// last block when that block alone overflowed the viewport).
+    scroll_handle: ScrollHandle,
 }
 
 /// State held while the user is browsing the filesystem. `underlying` keeps
@@ -594,7 +599,7 @@ impl SketchGpuiView {
                 blocks,
                 file_label: file_label.into(),
                 cursor_block: 0,
-                scroll_block: 0,
+                scroll_handle: ScrollHandle::new(),
             }),
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
@@ -652,7 +657,7 @@ impl SketchGpuiView {
             blocks,
             file_label: canon.into(),
             cursor_block: 0,
-            scroll_block: 0,
+            scroll_handle: ScrollHandle::new(),
         });
         true
     }
@@ -661,29 +666,33 @@ impl SketchGpuiView {
 
     fn scroll_down(&mut self, _: &ScrollDown, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(d) = self.doc_mut() {
-            if d.scroll_block + 1 < d.blocks.len() {
-                d.scroll_block += 1;
+            if d.cursor_block + 1 < d.blocks.len() {
+                d.cursor_block += 1;
+                d.scroll_handle.scroll_to_item(d.cursor_block);
                 cx.notify();
             }
         }
     }
     fn scroll_up(&mut self, _: &ScrollUp, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(d) = self.doc_mut() {
-            if d.scroll_block > 0 {
-                d.scroll_block -= 1;
+            if d.cursor_block > 0 {
+                d.cursor_block -= 1;
+                d.scroll_handle.scroll_to_item(d.cursor_block);
                 cx.notify();
             }
         }
     }
     fn page_down(&mut self, _: &ScrollPageDown, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(d) = self.doc_mut() {
-            d.scroll_block = (d.scroll_block + 5).min(d.blocks.len().saturating_sub(1));
+            d.cursor_block = (d.cursor_block + 8).min(d.blocks.len().saturating_sub(1));
+            d.scroll_handle.scroll_to_top_of_item(d.cursor_block);
             cx.notify();
         }
     }
     fn page_up(&mut self, _: &ScrollPageUp, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(d) = self.doc_mut() {
-            d.scroll_block = d.scroll_block.saturating_sub(5);
+            d.cursor_block = d.cursor_block.saturating_sub(8);
+            d.scroll_handle.scroll_to_top_of_item(d.cursor_block);
             cx.notify();
         }
     }
@@ -691,9 +700,7 @@ impl SketchGpuiView {
         if let Some(d) = self.doc_mut() {
             if d.cursor_block + 1 < d.blocks.len() {
                 d.cursor_block += 1;
-                if d.cursor_block > d.scroll_block + 6 {
-                    d.scroll_block = d.cursor_block.saturating_sub(6);
-                }
+                d.scroll_handle.scroll_to_item(d.cursor_block);
                 cx.notify();
             }
         }
@@ -702,9 +709,7 @@ impl SketchGpuiView {
         if let Some(d) = self.doc_mut() {
             if d.cursor_block > 0 {
                 d.cursor_block -= 1;
-                if d.cursor_block < d.scroll_block {
-                    d.scroll_block = d.cursor_block;
-                }
+                d.scroll_handle.scroll_to_item(d.cursor_block);
                 cx.notify();
             }
         }
@@ -712,7 +717,7 @@ impl SketchGpuiView {
     fn cursor_top(&mut self, _: &CursorTop, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(d) = self.doc_mut() {
             d.cursor_block = 0;
-            d.scroll_block = 0;
+            d.scroll_handle.scroll_to_top_of_item(0);
             cx.notify();
         }
     }
@@ -720,7 +725,7 @@ impl SketchGpuiView {
         if let Some(d) = self.doc_mut() {
             if !d.blocks.is_empty() {
                 d.cursor_block = d.blocks.len() - 1;
-                d.scroll_block = d.cursor_block.saturating_sub(3);
+                d.scroll_handle.scroll_to_item(d.cursor_block);
                 cx.notify();
             }
         }
@@ -861,18 +866,23 @@ impl SketchGpuiView {
             cursor_block: Some(d.cursor_block),
         };
 
+        // Render every block. The body div is overflow-y-scroll and tracks
+        // a ScrollHandle, so trackpad/mouse scrolling works natively and
+        // j/k/g/G drive `scroll_to_item(cursor_block)` programmatically.
         let mut body = div()
+            .id("doc-body")
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
             .px_8()
             .py_4()
-            .overflow_hidden()
+            .overflow_y_scroll()
+            .track_scroll(&d.scroll_handle)
             .text_size(px(14.0))
             .font_family(self.body_font.clone())
             .text_color(rgb(DEFAULT_FG));
-        for (i, b) in d.blocks.iter().enumerate().skip(d.scroll_block) {
+        for (i, b) in d.blocks.iter().enumerate() {
             body = body.child(block_element(&ctx, i, b));
         }
 
