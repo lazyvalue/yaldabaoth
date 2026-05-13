@@ -136,6 +136,10 @@ actions!(
         FocusDown,
         FocusNext,
         FocusPrev,
+        // Resize the focused pane vs. its sibling
+        ResizeShrink,
+        ResizeGrow,
+        Equalize,
         // Browser view
         BrowserDown,
         BrowserUp,
@@ -3141,6 +3145,29 @@ impl SketchGpuiView {
         cx.notify();
     }
 
+    /// `Ctrl-W <` / `Ctrl-W -` — shrink the focused pane by 5% (gives the
+    /// space to its next sibling within the parent split).
+    fn resize_shrink(&mut self, _: &ResizeShrink, _w: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.resize_focused(-0.05);
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    /// `Ctrl-W >` / `Ctrl-W +` — grow the focused pane by 5%.
+    fn resize_grow(&mut self, _: &ResizeGrow, _w: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.resize_focused(0.05);
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    /// `Ctrl-W =` — even out all sibling weights in the focused pane's
+    /// parent split.
+    fn equalize(&mut self, _: &Equalize, _w: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.equalize_focused();
+        self.save_workspace_state();
+        cx.notify();
+    }
+
     // ---- Browser actions ----------------------------------------------------
 
     fn browser_down(&mut self, _: &BrowserDown, _w: &mut Window, cx: &mut Context<Self>) {
@@ -5276,6 +5303,9 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::focus_down))
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::resize_shrink))
+            .on_action(cx.listener(Self::resize_grow))
+            .on_action(cx.listener(Self::equalize))
             .child(header)
             .child(body)
             .child(footer)
@@ -6813,6 +6843,12 @@ fn main() {
             KeyBinding::new("ctrl-w j", FocusDown, None),
             KeyBinding::new("ctrl-w w", FocusNext, None),
             KeyBinding::new("ctrl-w shift-w", FocusPrev, None),
+            // Resize the focused pane vs. its next sibling.
+            KeyBinding::new("ctrl-w <", ResizeShrink, None),
+            KeyBinding::new("ctrl-w -", ResizeShrink, None),
+            KeyBinding::new("ctrl-w >", ResizeGrow, None),
+            KeyBinding::new("ctrl-w +", ResizeGrow, None),
+            KeyBinding::new("ctrl-w =", Equalize, None),
         ]);
 
         // Browser-view bindings.
