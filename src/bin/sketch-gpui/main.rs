@@ -124,6 +124,11 @@ actions!(
         PrevTab,
         NewTab,
         CloseTab,
+        // Splits (Ctrl-W chord prefix per spec-tabs-and-splits.md §12)
+        SplitH,
+        SplitV,
+        CloseWindow,
+        OnlyWindow,
         // Browser view
         BrowserDown,
         BrowserUp,
@@ -2756,6 +2761,55 @@ impl SketchGpuiView {
         cx.notify();
     }
 
+    /// `Ctrl-W s` — horizontal split: new pane below the focused one.
+    fn split_h(&mut self, _: &SplitH, _w: &mut Window, cx: &mut Context<Self>) {
+        self.split_focused_with_browser(workspace::SplitDir::H);
+        cx.notify();
+    }
+
+    /// `Ctrl-W v` — vertical split: new pane to the right of the focused one.
+    fn split_v(&mut self, _: &SplitV, _w: &mut Window, cx: &mut Context<Self>) {
+        self.split_focused_with_browser(workspace::SplitDir::V);
+        cx.notify();
+    }
+
+    /// Shared helper. For now both split commands open a Browser in the new
+    /// pane so the user can pick what to load. Cloning the focused content
+    /// kind (Doc → Doc, Edit → Edit) is a follow-up that needs the buffer
+    /// pool to share editors.
+    fn split_focused_with_browser(&mut self, dir: workspace::SplitDir) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let content = WindowContent::Browser(BrowserWindow {
+            fb: FileBrowser::new(cwd),
+        });
+        let _ = self.workspace.split_focused(dir, content);
+    }
+
+    /// `Ctrl-W c` — close the focused window. If it was the only window in
+    /// the tab, close the tab instead.
+    fn close_window(&mut self, _: &CloseWindow, _w: &mut Window, cx: &mut Context<Self>) {
+        match self.workspace.close_focused() {
+            Ok(Some(_new_focus)) => cx.notify(),
+            Ok(None) => {
+                // Tab is empty — close the tab too (or quit if last).
+                if self.workspace.tabs.len() <= 1 {
+                    cx.quit();
+                    return;
+                }
+                let idx = self.workspace.active_tab;
+                self.workspace.close_tab(idx);
+                cx.notify();
+            }
+            Err(()) => {}
+        }
+    }
+
+    /// `Ctrl-W o` — keep only the focused window.
+    fn only_window(&mut self, _: &OnlyWindow, _w: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.only();
+        cx.notify();
+    }
+
     // ---- Browser actions ----------------------------------------------------
 
     fn browser_down(&mut self, _: &BrowserDown, _w: &mut Window, cx: &mut Context<Self>) {
@@ -4881,6 +4935,10 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::split_h))
+            .on_action(cx.listener(Self::split_v))
+            .on_action(cx.listener(Self::close_window))
+            .on_action(cx.listener(Self::only_window))
             .child(header)
             .child(body)
             .child(footer)
@@ -6376,7 +6434,9 @@ fn main() {
             KeyBinding::new("shift-g", CursorBottom, Some("SketchView")),
             KeyBinding::new("ctrl-o", OpenBrowser, Some("SketchView")),
             KeyBinding::new("ctrl-e", EnterEdit, Some("SketchView")),
-            KeyBinding::new("ctrl-w", EnterWp, Some("SketchView")),
+            // Ctrl-W is the split chord prefix (see global bindings below).
+            // Word-processor entry rebinds to Ctrl-Shift-E.
+            KeyBinding::new("ctrl-shift-e", EnterWp, Some("SketchView")),
             KeyBinding::new("ctrl-k", OpenClaude, Some("SketchView")),
             KeyBinding::new("space", OpenMenu, Some("SketchView")),
             KeyBinding::new("q", Quit, Some("SketchView")),
@@ -6402,6 +6462,13 @@ fn main() {
             KeyBinding::new("ctrl-shift-tab", PrevTab, None),
             KeyBinding::new("cmd-t", NewTab, None),
             KeyBinding::new("cmd-shift-w", CloseTab, None),
+            // Vim-style split chord prefix (spec-tabs-and-splits.md §12–§14).
+            // GPUI parses "ctrl-w s" as a two-keystroke chord; pressing
+            // Ctrl-W alone never resolves (it's a pure prefix here).
+            KeyBinding::new("ctrl-w s", SplitH, None),
+            KeyBinding::new("ctrl-w v", SplitV, None),
+            KeyBinding::new("ctrl-w c", CloseWindow, None),
+            KeyBinding::new("ctrl-w o", OnlyWindow, None),
         ]);
 
         // Browser-view bindings.
