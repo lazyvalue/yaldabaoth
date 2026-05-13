@@ -3516,6 +3516,112 @@ impl SketchGpuiView {
     /// and a footer hint. Has *no* key handlers — the wrapper in
     /// `Render::render` handles input via `capture_key_down` so the
     /// underlying screen never sees keystrokes while the menu is open.
+    /// Render the active tab's layout tree. Leaves dispatch to per-kind
+    /// render methods; splits become flex containers (row for V splits,
+    /// col for H splits) with weighted children.
+    fn render_focused_window(
+        &mut self,
+        root: gpui::Div,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tab_idx = self.workspace.active_tab;
+        let focused_id = self.workspace.tabs[tab_idx].focused;
+        let layout_ptr: *mut workspace::Layout<WindowContent> =
+            &mut self.workspace.tabs[tab_idx].layout as *mut _;
+        // SAFETY: `layout_ptr` is valid for as long as the active tab's
+        // `layout` field isn't structurally mutated (no splits/closes/etc.).
+        // The render pipeline only reads self's other fields (theme/fonts)
+        // and the layout subtree via this pointer; structural mutations
+        // happen in action handlers, never inside render. This sidesteps a
+        // Rust borrowck limitation where the compiler can't prove that
+        // &mut Layout<WindowContent> (a field inside self.workspace.tabs)
+        // is disjoint from &self.render_X's other field accesses.
+        let layout = unsafe { &mut *layout_ptr };
+        self.render_layout(root, layout, focused_id, cx)
+    }
+
+    /// Recursively render a `Layout<WindowContent>`. The `root` div is used
+    /// only for the leaf case (so leaves can attach focus + key bindings);
+    /// split branches build their own container.
+    fn render_layout(
+        &mut self,
+        root: gpui::Div,
+        layout: &mut workspace::Layout<WindowContent>,
+        focused_id: workspace::WindowId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match layout {
+            workspace::Layout::Empty => div().size_full().into_any_element(),
+            workspace::Layout::Leaf(window) => {
+                let is_focused = window.id == focused_id;
+                let content_ptr: *mut WindowContent =
+                    &mut window.content as *mut _;
+                // SAFETY: same as in render_focused_window — the leaf's
+                // content sits inside a layout tree we won't structurally
+                // mutate during this render call.
+                let content = unsafe { &mut *content_ptr };
+                let painted: AnyElement = match content {
+                    WindowContent::Doc(d) => self.render_doc(root, d, cx).into_any_element(),
+                    WindowContent::Edit(e) => self.render_edit(root, e, cx).into_any_element(),
+                    WindowContent::Browser(b) => self.render_browser(root, b, cx).into_any_element(),
+                    WindowContent::Claude(ring) => {
+                        self.render_claude(root, ring, cx).into_any_element()
+                    }
+                };
+                // Add a thin focus indicator around the focused leaf when
+                // there's more than one leaf in the tab. (A border on a
+                // single-leaf tab is just visual noise — the whole window
+                // *is* the focus.)
+                if is_focused && self.active_tab_leaf_count() > 1 {
+                    let accent: Hsla = rgb(STATUS_FG).into();
+                    div()
+                        .size_full()
+                        .border_1()
+                        .border_color(accent)
+                        .child(painted)
+                        .into_any_element()
+                } else {
+                    painted
+                }
+            }
+            workspace::Layout::Split { dir, children } => {
+                let mut container = div().size_full().flex().min_w_0().min_h_0();
+                container = match dir {
+                    workspace::SplitDir::V => container.flex_row(),
+                    workspace::SplitDir::H => container.flex_col(),
+                };
+                for (weight, child) in children.iter_mut() {
+                    let w = *weight;
+                    let child_root = div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .bg(rgb(BG))
+                        .text_color(rgb(DEFAULT_FG));
+                    let child_el = self.render_layout(child_root, child, focused_id, cx);
+                    let mut slot = div().min_w_0().min_h_0();
+                    {
+                        let style = slot.style();
+                        style.flex_grow = Some(w);
+                        style.flex_shrink = Some(1.0);
+                        style.flex_basis = Some(gpui::relative(0.0).into());
+                    }
+                    slot = slot.child(child_el);
+                    container = container.child(slot);
+                }
+                container.into_any_element()
+            }
+        }
+    }
+
+    /// How many leaves does the active tab's layout contain?
+    fn active_tab_leaf_count(&self) -> usize {
+        self.workspace
+            .active_tab()
+            .map(|t| t.layout.leaf_count())
+            .unwrap_or(0)
+    }
+
     /// If the workspace has more than one tab, stack a thin horizontal tab
     /// strip above the screen view. Single-tab workspaces render the screen
     /// alone (no strip).
@@ -4642,12 +4748,7 @@ impl Render for SketchGpuiView {
             }
         };
 
-        let screen_view: AnyElement = match self.workspace.focused_content().expect("no focused window") {
-            WindowContent::Doc(_) => self.render_doc(screen_root, cx).into_any_element(),
-            WindowContent::Edit(_) => self.render_edit(screen_root, cx).into_any_element(),
-            WindowContent::Claude(_) => self.render_claude(screen_root, cx).into_any_element(),
-            WindowContent::Browser(_) => self.render_browser(screen_root, cx).into_any_element(),
-        };
+        let screen_view: AnyElement = self.render_focused_window(screen_root, cx);
 
         // When there's more than one tab, stack the tab strip above the
         // screen view. Single-tab workspaces render no strip — matches the
@@ -4694,13 +4795,9 @@ impl SketchGpuiView {
     fn render_doc(
         &self,
         root: gpui::Div,
+        d: &DocState,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let d = match self.workspace.focused_content().expect("no focused window") {
-            WindowContent::Doc(d) => d,
-            _ => unreachable!(),
-        };
-
         let ctx = RenderCtx {
             theme: &self.theme,
             body_font: self.body_font.clone(),
@@ -4792,13 +4889,9 @@ impl SketchGpuiView {
     fn render_edit(
         &self,
         root: gpui::Div,
+        e: &EditState,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let e = match self.workspace.focused_content().expect("no focused window") {
-            WindowContent::Edit(e) => e,
-            _ => unreachable!(),
-        };
-
         let cursor = e.editor.cursor();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
@@ -5138,14 +5231,11 @@ impl SketchGpuiView {
     /// Header shows attach status; footer shows mode + send hint + send
     /// state ("…" while a reply is in flight).
     fn render_claude(
-        &mut self,
+        &self,
         root: gpui::Div,
+        ring: &mut SessionRing,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let ring = match self.workspace.focused_content_mut().expect("no focused window") {
-            WindowContent::Claude(ring) => ring,
-            _ => unreachable!(),
-        };
         let session_count = ring.len();
         let active_session_idx = ring.active;
 
@@ -5933,13 +6023,9 @@ impl SketchGpuiView {
     fn render_browser(
         &self,
         root: gpui::Div,
+        b: &BrowserWindow,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let b = match self.workspace.focused_content().expect("no focused window") {
-            WindowContent::Browser(b) => b,
-            _ => unreachable!(),
-        };
-
         let entries: Vec<&BrowserEntry> = b.fb.visible_entries();
         let selected = b.fb.selected();
         let dir_str = b.fb.current_dir().display().to_string();
