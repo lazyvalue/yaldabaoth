@@ -40,5 +40,5 @@ path = "src/bin/sketch-channel.rs"
 
 [[bin]]
 name = "sketch-gpui"
-path = "src/bin/sketch-gpui.rs"
+path = "src/bin/sketch-gpui/main.rs"
 required-features = []
