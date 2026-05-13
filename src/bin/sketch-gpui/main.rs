@@ -119,6 +119,9 @@ actions!(
         // Buffer cycling
         NextBuffer,
         PrevBuffer,
+        // Tab cycling (workspace-level — independent of buffer list)
+        NextTab,
+        PrevTab,
         // Browser view
         BrowserDown,
         BrowserUp,
@@ -2713,6 +2716,20 @@ impl SketchGpuiView {
         }
     }
 
+    fn next_tab(&mut self, _: &NextTab, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.tabs.len() > 1 {
+            self.workspace.next_tab();
+            cx.notify();
+        }
+    }
+
+    fn prev_tab(&mut self, _: &PrevTab, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.tabs.len() > 1 {
+            self.workspace.prev_tab();
+            cx.notify();
+        }
+    }
+
     // ---- Browser actions ----------------------------------------------------
 
     fn browser_down(&mut self, _: &BrowserDown, _w: &mut Window, cx: &mut Context<Self>) {
@@ -3473,6 +3490,60 @@ impl SketchGpuiView {
     /// and a footer hint. Has *no* key handlers — the wrapper in
     /// `Render::render` handles input via `capture_key_down` so the
     /// underlying screen never sees keystrokes while the menu is open.
+    /// If the workspace has more than one tab, stack a thin horizontal tab
+    /// strip above the screen view. Single-tab workspaces render the screen
+    /// alone (no strip).
+    fn wrap_with_tab_strip(
+        &self,
+        screen_view: AnyElement,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.workspace.tabs.len() <= 1 {
+            return screen_view;
+        }
+
+        let active_idx = self.workspace.active_tab;
+        let active_fg: Hsla = rgb(STATUS_FG).into();
+        let inactive_fg: Hsla = rgb(0x6272a4).into();
+        let strip_bg: Hsla = rgb(STATUS_BG).into();
+        let active_bg: Hsla = rgb(0x282a36).into();
+
+        let mut strip = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_2()
+            .h(px(24.0))
+            .bg(strip_bg)
+            .text_size(px(12.0))
+            .font_family(self.body_font.clone())
+            .gap_1();
+
+        for (i, tab) in self.workspace.tabs.iter().enumerate() {
+            let label = tab_strip_label(tab);
+            let is_active = i == active_idx;
+            let fg = if is_active { active_fg } else { inactive_fg };
+            let bg = if is_active { active_bg } else { strip_bg };
+
+            let entry = div()
+                .px_3()
+                .py_1()
+                .rounded(px(3.0))
+                .bg(bg)
+                .text_color(fg)
+                .child(label);
+            strip = strip.child(entry);
+        }
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(strip)
+            .child(div().flex_1().min_h_0().child(screen_view))
+            .into_any_element()
+    }
+
     fn render_menu_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let m = match &self.menu {
             Some(m) => m,
@@ -4552,6 +4623,13 @@ impl Render for SketchGpuiView {
             WindowContent::Browser(_) => self.render_browser(screen_root, cx).into_any_element(),
         };
 
+        // When there's more than one tab, stack the tab strip above the
+        // screen view. Single-tab workspaces render no strip — matches the
+        // spec for "always show strip when >= 1 tab" but conservatively
+        // suppresses it for the most common case (one-tab session) while
+        // tab-creation commands are still landing.
+        let screen_view = self.wrap_with_tab_strip(screen_view, cx);
+
         if !has_overlay {
             return screen_view;
         }
@@ -4676,6 +4754,8 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::next_buffer))
             .on_action(cx.listener(Self::prev_buffer))
+            .on_action(cx.listener(Self::next_tab))
+            .on_action(cx.listener(Self::prev_tab))
             .child(header)
             .child(body)
             .child(footer)
@@ -6042,6 +6122,28 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 // Buffer helpers
 // ----------------------------------------------------------------------------
 
+/// Short display label for the tab strip. Doc/Edit tabs show the file's
+/// basename (`E ` prefix for Edit); Browser/Claude show their kind.
+fn tab_strip_label(tab: &workspace::Tab<WindowContent>) -> String {
+    if let workspace::Layout::Leaf(w) = &tab.layout {
+        match &w.content {
+            WindowContent::Doc(d) => basename_or_full(d.file_label.as_ref()),
+            WindowContent::Edit(e) => format!("E {}", basename_or_full(e.file_label.as_ref())),
+            WindowContent::Browser(_) => format!("Browser ({})", tab.display_label()),
+            WindowContent::Claude(_) => format!("Claude ({})", tab.display_label()),
+        }
+    } else {
+        tab.display_label().to_string()
+    }
+}
+
+fn basename_or_full(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
 /// Extract the file label of a tab's focused window, if Doc or Edit.
 /// Returns `None` for Browser/Claude tabs or non-leaf layouts.
 fn tab_doc_label(tab: &workspace::Tab<WindowContent>) -> Option<String> {
@@ -6178,6 +6280,12 @@ fn main() {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-o", OpenBrowser, None),
             KeyBinding::new("cmd-k", OpenClaude, None),
+            // Workspace-level tab switching — app-global so the strip is
+            // reachable from every screen and overlay (per spec Interfaces
+            // table; bind also `Ctrl-Tab`/`Ctrl-Shift-Tab` for keyboard-only
+            // users without Cmd).
+            KeyBinding::new("ctrl-tab", NextTab, None),
+            KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         ]);
 
         // Browser-view bindings.
