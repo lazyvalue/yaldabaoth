@@ -122,6 +122,8 @@ actions!(
         // Tab cycling (workspace-level — independent of buffer list)
         NextTab,
         PrevTab,
+        NewTab,
+        CloseTab,
         // Browser view
         BrowserDown,
         BrowserUp,
@@ -2730,6 +2732,30 @@ impl SketchGpuiView {
         }
     }
 
+    /// Open a new tab containing a Browser rooted at cwd. Spec Behavior 3:
+    /// no-arg `:tabnew` / `Cmd-T` creates a browser tab so the user can pick
+    /// what to load.
+    fn new_tab(&mut self, _: &NewTab, _w: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.push_initial_tab(WindowContent::Browser(BrowserWindow {
+            fb: FileBrowser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        }));
+        cx.notify();
+    }
+
+    /// Close the active tab. Spec Behavior 5: ClaudeWindows drop their ACP
+    /// channels (subprocess killed via kill_on_drop). When the last tab is
+    /// closed, quit the app for now (placeholder-tab Behavior 2 is a
+    /// follow-up).
+    fn close_tab(&mut self, _: &CloseTab, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.tabs.len() <= 1 {
+            cx.quit();
+            return;
+        }
+        let idx = self.workspace.active_tab;
+        self.workspace.close_tab(idx);
+        cx.notify();
+    }
+
     // ---- Browser actions ----------------------------------------------------
 
     fn browser_down(&mut self, _: &BrowserDown, _w: &mut Window, cx: &mut Context<Self>) {
@@ -4756,6 +4782,8 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::prev_buffer))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
+            .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(Self::close_tab))
             .child(header)
             .child(body)
             .child(footer)
@@ -6286,6 +6314,8 @@ fn main() {
             // users without Cmd).
             KeyBinding::new("ctrl-tab", NextTab, None),
             KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+            KeyBinding::new("cmd-t", NewTab, None),
+            KeyBinding::new("cmd-shift-w", CloseTab, None),
         ]);
 
         // Browser-view bindings.
