@@ -2415,6 +2415,14 @@ struct SketchGpuiView {
     active_buffer_idx: usize,
     /// Buffer-list picker overlay — open while `Some`.
     buffer_switcher: Option<BufferSwitcher>,
+    /// Tabs + n-ary split tree (spec-tabs-and-splits.md). Initialized as a
+    /// parallel mirror of `screen` / `open_buffers` during the workspace
+    /// migration; the existing fields remain authoritative until they are
+    /// drained in follow-up commits. The content kind is `()` for now —
+    /// the migration will replace it with `WindowContent` once call sites
+    /// move over.
+    #[allow(dead_code)]
+    workspace: workspace::Workspace<()>,
 }
 
 impl SketchGpuiView {
@@ -2441,6 +2449,7 @@ impl SketchGpuiView {
             open_buffers: vec![OpenBuffer { file_label: label, state: None }],
             active_buffer_idx: 0,
             buffer_switcher: None,
+            workspace: workspace::Workspace::with_initial(()),
         }
     }
 
@@ -2457,6 +2466,7 @@ impl SketchGpuiView {
             open_buffers: Vec::new(),
             active_buffer_idx: 0,
             buffer_switcher: None,
+            workspace: workspace::Workspace::with_initial(()),
         }
     }
 
