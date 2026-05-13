@@ -2399,7 +2399,6 @@ fn gpui_menu() -> Vec<MenuNode> {
 }
 
 struct SketchGpuiView {
-    screen: WindowContent,
     theme: Theme,
     body_font: SharedString,
     code_font: SharedString,
@@ -2415,14 +2414,12 @@ struct SketchGpuiView {
     active_buffer_idx: usize,
     /// Buffer-list picker overlay — open while `Some`.
     buffer_switcher: Option<BufferSwitcher>,
-    /// Tabs + n-ary split tree (spec-tabs-and-splits.md). Initialized as a
-    /// parallel mirror of `screen` / `open_buffers` during the workspace
-    /// migration; the existing fields remain authoritative until they are
-    /// drained in follow-up commits. The content kind is `()` for now —
-    /// the migration will replace it with `WindowContent` once call sites
-    /// move over.
-    #[allow(dead_code)]
-    workspace: workspace::Workspace<()>,
+    /// Tabs + n-ary split tree (spec-tabs-and-splits.md). The focused
+    /// window's content is the authoritative live state — `screen` and
+    /// `open_buffers` are now thin views over `workspace.tabs` for the
+    /// duration of the migration and will be removed once their last call
+    /// site is gone.
+    workspace: workspace::Workspace<WindowContent>,
 }
 
 impl SketchGpuiView {
@@ -2433,14 +2430,14 @@ impl SketchGpuiView {
         focus_handle: FocusHandle,
     ) -> Self {
         let label: SharedString = file_label.into();
+        let initial = WindowContent::Doc(DocState {
+            blocks,
+            file_label: label.clone(),
+            cursor_block: 0,
+            scroll_handle: ScrollHandle::new(),
+            edit_cache: None,
+        });
         Self {
-            screen: WindowContent::Doc(DocState {
-                blocks,
-                file_label: label.clone(),
-                cursor_block: 0,
-                scroll_handle: ScrollHandle::new(),
-                edit_cache: None,
-            }),
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("Menlo"),
@@ -2449,15 +2446,15 @@ impl SketchGpuiView {
             open_buffers: vec![OpenBuffer { file_label: label, state: None }],
             active_buffer_idx: 0,
             buffer_switcher: None,
-            workspace: workspace::Workspace::with_initial(()),
+            workspace: workspace::Workspace::with_initial(initial),
         }
     }
 
     fn new_browser(start_dir: PathBuf, theme: Theme, focus_handle: FocusHandle) -> Self {
+        let initial = WindowContent::Browser(BrowserWindow {
+            fb: FileBrowser::new(start_dir),
+        });
         Self {
-            screen: WindowContent::Browser(BrowserWindow {
-                fb: FileBrowser::new(start_dir),
-            }),
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("Menlo"),
@@ -2466,41 +2463,46 @@ impl SketchGpuiView {
             open_buffers: Vec::new(),
             active_buffer_idx: 0,
             buffer_switcher: None,
-            workspace: workspace::Workspace::with_initial(()),
+            workspace: workspace::Workspace::with_initial(initial),
         }
+    }
+
+    /// Replace the focused window's content (old `self.screen = X` writes).
+    fn set_screen(&mut self, content: WindowContent) {
+        self.workspace.replace_focused_content(content);
     }
 
     /// `Some(doc)` if currently viewing a document, else `None`.
     fn doc_mut(&mut self) -> Option<&mut DocState> {
-        match &mut self.screen {
+        match self.workspace.focused_content_mut().expect("no focused window") {
             WindowContent::Doc(d) => Some(d),
             _ => None,
         }
     }
 
     fn browser_mut(&mut self) -> Option<&mut BrowserWindow> {
-        match &mut self.screen {
+        match self.workspace.focused_content_mut().expect("no focused window") {
             WindowContent::Browser(b) => Some(b),
             _ => None,
         }
     }
 
     fn claude_mut(&mut self) -> Option<&mut ClaudeState> {
-        match &mut self.screen {
+        match self.workspace.focused_content_mut().expect("no focused window") {
             WindowContent::Claude(ring) if !ring.is_empty() => Some(&mut ring.active_mut().state),
             _ => None,
         }
     }
 
     fn claude_ring(&self) -> Option<&SessionRing> {
-        match &self.screen {
+        match self.workspace.focused_content().expect("no focused window") {
             WindowContent::Claude(ring) => Some(ring),
             _ => None,
         }
     }
 
     fn claude_ring_mut(&mut self) -> Option<&mut SessionRing> {
-        match &mut self.screen {
+        match self.workspace.focused_content_mut().expect("no focused window") {
             WindowContent::Claude(ring) => Some(ring),
             _ => None,
         }
@@ -2553,7 +2555,7 @@ impl SketchGpuiView {
             file_label: label,
             state: None,
         });
-        self.screen = new_screen;
+        self.set_screen(new_screen);
         self.active_buffer_idx = new_idx;
         true
     }
@@ -2565,7 +2567,7 @@ impl SketchGpuiView {
             return;
         }
         // Update label from the live screen (Edit may have changed it via save-as).
-        let label = screen_file_label(&self.screen);
+        let label = screen_file_label(self.workspace.focused_content().expect("no focused window"));
         if let Some(l) = label {
             self.open_buffers[self.active_buffer_idx].file_label = l;
         }
@@ -2576,7 +2578,10 @@ impl SketchGpuiView {
             scroll_handle: ScrollHandle::new(),
             edit_cache: None,
         });
-        let old_screen = std::mem::replace(&mut self.screen, placeholder);
+        let old_screen = self
+            .workspace
+            .replace_focused_content(placeholder)
+            .expect("workspace has no focused window");
         self.open_buffers[self.active_buffer_idx].state = Some(old_screen);
     }
 
@@ -2589,7 +2594,7 @@ impl SketchGpuiView {
         self.stash_active_screen();
         self.active_buffer_idx = idx;
         if let Some(screen) = self.open_buffers[idx].state.take() {
-            self.screen = screen;
+            self.set_screen(screen);
         }
     }
 
@@ -2598,7 +2603,7 @@ impl SketchGpuiView {
     fn close_buffer_at(&mut self, idx: usize, cx: &mut Context<Self>) -> bool {
         // Check if the buffer is modified.
         let is_modified = if idx == self.active_buffer_idx {
-            screen_is_modified(&self.screen)
+            screen_is_modified(self.workspace.focused_content().expect("no focused window"))
         } else {
             self.open_buffers[idx]
                 .state
@@ -2622,7 +2627,7 @@ impl SketchGpuiView {
             self.stash_active_screen();
             self.active_buffer_idx = next;
             if let Some(screen) = self.open_buffers[self.active_buffer_idx].state.take() {
-                self.screen = screen;
+                self.set_screen(screen);
             }
         }
         self.open_buffers.remove(idx);
@@ -2708,15 +2713,15 @@ impl SketchGpuiView {
     }
 
     fn open_browser_inner(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.screen, WindowContent::Browser(_)) {
+        if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Browser(_)) {
             return;
         }
         // Stash the current doc/edit screen into its buffer slot so
         // buffer-list and back-to-doc can restore it later.
         self.stash_active_screen();
-        self.screen = WindowContent::Browser(BrowserWindow {
+        self.set_screen(WindowContent::Browser(BrowserWindow {
             fb: FileBrowser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-        });
+        }));
         cx.notify();
     }
     fn quit(&mut self, _: &Quit, _w: &mut Window, cx: &mut Context<Self>) {
@@ -2731,7 +2736,7 @@ impl SketchGpuiView {
     /// lingering child agents have been observed at exit. Called from
     /// `on_app_quit` in `main`.
     fn shutdown_acp(&mut self) {
-        if let WindowContent::Claude(ring) = &mut self.screen {
+        if let WindowContent::Claude(ring) = self.workspace.focused_content_mut().expect("no focused window") {
             for slot in &mut ring.slots {
                 let _dropped = slot.state.channel.take();
             }
@@ -2818,7 +2823,7 @@ impl SketchGpuiView {
         }
     }
     fn browser_close(&mut self, _: &BrowserClose, _w: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.screen, WindowContent::Browser(_)) {
+        if !matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Browser(_)) {
             return;
         }
         // Restore the active buffer's screen, or quit if no buffers.
@@ -2827,7 +2832,7 @@ impl SketchGpuiView {
             return;
         }
         if let Some(screen) = self.open_buffers[self.active_buffer_idx].state.take() {
-            self.screen = screen;
+            self.set_screen(screen);
         } else {
             // Active buffer has no stashed state — shouldn't happen, but
             // fall back to quit.
@@ -2841,7 +2846,7 @@ impl SketchGpuiView {
 
     /// `Some(edit)` if currently editing, else `None`.
     fn edit_mut(&mut self) -> Option<&mut EditState> {
-        match &mut self.screen {
+        match self.workspace.focused_content_mut().expect("no focused window") {
             WindowContent::Edit(e) => Some(e),
             _ => None,
         }
@@ -2863,7 +2868,7 @@ impl SketchGpuiView {
     /// disk. The chosen `view` is applied either way — switching from Code
     /// → WP without losing cursor/buffer state is just `cached.view = view`.
     fn enter_edit_with(&mut self, view: EditView, cx: &mut Context<Self>) {
-        let mut edit_state = match &mut self.screen {
+        let mut edit_state = match self.workspace.focused_content_mut().expect("no focused window") {
             WindowContent::Doc(d) => match d.edit_cache.take() {
                 Some(cached) => cached,
                 None => {
@@ -2876,7 +2881,7 @@ impl SketchGpuiView {
             _ => return,
         };
         edit_state.view = view;
-        self.screen = WindowContent::Edit(edit_state);
+        self.set_screen(WindowContent::Edit(edit_state));
         cx.notify();
     }
 
@@ -2885,8 +2890,9 @@ impl SketchGpuiView {
     /// Stashes the EditState on the new DocState so re-entering edit picks
     /// up exactly where the user left off (cursor, mode, scroll, undo).
     fn back_to_doc(&mut self, cx: &mut Context<Self>) {
-        let prev = std::mem::replace(
-            &mut self.screen,
+        let prev = self
+            .workspace
+            .replace_focused_content(
             // Placeholder; overwritten in every match arm below.
             WindowContent::Doc(DocState {
                 blocks: Vec::new(),
@@ -2895,25 +2901,26 @@ impl SketchGpuiView {
                 scroll_handle: ScrollHandle::new(),
                 edit_cache: None,
             }),
-        );
+        )
+            .expect("workspace has no focused window");
         match prev {
             WindowContent::Edit(edit) => {
                 let blocks = render::render(&edit.editor.document().full_text(), &self.theme);
                 let file_label = edit.file_label.clone();
-                self.screen = WindowContent::Doc(DocState {
+                self.set_screen(WindowContent::Doc(DocState {
                     blocks,
                     file_label,
                     cursor_block: 0,
                     scroll_handle: ScrollHandle::new(),
                     edit_cache: Some(edit),
-                });
+                }));
             }
             WindowContent::Claude(ring) => {
                 // Restore whatever screen the user opened Claude from. If
                 // none was stashed, fall back to a fresh Browser at cwd.
                 // SessionRing and all its sessions drop here, taking pump
                 // tasks and ACP channels with them.
-                self.screen = match ring.underlying {
+                let new = match ring.underlying {
                     Some(boxed) => *boxed,
                     None => WindowContent::Browser(BrowserWindow {
                         fb: FileBrowser::new(
@@ -2921,9 +2928,10 @@ impl SketchGpuiView {
                         ),
                     }),
                 };
+                self.set_screen(new);
             }
             other => {
-                self.screen = other;
+                self.set_screen(other);
                 return;
             }
         }
@@ -3338,7 +3346,7 @@ impl SketchGpuiView {
                 // Only meaningful while the claude screen is active. Surface
                 // a hint via the doc/edit footer if it isn't, so the user
                 // gets a visible no-op instead of silent.
-                if matches!(self.screen, WindowContent::Claude(_)) {
+                if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Claude(_)) {
                     self.send_claude(cx);
                 }
             }
@@ -3350,7 +3358,7 @@ impl SketchGpuiView {
             "claude-mode-cycle" => self.cycle_claude_permission_mode(cx),
             "claude-clear" => self.clear_claude_session(cx),
             "compose-toggle" => {
-                if matches!(self.screen, WindowContent::Claude(_)) {
+                if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Claude(_)) {
                     self.compose_toggle(cx);
                 }
             }
@@ -3693,7 +3701,7 @@ impl SketchGpuiView {
             let is_selected = vis_idx == bs.selected;
             let is_active = buf_idx == self.active_buffer_idx;
             let is_modified = if is_active {
-                screen_is_modified(&self.screen)
+                screen_is_modified(self.workspace.focused_content().expect("no focused window"))
             } else {
                 ob.state.as_ref().map_or(false, screen_is_modified)
             };
@@ -3821,22 +3829,22 @@ impl SketchGpuiView {
 
     fn open_claude_inner(&mut self, cx: &mut Context<Self>) {
         // If already on Claude screen, just add a new session to the ring.
-        if matches!(self.screen, WindowContent::Claude(_)) {
+        if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Claude(_)) {
             self.new_claude_session(cx);
             return;
         }
 
         // Stash the current screen so back_to_doc can restore it.
-        let prior = std::mem::replace(
-            &mut self.screen,
-            WindowContent::Doc(DocState {
+        let prior = self
+            .workspace
+            .replace_focused_content(WindowContent::Doc(DocState {
                 blocks: Vec::new(),
                 file_label: SharedString::new_static(""),
                 cursor_block: 0,
                 scroll_handle: ScrollHandle::new(),
                 edit_cache: None,
-            }),
-        );
+            }))
+            .expect("workspace has no focused window");
 
         let mut ring = SessionRing::new(Some(Box::new(prior)));
         let cwd_opt = std::env::current_dir().ok();
@@ -3865,7 +3873,7 @@ impl SketchGpuiView {
             ring.active = active_pos.min(ring.slots.len().saturating_sub(1));
         }
 
-        self.screen = WindowContent::Claude(ring);
+        self.set_screen(WindowContent::Claude(ring));
 
         if let Some(c) = self.claude_mut() {
             c.editor.begin_insert();
@@ -4261,7 +4269,7 @@ impl SketchGpuiView {
         // the existing ClaudeState because the underlying screen
         // (browser/doc) is also stashed there — preserving it is the
         // job of open_claude_inner via the prior-screen swap dance.
-        if matches!(self.screen, WindowContent::Claude(_)) {
+        if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Claude(_)) {
             // Restore underlying first so open_claude_inner can capture
             // it as the new "prior" screen. Otherwise we'd lose the
             // file/browser the user was viewing before they opened
@@ -4597,7 +4605,7 @@ impl Render for SketchGpuiView {
             }
         };
 
-        let screen_view: AnyElement = match &self.screen {
+        let screen_view: AnyElement = match self.workspace.focused_content().expect("no focused window") {
             WindowContent::Doc(_) => self.render_doc(screen_root, cx).into_any_element(),
             WindowContent::Edit(_) => self.render_edit(screen_root, cx).into_any_element(),
             WindowContent::Claude(_) => self.render_claude(screen_root, cx).into_any_element(),
@@ -4644,7 +4652,7 @@ impl SketchGpuiView {
         root: gpui::Div,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let d = match &self.screen {
+        let d = match self.workspace.focused_content().expect("no focused window") {
             WindowContent::Doc(d) => d,
             _ => unreachable!(),
         };
@@ -4738,7 +4746,7 @@ impl SketchGpuiView {
         root: gpui::Div,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let e = match &self.screen {
+        let e = match self.workspace.focused_content().expect("no focused window") {
             WindowContent::Edit(e) => e,
             _ => unreachable!(),
         };
@@ -5086,7 +5094,7 @@ impl SketchGpuiView {
         root: gpui::Div,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let ring = match &mut self.screen {
+        let ring = match self.workspace.focused_content_mut().expect("no focused window") {
             WindowContent::Claude(ring) => ring,
             _ => unreachable!(),
         };
@@ -5879,7 +5887,7 @@ impl SketchGpuiView {
         root: gpui::Div,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let b = match &self.screen {
+        let b = match self.workspace.focused_content().expect("no focused window") {
             WindowContent::Browser(b) => b,
             _ => unreachable!(),
         };
