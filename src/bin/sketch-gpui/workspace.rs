@@ -45,7 +45,15 @@ pub struct Window<C> {
 /// child collapses the split into that child (Behavior 14). Weights inside
 /// any single `Split` sum to 1.0 and renormalize proportionally on insert/
 /// close.
+///
+/// `Empty` is a sentinel used only as a transient placeholder during
+/// `std::mem::take` swaps inside mutation methods (split / close / only). It
+/// MUST NOT appear in a tree at rest — mutation methods are responsible for
+/// restoring a non-`Empty` root before returning. The variant exists because
+/// `Layout<C>` is generic over `C` and can't construct an arbitrary placeholder
+/// otherwise.
 pub enum Layout<C> {
+    Empty,
     Leaf(Window<C>),
     Split {
         dir: SplitDir,
@@ -53,10 +61,17 @@ pub enum Layout<C> {
     },
 }
 
+impl<C> Default for Layout<C> {
+    fn default() -> Self {
+        Layout::Empty
+    }
+}
+
 impl<C> Layout<C> {
     /// Find the leaf with the given id (recursive).
     pub fn find_leaf(&self, id: WindowId) -> Option<&Window<C>> {
         match self {
+            Layout::Empty => None,
             Layout::Leaf(w) if w.id == id => Some(w),
             Layout::Leaf(_) => None,
             Layout::Split { children, .. } => {
@@ -68,6 +83,7 @@ impl<C> Layout<C> {
     /// Find the leaf with the given id (mutable, recursive).
     pub fn find_leaf_mut(&mut self, id: WindowId) -> Option<&mut Window<C>> {
         match self {
+            Layout::Empty => None,
             Layout::Leaf(w) if w.id == id => Some(w),
             Layout::Leaf(_) => None,
             Layout::Split { children, .. } => {
@@ -79,6 +95,7 @@ impl<C> Layout<C> {
     /// Walk every leaf in tree order (depth-first, in `children` order).
     pub fn for_each_leaf<F: FnMut(&Window<C>)>(&self, f: &mut F) {
         match self {
+            Layout::Empty => {}
             Layout::Leaf(w) => f(w),
             Layout::Split { children, .. } => {
                 for (_, c) in children {
@@ -86,6 +103,81 @@ impl<C> Layout<C> {
                 }
             }
         }
+    }
+
+    /// Find the path from root to the leaf with `target` id, expressed as a
+    /// sequence of child-indices to follow at each `Split` node. An empty
+    /// path means the root itself is the target leaf. Returns `None` if the
+    /// target isn't in the tree.
+    pub fn path_to(&self, target: WindowId) -> Option<Vec<usize>> {
+        match self {
+            Layout::Empty => None,
+            Layout::Leaf(w) if w.id == target => Some(Vec::new()),
+            Layout::Leaf(_) => None,
+            Layout::Split { children, .. } => {
+                for (idx, (_, child)) in children.iter().enumerate() {
+                    if let Some(mut rest) = child.path_to(target) {
+                        rest.insert(0, idx);
+                        return Some(rest);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Walk the path down to a node and return a mutable handle to it. An
+    /// empty path returns `self`. Returns `None` if the path goes off the
+    /// tree (shouldn't happen with paths from `path_to`).
+    pub fn node_at_path_mut(&mut self, path: &[usize]) -> Option<&mut Layout<C>> {
+        let mut cur = self;
+        for &idx in path {
+            match cur {
+                Layout::Split { children, .. } => {
+                    cur = &mut children.get_mut(idx)?.1;
+                }
+                Layout::Leaf(_) | Layout::Empty => return None,
+            }
+        }
+        Some(cur)
+    }
+
+    /// Count the number of leaves in this subtree.
+    pub fn leaf_count(&self) -> usize {
+        match self {
+            Layout::Empty => 0,
+            Layout::Leaf(_) => 1,
+            Layout::Split { children, .. } => {
+                children.iter().map(|(_, c)| c.leaf_count()).sum()
+            }
+        }
+    }
+
+    /// Yield the ids of every leaf in tree order.
+    pub fn leaf_ids(&self) -> Vec<WindowId> {
+        let mut out = Vec::new();
+        self.for_each_leaf(&mut |w| out.push(w.id));
+        out
+    }
+}
+
+/// Normalize a vector of weights so they sum to 1.0. If the sum is zero or
+/// negative, distributes uniformly. Single-element children stay [1.0].
+fn renormalize(children: &mut [(f32, impl Sized)]) {
+    let n = children.len();
+    if n == 0 {
+        return;
+    }
+    let sum: f32 = children.iter().map(|(w, _)| *w).sum();
+    if sum <= 0.0 {
+        let even = 1.0 / n as f32;
+        for (w, _) in children.iter_mut() {
+            *w = even;
+        }
+        return;
+    }
+    for (w, _) in children.iter_mut() {
+        *w /= sum;
     }
 }
 
@@ -259,6 +351,214 @@ impl<C> Workspace<C> {
     }
 }
 
+impl<C> Workspace<C> {
+    /// Insert a new window adjacent to the focused leaf in the active tab.
+    /// Implements Behavior 12–13 of `spec-tabs-and-splits.md`:
+    /// - If the focused leaf's parent split has the same `dir`, append the
+    ///   new leaf right after the focused leaf (no nesting).
+    /// - Otherwise (root leaf, or perpendicular parent), wrap the focused
+    ///   leaf in a fresh 2-child split.
+    ///
+    /// The new window's weight initializes to the average of existing
+    /// siblings; all weights renormalize to sum to 1.0. Focus moves to the
+    /// new window. Returns the new window's id (or `None` if the workspace
+    /// has no active tab).
+    pub fn split_focused(&mut self, dir: SplitDir, content: C) -> Option<WindowId> {
+        let new_id = self.alloc_window_id();
+        let new_window = Window {
+            id: new_id,
+            content,
+        };
+        let tab = self.active_tab_mut()?;
+        let focused = tab.focused;
+        let path = tab.layout.path_to(focused)?;
+
+        if path.is_empty() {
+            // Root is the focused leaf. Wrap it in a Split with the new leaf.
+            let old_root = std::mem::take(&mut tab.layout);
+            tab.layout = Layout::Split {
+                dir,
+                children: vec![(0.5, old_root), (0.5, Layout::Leaf(new_window))],
+            };
+        } else {
+            // Walk to the parent of the focused leaf.
+            let (parent_path, tail) = path.split_at(path.len() - 1);
+            let leaf_idx = tail[0];
+            let parent = tab.layout.node_at_path_mut(parent_path)?;
+            let Layout::Split { dir: parent_dir, children } = parent else {
+                return None;
+            };
+            if *parent_dir == dir {
+                // Same direction — insert adjacent to the focused leaf.
+                let avg = if children.is_empty() {
+                    1.0
+                } else {
+                    children.iter().map(|(w, _)| *w).sum::<f32>() / children.len() as f32
+                };
+                children.insert(leaf_idx + 1, (avg, Layout::Leaf(new_window)));
+                renormalize(children);
+            } else {
+                // Perpendicular — wrap the focused leaf in a nested Split.
+                let (old_weight, old_leaf) = children
+                    .get_mut(leaf_idx)
+                    .map(|(w, l)| (*w, std::mem::take(l)))?;
+                let nested = Layout::Split {
+                    dir,
+                    children: vec![(0.5, old_leaf), (0.5, Layout::Leaf(new_window))],
+                };
+                children[leaf_idx] = (old_weight, nested);
+            }
+        }
+        tab.focused = new_id;
+        Some(new_id)
+    }
+
+    /// Close the focused window. Returns:
+    /// - `Ok(Some(new_focus))` — close succeeded, focus moved to a sibling.
+    /// - `Ok(None)` — the focused window was the last in the tab; the caller
+    ///   should close the tab (or replace it with a placeholder per spec
+    ///   Behavior 2).
+    /// - `Err(())` — no active tab / no focused window.
+    pub fn close_focused(&mut self) -> Result<Option<WindowId>, ()> {
+        let tab = self.active_tab_mut().ok_or(())?;
+        let focused = tab.focused;
+        let path = tab.layout.path_to(focused).ok_or(())?;
+
+        if path.is_empty() {
+            // Focused leaf IS the root. The tab has nothing left.
+            return Ok(None);
+        }
+
+        let (parent_path, tail) = path.split_at(path.len() - 1);
+        let leaf_idx = tail[0];
+        let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+        let Layout::Split { children, .. } = parent else {
+            return Err(());
+        };
+        children.remove(leaf_idx);
+
+        // Pick focus successor: previous index in this split, else first
+        // remaining child, else (if split is now single-child) the inner leaf.
+        let new_focus = if children.is_empty() {
+            // Shouldn't happen — invariant says split had >= 2 children.
+            return Err(());
+        } else if leaf_idx > 0 {
+            children[leaf_idx - 1].1.leaf_ids().last().copied()
+        } else {
+            children[0].1.leaf_ids().first().copied()
+        };
+
+        let collapse = children.len() == 1;
+        if collapse {
+            // Replace this split with its sole remaining child.
+            let only_child = std::mem::take(&mut children[0].1);
+            let parent_slot = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+            *parent_slot = only_child;
+        } else {
+            // Renormalize the remaining siblings.
+            renormalize(children);
+        }
+
+        if let Some(id) = new_focus {
+            tab.focused = id;
+            Ok(Some(id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Close every window in the active tab except the focused one. The
+    /// focused leaf becomes the tab's root. Returns `Err(())` if there is no
+    /// focused window.
+    pub fn only(&mut self) -> Result<(), ()> {
+        let tab = self.active_tab_mut().ok_or(())?;
+        let focused = tab.focused;
+        let path = tab.layout.path_to(focused).ok_or(())?;
+        if path.is_empty() {
+            return Ok(()); // Already the root.
+        }
+        // Take the focused leaf out of the tree, replace root with it.
+        let mut focused_leaf: Option<Layout<C>> = None;
+        // Extract via walk: get to parent, swap leaf out with Empty.
+        let (parent_path, tail) = path.split_at(path.len() - 1);
+        let leaf_idx = tail[0];
+        let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+        if let Layout::Split { children, .. } = parent {
+            let (_w, l) = children.get_mut(leaf_idx).ok_or(())?;
+            focused_leaf = Some(std::mem::take(l));
+        }
+        let leaf = focused_leaf.ok_or(())?;
+        tab.layout = leaf;
+        Ok(())
+    }
+
+    /// Shift weight between the focused leaf and its immediate next sibling
+    /// inside the parent `Split`. `delta` is added to the focused leaf's
+    /// weight and subtracted from the sibling's; both clamp to a 5%/95%
+    /// floor/ceiling per slot. No-op if the focused leaf has no sibling in
+    /// the requested direction.
+    pub fn resize_focused(&mut self, delta: f32) -> Result<(), ()> {
+        let tab = self.active_tab_mut().ok_or(())?;
+        let focused = tab.focused;
+        let path = tab.layout.path_to(focused).ok_or(())?;
+        if path.is_empty() {
+            return Ok(()); // No parent to resize against.
+        }
+        let (parent_path, tail) = path.split_at(path.len() - 1);
+        let leaf_idx = tail[0];
+        let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+        let Layout::Split { children, .. } = parent else {
+            return Err(());
+        };
+        let sibling_idx = if leaf_idx + 1 < children.len() {
+            leaf_idx + 1
+        } else if leaf_idx > 0 {
+            leaf_idx - 1
+        } else {
+            return Ok(());
+        };
+        let (a, b) = if leaf_idx < sibling_idx {
+            (leaf_idx, sibling_idx)
+        } else {
+            (sibling_idx, leaf_idx)
+        };
+        // Borrow split: take both weights.
+        let (left, right) = children.split_at_mut(b);
+        let leaf_w = &mut left[a].0;
+        let sib_w = &mut right[0].0;
+        let signed_delta = if leaf_idx < sibling_idx { delta } else { -delta };
+        let new_leaf = (*leaf_w + signed_delta).clamp(0.05, 0.95);
+        let new_sib = (*sib_w - signed_delta).clamp(0.05, 0.95);
+        *leaf_w = new_leaf;
+        *sib_w = new_sib;
+        renormalize(children);
+        Ok(())
+    }
+
+    /// Equalize all weights in the focused window's parent split. No-op if
+    /// the focused leaf is the tab's root.
+    pub fn equalize_focused(&mut self) -> Result<(), ()> {
+        let tab = self.active_tab_mut().ok_or(())?;
+        let focused = tab.focused;
+        let path = tab.layout.path_to(focused).ok_or(())?;
+        if path.is_empty() {
+            return Ok(());
+        }
+        let (parent_path, _) = path.split_at(path.len() - 1);
+        let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+        if let Layout::Split { children, .. } = parent {
+            let n = children.len();
+            if n > 0 {
+                let even = 1.0 / n as f32;
+                for (w, _) in children.iter_mut() {
+                    *w = even;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<C> Default for Workspace<C> {
     fn default() -> Self {
         Self::new()
@@ -353,6 +653,197 @@ mod tests {
         let id2 = ws.open_buffer(&p).unwrap();
         assert_eq!(id1, id2, "same path should return same id");
         assert_eq!(ws.file_buffers.len(), 1);
+    }
+
+    // --- Mutation methods (split / close / only / resize / equalize) ---
+
+    fn ws_with_layout(layout: Layout<TestContent>, focused: WindowId) -> Workspace<TestContent> {
+        let mut ws: Workspace<TestContent> = Workspace::new();
+        ws.tabs.push(Tab {
+            auto_name: "tab-1".into(),
+            display_name: None,
+            layout,
+            focused,
+        });
+        // Ensure window-id allocator skips past the ids we hand-rolled.
+        let max_id = ws.tabs[0].layout.leaf_ids().into_iter().max().unwrap_or(0);
+        ws.next_window_id = max_id + 1;
+        ws
+    }
+
+    #[test]
+    fn split_focused_on_root_wraps_in_split() {
+        let mut ws = ws_with_layout(leaf(1, "a"), 1);
+        let new_id = ws.split_focused(SplitDir::V, TestContent("b")).unwrap();
+        let tab = ws.active_tab().unwrap();
+        match &tab.layout {
+            Layout::Split { dir, children } => {
+                assert_eq!(*dir, SplitDir::V);
+                assert_eq!(children.len(), 2);
+                assert_eq!(children[0].1.leaf_ids(), vec![1]);
+                assert_eq!(children[1].1.leaf_ids(), vec![new_id]);
+            }
+            _ => panic!("expected Split at root, got {:?}", tab.layout.leaf_ids()),
+        }
+        assert_eq!(tab.focused, new_id);
+    }
+
+    #[test]
+    fn split_focused_same_dir_appends_to_existing_split() {
+        // [a | b]  → split focused (b) vertically again → [a | b | c]
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![(0.5, leaf(1, "a")), (0.5, leaf(2, "b"))],
+        };
+        let mut ws = ws_with_layout(layout, 2);
+        let new_id = ws.split_focused(SplitDir::V, TestContent("c")).unwrap();
+        let tab = ws.active_tab().unwrap();
+        match &tab.layout {
+            Layout::Split { dir, children } => {
+                assert_eq!(*dir, SplitDir::V);
+                assert_eq!(children.len(), 3);
+                assert_eq!(children[2].1.leaf_ids(), vec![new_id]);
+                // weights renormalize.
+                let sum: f32 = children.iter().map(|(w, _)| *w).sum();
+                assert!((sum - 1.0).abs() < 1e-5);
+            }
+            _ => panic!("expected flat 3-way Split"),
+        }
+    }
+
+    #[test]
+    fn split_focused_perpendicular_dir_nests() {
+        // [a | b]  → split focused (b) horizontally → [a | (b/c)]
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![(0.5, leaf(1, "a")), (0.5, leaf(2, "b"))],
+        };
+        let mut ws = ws_with_layout(layout, 2);
+        let _new_id = ws.split_focused(SplitDir::H, TestContent("c")).unwrap();
+        let tab = ws.active_tab().unwrap();
+        match &tab.layout {
+            Layout::Split { dir, children } => {
+                assert_eq!(*dir, SplitDir::V);
+                assert_eq!(children.len(), 2);
+                match &children[1].1 {
+                    Layout::Split { dir, children } => {
+                        assert_eq!(*dir, SplitDir::H);
+                        assert_eq!(children.len(), 2);
+                    }
+                    _ => panic!("expected nested Split at child 1"),
+                }
+            }
+            _ => panic!("expected outer V-split"),
+        }
+    }
+
+    #[test]
+    fn close_focused_in_2child_split_collapses() {
+        // [a | b]  → close focused (b) → root becomes Leaf(a).
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![(0.5, leaf(1, "a")), (0.5, leaf(2, "b"))],
+        };
+        let mut ws = ws_with_layout(layout, 2);
+        let new_focus = ws.close_focused().unwrap();
+        assert_eq!(new_focus, Some(1));
+        let tab = ws.active_tab().unwrap();
+        match &tab.layout {
+            Layout::Leaf(w) => assert_eq!(w.id, 1),
+            _ => panic!("expected collapsed root Leaf(1)"),
+        }
+        assert_eq!(tab.focused, 1);
+    }
+
+    #[test]
+    fn close_focused_in_3child_split_keeps_split() {
+        // [a | b | c]  → close b → [a | c]
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![
+                (0.33, leaf(1, "a")),
+                (0.33, leaf(2, "b")),
+                (0.34, leaf(3, "c")),
+            ],
+        };
+        let mut ws = ws_with_layout(layout, 2);
+        let new_focus = ws.close_focused().unwrap();
+        // After close, focus moves to previous index → leaf 1.
+        assert_eq!(new_focus, Some(1));
+        let tab = ws.active_tab().unwrap();
+        match &tab.layout {
+            Layout::Split { children, .. } => {
+                assert_eq!(children.len(), 2);
+                let sum: f32 = children.iter().map(|(w, _)| *w).sum();
+                assert!((sum - 1.0).abs() < 1e-5);
+            }
+            _ => panic!("expected 2-child split"),
+        }
+    }
+
+    #[test]
+    fn close_focused_on_root_leaf_signals_tab_empty() {
+        let mut ws = ws_with_layout(leaf(1, "a"), 1);
+        let result = ws.close_focused().unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn only_replaces_root_with_focused_leaf() {
+        // [a | (b/c)]  → only on c → root = Leaf(c)
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![
+                (0.5, leaf(1, "a")),
+                (
+                    0.5,
+                    Layout::Split {
+                        dir: SplitDir::H,
+                        children: vec![(0.5, leaf(2, "b")), (0.5, leaf(3, "c"))],
+                    },
+                ),
+            ],
+        };
+        let mut ws = ws_with_layout(layout, 3);
+        ws.only().unwrap();
+        let tab = ws.active_tab().unwrap();
+        assert_eq!(tab.layout.leaf_ids(), vec![3]);
+    }
+
+    #[test]
+    fn resize_focused_shifts_weights() {
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![(0.5, leaf(1, "a")), (0.5, leaf(2, "b"))],
+        };
+        let mut ws = ws_with_layout(layout, 1);
+        // Grow leaf 1's weight by 0.1; sibling 2 shrinks by 0.1.
+        ws.resize_focused(0.1).unwrap();
+        let tab = ws.active_tab().unwrap();
+        if let Layout::Split { children, .. } = &tab.layout {
+            assert!((children[0].0 - 0.6).abs() < 1e-5);
+            assert!((children[1].0 - 0.4).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn equalize_focused_resets_to_equal() {
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![
+                (0.7, leaf(1, "a")),
+                (0.2, leaf(2, "b")),
+                (0.1, leaf(3, "c")),
+            ],
+        };
+        let mut ws = ws_with_layout(layout, 2);
+        ws.equalize_focused().unwrap();
+        let tab = ws.active_tab().unwrap();
+        if let Layout::Split { children, .. } = &tab.layout {
+            for (w, _) in children {
+                assert!((w - 1.0 / 3.0).abs() < 1e-5);
+            }
+        }
     }
 
     #[test]
