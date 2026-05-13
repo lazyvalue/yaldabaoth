@@ -2720,10 +2720,10 @@ impl SketchGpuiView {
                 })
             }
             PersistedKind::Edit { path } => {
-                // Round-trip as Doc for now — Edit-mode restore needs an
-                // EditState constructor we don't have a clean place to call
-                // from here. The user can re-enter edit mode via Ctrl-E.
-                self.restore_content(PersistedKind::Doc { path })
+                let label: SharedString = path.display().to_string().into();
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let editor = Editor::new(text, path);
+                WindowContent::Edit(EditState::new(editor, label, EditView::Code))
             }
             PersistedKind::Browser { dir } => {
                 let dir = if dir.is_dir() {
@@ -3069,16 +3069,61 @@ impl SketchGpuiView {
         cx.notify();
     }
 
-    /// Shared helper. For now both split commands open a Browser in the new
-    /// pane so the user can pick what to load. Cloning the focused content
-    /// kind (Doc → Doc, Edit → Edit) is a follow-up that needs the buffer
-    /// pool to share editors.
+    /// Shared helper. The new pane mirrors the focused content kind:
+    ///
+    /// - Doc → new Doc over the same file (independent scroll/cursor).
+    /// - Edit → new Edit over the same file path; the new editor reads
+    ///   from disk so unsaved changes in the source pane don't carry over
+    ///   (a shared buffer pool would fix that — separate stage).
+    /// - Browser → new Browser at cwd.
+    /// - Claude → new Browser at cwd (Claude is exclusive per spec).
+    ///
+    /// Browser is the universal fallback when the focused content has no
+    /// natural file pane to clone (Claude) or when reading the source
+    /// file fails.
     fn split_focused_with_browser(&mut self, dir: workspace::SplitDir) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let content = WindowContent::Browser(BrowserWindow {
-            fb: FileBrowser::new(cwd),
-        });
+        let content = self.clone_focused_for_split(&cwd);
         let _ = self.workspace.split_focused(dir, content);
+    }
+
+    fn clone_focused_for_split(&self, cwd: &std::path::Path) -> WindowContent {
+        let label = match self.workspace.focused_content() {
+            Some(WindowContent::Doc(d)) => Some(d.file_label.clone()),
+            Some(WindowContent::Edit(e)) => Some(e.file_label.clone()),
+            _ => None,
+        };
+        let is_edit = matches!(
+            self.workspace.focused_content(),
+            Some(WindowContent::Edit(_))
+        );
+        let browser_fallback = || {
+            WindowContent::Browser(BrowserWindow {
+                fb: FileBrowser::new(cwd.to_path_buf()),
+            })
+        };
+        let Some(label) = label else {
+            return browser_fallback();
+        };
+        let path = PathBuf::from(label.as_ref());
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => return browser_fallback(),
+        };
+        if is_edit {
+            let editor = Editor::new(text, path);
+            WindowContent::Edit(EditState::new(editor, label, EditView::Code))
+        } else {
+            let doc = Document::from_text(text, path);
+            let blocks = render::render(&doc.full_text(), &self.theme);
+            WindowContent::Doc(DocState {
+                blocks,
+                file_label: label,
+                cursor_block: 0,
+                scroll_handle: ScrollHandle::new(),
+                edit_cache: None,
+            })
+        }
     }
 
     /// `Ctrl-W c` — close the focused window. If it was the only window in
