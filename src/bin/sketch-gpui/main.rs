@@ -986,6 +986,163 @@ fn acp_session_persist_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("sketch").join("acp_sessions.json"))
 }
 
+/// Path to the JSON file that maps cwd → workspace snapshot (tabs + layout
+/// tree). Companion to acp_sessions.json; cleared by clearing cache_dir.
+fn workspace_persist_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("sketch").join("workspace.json"))
+}
+
+/// Serializable shadow of `WindowContent` for spec-tabs-and-splits.md
+/// Behavior 23. Doc/Edit persist their file path; Browser its current_dir;
+/// Claude its session_id (or `None` if not yet attached). Window-local view
+/// state (scroll, cursor) is intentionally NOT persisted (Constraint §4).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "data")]
+enum PersistedKind {
+    Doc { path: PathBuf },
+    Edit { path: PathBuf },
+    Browser { dir: PathBuf },
+    Claude { session_id: Option<String> },
+}
+
+/// One leaf in a persisted layout. Carries the (stable) window id so
+/// `focused_window` references survive restore.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedLeaf {
+    id: workspace::WindowId,
+    #[serde(flatten)]
+    kind: PersistedKind,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedLayout {
+    Leaf(PersistedLeaf),
+    Split {
+        dir: workspace::SplitDir,
+        children: Vec<(f32, PersistedLayout)>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedTab {
+    auto_name: String,
+    display_name: Option<String>,
+    focused_window: workspace::WindowId,
+    layout: PersistedLayout,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedWorkspace {
+    tabs: Vec<PersistedTab>,
+    active_tab: usize,
+}
+
+/// Snapshot a live `WindowContent` into its persisted shadow. Returns `None`
+/// for content kinds that aren't worth persisting (e.g., an unattached
+/// transient state we'd lose nothing by skipping).
+fn snapshot_content(content: &WindowContent) -> PersistedKind {
+    match content {
+        WindowContent::Doc(d) => PersistedKind::Doc {
+            path: PathBuf::from(d.file_label.as_ref()),
+        },
+        WindowContent::Edit(e) => PersistedKind::Edit {
+            path: PathBuf::from(e.file_label.as_ref()),
+        },
+        WindowContent::Browser(b) => PersistedKind::Browser {
+            dir: b.fb.current_dir().to_path_buf(),
+        },
+        WindowContent::Claude(ring) => {
+            // Use the active session's id if any. Multi-session restore is
+            // handled by the existing ACP persistence path; this is just
+            // enough to know "this slot had a Claude session" so on restore
+            // we can spawn the ring shell.
+            let session_id = ring
+                .slots
+                .first()
+                .and_then(|s| s.state.channel.as_ref())
+                .and_then(|c| c.session_id().map(|s| s.to_string()));
+            PersistedKind::Claude { session_id }
+        }
+    }
+}
+
+/// Snapshot a live `Layout<WindowContent>` into its persisted shadow.
+fn snapshot_layout(layout: &workspace::Layout<WindowContent>) -> PersistedLayout {
+    match layout {
+        workspace::Layout::Empty => PersistedLayout::Leaf(PersistedLeaf {
+            id: 0,
+            kind: PersistedKind::Browser {
+                dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            },
+        }),
+        workspace::Layout::Leaf(win) => PersistedLayout::Leaf(PersistedLeaf {
+            id: win.id,
+            kind: snapshot_content(&win.content),
+        }),
+        workspace::Layout::Split { dir, children } => PersistedLayout::Split {
+            dir: *dir,
+            children: children
+                .iter()
+                .map(|(w, c)| (*w, snapshot_layout(c)))
+                .collect(),
+        },
+    }
+}
+
+/// Snapshot a live workspace into a fully serializable shape.
+fn snapshot_workspace(ws: &workspace::Workspace<WindowContent>) -> PersistedWorkspace {
+    PersistedWorkspace {
+        tabs: ws
+            .tabs
+            .iter()
+            .map(|t| PersistedTab {
+                auto_name: t.auto_name.clone(),
+                display_name: t.display_name.clone(),
+                focused_window: t.focused,
+                layout: snapshot_layout(&t.layout),
+            })
+            .collect(),
+        active_tab: ws.active_tab,
+    }
+}
+
+/// Best-effort write of the workspace snapshot for `cwd`. Silently no-ops
+/// on any I/O / serialization failure (Behavior 23: best-effort + silent).
+fn save_persisted_workspace(cwd: &std::path::Path, ws: &workspace::Workspace<WindowContent>) {
+    let Some(path) = workspace_persist_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // Read-modify-write so other cwds in the file aren't clobbered (Constraint
+    // §11 / multi-session §15: last-writer-wins).
+    let mut map: serde_json::Map<String, serde_json::Value> = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let snap = snapshot_workspace(ws);
+    if let Ok(v) = serde_json::to_value(&snap) {
+        map.insert(cwd.display().to_string(), v);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+/// Read the persisted workspace for `cwd`. Returns `None` if no file, no
+/// entry, or unparseable — the caller treats these as "no saved state,
+/// bootstrap fresh" (Behavior 24).
+fn load_persisted_workspace(cwd: &std::path::Path) -> Option<PersistedWorkspace> {
+    let path = workspace_persist_path()?;
+    let bytes = std::fs::read(&path).ok()?;
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
+    let entry = map.get(&cwd.display().to_string())?;
+    serde_json::from_value(entry.clone()).ok()
+}
+
 /// One restored session slot. Order in the returned `Vec` matches the
 /// saved ring order; reboot rebuilds the ring in this same order.
 #[derive(Debug, Clone)]
@@ -2468,6 +2625,126 @@ impl SketchGpuiView {
         self.workspace.replace_focused_content(content);
     }
 
+    /// Persist the current workspace snapshot for the active cwd. Called
+    /// after every structural mutation (tab add/remove, split, close,
+    /// focus change, etc.). Best-effort — failures are silent so a
+    /// read-only cache_dir or full disk doesn't break the editor.
+    fn save_workspace_state(&self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        save_persisted_workspace(&cwd, &self.workspace);
+    }
+
+    /// Replace `self.workspace` with one rebuilt from the persisted snapshot
+    /// for `cwd`, if any. Doc/Edit windows reload their files; Browser
+    /// windows reattach to their saved dir; Claude windows are replaced
+    /// with a Browser at cwd (full ACP restore is a follow-up). Returns
+    /// `true` if a snapshot was loaded.
+    fn restore_workspace_from_disk(&mut self) -> bool {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let Some(snap) = load_persisted_workspace(&cwd) else {
+            return false;
+        };
+        let mut ws: workspace::Workspace<WindowContent> = workspace::Workspace::new();
+        for ptab in snap.tabs {
+            let (layout, max_id) = self.restore_layout(ptab.layout);
+            ws.next_window_id = ws.next_window_id.max(max_id + 1);
+            ws.tabs.push(workspace::Tab {
+                auto_name: ptab.auto_name,
+                display_name: ptab.display_name,
+                focused: ptab.focused_window,
+                layout,
+            });
+            ws.next_tab_index += 1;
+        }
+        if !ws.tabs.is_empty() {
+            ws.active_tab = snap.active_tab.min(ws.tabs.len() - 1);
+        }
+        if ws.tabs.is_empty() {
+            return false;
+        }
+        self.workspace = ws;
+        true
+    }
+
+    fn restore_layout(
+        &self,
+        layout: PersistedLayout,
+    ) -> (workspace::Layout<WindowContent>, workspace::WindowId) {
+        match layout {
+            PersistedLayout::Leaf(leaf) => {
+                let id = leaf.id;
+                let content = self.restore_content(leaf.kind);
+                (
+                    workspace::Layout::Leaf(workspace::Window { id, content }),
+                    id,
+                )
+            }
+            PersistedLayout::Split { dir, children } => {
+                let mut max_id: workspace::WindowId = 0;
+                let mut restored_children = Vec::with_capacity(children.len());
+                for (w, child) in children {
+                    let (sub, sub_max) = self.restore_layout(child);
+                    if sub_max > max_id {
+                        max_id = sub_max;
+                    }
+                    restored_children.push((w, sub));
+                }
+                (
+                    workspace::Layout::Split {
+                        dir,
+                        children: restored_children,
+                    },
+                    max_id,
+                )
+            }
+        }
+    }
+
+    fn restore_content(&self, kind: PersistedKind) -> WindowContent {
+        match kind {
+            PersistedKind::Doc { path } => {
+                let label: SharedString = path.display().to_string().into();
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let doc = Document::from_text(text, path.clone());
+                let blocks = render::render(&doc.full_text(), &self.theme);
+                WindowContent::Doc(DocState {
+                    blocks,
+                    file_label: label,
+                    cursor_block: 0,
+                    scroll_handle: ScrollHandle::new(),
+                    edit_cache: None,
+                })
+            }
+            PersistedKind::Edit { path } => {
+                // Round-trip as Doc for now — Edit-mode restore needs an
+                // EditState constructor we don't have a clean place to call
+                // from here. The user can re-enter edit mode via Ctrl-E.
+                self.restore_content(PersistedKind::Doc { path })
+            }
+            PersistedKind::Browser { dir } => {
+                let dir = if dir.is_dir() {
+                    dir
+                } else {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                };
+                WindowContent::Browser(BrowserWindow {
+                    fb: FileBrowser::new(dir),
+                })
+            }
+            PersistedKind::Claude { .. } => {
+                // Claude restore is its own subsystem (acp_sessions.json +
+                // open_claude_inner). Replace with a Browser stub here so the
+                // tab survives; user can re-attach via the existing Claude
+                // commands.
+                WindowContent::Browser(BrowserWindow {
+                    fb: FileBrowser::new(
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                    ),
+                })
+            }
+        }
+    }
+
     /// `Some(doc)` if currently viewing a document, else `None`.
     fn doc_mut(&mut self) -> Option<&mut DocState> {
         match self.workspace.focused_content_mut().expect("no focused window") {
@@ -2551,6 +2828,7 @@ impl SketchGpuiView {
         } else {
             self.workspace.push_initial_tab(new_content);
         }
+        self.save_workspace_state();
         true
     }
 
@@ -2682,6 +2960,7 @@ impl SketchGpuiView {
         self.workspace.push_initial_tab(WindowContent::Browser(BrowserWindow {
             fb: FileBrowser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         }));
+        self.save_workspace_state();
         cx.notify();
     }
     fn quit(&mut self, _: &Quit, _w: &mut Window, cx: &mut Context<Self>) {
@@ -2733,6 +3012,7 @@ impl SketchGpuiView {
     fn next_tab(&mut self, _: &NextTab, _w: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.tabs.len() > 1 {
             self.workspace.next_tab();
+            self.save_workspace_state();
             cx.notify();
         }
     }
@@ -2740,6 +3020,7 @@ impl SketchGpuiView {
     fn prev_tab(&mut self, _: &PrevTab, _w: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.tabs.len() > 1 {
             self.workspace.prev_tab();
+            self.save_workspace_state();
             cx.notify();
         }
     }
@@ -2751,6 +3032,7 @@ impl SketchGpuiView {
         self.workspace.push_initial_tab(WindowContent::Browser(BrowserWindow {
             fb: FileBrowser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         }));
+        self.save_workspace_state();
         cx.notify();
     }
 
@@ -2765,18 +3047,21 @@ impl SketchGpuiView {
         }
         let idx = self.workspace.active_tab;
         self.workspace.close_tab(idx);
+        self.save_workspace_state();
         cx.notify();
     }
 
     /// `Ctrl-W s` — horizontal split: new pane below the focused one.
     fn split_h(&mut self, _: &SplitH, _w: &mut Window, cx: &mut Context<Self>) {
         self.split_focused_with_browser(workspace::SplitDir::H);
+        self.save_workspace_state();
         cx.notify();
     }
 
     /// `Ctrl-W v` — vertical split: new pane to the right of the focused one.
     fn split_v(&mut self, _: &SplitV, _w: &mut Window, cx: &mut Context<Self>) {
         self.split_focused_with_browser(workspace::SplitDir::V);
+        self.save_workspace_state();
         cx.notify();
     }
 
@@ -2796,7 +3081,10 @@ impl SketchGpuiView {
     /// the tab, close the tab instead.
     fn close_window(&mut self, _: &CloseWindow, _w: &mut Window, cx: &mut Context<Self>) {
         match self.workspace.close_focused() {
-            Ok(Some(_new_focus)) => cx.notify(),
+            Ok(Some(_new_focus)) => {
+                self.save_workspace_state();
+                cx.notify();
+            }
             Ok(None) => {
                 // Tab is empty — close the tab too (or quit if last).
                 if self.workspace.tabs.len() <= 1 {
@@ -2805,6 +3093,7 @@ impl SketchGpuiView {
                 }
                 let idx = self.workspace.active_tab;
                 self.workspace.close_tab(idx);
+                self.save_workspace_state();
                 cx.notify();
             }
             Err(()) => {}
@@ -2814,34 +3103,41 @@ impl SketchGpuiView {
     /// `Ctrl-W o` — keep only the focused window.
     fn only_window(&mut self, _: &OnlyWindow, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.only();
+        self.save_workspace_state();
         cx.notify();
     }
 
     /// `Ctrl-W h/j/k/l` — move focus to a sibling split in that direction.
     fn focus_left(&mut self, _: &FocusLeft, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.focus_motion(workspace::FocusDir::Left);
+        self.save_workspace_state();
         cx.notify();
     }
     fn focus_right(&mut self, _: &FocusRight, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.focus_motion(workspace::FocusDir::Right);
+        self.save_workspace_state();
         cx.notify();
     }
     fn focus_up(&mut self, _: &FocusUp, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.focus_motion(workspace::FocusDir::Up);
+        self.save_workspace_state();
         cx.notify();
     }
     fn focus_down(&mut self, _: &FocusDown, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.focus_motion(workspace::FocusDir::Down);
+        self.save_workspace_state();
         cx.notify();
     }
 
     /// `Ctrl-W w` / `Ctrl-W W` — cycle focus through leaves in tree order.
     fn focus_next(&mut self, _: &FocusNext, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.focus_next();
+        self.save_workspace_state();
         cx.notify();
     }
     fn focus_prev(&mut self, _: &FocusPrev, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.focus_prev();
+        self.save_workspace_state();
         cx.notify();
     }
 
@@ -6584,6 +6880,13 @@ fn main() {
                             focus_handle,
                         ),
                     };
+                    // If we were launched with no explicit file arg, try to
+                    // restore the saved workspace for this cwd. With an
+                    // explicit arg the user wants that file, so the saved
+                    // snapshot stays on disk for the next no-arg launch.
+                    if initial_doc.is_none() {
+                        view.restore_workspace_from_disk();
+                    }
                     // Reboot handoff: the previous sketch process set this
                     // env var via `reboot_into_claude` to mean "boot
                     // straight into the claude screen and resume every
