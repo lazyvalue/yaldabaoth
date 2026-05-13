@@ -129,6 +129,13 @@ actions!(
         SplitV,
         CloseWindow,
         OnlyWindow,
+        // Focus motion within the active tab's split tree
+        FocusLeft,
+        FocusRight,
+        FocusUp,
+        FocusDown,
+        FocusNext,
+        FocusPrev,
         // Browser view
         BrowserDown,
         BrowserUp,
@@ -2810,6 +2817,34 @@ impl SketchGpuiView {
         cx.notify();
     }
 
+    /// `Ctrl-W h/j/k/l` — move focus to a sibling split in that direction.
+    fn focus_left(&mut self, _: &FocusLeft, _w: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.focus_motion(workspace::FocusDir::Left);
+        cx.notify();
+    }
+    fn focus_right(&mut self, _: &FocusRight, _w: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.focus_motion(workspace::FocusDir::Right);
+        cx.notify();
+    }
+    fn focus_up(&mut self, _: &FocusUp, _w: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.focus_motion(workspace::FocusDir::Up);
+        cx.notify();
+    }
+    fn focus_down(&mut self, _: &FocusDown, _w: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.focus_motion(workspace::FocusDir::Down);
+        cx.notify();
+    }
+
+    /// `Ctrl-W w` / `Ctrl-W W` — cycle focus through leaves in tree order.
+    fn focus_next(&mut self, _: &FocusNext, _w: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.focus_next();
+        cx.notify();
+    }
+    fn focus_prev(&mut self, _: &FocusPrev, _w: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.focus_prev();
+        cx.notify();
+    }
+
     // ---- Browser actions ----------------------------------------------------
 
     fn browser_down(&mut self, _: &BrowserDown, _w: &mut Window, cx: &mut Context<Self>) {
@@ -4939,6 +4974,12 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::split_v))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::only_window))
+            .on_action(cx.listener(Self::focus_left))
+            .on_action(cx.listener(Self::focus_right))
+            .on_action(cx.listener(Self::focus_up))
+            .on_action(cx.listener(Self::focus_down))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
             .child(header)
             .child(body)
             .child(footer)
@@ -6469,6 +6510,13 @@ fn main() {
             KeyBinding::new("ctrl-w v", SplitV, None),
             KeyBinding::new("ctrl-w c", CloseWindow, None),
             KeyBinding::new("ctrl-w o", OnlyWindow, None),
+            // Vim-style focus motion across split panes.
+            KeyBinding::new("ctrl-w h", FocusLeft, None),
+            KeyBinding::new("ctrl-w l", FocusRight, None),
+            KeyBinding::new("ctrl-w k", FocusUp, None),
+            KeyBinding::new("ctrl-w j", FocusDown, None),
+            KeyBinding::new("ctrl-w w", FocusNext, None),
+            KeyBinding::new("ctrl-w shift-w", FocusPrev, None),
         ]);
 
         // Browser-view bindings.

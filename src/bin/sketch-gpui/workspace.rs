@@ -635,6 +635,90 @@ impl<C> Workspace<C> {
         Ok(())
     }
 
+    /// Cycle focus to the next leaf in tree order (depth-first, in
+    /// `children` order). Wraps from the last leaf to the first. No-op if
+    /// the active tab has fewer than 2 leaves.
+    pub fn focus_next(&mut self) -> Result<(), ()> {
+        let tab = self.active_tab_mut().ok_or(())?;
+        let ids = tab.layout.leaf_ids();
+        if ids.len() < 2 {
+            return Ok(());
+        }
+        let pos = ids.iter().position(|&id| id == tab.focused).ok_or(())?;
+        let next = (pos + 1) % ids.len();
+        tab.focused = ids[next];
+        Ok(())
+    }
+
+    /// Cycle focus to the previous leaf in tree order.
+    pub fn focus_prev(&mut self) -> Result<(), ()> {
+        let tab = self.active_tab_mut().ok_or(())?;
+        let ids = tab.layout.leaf_ids();
+        if ids.len() < 2 {
+            return Ok(());
+        }
+        let pos = ids.iter().position(|&id| id == tab.focused).ok_or(())?;
+        let prev = if pos == 0 { ids.len() - 1 } else { pos - 1 };
+        tab.focused = ids[prev];
+        Ok(())
+    }
+
+    /// Topological focus motion. Walks up the tree from the focused leaf to
+    /// find the nearest ancestor `Split` whose direction matches:
+    ///
+    /// - `Left`/`Right` → nearest `SplitDir::V` ancestor (children laid out
+    ///   left-to-right).
+    /// - `Up`/`Down` → nearest `SplitDir::H` ancestor (children laid out
+    ///   top-to-bottom).
+    ///
+    /// At that ancestor, moves to the sibling at `current_idx ± 1`. If the
+    /// sibling is itself a `Split`, descends into its first leaf (matching
+    /// vim's "land on the most-recently-focused descendant" heuristic with
+    /// a simpler proxy — left-most/top-most leaf).
+    ///
+    /// No-op when there's no sibling in the requested direction.
+    pub fn focus_motion(&mut self, dir: FocusDir) -> Result<(), ()> {
+        let tab = self.active_tab_mut().ok_or(())?;
+        let focused = tab.focused;
+        let path = tab.layout.path_to(focused).ok_or(())?;
+        if path.is_empty() {
+            return Ok(());
+        }
+        let want_dir = match dir {
+            FocusDir::Left | FocusDir::Right => SplitDir::V,
+            FocusDir::Up | FocusDir::Down => SplitDir::H,
+        };
+        let delta: isize = match dir {
+            FocusDir::Right | FocusDir::Down => 1,
+            FocusDir::Left | FocusDir::Up => -1,
+        };
+
+        // Walk path back-to-front looking for the nearest matching-direction
+        // ancestor that has a sibling in the requested direction.
+        for depth in (0..path.len()).rev() {
+            let parent_path = &path[..depth];
+            let child_idx = path[depth];
+            let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+            let Layout::Split { dir: parent_dir, children } = parent else {
+                continue;
+            };
+            if *parent_dir != want_dir {
+                continue;
+            }
+            let target_idx = (child_idx as isize) + delta;
+            if target_idx < 0 || target_idx as usize >= children.len() {
+                continue; // No sibling in this direction at this depth.
+            }
+            // Descend into the target sibling's first leaf (or itself if leaf).
+            let target_layout = &children[target_idx as usize].1;
+            if let Some(&first_leaf_id) = target_layout.leaf_ids().first() {
+                tab.focused = first_leaf_id;
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     /// Equalize all weights in the focused window's parent split. No-op if
     /// the focused leaf is the tab's root.
     pub fn equalize_focused(&mut self) -> Result<(), ()> {
@@ -924,6 +1008,79 @@ mod tests {
             assert!((children[0].0 - 0.6).abs() < 1e-5);
             assert!((children[1].0 - 0.4).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn focus_next_cycles_in_tree_order() {
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![
+                (0.5, leaf(1, "a")),
+                (
+                    0.5,
+                    Layout::Split {
+                        dir: SplitDir::H,
+                        children: vec![(0.5, leaf(2, "b")), (0.5, leaf(3, "c"))],
+                    },
+                ),
+            ],
+        };
+        let mut ws = ws_with_layout(layout, 1);
+        ws.focus_next().unwrap();
+        assert_eq!(ws.active_tab().unwrap().focused, 2);
+        ws.focus_next().unwrap();
+        assert_eq!(ws.active_tab().unwrap().focused, 3);
+        ws.focus_next().unwrap();
+        assert_eq!(ws.active_tab().unwrap().focused, 1, "wraps around");
+    }
+
+    #[test]
+    fn focus_motion_left_right_walks_v_split() {
+        // [a | b | c] — V split with three children.
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![
+                (0.33, leaf(1, "a")),
+                (0.34, leaf(2, "b")),
+                (0.33, leaf(3, "c")),
+            ],
+        };
+        let mut ws = ws_with_layout(layout, 2);
+        ws.focus_motion(FocusDir::Right).unwrap();
+        assert_eq!(ws.active_tab().unwrap().focused, 3);
+        ws.focus_motion(FocusDir::Right).unwrap();
+        assert_eq!(ws.active_tab().unwrap().focused, 3, "no-op at right edge");
+        ws.focus_motion(FocusDir::Left).unwrap();
+        assert_eq!(ws.active_tab().unwrap().focused, 2);
+    }
+
+    #[test]
+    fn focus_motion_down_descends_through_nested_split() {
+        // Outer H split [top / bottom]; bottom is a V split [b | c].
+        // From top (1), Down should land on bottom's first leaf (b → 2).
+        let layout = Layout::Split {
+            dir: SplitDir::H,
+            children: vec![
+                (0.5, leaf(1, "top")),
+                (
+                    0.5,
+                    Layout::Split {
+                        dir: SplitDir::V,
+                        children: vec![(0.5, leaf(2, "b")), (0.5, leaf(3, "c"))],
+                    },
+                ),
+            ],
+        };
+        let mut ws = ws_with_layout(layout, 1);
+        ws.focus_motion(FocusDir::Down).unwrap();
+        assert_eq!(ws.active_tab().unwrap().focused, 2);
+    }
+
+    #[test]
+    fn focus_motion_no_op_at_root() {
+        let mut ws = ws_with_layout(leaf(1, "only"), 1);
+        ws.focus_motion(FocusDir::Right).unwrap();
+        assert_eq!(ws.active_tab().unwrap().focused, 1);
     }
 
     #[test]
