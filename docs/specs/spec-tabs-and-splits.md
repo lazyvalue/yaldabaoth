@@ -1,8 +1,8 @@
 # Tabs and Splits (GPUI Workspace Model)
 
-**Status:** DRAFT
+**Status:** PARTIAL — workspace data model, tabs, splits, focus motion, resize, and persistence SHIPPED; shared buffer pool (Behaviors 9–11, 21–22) and `SessionRing` dissolution (Constraint §2) DRAFT.
 
-**Last updated:** 2026-05-11
+**Last updated:** 2026-05-13
 
 ## Builds On
 
@@ -31,17 +31,17 @@ Buffers follow a hybrid model: file-backed `EditorCore`s live in the global `Wor
 
 ### Workspace lifecycle
 
-1. **Bootstrap.** [DRAFT] On launch, the GPUI app constructs a `Workspace` with exactly one tab containing one window. The window's initial content matches today's startup behavior — `Doc` over the file the user opened, or `Browser` if launched into a directory. Tab is auto-named (`tab-1`).
+1. **Bootstrap.** [SHIPPED] On launch, the GPUI app constructs a `Workspace` with exactly one tab containing one window. The window's initial content matches today's startup behavior — `Doc` over the file the user opened, or `Browser` if launched into a directory. Tab is auto-named (`tab-1`).
 
 2. **Quit.** [DRAFT] Closing the last tab does not auto-quit — the workspace shows an empty placeholder tab (one window, `Browser` rooted at cwd). Quitting the app is `:q` / `Cmd-Q` as today.
 
 ### Tab lifecycle
 
-3. **Create.** [DRAFT] `:tabnew [path]` and `Cmd-T` (or menu: `Space → w → t`) create a new tab. With no argument, the new tab contains one `BrowserWindow` rooted at cwd. With a path argument, it contains one `DocWindow` over the (newly-pooled, if needed) `EditorCore`. The new tab is auto-named (`tab-{N}` with monotonic `N`, stored in `Tab.auto_name`) and becomes active.
+3. **Create.** [SHIPPED] `:tabnew [path]` and `Cmd-T` (or menu: `Space → w → t`) create a new tab. With no argument, the new tab contains one `BrowserWindow` rooted at cwd. With a path argument, it contains one `DocWindow` over the (newly-pooled, if needed) `EditorCore`. The new tab is auto-named (`tab-{N}` with monotonic `N`, stored in `Tab.auto_name`) and becomes active.
 
-4. **Switch.** [DRAFT] `:tabnext` / `:tabprev` (`Ctrl-Tab` / `Ctrl-Shift-Tab`, menu: `Space → w → ]` / `Space → w → [`) cycle through tabs. Clicking a tab in the strip switches to it. Switching restores the tab's last-focused window.
+4. **Switch.** [SHIPPED] `:tabnext` / `:tabprev` (`Ctrl-Tab` / `Ctrl-Shift-Tab`, menu: `Space → w → ]` / `Space → w → [`) cycle through tabs. Clicking a tab in the strip switches to it. Switching restores the tab's last-focused window.
 
-5. **Close.** [DRAFT] `:tabclose` (`Cmd-Shift-W` from inside the tab, menu: `Space → w → x`) closes the active tab. All windows in the tab are closed in tree order — `ClaudeWindow`s drop their `AcpChannelClient`s (subprocess killed); `BrowserWindow`s drop their `FileBrowser`s; `DocWindow` / `EditWindow` instances drop their `EditorView` and decrement the referenced `EditorCore`'s refcount. An `EditorCore` is removed from the pool when its refcount reaches zero AND it has no unsaved changes; dirty cores remain in the pool with zero references (recoverable via `:buffers`). Per behavior 2, closing the last tab opens an empty placeholder, not the app.
+5. **Close.** [SHIPPED] `:tabclose` (`Cmd-Shift-W` from inside the tab, menu: `Space → w → x`) closes the active tab. All windows in the tab are closed in tree order — `ClaudeWindow`s drop their `AcpChannelClient`s (subprocess killed); `BrowserWindow`s drop their `FileBrowser`s; `DocWindow` / `EditWindow` instances drop their `EditorView` and decrement the referenced `EditorCore`'s refcount. An `EditorCore` is removed from the pool when its refcount reaches zero AND it has no unsaved changes; dirty cores remain in the pool with zero references (recoverable via `:buffers`). Per behavior 2, closing the last tab opens an empty placeholder, not the app.
 
 6. **Rename.** [DRAFT] `:tabrename {name}` sets the active tab's `display_name`. Names are cosmetic; the strip falls back to `auto_name` when `display_name` is empty.
 
@@ -79,7 +79,7 @@ Buffers follow a hybrid model: file-backed `EditorCore`s live in the global `Wor
 
 ### Layout — splits, close, resize
 
-12. **Split.** [DRAFT] From a focused leaf window:
+12. **Split.** [SHIPPED] From a focused leaf window:
 
    - `:split [path]` / `Ctrl-W s` adds a horizontal split — a new leaf below the focused one.
    - `:vsplit [path]` / `Ctrl-W v` adds a vertical split — a new leaf to the right.
@@ -87,9 +87,9 @@ Buffers follow a hybrid model: file-backed `EditorCore`s live in the global `Wor
    - The new window inherits the parent split's direction if compatible; otherwise the focused leaf is wrapped in a new `Split` with two children.
    - **Creating a `ClaudeWindow` via split:** `:claude-new` (carried over from `spec-multi-session.md`) now splits the focused tab — vertical split by default, configurable — and inserts a new `ClaudeWindow` on the new leaf. `:claude-attach <id>` likewise splits and inserts a `ClaudeWindow` bound to the given session id.
 
-13. **Split with children count.** [DRAFT] Splits are always n-ary with `children.len() >= 2`. Adding a window adjacent to an existing split of the same direction appends to that split's children (no nesting). Adding a window in the perpendicular direction creates a new nested split. Initial weight for a newly inserted child is the average of its siblings; existing siblings are renormalized proportionally so weights still sum to 1.0.
+13. **Split with children count.** [SHIPPED] Splits are always n-ary with `children.len() >= 2`. Adding a window adjacent to an existing split of the same direction appends to that split's children (no nesting). Adding a window in the perpendicular direction creates a new nested split. Initial weight for a newly inserted child is the average of its siblings; existing siblings are renormalized proportionally so weights still sum to 1.0.
 
-14. **Close window.** [DRAFT] `:close` / `Ctrl-W c` removes the focused leaf. The pruning algorithm:
+14. **Close window.** [SHIPPED] `:close` / `Ctrl-W c` removes the focused leaf. The pruning algorithm:
 
     1. Remove the leaf from its parent split's `children`.
     2. If the parent split now has 1 child, replace the parent with that child (collapse).
@@ -99,19 +99,19 @@ Buffers follow a hybrid model: file-backed `EditorCore`s live in the global `Wor
 
     Focus moves to the spatially-nearest sibling (heuristic: previous index in the parent split's `children`, else first remaining child of the grandparent).
 
-15. **Only.** [DRAFT] `:only` / `Ctrl-W o` closes every window in the tab except the focused one. The focused leaf becomes the tab's root `Layout`.
+15. **Only.** [SHIPPED] `:only` / `Ctrl-W o` closes every window in the tab except the focused one. The focused leaf becomes the tab's root `Layout`.
 
-16. **Resize.** [DRAFT] `Ctrl-W <` / `Ctrl-W >` / `Ctrl-W -` / `Ctrl-W +` shift weight between the focused window and its immediate sibling within the parent split (5% of the parent's allocation per keypress). Resizing across splits (e.g., resizing the parent split's outer boundary) is out of scope; weights apply only inside a single `Split` node. Mouse-drag resize is **out of scope for v1** (see Constraint §8).
+16. **Resize.** [SHIPPED] `Ctrl-W <` / `Ctrl-W >` / `Ctrl-W -` / `Ctrl-W +` shift weight between the focused window and its immediate sibling within the parent split (5% of the parent's allocation per keypress). Resizing across splits (e.g., resizing the parent split's outer boundary) is out of scope; weights apply only inside a single `Split` node. Mouse-drag resize is **out of scope for v1** (see Constraint §8).
 
-17. **Equalize.** [DRAFT] `Ctrl-W =` resets all weights in the focused window's parent split to equal. Does not recurse into nested splits.
+17. **Equalize.** [SHIPPED] `Ctrl-W =` resets all weights in the focused window's parent split to equal. Does not recurse into nested splits.
 
 ### Focus
 
-18. **Focused window per tab.** [DRAFT] Each tab tracks `focused: WindowId`. Switching tabs restores that tab's focused window. Creating a new window (split, browser-open, etc.) moves focus to the new window. Closing the focused window moves focus per behavior 14.
+18. **Focused window per tab.** [SHIPPED] Each tab tracks `focused: WindowId`. Switching tabs restores that tab's focused window. Creating a new window (split, browser-open, etc.) moves focus to the new window. Closing the focused window moves focus per behavior 14.
 
-19. **Vim-style focus motions.** [DRAFT] `Ctrl-W h | j | k | l` moves focus to the spatially-nearest window in that direction. The algorithm uses **cached leaf screen-rects** populated by the paint pass (`Tab.last_paint_rects: HashMap<WindowId, Rect>`); a keypress never triggers a layout pass. The algorithm projects each leaf rect onto the screen, picks the leaf whose center is closest along the target axis among those that overlap the focused leaf's perpendicular extent, and breaks ties by most-recently-focused. If no overlapping leaf exists in that direction, focus does not move. `Ctrl-W w` cycles forward through windows in tree order; `Ctrl-W W` cycles backward.
+19. **Vim-style focus motions.** [PARTIAL — topological motion shipped; screen-rect cache is a follow-up] `Ctrl-W h | j | k | l` moves focus to the spatially-nearest window in that direction. The algorithm uses **cached leaf screen-rects** populated by the paint pass (`Tab.last_paint_rects: HashMap<WindowId, Rect>`); a keypress never triggers a layout pass. The algorithm projects each leaf rect onto the screen, picks the leaf whose center is closest along the target axis among those that overlap the focused leaf's perpendicular extent, and breaks ties by most-recently-focused. If no overlapping leaf exists in that direction, focus does not move. `Ctrl-W w` cycles forward through windows in tree order; `Ctrl-W W` cycles backward.
 
-20. **Key dispatch within a window.** [DRAFT] After workspace-level shortcuts (tab switching, `Ctrl-W <motion>`, etc.) are matched, all other keys route to the focused window's content kind, which dispatches to the existing handlers (`handle_doc_key`, `handle_edit_key`, `handle_claude_key`, `handle_browser_key` — unchanged in semantics).
+20. **Key dispatch within a window.** [SHIPPED] After workspace-level shortcuts (tab switching, `Ctrl-W <motion>`, etc.) are matched, all other keys route to the focused window's content kind, which dispatches to the existing handlers (`handle_doc_key`, `handle_edit_key`, `handle_claude_key`, `handle_browser_key` — unchanged in semantics).
 
 ### Buffer pool semantics
 
@@ -126,7 +126,7 @@ Buffers follow a hybrid model: file-backed `EditorCore`s live in the global `Wor
 
 ### Persistence
 
-23. **Workspace persistence.** [DRAFT] On change, the workspace is serialized to `~/.cache/sketch/workspace.json` keyed by `cwd`. Format:
+23. **Workspace persistence.** [SHIPPED — every structural mutation triggers a write; focus-change debounce is a follow-up] On change, the workspace is serialized to `~/.cache/sketch/workspace.json` keyed by `cwd`. Format:
 
     ```json
     {
@@ -160,7 +160,7 @@ Buffers follow a hybrid model: file-backed `EditorCore`s live in the global `Wor
 
     **Write trigger and debouncing.** Structural changes (tab add/remove/rename, window split/close, content kind swap) write immediately. Focus changes (active tab, focused window) are coalesced behind a 250ms debounce so rapid `Ctrl-W h|j|k|l` or `Ctrl-Tab` runs produce at most one write per quiescent period. Best-effort writes, silent failure, last-writer-wins for concurrent sketch instances on the same cwd.
 
-24. **Restore.** [DRAFT] On launch, the workspace loader reads `workspace.json[cwd]`. Each leaf reconstructs:
+24. **Restore.** [PARTIAL — Doc / Edit / Browser leaves restore; Claude leaves come back as Browser stubs and the user reattaches via the existing Claude commands] On launch, the workspace loader reads `workspace.json[cwd]`. Each leaf reconstructs:
 
     - `DocWindow` / `EditWindow` — opens the canonical path into the buffer pool (pooled on first reference; subsequent references share). If the file is missing or unreadable, the leaf is replaced with a `BrowserWindow` rooted at the file's parent dir and a one-line message lands in the footer.
     - `ClaudeWindow` — spawns an `AcpChannelClient` with `session/load(session_id)`. On load success, `load_outcome = Resumed`. On load failure, the leaf survives — the channel falls back to `session/new`; `load_outcome = FallbackToNew`, `resume_id` is **preserved unchanged** so the next reboot retries the original id. The window header shows a `[new]` suffix after its label (e.g., `claude-1 [new]`) and the footer logs `claude-1: session not resumable, started fresh`. This rule is the same as `spec-multi-session.md` §15 — inlined here because that contract is unshipped.
@@ -397,5 +397,6 @@ Menu (DRAFT, new top-level `w` submenu — "windows"):
 
 ## Revision History
 
+- 2026-05-13 — First implementation wave landed (commits `190b896`..`3576b3d`). SHIPPED: `EditorCore` / `EditorView` split with `Editor` wrapper preserving TUI surface; `Workspace<C>` + `Tab` + n-ary `Layout` with split/close/only/resize/equalize and 15+ unit tests; binary directory layout; full structural pivot in `SketchGpuiView` (old `screen` / `open_buffers` / `active_buffer_idx` deleted, `OpenBuffer` struct gone, content routed via `workspace.focused_content_*`); tab strip + `Ctrl-Tab` cycling + `Cmd-T` / `Cmd-Shift-W`; recursive layout renderer (weighted flex grids, focused-leaf border); `Ctrl-W` chord prefix bound to `s` / `v` / `c` / `o` / `h` / `j` / `k` / `l` / `w` / `W` / `<` / `>` / `-` / `+` / `=`; topological focus motion; `workspace.json` autosave + restore (Doc / Edit / Browser leaves; Claude restored as Browser stub); clone-focused-content on split (Doc → Doc, Edit → Edit re-reading from disk); proper Edit-mode reconstruction on restore. DRAFT still: shared `FileBuffer` pool (so Doc / Edit in two windows share an editor — Behaviors 9–11, 21–22); `SessionRing` dissolution (Constraint §2 — Claude session per window); placeholder-tab on last close (Behavior 2); `:tabrename` binding (Behavior 6); screen-rect-based focus motion (Behavior 19 currently topological); 250ms focus-change debounce on persistence (Behavior 23 currently writes on every focus change); cross-window edit propagation broadcast (Behavior 10 — pending shared pool).
 - 2026-05-11 (2) — Adversarial review pass. Cursor lift expanded into `EditorCore` / `EditorView` split (new Overview artifacts §5–§6, Data Model section, Constraint §3 honest about scope and TUI parity). Cross-window buffer sharing detailed in new Behaviors §9–§11 (per-view cursor, edit propagation via shift broadcast, shared-undo contract). `:tabn` alias collision removed. Persistence write trigger debounced (250ms on focus changes; structural changes synchronous). `:bdelete` Doc/Edit→Browser transition added to Behavior 8. `Ctrl-W` rebinding documented; `:wp-toggle` added on `Ctrl-Shift-E`. `Cmd-W` swapped to `:close`; `Cmd-Shift-W` is `:tabclose`. Tab strip always-visible (Constraint §9). `ClaudeWindow` load fallback exposes `LoadOutcome` + `[new]` label suffix + footer hint (Behavior 24). Path canonicalization spelled out (Constraint §11). Leaf rects cached at paint for focus motion (Behavior 19). Mouse-drag resize marked explicitly out-of-scope for v1 (Constraint §8). `Tab.auto_name` / `display_name` separation. Inlined `spec-multi-session.md` §15's `resume_id` semantics here rather than depending on unshipped contract.
 - 2026-05-11 — Initial draft.
