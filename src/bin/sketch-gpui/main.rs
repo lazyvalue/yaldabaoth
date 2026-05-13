@@ -4097,12 +4097,16 @@ impl SketchGpuiView {
         let strip_bg: Hsla = rgb(STATUS_BG).into();
         let active_bg: Hsla = rgb(0x282a36).into();
 
+        // Vertical sidebar on the left, fixed-width. Flex default for
+        // align-items is stretch, which is what we want — entries fill the
+        // strip width and truncate via overflow_hidden.
         let mut strip = div()
             .flex()
-            .flex_row()
-            .items_center()
-            .px_2()
-            .h(px(24.0))
+            .flex_col()
+            .px_1()
+            .py_2()
+            .w(px(160.0))
+            .min_w(px(160.0))
             .bg(strip_bg)
             .text_size(px(12.0))
             .font_family(self.body_font.clone())
@@ -4115,11 +4119,13 @@ impl SketchGpuiView {
             let bg = if is_active { active_bg } else { strip_bg };
 
             let entry = div()
-                .px_3()
+                .w_full()
+                .px_2()
                 .py_1()
                 .rounded(px(3.0))
                 .bg(bg)
                 .text_color(fg)
+                .overflow_hidden()
                 .child(label);
             strip = strip.child(entry);
         }
@@ -4127,9 +4133,9 @@ impl SketchGpuiView {
         div()
             .size_full()
             .flex()
-            .flex_col()
+            .flex_row()
             .child(strip)
-            .child(div().flex_1().min_h_0().child(screen_view))
+            .child(div().flex_1().min_w_0().min_h_0().child(screen_view))
             .into_any_element()
     }
 
