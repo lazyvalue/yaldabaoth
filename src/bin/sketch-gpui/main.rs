@@ -2346,14 +2346,6 @@ struct MenuOverlay {
     menu: Vec<MenuNode>,
 }
 
-/// One entry in the open-buffer list. Mirrors the TUI's `Vec<Buffer>` concept.
-/// The currently-active buffer has `state: None` (its live state is in
-/// `SketchGpuiView::screen`); stashed buffers have `state: Some(screen)`.
-struct OpenBuffer {
-    file_label: SharedString,
-    state: Option<WindowContent>,
-}
-
 /// Overlay state for the buffer-list picker (TUI: `AppScreen::BufferList`).
 struct BufferSwitcher {
     selected: usize,
@@ -2406,19 +2398,10 @@ struct SketchGpuiView {
     /// Active TUI-style menu overlay. `Some` while the picker is open;
     /// flipped to `None` on Esc-from-root or after a command is dispatched.
     menu: Option<MenuOverlay>,
-    /// All open document buffers. The currently-active buffer is at index
-    /// `active_buffer_idx` with `state: None` (its live state is in
-    /// `self.screen`). Non-Browser/Claude screens count as buffers.
-    open_buffers: Vec<OpenBuffer>,
-    /// Index into `open_buffers` for the currently-displayed document.
-    active_buffer_idx: usize,
     /// Buffer-list picker overlay — open while `Some`.
     buffer_switcher: Option<BufferSwitcher>,
     /// Tabs + n-ary split tree (spec-tabs-and-splits.md). The focused
-    /// window's content is the authoritative live state — `screen` and
-    /// `open_buffers` are now thin views over `workspace.tabs` for the
-    /// duration of the migration and will be removed once their last call
-    /// site is gone.
+    /// window's content is the authoritative live state for the workspace.
     workspace: workspace::Workspace<WindowContent>,
 }
 
@@ -2443,8 +2426,6 @@ impl SketchGpuiView {
             code_font: SharedString::new_static("Menlo"),
             focus_handle,
             menu: None,
-            open_buffers: vec![OpenBuffer { file_label: label, state: None }],
-            active_buffer_idx: 0,
             buffer_switcher: None,
             workspace: workspace::Workspace::with_initial(initial),
         }
@@ -2460,8 +2441,6 @@ impl SketchGpuiView {
             code_font: SharedString::new_static("Menlo"),
             focus_handle,
             menu: None,
-            open_buffers: Vec::new(),
-            active_buffer_idx: 0,
             buffer_switcher: None,
             workspace: workspace::Workspace::with_initial(initial),
         }
@@ -2508,9 +2487,8 @@ impl SketchGpuiView {
         }
     }
 
-    /// Open `path` as a doc. If it's already in `open_buffers`, switch to it.
-    /// Otherwise push a new buffer, stash the current screen, and display the
-    /// new file. Returns false on read error.
+    /// Open `path` as a doc. If it's already in a tab, switch to that tab.
+    /// Otherwise push a new tab containing the doc. Returns false on read error.
     fn open_file(&mut self, path: PathBuf) -> bool {
         let canon = path
             .canonicalize()
@@ -2518,14 +2496,12 @@ impl SketchGpuiView {
             .display()
             .to_string();
 
-        // Already open? Switch to it.
-        for (i, ob) in self.open_buffers.iter().enumerate() {
-            if ob.file_label.as_ref() == canon {
-                if i != self.active_buffer_idx {
-                    self.switch_to_buffer(i);
-                }
-                return true;
+        // Already open? Switch to that tab.
+        if let Some(idx) = self.find_tab_by_doc_label(&canon) {
+            if idx != self.workspace.active_tab {
+                self.workspace.active_tab = idx;
             }
+            return true;
         }
 
         let text = match std::fs::read_to_string(&path) {
@@ -2538,105 +2514,72 @@ impl SketchGpuiView {
         let label: SharedString = canon.into();
         let doc = Document::from_text(text, path.clone());
         let blocks = render::render(&doc.full_text(), &self.theme);
-        let new_screen = WindowContent::Doc(DocState {
+        let new_content = WindowContent::Doc(DocState {
             blocks,
-            file_label: label.clone(),
+            file_label: label,
             cursor_block: 0,
             scroll_handle: ScrollHandle::new(),
             edit_cache: None,
         });
 
-        // Stash current screen into its buffer slot (if one exists).
-        self.stash_active_screen();
-
-        // Push the new buffer and make it active.
-        let new_idx = self.open_buffers.len();
-        self.open_buffers.push(OpenBuffer {
-            file_label: label,
-            state: None,
-        });
-        self.set_screen(new_screen);
-        self.active_buffer_idx = new_idx;
+        // If the current tab is a transient Browser, replace its content
+        // (matches today's "browser disappears when you pick a file"). For
+        // Doc/Edit/Claude, push a new tab so the existing work isn't lost.
+        let replace_in_place = matches!(
+            self.workspace.focused_content(),
+            Some(WindowContent::Browser(_))
+        );
+        if replace_in_place {
+            self.set_screen(new_content);
+        } else {
+            self.workspace.push_initial_tab(new_content);
+        }
         true
     }
 
-    /// Stash the current `self.screen` into `open_buffers[active_buffer_idx]`.
-    /// Only meaningful for Doc/Edit screens that correspond to a buffer slot.
-    fn stash_active_screen(&mut self) {
-        if self.open_buffers.is_empty() {
-            return;
+    /// Find a tab whose focused content is a Doc/Edit with the given file
+    /// label. Returns the tab index, or None.
+    fn find_tab_by_doc_label(&self, label: &str) -> Option<usize> {
+        for (i, tab) in self.workspace.tabs.iter().enumerate() {
+            if let workspace::Layout::Leaf(w) = &tab.layout {
+                match &w.content {
+                    WindowContent::Doc(d) if d.file_label.as_ref() == label => return Some(i),
+                    WindowContent::Edit(e) if e.file_label.as_ref() == label => return Some(i),
+                    _ => {}
+                }
+            }
         }
-        // Update label from the live screen (Edit may have changed it via save-as).
-        let label = screen_file_label(self.workspace.focused_content().expect("no focused window"));
-        if let Some(l) = label {
-            self.open_buffers[self.active_buffer_idx].file_label = l;
-        }
-        let placeholder = WindowContent::Doc(DocState {
-            blocks: Vec::new(),
-            file_label: SharedString::new_static(""),
-            cursor_block: 0,
-            scroll_handle: ScrollHandle::new(),
-            edit_cache: None,
-        });
-        let old_screen = self
-            .workspace
-            .replace_focused_content(placeholder)
-            .expect("workspace has no focused window");
-        self.open_buffers[self.active_buffer_idx].state = Some(old_screen);
+        None
     }
 
-    /// Switch to the buffer at `idx`. Stashes the current screen and restores
-    /// the target buffer's screen.
+    /// Switch the workspace to the tab at `idx`. Used by the buffer-list
+    /// picker. No-op if idx is out of range.
     fn switch_to_buffer(&mut self, idx: usize) {
-        if idx == self.active_buffer_idx || idx >= self.open_buffers.len() {
+        if idx >= self.workspace.tabs.len() || idx == self.workspace.active_tab {
             return;
         }
-        self.stash_active_screen();
-        self.active_buffer_idx = idx;
-        if let Some(screen) = self.open_buffers[idx].state.take() {
-            self.set_screen(screen);
-        }
+        self.workspace.active_tab = idx;
     }
 
-    /// Close the buffer at `idx`. Returns false if the buffer is modified
-    /// (refusing to close). If it's the last buffer, quits.
+    /// Close the tab at `idx`. Returns false if the tab's content has unsaved
+    /// modifications (refusing to close). If it's the last tab, quits.
     fn close_buffer_at(&mut self, idx: usize, cx: &mut Context<Self>) -> bool {
-        // Check if the buffer is modified.
-        let is_modified = if idx == self.active_buffer_idx {
-            screen_is_modified(self.workspace.focused_content().expect("no focused window"))
-        } else {
-            self.open_buffers[idx]
-                .state
-                .as_ref()
-                .map_or(false, screen_is_modified)
+        if idx >= self.workspace.tabs.len() {
+            return true;
+        }
+        // Check if the tab's focused content is modified.
+        let is_modified = match &self.workspace.tabs[idx].layout {
+            workspace::Layout::Leaf(w) => screen_is_modified(&w.content),
+            _ => false,
         };
         if is_modified {
             return false;
         }
-        if self.open_buffers.len() <= 1 {
+        if self.workspace.tabs.len() <= 1 {
             cx.quit();
             return true;
         }
-        // If closing the active buffer, switch away first.
-        if idx == self.active_buffer_idx {
-            let next = if idx + 1 < self.open_buffers.len() {
-                idx + 1
-            } else {
-                idx - 1
-            };
-            self.stash_active_screen();
-            self.active_buffer_idx = next;
-            if let Some(screen) = self.open_buffers[self.active_buffer_idx].state.take() {
-                self.set_screen(screen);
-            }
-        }
-        self.open_buffers.remove(idx);
-        // Adjust active index if needed.
-        if self.active_buffer_idx > idx {
-            self.active_buffer_idx -= 1;
-        } else if self.active_buffer_idx >= self.open_buffers.len() {
-            self.active_buffer_idx = self.open_buffers.len() - 1;
-        }
+        self.workspace.close_tab(idx);
         true
     }
 
@@ -2716,10 +2659,10 @@ impl SketchGpuiView {
         if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Browser(_)) {
             return;
         }
-        // Stash the current doc/edit screen into its buffer slot so
-        // buffer-list and back-to-doc can restore it later.
-        self.stash_active_screen();
-        self.set_screen(WindowContent::Browser(BrowserWindow {
+        // Open the browser in a new tab so the current doc/edit/claude work
+        // isn't lost. Picking a file from the browser replaces the browser
+        // tab in place (see open_file).
+        self.workspace.push_initial_tab(WindowContent::Browser(BrowserWindow {
             fb: FileBrowser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         }));
         cx.notify();
@@ -2736,34 +2679,34 @@ impl SketchGpuiView {
     /// lingering child agents have been observed at exit. Called from
     /// `on_app_quit` in `main`.
     fn shutdown_acp(&mut self) {
-        if let WindowContent::Claude(ring) = self.workspace.focused_content_mut().expect("no focused window") {
-            for slot in &mut ring.slots {
-                let _dropped = slot.state.channel.take();
-            }
-        }
-        for buf in self.open_buffers.iter_mut() {
-            if let Some(WindowContent::Claude(ring)) = buf.state.as_mut() {
-                for slot in &mut ring.slots {
-                    let _dropped = slot.state.channel.take();
+        // Walk every Claude window in every tab and drop its channel so the
+        // worker thread shuts down its child agent before GPUI's window
+        // teardown races with us.
+        for tab in self.workspace.tabs.iter_mut() {
+            tab.layout.for_each_leaf_content_mut(&mut |content| {
+                if let WindowContent::Claude(ring) = content {
+                    for slot in &mut ring.slots {
+                        let _dropped = slot.state.channel.take();
+                    }
                 }
-            }
+            });
         }
     }
 
     fn next_buffer(&mut self, _: &NextBuffer, _w: &mut Window, cx: &mut Context<Self>) {
-        if self.open_buffers.len() > 1 {
-            let next = (self.active_buffer_idx + 1) % self.open_buffers.len();
+        if self.workspace.tabs.len() > 1 {
+            let next = (self.workspace.active_tab + 1) % self.workspace.tabs.len();
             self.switch_to_buffer(next);
             cx.notify();
         }
     }
 
     fn prev_buffer(&mut self, _: &PrevBuffer, _w: &mut Window, cx: &mut Context<Self>) {
-        if self.open_buffers.len() > 1 {
-            let prev = if self.active_buffer_idx == 0 {
-                self.open_buffers.len() - 1
+        if self.workspace.tabs.len() > 1 {
+            let prev = if self.workspace.active_tab == 0 {
+                self.workspace.tabs.len() - 1
             } else {
-                self.active_buffer_idx - 1
+                self.workspace.active_tab - 1
             };
             self.switch_to_buffer(prev);
             cx.notify();
@@ -2826,19 +2769,14 @@ impl SketchGpuiView {
         if !matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Browser(_)) {
             return;
         }
-        // Restore the active buffer's screen, or quit if no buffers.
-        if self.open_buffers.is_empty() {
+        // Close the Browser tab. If it's the only tab left, quit instead —
+        // matches today's behavior of quit-on-last-screen.
+        if self.workspace.tabs.len() <= 1 {
             cx.quit();
             return;
         }
-        if let Some(screen) = self.open_buffers[self.active_buffer_idx].state.take() {
-            self.set_screen(screen);
-        } else {
-            // Active buffer has no stashed state — shouldn't happen, but
-            // fall back to quit.
-            cx.quit();
-            return;
-        }
+        let idx = self.workspace.active_tab;
+        self.workspace.close_tab(idx);
         cx.notify();
     }
 
@@ -2982,19 +2920,19 @@ impl SketchGpuiView {
         if mode == EditMode::Normal {
             match press.key {
                 Key::Tab => {
-                    if self.open_buffers.len() > 1 {
-                        let next = (self.active_buffer_idx + 1) % self.open_buffers.len();
+                    if self.workspace.tabs.len() > 1 {
+                        let next = (self.workspace.active_tab + 1) % self.workspace.tabs.len();
                         self.switch_to_buffer(next);
                         cx.notify();
                     }
                     return;
                 }
                 Key::BackTab => {
-                    if self.open_buffers.len() > 1 {
-                        let prev = if self.active_buffer_idx == 0 {
-                            self.open_buffers.len() - 1
+                    if self.workspace.tabs.len() > 1 {
+                        let prev = if self.workspace.active_tab == 0 {
+                            self.workspace.tabs.len() - 1
                         } else {
-                            self.active_buffer_idx - 1
+                            self.workspace.active_tab - 1
                         };
                         self.switch_to_buffer(prev);
                         cx.notify();
@@ -3375,11 +3313,11 @@ impl SketchGpuiView {
     // ---- Buffer switcher ---------------------------------------------------
 
     fn open_buffer_switcher(&mut self, cx: &mut Context<Self>) {
-        if self.buffer_switcher.is_some() || self.open_buffers.is_empty() {
+        if self.buffer_switcher.is_some() || self.workspace.tabs.is_empty() {
             return;
         }
         self.buffer_switcher = Some(BufferSwitcher {
-            selected: self.active_buffer_idx,
+            selected: self.workspace.active_tab,
             filter_mode: false,
             filter_text: String::new(),
         });
@@ -3394,16 +3332,18 @@ impl SketchGpuiView {
     fn filtered_buffer_indices(&self) -> Vec<usize> {
         let bs = match &self.buffer_switcher {
             Some(bs) => bs,
-            None => return (0..self.open_buffers.len()).collect(),
+            None => return (0..self.workspace.tabs.len()).collect(),
         };
         if bs.filter_text.is_empty() {
-            return (0..self.open_buffers.len()).collect();
+            return (0..self.workspace.tabs.len()).collect();
         }
         let query = bs.filter_text.to_lowercase();
-        (0..self.open_buffers.len())
+        (0..self.workspace.tabs.len())
             .filter(|&i| {
-                let path = self.open_buffers[i].file_label.to_lowercase();
-                fuzzy_match_gpui(&path, &query)
+                let label = tab_doc_label(&self.workspace.tabs[i])
+                    .map(|s| s.to_lowercase())
+                    .unwrap_or_default();
+                fuzzy_match_gpui(&label, &query)
             })
             .collect()
     }
@@ -3667,7 +3607,7 @@ impl SketchGpuiView {
         let filter_fg: Hsla = rgb(0xf1fa8c).into();
 
         let filtered = self.filtered_buffer_indices();
-        let total = self.open_buffers.len();
+        let total = self.workspace.tabs.len();
         let visible = filtered.len();
 
         // Header
@@ -3697,13 +3637,12 @@ impl SketchGpuiView {
             .font_family(self.code_font.clone());
 
         for (vis_idx, &buf_idx) in filtered.iter().enumerate() {
-            let ob = &self.open_buffers[buf_idx];
+            let tab = &self.workspace.tabs[buf_idx];
             let is_selected = vis_idx == bs.selected;
-            let is_active = buf_idx == self.active_buffer_idx;
-            let is_modified = if is_active {
-                screen_is_modified(self.workspace.focused_content().expect("no focused window"))
-            } else {
-                ob.state.as_ref().map_or(false, screen_is_modified)
+            let is_active = buf_idx == self.workspace.active_tab;
+            let is_modified = match &tab.layout {
+                workspace::Layout::Leaf(w) => screen_is_modified(&w.content),
+                _ => false,
             };
 
             let marker = if is_selected { "\u{25b8} " } else { "  " };
@@ -3711,7 +3650,8 @@ impl SketchGpuiView {
             let modified_mark = if is_modified { " [+]" } else { "" };
 
             // Shorten the path for display
-            let display_path = shorten_path(&ob.file_label);
+            let label_owned = tab_doc_label(tab).unwrap_or_else(|| tab.display_label().to_string());
+            let display_path = shorten_path(&label_owned);
 
             let name_color = if is_active { active_fg } else { normal_fg };
 
@@ -6101,6 +6041,20 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 // ----------------------------------------------------------------------------
 // Buffer helpers
 // ----------------------------------------------------------------------------
+
+/// Extract the file label of a tab's focused window, if Doc or Edit.
+/// Returns `None` for Browser/Claude tabs or non-leaf layouts.
+fn tab_doc_label(tab: &workspace::Tab<WindowContent>) -> Option<String> {
+    if let workspace::Layout::Leaf(w) = &tab.layout {
+        match &w.content {
+            WindowContent::Doc(d) => Some(d.file_label.to_string()),
+            WindowContent::Edit(e) => Some(e.file_label.to_string()),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
 
 /// Extract the file label from a screen, if it's a Doc or Edit screen.
 fn screen_file_label(screen: &WindowContent) -> Option<SharedString> {

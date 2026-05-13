@@ -105,6 +105,19 @@ impl<C> Layout<C> {
         }
     }
 
+    /// Mutable walk over every leaf's content in tree order.
+    pub fn for_each_leaf_content_mut<F: FnMut(&mut C)>(&mut self, f: &mut F) {
+        match self {
+            Layout::Empty => {}
+            Layout::Leaf(w) => f(&mut w.content),
+            Layout::Split { children, .. } => {
+                for (_, c) in children {
+                    c.for_each_leaf_content_mut(f);
+                }
+            }
+        }
+    }
+
     /// Find the path from root to the leaf with `target` id, expressed as a
     /// sequence of child-indices to follow at each `Split` node. An empty
     /// path means the root itself is the target leaf. Returns `None` if the
