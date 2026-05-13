@@ -2017,7 +2017,7 @@ struct DocState {
 /// State held while the user is browsing the filesystem. The active buffer's
 /// screen state is stashed in `open_buffers` before entering the browser and
 /// restored when the browser closes.
-struct BrowserScreen {
+struct BrowserWindow {
     fb: FileBrowser,
 }
 
@@ -2114,11 +2114,11 @@ impl EditState {
     }
 }
 
-enum Screen {
+enum WindowContent {
     Doc(DocState),
     Edit(EditState),
     Claude(SessionRing),
-    Browser(BrowserScreen),
+    Browser(BrowserWindow),
 }
 
 /// State held while the user is conversing with an ACP-attached Claude
@@ -2236,13 +2236,13 @@ struct SessionRing {
     active: usize,
     /// Monotonic counter for `SessionSlot::index` — never reused.
     next_index: usize,
-    /// Screen to restore when leaving Claude entirely (Ctrl-V / back_to_doc).
+    /// WindowContent to restore when leaving Claude entirely (Ctrl-V / back_to_doc).
     /// Belongs to the ring, not any individual session.
-    underlying: Option<Box<Screen>>,
+    underlying: Option<Box<WindowContent>>,
 }
 
 impl SessionRing {
-    fn new(underlying: Option<Box<Screen>>) -> Self {
+    fn new(underlying: Option<Box<WindowContent>>) -> Self {
         Self {
             slots: Vec::new(),
             active: 0,
@@ -2351,7 +2351,7 @@ struct MenuOverlay {
 /// `SketchGpuiView::screen`); stashed buffers have `state: Some(screen)`.
 struct OpenBuffer {
     file_label: SharedString,
-    state: Option<Screen>,
+    state: Option<WindowContent>,
 }
 
 /// Overlay state for the buffer-list picker (TUI: `AppScreen::BufferList`).
@@ -2399,7 +2399,7 @@ fn gpui_menu() -> Vec<MenuNode> {
 }
 
 struct SketchGpuiView {
-    screen: Screen,
+    screen: WindowContent,
     theme: Theme,
     body_font: SharedString,
     code_font: SharedString,
@@ -2426,7 +2426,7 @@ impl SketchGpuiView {
     ) -> Self {
         let label: SharedString = file_label.into();
         Self {
-            screen: Screen::Doc(DocState {
+            screen: WindowContent::Doc(DocState {
                 blocks,
                 file_label: label.clone(),
                 cursor_block: 0,
@@ -2446,7 +2446,7 @@ impl SketchGpuiView {
 
     fn new_browser(start_dir: PathBuf, theme: Theme, focus_handle: FocusHandle) -> Self {
         Self {
-            screen: Screen::Browser(BrowserScreen {
+            screen: WindowContent::Browser(BrowserWindow {
                 fb: FileBrowser::new(start_dir),
             }),
             theme,
@@ -2463,35 +2463,35 @@ impl SketchGpuiView {
     /// `Some(doc)` if currently viewing a document, else `None`.
     fn doc_mut(&mut self) -> Option<&mut DocState> {
         match &mut self.screen {
-            Screen::Doc(d) => Some(d),
+            WindowContent::Doc(d) => Some(d),
             _ => None,
         }
     }
 
-    fn browser_mut(&mut self) -> Option<&mut BrowserScreen> {
+    fn browser_mut(&mut self) -> Option<&mut BrowserWindow> {
         match &mut self.screen {
-            Screen::Browser(b) => Some(b),
+            WindowContent::Browser(b) => Some(b),
             _ => None,
         }
     }
 
     fn claude_mut(&mut self) -> Option<&mut ClaudeState> {
         match &mut self.screen {
-            Screen::Claude(ring) if !ring.is_empty() => Some(&mut ring.active_mut().state),
+            WindowContent::Claude(ring) if !ring.is_empty() => Some(&mut ring.active_mut().state),
             _ => None,
         }
     }
 
     fn claude_ring(&self) -> Option<&SessionRing> {
         match &self.screen {
-            Screen::Claude(ring) => Some(ring),
+            WindowContent::Claude(ring) => Some(ring),
             _ => None,
         }
     }
 
     fn claude_ring_mut(&mut self) -> Option<&mut SessionRing> {
         match &mut self.screen {
-            Screen::Claude(ring) => Some(ring),
+            WindowContent::Claude(ring) => Some(ring),
             _ => None,
         }
     }
@@ -2526,7 +2526,7 @@ impl SketchGpuiView {
         let label: SharedString = canon.into();
         let doc = Document::from_text(text, path.clone());
         let blocks = render::render(&doc.full_text(), &self.theme);
-        let new_screen = Screen::Doc(DocState {
+        let new_screen = WindowContent::Doc(DocState {
             blocks,
             file_label: label.clone(),
             cursor_block: 0,
@@ -2559,7 +2559,7 @@ impl SketchGpuiView {
         if let Some(l) = label {
             self.open_buffers[self.active_buffer_idx].file_label = l;
         }
-        let placeholder = Screen::Doc(DocState {
+        let placeholder = WindowContent::Doc(DocState {
             blocks: Vec::new(),
             file_label: SharedString::new_static(""),
             cursor_block: 0,
@@ -2698,13 +2698,13 @@ impl SketchGpuiView {
     }
 
     fn open_browser_inner(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.screen, Screen::Browser(_)) {
+        if matches!(self.screen, WindowContent::Browser(_)) {
             return;
         }
         // Stash the current doc/edit screen into its buffer slot so
         // buffer-list and back-to-doc can restore it later.
         self.stash_active_screen();
-        self.screen = Screen::Browser(BrowserScreen {
+        self.screen = WindowContent::Browser(BrowserWindow {
             fb: FileBrowser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         });
         cx.notify();
@@ -2721,13 +2721,13 @@ impl SketchGpuiView {
     /// lingering child agents have been observed at exit. Called from
     /// `on_app_quit` in `main`.
     fn shutdown_acp(&mut self) {
-        if let Screen::Claude(ring) = &mut self.screen {
+        if let WindowContent::Claude(ring) = &mut self.screen {
             for slot in &mut ring.slots {
                 let _dropped = slot.state.channel.take();
             }
         }
         for buf in self.open_buffers.iter_mut() {
-            if let Some(Screen::Claude(ring)) = buf.state.as_mut() {
+            if let Some(WindowContent::Claude(ring)) = buf.state.as_mut() {
                 for slot in &mut ring.slots {
                     let _dropped = slot.state.channel.take();
                 }
@@ -2808,7 +2808,7 @@ impl SketchGpuiView {
         }
     }
     fn browser_close(&mut self, _: &BrowserClose, _w: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.screen, Screen::Browser(_)) {
+        if !matches!(self.screen, WindowContent::Browser(_)) {
             return;
         }
         // Restore the active buffer's screen, or quit if no buffers.
@@ -2832,7 +2832,7 @@ impl SketchGpuiView {
     /// `Some(edit)` if currently editing, else `None`.
     fn edit_mut(&mut self) -> Option<&mut EditState> {
         match &mut self.screen {
-            Screen::Edit(e) => Some(e),
+            WindowContent::Edit(e) => Some(e),
             _ => None,
         }
     }
@@ -2854,7 +2854,7 @@ impl SketchGpuiView {
     /// → WP without losing cursor/buffer state is just `cached.view = view`.
     fn enter_edit_with(&mut self, view: EditView, cx: &mut Context<Self>) {
         let mut edit_state = match &mut self.screen {
-            Screen::Doc(d) => match d.edit_cache.take() {
+            WindowContent::Doc(d) => match d.edit_cache.take() {
                 Some(cached) => cached,
                 None => {
                     let path: PathBuf = d.file_label.to_string().into();
@@ -2866,7 +2866,7 @@ impl SketchGpuiView {
             _ => return,
         };
         edit_state.view = view;
-        self.screen = Screen::Edit(edit_state);
+        self.screen = WindowContent::Edit(edit_state);
         cx.notify();
     }
 
@@ -2878,7 +2878,7 @@ impl SketchGpuiView {
         let prev = std::mem::replace(
             &mut self.screen,
             // Placeholder; overwritten in every match arm below.
-            Screen::Doc(DocState {
+            WindowContent::Doc(DocState {
                 blocks: Vec::new(),
                 file_label: SharedString::new_static(""),
                 cursor_block: 0,
@@ -2887,10 +2887,10 @@ impl SketchGpuiView {
             }),
         );
         match prev {
-            Screen::Edit(edit) => {
+            WindowContent::Edit(edit) => {
                 let blocks = render::render(&edit.editor.document().full_text(), &self.theme);
                 let file_label = edit.file_label.clone();
-                self.screen = Screen::Doc(DocState {
+                self.screen = WindowContent::Doc(DocState {
                     blocks,
                     file_label,
                     cursor_block: 0,
@@ -2898,14 +2898,14 @@ impl SketchGpuiView {
                     edit_cache: Some(edit),
                 });
             }
-            Screen::Claude(ring) => {
+            WindowContent::Claude(ring) => {
                 // Restore whatever screen the user opened Claude from. If
                 // none was stashed, fall back to a fresh Browser at cwd.
                 // SessionRing and all its sessions drop here, taking pump
                 // tasks and ACP channels with them.
                 self.screen = match ring.underlying {
                     Some(boxed) => *boxed,
-                    None => Screen::Browser(BrowserScreen {
+                    None => WindowContent::Browser(BrowserWindow {
                         fb: FileBrowser::new(
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                         ),
@@ -3328,7 +3328,7 @@ impl SketchGpuiView {
                 // Only meaningful while the claude screen is active. Surface
                 // a hint via the doc/edit footer if it isn't, so the user
                 // gets a visible no-op instead of silent.
-                if matches!(self.screen, Screen::Claude(_)) {
+                if matches!(self.screen, WindowContent::Claude(_)) {
                     self.send_claude(cx);
                 }
             }
@@ -3340,7 +3340,7 @@ impl SketchGpuiView {
             "claude-mode-cycle" => self.cycle_claude_permission_mode(cx),
             "claude-clear" => self.clear_claude_session(cx),
             "compose-toggle" => {
-                if matches!(self.screen, Screen::Claude(_)) {
+                if matches!(self.screen, WindowContent::Claude(_)) {
                     self.compose_toggle(cx);
                 }
             }
@@ -3811,7 +3811,7 @@ impl SketchGpuiView {
 
     fn open_claude_inner(&mut self, cx: &mut Context<Self>) {
         // If already on Claude screen, just add a new session to the ring.
-        if matches!(self.screen, Screen::Claude(_)) {
+        if matches!(self.screen, WindowContent::Claude(_)) {
             self.new_claude_session(cx);
             return;
         }
@@ -3819,7 +3819,7 @@ impl SketchGpuiView {
         // Stash the current screen so back_to_doc can restore it.
         let prior = std::mem::replace(
             &mut self.screen,
-            Screen::Doc(DocState {
+            WindowContent::Doc(DocState {
                 blocks: Vec::new(),
                 file_label: SharedString::new_static(""),
                 cursor_block: 0,
@@ -3855,7 +3855,7 @@ impl SketchGpuiView {
             ring.active = active_pos.min(ring.slots.len().saturating_sub(1));
         }
 
-        self.screen = Screen::Claude(ring);
+        self.screen = WindowContent::Claude(ring);
 
         if let Some(c) = self.claude_mut() {
             c.editor.begin_insert();
@@ -4251,7 +4251,7 @@ impl SketchGpuiView {
         // the existing ClaudeState because the underlying screen
         // (browser/doc) is also stashed there — preserving it is the
         // job of open_claude_inner via the prior-screen swap dance.
-        if matches!(self.screen, Screen::Claude(_)) {
+        if matches!(self.screen, WindowContent::Claude(_)) {
             // Restore underlying first so open_claude_inner can capture
             // it as the new "prior" screen. Otherwise we'd lose the
             // file/browser the user was viewing before they opened
@@ -4588,10 +4588,10 @@ impl Render for SketchGpuiView {
         };
 
         let screen_view: AnyElement = match &self.screen {
-            Screen::Doc(_) => self.render_doc(screen_root, cx).into_any_element(),
-            Screen::Edit(_) => self.render_edit(screen_root, cx).into_any_element(),
-            Screen::Claude(_) => self.render_claude(screen_root, cx).into_any_element(),
-            Screen::Browser(_) => self.render_browser(screen_root, cx).into_any_element(),
+            WindowContent::Doc(_) => self.render_doc(screen_root, cx).into_any_element(),
+            WindowContent::Edit(_) => self.render_edit(screen_root, cx).into_any_element(),
+            WindowContent::Claude(_) => self.render_claude(screen_root, cx).into_any_element(),
+            WindowContent::Browser(_) => self.render_browser(screen_root, cx).into_any_element(),
         };
 
         if !has_overlay {
@@ -4635,7 +4635,7 @@ impl SketchGpuiView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let d = match &self.screen {
-            Screen::Doc(d) => d,
+            WindowContent::Doc(d) => d,
             _ => unreachable!(),
         };
 
@@ -4729,7 +4729,7 @@ impl SketchGpuiView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let e = match &self.screen {
-            Screen::Edit(e) => e,
+            WindowContent::Edit(e) => e,
             _ => unreachable!(),
         };
 
@@ -5077,7 +5077,7 @@ impl SketchGpuiView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let ring = match &mut self.screen {
-            Screen::Claude(ring) => ring,
+            WindowContent::Claude(ring) => ring,
             _ => unreachable!(),
         };
         let session_count = ring.len();
@@ -5870,7 +5870,7 @@ impl SketchGpuiView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let b = match &self.screen {
-            Screen::Browser(b) => b,
+            WindowContent::Browser(b) => b,
             _ => unreachable!(),
         };
 
@@ -6085,19 +6085,19 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 // ----------------------------------------------------------------------------
 
 /// Extract the file label from a screen, if it's a Doc or Edit screen.
-fn screen_file_label(screen: &Screen) -> Option<SharedString> {
+fn screen_file_label(screen: &WindowContent) -> Option<SharedString> {
     match screen {
-        Screen::Doc(d) => Some(d.file_label.clone()),
-        Screen::Edit(e) => Some(e.file_label.clone()),
+        WindowContent::Doc(d) => Some(d.file_label.clone()),
+        WindowContent::Edit(e) => Some(e.file_label.clone()),
         _ => None,
     }
 }
 
 /// Check whether the screen's underlying editor has unsaved modifications.
-fn screen_is_modified(screen: &Screen) -> bool {
+fn screen_is_modified(screen: &WindowContent) -> bool {
     match screen {
-        Screen::Edit(e) => e.editor.document().is_modified(),
-        Screen::Doc(d) => d
+        WindowContent::Edit(e) => e.editor.document().is_modified(),
+        WindowContent::Doc(d) => d
             .edit_cache
             .as_ref()
             .map_or(false, |ec| ec.editor.document().is_modified()),

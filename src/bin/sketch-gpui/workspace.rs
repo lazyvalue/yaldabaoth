@@ -245,6 +245,93 @@ impl<C> Workspace<C> {
         self.tabs.get_mut(self.active_tab)
     }
 
+    /// Borrow the focused window's content (None if no tab, or the tab's
+    /// focused id is missing from the layout — invariant violation).
+    pub fn focused_content(&self) -> Option<&C> {
+        let tab = self.active_tab()?;
+        tab.layout.find_leaf(tab.focused).map(|w| &w.content)
+    }
+
+    /// Mutably borrow the focused window's content.
+    pub fn focused_content_mut(&mut self) -> Option<&mut C> {
+        let tab = self.active_tab_mut()?;
+        let focused = tab.focused;
+        tab.layout.find_leaf_mut(focused).map(|w| &mut w.content)
+    }
+
+    /// Replace the focused window's content in place. Returns the old value
+    /// (or None if there's no focused window).
+    pub fn replace_focused_content(&mut self, content: C) -> Option<C> {
+        let tab = self.active_tab_mut()?;
+        let focused = tab.focused;
+        let win = tab.layout.find_leaf_mut(focused)?;
+        Some(std::mem::replace(&mut win.content, content))
+    }
+
+    /// The id of the focused window (or None if the workspace has no tabs).
+    pub fn focused_window_id(&self) -> Option<WindowId> {
+        self.active_tab().map(|t| t.focused)
+    }
+
+    /// Construct a workspace pre-populated with one tab containing one
+    /// window of `content`. Tab name is auto-assigned to `tab-1`.
+    pub fn with_initial(content: C) -> Self {
+        let mut ws = Self::new();
+        ws.push_initial_tab(content);
+        ws
+    }
+
+    /// Append a new tab containing a single window with `content`. Becomes
+    /// the active tab. Returns the new window's id.
+    pub fn push_initial_tab(&mut self, content: C) -> WindowId {
+        let id = self.alloc_window_id();
+        let name = auto_tab_name(self.next_tab_index);
+        self.next_tab_index += 1;
+        self.tabs.push(Tab {
+            auto_name: name,
+            display_name: None,
+            layout: Layout::Leaf(Window { id, content }),
+            focused: id,
+        });
+        self.active_tab = self.tabs.len() - 1;
+        id
+    }
+
+    /// Close the tab at index `idx`. The active-tab pointer adjusts to stay
+    /// in range; closing the last tab leaves the workspace with zero tabs
+    /// (caller is responsible for the spec Behavior 2 placeholder).
+    pub fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(idx);
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len().saturating_sub(1);
+        } else if idx < self.active_tab {
+            self.active_tab -= 1;
+        }
+    }
+
+    /// Cycle to the next tab (wraps).
+    pub fn next_tab(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        self.active_tab = (self.active_tab + 1) % self.tabs.len();
+    }
+
+    /// Cycle to the previous tab (wraps).
+    pub fn prev_tab(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        self.active_tab = if self.active_tab == 0 {
+            self.tabs.len() - 1
+        } else {
+            self.active_tab - 1
+        };
+    }
+
     /// Allocate the next stable window id.
     pub fn alloc_window_id(&mut self) -> WindowId {
         let id = self.next_window_id;
