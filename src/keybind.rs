@@ -1,8 +1,7 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::keys::KeyPress;
+use crate::keys::{Key, KeyPress, Modifiers};
 
 const MULTI_KEY_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -112,6 +111,11 @@ pub enum Action {
     ClaudeAcpSendSelection,
     /// Show the current ACP agent attachment.
     ClaudeAcpStatus,
+    // --- Compose textbox (stable editing surface in *claude* buffer) ---
+    /// Toggle the compose textbox open/closed.
+    ComposeToggle,
+    /// Send the compose textbox contents and close.
+    ComposeSend,
     None,
 }
 
@@ -134,11 +138,11 @@ impl KeySequenceMatcher {
         }
     }
 
-    /// Feed a key event. Returns Some(matched_sequence) if a match was found,
+    /// Feed a key press. Returns Some(matched_sequence) if a match was found,
     /// None if still accumulating or no match.
     pub fn feed<V>(
         &mut self,
-        event: KeyEvent,
+        press: KeyPress,
         single: &HashMap<KeyPress, V>,
         multi: &HashMap<Vec<KeyPress>, V>,
     ) -> Option<Vec<KeyPress>> {
@@ -150,7 +154,6 @@ impl KeySequenceMatcher {
             self.pending_since = None;
         }
 
-        let press = KeyPress::from_event(event);
         self.pending.push(press.clone());
         self.pending_since = Some(Instant::now());
 
@@ -209,8 +212,8 @@ impl KeybindManager {
         }
     }
 
-    pub fn process_key(&mut self, event: KeyEvent) -> Option<String> {
-        let matched = self.matcher.feed(event, &self.single, &self.multi)?;
+    pub fn process_key(&mut self, press: KeyPress) -> Option<String> {
+        let matched = self.matcher.feed(press, &self.single, &self.multi)?;
         if matched.len() == 1 {
             self.single.get(&matched[0]).cloned()
         } else {
@@ -285,16 +288,16 @@ impl Default for KeybindManager {
         single.insert(key(' '), "open-menu".into());
         single.insert(key('m'), "nav-cycle".into());
         single.insert(
-            KeyPress::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyPress::new(Key::Enter, Modifiers::NONE),
             "nav-activate".into(),
         );
 
         single.insert(
-            KeyPress::new(KeyCode::Tab, KeyModifiers::NONE),
+            KeyPress::new(Key::Tab, Modifiers::NONE),
             "next-buffer".into(),
         );
         single.insert(
-            KeyPress::new(KeyCode::BackTab, KeyModifiers::NONE),
+            KeyPress::new(Key::BackTab, Modifiers::NONE),
             "prev-buffer".into(),
         );
 
@@ -308,7 +311,7 @@ impl Default for KeybindManager {
         multi.insert(vec![key('['), key('[')], "prev-heading-same-level".into());
 
         // Heading level shortcuts (Alt+N)
-        let alt = |c: char| KeyPress::new(KeyCode::Char(c), KeyModifiers::ALT);
+        let alt = |c: char| KeyPress::new(Key::Char(c), Modifiers::ALT);
         single.insert(alt('1'), "set-heading-1".into());
         single.insert(alt('2'), "set-heading-2".into());
         single.insert(alt('3'), "set-heading-3".into());
@@ -317,14 +320,17 @@ impl Default for KeybindManager {
         single.insert(alt('6'), "set-heading-6".into());
         single.insert(alt('0'), "clear-heading".into());
 
+        // Compose textbox
+        single.insert(ctrl('t'), "compose".into());
+
         Self::new(single, multi)
     }
 }
 
 fn key(c: char) -> KeyPress {
-    KeyPress::new(KeyCode::Char(c), KeyModifiers::NONE)
+    KeyPress::new(Key::Char(c), Modifiers::NONE)
 }
 
 fn ctrl(c: char) -> KeyPress {
-    KeyPress::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    KeyPress::new(Key::Char(c), Modifiers::CONTROL)
 }

@@ -105,6 +105,12 @@ pub struct ViewState<'a> {
     /// Char index of the locked-prefix boundary. Chars below this are styled
     /// muted (older locked turns).
     pub lockable_through_char: usize,
+    // --- Compose textbox state ---
+    pub compose_active: bool,
+    pub compose_lines: Vec<String>,
+    pub compose_cursor_line: usize,
+    pub compose_cursor_col: usize,
+    pub compose_insert_mode: bool,
 }
 
 /// Ground-truth feedback from the renderer back to App, populated during
@@ -186,12 +192,22 @@ pub fn draw(frame: &mut Frame, state: &ViewState, report: &mut DrawReport) {
         || !state.command_error.is_empty();
     let bottom_bar_height = if needs_bottom_bar { 1u16 } else { 0 };
 
+    // Compose textbox panel
+    let compose_height = if state.compose_active {
+        let lines = state.compose_lines.len().max(1);
+        let capped = lines.min((area.height as usize) / 3).min(12).max(3);
+        (capped + 1) as u16 // +1 for separator line
+    } else {
+        0
+    };
+
     let chunks = Layout::vertical([
         Constraint::Length(1),                        // top bar
         Constraint::Length(buffer_list_height),        // buffer list
         Constraint::Length(file_browser_height),       // file browser
         Constraint::Length(outline_height),            // outline
         Constraint::Min(1),                           // content
+        Constraint::Length(compose_height),            // compose textbox
         Constraint::Length(bottom_bar_height),         // bottom bar (conditional)
     ])
     .split(area);
@@ -201,7 +217,8 @@ pub fn draw(frame: &mut Frame, state: &ViewState, report: &mut DrawReport) {
     let file_browser_area = chunks[2];
     let outline_area = chunks[3];
     let content_area = chunks[4];
-    let bottom_bar = chunks[5];
+    let compose_area = chunks[5];
+    let bottom_bar = chunks[6];
 
     draw_top_bar(frame, top_bar, state);
 
@@ -221,6 +238,9 @@ pub fn draw(frame: &mut Frame, state: &ViewState, report: &mut DrawReport) {
     draw_content(frame, content_area, state, report);
     if state.menu_active {
         draw_menu_popup(frame, content_area, state);
+    }
+    if state.compose_active && compose_height > 0 {
+        draw_compose_box(frame, compose_area, state);
     }
     if needs_bottom_bar {
         draw_bottom_bar(frame, bottom_bar, state);
@@ -310,6 +330,93 @@ fn draw_bottom_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
             Span::styled(" ".repeat(padding), state.theme.bottom_bar),
         ]);
         frame.render_widget(Paragraph::new(line), area);
+    }
+}
+
+fn draw_compose_box(frame: &mut Frame, area: Rect, state: &ViewState) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let separator_style = Style::default()
+        .fg(Color::Rgb(100, 100, 120))
+        .add_modifier(Modifier::DIM);
+    let compose_bg = Style::default().bg(Color::Rgb(25, 25, 40));
+
+    // First row: separator
+    let label = if state.compose_insert_mode {
+        " compose (insert) "
+    } else {
+        " compose "
+    };
+    let width = area.width as usize;
+    let dash_total = width.saturating_sub(label.len());
+    let left_dashes = dash_total / 2;
+    let right_dashes = dash_total - left_dashes;
+    let sep_text = format!(
+        "{}{}{}",
+        "─".repeat(left_dashes),
+        label,
+        "─".repeat(right_dashes),
+    );
+    let sep_line = Line::from(Span::styled(sep_text, separator_style));
+    let sep_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(sep_line), sep_area);
+
+    // Remaining rows: compose text
+    let text_area = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    };
+    let text_height = text_area.height as usize;
+    let text_width = text_area.width as usize;
+
+    // Render compose lines, scrolling if needed to keep cursor visible
+    let scroll_offset = if state.compose_cursor_line >= text_height {
+        state.compose_cursor_line - text_height + 1
+    } else {
+        0
+    };
+
+    for row in 0..text_height {
+        let line_idx = scroll_offset + row;
+        let y = text_area.y + row as u16;
+        let line_text = state
+            .compose_lines
+            .get(line_idx)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        // Truncate to fit width
+        let display: String = line_text.chars().take(text_width).collect();
+        let padding = text_width.saturating_sub(display.len());
+        let spans = vec![
+            Span::styled(display, compose_bg.fg(Color::Rgb(220, 220, 220))),
+            Span::styled(" ".repeat(padding), compose_bg),
+        ];
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect {
+                x: text_area.x,
+                y,
+                width: text_area.width,
+                height: 1,
+            },
+        );
+    }
+
+    // Position cursor in the compose box
+    let cursor_row_in_view = state.compose_cursor_line.saturating_sub(scroll_offset);
+    if cursor_row_in_view < text_height {
+        let cursor_y = text_area.y + cursor_row_in_view as u16;
+        let cursor_x = text_area.x + (state.compose_cursor_col as u16).min(text_area.width.saturating_sub(1));
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 

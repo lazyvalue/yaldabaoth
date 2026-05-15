@@ -1,6 +1,6 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sketch::config::Config;
 use sketch::keybind::KeybindManager;
+use sketch::keys::{Key, KeyPress, Modifiers};
 use sketch::theme::ThemeName;
 
 fn parse_config(content: &str) -> Config {
@@ -159,11 +159,11 @@ fn test_config_keybinds_override_default() {
     mgr.apply_bindings(&kb.bindings);
 
     // j should now be scroll-up instead of move-down
-    let result = mgr.process_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    let result = mgr.process_key(KeyPress::new(Key::Char('j'), Modifiers::NONE));
     assert_eq!(result, Some("scroll-up".to_string()));
 
     // k should still be the default
-    let result = mgr.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+    let result = mgr.process_key(KeyPress::new(Key::Char('k'), Modifiers::NONE));
     assert_eq!(result, Some("move-up".to_string()));
 }
 
@@ -188,11 +188,11 @@ fn test_config_keybinds_reset_defaults() {
     mgr.apply_bindings(&kb.bindings);
 
     // j works
-    let result = mgr.process_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    let result = mgr.process_key(KeyPress::new(Key::Char('j'), Modifiers::NONE));
     assert_eq!(result, Some("move-down".to_string()));
 
     // k should NOT work (defaults were reset)
-    let result = mgr.process_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+    let result = mgr.process_key(KeyPress::new(Key::Char('k'), Modifiers::NONE));
     assert_eq!(result, None);
 }
 

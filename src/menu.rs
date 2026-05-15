@@ -1,5 +1,3 @@
-use crossterm::event::KeyEvent;
-
 use crate::keys::KeyPress;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,11 +97,10 @@ impl MenuState {
         self.path.clear();
     }
 
-    /// Process a key event in the menu. Returns Some(command_name) if a command was selected.
+    /// Process a key press in the menu. Returns Some(command_name) if a command was selected.
     /// Returns None if a submenu was entered or key was unrecognized.
     /// Closes the menu when a command is executed.
-    pub fn process_key_event(&mut self, event: KeyEvent, menu: &[MenuNode]) -> Option<String> {
-        let press = KeyPress::from_event(event);
+    pub fn process_key(&mut self, press: KeyPress, menu: &[MenuNode]) -> Option<String> {
         let nodes = self.current_nodes(menu);
 
         for node in nodes.iter() {
@@ -223,6 +220,7 @@ pub fn default_menu() -> Vec<MenuNode> {
             MenuNode::entry("s", "send buffer", "claude-send"),
             MenuNode::entry("S", "send selection", "claude-send-selection"),
             MenuNode::entry("?", "status", "claude-status"),
+            MenuNode::entry("t", "compose", "compose"),
             MenuNode::submenu("p", "ACP (subprocess)", vec![
                 MenuNode::entry("a", "attach", "claude-acp-attach"),
                 MenuNode::entry("d", "detach", "claude-acp-detach"),

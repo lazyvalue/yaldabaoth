@@ -577,6 +577,19 @@ impl CommandRegistry {
                 action: Action::ClaudeAcpStatus,
                 description: "Show the current ACP agent attachment".into(),
             },
+            // --- Compose textbox commands ---
+            CommandDef {
+                name: "compose".into(),
+                aliases: vec![],
+                action: Action::ComposeToggle,
+                description: "Toggle compose textbox in *claude* buffer".into(),
+            },
+            CommandDef {
+                name: "compose-send".into(),
+                aliases: vec![],
+                action: Action::ComposeSend,
+                description: "Send compose textbox contents and close".into(),
+            },
         ])
     }
 }

@@ -1,5 +1,13 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use sketch::menu::{MenuState, MenuNode, MenuAction, default_menu};
+use sketch::keys::{Key, KeyPress, Modifiers};
+use sketch::menu::{default_menu, MenuAction, MenuNode, MenuState};
+
+fn k(c: char) -> KeyPress {
+    KeyPress::new(Key::Char(c), Modifiers::NONE)
+}
+
+fn ctrl(c: char) -> KeyPress {
+    KeyPress::new(Key::Char(c), Modifiers::CONTROL)
+}
 
 #[test]
 fn test_menu_starts_inactive() {
@@ -21,10 +29,7 @@ fn test_menu_command_key() {
     let mut state = MenuState::new();
     let menu = default_menu();
     state.open();
-    let result = state.process_key_event(
-        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
-        &menu,
-    );
+    let result = state.process_key(k('f'), &menu);
     assert_eq!(result, Some("file-browser".to_string()));
     assert!(!state.is_active());
 }
@@ -34,10 +39,7 @@ fn test_menu_submenu_key() {
     let mut state = MenuState::new();
     let menu = default_menu();
     state.open();
-    let result = state.process_key_event(
-        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
-        &menu,
-    );
+    let result = state.process_key(k('g'), &menu);
     assert_eq!(result, None);
     assert!(state.is_active());
 }
@@ -47,11 +49,8 @@ fn test_menu_submenu_then_command() {
     let mut state = MenuState::new();
     let menu = default_menu();
     state.open();
-    state.process_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &menu);
-    let result = state.process_key_event(
-        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
-        &menu,
-    );
+    state.process_key(k('g'), &menu);
+    let result = state.process_key(k('g'), &menu);
     assert_eq!(result, Some("goto-top".to_string()));
     assert!(!state.is_active());
 }
@@ -61,7 +60,7 @@ fn test_menu_escape_from_submenu() {
     let mut state = MenuState::new();
     let menu = default_menu();
     state.open();
-    state.process_key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &menu);
+    state.process_key(k('g'), &menu);
     state.handle_escape();
     assert!(state.is_active());
     assert!(state.path.is_empty());
@@ -80,10 +79,7 @@ fn test_menu_unrecognized_key_ignored() {
     let mut state = MenuState::new();
     let menu = default_menu();
     state.open();
-    let result = state.process_key_event(
-        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
-        &menu,
-    );
+    let result = state.process_key(k('z'), &menu);
     assert_eq!(result, None);
     assert!(state.is_active());
 }
@@ -98,28 +94,19 @@ fn test_menu_separator_and_label() {
     ];
     let mut state = MenuState::new();
     state.open();
-    let result = state.process_key_event(
-        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
-        &menu,
-    );
+    let result = state.process_key(k('f'), &menu);
     assert_eq!(result, Some("file-browser".to_string()));
 }
 
 #[test]
 fn test_menu_modifier_key_entry() {
-    use sketch::keys::KeyPress;
-    let menu = vec![
-        MenuNode {
-            key: vec![KeyPress::new(KeyCode::Char('h'), KeyModifiers::CONTROL)],
-            label: "prev heading".into(),
-            action: MenuAction::Command("prev-heading".into()),
-        },
-    ];
+    let menu = vec![MenuNode {
+        key: vec![ctrl('h')],
+        label: "prev heading".into(),
+        action: MenuAction::Command("prev-heading".into()),
+    }];
     let mut state = MenuState::new();
     state.open();
-    let result = state.process_key_event(
-        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
-        &menu,
-    );
+    let result = state.process_key(ctrl('h'), &menu);
     assert_eq!(result, Some("prev-heading".to_string()));
 }
