@@ -2531,6 +2531,16 @@ struct BufferSwitcher {
     filter_text: String,
 }
 
+/// Single-line input overlay for renaming the active claude session.
+/// Pre-filled with the current label; Enter commits, Esc cancels.
+/// Targets the slot by its monotonic `SessionSlot::index` rather than its
+/// position so a concurrent `claude-close` on another slot doesn't rename
+/// the wrong one.
+struct RenameOverlay {
+    text: String,
+    target_index: usize,
+}
+
 /// GPUI menu tree. Mirrors the TUI's `default_menu` for the navigation
 /// commands that exist in the GPUI frontend; omits TUI-only entries
 /// (search, claude-attach via socket, save-quit, …) that have no GPUI
@@ -2553,6 +2563,9 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
                 MenuNode::entry("c", "clear → fresh session", "claude-clear"),
                 MenuNode::entry("r", "reboot → resume claude", "claude-reboot"),
+                MenuNode::entry("d", "detach session", "claude-detach"),
+                MenuNode::entry("a", "attach session", "claude-attach"),
+                MenuNode::entry("R", "rename session", "claude-rename"),
                 MenuNode::entry("t", "compose", "compose-toggle"),
             ],
         ),
@@ -2578,6 +2591,10 @@ struct SketchGpuiView {
     menu: Option<MenuOverlay>,
     /// Buffer-list picker overlay — open while `Some`.
     buffer_switcher: Option<BufferSwitcher>,
+    /// Single-line rename input overlay for the active claude session.
+    /// `Some` while the input box is open; cleared on Enter (commit) or
+    /// Esc (cancel).
+    rename_overlay: Option<RenameOverlay>,
     /// Tabs + n-ary split tree (spec-tabs-and-splits.md). The focused
     /// window's content is the authoritative live state for the workspace.
     workspace: workspace::Workspace<WindowContent>,
@@ -2605,6 +2622,7 @@ impl SketchGpuiView {
             focus_handle,
             menu: None,
             buffer_switcher: None,
+            rename_overlay: None,
             workspace: workspace::Workspace::with_initial(initial),
         }
     }
@@ -2620,6 +2638,7 @@ impl SketchGpuiView {
             focus_handle,
             menu: None,
             buffer_switcher: None,
+            rename_overlay: None,
             workspace: workspace::Workspace::with_initial(initial),
         }
     }
@@ -3785,7 +3804,17 @@ impl SketchGpuiView {
                 // a hint via the doc/edit footer if it isn't, so the user
                 // gets a visible no-op instead of silent.
                 if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Claude(_)) {
-                    self.send_claude(cx);
+                    // If the compose textbox is open, send its contents;
+                    // otherwise send the main editor's draft region.
+                    let has_compose = self
+                        .claude_mut()
+                        .map(|c| c.compose_box.is_some())
+                        .unwrap_or(false);
+                    if has_compose {
+                        self.compose_send(cx);
+                    } else {
+                        self.send_claude(cx);
+                    }
                 }
             }
             "claude-new" => self.new_claude_session(cx),
@@ -3795,6 +3824,9 @@ impl SketchGpuiView {
             "claude-reboot" => self.reboot_into_claude(cx),
             "claude-mode-cycle" => self.cycle_claude_permission_mode(cx),
             "claude-clear" => self.clear_claude_session(cx),
+            "claude-detach" => self.detach_active_claude_session(cx),
+            "claude-attach" => self.attach_active_claude_session(cx),
+            "claude-rename" => self.open_rename_overlay(cx),
             "compose-toggle" => {
                 if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Claude(_)) {
                     self.compose_toggle(cx);
@@ -3826,6 +3858,82 @@ impl SketchGpuiView {
 
     fn close_buffer_switcher(&mut self) {
         self.buffer_switcher = None;
+    }
+
+    // ---- Session rename overlay -------------------------------------------
+
+    /// Open the rename input overlay for the active claude session. No-op
+    /// if claude isn't focused (the command is gated by the menu but a
+    /// stray dispatch shouldn't crash) or if an overlay is already open.
+    fn open_rename_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.rename_overlay.is_some() {
+            return;
+        }
+        let Some(ring) = self.claude_ring() else {
+            return;
+        };
+        let slot = &ring.slots[ring.active];
+        self.rename_overlay = Some(RenameOverlay {
+            text: slot.label.clone(),
+            target_index: slot.index,
+        });
+        cx.notify();
+    }
+
+    fn close_rename_overlay(&mut self) {
+        self.rename_overlay = None;
+    }
+
+    /// Apply the overlay's text as the target slot's new label, then close.
+    /// Trims whitespace; an all-whitespace input cancels (acts like Esc) so
+    /// the user can't accidentally erase the label by hammering Enter.
+    fn commit_rename_overlay(&mut self, cx: &mut Context<Self>) {
+        let (target_index, new_label) = match &self.rename_overlay {
+            Some(o) => (o.target_index, o.text.trim().to_string()),
+            None => return,
+        };
+        if new_label.is_empty() {
+            self.close_rename_overlay();
+            cx.notify();
+            return;
+        }
+        if let Some(ring) = self.claude_ring_mut() {
+            if let Some(slot) = ring.slot_by_index_mut(target_index) {
+                slot.label = new_label;
+            }
+        }
+        self.close_rename_overlay();
+        self.save_claude_ring();
+        cx.notify();
+    }
+
+    fn handle_rename_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        match press.key {
+            Key::Esc => {
+                self.close_rename_overlay();
+                cx.notify();
+            }
+            Key::Enter => self.commit_rename_overlay(cx),
+            Key::Backspace => {
+                if let Some(o) = &mut self.rename_overlay {
+                    o.text.pop();
+                }
+                cx.notify();
+            }
+            Key::Char(c) => {
+                if let Some(o) = &mut self.rename_overlay {
+                    o.text.push(c);
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
     }
 
     /// Return the indices of buffers matching the current filter query.
@@ -4408,6 +4516,67 @@ impl SketchGpuiView {
             .child(footer)
     }
 
+    /// Render the centered single-line input box for renaming a session.
+    /// Visual style follows the buffer-switcher's filter row (yellow text
+    /// on the popup background) but in a small centered modal rather than
+    /// a full-screen panel. Pre-filled with the current label; trailing
+    /// block char serves as a cursor.
+    fn render_rename_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let o = match &self.rename_overlay {
+            Some(o) => o,
+            None => unreachable!(),
+        };
+        let menu_bg: Hsla = rgb(0x1e1e3a).into();
+        let popup_border: Hsla = rgb(0x383a4f).into();
+        let label_fg: Hsla = rgb(0x6272a4).into();
+        let input_fg: Hsla = rgb(0xf1fa8c).into();
+
+        let header = div()
+            .px_4()
+            .py_1()
+            .text_color(label_fg)
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::new_static("RENAME SESSION"));
+
+        let input_row = div()
+            .px_4()
+            .py_2()
+            .text_color(input_fg)
+            .text_size(px(14.0))
+            .font_family(self.code_font.clone())
+            .child(SharedString::from(format!("{}\u{2588}", o.text)));
+
+        let footer = div()
+            .px_4()
+            .py_1()
+            .text_color(label_fg)
+            .text_size(px(11.0))
+            .child(SharedString::new_static("enter:save  esc:cancel"));
+
+        // Centered modal: absolutely positioned, fixed width, top inset
+        // to keep it out of the header strip.
+        div()
+            .absolute()
+            .top(px(80.0))
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_row()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(360.0))
+                    .bg(menu_bg)
+                    .border_2()
+                    .border_color(popup_border)
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .child(input_row)
+                    .child(footer),
+            )
+    }
+
     /// Best-effort copy via macOS `pbcopy`. Failures are silent — yank is
     /// a convenience, and we don't want to surface system errors per keystroke.
     /// (TUI uses the same approach.)
@@ -4499,8 +4668,17 @@ impl SketchGpuiView {
         let state = self.create_claude_session(None, cx);
         let ring = self.claude_ring_mut().unwrap();
         ring.push(label, state, None);
+        // §18 soft cap: at 6+ slots, surface a one-shot footer warning so
+        // the user notices the per-slot ~100MB subprocess cost. Advisory
+        // only — no enforcement.
+        let count = self.claude_ring().map(|r| r.len()).unwrap_or(0);
         if let Some(c) = self.claude_mut() {
             c.editor.begin_insert();
+            if count >= 6 {
+                c.status = Some(
+                    format!("{count} sessions active — each uses ~100MB").into(),
+                );
+            }
         }
         self.save_claude_ring();
         cx.notify();
@@ -4915,6 +5093,75 @@ impl SketchGpuiView {
         cx.notify();
     }
 
+    /// Drop the active session's `AcpChannelClient` (kills the subprocess
+    /// via `kill_on_drop`) but keep the `SessionSlot` and its chat history
+    /// intact. The sidebar's `[d]` suffix surfaces the detached state. The
+    /// slot's `resume_id` is preserved so the next reboot still tries to
+    /// `session/load` the original id (per spec §15 stability rule); fresh
+    /// `claude-new` slots without a `resume_id` will silently drop from
+    /// persistence on the next save (per spec: "slots without a session id
+    /// are not written").
+    fn detach_active_claude_session(&mut self, cx: &mut Context<Self>) {
+        let claude = match self.claude_mut() {
+            Some(c) => c,
+            None => return,
+        };
+        if claude.channel.is_none() && claude.attach_pending.is_none() {
+            claude.status = Some("session is already detached".into());
+            cx.notify();
+            return;
+        }
+        // Drop runs `kill_on_drop` on the subprocess; cancel any in-flight
+        // attach by dropping its receiver (the spawning thread's send will
+        // fail silently when the connection drops).
+        claude.channel = None;
+        claude.attach_pending = None;
+        claude.awaiting_reply = false;
+        claude.turn_started = None;
+        claude.status = Some("session detached".into());
+        self.save_claude_ring();
+        cx.notify();
+    }
+
+    /// Spawn a fresh `AcpChannelClient` for the active session. Per spec §4
+    /// re-attach does NOT resume the previous conversation — the agent
+    /// subprocess was killed on detach, so the session is gone. Clear
+    /// `resume_id` so persistence captures the new channel's id once it
+    /// binds (rather than retrying the original-load id forever).
+    fn attach_active_claude_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(c) = self.claude_mut() {
+            if c.channel.is_some() || c.attach_pending.is_some() {
+                c.status = Some("session is already attached".into());
+                cx.notify();
+                return;
+            }
+        }
+
+        let (attach_tx, attach_rx) =
+            std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
+        let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
+        let cwd = std::env::current_dir().ok();
+        let _ = std::thread::Builder::new()
+            .name("sketch-acp-attach".into())
+            .spawn(move || {
+                let _ = attach_tx.send(AcpChannelClient::spawn_with_resume_in(
+                    &cmd,
+                    cwd,
+                    None,
+                    sketch::acp_channel::SketchFrontend::Gpui,
+                ));
+            });
+
+        if let Some(ring) = self.claude_ring_mut() {
+            ring.active_mut().resume_id = None;
+            let claude = &mut ring.active_mut().state;
+            claude.attach_pending = Some(attach_rx);
+            claude.status = Some("attaching new session…".into());
+        }
+        self.save_claude_ring();
+        cx.notify();
+    }
+
     /// Quit-and-relaunch sketch with the auto-open-claude flag set, so the
     /// new process boots straight into the claude screen and restores every
     /// session that was in the ring at quit time via `load_persisted_acp_sessions`
@@ -5187,7 +5434,9 @@ impl Focusable for SketchGpuiView {
 
 impl Render for SketchGpuiView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_overlay = self.menu.is_some() || self.buffer_switcher.is_some();
+        let has_overlay = self.menu.is_some()
+            || self.buffer_switcher.is_some()
+            || self.rename_overlay.is_some();
 
         // Build the screen content. When an overlay is OPEN, focus moves up
         // to the wrapper so the screen's `SketchView`/`BrowserView` action
@@ -5222,6 +5471,22 @@ impl Render for SketchGpuiView {
 
         if !has_overlay {
             return screen_view;
+        }
+
+        // Rename overlay takes priority — it's a transient single-line
+        // input opened from the menu, so nothing else should steal keys.
+        if self.rename_overlay.is_some() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("RenameOverlayView")
+                .size_full()
+                .bg(rgb(BG))
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_rename_key(ev, w, cx);
+                }))
+                .child(screen_view)
+                .child(self.render_rename_overlay(cx))
+                .into_any_element();
         }
 
         // Buffer switcher takes priority over menu.
