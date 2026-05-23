@@ -165,6 +165,10 @@ actions!(
         // Agent window: flip the input mode between Worksheet and
         // Chatbox (§5). Bound to `Ctrl-Alt-Enter`.
         ToggleAgentInputMode,
+        // Agent window: open/close the Tasklist sidepane (§32). Cmd-1.
+        ToggleTasklist,
+        // Agent window: open/close the Subagents sidepane (§32). Cmd-2.
+        ToggleSubagents,
     ]
 );
 
@@ -1746,11 +1750,18 @@ fn load_persisted_workspace(cwd: &std::path::Path) -> Option<PersistedWorkspace>
 
 /// One restored session slot. Order in the returned `Vec` matches the
 /// saved ring order; reboot rebuilds the ring in this same order.
+/// `mode`, `tasklist_open`, and `subagents_open` are spec §35 additions;
+/// older files (without these keys) deserialize with defaults
+/// (Chatbox, false, false). Older sketch binaries reading newer files
+/// silently drop the unknown keys (downgrade contract, §35).
 #[derive(Debug, Clone)]
 struct PersistedSlot {
     id: String,
     label: String,
     active: bool,
+    mode: InputMode,
+    tasklist_open: bool,
+    subagents_open: bool,
 }
 
 /// Load the persisted slot list for `cwd`. Returns an empty vec if no
@@ -1772,12 +1783,16 @@ fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<PersistedSlot> {
     let Some(entry) = json.get(key.as_ref()) else {
         return Vec::new();
     };
-    // Legacy single-string shape: synthesize a one-slot list.
+    // Legacy single-string shape: synthesize a one-slot list with the
+    // spec-§35 defaults for the missing fields.
     if let Some(id) = entry.as_str() {
         return vec![PersistedSlot {
             id: id.to_string(),
             label: "claude-1".into(),
             active: true,
+            mode: InputMode::Chatbox,
+            tasklist_open: false,
+            subagents_open: false,
         }];
     }
     let Some(arr) = entry.as_array() else {
@@ -1796,7 +1811,33 @@ fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<PersistedSlot> {
                 .get("active")
                 .and_then(|b| b.as_bool())
                 .unwrap_or(false);
-            Some(PersistedSlot { id, label, active })
+            // Spec §35 additions. Missing keys default per the same
+            // table (chatbox, false, false). Unknown mode strings fall
+            // back to Chatbox.
+            let mode = obj
+                .get("mode")
+                .and_then(|m| m.as_str())
+                .map(|s| match s {
+                    "worksheet" => InputMode::Worksheet,
+                    _ => InputMode::Chatbox,
+                })
+                .unwrap_or(InputMode::Chatbox);
+            let tasklist_open = obj
+                .get("tasklist_open")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            let subagents_open = obj
+                .get("subagents_open")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            Some(PersistedSlot {
+                id,
+                label,
+                active,
+                mode,
+                tasklist_open,
+                subagents_open,
+            })
         })
         .collect()
 }
@@ -1859,6 +1900,25 @@ fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRing) {
             if i == active_index {
                 obj.insert("active".into(), serde_json::Value::Bool(true));
             }
+            // Spec §35: persist input mode and sidepane state per slot.
+            // Older sketch binaries reading this file ignore the unknown
+            // keys (serde's standard behavior); no migration needed.
+            let mode_str = match slot.state.input_mode {
+                InputMode::Worksheet => "worksheet",
+                InputMode::Chatbox => "chatbox",
+            };
+            obj.insert(
+                "mode".into(),
+                serde_json::Value::String(mode_str.to_string()),
+            );
+            obj.insert(
+                "tasklist_open".into(),
+                serde_json::Value::Bool(slot.state.tasklist_open),
+            );
+            obj.insert(
+                "subagents_open".into(),
+                serde_json::Value::Bool(slot.state.subagents_open),
+            );
             Some(serde_json::Value::Object(obj))
         })
         .collect();
@@ -2733,6 +2793,62 @@ enum InputMode {
     Chatbox,
 }
 
+/// Tool names that the v1 sub-agent classifier treats as sub-agents.
+/// Centralised here so swapping in a structured ACP sub-agent type — or
+/// supporting a renamed vendor tool — is a one-slice change (§25).
+const SUBAGENT_TOOL_NAMES: &[&str] = &["Task", "Subagent", "Spawn"];
+
+/// Sketch-side classification of a `ToolCall` that represents a sub-agent
+/// transcript (§26). Produced by the heuristic in `classify_subagent`; the
+/// `Subagents` sidepane lists these, and `focused_subagent` indexes into
+/// `AgentState.subagents` to swap the main transcript view.
+#[derive(Clone)]
+struct SubAgent {
+    /// Originating tool-call id. The tool call itself stays in
+    /// `tool_calls`; the sub-agent entry is an extra view over the same
+    /// content.
+    tool_call_id: String,
+    /// Best-effort display label: the tool call's `title` if set,
+    /// otherwise its `name`, with `subagent-N` as the ultimate fallback.
+    label: String,
+    /// Mirrors the underlying tool call's status.
+    status: sketch::acp_channel::ToolCallStatus,
+    /// Accumulated content blocks. Sketch caps these to the same per-
+    /// payload budget as main-transcript tool calls (§26).
+    transcript: Vec<sketch::acp_channel::ToolCallContent>,
+}
+
+/// Heuristic classifier (§25). v1: anything with `kind == ToolKind::Other`
+/// AND a `title` prefix in [`SUBAGENT_TOOL_NAMES`] is treated as a sub-
+/// agent. (The spec calls the matching field "name"; ACP names it
+/// `title` — same meaning, the user-facing label for the tool call.)
+/// Returns the freshly-constructed `SubAgent`, or `None` if the tool call
+/// doesn't match.
+fn classify_subagent(tc: &sketch::acp_channel::ToolCall) -> Option<SubAgent> {
+    use sketch::acp_channel::ToolKind;
+    if tc.kind != ToolKind::Other {
+        return None;
+    }
+    let title = tc.title.as_str();
+    if !SUBAGENT_TOOL_NAMES
+        .iter()
+        .any(|prefix| title.starts_with(prefix))
+    {
+        return None;
+    }
+    let label = if title.is_empty() {
+        "subagent".to_string()
+    } else {
+        title.to_string()
+    };
+    Some(SubAgent {
+        tool_call_id: tc.tool_call_id.0.to_string(),
+        label,
+        status: tc.status,
+        transcript: tc.content.clone(),
+    })
+}
+
 /// Per-line metadata that the Worksheet gutter reads to label each line.
 /// Stored in `editor.metadata::<TurnId>()` keyed by `LineAnchor`, so the
 /// tag follows the line through inserts, deletes, and inter-block
@@ -2943,6 +3059,19 @@ struct AgentState {
     /// when the upstream `unstable_session_usage` feature is on; otherwise
     /// stays `None` and the Status Strip omits these fields per §30.
     usage: Option<sketch::acp_channel::UsageSnapshot>,
+    /// Classified sub-agents — `ToolCall`s the heuristic flagged as
+    /// representing a sub-agent transcript (§25–§26). Ordered by
+    /// first-seen. Each carries the originating tool-call id, label,
+    /// status mirror, and accumulated content.
+    subagents: Vec<SubAgent>,
+    /// Index into `subagents` of the currently focused sub-agent. When
+    /// `Some`, the main transcript area swaps to show that sub-agent's
+    /// content instead of the root agent's (§27).
+    focused_subagent: Option<usize>,
+    /// Whether the Tasklist sidepane is open (§24).
+    tasklist_open: bool,
+    /// Whether the Subagents sidepane is open (§28).
+    subagents_open: bool,
     /// Background polling task that drains the ACP channel into the editor
     /// every ~50ms. Held only so that dropping `AgentState` (e.g. on
     /// `back_to_doc`) cancels the task. The leading `_` mutes unused-field
@@ -5852,7 +5981,18 @@ impl SketchGpuiView {
                 .position(|s| s.active)
                 .unwrap_or(0);
             for slot in persisted {
-                let state = self.create_agent_session(Some(slot.id.clone()), cx);
+                let mut state = self.create_agent_session(Some(slot.id.clone()), cx);
+                // Spec §35 fields. Mode chatbox stays as default; if the
+                // slot was saved in Worksheet, drop the freshly-created
+                // empty chatbox so the rendered view starts in Worksheet
+                // immediately. Per §36, the chatbox's unsent text is
+                // intentionally NOT persisted.
+                state.input_mode = slot.mode;
+                if slot.mode == InputMode::Worksheet {
+                    state.chatbox = None;
+                }
+                state.tasklist_open = slot.tasklist_open;
+                state.subagents_open = slot.subagents_open;
                 ring.push(slot.label, state, Some(slot.id));
             }
             ring.active = active_pos.min(ring.slots.len().saturating_sub(1));
@@ -6056,6 +6196,10 @@ impl SketchGpuiView {
             current_plan: None,
             agent_mode: None,
             usage: None,
+            subagents: Vec::new(),
+            focused_subagent: None,
+            tasklist_open: false,
+            subagents_open: false,
             _pump: Some(pump),
         }
     }
@@ -6167,6 +6311,24 @@ impl SketchGpuiView {
                     claude.awaiting_reply = false;
                     claude.turn_started = None;
                 }
+                // Spec §19 auto-scroll. In Chatbox mode the user's
+                // cursor isn't in the transcript so chunks land with
+                // sticky-bottom behavior. In Worksheet mode the
+                // viewport stays anchored to the cursor; the one
+                // exception is the cursor-at-EOF case (the user is
+                // typing at the tail and wants to keep seeing the
+                // freshly streamed output).
+                let line_count = claude.editor.document().line_count();
+                let cursor_at_eof = claude.editor.cursor().line + 1 >= line_count;
+                let follow_chunks = match claude.input_mode {
+                    InputMode::Chatbox => true,
+                    InputMode::Worksheet => cursor_at_eof,
+                };
+                if follow_chunks && claude.list_item_count > 0 {
+                    claude
+                        .list_state
+                        .scroll_to_reveal_item(claude.list_item_count - 1);
+                }
             }
 
             (has_events, more_pending, attached_with_id, is_active)
@@ -6233,6 +6395,12 @@ impl SketchGpuiView {
                         .editor
                         .metadata_mut::<TurnId>()
                         .insert(anchor, TurnId::Tool(current_turn));
+                    // Sub-agent classification (§25). Flat — nested tool
+                    // calls also classify here and become top-level
+                    // sub-agent entries.
+                    if let Some(sa) = classify_subagent(&tc) {
+                        claude.subagents.push(sa);
+                    }
                     if !claude.tool_calls.contains_key(&id) {
                         claude.tool_call_order.push(id.clone());
                     }
@@ -6243,6 +6411,17 @@ impl SketchGpuiView {
                     if let Some(existing) = claude.tool_calls.get_mut(&id) {
                         existing.update(upd.fields);
                         cap_tool_call_payloads(existing);
+                        // Keep sub-agent mirror up to date: status +
+                        // accumulated content. Done after the mutation
+                        // so the latest state lands in the sidepane.
+                        if let Some(sa) = claude
+                            .subagents
+                            .iter_mut()
+                            .find(|s| s.tool_call_id == id)
+                        {
+                            sa.status = existing.status;
+                            sa.transcript = existing.content.clone();
+                        }
                     } else {
                         // Update arrived for a tool call we never saw the
                         // start for (rare, but possible if the worker
@@ -6260,6 +6439,9 @@ impl SketchGpuiView {
                             .editor
                             .metadata_mut::<TurnId>()
                             .insert(anchor, TurnId::Tool(current_turn));
+                        if let Some(sa) = classify_subagent(&tc) {
+                            claude.subagents.push(sa);
+                        }
                         claude.tool_call_order.push(id.clone());
                         claude.tool_calls.insert(id, tc);
                     }
@@ -6450,6 +6632,41 @@ impl SketchGpuiView {
     /// only the editable runs between/after frozen Claude turns) as the
     /// next ACP prompt, then lock the turn so that content can't be
     /// retroactively edited.
+    /// Toggle the Tasklist sidepane visibility (§24).
+    fn toggle_tasklist(&mut self, cx: &mut Context<Self>) {
+        if let Some(c) = self.agent_mut() {
+            c.tasklist_open = !c.tasklist_open;
+        }
+        cx.notify();
+    }
+
+    /// Toggle the Subagents sidepane visibility (§28).
+    fn toggle_subagents(&mut self, cx: &mut Context<Self>) {
+        if let Some(c) = self.agent_mut() {
+            c.subagents_open = !c.subagents_open;
+        }
+        cx.notify();
+    }
+
+    /// Set focused sub-agent index (§27). The main transcript swap is
+    /// purely a render-time decision; this just flips the field.
+    fn focus_subagent(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(c) = self.agent_mut() {
+            if idx < c.subagents.len() {
+                c.focused_subagent = Some(idx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Return focus from a sub-agent transcript to the root agent (§27).
+    fn unfocus_subagent(&mut self, cx: &mut Context<Self>) {
+        if let Some(c) = self.agent_mut() {
+            c.focused_subagent = None;
+        }
+        cx.notify();
+    }
+
     /// Flip the agent window's input mode (§5). Data movement is
     /// asymmetric per §6/§7:
     ///
@@ -6677,6 +6894,20 @@ impl SketchGpuiView {
         cx: &mut Context<Self>,
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
+
+        // Esc with a focused sub-agent: return to the parent transcript
+        // (§27). Otherwise Esc falls through — the project rule is
+        // "Esc never quits / never closes", so an unfocused-sub-agent
+        // Esc keeps the existing per-mode behavior (toggle Normal etc.).
+        if press.key == Key::Esc
+            && self
+                .agent_mut()
+                .map(|c| c.focused_subagent.is_some())
+                .unwrap_or(false)
+        {
+            self.unfocus_subagent(cx);
+            return;
+        }
 
         // Mode-toggle: Ctrl-Alt-Enter (§5). Checked before Ctrl-Enter so
         // an accidental Alt-press doesn't fire a submit instead.
@@ -7431,6 +7662,7 @@ impl SketchGpuiView {
             (slot.index, slot.label.clone(), is_active, slot.has_unseen_activity, has_channel)
         }).collect();
 
+        let active_slot_label = ring.active().label.clone();
         let c = &mut ring.active_mut().state;
 
         let cursor = c.editor.cursor();
@@ -7865,58 +8097,146 @@ impl SketchGpuiView {
         let top = self.theme.top_bar;
         let bot = self.theme.bottom_bar;
 
-        let attach_label: SharedString = match &c.channel {
-            Some(ch) => {
-                // Turn count: completed turns + 1 if a reply is in flight,
-                // so the displayed number tracks "the turn we're in" rather
-                // than "turns finished". Settles back to N=completed once
-                // the agent's prompt response lands.
-                let completed = ch.turn_count();
-                let n = if c.awaiting_reply { completed + 1 } else { completed };
-                let mode = ch.permission_mode().short_label();
-                if n > 0 {
-                    format!("ACP: {} · turn {} · {}", ch.command(), n, mode).into()
-                } else {
-                    format!("ACP: {} · {}", ch.command(), mode).into()
-                }
-            }
-            None if c.attach_pending.is_some() => "ACP: attaching…".into(),
-            None => "ACP: not attached".into(),
-        };
+        // ---- Status Strip (spec §30) ----
+        // Single-row header showing agent label, sub-agent breadcrumb
+        // (when focused), model id, permission mode, context-window
+        // usage + cost (when present), and turn / elapsed. Any field
+        // whose underlying signal is absent renders nothing — no
+        // placeholder, no `?`. The strip is at most as wide as the
+        // data it has.
+        let strip_dim: Hsla = rgb(0x6272a4).into();
+        let strip_warm: Hsla = rgb(0xf1fa8c).into();
+        let strip_fg = fg_or(top, STATUS_FG);
 
-        let timer_label: String = if let Some(started) = c.turn_started {
-            let elapsed = started.elapsed();
-            let secs = elapsed.as_secs();
-            let m = secs / 60;
-            let s = secs % 60;
-            format!("  {}:{:02}", m, s)
-        } else {
-            String::new()
-        };
-
-        let header = div()
+        let mut strip = div()
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
             .px_4()
             .py_1()
             .h(px(28.0))
             .bg(bg_or(top, STATUS_BG))
-            .text_color(fg_or(top, STATUS_FG))
+            .text_color(strip_fg)
             .font_weight(FontWeight::BOLD)
-            .child(format!("sketch-gpui [claude] — {}", attach_label))
-            .child(
+            .text_size(px(12.0));
+
+        // Agent label (slot label).
+        strip = strip.child(
+            div()
+                .pr_2()
+                .child(SharedString::from(active_slot_label.clone())),
+        );
+
+        // Sub-agent breadcrumb (only when focused).
+        if let Some(idx) = c.focused_subagent {
+            if let Some(sa) = c.subagents.get(idx) {
+                let crumb = format!(" ⏵ {} ◂", sa.label);
+                strip = strip.child(
+                    div()
+                        .pr_2()
+                        .text_color(strip_warm)
+                        .child(SharedString::from(crumb)),
+                );
+            }
+        }
+
+        // Model id (best-effort: agent_mode → channel description).
+        let model_label: Option<String> = c
+            .agent_mode
+            .as_ref()
+            .map(|m| m.0.to_string())
+            .or_else(|| {
+                c.channel.as_ref().map(|ch| ch.command().to_string())
+            });
+        if let Some(m) = model_label {
+            strip = strip.child(
                 div()
-                    .text_size(px(12.0))
-                    .text_color(if c.turn_started.is_some() {
-                        let c: Hsla = rgb(0xf1fa8c).into();
-                        c
-                    } else {
-                        fg_or(top, STATUS_FG)
-                    })
-                    .child(SharedString::from(timer_label)),
+                    .pr_2()
+                    .text_color(strip_dim)
+                    .child(SharedString::from(m)),
             );
+        }
+
+        // Permission mode.
+        if let Some(ch) = &c.channel {
+            let mode_str = ch.permission_mode().short_label();
+            strip = strip.child(
+                div()
+                    .pr_2()
+                    .text_color(strip_dim)
+                    .child(SharedString::from(mode_str.to_string())),
+            );
+        }
+
+        // Context-window usage + cost (when the unstable feature is on
+        // and the agent has emitted a UsageUpdate).
+        if let Some(usage) = &c.usage {
+            let used_k = (usage.tokens_used as f64) / 1000.0;
+            let total_k = (usage.tokens_total as f64) / 1000.0;
+            let pct = if usage.tokens_total > 0 {
+                (usage.tokens_used as f64 / usage.tokens_total as f64) * 100.0
+            } else {
+                0.0
+            };
+            let usage_text = format!(
+                "{:.1}k / {:.0}k ({:.0}%)",
+                used_k, total_k, pct
+            );
+            strip = strip.child(
+                div()
+                    .pr_2()
+                    .text_color(strip_dim)
+                    .child(SharedString::from(usage_text)),
+            );
+            if let Some(cost) = usage.cost_usd {
+                strip = strip.child(
+                    div()
+                        .pr_2()
+                        .text_color(strip_dim)
+                        .child(SharedString::from(format!("${:.2}", cost))),
+                );
+            }
+        }
+
+        // Turn / elapsed. Show "turn N · M:SS" when a turn has run; "turn
+        // N" alone if no timer is active; nothing if no turns have run.
+        let completed_turns = c
+            .channel
+            .as_ref()
+            .map(|ch| ch.turn_count())
+            .unwrap_or(0);
+        let display_turn = if c.awaiting_reply {
+            completed_turns + 1
+        } else {
+            completed_turns
+        };
+        if display_turn > 0 || c.turn_started.is_some() {
+            let elapsed_str = if let Some(t) = c.turn_started {
+                let s = t.elapsed().as_secs();
+                format!("{}:{:02}", s / 60, s % 60)
+            } else {
+                String::new()
+            };
+            let turn_color = if c.turn_started.is_some() {
+                strip_warm
+            } else {
+                strip_dim
+            };
+            let label = if elapsed_str.is_empty() {
+                format!("turn {}", display_turn)
+            } else {
+                format!("turn {} · {}", display_turn, elapsed_str)
+            };
+            strip = strip
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_color(turn_color)
+                        .child(SharedString::from(label)),
+                );
+        }
+
+        let header = strip;
 
         let in_chatbox = c.input_mode == InputMode::Chatbox && c.chatbox.is_some();
         let mode_label = if in_chatbox {
@@ -8064,6 +8384,165 @@ impl SketchGpuiView {
             None
         };
 
+        // ---- Right-side sidepanes (Tasklist / Subagents) ----
+        //
+        // Stacked horizontally in fixed order (Tasklist innermost, then
+        // Subagents) per spec §2. Each pane is a fixed 28-char column;
+        // the transcript area's flex-1 shrinks to make room. Panes only
+        // render when their `*_open` flag is true.
+        let pane_width = px(28.0 * 7.0); // ~28 monospace cols at 13px = ~196px
+        let pane_border: Hsla = rgb(0x44475a).into();
+        let pane_header_fg: Hsla = rgb(0x8be9fd).into();
+        let pane_dim_fg: Hsla = rgb(0x6272a4).into();
+        let pane_bg: Hsla = rgb(0x21222c).into();
+
+        let tasklist_pane = if c.tasklist_open {
+            let mut pane = div()
+                .id("tasklist-pane")
+                .flex()
+                .flex_col()
+                .w(pane_width)
+                .min_w(pane_width)
+                .flex_none()
+                .bg(pane_bg)
+                .border_l_1()
+                .border_color(pane_border)
+                .py_1()
+                .text_size(px(12.0))
+                .font_family(self.code_font.clone());
+            pane = pane.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_color(pane_header_fg)
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::new_static("Plan")),
+            );
+            match &c.current_plan {
+                Some(plan) if !plan.entries.is_empty() => {
+                    use sketch::acp_channel::PlanEntryStatus;
+                    for entry in &plan.entries {
+                        let glyph: &'static str = match entry.status {
+                            PlanEntryStatus::Completed => "✓",
+                            PlanEntryStatus::InProgress => "●",
+                            PlanEntryStatus::Pending => "○",
+                            // ACP marks the enum #[non_exhaustive]; a
+                            // future "failed" or similar status falls
+                            // back to a clear indicator (§22).
+                            _ => "✗",
+                        };
+                        let line_text = if entry.content.chars().count() > 22 {
+                            let truncated: String =
+                                entry.content.chars().take(21).collect();
+                            format!("{}  {}…", glyph, truncated)
+                        } else {
+                            format!("{}  {}", glyph, entry.content)
+                        };
+                        pane = pane.child(
+                            div()
+                                .px_2()
+                                .py(px(1.0))
+                                .text_color(rgb(DEFAULT_FG))
+                                .child(SharedString::from(line_text)),
+                        );
+                    }
+                }
+                _ => {
+                    pane = pane.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_color(pane_dim_fg)
+                            .child(SharedString::new_static("(no plan)")),
+                    );
+                }
+            }
+            Some(pane)
+        } else {
+            None
+        };
+
+        let subagents_pane = if c.subagents_open {
+            let mut pane = div()
+                .id("subagents-pane")
+                .flex()
+                .flex_col()
+                .w(pane_width)
+                .min_w(pane_width)
+                .flex_none()
+                .bg(pane_bg)
+                .border_l_1()
+                .border_color(pane_border)
+                .py_1()
+                .text_size(px(12.0))
+                .font_family(self.code_font.clone());
+            pane = pane.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_color(pane_header_fg)
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::new_static("Subagents")),
+            );
+            if c.subagents.is_empty() {
+                pane = pane.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_color(pane_dim_fg)
+                        .child(SharedString::new_static("(no subagents)")),
+                );
+            } else {
+                use sketch::acp_channel::ToolCallStatus;
+                let focused_idx = c.focused_subagent;
+                for (i, sa) in c.subagents.iter().enumerate() {
+                    let glyph: &'static str = match sa.status {
+                        ToolCallStatus::Completed => "✓",
+                        ToolCallStatus::Failed => "✗",
+                        ToolCallStatus::InProgress => "●",
+                        ToolCallStatus::Pending => "○",
+                        _ => "·",
+                    };
+                    let trunc_label: String = if sa.label.chars().count() > 20 {
+                        let head: String = sa.label.chars().take(19).collect();
+                        format!("{}…", head)
+                    } else {
+                        sa.label.clone()
+                    };
+                    let row_text = format!("▸ {} {}", glyph, trunc_label);
+                    let is_focused = focused_idx == Some(i);
+                    let row_fg: Hsla = if is_focused {
+                        rgb(0xf1fa8c).into()
+                    } else {
+                        rgb(DEFAULT_FG).into()
+                    };
+                    let row_bg: Hsla = if is_focused {
+                        rgba(0x44475a55).into()
+                    } else {
+                        rgba(0x00000000).into()
+                    };
+                    let weak = cx.entity().downgrade();
+                    let row = div()
+                        .id(SharedString::from(format!("subagent-row-{}", i)))
+                        .px_2()
+                        .py(px(1.0))
+                        .cursor_pointer()
+                        .text_color(row_fg)
+                        .bg(row_bg)
+                        .on_click(move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
+                            let _ = weak.update(app, |this, cx| {
+                                this.focus_subagent(i, cx);
+                            });
+                        })
+                        .child(SharedString::from(row_text));
+                    pane = pane.child(row);
+                }
+            }
+            Some(pane)
+        } else {
+            None
+        };
+
         // Session sidebar — visible when more than one session exists.
         let editor_bg = self.editor_bg();
         let editor_fg = self.editor_fg();
@@ -8150,14 +8629,29 @@ impl SketchGpuiView {
                     }),
             );
 
-            // Right column: body (flex-1) + optional compose panel.
+            // Transcript row: body | tasklist | subagents (panes only
+            // appear when open per §1–§2). Below the row, the chatbox
+            // panel spans full width.
+            let mut transcript_row = div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h_0()
+                .child(div().flex_1().min_w_0().child(body));
+            if let Some(p) = tasklist_pane {
+                transcript_row = transcript_row.child(p);
+            }
+            if let Some(p) = subagents_pane {
+                transcript_row = transcript_row.child(p);
+            }
+
             let mut right_col = div()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
-                .child(body);
+                .child(transcript_row);
             if let Some(panel) = compose_panel {
                 right_col = right_col.child(panel);
             }
@@ -8171,13 +8665,27 @@ impl SketchGpuiView {
                 .child(right_col)
                 .into_any_element()
         } else {
-            // No sidebar: body + compose stacked vertically.
+            // No session sidebar. Same transcript-row + chatbox stack
+            // as the multi-session branch, without the left column.
+            let mut transcript_row = div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h_0()
+                .child(div().flex_1().min_w_0().child(body));
+            if let Some(p) = tasklist_pane {
+                transcript_row = transcript_row.child(p);
+            }
+            if let Some(p) = subagents_pane {
+                transcript_row = transcript_row.child(p);
+            }
+
             let mut col = div()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h_0()
-                .child(body);
+                .child(transcript_row);
             if let Some(panel) = compose_panel {
                 col = col.child(panel);
             }
@@ -8195,6 +8703,12 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::zoom_reset))
             .on_action(cx.listener(Self::rename_tab))
             .on_action(cx.listener(Self::close_window))
+            .on_action(cx.listener(|this, _: &ToggleTasklist, _w, cx| {
+                this.toggle_tasklist(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSubagents, _w, cx| {
+                this.toggle_subagents(cx);
+            }))
             .child(header)
             .child(content_area)
             .child(footer)
@@ -8595,6 +9109,10 @@ fn main() {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-o", OpenBrowser, None),
             KeyBinding::new("cmd-k", OpenAgent, None),
+            // Agent-window sidepane toggles (§32). Scoped to AgentView
+            // so Cmd-1/Cmd-2 don't shadow anything in other screens.
+            KeyBinding::new("cmd-1", ToggleTasklist, Some("AgentView")),
+            KeyBinding::new("cmd-2", ToggleSubagents, Some("AgentView")),
             // Workspace-level tab switching — app-global so the strip is
             // reachable from every screen and overlay (per spec Interfaces
             // table; bind also `Ctrl-Tab`/`Ctrl-Shift-Tab` for keyboard-only

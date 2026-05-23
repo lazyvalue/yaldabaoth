@@ -1,8 +1,8 @@
 # Agent Window — Worksheet + Chatbox + Sidepanes
 
-**Status:** ACTIVE — approved, not yet implemented. Section-level status markers stay DRAFT where they were until each piece lands.
+**Status:** ACTIVE — phases 1–4 shipped. Section-level markers below reflect what landed; the rendering polish around sub-agent transcript swap (§27) and a few corner cases still flagged DRAFT.
 
-**Last updated:** 2026-05-22
+**Last updated:** 2026-05-23
 
 ## Builds On
 
@@ -421,6 +421,7 @@ Pointer handling for both the Tasklist pane (entry hover-tooltip) and the Subage
 
 ## Revision History
 
+- 2026-05-23 — Phases 1–4 landed. Editor extensions (§E1–§E3), Claude→Agent rename, ACP signal forwarding (§31), worksheet/chatbox modes (§4–§20), turn gutter (§11), Tasklist + Subagents sidepanes (§21–§29), Status Strip (§30), persistence schema extension (§35), and cursor-anchored auto-scroll (§19) all shipped. Per-window cwd is parked as a sibling spec for follow-up. Sub-agent transcript swap (§27) is wired up to the focus-state field but the main-area swap rendering hasn't been built yet — clicking a sub-agent today highlights the row and primes the field; the transcript renderer continues to show the parent agent. Spec §27's footer-hint and Cmd-[ return path are also unbuilt.
 - 2026-05-22 (3) — Status bumped DRAFT → ACTIVE after the user approved the rev-2 revisions. Section-level markers stay DRAFT until each piece ships.
 - 2026-05-22 (2) — Adversarial review pass. Three blocking concerns from the reviewer addressed by introducing a new **Editor Extensions** section (`§E1`–`§E4`): opaque `LineAnchor` ids replace raw line-index anchors for tool calls (fixes the "anchor doesn't shift when user inserts above" bug); typed `LineMetadata<T>` sparse map replaces the proposed `line_turn_ids: Vec<TurnId>` parallel array (anchor-keyed, auto-shifts with the same machinery as `frozen_lines`); the LLM-chunk splice is replaced with `append_llm_chunk(turn_id, chunk)`, an insert-and-tag that leaves trailing draft AND inter-block annotations untouched. Worksheet submit (§12) now distinguishes prompt-body (skips whitespace-only lines) from freeze-pass (includes them) so blank spacers survive in the transcript without polluting the wire prompt. Worksheet auto-scroll (§19) now anchors to the user's cursor, not to streaming output (sticky-bottom only when cursor is at EOF). Sub-agent classifier (§25) hardens the heuristic to a const slice of name prefixes and specifies flat (not tree) classification for nested tool calls. Sub-agent transcripts (§26) reuse the existing `cap_tool_call_payloads` per-payload cap. `ReplyEvent::UsageUpdated` (§31) is now unconditional in the enum with a feature-gated *emitter* so match-exhaustiveness stays clean across feature settings. Persistence (§35) adds an explicit downgrade-compat note. Constraint §6 expands the auto-close threshold to account for the workspace tab strip's width. Constraint §8 adds a mid-session model-staleness note for agents that change models without emitting `CurrentModeUpdate`. Menu chord for the input-mode toggle (§5) moved from `m` (collides with `claude-mode-cycle` for permission mode) to `i` ("input mode"). Mode-switch undo behavior (§7) and `Tn` gutter source (§11) clarified inline. New Interfaces entry for sidepane pointer events citing the existing session-sidebar handler pattern.
 - 2026-05-22 — Initial DRAFT. Replaces the ad-hoc Claude-only screen with the unified Agent Window model. Worksheet contract (§9–§15), Chatbox contract (§16–§20), Tasklist sidepane (§21–§24), Subagents sidepane (§25–§29), Status Strip (§30), and ACP signal extensions (§31, §35) all DRAFT. Rename pass (Claude → Agent) DRAFT. `spec-textbox-compose.md` to be marked SUPERSEDED once this lands.
