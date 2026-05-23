@@ -68,6 +68,8 @@
 
 mod workspace;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process;
 use std::time::Duration;
@@ -76,15 +78,16 @@ use gpui::{
     actions, div, point, px, rgb, rgba, size, AnyElement, App, AppContext, Application,
     Bounds, Context, FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight,
     Hsla, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke, Menu,
-    MenuItem, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    StrikethroughStyle, Styled, StyledText, Task, TextRun, TitlebarOptions, UnderlineStyle,
-    Window, WindowBounds, WindowOptions,
+    MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    Render, ScrollHandle, SharedString, StatefulInteractiveElement, StrikethroughStyle,
+    Styled, StyledText, Task, TextLayout, TextRun, TitlebarOptions, UnderlineStyle, Window,
+    WindowBounds, WindowOptions,
 };
 
 use sketch::acp_channel::AcpChannelClient;
 use sketch::blocks::{ColumnAlignment, ListItem, RenderedBlock, StyledLine, StyledSpan};
 use sketch::document::Document;
-use sketch::editor::Editor;
+use sketch::editor::{Editor, LineAnchor};
 use sketch::file_browser::{BrowserEntry, FileBrowser};
 use sketch::keybind::KeybindManager;
 use sketch::keys::{Key, KeyPress, Modifiers as KMods};
@@ -92,7 +95,7 @@ use sketch::md_highlight::{highlight_markdown_lines, Segment};
 use sketch::menu::{MenuNode, MenuNodeKind, MenuState};
 use sketch::render;
 use sketch::style::{Color as NColor, Modifier, Style as NStyle};
-use sketch::theme::Theme;
+use sketch::theme::{Theme, ThemeName};
 
 // ----------------------------------------------------------------------------
 // Actions
@@ -113,7 +116,7 @@ actions!(
         OpenBrowser,
         EnterEdit,
         EnterWp,
-        OpenClaude,
+        OpenAgent,
         OpenMenu,
         Quit,
         // Buffer cycling
@@ -148,6 +151,14 @@ actions!(
         BrowserToggleHidden,
         BrowserCycleSort,
         BrowserClose,
+        // Document text zoom (scales body + headings; chrome stays fixed)
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
+        // View-mode mouse text selection
+        CopyDocSelection,
+        // Open the rename input overlay for the active tab.
+        RenameTab,
     ]
 );
 
@@ -216,6 +227,13 @@ const STATUS_FG: u32 = 0x8be9fd;
 /// "current line" gray reads as a contiguous swath against the editor bg
 /// without overpowering syntax-highlighted spans.
 const SELECTION_BG: NColor = NColor::Rgb(68, 71, 90);
+
+/// Multiplicative step per Cmd+= / Cmd+- press. 1.1 is the same ratio
+/// Chromium uses for browser zoom — small enough that hitting the key twice
+/// is meaningful, large enough to feel responsive.
+const TEXT_SCALE_STEP: f32 = 1.1;
+const MIN_TEXT_SCALE: f32 = 0.5;
+const MAX_TEXT_SCALE: f32 = 3.0;
 
 fn ncolor_to_hsla(c: NColor, fallback: u32) -> Hsla {
     match c {
@@ -368,6 +386,222 @@ fn styled_line_element(
     StyledText::new(text).with_runs(runs).into_any_element()
 }
 
+/// Doc-view counterpart to `styled_line_element` — same run construction,
+/// plus optional selection-background painting (driven by `ctx.doc_selection`
+/// projected onto this `(block_idx, line_idx)`) and registration of the
+/// resulting `TextLayout` in `ctx.line_layouts` for mouse hit-testing.
+///
+/// Used only on the view-mode render path; edit-mode and Claude rendering
+/// continue to call `styled_line_element` directly.
+fn doc_styled_line_element(
+    ctx: &RenderCtx<'_>,
+    line: &StyledLine,
+    base_style: NStyle,
+    base_fg: u32,
+    body_font: &SharedString,
+    code_font: &SharedString,
+    line_idx: usize,
+) -> AnyElement {
+    // Reuse the plain element when this ctx isn't set up for doc-view selection.
+    let (block_idx, sink) = match (ctx.current_block, ctx.line_layouts) {
+        (Some(b), Some(s)) => (b, s),
+        _ => return styled_line_element(line, base_style, base_fg, body_font, code_font),
+    };
+
+    // Build text + runs, identical to `styled_line_element`. We need the
+    // intermediate form so we can patch background_color before sealing the
+    // StyledText.
+    let mut text = String::new();
+    let mut runs: Vec<TextRun> = Vec::new();
+    // Byte range + target for every wiki link on this line. Populated as
+    // we walk spans below; used to wrap the StyledText in InteractiveText
+    // with on_click handlers.
+    let mut wiki_link_ranges: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+
+    if line.spans.is_empty() {
+        text.push(' ');
+        runs.push(TextRun {
+            len: 1,
+            font: font_for(base_style, body_font),
+            color: rgb(base_fg).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    } else {
+        for span in &line.spans {
+            if span.text.is_empty() {
+                continue;
+            }
+            let combined = base_style.patch(span.style);
+            let len = span.text.len();
+            let span_start = text.len();
+            text.push_str(&span.text);
+            if let Some(link) = span
+                .link
+                .as_deref()
+                .and_then(|l| l.strip_prefix(WIKI_LINK_PREFIX))
+            {
+                wiki_link_ranges.push((span_start..span_start + len, link.to_string()));
+            }
+            let font = if combined.bg.is_some() || combined.fg == Some(NColor::Rgb(241, 250, 140))
+            {
+                font_for(combined, code_font)
+            } else {
+                font_for(combined, body_font)
+            };
+            let underline = if combined.modifier.contains(Modifier::UNDERLINED) {
+                Some(UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(fg_or(combined, base_fg)),
+                    wavy: false,
+                })
+            } else {
+                None
+            };
+            let strikethrough = if combined.modifier.contains(Modifier::CROSSED_OUT) {
+                Some(StrikethroughStyle {
+                    thickness: px(1.0),
+                    color: Some(fg_or(combined, base_fg)),
+                })
+            } else {
+                None
+            };
+            let bg = combined.bg.map(|c| ncolor_to_hsla(c, BG));
+            runs.push(TextRun {
+                len,
+                font,
+                color: fg_or(combined, base_fg),
+                background_color: bg,
+                underline,
+                strikethrough,
+            });
+        }
+    }
+    if runs.is_empty() {
+        text.push(' ');
+        runs.push(TextRun {
+            len: 1,
+            font: font_for(base_style, body_font),
+            color: rgb(base_fg).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    }
+
+    // Patch selection background on the runs that overlap the projected
+    // char range. Convert char range → byte range against `text`, then
+    // walk runs and split any that straddle a boundary.
+    if let Some(sel) = ctx.doc_selection {
+        let line_chars = styled_line_char_count(line);
+        if let Some((s_char, e_char)) = doc_selection_for_line(&sel, block_idx, line_idx, line_chars) {
+            let s_byte = char_offset_to_byte_offset(&text, s_char);
+            let e_byte = char_offset_to_byte_offset(&text, e_char);
+            runs = apply_selection_bg_to_runs(runs, s_byte, e_byte, ncolor_to_hsla(SELECTION_BG, BG));
+        }
+    }
+
+    let styled = StyledText::new(text).with_runs(runs);
+    // Clone the TextLayout handle into the side channel so mouse handlers
+    // on the doc body can later hit-test this line.
+    sink.borrow_mut().insert((block_idx, line_idx), styled.layout().clone());
+
+    // Plain text path — no wiki links on this line.
+    if wiki_link_ranges.is_empty() {
+        return styled.into_any_element();
+    }
+
+    // Wrap in InteractiveText so we can attach an on_click handler. Wiki
+    // link clicks navigate the focused pane to the target file via
+    // `open_wiki_link` on the view (resolved through the weak handle
+    // captured in RenderCtx).
+    let weak = match &ctx.weak_view {
+        Some(w) => w.clone(),
+        None => return styled.into_any_element(),
+    };
+    let doc_dir = ctx.doc_dir.clone();
+    let ranges: Vec<std::ops::Range<usize>> =
+        wiki_link_ranges.iter().map(|(r, _)| r.clone()).collect();
+    let targets: Vec<String> = wiki_link_ranges.into_iter().map(|(_, t)| t).collect();
+    let element_id = gpui::ElementId::Name(SharedString::from(format!(
+        "wiki-line-{block_idx}-{line_idx}"
+    )));
+    gpui::InteractiveText::new(element_id, styled)
+        .on_click(ranges, move |idx, _w, app| {
+            let Some(target) = targets.get(idx) else {
+                return;
+            };
+            let target = target.clone();
+            let doc_dir = doc_dir.clone();
+            let _ = weak.update(app, |view, cx| {
+                view.open_wiki_link(&target, doc_dir.as_deref(), cx);
+            });
+        })
+        .into_any_element()
+}
+
+/// Convert a char-index into its byte offset within `s`. Saturates at
+/// `s.len()` if `char_offset` is past the end (the selection projection
+/// already clamps to `line_char_count`, but `text` here may include the
+/// defensive trailing space we add for empty lines).
+fn char_offset_to_byte_offset(s: &str, char_offset: usize) -> usize {
+    let mut chars_seen = 0;
+    for (byte_idx, _) in s.char_indices() {
+        if chars_seen == char_offset {
+            return byte_idx;
+        }
+        chars_seen += 1;
+    }
+    s.len()
+}
+
+/// Split runs at `[s_byte, e_byte)` and patch the in-range runs'
+/// `background_color`. Runs are sequential and their `len` sums to the
+/// total text byte length; we walk byte by byte (run-major) and split
+/// at each boundary.
+fn apply_selection_bg_to_runs(
+    runs: Vec<TextRun>,
+    s_byte: usize,
+    e_byte: usize,
+    bg: Hsla,
+) -> Vec<TextRun> {
+    if s_byte >= e_byte {
+        return runs;
+    }
+    let mut out: Vec<TextRun> = Vec::with_capacity(runs.len() + 2);
+    let mut cursor = 0usize;
+    for run in runs {
+        let run_start = cursor;
+        let run_end = cursor + run.len;
+        cursor = run_end;
+        if run_end <= s_byte || run_start >= e_byte {
+            out.push(run);
+            continue;
+        }
+        // Split into pre / mid / post relative to [s_byte, e_byte).
+        let mid_s = s_byte.max(run_start);
+        let mid_e = e_byte.min(run_end);
+        if run_start < mid_s {
+            let mut pre = run.clone();
+            pre.len = mid_s - run_start;
+            out.push(pre);
+        }
+        if mid_s < mid_e {
+            let mut mid = run.clone();
+            mid.len = mid_e - mid_s;
+            mid.background_color = Some(bg);
+            out.push(mid);
+        }
+        if mid_e < run_end {
+            let mut post = run.clone();
+            post.len = run_end - mid_e;
+            out.push(post);
+        }
+    }
+    out
+}
+
 // ----------------------------------------------------------------------------
 // Block → Element
 // ----------------------------------------------------------------------------
@@ -376,12 +610,52 @@ struct RenderCtx<'a> {
     theme: &'a Theme,
     body_font: SharedString,
     code_font: SharedString,
+    /// Cmd-zoom multiplier on body text. 1.0 = unzoomed. Set to 1.0 in
+    /// contexts where zoom shouldn't apply (e.g. the Claude session block
+    /// renderer).
+    text_scale: f32,
     cursor_block: Option<usize>,
+    /// Active doc-view mouse selection, used to paint background on
+    /// participating lines. `None` outside the view-mode render path.
+    doc_selection: Option<DocSelection>,
+    /// Side channel for line-layout registration. Lines store their cloned
+    /// `TextLayout` here keyed by `(block_idx, line_idx)` so mouse handlers
+    /// on the doc body can hit-test against bounds and map pixels → bytes.
+    /// `None` outside the view-mode render path (e.g. edit-mode rendering
+    /// and nested ctxes inside blockquotes/lists where v1 doesn't yet
+    /// support selection).
+    line_layouts: Option<&'a RefCell<HashMap<(usize, usize), TextLayout>>>,
+    /// The top-level block index currently being rendered. Set by
+    /// `block_element` and cleared (set to `None`) when `block_inner`
+    /// recurses into nested blocks (blockquote/list content), so the v1
+    /// "top-level only" selection scope is enforced naturally.
+    current_block: Option<usize>,
+    /// Weak handle on the view, captured so click handlers built inside
+    /// free render functions (`doc_styled_line_element`, etc.) can call
+    /// back into the view for wiki-link navigation. `None` outside the
+    /// view-mode render path.
+    weak_view: Option<gpui::WeakEntity<SketchGpuiView>>,
+    /// Directory of the currently focused Doc, used to resolve wiki link
+    /// targets (`[[notes]]` → `<doc_dir>/notes.md`). `None` outside the
+    /// view-mode render path or when the doc has no parent dir.
+    doc_dir: Option<PathBuf>,
 }
 
 fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlock) -> AnyElement {
     let highlighted = ctx.cursor_block == Some(idx);
-    let base = block_inner(ctx, block);
+    let inner_ctx = RenderCtx {
+        theme: ctx.theme,
+        body_font: ctx.body_font.clone(),
+        code_font: ctx.code_font.clone(),
+        text_scale: ctx.text_scale,
+        cursor_block: ctx.cursor_block,
+        doc_selection: ctx.doc_selection,
+        line_layouts: ctx.line_layouts,
+        current_block: Some(idx),
+        weak_view: ctx.weak_view.clone(),
+        doc_dir: ctx.doc_dir.clone(),
+    };
+    let base = block_inner(&inner_ctx, block);
 
     // Wrap with a left "cursor bar" indicator when this is the focused block.
     div()
@@ -419,16 +693,18 @@ fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElement {
                 _ => 15.0,
             };
             div()
-                .text_size(px(size_px))
+                .text_size(px(size_px * ctx.text_scale))
                 .font_weight(FontWeight::BOLD)
                 .text_color(fg_or(style, DEFAULT_FG))
                 .pb_1()
-                .child(styled_line_element(
+                .child(doc_styled_line_element(
+                    ctx,
                     content,
                     style,
                     DEFAULT_FG,
                     &ctx.body_font,
                     &ctx.code_font,
+                    0,
                 ))
                 .into_any_element()
         }
@@ -442,13 +718,15 @@ fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElement {
                 .flex()
                 .flex_col()
                 .text_color(fg_or(base, DEFAULT_FG));
-            for line in lines {
-                col = col.child(styled_line_element(
+            for (li, line) in lines.iter().enumerate() {
+                col = col.child(doc_styled_line_element(
+                    ctx,
                     line,
                     base,
                     DEFAULT_FG,
                     &ctx.body_font,
                     &ctx.code_font,
+                    li,
                 ));
             }
             col.into_any_element()
@@ -475,13 +753,15 @@ fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElement {
                 }
             }
             let row_style = NStyle::default();
-            for line in lines {
-                col = col.child(styled_line_element(
+            for (li, line) in lines.iter().enumerate() {
+                col = col.child(doc_styled_line_element(
+                    ctx,
                     line,
                     row_style,
                     DEFAULT_FG,
                     &ctx.code_font,
                     &ctx.code_font,
+                    li,
                 ));
             }
             col.into_any_element()
@@ -501,7 +781,16 @@ fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElement {
                         theme: ctx.theme,
                         body_font: ctx.body_font.clone(),
                         code_font: ctx.code_font.clone(),
+                        text_scale: ctx.text_scale,
                         cursor_block: None,
+                        doc_selection: None,
+                        line_layouts: None,
+                        current_block: None,
+                        // Wiki links should still be clickable inside
+                        // nested blocks (blockquotes, list items) — only
+                        // selection is scoped top-level.
+                        weak_view: ctx.weak_view.clone(),
+                        doc_dir: ctx.doc_dir.clone(),
                     },
                     b,
                 ));
@@ -582,7 +871,13 @@ fn list_item_element(
                 theme: ctx.theme,
                 body_font: ctx.body_font.clone(),
                 code_font: ctx.code_font.clone(),
+                text_scale: ctx.text_scale,
                 cursor_block: None,
+                doc_selection: None,
+                line_layouts: None,
+                current_block: None,
+                weak_view: ctx.weak_view.clone(),
+                doc_dir: ctx.doc_dir.clone(),
             },
             b,
         ));
@@ -741,6 +1036,254 @@ fn split_segments_at_col(segs: &[Segment], col: usize) -> (Vec<Segment>, (char, 
 
     let at = at.unwrap_or((' ', last_style));
     (before, at, after)
+}
+
+/// Doc-view mouse selection. Coordinates are (block_idx, line_idx within
+/// the block's rendered lines, char_offset within that line). `dragging`
+/// is true between MouseDown and MouseUp on the doc body — during that
+/// window every MouseMove updates `head`. Once `dragging` is false the
+/// range is frozen and Cmd-C reads from it.
+#[derive(Clone, Copy, Debug)]
+struct DocSelection {
+    anchor: DocPos,
+    head: DocPos,
+    dragging: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DocPos {
+    block_idx: usize,
+    line_idx: usize,
+    char_offset: usize,
+}
+
+impl DocSelection {
+    fn normalized(&self) -> (DocPos, DocPos) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+}
+
+/// Char count of a StyledLine (sum of `chars().count()` over all spans).
+fn styled_line_char_count(line: &StyledLine) -> usize {
+    line.spans.iter().map(|s| s.text.chars().count()).sum()
+}
+
+/// Prefix on `StyledSpan.link` that marks a wiki-style link target
+/// (`[[note]]` in markdown). The doc-view click handler treats spans with
+/// this prefix as file references — anything else is a regular markdown
+/// link and is left alone for now.
+const WIKI_LINK_PREFIX: &str = "wiki:";
+
+/// Render markdown to blocks + post-process `[[name]]` / `[[name|display]]`
+/// patterns into link-bearing spans. pulldown-cmark doesn't understand
+/// wiki links, so they arrive as plain text and we rewrite them after
+/// rendering. Reuses the existing `StyledSpan.link` channel so click
+/// handling stays uniform with regular markdown links.
+fn render_with_wiki(text: &str, theme: &Theme) -> Vec<RenderedBlock> {
+    let mut blocks = render::render(text, theme);
+    expand_wiki_links_in_blocks(&mut blocks, theme);
+    blocks
+}
+
+fn expand_wiki_links_in_blocks(blocks: &mut Vec<RenderedBlock>, theme: &Theme) {
+    for b in blocks.iter_mut() {
+        expand_wiki_links_in_block(b, theme);
+    }
+}
+
+fn expand_wiki_links_in_block(block: &mut RenderedBlock, theme: &Theme) {
+    match block {
+        RenderedBlock::Heading { content, .. } => expand_wiki_links_in_line(content, theme),
+        RenderedBlock::Paragraph { lines } => {
+            for line in lines.iter_mut() {
+                expand_wiki_links_in_line(line, theme);
+            }
+        }
+        // Code blocks: deliberately untouched. `[[foo]]` inside a fenced
+        // block is code text, not a link.
+        RenderedBlock::CodeBlock { .. } => {}
+        RenderedBlock::BlockQuote { blocks } => expand_wiki_links_in_blocks(blocks, theme),
+        RenderedBlock::List { items, .. } => {
+            for item in items.iter_mut() {
+                expand_wiki_links_in_blocks(&mut item.content, theme);
+            }
+        }
+        RenderedBlock::Table { headers, rows, .. } => {
+            for h in headers.iter_mut() {
+                expand_wiki_links_in_line(h, theme);
+            }
+            for row in rows.iter_mut() {
+                for cell in row.iter_mut() {
+                    expand_wiki_links_in_line(cell, theme);
+                }
+            }
+        }
+        RenderedBlock::HorizontalRule | RenderedBlock::Image { .. } => {}
+    }
+}
+
+fn expand_wiki_links_in_line(line: &mut StyledLine, theme: &Theme) {
+    let mut new_spans: Vec<StyledSpan> = Vec::with_capacity(line.spans.len());
+    for span in line.spans.drain(..) {
+        // Skip spans that already carry a link (real markdown links) —
+        // wiki rewriting only applies to plain text.
+        if span.link.is_some() {
+            new_spans.push(span);
+            continue;
+        }
+        new_spans.extend(split_wiki_links(&span, theme));
+    }
+    line.spans = new_spans;
+}
+
+fn split_wiki_links(span: &StyledSpan, theme: &Theme) -> Vec<StyledSpan> {
+    let text = &span.text;
+    if !text.contains("[[") {
+        return vec![span.clone()];
+    }
+    let mut out: Vec<StyledSpan> = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let Some(rel_start) = text[cursor..].find("[[") else {
+            out.push(StyledSpan {
+                text: text[cursor..].to_string(),
+                style: span.style,
+                link: None,
+            });
+            break;
+        };
+        let abs_start = cursor + rel_start;
+        let inner_start = abs_start + 2;
+        let Some(rel_end) = text[inner_start..].find("]]") else {
+            // No closing — emit the rest verbatim and stop.
+            out.push(StyledSpan {
+                text: text[cursor..].to_string(),
+                style: span.style,
+                link: None,
+            });
+            break;
+        };
+        let abs_close = inner_start + rel_end;
+        // Emit the chunk before the `[[`.
+        if abs_start > cursor {
+            out.push(StyledSpan {
+                text: text[cursor..abs_start].to_string(),
+                style: span.style,
+                link: None,
+            });
+        }
+        let inner = &text[inner_start..abs_close];
+        let (target, display) = match inner.find('|') {
+            Some(pipe) => (inner[..pipe].trim(), inner[pipe + 1..].trim()),
+            None => (inner.trim(), inner.trim()),
+        };
+        // Empty `[[]]` — keep raw text, don't make it a link.
+        if target.is_empty() {
+            out.push(StyledSpan {
+                text: text[abs_start..abs_close + 2].to_string(),
+                style: span.style,
+                link: None,
+            });
+        } else {
+            out.push(StyledSpan {
+                text: display.to_string(),
+                style: theme.link,
+                link: Some(format!("{}{}", WIKI_LINK_PREFIX, target)),
+            });
+        }
+        cursor = abs_close + 2;
+    }
+    out
+}
+
+/// Walk a `Layout` tree and re-render every Doc window's `blocks` against
+/// `theme`. Called on theme switch. Edit / Browser / Claude windows don't
+/// cache theme-styled output, so they pick up the new palette on next
+/// paint without needing intervention here.
+fn re_render_layout_docs(layout: &mut workspace::Layout<WindowContent>, theme: &Theme) {
+    match layout {
+        workspace::Layout::Empty => {}
+        workspace::Layout::Leaf(win) => {
+            if let WindowContent::Doc(d) = &mut win.content {
+                let path = PathBuf::from(d.file_label.as_ref());
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let doc = Document::from_text(text, path);
+                d.blocks = render_with_wiki(&doc.full_text(), theme);
+            }
+            // Browser's underlying-stashed content is also restyled if it
+            // happens to be a Doc — otherwise reverting via Esc lands on
+            // stale-themed blocks.
+            if let WindowContent::Browser(b) = &mut win.content {
+                if let Some(under) = b.underlying.as_deref_mut() {
+                    if let WindowContent::Doc(d) = under {
+                        let path = PathBuf::from(d.file_label.as_ref());
+                        let text = std::fs::read_to_string(&path).unwrap_or_default();
+                        let doc = Document::from_text(text, path);
+                        d.blocks = render_with_wiki(&doc.full_text(), theme);
+                    }
+                }
+            }
+        }
+        workspace::Layout::Split { children, .. } => {
+            for (_, child) in children.iter_mut() {
+                re_render_layout_docs(child, theme);
+            }
+        }
+    }
+}
+
+/// Return the `StyledLine`s of a block that v1 view-mode selection treats
+/// as selectable, in the same order line_idx is assigned during render.
+/// Blocks not covered (BlockQuote, List, Table, HorizontalRule, Image)
+/// produce an empty slice — they remain unselectable for now.
+fn block_selectable_lines(block: &RenderedBlock) -> &[StyledLine] {
+    match block {
+        RenderedBlock::Heading { content, .. } => std::slice::from_ref(content),
+        RenderedBlock::Paragraph { lines } => lines.as_slice(),
+        RenderedBlock::CodeBlock { lines, .. } => lines.as_slice(),
+        _ => &[],
+    }
+}
+
+/// Project a `DocSelection` onto a single rendered line. Returns
+/// `[start_col, end_col)` in characters or `None` if the line is outside
+/// the selection.
+fn doc_selection_for_line(
+    sel: &DocSelection,
+    block_idx: usize,
+    line_idx: usize,
+    line_char_count: usize,
+) -> Option<(usize, usize)> {
+    let (start, end) = sel.normalized();
+    if (block_idx, line_idx) < (start.block_idx, start.line_idx) {
+        return None;
+    }
+    if (block_idx, line_idx) > (end.block_idx, end.line_idx) {
+        return None;
+    }
+    let s = if (block_idx, line_idx) == (start.block_idx, start.line_idx) {
+        start.char_offset.min(line_char_count)
+    } else {
+        0
+    };
+    let e = if (block_idx, line_idx) == (end.block_idx, end.line_idx) {
+        end.char_offset.min(line_char_count)
+    } else {
+        line_char_count
+    };
+    if s < e {
+        Some((s, e))
+    } else {
+        None
+    }
 }
 
 /// Project a document-level selection range onto a single line. Returns
@@ -996,6 +1539,50 @@ fn workspace_persist_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("sketch").join("workspace.json"))
 }
 
+/// Path to the JSON file holding app-managed runtime preferences (theme
+/// choice, eventually other "View" menu state). Kept separate from the
+/// user-edited `~/.config/sketch/config.kdl` so the menu-driven theme
+/// switcher doesn't have to rewrite a hand-curated config file. On launch
+/// preferences override the config's theme — if the user picked a theme
+/// from the menu, that's what they expect next time, regardless of what
+/// the kdl says.
+fn preferences_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("sketch").join("preferences.json"))
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct Preferences {
+    /// Kebab-case theme identifier — `ThemeName::as_kebab()` /
+    /// `ThemeName::parse()`. `None` means "no app-managed override; use
+    /// the value from config.kdl (or the built-in default)."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
+}
+
+fn load_preferences() -> Preferences {
+    let Some(path) = preferences_path() else {
+        return Preferences::default();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Preferences::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+/// Best-effort write. Silently no-ops on any I/O / serialization failure —
+/// preference persistence is a convenience, not a correctness boundary.
+fn save_preferences(prefs: &Preferences) {
+    let Some(path) = preferences_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(prefs) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
 /// Serializable shadow of `WindowContent` for spec-tabs-and-splits.md
 /// Behavior 23. Doc/Edit persist their file path; Browser its current_dir;
 /// Claude its session_id (or `None` if not yet attached). Window-local view
@@ -1006,7 +1593,11 @@ enum PersistedKind {
     Doc { path: PathBuf },
     Edit { path: PathBuf },
     Browser { dir: PathBuf },
-    Claude { session_id: Option<String> },
+    /// JSON tag stays as "claude" so saved layouts from earlier builds load
+    /// without migration; the in-memory variant is `Agent` to match the rest
+    /// of the rename pass (spec-agent-window.md).
+    #[serde(rename = "claude")]
+    Agent { session_id: Option<String> },
 }
 
 /// One leaf in a persisted layout. Carries the (stable) window id so
@@ -1056,7 +1647,7 @@ fn snapshot_content(content: &WindowContent) -> PersistedKind {
         WindowContent::Browser(b) => PersistedKind::Browser {
             dir: b.fb.current_dir().to_path_buf(),
         },
-        WindowContent::Claude(ring) => {
+        WindowContent::Agent(ring) => {
             // Use the active session's id if any. Multi-session restore is
             // handled by the existing ACP persistence path; this is just
             // enough to know "this slot had a Claude session" so on restore
@@ -1066,7 +1657,7 @@ fn snapshot_content(content: &WindowContent) -> PersistedKind {
                 .first()
                 .and_then(|s| s.state.channel.as_ref())
                 .and_then(|c| c.session_id().map(|s| s.to_string()));
-            PersistedKind::Claude { session_id }
+            PersistedKind::Agent { session_id }
         }
     }
 }
@@ -1237,7 +1828,7 @@ fn forget_persisted_acp_sessions(cwd: &std::path::Path) {
 /// Concurrent sketch instances on the same `cwd`: last-writer-wins. Each
 /// call does a read-modify-write of the file, replacing only the cwd
 /// entry; other cwds are preserved.
-fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &SessionRing) {
+fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRing) {
     let Some(path) = acp_session_persist_path() else {
         return;
     };
@@ -1368,7 +1959,7 @@ fn build_tool_block_with_weak(
             move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
                 let id = id_for_click.clone();
                 let _ = weak_view.update(app, |this, cx| {
-                    if let Some(c) = this.claude_mut() {
+                    if let Some(c) = this.agent_mut() {
                         if c.expanded_tool_calls.contains(&id) {
                             c.expanded_tool_calls.remove(&id);
                         } else {
@@ -1595,7 +2186,12 @@ fn truncate_lines(body: &str, max_lines: usize) -> String {
 /// terminated by the trailing `\n`), so the tool block renders just
 /// after the pre-tool content and just before the empty line where the
 /// next chunk will splice in.
-fn anchor_for_new_tool_call(editor: &mut Editor) -> usize {
+///
+/// Returns a [`LineAnchor`] that survives inserts and deletes elsewhere in
+/// the document, per spec-agent-window.md §E1. The renderer resolves it to
+/// a line index via `editor.line_for_anchor(a)`; a `None` (line consumed)
+/// falls back to EOF rendering.
+fn anchor_for_new_tool_call(editor: &mut Editor) -> LineAnchor {
     let doc_text = editor.document().full_text();
     if !doc_text.is_empty() && !doc_text.ends_with('\n') {
         let len = editor.document().rope().len_chars();
@@ -1606,13 +2202,14 @@ fn anchor_for_new_tool_call(editor: &mut Editor) -> usize {
     // line_count - 2 (line_count - 1 is the empty trailing line).
     // saturating_sub guards an empty doc, where there's no content to
     // anchor to and we just put the tool block at the top.
-    line_count.saturating_sub(2)
+    let line = line_count.saturating_sub(2);
+    editor.anchor_for_line(line)
 }
 
 /// Map a doc-line index to the flat-child index inside the claude body
 /// container, accounting for tool blocks rendered between text lines.
 ///
-/// `render_claude` emits children in this order:
+/// `render_agent` emits children in this order:
 ///
 /// ```text
 /// line 0
@@ -1629,16 +2226,21 @@ fn anchor_for_new_tool_call(editor: &mut Editor) -> usize {
 /// (each collapses N lines into one FlatItem::Block, removing N-1
 /// items).
 fn cursor_visible_child_index(
-    c: &ClaudeState,
+    c: &AgentState,
     doc_line: usize,
     block_ranges: &[(usize, usize)],
 ) -> usize {
     // Count distinct anchor lines before doc_line (each = one ToolGroup item).
+    // `LineAnchor` is opaque; resolve to a current line index via the editor.
+    // Anchors whose line was consumed by a delete (`None`) are treated as
+    // EOF — they sort after `doc_line` and don't count.
+    let eof_line = c.editor.document().line_count();
     let mut anchors_before: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for id in &c.tool_call_order {
-        if let Some(line) = c.tool_call_anchor_line.get(id) {
-            if *line < doc_line {
-                anchors_before.insert(*line);
+        if let Some(&anchor) = c.tool_call_anchor_line.get(id) {
+            let line = c.editor.line_for_anchor(anchor).unwrap_or(eof_line);
+            if line < doc_line {
+                anchors_before.insert(line);
             }
         }
     }
@@ -1728,7 +2330,7 @@ fn parse_block_range(
     theme: &Theme,
 ) -> Option<RenderedBlock> {
     let slice: String = lines[start..end].join("\n");
-    let blocks = sketch::render::render(&slice, theme);
+    let blocks = render_with_wiki(&slice, theme);
     // Take the first Table or CodeBlock produced.
     for b in blocks {
         match &b {
@@ -2041,7 +2643,7 @@ fn doc_char_to_line_col(doc: &Document, char_idx: usize) -> (usize, usize) {
 /// chunk re-finds the splice point so subsequent chunks slot in just after
 /// the prior chunk, not below the draft. Direct port of
 /// `App::append_to_claude_buffer` from `src/app/claude.rs`.
-fn splice_claude_chunk(editor: &mut Editor, text: &str) {
+fn splice_agent_chunk(editor: &mut Editor, text: &str) {
     if text.is_empty() {
         return;
     }
@@ -2129,7 +2731,7 @@ fn splice_claude_chunk(editor: &mut Editor, text: &str) {
 /// time we get here the cursor may sit on the last frozen line with no room
 /// to type. Ensure there's an editable line below the frozen content and
 /// move the cursor there so the user can immediately keep typing.
-fn finalize_claude_turn(editor: &mut Editor) {
+fn finalize_agent_turn(editor: &mut Editor) {
     let total_len = editor.document().rope().len_chars();
     let needs_newline = total_len == 0
         || editor
@@ -2153,7 +2755,7 @@ fn finalize_claude_turn(editor: &mut Editor) {
 /// `lockable_through_line` to the cursor's line so the user can't
 /// retroactively edit content they just sent. Mirrors
 /// `App::lock_active_turn` from `src/app/claude.rs`.
-fn lock_claude_turn(editor: &mut Editor) {
+fn lock_agent_turn(editor: &mut Editor) {
     let pre_len = editor.document().rope().len_chars();
     let s = editor.document().full_text();
     let trailing_nl = s.chars().rev().take_while(|c| *c == '\n').count();
@@ -2192,11 +2794,28 @@ struct DocState {
     edit_cache: Option<EditState>,
 }
 
-/// State held while the user is browsing the filesystem. The active buffer's
-/// screen state is stashed in `open_buffers` before entering the browser and
-/// restored when the browser closes.
+/// State held while the user is browsing the filesystem.
+///
+/// `underlying`: when the browser was opened *in place* of an existing
+/// Doc/Edit/Claude window (Cmd-O from a focused pane), this holds that
+/// prior content so Esc/q can restore it. `None` when the browser was
+/// opened standalone (new-tab open, initial cwd browser, splits that
+/// fall back to a browser pane). In-memory only — not persisted with
+/// the workspace snapshot, since "restore to a browser-with-stashed-
+/// content" doesn't carry meaning across process restarts.
 struct BrowserWindow {
     fb: FileBrowser,
+    underlying: Option<Box<WindowContent>>,
+}
+
+impl BrowserWindow {
+    /// Standalone browser — no prior content to restore on Esc.
+    fn standalone(dir: PathBuf) -> Self {
+        Self {
+            fb: FileBrowser::new(dir),
+            underlying: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2295,7 +2914,7 @@ impl EditState {
 enum WindowContent {
     Doc(DocState),
     Edit(EditState),
-    Claude(SessionRing),
+    Agent(AgentRing),
     Browser(BrowserWindow),
 }
 
@@ -2304,7 +2923,7 @@ enum WindowContent {
 /// Claude's replies are spliced in as frozen lines via the same lock-and-
 /// advance pattern the TUI uses (`app::claude::append_to_claude_buffer`),
 /// so the user can keep typing inline edits between turns.
-struct ClaudeState {
+struct AgentState {
     /// Editor over the chat transcript. `frozen_lines` mark Claude's turns;
     /// the editable region below `lockable_through_line` is the user's
     /// pending draft.
@@ -2363,7 +2982,7 @@ struct ClaudeState {
     /// line at the moment it was announced. The renderer slots the tool
     /// block in just after that line, so tool blocks land between the
     /// chunks that bracketed them in time.
-    tool_call_anchor_line: std::collections::HashMap<String, usize>,
+    tool_call_anchor_line: std::collections::HashMap<String, LineAnchor>,
     /// Tool calls the user has expanded inline. Default-collapsed; click
     /// the summary header to expand or recollapse.
     expanded_tool_calls: std::collections::HashSet<String>,
@@ -2380,22 +2999,34 @@ struct ClaudeState {
     /// messages without auto-scroll interference. When `Some`, key dispatch
     /// routes here instead of the main transcript editor.
     compose_box: Option<ComposeBox>,
+    /// Last-seen full snapshot of the agent's plan. Updated on every ACP
+    /// `Plan` notification (which carries a complete plan, not a delta —
+    /// see spec-agent-window.md §21). Consumed by the Tasklist sidepane.
+    current_plan: Option<sketch::acp_channel::Plan>,
+    /// Last-seen session mode id from the agent (Claude Code's `default` /
+    /// `plan` / `learn`, etc.). Distinct from the permission mode on
+    /// `AcpChannelClient`. Surfaced by the Status Strip.
+    agent_mode: Option<sketch::acp_channel::SessionModeId>,
+    /// Last-seen usage snapshot (tokens used/total, cost). Populated only
+    /// when the upstream `unstable_session_usage` feature is on; otherwise
+    /// stays `None` and the Status Strip omits these fields per §30.
+    usage: Option<sketch::acp_channel::UsageSnapshot>,
     /// Background polling task that drains the ACP channel into the editor
-    /// every ~50ms. Held only so that dropping `ClaudeState` (e.g. on
+    /// every ~50ms. Held only so that dropping `AgentState` (e.g. on
     /// `back_to_doc`) cancels the task. The leading `_` mutes unused-field
     /// warnings — the field IS used (its Drop runs on screen exit), but
     /// no method reads it.
     _pump: Option<Task<()>>,
 }
 
-/// A named wrapper around `ClaudeState` for multi-session support.
-struct SessionSlot {
+/// A named wrapper around `AgentState` for multi-session support.
+struct AgentSlot {
     /// User-facing label shown in the sidebar.
     label: String,
     /// Monotonic index for stable identification (not reused after close).
     index: usize,
     /// The session state. Contains editor, channel, tool calls, etc.
-    state: ClaudeState,
+    state: AgentState,
     /// True if new content has arrived since the user last viewed this session.
     has_unseen_activity: bool,
     /// The id this slot was created from on persistence restore. The slot's
@@ -2406,20 +3037,20 @@ struct SessionSlot {
     resume_id: Option<String>,
 }
 
-/// An ordered collection of `SessionSlot`s with one active slot.
+/// An ordered collection of `AgentSlot`s with one active slot.
 /// Ring-style next/prev navigation wraps around.
-struct SessionRing {
-    slots: Vec<SessionSlot>,
+struct AgentRing {
+    slots: Vec<AgentSlot>,
     /// Index into `slots` for the currently-active session.
     active: usize,
-    /// Monotonic counter for `SessionSlot::index` — never reused.
+    /// Monotonic counter for `AgentSlot::index` — never reused.
     next_index: usize,
     /// WindowContent to restore when leaving Claude entirely (Ctrl-V / back_to_doc).
     /// Belongs to the ring, not any individual session.
     underlying: Option<Box<WindowContent>>,
 }
 
-impl SessionRing {
+impl AgentRing {
     fn new(underlying: Option<Box<WindowContent>>) -> Self {
         Self {
             slots: Vec::new(),
@@ -2430,18 +3061,18 @@ impl SessionRing {
     }
 
     #[allow(dead_code)]
-    fn active(&self) -> &SessionSlot {
+    fn active(&self) -> &AgentSlot {
         &self.slots[self.active]
     }
 
-    fn active_mut(&mut self) -> &mut SessionSlot {
+    fn active_mut(&mut self) -> &mut AgentSlot {
         &mut self.slots[self.active]
     }
 
-    fn push(&mut self, label: String, state: ClaudeState, resume_id: Option<String>) -> usize {
+    fn push(&mut self, label: String, state: AgentState, resume_id: Option<String>) -> usize {
         let index = self.next_index;
         self.next_index += 1;
-        self.slots.push(SessionSlot {
+        self.slots.push(AgentSlot {
             label,
             index,
             state,
@@ -2475,7 +3106,7 @@ impl SessionRing {
     /// Remove the active slot and return its state. Advances to the next
     /// slot (or previous if at the end). Returns `None` if the ring is
     /// now empty.
-    fn close_active(&mut self) -> Option<ClaudeState> {
+    fn close_active(&mut self) -> Option<AgentState> {
         if self.slots.is_empty() {
             return None;
         }
@@ -2499,7 +3130,7 @@ impl SessionRing {
         self.slots.is_empty()
     }
 
-    fn iter(&self) -> impl Iterator<Item = &SessionSlot> {
+    fn iter(&self) -> impl Iterator<Item = &AgentSlot> {
         self.slots.iter()
     }
 
@@ -2508,7 +3139,7 @@ impl SessionRing {
         self.slots.iter().position(|s| s.index == index)
     }
 
-    fn slot_by_index_mut(&mut self, index: usize) -> Option<&mut SessionSlot> {
+    fn slot_by_index_mut(&mut self, index: usize) -> Option<&mut AgentSlot> {
         self.slots.iter_mut().find(|s| s.index == index)
     }
 }
@@ -2531,14 +3162,25 @@ struct BufferSwitcher {
     filter_text: String,
 }
 
-/// Single-line input overlay for renaming the active claude session.
-/// Pre-filled with the current label; Enter commits, Esc cancels.
-/// Targets the slot by its monotonic `SessionSlot::index` rather than its
-/// position so a concurrent `claude-close` on another slot doesn't rename
-/// the wrong one.
+/// Single-line input overlay used by both Claude-session rename and
+/// tab rename. Pre-filled with the current label; Enter commits, Esc
+/// cancels, empty input cancels.
 struct RenameOverlay {
     text: String,
-    target_index: usize,
+    target: RenameTarget,
+}
+
+#[derive(Clone, Copy)]
+enum RenameTarget {
+    /// Claude session — targeted by monotonic `AgentSlot::index` so a
+    /// concurrent `claude-close` on another slot doesn't rename the
+    /// wrong one.
+    AgentSlot { index: usize },
+    /// Workspace tab — targeted by current tab position. Tab indices
+    /// don't shift during the rename's lifetime since the overlay
+    /// captures key dispatch (no structural mutations possible mid-
+    /// rename), so positional addressing is safe here.
+    Tab { index: usize },
 }
 
 /// GPUI menu tree. Mirrors the TUI's `default_menu` for the navigation
@@ -2573,9 +3215,55 @@ fn gpui_menu() -> Vec<MenuNode> {
         MenuNode::label("Edit"),
         MenuNode::entry("e", "edit (raw markdown)", "enter-edit"),
         MenuNode::entry("w", "edit (word processor)", "enter-wp"),
+        MenuNode::entry("r", "reload from disk (discards unsaved)", "reload-file"),
         MenuNode::separator(),
         MenuNode::label("View"),
         MenuNode::entry("v", "back to doc", "back-to-doc"),
+        MenuNode::submenu(
+            "t",
+            "theme",
+            vec![
+                MenuNode::entry("d", "Dracula (dark)", "theme-dracula"),
+                MenuNode::entry("n", "Nightfox (dark)", "theme-nightfox"),
+                MenuNode::entry("g", "Gruvbox (dark)", "theme-gruvbox-dark"),
+                MenuNode::entry("l", "Solarized Light", "theme-solarized-light"),
+                MenuNode::entry("L", "Solarized Dark", "theme-solarized-dark"),
+                MenuNode::entry("f", "Financial Times", "theme-financial-times"),
+                MenuNode::entry("F", "Financial Times Dark", "theme-financial-times-dark"),
+            ],
+        ),
+        MenuNode::separator(),
+        MenuNode::submenu(
+            "W",
+            "window (splits/tabs)",
+            vec![
+                MenuNode::label("Split"),
+                MenuNode::entry("s", "split horizontal (Ctrl-W s)", "split-h"),
+                MenuNode::entry("v", "split vertical (Ctrl-W v)", "split-v"),
+                MenuNode::entry("c", "close pane (Cmd-W / Ctrl-W c)", "close-window"),
+                MenuNode::entry("o", "only this pane (Ctrl-W o)", "only-window"),
+                MenuNode::separator(),
+                MenuNode::label("Focus"),
+                MenuNode::entry("h", "focus left (Ctrl-W h)", "focus-left"),
+                MenuNode::entry("l", "focus right (Ctrl-W l)", "focus-right"),
+                MenuNode::entry("k", "focus up (Ctrl-W k)", "focus-up"),
+                MenuNode::entry("j", "focus down (Ctrl-W j)", "focus-down"),
+                MenuNode::entry("n", "focus next (Ctrl-W w)", "focus-next"),
+                MenuNode::entry("p", "focus prev (Ctrl-W W)", "focus-prev"),
+                MenuNode::separator(),
+                MenuNode::label("Size"),
+                MenuNode::entry("-", "shrink (Ctrl-W -)", "resize-shrink"),
+                MenuNode::entry("+", "grow (Ctrl-W +)", "resize-grow"),
+                MenuNode::entry("=", "equalize (Ctrl-W =)", "equalize"),
+                MenuNode::separator(),
+                MenuNode::label("Tabs"),
+                MenuNode::entry("t", "new tab (Cmd-T)", "new-tab"),
+                MenuNode::entry("x", "close tab (Cmd-Shift-W)", "close-tab"),
+                MenuNode::entry("]", "next tab (Ctrl-Tab)", "next-tab"),
+                MenuNode::entry("[", "prev tab (Ctrl-Shift-Tab)", "prev-tab"),
+                MenuNode::entry("r", "rename tab (Cmd-Shift-R)", "rename-tab"),
+            ],
+        ),
         MenuNode::separator(),
         MenuNode::entry("q", "quit", "quit"),
     ]
@@ -2585,6 +3273,11 @@ struct SketchGpuiView {
     theme: Theme,
     body_font: SharedString,
     code_font: SharedString,
+    /// Multiplier applied to document body / heading font sizes (Cmd+= / Cmd+-
+    /// / Cmd+0). Chrome (status bar, tabs, file browser) stays fixed. 1.0 is
+    /// the unzoomed default; clamped to [MIN_TEXT_SCALE, MAX_TEXT_SCALE] on
+    /// every adjustment.
+    text_scale: f32,
     focus_handle: FocusHandle,
     /// Active TUI-style menu overlay. `Some` while the picker is open;
     /// flipped to `None` on Esc-from-root or after a command is dispatched.
@@ -2598,6 +3291,15 @@ struct SketchGpuiView {
     /// Tabs + n-ary split tree (spec-tabs-and-splits.md). The focused
     /// window's content is the authoritative live state for the workspace.
     workspace: workspace::Workspace<WindowContent>,
+    /// Active mouse-driven text selection in the doc view. Spans block/line/char.
+    /// `None` when nothing is selected. Cleared on Esc, on a fresh MouseDown
+    /// without modifier, and when entering edit mode.
+    doc_selection: Option<DocSelection>,
+    /// Per-render scratch — populated by `render_doc` as it emits each line's
+    /// StyledText, cleared at the top of every doc render. Mouse handlers on
+    /// the doc body look up `(block_idx, line_idx)` here to hit-test against
+    /// the layout's bounds and to map pixels → char offsets.
+    line_layouts: RefCell<HashMap<(usize, usize), TextLayout>>,
 }
 
 impl SketchGpuiView {
@@ -2619,27 +3321,31 @@ impl SketchGpuiView {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("Menlo"),
+            text_scale: 1.0,
             focus_handle,
             menu: None,
             buffer_switcher: None,
             rename_overlay: None,
             workspace: workspace::Workspace::with_initial(initial),
+            doc_selection: None,
+            line_layouts: RefCell::new(HashMap::new()),
         }
     }
 
     fn new_browser(start_dir: PathBuf, theme: Theme, focus_handle: FocusHandle) -> Self {
-        let initial = WindowContent::Browser(BrowserWindow {
-            fb: FileBrowser::new(start_dir),
-        });
+        let initial = WindowContent::Browser(BrowserWindow::standalone(start_dir));
         Self {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("Menlo"),
+            text_scale: 1.0,
             focus_handle,
             menu: None,
             buffer_switcher: None,
             rename_overlay: None,
             workspace: workspace::Workspace::with_initial(initial),
+            doc_selection: None,
+            line_layouts: RefCell::new(HashMap::new()),
         }
     }
 
@@ -2729,7 +3435,7 @@ impl SketchGpuiView {
                 let label: SharedString = path.display().to_string().into();
                 let text = std::fs::read_to_string(&path).unwrap_or_default();
                 let doc = Document::from_text(text, path.clone());
-                let blocks = render::render(&doc.full_text(), &self.theme);
+                let blocks = render_with_wiki(&doc.full_text(), &self.theme);
                 WindowContent::Doc(DocState {
                     blocks,
                     file_label: label,
@@ -2750,20 +3456,16 @@ impl SketchGpuiView {
                 } else {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                 };
-                WindowContent::Browser(BrowserWindow {
-                    fb: FileBrowser::new(dir),
-                })
+                WindowContent::Browser(BrowserWindow::standalone(dir))
             }
-            PersistedKind::Claude { .. } => {
+            PersistedKind::Agent { .. } => {
                 // Claude restore is its own subsystem (acp_sessions.json +
-                // open_claude_inner). Replace with a Browser stub here so the
+                // open_agent_inner). Replace with a Browser stub here so the
                 // tab survives; user can re-attach via the existing Claude
                 // commands.
-                WindowContent::Browser(BrowserWindow {
-                    fb: FileBrowser::new(
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                    ),
-                })
+                WindowContent::Browser(BrowserWindow::standalone(
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                ))
             }
         }
     }
@@ -2783,23 +3485,23 @@ impl SketchGpuiView {
         }
     }
 
-    fn claude_mut(&mut self) -> Option<&mut ClaudeState> {
+    fn agent_mut(&mut self) -> Option<&mut AgentState> {
         match self.workspace.focused_content_mut().expect("no focused window") {
-            WindowContent::Claude(ring) if !ring.is_empty() => Some(&mut ring.active_mut().state),
+            WindowContent::Agent(ring) if !ring.is_empty() => Some(&mut ring.active_mut().state),
             _ => None,
         }
     }
 
-    fn claude_ring(&self) -> Option<&SessionRing> {
+    fn agent_ring(&self) -> Option<&AgentRing> {
         match self.workspace.focused_content().expect("no focused window") {
-            WindowContent::Claude(ring) => Some(ring),
+            WindowContent::Agent(ring) => Some(ring),
             _ => None,
         }
     }
 
-    fn claude_ring_mut(&mut self) -> Option<&mut SessionRing> {
+    fn agent_ring_mut(&mut self) -> Option<&mut AgentRing> {
         match self.workspace.focused_content_mut().expect("no focused window") {
-            WindowContent::Claude(ring) => Some(ring),
+            WindowContent::Agent(ring) => Some(ring),
             _ => None,
         }
     }
@@ -2830,7 +3532,7 @@ impl SketchGpuiView {
         };
         let label: SharedString = canon.into();
         let doc = Document::from_text(text, path.clone());
-        let blocks = render::render(&doc.full_text(), &self.theme);
+        let blocks = render_with_wiki(&doc.full_text(), &self.theme);
         let new_content = WindowContent::Doc(DocState {
             blocks,
             file_label: label,
@@ -2974,20 +3676,239 @@ impl SketchGpuiView {
     }
 
     fn open_browser_inner(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Browser(_)) {
+        if matches!(
+            self.workspace.focused_content().expect("no focused window"),
+            WindowContent::Browser(_)
+        ) {
             return;
         }
-        // Open the browser in a new tab so the current doc/edit/claude work
-        // isn't lost. Picking a file from the browser replaces the browser
-        // tab in place (see open_file).
-        self.workspace.push_initial_tab(WindowContent::Browser(BrowserWindow {
+        // Open the browser IN the focused pane, stashing the prior content
+        // on `BrowserWindow.underlying` so Esc/q restores it. Picking a file
+        // discards the underlying and replaces the browser with the picked
+        // file in this same pane (see `open_file`'s `replace_in_place`
+        // branch). This keeps the browser pane-scoped instead of tab-
+        // scoped so splits/tabs aren't disrupted by file picking.
+        let placeholder = WindowContent::Browser(BrowserWindow::standalone(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ));
+        let prior = self
+            .workspace
+            .replace_focused_content(placeholder)
+            .expect("workspace has no focused window");
+        self.set_screen(WindowContent::Browser(BrowserWindow {
             fb: FileBrowser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+            underlying: Some(Box::new(prior)),
         }));
         self.save_workspace_state();
         cx.notify();
     }
     fn quit(&mut self, _: &Quit, _w: &mut Window, cx: &mut Context<Self>) {
         cx.quit();
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, _w: &mut Window, cx: &mut Context<Self>) {
+        self.set_text_scale(self.text_scale * TEXT_SCALE_STEP, cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, _w: &mut Window, cx: &mut Context<Self>) {
+        self.set_text_scale(self.text_scale / TEXT_SCALE_STEP, cx);
+    }
+
+    fn zoom_reset(&mut self, _: &ZoomReset, _w: &mut Window, cx: &mut Context<Self>) {
+        self.set_text_scale(1.0, cx);
+    }
+
+    fn set_text_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
+        let clamped = scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
+        if (clamped - self.text_scale).abs() > f32::EPSILON {
+            self.text_scale = clamped;
+            cx.notify();
+        }
+    }
+
+    /// Screen background pulled from the active theme. Used by every
+    /// top-level `.bg(...)` in the render pipeline so light themes
+    /// (Solarized Light, Financial Times) actually look light.
+    fn editor_bg(&self) -> Hsla {
+        ncolor_to_hsla(self.theme.editor_bg, BG)
+    }
+
+    /// Default foreground from the active theme. Used in place of the
+    /// hardcoded `DEFAULT_FG` constant on every top-level `.text_color(...)`
+    /// call so the editor text contrasts the theme's background.
+    fn editor_fg(&self) -> Hsla {
+        ncolor_to_hsla(self.theme.editor_fg, DEFAULT_FG)
+    }
+
+    /// Swap the active theme. Walks every Doc window in the workspace and
+    /// re-renders its block list against the new palette (Edit / Browser /
+    /// Claude pick the theme up on their next paint via `md_highlight` /
+    /// direct theme reads). Persisting the choice across restarts is a
+    /// follow-up — for now the theme resets to Dracula on launch.
+    fn set_theme(&mut self, name: ThemeName, cx: &mut Context<Self>) {
+        if self.theme.name == name {
+            return;
+        }
+        self.theme = Theme::from_name(name);
+        for tab in self.workspace.tabs.iter_mut() {
+            re_render_layout_docs(&mut tab.layout, &self.theme);
+        }
+        save_preferences(&Preferences {
+            theme: Some(name.as_kebab().to_string()),
+        });
+        cx.notify();
+    }
+
+    // ---- View-mode mouse selection ----------------------------------------
+
+    /// Hit-test a window-space position against the per-line `TextLayout`s
+    /// captured during the most recent render. Returns the doc position
+    /// (block_idx, line_idx, char_offset) if the point falls on a tracked
+    /// line, else `None`. For points off the right edge of a line, returns
+    /// the line's end (caller may treat as past-the-end selection).
+    fn doc_pos_at(&self, position: gpui::Point<gpui::Pixels>) -> Option<DocPos> {
+        let layouts = self.line_layouts.borrow();
+        // Choose the line whose vertical band contains `position.y`. Ties are
+        // broken by the smaller (block_idx, line_idx) — the map iteration
+        // order doesn't matter because the bounds bands don't overlap.
+        let mut hit: Option<(&(usize, usize), &TextLayout)> = None;
+        for (key, layout) in layouts.iter() {
+            let b = layout.bounds();
+            if position.y >= b.top() && position.y <= b.bottom() {
+                hit = Some((key, layout));
+                break;
+            }
+        }
+        let (key, layout) = hit?;
+        // Map pixel position → byte index. `index_for_position` returns Ok
+        // for in-line hits and Err for points past the right edge (it
+        // still gives a valid index).
+        let byte_idx = match layout.index_for_position(position) {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+        let text = layout.text();
+        let char_offset = text
+            .char_indices()
+            .position(|(b, _)| b >= byte_idx)
+            .unwrap_or_else(|| text.chars().count());
+        Some(DocPos {
+            block_idx: key.0,
+            line_idx: key.1,
+            char_offset,
+        })
+    }
+
+    fn doc_mouse_down(&mut self, ev: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(pos) = self.doc_pos_at(ev.position) else {
+            // Click on chrome / empty area: clear any existing selection.
+            if self.doc_selection.is_some() {
+                self.doc_selection = None;
+                cx.notify();
+            }
+            return;
+        };
+        self.doc_selection = Some(DocSelection {
+            anchor: pos,
+            head: pos,
+            dragging: true,
+        });
+        cx.notify();
+    }
+
+    fn doc_mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.doc_selection.map(|s| s.dragging).unwrap_or(false) {
+            return;
+        }
+        let Some(pos) = self.doc_pos_at(ev.position) else {
+            return;
+        };
+        if let Some(sel) = self.doc_selection.as_mut() {
+            if sel.head != pos {
+                sel.head = pos;
+                cx.notify();
+            }
+        }
+    }
+
+    fn doc_mouse_up(&mut self, _ev: &MouseUpEvent, cx: &mut Context<Self>) {
+        let Some(sel) = self.doc_selection.as_mut() else {
+            return;
+        };
+        sel.dragging = false;
+        if sel.is_empty() {
+            self.doc_selection = None;
+        }
+        cx.notify();
+    }
+
+    /// Read the doc-view text covered by `doc_selection` and write it to
+    /// the system clipboard. Walks blocks/lines in document order using
+    /// the focused window's DocState as the source of truth for line text.
+    fn copy_doc_selection(
+        &mut self,
+        _: &CopyDocSelection,
+        _w: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let Some(sel) = self.doc_selection else {
+            return;
+        };
+        let Some(text) = self.collect_doc_selection_text(&sel) else {
+            return;
+        };
+        if !text.is_empty() {
+            Self::yank_to_clipboard(&text);
+        }
+    }
+
+    fn collect_doc_selection_text(&self, sel: &DocSelection) -> Option<String> {
+        let (start, end) = sel.normalized();
+        let content = self.workspace.focused_content()?;
+        let blocks = match content {
+            WindowContent::Doc(d) => &d.blocks,
+            _ => return None,
+        };
+        let mut out = String::new();
+        for bi in start.block_idx..=end.block_idx {
+            let block = blocks.get(bi)?;
+            let lines = block_selectable_lines(block);
+            if lines.is_empty() {
+                continue;
+            }
+            let l_start = if bi == start.block_idx { start.line_idx } else { 0 };
+            let l_end = if bi == end.block_idx {
+                end.line_idx
+            } else {
+                lines.len().saturating_sub(1)
+            };
+            for li in l_start..=l_end {
+                let Some(line) = lines.get(li) else { continue };
+                let line_text: String =
+                    line.spans.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join("");
+                let chars: Vec<char> = line_text.chars().collect();
+                let s = if bi == start.block_idx && li == start.line_idx {
+                    start.char_offset.min(chars.len())
+                } else {
+                    0
+                };
+                let e = if bi == end.block_idx && li == end.line_idx {
+                    end.char_offset.min(chars.len())
+                } else {
+                    chars.len()
+                };
+                if s < e {
+                    out.extend(chars[s..e].iter());
+                }
+                if li < l_end {
+                    out.push('\n');
+                }
+            }
+            if bi < end.block_idx {
+                out.push_str("\n\n");
+            }
+        }
+        Some(out)
     }
 
     /// Drop every live `AcpChannelClient` we hold so its `Drop` impl can
@@ -3003,7 +3924,7 @@ impl SketchGpuiView {
         // teardown races with us.
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
-                if let WindowContent::Claude(ring) = content {
+                if let WindowContent::Agent(ring) = content {
                     for slot in &mut ring.slots {
                         let _dropped = slot.state.channel.take();
                     }
@@ -3040,6 +3961,17 @@ impl SketchGpuiView {
         }
     }
 
+    /// Activate the tab at `idx`. Mouse-click entry point from the tab
+    /// strip — no-ops if the index is out of range or already active.
+    fn select_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.workspace.tabs.len() || idx == self.workspace.active_tab {
+            return;
+        }
+        self.workspace.active_tab = idx;
+        self.save_workspace_state();
+        cx.notify();
+    }
+
     fn prev_tab(&mut self, _: &PrevTab, _w: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.tabs.len() > 1 {
             self.workspace.prev_tab();
@@ -3052,9 +3984,9 @@ impl SketchGpuiView {
     /// no-arg `:tabnew` / `Cmd-T` creates a browser tab so the user can pick
     /// what to load.
     fn new_tab(&mut self, _: &NewTab, _w: &mut Window, cx: &mut Context<Self>) {
-        self.workspace.push_initial_tab(WindowContent::Browser(BrowserWindow {
-            fb: FileBrowser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-        }));
+        self.workspace.push_initial_tab(WindowContent::Browser(BrowserWindow::standalone(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )));
         self.save_workspace_state();
         cx.notify();
     }
@@ -3072,6 +4004,10 @@ impl SketchGpuiView {
         self.workspace.close_tab(idx);
         self.save_workspace_state();
         cx.notify();
+    }
+
+    fn rename_tab(&mut self, _: &RenameTab, _w: &mut Window, cx: &mut Context<Self>) {
+        self.open_rename_active_tab_overlay(cx);
     }
 
     /// `Ctrl-W s` — horizontal split: new pane below the focused one.
@@ -3117,9 +4053,7 @@ impl SketchGpuiView {
             Some(WindowContent::Edit(_))
         );
         let browser_fallback = || {
-            WindowContent::Browser(BrowserWindow {
-                fb: FileBrowser::new(cwd.to_path_buf()),
-            })
+            WindowContent::Browser(BrowserWindow::standalone(cwd.to_path_buf()))
         };
         let Some(label) = label else {
             return browser_fallback();
@@ -3134,7 +4068,7 @@ impl SketchGpuiView {
             WindowContent::Edit(EditState::new(editor, label, EditView::Code))
         } else {
             let doc = Document::from_text(text, path);
-            let blocks = render::render(&doc.full_text(), &self.theme);
+            let blocks = render_with_wiki(&doc.full_text(), &self.theme);
             WindowContent::Doc(DocState {
                 blocks,
                 file_label: label,
@@ -3154,9 +4088,11 @@ impl SketchGpuiView {
                 cx.notify();
             }
             Ok(None) => {
-                // Tab is empty — close the tab too (or quit if last).
+                // Focused leaf is the only one in its tab. Close the tab
+                // if there are other tabs; otherwise no-op — closing the
+                // absolute last pane would leave the app with nothing to
+                // render. Cmd-Q is the only quit path now.
                 if self.workspace.tabs.len() <= 1 {
-                    cx.quit();
                     return;
                 }
                 let idx = self.workspace.active_tab;
@@ -3285,18 +4221,41 @@ impl SketchGpuiView {
         }
     }
     fn browser_close(&mut self, _: &BrowserClose, _w: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Browser(_)) {
+        let underlying = match self.workspace.focused_content_mut().expect("no focused window") {
+            WindowContent::Browser(b) => b.underlying.take(),
+            _ => return,
+        };
+        // If the browser was opened over an existing pane (Cmd-O from a
+        // Doc/Edit/Claude window), restore that prior content in place —
+        // user pressed Esc/q to cancel the file pick.
+        if let Some(boxed) = underlying {
+            self.set_screen(*boxed);
+            self.save_workspace_state();
+            cx.notify();
             return;
         }
-        // Close the Browser tab. If it's the only tab left, quit instead —
-        // matches today's behavior of quit-on-last-screen.
-        if self.workspace.tabs.len() <= 1 {
-            cx.quit();
-            return;
+        // Standalone browser (new-tab open, persisted browser tab, split
+        // fallback). Try to dismiss the pane:
+        //   - one pane of a split → close just that pane.
+        //   - sole pane in tab, multiple tabs → close the tab.
+        //   - sole pane in sole tab → no-op. Esc/q is intentionally NOT a
+        //     quit shortcut — too easy to lose the app by mashing keys.
+        //     Quit lives on Cmd-Q.
+        match self.workspace.close_focused() {
+            Ok(Some(_)) => {
+                self.save_workspace_state();
+                cx.notify();
+            }
+            Ok(None) => {
+                if self.workspace.tabs.len() > 1 {
+                    let idx = self.workspace.active_tab;
+                    self.workspace.close_tab(idx);
+                    self.save_workspace_state();
+                    cx.notify();
+                }
+            }
+            Err(()) => {}
         }
-        let idx = self.workspace.active_tab;
-        self.workspace.close_tab(idx);
-        cx.notify();
     }
 
     // ---- Edit mode ---------------------------------------------------------
@@ -3362,7 +4321,8 @@ impl SketchGpuiView {
             .expect("workspace has no focused window");
         match prev {
             WindowContent::Edit(edit) => {
-                let blocks = render::render(&edit.editor.document().full_text(), &self.theme);
+                let blocks =
+                    render_with_wiki(&edit.editor.document().full_text(), &self.theme);
                 let file_label = edit.file_label.clone();
                 self.set_screen(WindowContent::Doc(DocState {
                     blocks,
@@ -3372,18 +4332,16 @@ impl SketchGpuiView {
                     edit_cache: Some(edit),
                 }));
             }
-            WindowContent::Claude(ring) => {
+            WindowContent::Agent(ring) => {
                 // Restore whatever screen the user opened Claude from. If
                 // none was stashed, fall back to a fresh Browser at cwd.
-                // SessionRing and all its sessions drop here, taking pump
+                // AgentRing and all its sessions drop here, taking pump
                 // tasks and ACP channels with them.
                 let new = match ring.underlying {
                     Some(boxed) => *boxed,
-                    None => WindowContent::Browser(BrowserWindow {
-                        fb: FileBrowser::new(
-                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                        ),
-                    }),
+                    None => WindowContent::Browser(BrowserWindow::standalone(
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                    )),
                 };
                 self.set_screen(new);
             }
@@ -3392,6 +4350,134 @@ impl SketchGpuiView {
                 return;
             }
         }
+        cx.notify();
+    }
+
+    /// Resolve a wiki link target (e.g. `notes`, `subdir/topic`) against
+    /// the source doc's directory and replace the focused pane with the
+    /// resulting Doc. Lookup order:
+    ///   1. `<doc_dir>/<target>.md` — markdown convention; matches what
+    ///      Obsidian / Foam / most wiki-aware editors do.
+    ///   2. `<doc_dir>/<target>` — literal path, in case the user included
+    ///      the extension already (or wants a non-md file).
+    /// If neither exists, log to stderr and no-op (the pane stays put;
+    /// nothing to navigate to).
+    fn open_wiki_link(
+        &mut self,
+        target: &str,
+        doc_dir: Option<&std::path::Path>,
+        cx: &mut Context<Self>,
+    ) {
+        let target = target.trim();
+        if target.is_empty() {
+            return;
+        }
+        let bases: Vec<PathBuf> = match doc_dir {
+            Some(d) => vec![d.to_path_buf()],
+            None => vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))],
+        };
+        let mut resolved: Option<PathBuf> = None;
+        for base in &bases {
+            let with_md = base.join(format!("{target}.md"));
+            if with_md.is_file() {
+                resolved = Some(with_md);
+                break;
+            }
+            let bare = base.join(target);
+            if bare.is_file() {
+                resolved = Some(bare);
+                break;
+            }
+        }
+        let Some(path) = resolved else {
+            eprintln!("wiki link: no file found for [[{}]]", target);
+            return;
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(err) => {
+                eprintln!("wiki link: cannot read {}: {}", path.display(), err);
+                return;
+            }
+        };
+        let canon = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.clone())
+            .display()
+            .to_string();
+        let label: SharedString = canon.into();
+        let doc = Document::from_text(text, path);
+        let blocks = render_with_wiki(&doc.full_text(), &self.theme);
+        self.set_screen(WindowContent::Doc(DocState {
+            blocks,
+            file_label: label,
+            cursor_block: 0,
+            scroll_handle: ScrollHandle::new(),
+            edit_cache: None,
+        }));
+        self.doc_selection = None;
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    /// Re-read the focused window's file from disk and rebuild its content,
+    /// discarding any unsaved buffer state. Doc view: re-renders blocks and
+    /// resets scroll/cursor (file may have shifted out from under the user).
+    /// Edit view: replaces the Editor with a fresh one over the same path.
+    /// Browser / Claude windows: no-op — there's no on-disk file to revert
+    /// to. Read failures log to stderr (consistent with the existing open
+    /// path) and leave the buffer untouched.
+    fn reload_focused_from_disk(&mut self, cx: &mut Context<Self>) {
+        // Two passes: extract the path from the focused window without
+        // holding a mutable borrow across the file I/O + workspace mutation.
+        // Preserves the Edit sub-view (Code vs. WordProcessor) so reload
+        // doesn't yank the user out of WP mode.
+        enum Kind {
+            Doc,
+            Edit(EditView),
+        }
+        let (path, label, kind) = match self.workspace.focused_content() {
+            Some(WindowContent::Doc(d)) => (
+                PathBuf::from(d.file_label.as_ref()),
+                d.file_label.clone(),
+                Kind::Doc,
+            ),
+            Some(WindowContent::Edit(e)) => (
+                PathBuf::from(e.file_label.as_ref()),
+                e.file_label.clone(),
+                Kind::Edit(e.view),
+            ),
+            _ => return,
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(err) => {
+                eprintln!("reload: cannot read {}: {}", path.display(), err);
+                return;
+            }
+        };
+        let new_content = match kind {
+            Kind::Edit(view) => {
+                let editor = Editor::new(text, path);
+                let mut es = EditState::new(editor, label, EditView::Code);
+                es.view = view;
+                WindowContent::Edit(es)
+            }
+            Kind::Doc => {
+                let doc = Document::from_text(text, path);
+                let blocks = render_with_wiki(&doc.full_text(), &self.theme);
+                WindowContent::Doc(DocState {
+                    blocks,
+                    file_label: label,
+                    cursor_block: 0,
+                    scroll_handle: ScrollHandle::new(),
+                    edit_cache: None,
+                })
+            }
+        };
+        self.set_screen(new_content);
+        self.doc_selection = None;
+        self.save_workspace_state();
         cx.notify();
     }
 
@@ -3798,41 +4884,164 @@ impl SketchGpuiView {
             "buffer-list" => self.open_buffer_switcher(cx),
             "enter-edit" => self.enter_edit_with(EditView::Code, cx),
             "enter-wp" => self.enter_edit_with(EditView::WordProcessor, cx),
-            "open-claude" => self.open_claude_inner(cx),
+            "open-claude" => self.open_agent_inner(cx),
             "claude-send" => {
                 // Only meaningful while the claude screen is active. Surface
                 // a hint via the doc/edit footer if it isn't, so the user
                 // gets a visible no-op instead of silent.
-                if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Claude(_)) {
+                if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
                     // If the compose textbox is open, send its contents;
                     // otherwise send the main editor's draft region.
                     let has_compose = self
-                        .claude_mut()
+                        .agent_mut()
                         .map(|c| c.compose_box.is_some())
                         .unwrap_or(false);
                     if has_compose {
                         self.compose_send(cx);
                     } else {
-                        self.send_claude(cx);
+                        self.send_agent(cx);
                     }
                 }
             }
-            "claude-new" => self.new_claude_session(cx),
-            "claude-close" => self.close_active_claude_session(cx),
-            "claude-next" => self.switch_claude_session(1, cx),
-            "claude-prev" => self.switch_claude_session(-1, cx),
+            "claude-new" => self.new_agent_session(cx),
+            "claude-close" => self.close_active_agent_session(cx),
+            "claude-next" => self.switch_agent_session(1, cx),
+            "claude-prev" => self.switch_agent_session(-1, cx),
             "claude-reboot" => self.reboot_into_claude(cx),
             "claude-mode-cycle" => self.cycle_claude_permission_mode(cx),
-            "claude-clear" => self.clear_claude_session(cx),
-            "claude-detach" => self.detach_active_claude_session(cx),
-            "claude-attach" => self.attach_active_claude_session(cx),
+            "claude-clear" => self.clear_agent_session(cx),
+            "claude-detach" => self.detach_active_agent_session(cx),
+            "claude-attach" => self.attach_active_agent_session(cx),
             "claude-rename" => self.open_rename_overlay(cx),
             "compose-toggle" => {
-                if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Claude(_)) {
+                if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
                     self.compose_toggle(cx);
                 }
             }
             "back-to-doc" => self.back_to_doc(cx),
+            "reload-file" => self.reload_focused_from_disk(cx),
+            "rename-tab" => self.open_rename_active_tab_overlay(cx),
+            "theme-dracula" => self.set_theme(ThemeName::Dracula, cx),
+            "theme-nightfox" => self.set_theme(ThemeName::Nightfox, cx),
+            "theme-solarized-light" => self.set_theme(ThemeName::SolarizedLight, cx),
+            "theme-solarized-dark" => self.set_theme(ThemeName::SolarizedDark, cx),
+            "theme-gruvbox-dark" => self.set_theme(ThemeName::GruvboxDark, cx),
+            "theme-financial-times" => self.set_theme(ThemeName::FinancialTimes, cx),
+            "theme-financial-times-dark" => self.set_theme(ThemeName::FinancialTimesDark, cx),
+            // Window splits + focus + sizing — same logic the keyboard
+            // handlers run, so behavior is identical via either path.
+            "split-h" => {
+                self.split_focused_with_browser(workspace::SplitDir::H);
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "split-v" => {
+                self.split_focused_with_browser(workspace::SplitDir::V);
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "close-window" => {
+                match self.workspace.close_focused() {
+                    Ok(Some(_)) => {
+                        self.save_workspace_state();
+                        cx.notify();
+                    }
+                    Ok(None) => {
+                        // Same no-quit-on-last rule as the keyboard action.
+                        if self.workspace.tabs.len() <= 1 {
+                            return;
+                        }
+                        let idx = self.workspace.active_tab;
+                        self.workspace.close_tab(idx);
+                        self.save_workspace_state();
+                        cx.notify();
+                    }
+                    Err(()) => {}
+                }
+            }
+            "only-window" => {
+                let _ = self.workspace.only();
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "focus-left" => {
+                let _ = self.workspace.focus_motion(workspace::FocusDir::Left);
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "focus-right" => {
+                let _ = self.workspace.focus_motion(workspace::FocusDir::Right);
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "focus-up" => {
+                let _ = self.workspace.focus_motion(workspace::FocusDir::Up);
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "focus-down" => {
+                let _ = self.workspace.focus_motion(workspace::FocusDir::Down);
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "focus-next" => {
+                let _ = self.workspace.focus_next();
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "focus-prev" => {
+                let _ = self.workspace.focus_prev();
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "resize-shrink" => {
+                let _ = self.workspace.resize_focused(-0.05);
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "resize-grow" => {
+                let _ = self.workspace.resize_focused(0.05);
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "equalize" => {
+                let _ = self.workspace.equalize_focused();
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "new-tab" => {
+                self.workspace.push_initial_tab(WindowContent::Browser(
+                    BrowserWindow::standalone(
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                    ),
+                ));
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "close-tab" => {
+                if self.workspace.tabs.len() <= 1 {
+                    cx.quit();
+                    return;
+                }
+                let idx = self.workspace.active_tab;
+                self.workspace.close_tab(idx);
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "next-tab" => {
+                if self.workspace.tabs.len() > 1 {
+                    self.workspace.next_tab();
+                    self.save_workspace_state();
+                    cx.notify();
+                }
+            }
+            "prev-tab" => {
+                if self.workspace.tabs.len() > 1 {
+                    self.workspace.prev_tab();
+                    self.save_workspace_state();
+                    cx.notify();
+                }
+            }
             "quit" | "force-quit" => cx.quit(),
             _ => {
                 // Unknown command — keep the menu closed but no-op so the
@@ -3869,13 +5078,31 @@ impl SketchGpuiView {
         if self.rename_overlay.is_some() {
             return;
         }
-        let Some(ring) = self.claude_ring() else {
+        let Some(ring) = self.agent_ring() else {
             return;
         };
         let slot = &ring.slots[ring.active];
         self.rename_overlay = Some(RenameOverlay {
             text: slot.label.clone(),
-            target_index: slot.index,
+            target: RenameTarget::AgentSlot { index: slot.index },
+        });
+        cx.notify();
+    }
+
+    /// Open the rename overlay targeting the active workspace tab. The
+    /// input pre-fills with the tab's current display label (display_name
+    /// if set, else auto_name).
+    fn open_rename_active_tab_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.rename_overlay.is_some() {
+            return;
+        }
+        let idx = self.workspace.active_tab;
+        let Some(tab) = self.workspace.tabs.get(idx) else {
+            return;
+        };
+        self.rename_overlay = Some(RenameOverlay {
+            text: tab.display_label().to_string(),
+            target: RenameTarget::Tab { index: idx },
         });
         cx.notify();
     }
@@ -3884,12 +5111,12 @@ impl SketchGpuiView {
         self.rename_overlay = None;
     }
 
-    /// Apply the overlay's text as the target slot's new label, then close.
+    /// Apply the overlay's text to the targeted slot/tab, then close.
     /// Trims whitespace; an all-whitespace input cancels (acts like Esc) so
     /// the user can't accidentally erase the label by hammering Enter.
     fn commit_rename_overlay(&mut self, cx: &mut Context<Self>) {
-        let (target_index, new_label) = match &self.rename_overlay {
-            Some(o) => (o.target_index, o.text.trim().to_string()),
+        let (target, new_label) = match &self.rename_overlay {
+            Some(o) => (o.target, o.text.trim().to_string()),
             None => return,
         };
         if new_label.is_empty() {
@@ -3897,14 +5124,26 @@ impl SketchGpuiView {
             cx.notify();
             return;
         }
-        if let Some(ring) = self.claude_ring_mut() {
-            if let Some(slot) = ring.slot_by_index_mut(target_index) {
-                slot.label = new_label;
+        match target {
+            RenameTarget::AgentSlot { index } => {
+                if let Some(ring) = self.agent_ring_mut() {
+                    if let Some(slot) = ring.slot_by_index_mut(index) {
+                        slot.label = new_label;
+                    }
+                }
+                self.close_rename_overlay();
+                self.save_agent_ring();
+                cx.notify();
+            }
+            RenameTarget::Tab { index } => {
+                if let Some(tab) = self.workspace.tabs.get_mut(index) {
+                    tab.display_name = Some(new_label);
+                }
+                self.close_rename_overlay();
+                self.save_workspace_state();
+                cx.notify();
             }
         }
-        self.close_rename_overlay();
-        self.save_claude_ring();
-        cx.notify();
     }
 
     fn handle_rename_key(
@@ -4087,6 +5326,7 @@ impl SketchGpuiView {
     fn render_focused_window(
         &mut self,
         root: gpui::Div,
+        attach_focus: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tab_idx = self.workspace.active_tab;
@@ -4102,17 +5342,23 @@ impl SketchGpuiView {
         // &mut Layout<WindowContent> (a field inside self.workspace.tabs)
         // is disjoint from &self.render_X's other field accesses.
         let layout = unsafe { &mut *layout_ptr };
-        self.render_layout(root, layout, focused_id, cx)
+        self.render_layout(root, layout, focused_id, attach_focus, cx)
     }
 
     /// Recursively render a `Layout<WindowContent>`. The `root` div is used
     /// only for the leaf case (so leaves can attach focus + key bindings);
     /// split branches build their own container.
+    ///
+    /// `attach_focus` is true when no overlay is open — in that case the
+    /// focused leaf attaches `track_focus(&self.focus_handle)` so the focus
+    /// handle sits inside that leaf's key context. When an overlay is open,
+    /// focus belongs on the overlay wrapper and no leaf attaches it.
     fn render_layout(
         &mut self,
         root: gpui::Div,
         layout: &mut workspace::Layout<WindowContent>,
         focused_id: workspace::WindowId,
+        attach_focus: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match layout {
@@ -4125,12 +5371,17 @@ impl SketchGpuiView {
                 // content sits inside a layout tree we won't structurally
                 // mutate during this render call.
                 let content = unsafe { &mut *content_ptr };
+                let leaf_root = if is_focused && attach_focus {
+                    root.track_focus(&self.focus_handle)
+                } else {
+                    root
+                };
                 let painted: AnyElement = match content {
-                    WindowContent::Doc(d) => self.render_doc(root, d, cx).into_any_element(),
-                    WindowContent::Edit(e) => self.render_edit(root, e, cx).into_any_element(),
-                    WindowContent::Browser(b) => self.render_browser(root, b, cx).into_any_element(),
-                    WindowContent::Claude(ring) => {
-                        self.render_claude(root, ring, cx).into_any_element()
+                    WindowContent::Doc(d) => self.render_doc(leaf_root, d, cx).into_any_element(),
+                    WindowContent::Edit(e) => self.render_edit(leaf_root, e, cx).into_any_element(),
+                    WindowContent::Browser(b) => self.render_browser(leaf_root, b, cx).into_any_element(),
+                    WindowContent::Agent(ring) => {
+                        self.render_agent(leaf_root, ring, cx).into_any_element()
                     }
                 };
                 // Add a thin focus indicator around the focused leaf when
@@ -4150,20 +5401,29 @@ impl SketchGpuiView {
                 }
             }
             workspace::Layout::Split { dir, children } => {
+                // The `root` div carries `track_focus(&self.focus_handle)`
+                // when no overlay is open, so we must include it in the
+                // tree. Without it the focus handle isn't attached to any
+                // rendered element and global key bindings (e.g. Space →
+                // OpenMenu) have nowhere to dispatch. Wrap the split's
+                // flex container inside `root` rather than discarding it.
                 let mut container = div().size_full().flex().min_w_0().min_h_0();
                 container = match dir {
                     workspace::SplitDir::V => container.flex_row(),
                     workspace::SplitDir::H => container.flex_col(),
                 };
+                let editor_bg = self.editor_bg();
+                let editor_fg = self.editor_fg();
                 for (weight, child) in children.iter_mut() {
                     let w = *weight;
                     let child_root = div()
                         .size_full()
                         .flex()
                         .flex_col()
-                        .bg(rgb(BG))
-                        .text_color(rgb(DEFAULT_FG));
-                    let child_el = self.render_layout(child_root, child, focused_id, cx);
+                        .bg(editor_bg)
+                        .text_color(editor_fg);
+                    let child_el =
+                        self.render_layout(child_root, child, focused_id, attach_focus, cx);
                     let mut slot = div().min_w_0().min_h_0();
                     {
                         let style = slot.style();
@@ -4174,7 +5434,7 @@ impl SketchGpuiView {
                     slot = slot.child(child_el);
                     container = container.child(slot);
                 }
-                container.into_any_element()
+                root.child(container).into_any_element()
             }
         }
     }
@@ -4193,17 +5453,21 @@ impl SketchGpuiView {
     fn wrap_with_tab_strip(
         &self,
         screen_view: AnyElement,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         if self.workspace.tabs.len() <= 1 {
             return screen_view;
         }
 
         let active_idx = self.workspace.active_tab;
-        let active_fg: Hsla = rgb(STATUS_FG).into();
+        // Pull chrome colors from the active theme so the strip matches the
+        // light/dark palette. Active tab inverts to editor_bg (the doc body
+        // colour) so the focused tab visually connects to the work area.
+        let top_bar = self.theme.top_bar;
+        let active_fg: Hsla = fg_or(top_bar, STATUS_FG);
         let inactive_fg: Hsla = rgb(0x6272a4).into();
-        let strip_bg: Hsla = rgb(STATUS_BG).into();
-        let active_bg: Hsla = rgb(0x282a36).into();
+        let strip_bg: Hsla = bg_or(top_bar, STATUS_BG);
+        let active_bg: Hsla = self.editor_bg();
 
         // Vertical sidebar on the left, fixed-width. Flex default for
         // align-items is stretch, which is what we want — entries fill the
@@ -4227,6 +5491,7 @@ impl SketchGpuiView {
             let bg = if is_active { active_bg } else { strip_bg };
 
             let entry = div()
+                .id(("tab-strip-entry", i))
                 .w_full()
                 .px_2()
                 .py_1()
@@ -4234,7 +5499,21 @@ impl SketchGpuiView {
                 .bg(bg)
                 .text_color(fg)
                 .overflow_hidden()
-                .child(label);
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, ev: &MouseDownEvent, _w, cx| {
+                        // Double-click on a tab entry opens the rename
+                        // overlay for that tab. Single-click just
+                        // switches to it.
+                        if ev.click_count >= 2 {
+                            view.workspace.active_tab = i;
+                            view.open_rename_active_tab_overlay(cx);
+                        } else {
+                            view.select_tab(i, cx);
+                        }
+                    }),
+                );
             strip = strip.child(entry);
         }
 
@@ -4531,12 +5810,16 @@ impl SketchGpuiView {
         let label_fg: Hsla = rgb(0x6272a4).into();
         let input_fg: Hsla = rgb(0xf1fa8c).into();
 
+        let header_label = match o.target {
+            RenameTarget::AgentSlot { .. } => "RENAME SESSION",
+            RenameTarget::Tab { .. } => "RENAME TAB",
+        };
         let header = div()
             .px_4()
             .py_1()
             .text_color(label_fg)
             .font_weight(FontWeight::BOLD)
-            .child(SharedString::new_static("RENAME SESSION"));
+            .child(SharedString::new_static(header_label));
 
         let input_row = div()
             .px_4()
@@ -4598,14 +5881,14 @@ impl SketchGpuiView {
     ///
     /// Attach uses `SKETCH_ACP_AGENT` if set, else the
     /// `claude-agent-acp` default (`AcpChannelClient::DEFAULT_AGENT_COMMAND`).
-    fn open_claude(&mut self, _: &OpenClaude, _w: &mut Window, cx: &mut Context<Self>) {
-        self.open_claude_inner(cx);
+    fn open_agent(&mut self, _: &OpenAgent, _w: &mut Window, cx: &mut Context<Self>) {
+        self.open_agent_inner(cx);
     }
 
-    fn open_claude_inner(&mut self, cx: &mut Context<Self>) {
+    fn open_agent_inner(&mut self, cx: &mut Context<Self>) {
         // If already on Claude screen, just add a new session to the ring.
-        if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Claude(_)) {
-            self.new_claude_session(cx);
+        if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
+            self.new_agent_session(cx);
             return;
         }
 
@@ -4621,7 +5904,7 @@ impl SketchGpuiView {
             }))
             .expect("workspace has no focused window");
 
-        let mut ring = SessionRing::new(Some(Box::new(prior)));
+        let mut ring = AgentRing::new(Some(Box::new(prior)));
         let cwd_opt = std::env::current_dir().ok();
         let persisted = cwd_opt
             .as_deref()
@@ -4630,7 +5913,7 @@ impl SketchGpuiView {
 
         if persisted.is_empty() {
             // No saved state → fresh single slot, as before.
-            let state = self.create_claude_session(None, cx);
+            let state = self.create_agent_session(None, cx);
             ring.push("claude-1".into(), state, None);
         } else {
             // Restore every saved slot in order. Each slot's
@@ -4642,37 +5925,37 @@ impl SketchGpuiView {
                 .position(|s| s.active)
                 .unwrap_or(0);
             for slot in persisted {
-                let state = self.create_claude_session(Some(slot.id.clone()), cx);
+                let state = self.create_agent_session(Some(slot.id.clone()), cx);
                 ring.push(slot.label, state, Some(slot.id));
             }
             ring.active = active_pos.min(ring.slots.len().saturating_sub(1));
         }
 
-        self.set_screen(WindowContent::Claude(ring));
+        self.set_screen(WindowContent::Agent(ring));
 
-        if let Some(c) = self.claude_mut() {
+        if let Some(c) = self.agent_mut() {
             c.editor.begin_insert();
         }
         cx.notify();
     }
 
     /// Create a new session and add it to the existing ring.
-    fn new_claude_session(&mut self, cx: &mut Context<Self>) {
-        let ring = match self.claude_ring_mut() {
+    fn new_agent_session(&mut self, cx: &mut Context<Self>) {
+        let ring = match self.agent_ring_mut() {
             Some(r) => r,
             None => return,
         };
         let n = ring.next_index + 1;
         let label = format!("claude-{n}");
         // New sessions don't resume — they're fresh.
-        let state = self.create_claude_session(None, cx);
-        let ring = self.claude_ring_mut().unwrap();
+        let state = self.create_agent_session(None, cx);
+        let ring = self.agent_ring_mut().unwrap();
         ring.push(label, state, None);
         // §18 soft cap: at 6+ slots, surface a one-shot footer warning so
         // the user notices the per-slot ~100MB subprocess cost. Advisory
         // only — no enforcement.
-        let count = self.claude_ring().map(|r| r.len()).unwrap_or(0);
-        if let Some(c) = self.claude_mut() {
+        let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
+        if let Some(c) = self.agent_mut() {
             c.editor.begin_insert();
             if count >= 6 {
                 c.status = Some(
@@ -4680,31 +5963,31 @@ impl SketchGpuiView {
                 );
             }
         }
-        self.save_claude_ring();
+        self.save_agent_ring();
         cx.notify();
     }
 
     /// Switch to the next (+1) or previous (-1) session in the ring.
-    fn switch_claude_session(&mut self, direction: i32, cx: &mut Context<Self>) {
-        if let Some(ring) = self.claude_ring_mut() {
+    fn switch_agent_session(&mut self, direction: i32, cx: &mut Context<Self>) {
+        if let Some(ring) = self.agent_ring_mut() {
             if direction > 0 {
                 ring.next();
             } else {
                 ring.prev();
             }
         }
-        self.save_claude_ring();
+        self.save_agent_ring();
         cx.notify();
     }
 
     /// Close the active session. If the ring is now empty, exit Claude.
-    fn close_active_claude_session(&mut self, cx: &mut Context<Self>) {
+    fn close_active_agent_session(&mut self, cx: &mut Context<Self>) {
         let is_empty = {
-            let ring = match self.claude_ring_mut() {
+            let ring = match self.agent_ring_mut() {
                 Some(r) => r,
                 None => return,
             };
-            let _dropped = ring.close_active(); // ClaudeState drops → pump task cancelled
+            let _dropped = ring.close_active(); // AgentState drops → pump task cancelled
             ring.is_empty()
         };
         if is_empty {
@@ -4715,7 +5998,7 @@ impl SketchGpuiView {
             }
             self.back_to_doc(cx);
         } else {
-            self.save_claude_ring();
+            self.save_agent_ring();
             cx.notify();
         }
     }
@@ -4723,23 +6006,23 @@ impl SketchGpuiView {
     /// Snapshot the current ring to disk. Called after every ring mutation
     /// (new/close/switch) and from the pump after a slot's attach resolves.
     /// Best-effort: any failure to write is silently ignored.
-    fn save_claude_ring(&self) {
+    fn save_agent_ring(&self) {
         let Ok(cwd) = std::env::current_dir() else {
             return;
         };
-        let Some(ring) = self.claude_ring() else {
+        let Some(ring) = self.agent_ring() else {
             return;
         };
         save_persisted_acp_sessions(&cwd, ring);
     }
 
-    /// Build a `ClaudeState` with ACP attach thread and pump task.
-    /// The returned state is ready to be pushed into a `SessionRing`.
-    fn create_claude_session(
+    /// Build a `AgentState` with ACP attach thread and pump task.
+    /// The returned state is ready to be pushed into a `AgentRing`.
+    fn create_agent_session(
         &mut self,
         resume_id: Option<String>,
         cx: &mut Context<Self>,
-    ) -> ClaudeState {
+    ) -> AgentState {
         let (attach_tx, attach_rx) =
             std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
         let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
@@ -4761,7 +6044,7 @@ impl SketchGpuiView {
         // that the pump will look up dynamically. The pump captures
         // a stable session_index once the ring assigns one.
         // For now, peek the next_index from the ring.
-        let session_index = match self.claude_ring() {
+        let session_index = match self.agent_ring() {
             Some(ring) => ring.next_index,
             None => 0, // first session — ring doesn't exist yet
         };
@@ -4788,7 +6071,7 @@ impl SketchGpuiView {
                 } else {
                     cx.background_executor().timer(idle_delay).await;
                     let _ = this.update(cx, |this, _cx| {
-                        if let Some(ring) = this.claude_ring_mut() {
+                        if let Some(ring) = this.agent_ring_mut() {
                             if let Some(slot) = ring.slot_by_index_mut(session_index) {
                                 if let Some(ch) = &slot.state.channel {
                                     wake_rx = ch.take_wake_receiver();
@@ -4818,7 +6101,7 @@ impl SketchGpuiView {
             }
         });
 
-        ClaudeState {
+        AgentState {
             editor,
             channel: None,
             attach_pending: Some(attach_rx),
@@ -4842,6 +6125,9 @@ impl SketchGpuiView {
             block_cache: std::collections::HashMap::new(),
             block_cache_frozen_count: 0,
             compose_box: Some(ComposeBox::new()),
+            current_plan: None,
+            agent_mode: None,
+            usage: None,
             _pump: Some(pump),
         }
     }
@@ -4857,7 +6143,7 @@ impl SketchGpuiView {
         // inside this block. Returns (has_events, more_pending, attached_with_id,
         // is_active) so post-borrow work (persistence, activity flag) can proceed.
         let (has_events, more_pending, attached_with_id, is_active) = {
-            let ring = match self.claude_ring_mut() {
+            let ring = match self.agent_ring_mut() {
                 Some(r) => r,
                 None => return false,
             };
@@ -4948,7 +6234,7 @@ impl SketchGpuiView {
                         }
                     }
                     Self::apply_reply_events(claude, tail);
-                    finalize_claude_turn(&mut claude.editor);
+                    finalize_agent_turn(&mut claude.editor);
                     claude.last_seen_turns = current_turns;
                     claude.awaiting_reply = false;
                     claude.turn_started = None;
@@ -4964,12 +6250,12 @@ impl SketchGpuiView {
         // a stale pump from a removed slot safe — it contributes nothing
         // if its slot isn't in the ring anymore.
         if attached_with_id {
-            self.save_claude_ring();
+            self.save_agent_ring();
         }
 
         // Mark inactive sessions with unseen activity.
         if has_events && !is_active {
-            if let Some(ring) = self.claude_ring_mut() {
+            if let Some(ring) = self.agent_ring_mut() {
                 if let Some(slot) = ring.slot_by_index_mut(session_index) {
                     slot.has_unseen_activity = true;
                 }
@@ -4982,20 +6268,20 @@ impl SketchGpuiView {
         more_pending
     }
 
-    /// Apply a batch of reply events to the ClaudeState. Text chunks are
+    /// Apply a batch of reply events to the AgentState. Text chunks are
     /// spliced into the buffer; tool calls land in `tool_calls` and are
     /// anchored to whatever buffer line is the current end-of-frozen so
     /// the renderer can slot the tool block in between text on either
     /// side. Updates merge into existing tool calls via `ToolCall::update`.
     fn apply_reply_events(
-        claude: &mut ClaudeState,
+        claude: &mut AgentState,
         events: Vec<sketch::acp_channel::ReplyEvent>,
     ) {
         use sketch::acp_channel::ReplyEvent;
         for ev in events {
             match ev {
                 ReplyEvent::Chunk(text) => {
-                    splice_claude_chunk(&mut claude.editor, &text);
+                    splice_agent_chunk(&mut claude.editor, &text);
                 }
                 ReplyEvent::ToolCallStarted(mut tc) => {
                     cap_tool_call_payloads(&mut tc);
@@ -5029,6 +6315,16 @@ impl SketchGpuiView {
                         claude.tool_calls.insert(id, tc);
                     }
                 }
+                ReplyEvent::PlanUpdated(plan) => {
+                    // Full snapshot replaces the previous plan (§21).
+                    claude.current_plan = Some(plan);
+                }
+                ReplyEvent::ModeChanged(mode_id) => {
+                    claude.agent_mode = Some(mode_id);
+                }
+                ReplyEvent::UsageUpdated(snap) => {
+                    claude.usage = Some(snap);
+                }
             }
         }
     }
@@ -5040,28 +6336,28 @@ impl SketchGpuiView {
     /// holding on to context from the cleared conversation. Use this
     /// when the model has gone off-track and you want a clean slate
     /// without restarting sketch.
-    fn clear_claude_session(&mut self, cx: &mut Context<Self>) {
+    fn clear_agent_session(&mut self, cx: &mut Context<Self>) {
         // Forget every persisted slot BEFORE re-opening so the new spawn
         // hits session/new instead of session/load. Done first so even
-        // if open_claude_inner panics partway through, the next manual
+        // if open_agent_inner panics partway through, the next manual
         // attach won't accidentally resume any cleared session.
         if let Ok(cwd) = std::env::current_dir() {
             forget_persisted_acp_sessions(&cwd);
         }
-        // Drop the current claude screen entirely; open_claude_inner
+        // Drop the current claude screen entirely; open_agent_inner
         // builds a new one. We don't try to surgically reset fields on
-        // the existing ClaudeState because the underlying screen
+        // the existing AgentState because the underlying screen
         // (browser/doc) is also stashed there — preserving it is the
-        // job of open_claude_inner via the prior-screen swap dance.
-        if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Claude(_)) {
-            // Restore underlying first so open_claude_inner can capture
+        // job of open_agent_inner via the prior-screen swap dance.
+        if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
+            // Restore underlying first so open_agent_inner can capture
             // it as the new "prior" screen. Otherwise we'd lose the
             // file/browser the user was viewing before they opened
             // claude.
             self.back_to_doc(cx);
         }
-        self.open_claude_inner(cx);
-        if let Some(c) = self.claude_mut() {
+        self.open_agent_inner(cx);
+        if let Some(c) = self.agent_mut() {
             c.status = Some("session cleared".into());
         }
         cx.notify();
@@ -5071,7 +6367,7 @@ impl SketchGpuiView {
     /// yolo → read-only). Surfaces the new mode in the claude footer so
     /// the user sees the change without having to find it in the header.
     fn cycle_claude_permission_mode(&mut self, cx: &mut Context<Self>) {
-        let Some(claude) = self.claude_mut() else {
+        let Some(claude) = self.agent_mut() else {
             return;
         };
         let new_mode = match &claude.channel {
@@ -5094,15 +6390,15 @@ impl SketchGpuiView {
     }
 
     /// Drop the active session's `AcpChannelClient` (kills the subprocess
-    /// via `kill_on_drop`) but keep the `SessionSlot` and its chat history
+    /// via `kill_on_drop`) but keep the `AgentSlot` and its chat history
     /// intact. The sidebar's `[d]` suffix surfaces the detached state. The
     /// slot's `resume_id` is preserved so the next reboot still tries to
     /// `session/load` the original id (per spec §15 stability rule); fresh
     /// `claude-new` slots without a `resume_id` will silently drop from
     /// persistence on the next save (per spec: "slots without a session id
     /// are not written").
-    fn detach_active_claude_session(&mut self, cx: &mut Context<Self>) {
-        let claude = match self.claude_mut() {
+    fn detach_active_agent_session(&mut self, cx: &mut Context<Self>) {
+        let claude = match self.agent_mut() {
             Some(c) => c,
             None => return,
         };
@@ -5119,7 +6415,7 @@ impl SketchGpuiView {
         claude.awaiting_reply = false;
         claude.turn_started = None;
         claude.status = Some("session detached".into());
-        self.save_claude_ring();
+        self.save_agent_ring();
         cx.notify();
     }
 
@@ -5128,8 +6424,8 @@ impl SketchGpuiView {
     /// subprocess was killed on detach, so the session is gone. Clear
     /// `resume_id` so persistence captures the new channel's id once it
     /// binds (rather than retrying the original-load id forever).
-    fn attach_active_claude_session(&mut self, cx: &mut Context<Self>) {
-        if let Some(c) = self.claude_mut() {
+    fn attach_active_agent_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(c) = self.agent_mut() {
             if c.channel.is_some() || c.attach_pending.is_some() {
                 c.status = Some("session is already attached".into());
                 cx.notify();
@@ -5152,13 +6448,13 @@ impl SketchGpuiView {
                 ));
             });
 
-        if let Some(ring) = self.claude_ring_mut() {
+        if let Some(ring) = self.agent_ring_mut() {
             ring.active_mut().resume_id = None;
             let claude = &mut ring.active_mut().state;
             claude.attach_pending = Some(attach_rx);
             claude.status = Some("attaching new session…".into());
         }
-        self.save_claude_ring();
+        self.save_agent_ring();
         cx.notify();
     }
 
@@ -5194,7 +6490,7 @@ impl SketchGpuiView {
         match cmd.spawn() {
             Ok(_) => cx.quit(),
             Err(e) => {
-                if let Some(c) = self.claude_mut() {
+                if let Some(c) = self.agent_mut() {
                     c.status = Some(format!("reboot failed: {e}").into());
                 }
             }
@@ -5205,8 +6501,8 @@ impl SketchGpuiView {
     /// only the editable runs between/after frozen Claude turns) as the
     /// next ACP prompt, then lock the turn so that content can't be
     /// retroactively edited.
-    fn send_claude(&mut self, cx: &mut Context<Self>) {
-        let claude = match self.claude_mut() {
+    fn send_agent(&mut self, cx: &mut Context<Self>) {
+        let claude = match self.agent_mut() {
             Some(c) => c,
             None => return,
         };
@@ -5228,7 +6524,7 @@ impl SketchGpuiView {
 
         match result {
             Ok(()) => {
-                lock_claude_turn(&mut claude.editor);
+                lock_agent_turn(&mut claude.editor);
                 claude.awaiting_reply = true;
                 claude.turn_started = Some(std::time::Instant::now());
                 claude.status = Some(format!("sent ({} chars)", payload.len()).into());
@@ -5246,7 +6542,7 @@ impl SketchGpuiView {
 
     /// Toggle the compose textbox in the Claude screen.
     fn compose_toggle(&mut self, cx: &mut Context<Self>) {
-        let claude = match self.claude_mut() {
+        let claude = match self.agent_mut() {
             Some(c) => c,
             None => return,
         };
@@ -5270,7 +6566,7 @@ impl SketchGpuiView {
 
     /// Send compose box contents, then close it.
     fn compose_send(&mut self, cx: &mut Context<Self>) {
-        let claude = match self.claude_mut() {
+        let claude = match self.agent_mut() {
             Some(c) => c,
             None => return,
         };
@@ -5293,7 +6589,7 @@ impl SketchGpuiView {
         claude.editor.cursor_mut().line = cl;
         claude.editor.cursor_mut().col = cc;
         // Now send via the normal path.
-        self.send_claude(cx);
+        self.send_agent(cx);
     }
 
     /// Key dispatch for the Claude screen. Mirrors `handle_edit_key` but
@@ -5315,7 +6611,7 @@ impl SketchGpuiView {
             }
             if let Key::Char('v') | Key::Char('V') = press.key {
                 // Close compose without sending before leaving.
-                if let Some(c) = self.claude_mut() {
+                if let Some(c) = self.agent_mut() {
                     c.compose_box = None;
                 }
                 self.back_to_doc(cx);
@@ -5325,7 +6621,7 @@ impl SketchGpuiView {
 
         // Compose box intercept: when open, route keys to the compose editor.
         let compose_active = self
-            .claude_mut()
+            .agent_mut()
             .map(|c| c.compose_box.is_some())
             .unwrap_or(false);
         if compose_active {
@@ -5334,7 +6630,7 @@ impl SketchGpuiView {
                 return;
             }
             let outcome = {
-                let claude = match self.claude_mut() {
+                let claude = match self.agent_mut() {
                     Some(c) => c,
                     None => return,
                 };
@@ -5364,22 +6660,22 @@ impl SketchGpuiView {
         // Non-compose: normal Claude key handling.
         if press.modifiers.contains(KMods::CONTROL) {
             if press.key == Key::Enter {
-                self.send_claude(cx);
+                self.send_agent(cx);
                 return;
             }
             // Session switching: Ctrl-] next, Ctrl-[ prev.
             if press.key == Key::Char(']') {
-                self.switch_claude_session(1, cx);
+                self.switch_agent_session(1, cx);
                 return;
             }
             if press.key == Key::Char('[') {
-                self.switch_claude_session(-1, cx);
+                self.switch_agent_session(-1, cx);
                 return;
             }
         }
 
         let outcome = {
-            let claude = match self.claude_mut() {
+            let claude = match self.agent_mut() {
                 Some(c) => c,
                 None => return,
             };
@@ -5404,7 +6700,7 @@ impl SketchGpuiView {
         // the cursor's index in the virtualised list (text lines are
         // interleaved with tool blocks anchored above them) and ask
         // the ListState to scroll just enough to reveal it.
-        if let Some(c) = self.claude_mut() {
+        if let Some(c) = self.agent_mut() {
             let cursor_line = c.editor.cursor().line;
             let ranges = c.block_ranges.clone();
             let target = cursor_visible_child_index(c, cursor_line, &ranges);
@@ -5415,7 +6711,7 @@ impl SketchGpuiView {
             NormalOutcome::Skipped => {}
             NormalOutcome::Handled => cx.notify(),
             NormalOutcome::Yanked => {
-                if let Some(c) = self.claude_mut() {
+                if let Some(c) = self.agent_mut() {
                     c.status = Some("yanked".into());
                 }
                 cx.notify();
@@ -5445,22 +6741,23 @@ impl Render for SketchGpuiView {
         // `ScrollUp` and `k` in Browser context is bound to `BrowserUp`,
         // both of which intercept the keystroke before any `on_key_down`
         // handler runs and stop propagation as the default action behavior).
-        // When no overlay is open, the screen_root keeps focus.
-        let screen_root = {
-            let d = div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .bg(rgb(BG))
-                .text_color(rgb(DEFAULT_FG));
-            if !has_overlay {
-                d.track_focus(&self.focus_handle)
-            } else {
-                d
-            }
-        };
+        // When no overlay is open, the focused leaf inside `render_layout`
+        // attaches `track_focus(&self.focus_handle)` — that way the focus
+        // handle sits INSIDE the SketchView/EditView/etc. key context, so
+        // context-scoped bindings actually match on dispatch. (Putting the
+        // focus on an outer wrapper means bubble-up from focus skips the
+        // context-bearing leaf, and Space → OpenMenu silently no-ops in
+        // multi-leaf splits.)
+        let editor_bg = self.editor_bg();
+        let editor_fg = self.editor_fg();
+        let screen_root = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(editor_bg)
+            .text_color(editor_fg);
 
-        let screen_view: AnyElement = self.render_focused_window(screen_root, cx);
+        let screen_view: AnyElement = self.render_focused_window(screen_root, !has_overlay, cx);
 
         // When there's more than one tab, stack the tab strip above the
         // screen view. Single-tab workspaces render no strip — matches the
@@ -5475,14 +6772,23 @@ impl Render for SketchGpuiView {
 
         // Rename overlay takes priority — it's a transient single-line
         // input opened from the menu, so nothing else should steal keys.
+        //
+        // Overlay key dispatch uses CAPTURE phase + `stop_propagation` so
+        // every keystroke is consumed by the overlay before action dispatch
+        // can fire. Without that, global keybindings (Cmd-T, Cmd-=, …) and
+        // any letters bound globally would leak through; in particular,
+        // shifted chars could shadow distinct overlay entries (e.g. `w` vs
+        // `W`). The capture handler short-circuits the entire rest of the
+        // pipeline.
         if self.rename_overlay.is_some() {
             return div()
                 .track_focus(&self.focus_handle)
                 .key_context("RenameOverlayView")
                 .size_full()
-                .bg(rgb(BG))
-                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                .bg(editor_bg)
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
                     this.handle_rename_key(ev, w, cx);
+                    cx.stop_propagation();
                 }))
                 .child(screen_view)
                 .child(self.render_rename_overlay(cx))
@@ -5495,9 +6801,10 @@ impl Render for SketchGpuiView {
                 .track_focus(&self.focus_handle)
                 .key_context("BufferSwitcherView")
                 .size_full()
-                .bg(rgb(BG))
-                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                .bg(editor_bg)
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
                     this.handle_buffer_switcher_key(ev, w, cx);
+                    cx.stop_propagation();
                 }))
                 .child(screen_view)
                 .child(self.render_buffer_switcher(cx))
@@ -5509,9 +6816,10 @@ impl Render for SketchGpuiView {
             .track_focus(&self.focus_handle)
             .key_context("MenuView")
             .size_full()
-            .bg(rgb(BG))
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+            .bg(editor_bg)
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
                 this.handle_menu_key(ev, w, cx);
+                cx.stop_propagation();
             }))
             .child(screen_view)
             .child(self.render_menu_overlay(cx))
@@ -5526,11 +6834,29 @@ impl SketchGpuiView {
         d: &DocState,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        // Clear the per-render layout sink before re-emitting lines. Mouse
+        // hit-testing reads this map between renders, so stale entries from
+        // a now-removed block would otherwise leak through.
+        self.line_layouts.borrow_mut().clear();
+        // Resolve the focused doc's directory for wiki link targets.
+        // `file_label` is the canonicalized path of the file backing this
+        // Doc — its parent dir is where `[[name]]` lookups start. `None`
+        // if the doc has no parent (e.g., root-level untitled buffer).
+        let doc_dir = {
+            let path = PathBuf::from(d.file_label.as_ref());
+            path.parent().map(|p| p.to_path_buf())
+        };
         let ctx = RenderCtx {
             theme: &self.theme,
             body_font: self.body_font.clone(),
             code_font: self.code_font.clone(),
+            text_scale: self.text_scale,
             cursor_block: Some(d.cursor_block),
+            doc_selection: self.doc_selection,
+            line_layouts: Some(&self.line_layouts),
+            current_block: None,
+            weak_view: Some(cx.entity().downgrade()),
+            doc_dir,
         };
 
         // Render every block. The body div is overflow-y-scroll and tracks
@@ -5546,12 +6872,32 @@ impl SketchGpuiView {
             .py_4()
             .overflow_y_scroll()
             .track_scroll(&d.scroll_handle)
-            .text_size(px(14.0))
+            .text_size(px(14.0 * self.text_scale))
             .font_family(self.body_font.clone())
-            .text_color(rgb(DEFAULT_FG));
+            .text_color(self.editor_fg());
         for (i, b) in d.blocks.iter().enumerate() {
             body = body.child(block_element(&ctx, i, b));
         }
+        // View-mode mouse selection: anchor on left MouseDown, update head on
+        // every MouseMove while a button is held, release on MouseUp. The
+        // doc body is the listener for all three; hit-testing falls through
+        // to the registered per-line TextLayouts in `self.line_layouts`.
+        body = body
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|view, ev: &MouseDownEvent, _w, cx| {
+                    view.doc_mouse_down(ev, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _w, cx| {
+                view.doc_mouse_move(ev, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, ev: &MouseUpEvent, _w, cx| {
+                    view.doc_mouse_up(ev, cx);
+                }),
+            );
 
         let top = self.theme.top_bar;
         let bot = self.theme.bottom_bar;
@@ -5585,7 +6931,7 @@ impl SketchGpuiView {
                 d.blocks.len()
             ))
             .child(SharedString::new_static(
-                "j/k scroll · h/l block · g/G top/bot · Ctrl-O browse · q/Esc quit",
+                "j/k scroll · h/l block · g/G top/bot · Ctrl-O browse · Space menu",
             ));
 
         root.key_context("SketchView")
@@ -5600,7 +6946,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::enter_edit))
             .on_action(cx.listener(Self::enter_wp))
-            .on_action(cx.listener(Self::open_claude))
+            .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_menu))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::next_buffer))
@@ -5622,6 +6968,11 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::resize_shrink))
             .on_action(cx.listener(Self::resize_grow))
             .on_action(cx.listener(Self::equalize))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::copy_doc_selection))
+            .on_action(cx.listener(Self::rename_tab))
             .child(header)
             .child(body)
             .child(footer)
@@ -5717,14 +7068,19 @@ impl SketchGpuiView {
 
         // No `actions!` wired here — the EditView key context catches all
         // keys via `on_key_down` so the same vocabulary works in both modes.
-        // The menu-bar actions (Quit / OpenBrowser / OpenClaude) still need
+        // The menu-bar actions (Quit / OpenBrowser / OpenAgent) still need
         // explicit `on_action` listeners on this root so the macOS menu bar
         // can dispatch them to whichever screen happens to be focused.
         root.key_context("EditView")
             .on_key_down(cx.listener(Self::handle_edit_key))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::open_browser))
-            .on_action(cx.listener(Self::open_claude))
+            .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::close_window))
             .child(header)
             .child(body)
             .child(footer)
@@ -5762,9 +7118,9 @@ impl SketchGpuiView {
             .py_2()
             .overflow_y_scroll()
             .track_scroll(&e.scroll_handle)
-            .text_size(px(14.0))
+            .text_size(px(14.0 * self.text_scale))
             .font_family(self.code_font.clone())
-            .text_color(rgb(DEFAULT_FG));
+            .text_color(self.editor_fg());
 
         let base_style = self.theme.paragraph;
         let sel = e.editor.selection_range();
@@ -5840,9 +7196,9 @@ impl SketchGpuiView {
             .py_4()
             .overflow_y_scroll()
             .track_scroll(&e.scroll_handle)
-            .text_size(px(14.0))
+            .text_size(px(14.0 * self.text_scale))
             .font_family(self.body_font.clone())
-            .text_color(rgb(DEFAULT_FG));
+            .text_color(self.editor_fg());
 
         let base_style = self.theme.paragraph;
         let sel = e.editor.selection_range();
@@ -5870,7 +7226,7 @@ impl SketchGpuiView {
             // Per-kind typography. Headings get scaled sizes + bold; lists
             // and paragraphs use the body font at the default size; code and
             // tables use monospace.
-            let (text_size_px, font_weight, top_pad) = match kind {
+            let (raw_size_px, font_weight, top_pad) = match kind {
                 WpLineKind::Heading(1) => (26.0, FontWeight::BOLD, 10.0),
                 WpLineKind::Heading(2) => (22.0, FontWeight::BOLD, 8.0),
                 WpLineKind::Heading(3) => (18.0, FontWeight::BOLD, 6.0),
@@ -5883,6 +7239,7 @@ impl SketchGpuiView {
                 WpLineKind::TableRow => (13.0, FontWeight::NORMAL, 0.0),
                 _ => (14.0, FontWeight::NORMAL, 0.0),
             };
+            let text_size_px = raw_size_px * self.text_scale;
             let line_font = match kind {
                 WpLineKind::CodeFence | WpLineKind::CodeContent | WpLineKind::TableRow => {
                     &self.code_font
@@ -5971,10 +7328,10 @@ impl SketchGpuiView {
     /// draft and any inline replies) renders normally with cursor splice.
     /// Header shows attach status; footer shows mode + send hint + send
     /// state ("…" while a reply is in flight).
-    fn render_claude(
+    fn render_agent(
         &self,
         root: gpui::Div,
-        ring: &mut SessionRing,
+        ring: &mut AgentRing,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let session_count = ring.len();
@@ -6048,14 +7405,17 @@ impl SketchGpuiView {
 
         // Build "tool calls anchored at line N" lookup, grouped by
         // anchor line. All calls at the same anchor form one ToolGroup.
+        // Anchors are opaque `LineAnchor` ids (spec §E1); resolve via the
+        // editor each paint. Anchors whose line got consumed by a delete
+        // fall back to EOF so the tool block still renders, just at the
+        // tail of the transcript.
+        let eof_line = c.editor.document().line_count().saturating_sub(1);
         let mut tools_at_line: std::collections::HashMap<usize, Vec<String>> =
             std::collections::HashMap::new();
         for id in &c.tool_call_order {
-            if let Some(line) = c.tool_call_anchor_line.get(id) {
-                tools_at_line
-                    .entry(*line)
-                    .or_default()
-                    .push(id.clone());
+            if let Some(&anchor) = c.tool_call_anchor_line.get(id) {
+                let line = c.editor.line_for_anchor(anchor).unwrap_or(eof_line);
+                tools_at_line.entry(line).or_default().push(id.clone());
             }
         }
 
@@ -6130,7 +7490,7 @@ impl SketchGpuiView {
         }
 
         // Snapshot data for the render closure. Cloned once per
-        // render_claude call; the closure is then called only for
+        // render_agent call; the closure is then called only for
         // visible items.
         let lines_snap = lines.clone();
         let highlighted_snap = highlighted.clone();
@@ -6358,7 +7718,7 @@ impl SketchGpuiView {
                                 move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
                                     let id = click_id.clone();
                                     let _ = weak.update(app, |this, cx| {
-                                        if let Some(c) = this.claude_mut() {
+                                        if let Some(c) = this.agent_mut() {
                                             if c.expanded_tool_calls.contains(&id) {
                                                 c.expanded_tool_calls.remove(&id);
                                             } else {
@@ -6400,7 +7760,18 @@ impl SketchGpuiView {
                             theme: &theme_snap,
                             body_font: body_font_snap.clone(),
                             code_font: code_font_snap.clone(),
+                            // Claude session chat blocks stay at fixed size —
+                            // Cmd-zoom is scoped to the document view.
+                            text_scale: 1.0,
                             cursor_block: None,
+                            doc_selection: None,
+                            line_layouts: None,
+                            current_block: None,
+                            // Wiki link clicks in Claude messages aren't
+                            // wired up — they'd need a per-message source
+                            // path which we don't track. Skip for v1.
+                            weak_view: None,
+                            doc_dir: None,
                         };
                         let inner = block_inner(&ctx, rendered_block);
                         div()
@@ -6422,7 +7793,7 @@ impl SketchGpuiView {
             .py_2()
             .text_size(px(13.0))
             .font_family(self.code_font.clone())
-            .text_color(rgb(DEFAULT_FG))
+            .text_color(self.editor_fg())
             .child(
                 gpui::list(c.list_state.clone(), render_fn)
                     .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
@@ -6633,6 +8004,8 @@ impl SketchGpuiView {
         };
 
         // Session sidebar — visible when more than one session exists.
+        let editor_bg = self.editor_bg();
+        let editor_fg = self.editor_fg();
         let content_area: gpui::AnyElement = if session_count > 1 {
             let weak_self = cx.entity().downgrade();
             let mut sidebar = div()
@@ -6643,7 +8016,7 @@ impl SketchGpuiView {
                 .min_w(px(160.0))
                 .border_r_1()
                 .border_color(rgb(0x44475a))
-                .bg(rgb(BG))
+                .bg(editor_bg)
                 .py_1()
                 .overflow_y_scroll();
 
@@ -6673,7 +8046,7 @@ impl SketchGpuiView {
                     .cursor_pointer()
                     .on_click(move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
                         let _ = weak.update(app, |this, cx| {
-                            if let Some(ring) = this.claude_ring_mut() {
+                            if let Some(ring) = this.agent_ring_mut() {
                                 if let Some(pos) = ring.slot_by_index(slot_index) {
                                     ring.active = pos;
                                     ring.slots[pos].has_unseen_activity = false;
@@ -6687,7 +8060,7 @@ impl SketchGpuiView {
                     row = row
                         .bg(rgb(0x44475a))
                         .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(DEFAULT_FG));
+                        .text_color(editor_fg);
                 } else if *has_unseen {
                     row = row.text_color(rgb(0xf1fa8c));
                 } else {
@@ -6711,7 +8084,7 @@ impl SketchGpuiView {
                     .child("  [+] new")
                     .on_click(move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
                         let _ = weak_new.update(app, |this, cx| {
-                            this.new_claude_session(cx);
+                            this.new_agent_session(cx);
                         });
                     }),
             );
@@ -6751,11 +8124,16 @@ impl SketchGpuiView {
         };
 
         root
-            .key_context("ClaudeView")
+            .key_context("AgentView")
             .on_key_down(cx.listener(Self::handle_claude_key))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::open_browser))
-            .on_action(cx.listener(Self::open_claude))
+            .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::close_window))
             .child(header)
             .child(content_area)
             .child(footer)
@@ -6838,7 +8216,12 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::open_menu))
             .on_action(cx.listener(Self::browser_close))
             .on_action(cx.listener(Self::quit))
-            .on_action(cx.listener(Self::open_claude))
+            .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::close_window))
             .child(header)
             .child(list)
             .child(hint)
@@ -6985,7 +8368,7 @@ fn tab_strip_label(tab: &workspace::Tab<WindowContent>) -> String {
             WindowContent::Doc(d) => basename_or_full(d.file_label.as_ref()),
             WindowContent::Edit(e) => format!("E {}", basename_or_full(e.file_label.as_ref())),
             WindowContent::Browser(_) => format!("Browser ({})", tab.display_label()),
-            WindowContent::Claude(_) => format!("Claude ({})", tab.display_label()),
+            WindowContent::Agent(_) => format!("Claude ({})", tab.display_label()),
         }
     } else {
         tab.display_label().to_string()
@@ -7067,7 +8450,17 @@ fn fuzzy_match_gpui(text: &str, query: &str) -> bool {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let config = sketch::config::Config::load().unwrap_or_default();
-    let theme = Theme::from_name(config.theme);
+    // App-managed preferences override config.kdl's theme — that's where
+    // the menu-driven "View → Theme" picks land. Falls back to the kdl
+    // theme (or built-in default) when the user hasn't switched themes via
+    // the UI yet.
+    let prefs = load_preferences();
+    let theme_name = prefs
+        .theme
+        .as_deref()
+        .and_then(ThemeName::parse)
+        .unwrap_or(config.theme);
+    let theme = Theme::from_name(theme_name);
 
     // No path → launch directly into the file browser at cwd.
     let initial_doc: Option<(Vec<RenderedBlock>, String)> = match args.get(1) {
@@ -7086,7 +8479,7 @@ fn main() {
                 .display()
                 .to_string();
             let doc = Document::from_text(text, path.clone());
-            let blocks = render::render(&doc.full_text(), &theme);
+            let blocks = render_with_wiki(&doc.full_text(), &theme);
             println!("sketch-gpui: loaded {} ({} blocks)", canon, blocks.len());
             Some((blocks, canon))
         }
@@ -7120,10 +8513,14 @@ fn main() {
             // Ctrl-W is the split chord prefix (see global bindings below).
             // Word-processor entry rebinds to Ctrl-Shift-E.
             KeyBinding::new("ctrl-shift-e", EnterWp, Some("SketchView")),
-            KeyBinding::new("ctrl-k", OpenClaude, Some("SketchView")),
+            KeyBinding::new("ctrl-k", OpenAgent, Some("SketchView")),
             KeyBinding::new("space", OpenMenu, Some("SketchView")),
-            KeyBinding::new("q", Quit, Some("SketchView")),
-            KeyBinding::new("escape", Quit, Some("SketchView")),
+            // Doc-view Esc and bare `q` used to dispatch `Quit` — that
+            // made it too easy to lose the app by mashing keys. Quit now
+            // lives only on Cmd-Q (the macOS-standard chord). Esc in the
+            // doc view is a no-op so users in normal-mode just stay where
+            // they are; the menu still dismisses on Esc via its own
+            // capture-phase handler.
             KeyBinding::new("tab", NextBuffer, Some("SketchView")),
             KeyBinding::new("shift-tab", PrevBuffer, Some("SketchView")),
         ]);
@@ -7136,7 +8533,7 @@ fn main() {
         app.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-o", OpenBrowser, None),
-            KeyBinding::new("cmd-k", OpenClaude, None),
+            KeyBinding::new("cmd-k", OpenAgent, None),
             // Workspace-level tab switching — app-global so the strip is
             // reachable from every screen and overlay (per spec Interfaces
             // table; bind also `Ctrl-Tab`/`Ctrl-Shift-Tab` for keyboard-only
@@ -7151,6 +8548,11 @@ fn main() {
             KeyBinding::new("ctrl-w s", SplitH, None),
             KeyBinding::new("ctrl-w v", SplitV, None),
             KeyBinding::new("ctrl-w c", CloseWindow, None),
+            // Mac-standard close shortcut. Closes the focused pane; falls
+            // through to closing the tab if the pane was the only one in
+            // its tab (unless it's also the only tab — then no-op rather
+            // than quit, per the "no surprise quits" rule).
+            KeyBinding::new("cmd-w", CloseWindow, None),
             KeyBinding::new("ctrl-w o", OnlyWindow, None),
             // Vim-style focus motion across split panes.
             KeyBinding::new("ctrl-w h", FocusLeft, None),
@@ -7165,6 +8567,19 @@ fn main() {
             KeyBinding::new("ctrl-w >", ResizeGrow, None),
             KeyBinding::new("ctrl-w +", ResizeGrow, None),
             KeyBinding::new("ctrl-w =", Equalize, None),
+            // Document text zoom — same chord set every Mac app uses for
+            // browser/editor zoom (Cmd-=, Cmd-+, Cmd--, Cmd-0). Scales the
+            // doc/edit body + heading sizes; chrome stays fixed.
+            KeyBinding::new("cmd-=", ZoomIn, None),
+            KeyBinding::new("cmd-+", ZoomIn, None),
+            KeyBinding::new("cmd--", ZoomOut, None),
+            KeyBinding::new("cmd-0", ZoomReset, None),
+            // Copy the view-mode mouse selection. Scoped to SketchView so it
+            // doesn't shadow edit-mode yank or other surfaces' copy paths.
+            KeyBinding::new("cmd-c", CopyDocSelection, Some("SketchView")),
+            // Rename the active tab. Global so it works from any screen
+            // (and the menu's "rename tab" entry uses the same path).
+            KeyBinding::new("cmd-shift-r", RenameTab, None),
         ]);
 
         // Browser-view bindings.
@@ -7242,11 +8657,11 @@ fn main() {
                     // Reboot handoff: the previous sketch process set this
                     // env var via `reboot_into_claude` to mean "boot
                     // straight into the claude screen and resume every
-                    // saved session." The downstream `open_claude_inner`
+                    // saved session." The downstream `open_agent_inner`
                     // consults `load_persisted_acp_sessions`, so
                     // session/load fires once per persisted slot.
                     if std::env::var("SKETCH_OPEN_CLAUDE").is_ok() {
-                        view.open_claude_inner(cx);
+                        view.open_agent_inner(cx);
                     }
                     view
                 })
@@ -7284,7 +8699,7 @@ fn main() {
                 name: "File".into(),
                 items: vec![
                     MenuItem::action("Open File Browser", OpenBrowser),
-                    MenuItem::action("Open Claude Session", OpenClaude),
+                    MenuItem::action("Open Claude Session", OpenAgent),
                 ],
             },
         ]);
@@ -7568,9 +8983,9 @@ mod tests {
     }
 
     #[test]
-    fn splice_claude_chunk_into_empty_editor_adds_frozen_lines() {
+    fn splice_agent_chunk_into_empty_editor_adds_frozen_lines() {
         let mut ed = fresh_claude_editor();
-        splice_claude_chunk(&mut ed, "Hello, human!");
+        splice_agent_chunk(&mut ed, "Hello, human!");
         let text = ed.document().full_text();
         assert!(
             text.contains("Hello, human!"),
@@ -7589,13 +9004,13 @@ mod tests {
     }
 
     #[test]
-    fn splice_claude_chunk_preserves_user_draft_below() {
+    fn splice_agent_chunk_preserves_user_draft_below() {
         let mut ed = fresh_claude_editor();
         // Type some draft text first.
         ed.insert_char('h');
         ed.insert_char('i');
         // The draft is in the editable region; splice a Claude reply.
-        splice_claude_chunk(&mut ed, "I am Claude.");
+        splice_agent_chunk(&mut ed, "I am Claude.");
 
         let text = ed.document().full_text();
         assert!(
@@ -7621,14 +9036,14 @@ mod tests {
     }
 
     #[test]
-    fn splice_claude_chunk_empty_text_is_noop() {
+    fn splice_agent_chunk_empty_text_is_noop() {
         let mut ed = fresh_claude_editor();
         ed.insert_char('a');
         let before = ed.document().full_text();
-        splice_claude_chunk(&mut ed, "   \n\n");
+        splice_agent_chunk(&mut ed, "   \n\n");
         // Whitespace-only text is treated as empty (trim_end_matches('\n') leaves spaces but the impl uses trimmed.is_empty after trim_end of '\n' only — so spaces survive). Verify the docstring behavior: empty after trim.
         // For this test, an actually-empty payload:
-        splice_claude_chunk(&mut ed, "");
+        splice_agent_chunk(&mut ed, "");
         // The all-spaces case may or may not no-op; what we definitely want is
         // "" doesn't change the doc.
         let after = ed.document().full_text();
@@ -7639,12 +9054,12 @@ mod tests {
     }
 
     #[test]
-    fn lock_claude_turn_appends_separator_and_locks_above() {
+    fn lock_agent_turn_appends_separator_and_locks_above() {
         let mut ed = fresh_claude_editor();
         ed.insert_char('h');
         ed.insert_char('i');
         let line_count_before = ed.document().line_count();
-        lock_claude_turn(&mut ed);
+        lock_agent_turn(&mut ed);
 
         let text = ed.document().full_text();
         assert!(
@@ -7760,7 +9175,7 @@ mod tests {
     }
 
     #[test]
-    fn menu_c_o_resolves_to_open_claude() {
+    fn menu_c_o_resolves_to_open_agent() {
         // `k` opens the claude submenu; `o` then resolves to open-claude.
         // Regression check that the Label node preceding `k` doesn't shadow
         // it (process_key must skip Labels).
@@ -7827,21 +9242,21 @@ mod tests {
     fn splice_then_lock_then_splice_again_chains_above_draft() {
         let mut ed = fresh_claude_editor();
         // Turn 1: Claude greets first (no prior draft).
-        splice_claude_chunk(&mut ed, "Hi.");
+        splice_agent_chunk(&mut ed, "Hi.");
         // Turn-end housekeeping mirrors what `pump_claude_replies` does
         // when the agent's prompt response lands: ensure an editable line
         // sits below the frozen content so the user can type.
-        finalize_claude_turn(&mut ed);
+        finalize_agent_turn(&mut ed);
         // User types a reply.
         ed.insert_char('o');
         ed.insert_char('k');
         // Send/lock.
-        lock_claude_turn(&mut ed);
+        lock_agent_turn(&mut ed);
         // User starts typing the next prompt.
         ed.insert_char('?');
         // Claude streams a reply mid-typing.
-        splice_claude_chunk(&mut ed, "Yes!");
-        finalize_claude_turn(&mut ed);
+        splice_agent_chunk(&mut ed, "Yes!");
+        finalize_agent_turn(&mut ed);
 
         let text = ed.document().full_text();
         // All three pieces of content + the locked draft survive.

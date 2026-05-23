@@ -2,7 +2,7 @@
 //!
 //! This is the data substrate for `spec-tabs-and-splits.md`: a workspace
 //! contains tabs, each tab roots an n-ary split tree of windows, and each
-//! window holds one content kind (Doc / Edit / Browser / Claude). File-backed
+//! window holds one content kind (Doc / Edit / Browser / Agent). File-backed
 //! editors live in a pooled `FileBuffer` and may be referenced by multiple
 //! windows simultaneously (shared edits across splits).
 //!
@@ -35,7 +35,7 @@ pub enum FocusDir {
 
 /// One leaf of a tab's layout tree. A `Window` carries its stable id plus the
 /// per-window content (kind- and frontend-specific state). The content kind
-/// (`DocWindow`, `EditWindow`, `BrowserWindow`, `ClaudeWindow`) is defined in
+/// (`DocWindow`, `EditWindow`, `BrowserWindow`, `AgentWindow`) is defined in
 /// the main binary because some fields reference GPUI-specific types
 /// (`ScrollHandle`, etc.).
 pub struct Window<C> {

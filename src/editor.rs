@@ -1,8 +1,165 @@
+use std::any::{Any, TypeId};
+use std::collections::{BTreeMap, HashMap};
+use std::marker::PhantomData;
 use std::path::PathBuf;
 
 use crate::cursor::CursorPos;
 use crate::document::Document;
 use crate::tree::{BlockInfo, TreeState};
+
+// =============================================================================
+// LineAnchor + LineMetadata
+// =============================================================================
+//
+// Opaque, monotonic line ids that survive inserts/deletes on *other* lines.
+// Backed by a side map kept in sync by `shift_anchors_for_*` whenever the same
+// edit paths shift `frozen_lines`. Anchors whose line is wholly consumed by a
+// delete are dropped from the map; subsequent `line_for_anchor` calls return
+// `None`. See spec-agent-window.md §E1.
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Debug)]
+pub struct LineAnchor(u64);
+
+#[derive(Default)]
+struct LineAnchorStore {
+    next_id: u64,
+    by_anchor: BTreeMap<LineAnchor, usize>,
+    by_line: BTreeMap<usize, LineAnchor>,
+}
+
+impl LineAnchorStore {
+    fn allocate(&mut self, line: usize) -> LineAnchor {
+        if let Some(&a) = self.by_line.get(&line) {
+            return a;
+        }
+        let a = LineAnchor(self.next_id);
+        self.next_id += 1;
+        self.by_anchor.insert(a, line);
+        self.by_line.insert(line, a);
+        a
+    }
+
+    fn line_for(&self, a: LineAnchor) -> Option<usize> {
+        self.by_anchor.get(&a).copied()
+    }
+
+    fn shift_for_insert(&mut self, eff_line: usize, eff_col: usize, inserted_nl: usize) {
+        if inserted_nl == 0 {
+            return;
+        }
+        let mut new_by_anchor: BTreeMap<LineAnchor, usize> = BTreeMap::new();
+        let mut new_by_line: BTreeMap<usize, LineAnchor> = BTreeMap::new();
+        for (&a, &line) in self.by_anchor.iter() {
+            let new_line = if line < eff_line {
+                line
+            } else if line == eff_line {
+                if eff_col == 0 { line + inserted_nl } else { line }
+            } else {
+                line + inserted_nl
+            };
+            new_by_anchor.insert(a, new_line);
+            new_by_line.insert(new_line, a);
+        }
+        self.by_anchor = new_by_anchor;
+        self.by_line = new_by_line;
+    }
+
+    /// Shift anchors for a delete that started at `(start_line, start_col)`
+    /// and removed `deleted_nl` newlines. Returns the set of anchors that
+    /// were dropped (so the metadata store can purge them).
+    ///
+    /// - Lines `< start_line` are unaffected.
+    /// - Line `start_line` survives if `start_col > 0` (its prefix remains);
+    ///   if `start_col == 0` and `deleted_nl > 0` it is wholly consumed by
+    ///   the merge and its anchor is dropped.
+    /// - Lines `(start_line, start_line + deleted_nl]` are wholly consumed
+    ///   and their anchors are dropped.
+    /// - Lines `> start_line + deleted_nl` shift down by `deleted_nl`.
+    fn shift_for_delete(
+        &mut self,
+        start_line: usize,
+        start_col: usize,
+        deleted_nl: usize,
+    ) -> Vec<LineAnchor> {
+        if deleted_nl == 0 {
+            return Vec::new();
+        }
+        let start_line_consumed = start_col == 0;
+        let mut dropped = Vec::new();
+        let mut new_by_anchor: BTreeMap<LineAnchor, usize> = BTreeMap::new();
+        let mut new_by_line: BTreeMap<usize, LineAnchor> = BTreeMap::new();
+        for (&a, &line) in self.by_anchor.iter() {
+            if line < start_line {
+                new_by_anchor.insert(a, line);
+                new_by_line.insert(line, a);
+            } else if line == start_line {
+                if start_line_consumed {
+                    dropped.push(a);
+                } else {
+                    new_by_anchor.insert(a, line);
+                    new_by_line.insert(line, a);
+                }
+            } else if line <= start_line + deleted_nl {
+                dropped.push(a);
+            } else {
+                let nl = line - deleted_nl;
+                new_by_anchor.insert(a, nl);
+                new_by_line.insert(nl, a);
+            }
+        }
+        self.by_anchor = new_by_anchor;
+        self.by_line = new_by_line;
+        dropped
+    }
+}
+
+/// Typed sparse map from `LineAnchor` to a per-type payload. One slot per
+/// `T` registered with the editor; reads return `None` when the anchor has no
+/// metadata of that type, or when the anchor has been dropped by a delete.
+/// See spec-agent-window.md §E2.
+#[derive(Default)]
+struct LineMetadataStore {
+    by_type: HashMap<TypeId, HashMap<LineAnchor, Box<dyn Any + Send + Sync>>>,
+}
+
+impl LineMetadataStore {
+    fn drop_anchor(&mut self, a: LineAnchor) {
+        for map in self.by_type.values_mut() {
+            map.remove(&a);
+        }
+    }
+}
+
+pub struct LineMetadataView<'a, T: Any + Send + Sync> {
+    map: Option<&'a HashMap<LineAnchor, Box<dyn Any + Send + Sync>>>,
+    _phantom: PhantomData<T>,
+}
+
+impl<'a, T: Any + Send + Sync> LineMetadataView<'a, T> {
+    pub fn get(&self, a: LineAnchor) -> Option<&T> {
+        let map = self.map?;
+        map.get(&a)?.downcast_ref::<T>()
+    }
+}
+
+pub struct LineMetadataMut<'a, T: Any + Send + Sync> {
+    map: &'a mut HashMap<LineAnchor, Box<dyn Any + Send + Sync>>,
+    _phantom: PhantomData<T>,
+}
+
+impl<'a, T: Any + Send + Sync> LineMetadataMut<'a, T> {
+    pub fn get(&self, a: LineAnchor) -> Option<&T> {
+        self.map.get(&a)?.downcast_ref::<T>()
+    }
+
+    pub fn insert(&mut self, a: LineAnchor, v: T) {
+        self.map.insert(a, Box::new(v));
+    }
+
+    pub fn remove(&mut self, a: LineAnchor) {
+        self.map.remove(&a);
+    }
+}
 
 /// Document substrate for a single file/buffer: rope, tree-sitter state, frozen
 /// ranges, and the read-only-prefix bookmark. One `EditorCore` may have many
@@ -21,6 +178,14 @@ pub struct EditorCore {
     /// `< this` are silently rejected. Used by the *claude* buffer to lock
     /// prior turns once a new turn begins.
     lockable_through_line: usize,
+    /// Opaque, monotonic line ids that survive inserts/deletes on other lines
+    /// (§E1). Side map maintained in lock-step with `frozen_lines` by the
+    /// `shift_*` paths. Anchors for lines wholly consumed by a delete are
+    /// dropped.
+    line_anchors: LineAnchorStore,
+    /// Typed sparse map from `LineAnchor` to per-type payloads (§E2). The
+    /// Worksheet gutter reads `TurnId` via this store keyed by line anchors.
+    line_metadata: LineMetadataStore,
 }
 
 /// Per-window cursor, selection, and insert-mode state attached to an
@@ -62,7 +227,62 @@ impl EditorCore {
             tree_state,
             frozen_lines: Vec::new(),
             lockable_through_line: 0,
+            line_anchors: LineAnchorStore::default(),
+            line_metadata: LineMetadataStore::default(),
         }
+    }
+
+    // --- LineAnchor + LineMetadata (§E1, §E2) ---
+
+    /// Allocate (or return the existing) anchor for `line`.
+    pub fn anchor_for_line(&mut self, line: usize) -> LineAnchor {
+        self.line_anchors.allocate(line)
+    }
+
+    /// `None` once the anchored line is gone (consumed by a delete).
+    pub fn line_for_anchor(&self, a: LineAnchor) -> Option<usize> {
+        self.line_anchors.line_for(a)
+    }
+
+    /// Read-only handle to per-line metadata of type `T`. Returns a view with
+    /// `.get(anchor)`; missing entries yield `None`.
+    pub fn metadata<T: Any + Send + Sync>(&self) -> LineMetadataView<'_, T> {
+        LineMetadataView {
+            map: self.line_metadata.by_type.get(&TypeId::of::<T>()),
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Mutable handle to per-line metadata of type `T`. The underlying slot is
+    /// created on demand. Use `.insert(anchor, v)` / `.remove(anchor)`.
+    pub fn metadata_mut<T: Any + Send + Sync>(&mut self) -> LineMetadataMut<'_, T> {
+        let map = self
+            .line_metadata
+            .by_type
+            .entry(TypeId::of::<T>())
+            .or_default();
+        LineMetadataMut {
+            map,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Walk anchors in descending line order, returning the highest line whose
+    /// `T` metadata equals `tag`. Used by `append_llm_chunk` to find the tail
+    /// of an in-progress LLM turn.
+    fn last_line_with_meta<T: Any + Send + Sync + PartialEq>(
+        &self,
+        tag: &T,
+    ) -> Option<usize> {
+        let view = self.metadata::<T>();
+        for (&line, &anchor) in self.line_anchors.by_line.iter().rev() {
+            if let Some(v) = view.get(anchor) {
+                if v == tag {
+                    return Some(line);
+                }
+            }
+        }
+        None
     }
 
     // --- Frozen lines / locked prefix ---
@@ -148,6 +368,15 @@ impl EditorCore {
 
     pub fn clear_frozen_ranges(&mut self) {
         self.frozen_lines.clear();
+    }
+
+    /// Drop every allocated anchor and all `LineMetadata`. Used by undo/redo,
+    /// which bulk-restore the rope and frozen ranges without going through the
+    /// shift machinery; the anchor store would otherwise be left referencing
+    /// stale line indices. Consumers must re-acquire anchors after this fires.
+    pub fn reset_line_anchors(&mut self) {
+        self.line_anchors = LineAnchorStore::default();
+        self.line_metadata = LineMetadataStore::default();
     }
 
     /// True if `line` is in any frozen range.
@@ -261,6 +490,9 @@ impl EditorCore {
         if self.lockable_through_line > eff_line {
             self.lockable_through_line += inserted_nl;
         }
+
+        self.line_anchors
+            .shift_for_insert(eff_line, eff_col, inserted_nl);
     }
 
     /// Recompute frozen line ranges after deleting `[del_s, del_e)`. Caller
@@ -279,7 +511,7 @@ impl EditorCore {
         if deleted_nl == 0 {
             return;
         }
-        let (start_line, _) = char_to_line_col(&self.document, del_s);
+        let (start_line, start_col) = char_to_line_col(&self.document, del_s);
         for (s, e) in self.frozen_lines.iter_mut() {
             if *s > start_line {
                 *s = s.saturating_sub(deleted_nl);
@@ -289,6 +521,13 @@ impl EditorCore {
         if self.lockable_through_line > start_line {
             self.lockable_through_line =
                 self.lockable_through_line.saturating_sub(deleted_nl);
+        }
+
+        let dropped = self
+            .line_anchors
+            .shift_for_delete(start_line, start_col, deleted_nl);
+        for a in dropped {
+            self.line_metadata.drop_anchor(a);
         }
     }
 
@@ -745,6 +984,7 @@ impl EditorView {
         {
             core.frozen_lines = frozen;
             core.lockable_through_line = lockable;
+            core.reset_line_anchors();
             self.cursor.line = line.min(core.document.line_count().saturating_sub(1));
             self.cursor.col = col;
             self.clamp_cursor_col(core, false);
@@ -760,6 +1000,7 @@ impl EditorView {
         {
             core.frozen_lines = frozen;
             core.lockable_through_line = lockable;
+            core.reset_line_anchors();
             self.cursor.line = line.min(core.document.line_count().saturating_sub(1));
             self.cursor.col = col;
             self.clamp_cursor_col(core, false);
@@ -915,6 +1156,87 @@ impl Editor {
 
     pub fn extract_editable_inserts(&self) -> String {
         self.core.extract_editable_inserts()
+    }
+
+    // --- LineAnchor / LineMetadata (delegate to core) ---
+
+    pub fn anchor_for_line(&mut self, line: usize) -> LineAnchor {
+        self.core.anchor_for_line(line)
+    }
+
+    pub fn line_for_anchor(&self, a: LineAnchor) -> Option<usize> {
+        self.core.line_for_anchor(a)
+    }
+
+    pub fn metadata<T: Any + Send + Sync>(&self) -> LineMetadataView<'_, T> {
+        self.core.metadata::<T>()
+    }
+
+    pub fn metadata_mut<T: Any + Send + Sync>(&mut self) -> LineMetadataMut<'_, T> {
+        self.core.metadata_mut::<T>()
+    }
+
+    pub fn reset_line_anchors(&mut self) {
+        self.core.reset_line_anchors();
+    }
+
+    /// Append an LLM chunk for `turn_tag` (typically a `TurnId::Llm(k)`
+    /// payload). Locates the insertion point as the end of the last frozen
+    /// line whose metadata of type `T` equals `turn_tag` (mid-line if that
+    /// line didn't end with `\n`), or EOF if no line carries this turn yet.
+    /// Inserts the chunk via `programmatic_insert`, extends the frozen range
+    /// to cover the newly-inserted lines, and tags each new line's anchor
+    /// with `turn_tag`. Editable user lines anywhere else in the document are
+    /// not touched. See spec-agent-window.md §E3.
+    pub fn append_llm_chunk<T>(&mut self, turn_tag: T, chunk: &str)
+    where
+        T: Any + Send + Sync + Clone + PartialEq,
+    {
+        if chunk.is_empty() {
+            return;
+        }
+        let insertion_char = self.find_llm_insertion_point::<T>(&turn_tag);
+        self.core.programmatic_insert(insertion_char, chunk);
+
+        let chunk_chars = chunk.chars().count();
+        let chunk_end_char = insertion_char + chunk_chars;
+        let doc = self.core.document();
+        let start_line = char_to_line_col(doc, insertion_char).0;
+        let mut end_line = char_to_line_col(doc, chunk_end_char).0;
+        if !chunk.ends_with('\n') {
+            end_line += 1;
+        }
+        self.core.add_frozen_lines(start_line, end_line);
+
+        for l in start_line..end_line {
+            let a = self.core.anchor_for_line(l);
+            self.core.metadata_mut::<T>().insert(a, turn_tag.clone());
+        }
+    }
+
+    fn find_llm_insertion_point<T: Any + Send + Sync + PartialEq>(
+        &self,
+        turn_tag: &T,
+    ) -> usize {
+        let doc = self.core.document();
+        let total_chars = doc.rope().len_chars();
+        let total_lines = doc.line_count();
+
+        let Some(last_llm_line) = self.core.last_line_with_meta::<T>(turn_tag) else {
+            return total_chars;
+        };
+
+        let line_text = doc.line_text(last_llm_line);
+        if line_text.ends_with('\n') {
+            if last_llm_line + 1 >= total_lines {
+                total_chars
+            } else {
+                doc.line_col_to_char(last_llm_line + 1, 0)
+            }
+        } else {
+            let line_len = doc.line_len_chars(last_llm_line);
+            doc.line_col_to_char(last_llm_line, line_len)
+        }
     }
 
     pub fn document(&self) -> &Document {
@@ -1137,4 +1459,188 @@ fn char_to_line_floor(doc: &Document, char_idx: usize) -> usize {
 fn char_to_line_ceil(doc: &Document, char_idx: usize) -> usize {
     let (line, col) = char_to_line_col(doc, char_idx);
     if col == 0 { line } else { line + 1 }
+}
+
+// =============================================================================
+// Tests — LineAnchor / LineMetadata / append_llm_chunk (§E1–§E3)
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TurnId {
+        Llm(usize),
+        User(usize),
+    }
+
+    fn new_editor(text: &str) -> Editor {
+        Editor::new(text.to_string(), PathBuf::from("test.md"))
+    }
+
+    #[test]
+    fn anchor_for_line_returns_same_id_on_repeat() {
+        let mut ed = new_editor("a\nb\nc\n");
+        let a0 = ed.anchor_for_line(1);
+        let a1 = ed.anchor_for_line(1);
+        assert_eq!(a0, a1);
+        assert_eq!(ed.line_for_anchor(a0), Some(1));
+    }
+
+    #[test]
+    fn anchor_distinct_per_line() {
+        let mut ed = new_editor("a\nb\nc\n");
+        let a0 = ed.anchor_for_line(0);
+        let a1 = ed.anchor_for_line(1);
+        let a2 = ed.anchor_for_line(2);
+        assert_ne!(a0, a1);
+        assert_ne!(a1, a2);
+        assert_ne!(a0, a2);
+    }
+
+    #[test]
+    fn anchor_shifts_when_inserts_above_at_col_zero() {
+        let mut ed = new_editor("a\nb\nc\n");
+        let a = ed.anchor_for_line(2); // "c"
+        // Insert a new line at start of line 1 ("b"). col==0, one newline.
+        ed.programmatic_insert(2, "X\n");
+        // Document is now: a\nX\nb\nc\n; anchor for original "c" → line 3.
+        assert_eq!(ed.line_for_anchor(a), Some(3));
+    }
+
+    #[test]
+    fn anchor_does_not_shift_for_inserts_below() {
+        let mut ed = new_editor("a\nb\nc\n");
+        let a = ed.anchor_for_line(0);
+        ed.programmatic_insert(ed.document().rope().len_chars(), "d\n");
+        assert_eq!(ed.line_for_anchor(a), Some(0));
+    }
+
+    #[test]
+    fn anchor_dropped_when_line_consumed_by_delete() {
+        let mut ed = new_editor("a\nb\nc\nd\n");
+        let a_b = ed.anchor_for_line(1);
+        let a_c = ed.anchor_for_line(2);
+        let a_d = ed.anchor_for_line(3);
+        // Delete "b\nc\n" — del_s=2 (col 0 of line 1), del_e=6 (col 0 of
+        // line 3), deleted_nl=2. Because del_s is at col 0 of start_line,
+        // original line 1 ("b") is wholly consumed along with lines 2 ("c")
+        // and 3 ("d"). After delete the rope is "a\nd\n"; the surviving
+        // line 1 is the former "d", but with a fresh identity (no anchor).
+        ed.programmatic_delete(2, 6);
+        assert_eq!(ed.line_for_anchor(a_b), None);
+        assert_eq!(ed.line_for_anchor(a_c), None);
+        assert_eq!(ed.line_for_anchor(a_d), None);
+        // A new anchor on the surviving line gets a fresh id.
+        let fresh = ed.anchor_for_line(1);
+        assert_ne!(fresh, a_b);
+        assert_eq!(ed.line_for_anchor(fresh), Some(1));
+    }
+
+    #[test]
+    fn anchor_preserved_when_delete_starts_mid_line() {
+        // Mid-line delete: line at start_line keeps its prefix and absorbs the
+        // tail of the deleted range. Anchor on start_line stays put.
+        let mut ed = new_editor("hello\nworld\n!\n");
+        let a0 = ed.anchor_for_line(0);
+        // del_s=3 (mid-"hello", col 3), del_e=7 (mid-"world", col 1).
+        // deleted_nl=1. start_line=0 survives; line 1 ("world") is consumed.
+        ed.programmatic_delete(3, 7);
+        assert_eq!(ed.line_for_anchor(a0), Some(0));
+        // Surviving doc: "hel" + "orld\n" + "!\n" = "helorld\n!\n"
+        assert_eq!(ed.document().full_text(), "helorld\n!\n");
+    }
+
+    #[test]
+    fn metadata_get_after_insert_returns_value() {
+        let mut ed = new_editor("hello\n");
+        let a = ed.anchor_for_line(0);
+        ed.metadata_mut::<TurnId>().insert(a, TurnId::User(3));
+        assert_eq!(ed.metadata::<TurnId>().get(a), Some(&TurnId::User(3)));
+    }
+
+    #[test]
+    fn metadata_dropped_when_anchor_dropped() {
+        let mut ed = new_editor("a\nb\nc\n");
+        let a = ed.anchor_for_line(1);
+        ed.metadata_mut::<TurnId>().insert(a, TurnId::Llm(1));
+        ed.programmatic_delete(2, 4); // delete "b\n"
+        assert_eq!(ed.line_for_anchor(a), None);
+        assert_eq!(ed.metadata::<TurnId>().get(a), None);
+    }
+
+    #[test]
+    fn append_llm_chunk_to_empty_editor_appends_and_freezes() {
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "Hello, world!\n");
+        assert_eq!(ed.document().full_text(), "Hello, world!\n");
+        assert!(!ed.frozen_lines().is_empty());
+        // Line 0 has the chunk; should be tagged Llm(1).
+        let a = ed.anchor_for_line(0);
+        assert_eq!(ed.metadata::<TurnId>().get(a), Some(&TurnId::Llm(1)));
+    }
+
+    #[test]
+    fn append_llm_chunk_continues_mid_line_within_same_turn() {
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "Hello, ");
+        ed.append_llm_chunk(TurnId::Llm(1), "world!\n");
+        // Two chunks for the same turn should join into one line.
+        assert_eq!(ed.document().full_text(), "Hello, world!\n");
+    }
+
+    #[test]
+    fn append_llm_chunk_starts_new_line_for_new_turn() {
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "first turn\n");
+        ed.append_llm_chunk(TurnId::Llm(2), "second turn\n");
+        assert_eq!(
+            ed.document().full_text(),
+            "first turn\nsecond turn\n"
+        );
+        let a0 = ed.anchor_for_line(0);
+        let a1 = ed.anchor_for_line(1);
+        assert_eq!(ed.metadata::<TurnId>().get(a0), Some(&TurnId::Llm(1)));
+        assert_eq!(ed.metadata::<TurnId>().get(a1), Some(&TurnId::Llm(2)));
+    }
+
+    #[test]
+    fn append_llm_chunk_preserves_editable_draft_below() {
+        // Simulate: turn 1's LLM line is frozen, user has typed a draft after.
+        let mut ed = new_editor("Hi from agent.\nuser draft here\n");
+        ed.add_frozen_lines(0, 1);
+        let a0 = ed.anchor_for_line(0);
+        ed.metadata_mut::<TurnId>().insert(a0, TurnId::Llm(1));
+        // New turn 2 chunk arrives. Insertion point should be at start of
+        // line 1 (after the last Llm(1) line, which has a trailing newline).
+        // But wait — turn 2 is a new turn so insertion is at EOF, not line 1.
+        ed.append_llm_chunk(TurnId::Llm(2), "Reply!\n");
+        assert_eq!(
+            ed.document().full_text(),
+            "Hi from agent.\nuser draft here\nReply!\n"
+        );
+        // User draft on line 1 should still be there.
+        assert_eq!(ed.document().line_text(1), "user draft here\n");
+    }
+
+    #[test]
+    fn append_llm_chunk_within_same_turn_inserts_above_draft() {
+        // Same setup but the chunk belongs to turn 1 (continuation), so it
+        // should insert at end of line 0 (last Llm(1) line, which ends \n →
+        // insertion at line 1 col 0), pushing the draft down.
+        let mut ed = new_editor("Hi from agent.\nuser draft here\n");
+        ed.add_frozen_lines(0, 1);
+        let a0 = ed.anchor_for_line(0);
+        ed.metadata_mut::<TurnId>().insert(a0, TurnId::Llm(1));
+        ed.append_llm_chunk(TurnId::Llm(1), "And more!\n");
+        assert_eq!(
+            ed.document().full_text(),
+            "Hi from agent.\nAnd more!\nuser draft here\n"
+        );
+        // The user's draft line should now be at line 2 and remain editable.
+        assert!(!ed.is_frozen_line(2));
+        // The new chunk line (line 1) should be frozen.
+        assert!(ed.is_frozen_line(1));
+    }
 }

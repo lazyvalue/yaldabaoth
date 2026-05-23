@@ -69,7 +69,8 @@ use agent_client_protocol::schema::{
 // match on tool-call events. `pub use` also brings these into local
 // scope, so anything below this line can refer to them unqualified.
 pub use agent_client_protocol::schema::{
-    ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
+    Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionModeId, ToolCall,
+    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -122,6 +123,21 @@ impl SketchFrontend {
     }
 }
 
+/// Sketch-side flattening of ACP's `UsageUpdate` (which is feature-gated
+/// behind `unstable_session_usage`). Carrying our own struct means the
+/// `ReplyEvent::UsageUpdated` variant stays unconditional regardless of
+/// whether the upstream feature is enabled — only the emitter in the
+/// notification handler is feature-gated (spec-agent-window.md §31).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageSnapshot {
+    /// Tokens currently in the context window.
+    pub tokens_used: u64,
+    /// Total context window size in tokens.
+    pub tokens_total: u64,
+    /// Cumulative session cost in USD, if the upstream provided one.
+    pub cost_usd: Option<f64>,
+}
+
 /// Events drained by the App from the ACP worker. Replaces the previous
 /// "stream of text chunks" channel so we can also report tool-call
 /// activity (announcements + status/output updates) in chronological
@@ -139,6 +155,18 @@ pub enum ReplyEvent {
     /// Incremental update (status change, content/output additions) for a
     /// previously-announced tool call.
     ToolCallUpdated(ToolCallUpdate),
+    /// Full-snapshot replacement of the agent's current plan. ACP's `Plan`
+    /// notification is always a full plan (not a delta) per the protocol.
+    /// Consumed by the Tasklist sidepane (spec-agent-window.md §21).
+    PlanUpdated(Plan),
+    /// The agent switched session modes (e.g. between Claude Code's
+    /// `default` / `plan` / `learn` modes). Consumed by the Status Strip
+    /// (spec-agent-window.md §30).
+    ModeChanged(SessionModeId),
+    /// Updated context-window utilization and cost. Variant is unconditional;
+    /// the *emitter* in the notification handler is gated on the upstream
+    /// `unstable_session_usage` feature (spec-agent-window.md §31).
+    UsageUpdated(UsageSnapshot),
 }
 
 /// How sketch responds to `session/request_permission` from the agent.
@@ -801,10 +829,11 @@ async fn worker_async(
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
                 acp_debug!("notification: {:?}", notification.update);
-                // Forward the variants the renderer knows how to interleave:
-                // streamed text + tool-call activity. Everything else
-                // (thoughts, plans, mode/info updates) is dropped at this
-                // layer for now — those would each need their own UI.
+                // Forward the variants the agent window knows how to render.
+                // Variants still parked (AgentThoughtChunk, AvailableCommands-
+                // Update, SessionInfoUpdate, ConfigOptionUpdate, UserMessage-
+                // Chunk) carry explicit drop arms so adding any one of them
+                // later is a one-arm change (spec-agent-window.md §31).
                 match notification.update {
                     SessionUpdate::AgentMessageChunk(ContentChunk {
                         content: ContentBlock::Text(text),
@@ -821,6 +850,38 @@ async fn worker_async(
                         let _ = event_tx_for_handlers
                             .send(WorkerEvent::Reply(ReplyEvent::ToolCallUpdated(upd)));
                     }
+                    SessionUpdate::Plan(plan) => {
+                        let _ = event_tx_for_handlers
+                            .send(WorkerEvent::Reply(ReplyEvent::PlanUpdated(plan)));
+                    }
+                    SessionUpdate::CurrentModeUpdate(upd) => {
+                        let _ = event_tx_for_handlers
+                            .send(WorkerEvent::Reply(ReplyEvent::ModeChanged(
+                                upd.current_mode_id,
+                            )));
+                    }
+                    #[cfg(feature = "unstable_session_usage")]
+                    SessionUpdate::UsageUpdate(usage) => {
+                        let snap = UsageSnapshot {
+                            tokens_used: usage.used,
+                            tokens_total: usage.size,
+                            cost_usd: usage.cost.as_ref().map(|c| c.amount_usd),
+                        };
+                        let _ = event_tx_for_handlers
+                            .send(WorkerEvent::Reply(ReplyEvent::UsageUpdated(snap)));
+                    }
+                    // Parked: explicit no-op arms — promotion is a one-arm
+                    // change. AgentMessageChunk's non-text content variants
+                    // (images, etc.) fall through to the catchall below.
+                    SessionUpdate::AgentMessageChunk(_)
+                    | SessionUpdate::AgentThoughtChunk(_)
+                    | SessionUpdate::UserMessageChunk(_)
+                    | SessionUpdate::AvailableCommandsUpdate(_)
+                    | SessionUpdate::SessionInfoUpdate(_)
+                    | SessionUpdate::ConfigOptionUpdate(_) => {}
+                    // Future variants added by upstream — drop them rather
+                    // than failing to compile, since the enum is
+                    // `#[non_exhaustive]`.
                     _ => {}
                 }
                 Ok(())
