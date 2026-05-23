@@ -159,6 +159,12 @@ actions!(
         CopyDocSelection,
         // Open the rename input overlay for the active tab.
         RenameTab,
+        // Agent window: send the current draft. Worksheet sweep (§12) or
+        // Chatbox submit (§18) depending on `AgentState::input_mode`.
+        SubmitAgent,
+        // Agent window: flip the input mode between Worksheet and
+        // Chatbox (§5). Bound to `Ctrl-Alt-Enter`.
+        ToggleAgentInputMode,
     ]
 );
 
@@ -2638,99 +2644,11 @@ fn doc_char_to_line_col(doc: &Document, char_idx: usize) -> (usize, usize) {
     (line, i - line_start)
 }
 
-/// Splice an incoming Claude reply chunk into the transcript above any
-/// pending user draft, then mark those lines frozen. Streaming-safe: each
-/// chunk re-finds the splice point so subsequent chunks slot in just after
-/// the prior chunk, not below the draft. Direct port of
-/// `App::append_to_claude_buffer` from `src/app/claude.rs`.
-fn splice_agent_chunk(editor: &mut Editor, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-
-    let total_len = editor.document().rope().len_chars();
-
-    let lockable = editor.lockable_through_char();
-    let frozen_end_line = editor
-        .frozen_lines()
-        .iter()
-        .map(|&(_, e)| e)
-        .max()
-        .unwrap_or(0);
-    let frozen_end_char = if frozen_end_line == 0 {
-        0
-    } else if frozen_end_line >= editor.document().line_count() {
-        total_len
-    } else {
-        editor.document().line_col_to_char(frozen_end_line, 0)
-    };
-    let splice_at = lockable.max(frozen_end_char).min(total_len);
-
-    let draft_text: String = editor
-        .document()
-        .rope()
-        .slice(splice_at..total_len)
-        .to_string();
-    let cursor_char = editor
-        .document()
-        .line_col_to_char(editor.cursor().line, editor.cursor().col);
-    let cursor_in_draft = cursor_char.saturating_sub(splice_at);
-    let cursor_was_in_draft = cursor_char >= splice_at;
-
-    if !draft_text.is_empty() {
-        editor.programmatic_delete(splice_at, total_len);
-    }
-
-    // Append the chunk verbatim. Streaming chunks are arbitrary slices of one
-    // logical message — any extra padding here breaks sentences (and inserts
-    // blank lines between every chunk). The caller's text already carries
-    // whatever newlines belong in the rendered transcript.
-    let pre_len = editor.document().rope().len_chars();
-    editor.programmatic_insert(pre_len, text);
-
-    // Freeze the lines that the chunk now occupies. add_frozen_lines uses a
-    // half-open [start, end) range, so when the chunk ends mid-line we have
-    // to bump end_line past it. If the chunk ended on \n, the line of
-    // claude_end_char is already the next line and serves as end directly.
-    let claude_end_char = pre_len + text.chars().count();
-    let start_line = doc_char_to_line_col(editor.document(), pre_len).0;
-    let mut end_line = doc_char_to_line_col(editor.document(), claude_end_char).0;
-    if !text.ends_with('\n') {
-        end_line += 1;
-    }
-    editor.add_frozen_lines(start_line, end_line);
-
-    // Re-attach the draft. If the chunk didn't end on a newline AND the draft
-    // is non-empty, prepend one so the user's draft doesn't run onto Claude's
-    // last line.
-    let needs_separator = !draft_text.is_empty() && !text.ends_with('\n');
-    let draft_reattach_at = editor.document().rope().len_chars();
-    if needs_separator {
-        editor.programmatic_insert(draft_reattach_at, "\n");
-    }
-    let draft_actual_at = editor.document().rope().len_chars();
-    if !draft_text.is_empty() {
-        editor.programmatic_insert(draft_actual_at, &draft_text);
-    }
-
-    if cursor_was_in_draft {
-        let new_cursor_char = if draft_text.is_empty() {
-            editor.document().rope().len_chars()
-        } else {
-            draft_actual_at + cursor_in_draft
-        };
-        let (cl, cc) = doc_char_to_line_col(editor.document(), new_cursor_char);
-        editor.cursor_mut().line = cl;
-        editor.cursor_mut().col = cc;
-    }
-    editor.clear_selection();
-}
-
 /// Called when the ACP turn ends (the agent's `session/prompt` response
-/// resolves). Streaming chunks splice in verbatim — no padding — so by the
-/// time we get here the cursor may sit on the last frozen line with no room
-/// to type. Ensure there's an editable line below the frozen content and
-/// move the cursor there so the user can immediately keep typing.
+/// resolves). Ensures the transcript has a trailing newline so the next
+/// chunk has a clean starting point. The cursor stays where the user put
+/// it (the worksheet is cursor-anchored, not auto-following the agent —
+/// spec-agent-window.md §19).
 fn finalize_agent_turn(editor: &mut Editor) {
     let total_len = editor.document().rope().len_chars();
     let needs_newline = total_len == 0
@@ -2744,31 +2662,6 @@ fn finalize_agent_turn(editor: &mut Editor) {
     if needs_newline {
         editor.programmatic_insert(total_len, "\n");
     }
-    let eof = editor.document().rope().len_chars();
-    let (cl, cc) = doc_char_to_line_col(editor.document(), eof);
-    editor.cursor_mut().line = cl;
-    editor.cursor_mut().col = cc;
-    editor.clear_selection();
-}
-
-/// Lock the active turn: append `\n\n---\n\n` and bump
-/// `lockable_through_line` to the cursor's line so the user can't
-/// retroactively edit content they just sent. Mirrors
-/// `App::lock_active_turn` from `src/app/claude.rs`.
-fn lock_agent_turn(editor: &mut Editor) {
-    let pre_len = editor.document().rope().len_chars();
-    let s = editor.document().full_text();
-    let trailing_nl = s.chars().rev().take_while(|c| *c == '\n').count();
-    let lead = "\n".repeat(2usize.saturating_sub(trailing_nl));
-    let separator = format!("{}{}\n\n", lead, "─".repeat(40));
-    editor.programmatic_insert(pre_len, &separator);
-
-    let eof = editor.document().rope().len_chars();
-    let (cl, cc) = doc_char_to_line_col(editor.document(), eof);
-    editor.set_lockable_through_line(cl);
-    editor.cursor_mut().line = cl;
-    editor.cursor_mut().col = cc;
-    editor.clear_selection();
 }
 
 // ----------------------------------------------------------------------------
@@ -2824,18 +2717,53 @@ enum EditMode {
     Insert,
 }
 
-/// Stable compose surface for drafting messages in the Claude screen.
-/// While active, key dispatch routes here instead of the main transcript.
-struct ComposeBox {
+/// Which input surface the agent window is currently presenting. Per
+/// spec-agent-window.md §4, every `AgentState` carries one of these two
+/// values; new sessions start at `Chatbox` to match today's compose-box-
+/// first feel. Toggled by `Ctrl-Alt-Enter` (§5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    /// User input is interleaved with LLM output in the transcript editor.
+    /// Frozen lines are immutable; editable lines accumulate until a Submit
+    /// sweeps and freezes them all (§9–§15).
+    Worksheet,
+    /// User input goes into a separate `Chatbox` editor pinned to the
+    /// bottom of the window. The transcript is read-only while in this
+    /// mode (§16–§20).
+    Chatbox,
+}
+
+/// Per-line metadata that the Worksheet gutter reads to label each line.
+/// Stored in `editor.metadata::<TurnId>()` keyed by `LineAnchor`, so the
+/// tag follows the line through inserts, deletes, and inter-block
+/// annotations (spec-agent-window.md §11, §E2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnId {
+    /// LLM output, turn N. Gutter prints `N` in a dim accent color.
+    Llm(usize),
+    /// User input frozen as part of turn n's prompt. Gutter prints `Un`.
+    User(usize),
+    /// Tool-call block originating from turn N. Gutter prints `Tn`.
+    /// Lives on the anchor line of a `ToolGroup` flat-item.
+    Tool(usize),
+}
+
+/// Standalone input editor used when `InputMode == Chatbox`. Has its own
+/// document, cursor, undo stack, and modal state (§16). The chatbox is
+/// dropped on a `Chatbox → Worksheet` toggle (§6) and re-constructed empty
+/// on a `Worksheet → Chatbox` toggle (§7) — undo history doesn't survive
+/// the round trip; the previous draft is recoverable as transcript
+/// content if the user already submitted.
+struct Chatbox {
     editor: Editor,
     mode: EditMode,
     scroll_handle: ScrollHandle,
 }
 
-impl ComposeBox {
+impl Chatbox {
     fn new() -> Self {
         Self {
-            editor: Editor::new(String::new(), std::path::PathBuf::from("*compose*")),
+            editor: Editor::new(String::new(), std::path::PathBuf::from("*chatbox*")),
             mode: EditMode::Insert,
             scroll_handle: ScrollHandle::new(),
         }
@@ -2995,10 +2923,14 @@ struct AgentState {
     block_cache: std::collections::HashMap<(usize, usize), RenderedBlock>,
     /// Frozen line count when `block_cache` was last populated.
     block_cache_frozen_count: usize,
-    /// Optional compose textbox — a standalone Editor + mode for drafting
-    /// messages without auto-scroll interference. When `Some`, key dispatch
-    /// routes here instead of the main transcript editor.
-    compose_box: Option<ComposeBox>,
+    /// Which input surface the user is currently using (§4). Per the
+    /// spec, new sessions start at `Chatbox` to match today's compose-box-
+    /// first feel; the user toggles with `Ctrl-Alt-Enter` (§5).
+    input_mode: InputMode,
+    /// Standalone draft editor. `Some` iff `input_mode == Chatbox`; in
+    /// Worksheet mode this is `None` and key dispatch routes to the
+    /// transcript editor instead.
+    chatbox: Option<Chatbox>,
     /// Last-seen full snapshot of the agent's plan. Updated on every ACP
     /// `Plan` notification (which carries a complete plan, not a delta —
     /// see spec-agent-window.md §21). Consumed by the Tasklist sidepane.
@@ -3320,7 +3252,7 @@ impl SketchGpuiView {
         Self {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
-            code_font: SharedString::new_static("Menlo"),
+            code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
             focus_handle,
             menu: None,
@@ -3337,7 +3269,7 @@ impl SketchGpuiView {
         Self {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
-            code_font: SharedString::new_static("Menlo"),
+            code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
             focus_handle,
             menu: None,
@@ -4890,17 +4822,9 @@ impl SketchGpuiView {
                 // a hint via the doc/edit footer if it isn't, so the user
                 // gets a visible no-op instead of silent.
                 if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
-                    // If the compose textbox is open, send its contents;
-                    // otherwise send the main editor's draft region.
-                    let has_compose = self
-                        .agent_mut()
-                        .map(|c| c.compose_box.is_some())
-                        .unwrap_or(false);
-                    if has_compose {
-                        self.compose_send(cx);
-                    } else {
-                        self.send_agent(cx);
-                    }
+                    // Mode-aware submit: Worksheet sweep (§12) or Chatbox
+                    // submit (§18) depending on `AgentState::input_mode`.
+                    self.submit_agent(cx);
                 }
             }
             "claude-new" => self.new_agent_session(cx),
@@ -4913,9 +4837,12 @@ impl SketchGpuiView {
             "claude-detach" => self.detach_active_agent_session(cx),
             "claude-attach" => self.attach_active_agent_session(cx),
             "claude-rename" => self.open_rename_overlay(cx),
-            "compose-toggle" => {
+            // Pre-rename "compose-toggle" entry retained semantically as
+            // the input-mode toggle (spec §34 — menu chord `t` rewires
+            // to the new toggle, same chord, new behavior).
+            "compose-toggle" | "agent-input-toggle" => {
                 if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
-                    self.compose_toggle(cx);
+                    self.toggle_agent_input_mode(cx);
                 }
             }
             "back-to-doc" => self.back_to_doc(cx),
@@ -6124,7 +6051,8 @@ impl SketchGpuiView {
             block_ranges: Vec::new(),
             block_cache: std::collections::HashMap::new(),
             block_cache_frozen_count: 0,
-            compose_box: Some(ComposeBox::new()),
+            input_mode: InputMode::Chatbox,
+            chatbox: Some(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
             usage: None,
@@ -6278,16 +6206,33 @@ impl SketchGpuiView {
         events: Vec<sketch::acp_channel::ReplyEvent>,
     ) {
         use sketch::acp_channel::ReplyEvent;
+        // In-progress turn for tagging streamed content. `last_seen_turns`
+        // only ticks up when the agent's prompt response resolves; while
+        // chunks are streaming for the turn in flight, that turn is k =
+        // last_seen_turns + 1 (spec §11, §E3).
+        let current_turn = claude.last_seen_turns + 1;
         for ev in events {
             match ev {
                 ReplyEvent::Chunk(text) => {
-                    splice_agent_chunk(&mut claude.editor, &text);
+                    // Spec §E3: append at the end of the last frozen line
+                    // tagged with this turn (mid-line for in-progress
+                    // continuation, EOF for a new turn). Editable user
+                    // lines anywhere else in the document stay put.
+                    claude
+                        .editor
+                        .append_llm_chunk(TurnId::Llm(current_turn), text.as_str());
                 }
                 ReplyEvent::ToolCallStarted(mut tc) => {
                     cap_tool_call_payloads(&mut tc);
                     let anchor = anchor_for_new_tool_call(&mut claude.editor);
                     let id = tc.tool_call_id.0.to_string();
                     claude.tool_call_anchor_line.insert(id.clone(), anchor);
+                    // Tag the anchor with `Tool(k)` so the gutter shows
+                    // `Tk` on tool-group anchor lines (§11).
+                    claude
+                        .editor
+                        .metadata_mut::<TurnId>()
+                        .insert(anchor, TurnId::Tool(current_turn));
                     if !claude.tool_calls.contains_key(&id) {
                         claude.tool_call_order.push(id.clone());
                     }
@@ -6311,6 +6256,10 @@ impl SketchGpuiView {
                         cap_tool_call_payloads(&mut tc);
                         let anchor = anchor_for_new_tool_call(&mut claude.editor);
                         claude.tool_call_anchor_line.insert(id.clone(), anchor);
+                        claude
+                            .editor
+                            .metadata_mut::<TurnId>()
+                            .insert(anchor, TurnId::Tool(current_turn));
                         claude.tool_call_order.push(id.clone());
                         claude.tool_calls.insert(id, tc);
                     }
@@ -6501,100 +6450,226 @@ impl SketchGpuiView {
     /// only the editable runs between/after frozen Claude turns) as the
     /// next ACP prompt, then lock the turn so that content can't be
     /// retroactively edited.
-    fn send_agent(&mut self, cx: &mut Context<Self>) {
+    /// Flip the agent window's input mode (§5). Data movement is
+    /// asymmetric per §6/§7:
+    ///
+    /// * Chatbox → Worksheet: take whatever's in the chatbox, append at
+    ///   EOF of the transcript as new editable user lines (one transcript
+    ///   line per chatbox line), drop the chatbox. If the chatbox was
+    ///   empty, nothing is added.
+    /// * Worksheet → Chatbox: don't touch the transcript at all; create
+    ///   a fresh empty chatbox `Editor` and route input there. Any
+    ///   editable lines already in the transcript stay pending and will
+    ///   be swept by the next Submit.
+    ///
+    /// The chatbox's undo history is per-`Editor`; closing the chatbox
+    /// drops that history (§7).
+    fn toggle_agent_input_mode(&mut self, cx: &mut Context<Self>) {
         let claude = match self.agent_mut() {
             Some(c) => c,
             None => return,
         };
+        match claude.input_mode {
+            InputMode::Chatbox => {
+                let text = claude
+                    .chatbox
+                    .as_ref()
+                    .map(|cb| cb.text())
+                    .unwrap_or_default();
+                claude.chatbox = None;
+                claude.input_mode = InputMode::Worksheet;
+                if !text.is_empty() {
+                    // Ensure the transcript ends with a `\n` so the
+                    // appended draft starts on its own line, then drop
+                    // the trailing newline of `text` so we don't leave a
+                    // dangling blank below the cursor.
+                    let needs_nl = !claude
+                        .editor
+                        .document()
+                        .full_text()
+                        .ends_with('\n');
+                    let eof = claude.editor.document().rope().len_chars();
+                    if needs_nl {
+                        claude.editor.programmatic_insert(eof, "\n");
+                    }
+                    let to_append =
+                        text.strip_suffix('\n').unwrap_or(&text).to_string();
+                    let eof2 = claude.editor.document().rope().len_chars();
+                    claude.editor.programmatic_insert(eof2, &to_append);
+                    let new_eof = claude.editor.document().rope().len_chars();
+                    let (cl, cc) =
+                        doc_char_to_line_col(claude.editor.document(), new_eof);
+                    claude.editor.cursor_mut().line = cl;
+                    claude.editor.cursor_mut().col = cc;
+                }
+                claude.editor.clear_selection();
+            }
+            InputMode::Worksheet => {
+                claude.input_mode = InputMode::Chatbox;
+                claude.chatbox = Some(Chatbox::new());
+            }
+        }
+        cx.notify();
+    }
 
-        let payload = claude.editor.extract_editable_inserts();
-        if payload.trim().is_empty() {
-            claude.status = Some("nothing to send (no draft)".into());
+    /// Submit the user's draft to the agent. Dispatches on `input_mode`:
+    /// Worksheet sweep (§12) sweeps every editable line in document order,
+    /// freezes them with `TurnId::User(k)`, and sends the non-blank lines.
+    /// Chatbox submit (§18) takes the chatbox text, appends + freezes it
+    /// at EOF of the transcript, then sends and clears the chatbox.
+    fn submit_agent(&mut self, cx: &mut Context<Self>) {
+        let mode = match self.agent_mut() {
+            Some(c) => c.input_mode,
+            None => return,
+        };
+        match mode {
+            InputMode::Worksheet => self.submit_worksheet(cx),
+            InputMode::Chatbox => self.submit_chatbox(cx),
+        }
+    }
+
+    /// Worksheet submit per §12. Sweep every editable line in document
+    /// order, build the prompt body from those with non-whitespace content
+    /// (`\n`-joined), freeze every collected line — including blank
+    /// spacers — and tag each with `TurnId::User(k)` so the gutter shows
+    /// `Uk`. If the body is empty, no-op with a footer hint.
+    fn submit_worksheet(&mut self, cx: &mut Context<Self>) {
+        let claude = match self.agent_mut() {
+            Some(c) => c,
+            None => return,
+        };
+        if claude.channel.is_none() {
+            claude.status = Some("no channel attached".into());
             cx.notify();
             return;
         }
 
-        let result = match &mut claude.channel {
-            Some(client) => client.send(&payload),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "no agent attached",
-            )),
-        };
-
-        match result {
-            Ok(()) => {
-                lock_agent_turn(&mut claude.editor);
-                claude.awaiting_reply = true;
-                claude.turn_started = Some(std::time::Instant::now());
-                claude.status = Some(format!("sent ({} chars)", payload.len()).into());
-                // Re-enter insert mode for immediate continuation.
-                claude.editor.begin_insert();
-                claude.mode = EditMode::Insert;
+        // Walk every line, classify editable vs frozen.
+        let line_count = claude.editor.document().line_count();
+        let mut collected: Vec<(usize, String)> = Vec::new();
+        for l in 0..line_count {
+            if claude.editor.is_frozen_line(l) {
+                continue;
             }
-            Err(e) => {
-                claude.status = Some(format!("send failed: {e}").into());
-                claude.channel = None;
-            }
+            let line_text = claude.editor.document().line_text(l);
+            let stripped = line_text.trim_end_matches('\n').to_string();
+            collected.push((l, stripped));
         }
+
+        // Build prompt body from lines with non-whitespace content.
+        let prompt_body: String = collected
+            .iter()
+            .filter(|(_, t)| !t.trim().is_empty())
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if prompt_body.is_empty() {
+            claude.status = Some("nothing to send".into());
+            cx.notify();
+            return;
+        }
+
+        // Determine the new turn number. `last_seen_turns` counts
+        // completed turns; the next submit becomes turn k = last_seen + 1.
+        let turn_k = claude.last_seen_turns + 1;
+
+        // Freeze every collected line (blanks included) as part of turn k.
+        // Freeze line by line so the line range stays accurate even if
+        // editable lines are non-contiguous.
+        for (l, _) in &collected {
+            claude.editor.add_frozen_lines(*l, *l + 1);
+            let anchor = claude.editor.anchor_for_line(*l);
+            claude
+                .editor
+                .metadata_mut::<TurnId>()
+                .insert(anchor, TurnId::User(turn_k));
+        }
+
+        // Send and update bookkeeping. `last_seen_turns` only ticks up
+        // when the agent's prompt response resolves, so we don't bump it
+        // here — `awaiting_reply` flips on instead.
+        if let Some(channel) = claude.channel.as_mut() {
+            let _ = channel.send(&prompt_body);
+            claude.awaiting_reply = true;
+            claude.turn_started = Some(std::time::Instant::now());
+        }
+        claude.editor.clear_selection();
         cx.notify();
     }
 
-    /// Toggle the compose textbox in the Claude screen.
-    fn compose_toggle(&mut self, cx: &mut Context<Self>) {
+    /// Chatbox submit per §18. Take the full chatbox text, append it at
+    /// EOF of the transcript as new lines, immediately freeze them with
+    /// `TurnId::User(k)`, send via the channel, clear the chatbox. Mode
+    /// stays `Chatbox`.
+    fn submit_chatbox(&mut self, cx: &mut Context<Self>) {
         let claude = match self.agent_mut() {
             Some(c) => c,
             None => return,
         };
-        if claude.compose_box.is_some() {
-            // Close: extract text and insert into main buffer.
-            let text = claude.compose_box.as_ref().unwrap().text();
-            claude.compose_box = None;
-            if !text.is_empty() {
-                let eof = claude.editor.document().rope().len_chars();
-                claude.editor.programmatic_insert(eof, &text);
-                let new_eof = claude.editor.document().rope().len_chars();
-                let (cl, cc) = doc_char_to_line_col(claude.editor.document(), new_eof);
-                claude.editor.cursor_mut().line = cl;
-                claude.editor.cursor_mut().col = cc;
-            }
-        } else {
-            claude.compose_box = Some(ComposeBox::new());
-        }
-        cx.notify();
-    }
-
-    /// Send compose box contents, then close it.
-    fn compose_send(&mut self, cx: &mut Context<Self>) {
-        let claude = match self.agent_mut() {
-            Some(c) => c,
-            None => return,
-        };
-        let text = match &claude.compose_box {
-            Some(tb) => tb.text(),
+        let text = match &claude.chatbox {
+            Some(cb) => cb.text(),
             None => return,
         };
         if text.trim().is_empty() {
-            claude.status = Some("nothing to send (compose box empty)".into());
-            claude.compose_box = None;
+            claude.status = Some("nothing to send".into());
             cx.notify();
             return;
         }
-        // Close compose and insert text into main buffer.
-        claude.compose_box = None;
+        if claude.channel.is_none() {
+            claude.status = Some("no channel attached".into());
+            cx.notify();
+            return;
+        }
+
+        // Ensure the transcript ends with a newline so the appended draft
+        // starts on its own line.
+        if !claude.editor.document().full_text().ends_with('\n')
+            && !claude.editor.document().full_text().is_empty()
+        {
+            let eof = claude.editor.document().rope().len_chars();
+            claude.editor.programmatic_insert(eof, "\n");
+        }
+        let start_line = claude.editor.document().line_count().saturating_sub(1);
+        let to_append = text.strip_suffix('\n').unwrap_or(&text).to_string();
         let eof = claude.editor.document().rope().len_chars();
-        claude.editor.programmatic_insert(eof, &text);
-        let new_eof = claude.editor.document().rope().len_chars();
-        let (cl, cc) = doc_char_to_line_col(claude.editor.document(), new_eof);
-        claude.editor.cursor_mut().line = cl;
-        claude.editor.cursor_mut().col = cc;
-        // Now send via the normal path.
-        self.send_agent(cx);
+        claude.editor.programmatic_insert(eof, &to_append);
+        // Ensure terminating newline so the next chunk starts cleanly.
+        if !claude.editor.document().full_text().ends_with('\n') {
+            let eof2 = claude.editor.document().rope().len_chars();
+            claude.editor.programmatic_insert(eof2, "\n");
+        }
+
+        let end_line = claude.editor.document().line_count();
+        let turn_k = claude.last_seen_turns + 1;
+        // Freeze + tag each newly appended line.
+        claude.editor.add_frozen_lines(start_line, end_line);
+        for l in start_line..end_line {
+            let anchor = claude.editor.anchor_for_line(l);
+            claude
+                .editor
+                .metadata_mut::<TurnId>()
+                .insert(anchor, TurnId::User(turn_k));
+        }
+
+        // Send.
+        let prompt_body = text.trim_end_matches('\n').to_string();
+        if let Some(channel) = claude.channel.as_mut() {
+            let _ = channel.send(&prompt_body);
+            claude.awaiting_reply = true;
+            claude.turn_started = Some(std::time::Instant::now());
+        }
+
+        // Reset the chatbox to empty; cursor stays inside.
+        claude.chatbox = Some(Chatbox::new());
+        cx.notify();
     }
 
-    /// Key dispatch for the Claude screen. Mirrors `handle_edit_key` but
-    /// catches `Ctrl-Enter` to send and `Ctrl-V` to leave; everything else
-    /// goes through the shared `dispatch_*_core` helpers.
+    /// Key dispatch for the agent window. Recognises the agent-window-
+    /// scoped shortcuts (`Ctrl-Enter` submit, `Ctrl-Alt-Enter` mode toggle,
+    /// `Ctrl-V` leave, session-cycle `Ctrl-]`/`Ctrl-[`) before routing
+    /// remaining keys to either the chatbox (in Chatbox mode) or the
+    /// transcript editor (in Worksheet mode). See spec-agent-window.md §32.
     fn handle_claude_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -6603,47 +6678,76 @@ impl SketchGpuiView {
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
 
-        // Mode-independent shortcuts (work in both main and compose).
+        // Mode-toggle: Ctrl-Alt-Enter (§5). Checked before Ctrl-Enter so
+        // an accidental Alt-press doesn't fire a submit instead.
+        if press.modifiers.contains(KMods::CONTROL)
+            && press.modifiers.contains(KMods::ALT)
+            && press.key == Key::Enter
+        {
+            self.toggle_agent_input_mode(cx);
+            return;
+        }
+
+        // Submit: Ctrl-Enter (§8). Bare Enter NEVER sends — it inserts a
+        // literal newline (chatbox) or a new editable line (worksheet),
+        // gated by the frozen-line invariants.
+        if press.modifiers.contains(KMods::CONTROL) && press.key == Key::Enter {
+            self.submit_agent(cx);
+            return;
+        }
+
+        // Leave the agent window with Ctrl-V; the chatbox (if any) is
+        // dropped without sending — its content is recoverable by toggling
+        // back into Chatbox mode (which creates a fresh chatbox) and
+        // re-typing, but we don't try to preserve unsent text across the
+        // jump (spec §36).
+        if press.modifiers.contains(KMods::CONTROL)
+            && matches!(press.key, Key::Char('v') | Key::Char('V'))
+        {
+            if let Some(c) = self.agent_mut() {
+                c.chatbox = None;
+                c.input_mode = InputMode::Worksheet;
+            }
+            self.back_to_doc(cx);
+            return;
+        }
+
+        // Session switching: Ctrl-] next, Ctrl-[ prev.
         if press.modifiers.contains(KMods::CONTROL) {
-            if let Key::Char('t') = press.key {
-                self.compose_toggle(cx);
+            if press.key == Key::Char(']') {
+                self.switch_agent_session(1, cx);
                 return;
             }
-            if let Key::Char('v') | Key::Char('V') = press.key {
-                // Close compose without sending before leaving.
-                if let Some(c) = self.agent_mut() {
-                    c.compose_box = None;
-                }
-                self.back_to_doc(cx);
+            if press.key == Key::Char('[') {
+                self.switch_agent_session(-1, cx);
                 return;
             }
         }
 
-        // Compose box intercept: when open, route keys to the compose editor.
-        let compose_active = self
+        // Chatbox-mode intercept: input routes to the chatbox editor when
+        // we're in Chatbox mode; the transcript is read-only (§17). In
+        // Worksheet mode the transcript IS the editing surface and the
+        // chatbox doesn't exist.
+        let in_chatbox = self
             .agent_mut()
-            .map(|c| c.compose_box.is_some())
+            .map(|c| c.input_mode == InputMode::Chatbox && c.chatbox.is_some())
             .unwrap_or(false);
-        if compose_active {
-            if press.modifiers.contains(KMods::CONTROL) && press.key == Key::Enter {
-                self.compose_send(cx);
-                return;
-            }
+        if in_chatbox {
             let outcome = {
                 let claude = match self.agent_mut() {
                     Some(c) => c,
                     None => return,
                 };
                 claude.status = None;
-                let tb = claude.compose_box.as_mut().unwrap();
-                match tb.mode {
+                let cb = claude.chatbox.as_mut().unwrap();
+                match cb.mode {
                     EditMode::Insert => {
-                        Self::dispatch_insert_core(&mut tb.editor, &mut tb.mode, press);
+                        Self::dispatch_insert_core(&mut cb.editor, &mut cb.mode, press);
                         NormalOutcome::Handled
                     }
                     EditMode::Normal => Self::dispatch_normal_core(
-                        &mut tb.editor,
-                        &mut tb.mode,
+                        &mut cb.editor,
+                        &mut cb.mode,
                         &mut claude.keybinds,
                         press,
                     ),
@@ -6655,23 +6759,6 @@ impl SketchGpuiView {
                 _ => cx.notify(),
             }
             return;
-        }
-
-        // Non-compose: normal Claude key handling.
-        if press.modifiers.contains(KMods::CONTROL) {
-            if press.key == Key::Enter {
-                self.send_agent(cx);
-                return;
-            }
-            // Session switching: Ctrl-] next, Ctrl-[ prev.
-            if press.key == Key::Char(']') {
-                self.switch_agent_session(1, cx);
-                return;
-            }
-            if press.key == Key::Char('[') {
-                self.switch_agent_session(-1, cx);
-                return;
-            }
         }
 
         let outcome = {
@@ -7375,26 +7462,18 @@ impl SketchGpuiView {
         let highlighted = highlight_markdown_lines(&lines, &self.theme);
         let base_style = self.theme.paragraph;
 
-        // Per-line turn numbers. Walk top-to-bottom: turn N covers the user
-        // message + the Claude reply for that turn. The boundary is "we just
-        // saw frozen content, then the next non-frozen line with content
-        // appears" — that's the user starting turn N+1. Empty lines stay in
-        // the prior turn so post-finalize blank rows don't shift the count.
-        let mut turn_per_line: Vec<usize> = Vec::with_capacity(lines.len());
-        let mut turn = 1usize;
-        let mut saw_frozen_since_user = false;
-        for (i, line_str) in lines.iter().enumerate() {
-            let is_frozen = c.editor.is_frozen_line(i);
-            let has_content = !line_str.trim().is_empty();
-            if has_content && !is_frozen && saw_frozen_since_user {
-                turn += 1;
-                saw_frozen_since_user = false;
-            }
-            if is_frozen {
-                saw_frozen_since_user = true;
-            }
-            turn_per_line.push(turn);
-        }
+        // Per-line gutter tag, sourced from the editor's `TurnId` metadata
+        // keyed by `LineAnchor` (spec §11, §E2). Lines without a tag yet
+        // (currently-editable, not yet swept by Submit) render as a blank
+        // gutter. Lines whose anchor hasn't been allocated count as
+        // untagged — happens for editable lines the user just typed.
+        let gutter_tag_per_line: Vec<Option<TurnId>> = (0..lines.len())
+            .map(|i| {
+                c.editor
+                    .anchor_for_line_opt(i)
+                    .and_then(|a| c.editor.metadata::<TurnId>().get(a).copied())
+            })
+            .collect();
 
         // ============ Virtualised list build ============
         //
@@ -7494,7 +7573,7 @@ impl SketchGpuiView {
         // visible items.
         let lines_snap = lines.clone();
         let highlighted_snap = highlighted.clone();
-        let turn_per_line_snap = turn_per_line.clone();
+        let gutter_tag_snap = gutter_tag_per_line.clone();
         let tool_calls_snap = c.tool_calls.clone();
         let expanded_snap = c.expanded_tool_calls.clone();
         let frozen_lines_snap: Vec<(usize, usize)> =
@@ -7582,44 +7661,26 @@ impl SketchGpuiView {
                             rgb(DEFAULT_FG)
                         };
 
-                        // Turn label gating. We can't peek at the
-                        // previous line's frozen-ness or content
-                        // without reaching outside this closure, but
-                        // we do have line_idx-1 in the snapshots.
-                        let turn_n = *turn_per_line_snap.get(line_idx).unwrap_or(&1);
-                        let prev_turn = if line_idx == 0 {
-                            0
-                        } else {
-                            *turn_per_line_snap.get(line_idx - 1).unwrap_or(&0)
-                        };
-                        let prev_frozen = if line_idx == 0 {
-                            !is_frozen
-                        } else {
-                            is_frozen_at(line_idx - 1, &frozen_lines_snap)
-                        };
-                        let prev_had_content = if line_idx == 0 {
-                            false
-                        } else {
-                            !lines_snap
-                                .get(line_idx - 1)
-                                .map(|s| s.trim().is_empty())
-                                .unwrap_or(true)
-                        };
-                        let block_starts_here = line_has_content
-                            && (prev_turn != turn_n
-                                || prev_frozen != is_frozen
-                                || !prev_had_content);
-                        let label_text: SharedString = if block_starts_here {
-                            format!("{:>3}", format!("T{}", turn_n)).into()
-                        } else {
-                            "   ".into()
-                        };
-                        let label_color: Hsla = if !block_starts_here {
-                            rgb(0x6272a4).into()
-                        } else if is_frozen {
-                            frozen_bar
-                        } else {
-                            user_bar
+                        // Gutter tag from the editor's per-line `TurnId`
+                        // metadata (spec §11): `N` for LLM lines, `Un`
+                        // for user lines, `Tn` for tool-call anchor
+                        // lines, blank for currently-editable
+                        // (unsubmitted) lines.
+                        let tag = gutter_tag_snap.get(line_idx).copied().flatten();
+                        let (label_text, label_color): (SharedString, Hsla) = match tag {
+                            Some(TurnId::Llm(n)) => (
+                                format!("{:>3}", n).into(),
+                                frozen_bar,
+                            ),
+                            Some(TurnId::User(n)) => (
+                                format!("{:>3}", format!("U{}", n)).into(),
+                                user_bar,
+                            ),
+                            Some(TurnId::Tool(n)) => (
+                                format!("{:>3}", format!("T{}", n)).into(),
+                                rgb(0xf1fa8c).into(),
+                            ),
+                            None => ("   ".into(), rgb(0x6272a4).into()),
                         };
                         let row_bg: Hsla = if line_idx == cursor_line {
                             rgba(0x44475a55).into()
@@ -7857,16 +7918,16 @@ impl SketchGpuiView {
                     .child(SharedString::from(timer_label)),
             );
 
-        let compose_active = c.compose_box.is_some();
-        let mode_label = if compose_active {
-            match c.compose_box.as_ref().unwrap().mode {
-                EditMode::Normal => "COMPOSE",
-                EditMode::Insert => "COMPOSE INSERT",
+        let in_chatbox = c.input_mode == InputMode::Chatbox && c.chatbox.is_some();
+        let mode_label = if in_chatbox {
+            match c.chatbox.as_ref().unwrap().mode {
+                EditMode::Normal => "CHATBOX",
+                EditMode::Insert => "CHATBOX INSERT",
             }
         } else {
             match c.mode {
-                EditMode::Normal => "NORMAL",
-                EditMode::Insert => "INSERT",
+                EditMode::Normal => "WORKSHEET",
+                EditMode::Insert => "WORKSHEET INSERT",
             }
         };
         let dirty_mark = if c.editor.document().is_modified() { "•" } else { " " };
@@ -7889,10 +7950,10 @@ impl SketchGpuiView {
         }
         let _ = dim_fg; // (reserved for future per-line dim styling)
 
-        let hints = if compose_active {
-            "Ctrl-Enter send · Ctrl-T close · esc normal"
+        let hints = if in_chatbox {
+            "Ctrl-Enter send · Ctrl-Alt-Enter worksheet · esc normal"
         } else {
-            "Ctrl-Enter send · Ctrl-V back · Ctrl-T compose · i insert · esc normal"
+            "Ctrl-Enter send · Ctrl-Alt-Enter chatbox · Ctrl-V back · i insert · esc normal"
         };
 
         let footer = div()
@@ -7909,8 +7970,8 @@ impl SketchGpuiView {
             .child(left_status)
             .child(SharedString::from(hints));
 
-        // Compose box panel — rendered between body and footer when active.
-        let compose_panel = if let Some(tb) = &c.compose_box {
+        // Chatbox panel — rendered between body and footer when active.
+        let compose_panel = if let Some(tb) = &c.chatbox {
             let compose_lines: Vec<String> = {
                 let doc = tb.editor.document();
                 (0..doc.line_count().max(1))
@@ -8964,11 +9025,7 @@ mod tests {
         assert_eq!(classify_wp_line("**bold** text", false), WpLineKind::Paragraph);
     }
 
-    // ---- Claude splice / lock helpers ----
-
-    fn fresh_claude_editor() -> Editor {
-        Editor::new(String::new(), std::path::PathBuf::from("*claude*"))
-    }
+    // ---- doc_char_to_line_col ----
 
     #[test]
     fn doc_char_to_line_col_basic_mapping() {
@@ -8980,106 +9037,6 @@ mod tests {
         assert_eq!(doc_char_to_line_col(ed.document(), 6), (2, 0));
         // Past EOF clamps to len.
         assert_eq!(doc_char_to_line_col(ed.document(), 999), (2, 2));
-    }
-
-    #[test]
-    fn splice_agent_chunk_into_empty_editor_adds_frozen_lines() {
-        let mut ed = fresh_claude_editor();
-        splice_agent_chunk(&mut ed, "Hello, human!");
-        let text = ed.document().full_text();
-        assert!(
-            text.contains("Hello, human!"),
-            "buffer should contain the spliced text, got {:?}",
-            text
-        );
-        // The reply line should be frozen (read-only).
-        assert!(
-            !ed.frozen_lines().is_empty(),
-            "expected at least one frozen-line range after splice"
-        );
-        assert!(
-            ed.is_frozen_line(0),
-            "first line should be frozen after splice into empty buffer"
-        );
-    }
-
-    #[test]
-    fn splice_agent_chunk_preserves_user_draft_below() {
-        let mut ed = fresh_claude_editor();
-        // Type some draft text first.
-        ed.insert_char('h');
-        ed.insert_char('i');
-        // The draft is in the editable region; splice a Claude reply.
-        splice_agent_chunk(&mut ed, "I am Claude.");
-
-        let text = ed.document().full_text();
-        assert!(
-            text.contains("I am Claude."),
-            "reply should be in buffer, got {:?}",
-            text
-        );
-        assert!(
-            text.contains("hi"),
-            "user draft should survive the splice, got {:?}",
-            text
-        );
-        // The reply should appear before the draft in the document.
-        let reply_pos = text.find("I am Claude.").unwrap();
-        let draft_pos = text.find("hi").unwrap();
-        assert!(
-            reply_pos < draft_pos,
-            "reply should slot ABOVE the draft, but reply@{} draft@{} in {:?}",
-            reply_pos,
-            draft_pos,
-            text
-        );
-    }
-
-    #[test]
-    fn splice_agent_chunk_empty_text_is_noop() {
-        let mut ed = fresh_claude_editor();
-        ed.insert_char('a');
-        let before = ed.document().full_text();
-        splice_agent_chunk(&mut ed, "   \n\n");
-        // Whitespace-only text is treated as empty (trim_end_matches('\n') leaves spaces but the impl uses trimmed.is_empty after trim_end of '\n' only — so spaces survive). Verify the docstring behavior: empty after trim.
-        // For this test, an actually-empty payload:
-        splice_agent_chunk(&mut ed, "");
-        // The all-spaces case may or may not no-op; what we definitely want is
-        // "" doesn't change the doc.
-        let after = ed.document().full_text();
-        // The first call (whitespace) may add some content; we only assert
-        // that at minimum the user's char is still there.
-        assert!(after.contains('a'));
-        let _ = before;
-    }
-
-    #[test]
-    fn lock_agent_turn_appends_separator_and_locks_above() {
-        let mut ed = fresh_claude_editor();
-        ed.insert_char('h');
-        ed.insert_char('i');
-        let line_count_before = ed.document().line_count();
-        lock_agent_turn(&mut ed);
-
-        let text = ed.document().full_text();
-        assert!(
-            text.contains("──"),
-            "lock should append a horizontal-rule separator, got {:?}",
-            text
-        );
-        // Lockable-through-line should have moved past the original content.
-        let cursor_line = ed.cursor().line;
-        let lockable = ed.lockable_through_line();
-        assert!(
-            lockable >= line_count_before,
-            "lockable_through_line ({}) should be at/past original last line ({})",
-            lockable,
-            line_count_before
-        );
-        assert_eq!(
-            cursor_line, lockable,
-            "cursor should land on the next-turn line (the lockable boundary)"
-        );
     }
 
     // ---- Menu rendering helpers ----
@@ -9239,38 +9196,36 @@ mod tests {
     }
 
     #[test]
-    fn splice_then_lock_then_splice_again_chains_above_draft() {
-        let mut ed = fresh_claude_editor();
-        // Turn 1: Claude greets first (no prior draft).
-        splice_agent_chunk(&mut ed, "Hi.");
-        // Turn-end housekeeping mirrors what `pump_claude_replies` does
-        // when the agent's prompt response lands: ensure an editable line
-        // sits below the frozen content so the user can type.
+    fn append_llm_chunk_chains_turns_above_draft() {
+        // Mirrors the old splice-then-lock-then-splice integration test
+        // for the new append-and-tag flow: each turn appends just after
+        // the last frozen Llm(n) line; a manually-inserted user draft
+        // (simulating worksheet typing) survives the agent's reply
+        // arriving for the same turn.
+        let mut ed = Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+        // Turn 1: agent greets.
+        ed.append_llm_chunk(TurnId::Llm(1), "Hi.");
         finalize_agent_turn(&mut ed);
-        // User types a reply.
+        // User types a reply on the editable line below the frozen
+        // "Hi.". The worksheet cursor lives wherever the user puts it.
+        ed.cursor_mut().line = ed.document().line_count().saturating_sub(1);
+        ed.cursor_mut().col = 0;
         ed.insert_char('o');
         ed.insert_char('k');
-        // Send/lock.
-        lock_agent_turn(&mut ed);
-        // User starts typing the next prompt.
-        ed.insert_char('?');
-        // Claude streams a reply mid-typing.
-        splice_agent_chunk(&mut ed, "Yes!");
+        // Turn 2 starts: agent's first chunk goes at EOF (no Llm(2) lines
+        // yet) — i.e. after the user's draft "ok". This matches the
+        // worksheet's "agent writes at the far end" model (§19).
+        ed.append_llm_chunk(TurnId::Llm(2), "Yes!");
         finalize_agent_turn(&mut ed);
 
         let text = ed.document().full_text();
-        // All three pieces of content + the locked draft survive.
-        assert!(text.contains("Hi."), "first reply missing: {:?}", text);
-        assert!(text.contains("ok"), "first user draft missing: {:?}", text);
-        assert!(text.contains("Yes!"), "second reply missing: {:?}", text);
-        assert!(text.contains('?'), "in-progress draft missing: {:?}", text);
-        // Order: Hi. → ok → Yes! → ?
+        assert!(text.contains("Hi."));
+        assert!(text.contains("ok"));
+        assert!(text.contains("Yes!"));
         let pos_hi = text.find("Hi.").unwrap();
         let pos_ok = text.find("ok").unwrap();
         let pos_yes = text.find("Yes!").unwrap();
-        let pos_q = text.find('?').unwrap();
         assert!(pos_hi < pos_ok, "Hi before ok ({:?})", text);
         assert!(pos_ok < pos_yes, "ok before Yes! ({:?})", text);
-        assert!(pos_yes < pos_q, "Yes! before ? ({:?})", text);
     }
 }

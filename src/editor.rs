@@ -244,6 +244,14 @@ impl EditorCore {
         self.line_anchors.line_for(a)
     }
 
+    /// Read-only counterpart to `anchor_for_line`: returns the existing
+    /// anchor for `line` without allocating. Useful for the render path
+    /// (no `&mut`) — anchors not yet allocated still produce `None` and
+    /// the caller treats those lines as "no metadata yet".
+    pub fn anchor_for_line_opt(&self, line: usize) -> Option<LineAnchor> {
+        self.line_anchors.by_line.get(&line).copied()
+    }
+
     /// Read-only handle to per-line metadata of type `T`. Returns a view with
     /// `.get(anchor)`; missing entries yield `None`.
     pub fn metadata<T: Any + Send + Sync>(&self) -> LineMetadataView<'_, T> {
@@ -1166,6 +1174,10 @@ impl Editor {
 
     pub fn line_for_anchor(&self, a: LineAnchor) -> Option<usize> {
         self.core.line_for_anchor(a)
+    }
+
+    pub fn anchor_for_line_opt(&self, line: usize) -> Option<LineAnchor> {
+        self.core.anchor_for_line_opt(line)
     }
 
     pub fn metadata<T: Any + Send + Sync>(&self) -> LineMetadataView<'_, T> {

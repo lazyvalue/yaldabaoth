@@ -25,6 +25,14 @@ futures = "0.3"
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 gpui = "0.2"
 
+[features]
+# Opt-in pass-through of ACP's unstable token / cost surfacing. When this
+# feature is enabled, the agent window's `ReplyEvent::UsageUpdated` emitter
+# in `acp_channel.rs` fires; otherwise the variant exists but never gets
+# constructed (spec-agent-window.md §31). The variant itself is
+# unconditional so `match ev` arms stay exhaustive regardless.
+unstable_session_usage = ["agent-client-protocol/unstable_session_usage"]
+
 [dev-dependencies]
 pretty_assertions = "1"
 insta = "1"
