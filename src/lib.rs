@@ -15,6 +15,8 @@ pub mod md_highlight;
 pub mod menu;
 pub mod parse;
 pub mod render;
+pub mod session_client;
+pub mod session_proto;
 pub mod style;
 pub mod theme;
 pub mod tree;

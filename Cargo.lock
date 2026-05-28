@@ -5508,6 +5508,7 @@ dependencies = [
  "tokio-util",
  "tree-sitter",
  "tree-sitter-md",
+ "uuid",
 ]
 
 [[package]]

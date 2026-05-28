@@ -128,7 +128,7 @@ impl SketchFrontend {
 /// `ReplyEvent::UsageUpdated` variant stays unconditional regardless of
 /// whether the upstream feature is enabled — only the emitter in the
 /// notification handler is feature-gated (spec-agent-window.md §31).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UsageSnapshot {
     /// Tokens currently in the context window.
     pub tokens_used: u64,
@@ -143,7 +143,7 @@ pub struct UsageSnapshot {
 /// activity (announcements + status/output updates) in chronological
 /// order — that order is what makes inline tool-call rendering match what
 /// the model actually did.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ReplyEvent {
     /// Streamed text from `AgentMessageChunk`. Splice into the *claude*
     /// buffer the same way as before.
@@ -178,7 +178,7 @@ pub enum ReplyEvent {
 ///
 /// Stored as `u8` in an [`AtomicU8`] so the worker thread can read it
 /// without locking from inside the permission-request callback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum PermissionMode {
     /// Decline every gated tool. Equivalent to the original behaviour —
@@ -732,6 +732,26 @@ async fn worker_async(
     // 1) Spawn the agent process.
     let mut cmd = tokio::process::Command::new(&parts[0]);
     cmd.args(&parts[1..]);
+    // The `cwd` argument has long been forwarded to the agent over the wire
+    // as `NewSessionRequest::new(cwd)` below — a project-root hint the agent
+    // is supposed to respect. But until this line, the OS-level cwd of the
+    // spawned subprocess was whatever sketch's own process cwd happened to
+    // be: `tokio::process::Command::new` does not inherit any specific
+    // working directory. The two paths could silently diverge, so any agent
+    // affordance that reads the OS cwd (Bash `pwd`, a subprocess spawned
+    // with a relative path) was resolving against sketch's process cwd,
+    // not the per-session cwd. `spec-agent-cwd.md` §3 fixes that.
+    cmd.current_dir(&cwd);
+    // Scrub the Claude Code nesting-detector env var. When sketch is
+    // launched from inside a Claude Code session (very common — sketch
+    // users tend to use claude-code as their editor), CLAUDECODE=1 is
+    // inherited and the spawned `claude-agent-acp` aborts with "Claude
+    // Code cannot be launched inside another Claude Code session." The
+    // error message explicitly says: "To bypass this check, unset the
+    // CLAUDECODE environment variable." We strip only that — other
+    // CLAUDE_CODE_* vars (SESSION_ID, ENTRYPOINT, etc.) are passed through
+    // since the agent may key behavior off them.
+    cmd.env_remove("CLAUDECODE");
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         // Pipe-and-discard the agent's stderr by default. Agents (including
@@ -1047,9 +1067,15 @@ Prioritize technical accuracy and truthfulness over validating the user's belief
 Never give time estimates or predictions for how long tasks will take, whether for your own work or for users planning their projects. Avoid phrases like "this will take me a few minutes," "should be done in about 5 minutes," "this is a quick fix," "this will take 2-3 weeks," or "we can do this later." Focus on what needs to be done, not how long it might take. Break work into actionable steps and let users judge timing for themselves.
 
 IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the conversation."#;
+                    let session_mode = if std::env::var("SKETCH_SESSION_MANAGED").as_deref() == Ok("1") {
+                        " Session mode: client/server (session survives GUI restarts; managed by sketch-session-server)."
+                    } else {
+                        " Session mode: direct (GUI owns the agent subprocess)."
+                    };
                     let claude_code_append = format!(
-                        "You are running inside the sketch editor's Claude Code surface — host: {host}. {body}",
+                        "You are running inside the sketch editor's Claude Code surface — host: {host}.{session_mode} {body}",
                         host = frontend.host_description(),
+                        session_mode = session_mode,
                         body = CLAUDE_CODE_APPEND_BODY,
                     );
                     let claude_code_meta = || {

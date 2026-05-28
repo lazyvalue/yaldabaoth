@@ -94,6 +94,8 @@ use sketch::keys::{Key, KeyPress, Modifiers as KMods};
 use sketch::md_highlight::{highlight_markdown_lines, Segment};
 use sketch::menu::{MenuNode, MenuNodeKind, MenuState};
 use sketch::render;
+use sketch::session_client::SessionServerClient;
+use sketch::session_proto::Notification as ServerNotification;
 use sketch::style::{Color as NColor, Modifier, Style as NStyle};
 use sketch::theme::{Theme, ThemeName};
 
@@ -1543,6 +1545,135 @@ fn acp_session_persist_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("sketch").join("acp_sessions.json"))
 }
 
+/// Sketch's process cwd, with a safe fallback. Used both as the default
+/// per-session cwd for new agent slots (spec-agent-cwd.md §1) and as the
+/// top-level key in `acp_sessions.json` / `workspace.json`.
+fn process_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+}
+
+/// Connect to the session server if `SKETCH_SESSION_SERVER=1` is set.
+/// Returns `None` when the env var is absent/empty, or when the connection
+/// fails (falls back to direct AcpChannelClient spawning silently).
+fn connect_session_server() -> Option<SessionServerClient> {
+    if std::env::var("SKETCH_SESSION_SERVER").as_deref() != Ok("1") {
+        return None;
+    }
+    match SessionServerClient::connect() {
+        Ok(client) => {
+            eprintln!("[sketch-gpui] connected to session server");
+            Some(client)
+        }
+        Err(e) => {
+            eprintln!("[sketch-gpui] session server connect failed: {e}; falling back to direct spawn");
+            None
+        }
+    }
+}
+
+/// Resolve a user-typed path argument to an absolute directory, per
+/// spec-agent-cwd.md §2: expand a leading `~`, canonicalize when the
+/// directory exists, fall back to process-cwd-relative resolution with
+/// `.`/`..` collapsed otherwise, then validate that the result names a
+/// directory. Returns the absolute path on success, or an error string
+/// suitable for a footer hint on failure.
+fn resolve_agent_cwd_arg(arg: &str) -> Result<PathBuf, String> {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return Err("missing path argument".into());
+    }
+    // 1) Tilde expansion. `~` or `~/...` → $HOME/.... `~user/...` is not
+    //    supported in v1 — sketch is single-user.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let expanded: PathBuf = if trimmed == "~" {
+        match home {
+            Some(h) => h,
+            None => return Err("$HOME not set, cannot expand ~".into()),
+        }
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        match home {
+            Some(h) => h.join(rest),
+            None => return Err("$HOME not set, cannot expand ~".into()),
+        }
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    // 2) Canonicalize when possible, else fall back to cwd-relative with
+    //    `.`/`..` collapsed (same pattern as `Workspace::canonical_key`).
+    let resolved = match std::fs::canonicalize(&expanded) {
+        Ok(c) => c,
+        Err(_) => {
+            let abs = if expanded.is_absolute() {
+                expanded
+            } else {
+                process_cwd().join(&expanded)
+            };
+            let mut out = PathBuf::new();
+            for comp in abs.components() {
+                match comp {
+                    std::path::Component::ParentDir => {
+                        out.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => out.push(other.as_os_str()),
+                }
+            }
+            out
+        }
+    };
+
+    // 3) Validate.
+    if !resolved.is_dir() {
+        return Err(format!("not a directory: {}", resolved.display()));
+    }
+    Ok(resolved)
+}
+
+/// Shorten an absolute path for display in the Status Strip
+/// (spec-agent-cwd.md §6): replace a `$HOME` prefix with `~`, then if the
+/// result is longer than 32 characters elide the middle so the leading and
+/// trailing segments survive.
+fn shorten_cwd_for_display(cwd: &std::path::Path) -> String {
+    let raw = cwd.display().to_string();
+    let shortened = if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home).display().to_string();
+        if let Some(rest) = raw.strip_prefix(&home) {
+            if rest.is_empty() {
+                "~".to_string()
+            } else if rest.starts_with('/') {
+                format!("~{}", rest)
+            } else {
+                raw
+            }
+        } else {
+            raw
+        }
+    } else {
+        raw
+    };
+    if shortened.chars().count() <= 32 {
+        return shortened;
+    }
+    // Keep leading two and trailing two segments. If we can't get that many
+    // segments, fall back to leading-truncation with a `…` prefix.
+    let parts: Vec<&str> = shortened.split('/').collect();
+    if parts.len() >= 4 {
+        let head = parts[..2].join("/");
+        let tail = parts[parts.len() - 2..].join("/");
+        return format!("{}/…/{}", head, tail);
+    }
+    // Few segments but very long names: leading-truncate.
+    let chars: Vec<char> = shortened.chars().collect();
+    let keep_tail = 30;
+    if chars.len() > keep_tail + 1 {
+        let tail: String = chars[chars.len() - keep_tail..].iter().collect();
+        format!("…{}", tail)
+    } else {
+        shortened
+    }
+}
+
 /// Path to the JSON file that maps cwd → workspace snapshot (tabs + layout
 /// tree). Companion to acp_sessions.json; cleared by clearing cache_dir.
 fn workspace_persist_path() -> Option<PathBuf> {
@@ -1754,6 +1885,8 @@ fn load_persisted_workspace(cwd: &std::path::Path) -> Option<PersistedWorkspace>
 /// older files (without these keys) deserialize with defaults
 /// (Chatbox, false, false). Older sketch binaries reading newer files
 /// silently drop the unknown keys (downgrade contract, §35).
+/// `cwd` is a spec-agent-cwd.md §5 addition; `None` (absence in JSON)
+/// resolves to the process cwd at restore time per §1.
 #[derive(Debug, Clone)]
 struct PersistedSlot {
     id: String,
@@ -1762,6 +1895,7 @@ struct PersistedSlot {
     mode: InputMode,
     tasklist_open: bool,
     subagents_open: bool,
+    cwd: Option<PathBuf>,
 }
 
 /// Load the persisted slot list for `cwd`. Returns an empty vec if no
@@ -1793,6 +1927,7 @@ fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<PersistedSlot> {
             mode: InputMode::Chatbox,
             tasklist_open: false,
             subagents_open: false,
+            cwd: None,
         }];
     }
     let Some(arr) = entry.as_array() else {
@@ -1830,6 +1965,13 @@ fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<PersistedSlot> {
                 .get("subagents_open")
                 .and_then(|b| b.as_bool())
                 .unwrap_or(false);
+            // spec-agent-cwd.md §5: optional per-slot cwd. Absent (old
+            // file, or pre-spec save) is loaded as None so the restore
+            // path can fall back to process cwd per §1.
+            let cwd = obj
+                .get("cwd")
+                .and_then(|c| c.as_str())
+                .map(PathBuf::from);
             Some(PersistedSlot {
                 id,
                 label,
@@ -1837,6 +1979,7 @@ fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<PersistedSlot> {
                 mode,
                 tasklist_open,
                 subagents_open,
+                cwd,
             })
         })
         .collect()
@@ -1918,6 +2061,14 @@ fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRing) {
             obj.insert(
                 "subagents_open".into(),
                 serde_json::Value::Bool(slot.state.subagents_open),
+            );
+            // spec-agent-cwd.md §5: persist the slot's working directory.
+            // Lossy on non-UTF8 paths (Constraint §11) — same as the
+            // top-level `cwd` key in this file. Acceptable on macOS where
+            // APFS enforces UTF8-encodable names.
+            obj.insert(
+                "cwd".into(),
+                serde_json::Value::String(slot.cwd.display().to_string()),
             );
             Some(serde_json::Value::Object(obj))
         })
@@ -2626,6 +2777,144 @@ fn build_wrapped_line(
 /// Build the cursor caret element. Pulled out so the empty-line, mid-line,
 /// and end-of-line code paths all produce identical-looking carets.
 ///
+/// Render a single chatbox line with horizontal viewport tracking.
+///
+/// Unlike `build_wrapped_line` (which relies on flex-wrap and breaks at
+/// word boundaries), this function renders the visible portion of a line
+/// as a single non-wrapping row. The caller pre-slices the text to the
+/// visible window; this function just builds the inline elements with
+/// cursor and selection highlighting.
+fn build_chatbox_line(
+    vis_text: &str,
+    is_cursor_line: bool,
+    vis_cursor_col: usize,
+    mode: EditMode,
+    cursor_color: Hsla,
+    sel: Option<((usize, usize), (usize, usize))>,
+    line_idx: usize,
+    scroll_start: usize,
+    total_line_chars: usize,
+    code_font: &SharedString,
+) -> AnyElement {
+    let line_h = px(18.0);
+    let fg: Hsla = rgb(DEFAULT_FG).into();
+    let sel_bg: Hsla = ncolor_to_hsla(SELECTION_BG, BG);
+
+    let vis_chars: Vec<char> = vis_text.chars().collect();
+    let vis_len = vis_chars.len();
+
+    // Compute selection range in visible coordinates.
+    let vis_sel = sel.and_then(|s| {
+        line_selection_range(s, line_idx, total_line_chars)
+    }).and_then(|(abs_start, abs_end)| {
+        // Convert absolute column range to visible-window-relative.
+        let vs = abs_start.saturating_sub(scroll_start);
+        let ve = abs_end.saturating_sub(scroll_start);
+        if ve > vs { Some((vs.min(vis_len), ve.min(vis_len))) } else { None }
+    });
+
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .h(line_h)
+        .items_center()
+        .font_family(code_font.clone())
+        .text_size(px(13.0))
+        .text_color(fg);
+
+    if vis_text.is_empty() && !is_cursor_line {
+        // Empty non-cursor line — just take up space.
+        row = row.child(" ");
+        return row.into_any_element();
+    }
+
+    if !is_cursor_line {
+        // Non-cursor line: render as a single span, with optional selection.
+        if let Some((ss, se)) = vis_sel {
+            if ss > 0 {
+                let before: String = vis_chars[..ss].iter().collect();
+                row = row.child(before);
+            }
+            let selected: String = vis_chars[ss..se].iter().collect();
+            row = row.child(
+                div()
+                    .bg(sel_bg)
+                    .child(selected),
+            );
+            if se < vis_len {
+                let after: String = vis_chars[se..].iter().collect();
+                row = row.child(after);
+            }
+        } else {
+            row = row.child(vis_text.to_string());
+        }
+        return row.into_any_element();
+    }
+
+    // Cursor line: split text around cursor position.
+    let clamped_cursor = vis_cursor_col.min(vis_len);
+
+    // Build three segments: before cursor, cursor, after cursor.
+    // Interleave selection highlighting.
+    let before: String = vis_chars[..clamped_cursor].iter().collect();
+    let cursor_char = vis_chars.get(clamped_cursor).copied().unwrap_or(' ');
+    let after_start = match mode {
+        EditMode::Normal => (clamped_cursor + 1).min(vis_len),
+        EditMode::Insert => clamped_cursor,
+    };
+    let after: String = vis_chars[after_start..].iter().collect();
+
+    // Before-cursor text (with selection overlay if applicable).
+    if !before.is_empty() {
+        if let Some((ss, se)) = vis_sel {
+            // Selection may overlap the before-cursor region.
+            let b_len = before.chars().count();
+            let sel_s = ss.min(b_len);
+            let sel_e = se.min(b_len);
+            if sel_s < sel_e {
+                let pre_sel: String = vis_chars[..sel_s].iter().collect();
+                if !pre_sel.is_empty() { row = row.child(pre_sel); }
+                let in_sel: String = vis_chars[sel_s..sel_e].iter().collect();
+                row = row.child(div().bg(sel_bg).child(in_sel));
+                let post_sel: String = vis_chars[sel_e..clamped_cursor].iter().collect();
+                if !post_sel.is_empty() { row = row.child(post_sel); }
+            } else {
+                row = row.child(before);
+            }
+        } else {
+            row = row.child(before);
+        }
+    }
+
+    // Cursor caret.
+    row = row.child(make_caret(mode, cursor_char, cursor_color));
+
+    // After-cursor text.
+    if !after.is_empty() {
+        if let Some((ss, se)) = vis_sel {
+            let a_start = after_start;
+            let a_chars: Vec<char> = after.chars().collect();
+            let a_len = a_chars.len();
+            let rel_ss = ss.saturating_sub(a_start).min(a_len);
+            let rel_se = se.saturating_sub(a_start).min(a_len);
+            if rel_ss < rel_se {
+                let pre: String = a_chars[..rel_ss].iter().collect();
+                if !pre.is_empty() { row = row.child(pre); }
+                let in_sel: String = a_chars[rel_ss..rel_se].iter().collect();
+                row = row.child(div().bg(sel_bg).child(in_sel));
+                let post: String = a_chars[rel_se..].iter().collect();
+                if !post.is_empty() { row = row.child(post); }
+            } else {
+                row = row.child(after);
+            }
+        } else {
+            row = row.child(after);
+        }
+    }
+
+    row.into_any_element()
+}
+
 /// `flex_none()` is essential — without it the caret can be shrunk to 0px
 /// inside the flex_wrap row when other items want more space, making the
 /// cursor appear to vanish. The bar is also a few pixels wider than a
@@ -2874,7 +3163,15 @@ struct Chatbox {
     editor: Editor,
     mode: EditMode,
     scroll_handle: ScrollHandle,
+    /// First visible column on the cursor's line — updated every render to
+    /// keep the cursor horizontally in view. Only the cursor line scrolls;
+    /// other lines always start at column 0.
+    h_scroll_col: usize,
 }
+
+/// Right-margin in columns: when the cursor hits this many columns from the
+/// right edge, start scrolling.
+const CHATBOX_H_MARGIN_COLS: usize = 4;
 
 impl Chatbox {
     fn new() -> Self {
@@ -2882,11 +3179,29 @@ impl Chatbox {
             editor: Editor::new(String::new(), std::path::PathBuf::from("*chatbox*")),
             mode: EditMode::Insert,
             scroll_handle: ScrollHandle::new(),
+            h_scroll_col: 0,
         }
     }
 
     fn text(&self) -> String {
         self.editor.document().full_text()
+    }
+
+    /// Update `h_scroll_col` so the cursor column is visible within
+    /// `visible_cols` columns. Call before rendering.
+    fn ensure_cursor_visible(&mut self, cursor_col: usize, visible_cols: usize) {
+        if visible_cols == 0 {
+            self.h_scroll_col = 0;
+            return;
+        }
+        let right_edge = self.h_scroll_col + visible_cols.saturating_sub(CHATBOX_H_MARGIN_COLS);
+        if cursor_col >= right_edge {
+            // Cursor past right edge — scroll right.
+            self.h_scroll_col = cursor_col.saturating_sub(visible_cols.saturating_sub(CHATBOX_H_MARGIN_COLS));
+        } else if cursor_col < self.h_scroll_col {
+            // Cursor past left edge — scroll left.
+            self.h_scroll_col = cursor_col;
+        }
     }
 }
 
@@ -3072,6 +3387,11 @@ struct AgentState {
     tasklist_open: bool,
     /// Whether the Subagents sidepane is open (§28).
     subagents_open: bool,
+    /// True when this session is managed by the session server (client/server
+    /// mode). False when the GUI owns the ACP subprocess directly (legacy).
+    /// Checked by the status strip and anywhere that needs to distinguish
+    /// the two paths from within `AgentState` alone.
+    server_managed: bool,
     /// Background polling task that drains the ACP channel into the editor
     /// every ~50ms. Held only so that dropping `AgentState` (e.g. on
     /// `back_to_doc`) cancels the task. The leading `_` mutes unused-field
@@ -3096,6 +3416,14 @@ struct AgentSlot {
     /// reboot retries the original load. `None` for slots created fresh by
     /// `claude-new` (then the channel's session/new id is persisted).
     resume_id: Option<String>,
+    /// Absolute working directory the agent subprocess runs in and the
+    /// directory its tool calls resolve relative to (spec-agent-cwd.md §1).
+    /// Defaults to `std::env::current_dir()` at slot creation; set
+    /// explicitly via `:claude-new <path>` or `:claude-cd <path>`.
+    cwd: PathBuf,
+    /// When using the session server, this is the server-assigned session id.
+    /// `None` when using direct AcpChannelClient spawning.
+    server_session_id: Option<String>,
 }
 
 /// An ordered collection of `AgentSlot`s with one active slot.
@@ -3130,7 +3458,14 @@ impl AgentRing {
         &mut self.slots[self.active]
     }
 
-    fn push(&mut self, label: String, state: AgentState, resume_id: Option<String>) -> usize {
+    fn push(
+        &mut self,
+        label: String,
+        state: AgentState,
+        resume_id: Option<String>,
+        cwd: PathBuf,
+        server_session_id: Option<String>,
+    ) -> usize {
         let index = self.next_index;
         self.next_index += 1;
         self.slots.push(AgentSlot {
@@ -3139,6 +3474,8 @@ impl AgentRing {
             state,
             has_unseen_activity: false,
             resume_id,
+            cwd,
+            server_session_id,
         });
         self.active = self.slots.len() - 1;
         index
@@ -3167,7 +3504,7 @@ impl AgentRing {
     /// Remove the active slot and return its state. Advances to the next
     /// slot (or previous if at the end). Returns `None` if the ring is
     /// now empty.
-    fn close_active(&mut self) -> Option<AgentState> {
+    fn close_active(&mut self) -> Option<AgentSlot> {
         if self.slots.is_empty() {
             return None;
         }
@@ -3180,7 +3517,25 @@ impl AgentRing {
         if !self.slots.is_empty() {
             self.slots[self.active].has_unseen_activity = false;
         }
-        Some(removed.state)
+        Some(removed)
+    }
+
+    fn close_at(&mut self, idx: usize) -> Option<AgentSlot> {
+        if idx >= self.slots.len() {
+            return None;
+        }
+        let removed = self.slots.remove(idx);
+        if self.slots.is_empty() {
+            self.active = 0;
+        } else if self.active >= self.slots.len() {
+            self.active = self.slots.len() - 1;
+        } else if self.active > idx {
+            self.active -= 1;
+        }
+        if !self.slots.is_empty() {
+            self.slots[self.active].has_unseen_activity = false;
+        }
+        Some(removed)
     }
 
     fn len(&self) -> usize {
@@ -3191,6 +3546,7 @@ impl AgentRing {
         self.slots.is_empty()
     }
 
+    #[allow(dead_code)]
     fn iter(&self) -> impl Iterator<Item = &AgentSlot> {
         self.slots.iter()
     }
@@ -3202,6 +3558,13 @@ impl AgentRing {
 
     fn slot_by_index_mut(&mut self, index: usize) -> Option<&mut AgentSlot> {
         self.slots.iter_mut().find(|s| s.index == index)
+    }
+
+    /// Find a slot by its server-assigned session id.
+    fn slot_by_server_session_id_mut(&mut self, sid: &str) -> Option<&mut AgentSlot> {
+        self.slots.iter_mut().find(|s| {
+            s.server_session_id.as_deref() == Some(sid)
+        })
     }
 }
 
@@ -3223,6 +3586,10 @@ struct BufferSwitcher {
     filter_text: String,
 }
 
+struct SessionSwitcher {
+    selected: usize,
+}
+
 /// Single-line input overlay used by both Claude-session rename and
 /// tab rename. Pre-filled with the current label; Enter commits, Esc
 /// cancels, empty input cancels.
@@ -3242,6 +3609,14 @@ enum RenameTarget {
     /// captures key dispatch (no structural mutations possible mid-
     /// rename), so positional addressing is safe here.
     Tab { index: usize },
+    /// Path-input overlay that, on commit, creates a new agent session
+    /// rooted at the typed path. Empty input cancels (spec-agent-cwd.md
+    /// §2 — bare `:claude-new` already exists and uses the process cwd).
+    AgentNewSessionCwd,
+    /// Path-input overlay that, on commit, changes the active slot's
+    /// cwd (spec-agent-cwd.md §4). Targeted by monotonic
+    /// `AgentSlot::index`, matching `AgentSlot`'s rule.
+    AgentChangeCwd { index: usize },
 }
 
 /// GPUI menu tree. Mirrors the TUI's `default_menu` for the navigation
@@ -3255,21 +3630,11 @@ fn gpui_menu() -> Vec<MenuNode> {
         MenuNode::entry("b", "buffer list", "buffer-list"),
         MenuNode::submenu(
             "c",
-            "claude (acp)",
+            "claude",
             vec![
-                MenuNode::entry("o", "open chat", "open-claude"),
-                MenuNode::entry("s", "send draft", "claude-send"),
                 MenuNode::entry("n", "new session", "claude-new"),
+                MenuNode::entry("l", "list sessions", "claude-list"),
                 MenuNode::entry("x", "close session", "claude-close"),
-                MenuNode::entry("]", "next session", "claude-next"),
-                MenuNode::entry("[", "prev session", "claude-prev"),
-                MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
-                MenuNode::entry("c", "clear → fresh session", "claude-clear"),
-                MenuNode::entry("r", "reboot → resume claude", "claude-reboot"),
-                MenuNode::entry("d", "detach session", "claude-detach"),
-                MenuNode::entry("a", "attach session", "claude-attach"),
-                MenuNode::entry("R", "rename session", "claude-rename"),
-                MenuNode::entry("t", "compose", "compose-toggle"),
             ],
         ),
         MenuNode::separator(),
@@ -3339,12 +3704,18 @@ struct SketchGpuiView {
     /// the unzoomed default; clamped to [MIN_TEXT_SCALE, MAX_TEXT_SCALE] on
     /// every adjustment.
     text_scale: f32,
+    /// Cached viewport width in pixels, updated every render frame from
+    /// `Window::viewport_size()`. Used by the chatbox to compute visible
+    /// columns for horizontal scroll tracking.
+    viewport_width_px: f32,
     focus_handle: FocusHandle,
     /// Active TUI-style menu overlay. `Some` while the picker is open;
     /// flipped to `None` on Esc-from-root or after a command is dispatched.
     menu: Option<MenuOverlay>,
     /// Buffer-list picker overlay — open while `Some`.
     buffer_switcher: Option<BufferSwitcher>,
+    /// Claude session picker overlay — open while `Some`.
+    session_switcher: Option<SessionSwitcher>,
     /// Single-line rename input overlay for the active claude session.
     /// `Some` while the input box is open; cleared on Enter (commit) or
     /// Esc (cancel).
@@ -3361,6 +3732,11 @@ struct SketchGpuiView {
     /// the doc body look up `(block_idx, line_idx)` here to hit-test against
     /// the layout's bounds and to map pixels → char offsets.
     line_layouts: RefCell<HashMap<(usize, usize), TextLayout>>,
+    /// Session server client. When `Some`, agent sessions are created and
+    /// managed through the session server (owned subprocesses survive GUI
+    /// restarts). Activated by `SKETCH_SESSION_SERVER=1`. When `None`, the
+    /// GUI spawns `AcpChannelClient` directly (legacy path).
+    session_server: Option<SessionServerClient>,
 }
 
 impl SketchGpuiView {
@@ -3383,13 +3759,16 @@ impl SketchGpuiView {
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
+            viewport_width_px: 800.0,
             focus_handle,
             menu: None,
             buffer_switcher: None,
+            session_switcher: None,
             rename_overlay: None,
             workspace: workspace::Workspace::with_initial(initial),
             doc_selection: None,
             line_layouts: RefCell::new(HashMap::new()),
+            session_server: connect_session_server(),
         }
     }
 
@@ -3400,13 +3779,16 @@ impl SketchGpuiView {
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
+            viewport_width_px: 800.0,
             focus_handle,
             menu: None,
             buffer_switcher: None,
+            session_switcher: None,
             rename_overlay: None,
             workspace: workspace::Workspace::with_initial(initial),
             doc_selection: None,
             line_layouts: RefCell::new(HashMap::new()),
+            session_server: connect_session_server(),
         }
     }
 
@@ -3551,6 +3933,13 @@ impl SketchGpuiView {
             WindowContent::Agent(ring) if !ring.is_empty() => Some(&mut ring.active_mut().state),
             _ => None,
         }
+    }
+
+    /// Return the active slot's server session id (cloned), or `None`.
+    fn active_server_session_id(&self) -> Option<String> {
+        self.agent_ring()
+            .and_then(|r| r.slots.get(r.active))
+            .and_then(|s| s.server_session_id.clone())
     }
 
     fn agent_ring(&self) -> Option<&AgentRing> {
@@ -4956,7 +5345,8 @@ impl SketchGpuiView {
                     self.submit_agent(cx);
                 }
             }
-            "claude-new" => self.new_agent_session(cx),
+            "claude-new" => self.new_agent_session(None, cx),
+            "claude-list" => self.open_session_switcher(cx),
             "claude-close" => self.close_active_agent_session(cx),
             "claude-next" => self.switch_agent_session(1, cx),
             "claude-prev" => self.switch_agent_session(-1, cx),
@@ -4966,9 +5356,8 @@ impl SketchGpuiView {
             "claude-detach" => self.detach_active_agent_session(cx),
             "claude-attach" => self.attach_active_agent_session(cx),
             "claude-rename" => self.open_rename_overlay(cx),
-            // Pre-rename "compose-toggle" entry retained semantically as
-            // the input-mode toggle (spec §34 — menu chord `t` rewires
-            // to the new toggle, same chord, new behavior).
+            "claude-new-here" => self.open_new_agent_session_cwd_overlay(cx),
+            "claude-cd" => self.open_change_agent_cwd_overlay(cx),
             "compose-toggle" | "agent-input-toggle" => {
                 if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
                     self.toggle_agent_input_mode(cx);
@@ -5125,6 +5514,247 @@ impl SketchGpuiView {
         self.buffer_switcher = None;
     }
 
+    // ---- Session switcher overlay -----------------------------------------
+
+    fn open_session_switcher(&mut self, cx: &mut Context<Self>) {
+        if self.session_switcher.is_some() {
+            return;
+        }
+        // Must be on the agent screen with at least one session.
+        let ring = match self.agent_ring() {
+            Some(r) if !r.is_empty() => r,
+            _ => {
+                // Not on Claude screen — open Claude first, then show the list.
+                self.open_agent_inner(cx);
+                if let Some(r) = self.agent_ring() {
+                    if r.is_empty() { return; }
+                } else {
+                    return;
+                }
+                // Fall through — ring is now valid.
+                self.agent_ring().unwrap()
+            }
+        };
+        self.session_switcher = Some(SessionSwitcher {
+            selected: ring.active,
+        });
+        cx.notify();
+    }
+
+    fn close_session_switcher(&mut self) {
+        self.session_switcher = None;
+    }
+
+    fn handle_session_switcher_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        let selected = match &self.session_switcher {
+            Some(ss) => ss.selected,
+            None => return,
+        };
+
+        match press.key {
+            Key::Esc | Key::Char('q') => {
+                self.close_session_switcher();
+            }
+            Key::Char('j') | Key::Down => {
+                let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
+                if let Some(ss) = &mut self.session_switcher {
+                    if count > 0 {
+                        ss.selected = (ss.selected + 1) % count;
+                    }
+                }
+            }
+            Key::Char('k') | Key::Up => {
+                let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
+                if let Some(ss) = &mut self.session_switcher {
+                    if count > 0 {
+                        ss.selected = if ss.selected == 0 {
+                            count - 1
+                        } else {
+                            ss.selected - 1
+                        };
+                    }
+                }
+            }
+            Key::Char('g') => {
+                if let Some(ss) = &mut self.session_switcher {
+                    ss.selected = 0;
+                }
+            }
+            Key::Char('G') => {
+                let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
+                if let Some(ss) = &mut self.session_switcher {
+                    if count > 0 {
+                        ss.selected = count - 1;
+                    }
+                }
+            }
+            Key::Enter | Key::Char('l') => {
+                // Switch to the selected session.
+                if let Some(ring) = self.agent_ring_mut() {
+                    ring.active = selected;
+                }
+                self.close_session_switcher();
+                self.save_agent_ring();
+            }
+            Key::Char('x') => {
+                // Close the selected session (without switching to it first).
+                let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
+                if count > 0 {
+                    let server_sid = {
+                        let ring = self.agent_ring_mut().unwrap();
+                        let dropped = ring.close_at(selected);
+                        dropped.and_then(|s| s.server_session_id)
+                    };
+                    if let Some(sid) = &server_sid {
+                        if let Some(server) = &self.session_server {
+                            let _ = server.close_session(sid);
+                        }
+                    }
+                    let new_count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
+                    if new_count == 0 {
+                        self.close_session_switcher();
+                        self.back_to_doc(cx);
+                        self.save_agent_ring();
+                        cx.notify();
+                        return;
+                    }
+                    if let Some(ss) = &mut self.session_switcher {
+                        if ss.selected >= new_count {
+                            ss.selected = new_count - 1;
+                        }
+                    }
+                    self.save_agent_ring();
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn render_session_switcher(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let ss = match &self.session_switcher {
+            Some(ss) => ss,
+            None => unreachable!(),
+        };
+        let ring = self.agent_ring().unwrap();
+
+        let menu_bg: Hsla = rgb(0x1e1e3a).into();
+        let label_fg: Hsla = rgb(0x6272a4).into();
+        let active_fg: Hsla = rgb(0x8be9fd).into();
+        let selected_bg: Hsla = rgb(0x383a4f).into();
+        let normal_fg: Hsla = rgb(0xcccccc).into();
+        let popup_border: Hsla = rgb(0x383a4f).into();
+        let busy_fg: Hsla = rgb(0xffb86c).into();
+
+        let header_text = format!("SESSIONS ({})", ring.len());
+        let header_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_4()
+            .py_1()
+            .h(px(28.0))
+            .text_color(label_fg)
+            .font_weight(FontWeight::BOLD)
+            .child(header_text);
+
+        let mut entries_col = div()
+            .flex()
+            .flex_col()
+            .px_4()
+            .py_2()
+            .text_size(px(14.0))
+            .font_family(self.code_font.clone());
+
+        for (i, slot) in ring.slots.iter().enumerate() {
+            let is_selected = i == ss.selected;
+            let is_active = i == ring.active;
+            let is_busy = slot.state.awaiting_reply;
+
+            let marker = if is_selected { "\u{25b8} " } else { "  " };
+            let active_dot = if is_active { "\u{25cf} " } else { "  " };
+            let busy_mark = if is_busy { " \u{2026}" } else { "" };
+            let cwd_display = shorten_cwd_for_display(&slot.cwd);
+            let label_text = format!("{}{}", slot.label, busy_mark);
+
+            let name_color = if is_active {
+                active_fg
+            } else if is_busy {
+                busy_fg
+            } else {
+                normal_fg
+            };
+
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_2()
+                .py_0p5();
+
+            if is_selected {
+                row = row.bg(selected_bg);
+            }
+
+            row = row
+                .child(
+                    div()
+                        .text_color(label_fg)
+                        .child(SharedString::from(marker.to_string())),
+                )
+                .child(
+                    div()
+                        .text_color(active_fg)
+                        .child(SharedString::from(active_dot.to_string())),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_color(name_color)
+                        .child(SharedString::from(label_text)),
+                )
+                .child(
+                    div()
+                        .text_color(label_fg)
+                        .child(SharedString::from(format!("  {cwd_display}"))),
+                );
+
+            entries_col = entries_col.child(row);
+        }
+
+        let hints_row = div()
+            .px_4()
+            .py_1()
+            .text_size(px(11.0))
+            .text_color(label_fg)
+            .child("j/k move · enter select · x close · q/esc cancel");
+
+        div()
+            .id("session-switcher")
+            .absolute()
+            .top(px(34.0))
+            .left(px(40.0))
+            .right(px(40.0))
+            .max_h(px(400.0))
+            .bg(menu_bg)
+            .border_1()
+            .border_color(popup_border)
+            .rounded_md()
+            .shadow_lg()
+            .overflow_y_scroll()
+            .child(header_row)
+            .child(entries_col)
+            .child(hints_row)
+    }
+
     // ---- Session rename overlay -------------------------------------------
 
     /// Open the rename input overlay for the active claude session. No-op
@@ -5141,6 +5771,41 @@ impl SketchGpuiView {
         self.rename_overlay = Some(RenameOverlay {
             text: slot.label.clone(),
             target: RenameTarget::AgentSlot { index: slot.index },
+        });
+        cx.notify();
+    }
+
+    /// Open a path-input overlay; on commit, spawn a new agent session
+    /// rooted at the typed path (spec-agent-cwd.md §2). Empty input
+    /// cancels — the bare `claude-new` already exists for the
+    /// "process cwd" case.
+    fn open_new_agent_session_cwd_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.rename_overlay.is_some() {
+            return;
+        }
+        // Don't gate by "claude is focused" — this command can transition
+        // the user into the agent screen at the chosen cwd in one step.
+        self.rename_overlay = Some(RenameOverlay {
+            text: String::new(),
+            target: RenameTarget::AgentNewSessionCwd,
+        });
+        cx.notify();
+    }
+
+    /// Open a path-input overlay pre-filled with the active slot's
+    /// current cwd; on commit, respawn the slot at the new path
+    /// (spec-agent-cwd.md §4).
+    fn open_change_agent_cwd_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.rename_overlay.is_some() {
+            return;
+        }
+        let Some(ring) = self.agent_ring() else {
+            return;
+        };
+        let slot = &ring.slots[ring.active];
+        self.rename_overlay = Some(RenameOverlay {
+            text: slot.cwd.display().to_string(),
+            target: RenameTarget::AgentChangeCwd { index: slot.index },
         });
         cx.notify();
     }
@@ -5198,6 +5863,39 @@ impl SketchGpuiView {
                 self.close_rename_overlay();
                 self.save_workspace_state();
                 cx.notify();
+            }
+            RenameTarget::AgentNewSessionCwd => {
+                // Resolve per spec-agent-cwd.md §2 (tilde, canonicalize,
+                // validate). Failure surfaces via the active agent's
+                // footer hint and leaves the overlay closed.
+                match resolve_agent_cwd_arg(&new_label) {
+                    Ok(resolved) => {
+                        self.close_rename_overlay();
+                        self.new_agent_session(Some(resolved), cx);
+                    }
+                    Err(msg) => {
+                        self.close_rename_overlay();
+                        if let Some(c) = self.agent_mut() {
+                            c.status = Some(msg.into());
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+            RenameTarget::AgentChangeCwd { index } => {
+                match resolve_agent_cwd_arg(&new_label) {
+                    Ok(resolved) => {
+                        self.close_rename_overlay();
+                        self.change_agent_cwd(index, resolved, cx);
+                    }
+                    Err(msg) => {
+                        self.close_rename_overlay();
+                        if let Some(c) = self.agent_mut() {
+                            c.status = Some(msg.into());
+                        }
+                        cx.notify();
+                    }
+                }
             }
         }
     }
@@ -5869,6 +6567,8 @@ impl SketchGpuiView {
         let header_label = match o.target {
             RenameTarget::AgentSlot { .. } => "RENAME SESSION",
             RenameTarget::Tab { .. } => "RENAME TAB",
+            RenameTarget::AgentNewSessionCwd => "NEW SESSION AT…",
+            RenameTarget::AgentChangeCwd { .. } => "CHANGE SESSION CWD",
         };
         let header = div()
             .px_4()
@@ -5944,7 +6644,7 @@ impl SketchGpuiView {
     fn open_agent_inner(&mut self, cx: &mut Context<Self>) {
         // If already on Claude screen, just add a new session to the ring.
         if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
-            self.new_agent_session(cx);
+            self.new_agent_session(None, cx);
             return;
         }
 
@@ -5961,41 +6661,133 @@ impl SketchGpuiView {
             .expect("workspace has no focused window");
 
         let mut ring = AgentRing::new(Some(Box::new(prior)));
-        let cwd_opt = std::env::current_dir().ok();
-        let persisted = cwd_opt
-            .as_deref()
-            .map(load_persisted_acp_sessions)
-            .unwrap_or_default();
+        let proc_cwd = process_cwd();
 
-        if persisted.is_empty() {
-            // No saved state → fresh single slot, as before.
-            let state = self.create_agent_session(None, cx);
-            ring.push("claude-1".into(), state, None);
-        } else {
-            // Restore every saved slot in order. Each slot's
-            // AcpChannelClient spawns on its own background thread, so
-            // the N attaches happen concurrently (~100MB RSS per slot
-            // during the restore window).
-            let active_pos = persisted
-                .iter()
-                .position(|s| s.active)
-                .unwrap_or(0);
-            for slot in persisted {
-                let mut state = self.create_agent_session(Some(slot.id.clone()), cx);
-                // Spec §35 fields. Mode chatbox stays as default; if the
-                // slot was saved in Worksheet, drop the freshly-created
-                // empty chatbox so the rendered view starts in Worksheet
-                // immediately. Per §36, the chatbox's unsent text is
-                // intentionally NOT persisted.
-                state.input_mode = slot.mode;
-                if slot.mode == InputMode::Worksheet {
-                    state.chatbox = None;
+        if self.session_server.is_some() {
+            // ── Session-server path ──────────────────────────────────
+            // Ask the server for existing sessions (survived a GUI restart).
+            // If none, create a fresh one.
+            let existing = self.session_server.as_ref().unwrap()
+                .list_sessions()
+                .unwrap_or_default();
+            let matching: Vec<_> = existing
+                .into_iter()
+                .filter(|s| s.cwd == proc_cwd)
+                .collect();
+
+            if matching.is_empty() {
+                let (state, server_sid) = self.create_agent_session_via_server(
+                    self.session_server.as_ref().unwrap(),
+                    None,
+                    "claude-1",
+                    proc_cwd.clone(),
+                );
+                ring.push("claude-1".into(), state, None, proc_cwd, server_sid);
+            } else {
+                for (i, info) in matching.iter().enumerate() {
+                    let label = if matching.len() == 1 {
+                        "claude-1".to_string()
+                    } else {
+                        format!("claude-{}", i + 1)
+                    };
+                    // Attach to existing server session.
+                    if let Err(e) = self.session_server.as_ref().unwrap().attach(&info.session_id) {
+                        eprintln!("[sketch-gpui] re-attach failed for {}: {e}", &info.session_id[..8]);
+                    }
+                    let editor = Editor::new(String::new(), PathBuf::from("*claude*"));
+                    let status_msg = if info.connected {
+                        format!("reconnected: {}", info.acp_session_id.as_deref().unwrap_or("active"))
+                    } else {
+                        "reconnected (agent spawning…)".to_string()
+                    };
+                    let state = AgentState {
+                        editor,
+                        channel: None,
+                        attach_pending: None,
+                        mode: EditMode::Insert,
+                        keybinds: KeybindManager::default(),
+                        list_state: gpui::ListState::new(
+                            0,
+                            gpui::ListAlignment::Bottom,
+                            gpui::px(256.0),
+                        ),
+                        list_item_count: 0,
+                        status: Some(status_msg.into()),
+                        awaiting_reply: false,
+                        turn_started: None,
+                        last_seen_turns: info.turns,
+                        tool_calls: std::collections::HashMap::new(),
+                        tool_call_order: Vec::new(),
+                        tool_call_anchor_line: std::collections::HashMap::new(),
+                        expanded_tool_calls: std::collections::HashSet::new(),
+                        block_ranges: Vec::new(),
+                        block_cache: std::collections::HashMap::new(),
+                        block_cache_frozen_count: 0,
+                        input_mode: InputMode::Chatbox,
+                        chatbox: Some(Chatbox::new()),
+                        current_plan: None,
+                        agent_mode: None,
+                        usage: None,
+                        subagents: Vec::new(),
+                        focused_subagent: None,
+                        tasklist_open: false,
+                        subagents_open: false,
+                        server_managed: true,
+                        _pump: None,
+                    };
+                    ring.push(
+                        label,
+                        state,
+                        info.acp_session_id.clone(),
+                        proc_cwd.clone(),
+                        Some(info.session_id.clone()),
+                    );
                 }
-                state.tasklist_open = slot.tasklist_open;
-                state.subagents_open = slot.subagents_open;
-                ring.push(slot.label, state, Some(slot.id));
             }
-            ring.active = active_pos.min(ring.slots.len().saturating_sub(1));
+            // Start the unified server pump (one per view, routes by session_id).
+            let _server_pump = self.start_server_pump(cx);
+            // Stash it on the first slot so it lives as long as the ring does.
+            if let Some(slot) = ring.slots.first_mut() {
+                slot.state._pump = Some(_server_pump);
+            }
+        } else {
+            // ── Direct-spawn path (legacy) ───────────────────────────
+            let persisted = load_persisted_acp_sessions(&proc_cwd);
+
+            if persisted.is_empty() {
+                let slot_cwd = proc_cwd.clone();
+                let session_index = ring.next_index;
+                let state = self.create_agent_session(
+                    None,
+                    slot_cwd.clone(),
+                    session_index,
+                    cx,
+                );
+                ring.push("claude-1".into(), state, None, slot_cwd, None);
+            } else {
+                let active_pos = persisted
+                    .iter()
+                    .position(|s| s.active)
+                    .unwrap_or(0);
+                for slot in persisted {
+                    let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
+                    let session_index = ring.next_index;
+                    let mut state = self.create_agent_session(
+                        Some(slot.id.clone()),
+                        slot_cwd.clone(),
+                        session_index,
+                        cx,
+                    );
+                    state.input_mode = slot.mode;
+                    if slot.mode == InputMode::Worksheet {
+                        state.chatbox = None;
+                    }
+                    state.tasklist_open = slot.tasklist_open;
+                    state.subagents_open = slot.subagents_open;
+                    ring.push(slot.label, state, Some(slot.id), slot_cwd, None);
+                }
+                ring.active = active_pos.min(ring.slots.len().saturating_sub(1));
+            }
         }
 
         self.set_screen(WindowContent::Agent(ring));
@@ -6006,18 +6798,40 @@ impl SketchGpuiView {
         cx.notify();
     }
 
-    /// Create a new session and add it to the existing ring.
-    fn new_agent_session(&mut self, cx: &mut Context<Self>) {
-        let ring = match self.agent_ring_mut() {
-            Some(r) => r,
+    /// Create a new session and add it to the existing ring. With `cwd =
+    /// None`, the new slot inherits the process cwd (today's behavior). With
+    /// `cwd = Some(path)`, that already-resolved absolute path becomes the
+    /// new slot's cwd — the caller (typically the `:claude-new <path>`
+    /// command handler) is responsible for running the input through
+    /// `resolve_agent_cwd_arg` first.
+    fn new_agent_session(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
+        let (label, session_index) = match self.agent_ring() {
+            Some(r) => (format!("claude-{}", r.next_index + 1), r.next_index),
             None => return,
         };
-        let n = ring.next_index + 1;
-        let label = format!("claude-{n}");
-        // New sessions don't resume — they're fresh.
-        let state = self.create_agent_session(None, cx);
-        let ring = self.agent_ring_mut().unwrap();
-        ring.push(label, state, None);
+        let slot_cwd = cwd.unwrap_or_else(process_cwd);
+
+        if let Some(server) = &self.session_server {
+            // Session-server path.
+            let (state, server_sid) = self.create_agent_session_via_server(
+                server,
+                None,
+                &label,
+                slot_cwd.clone(),
+            );
+            let ring = self.agent_ring_mut().unwrap();
+            ring.push(label, state, None, slot_cwd, server_sid);
+        } else {
+            // Direct-spawn path.
+            let state = self.create_agent_session(
+                None,
+                slot_cwd.clone(),
+                session_index,
+                cx,
+            );
+            let ring = self.agent_ring_mut().unwrap();
+            ring.push(label, state, None, slot_cwd, None);
+        }
         // §18 soft cap: at 6+ slots, surface a one-shot footer warning so
         // the user notices the per-slot ~100MB subprocess cost. Advisory
         // only — no enforcement.
@@ -6030,6 +6844,120 @@ impl SketchGpuiView {
                 );
             }
         }
+        self.save_agent_ring();
+        cx.notify();
+    }
+
+    /// Respawn the slot identified by `slot_index` (monotonic
+    /// `AgentSlot::index`) at a new working directory. Implements
+    /// spec-agent-cwd.md §4 step-by-step: drop the current channel
+    /// (kills subprocess), null out attach/awaiting state, swap the
+    /// slot's `cwd`, drop `resume_id`, append a session-divider line
+    /// to the transcript, and spawn a fresh channel. The transcript
+    /// is otherwise preserved so the user can scroll back through
+    /// the prior session's history above the divider.
+    fn change_agent_cwd(
+        &mut self,
+        slot_index: usize,
+        new_cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        // Resolve slot position once; the index is monotonic so it
+        // doesn't shift unless the slot was closed.
+        let pos = match self.agent_ring().and_then(|r| r.slot_by_index(slot_index)) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Phase 1: tear down the existing channel + attach state. The
+        // borrow ends before we cross-call create_agent_session.
+        let prev_cwd = {
+            let ring = self.agent_ring_mut().unwrap();
+            let slot = &mut ring.slots[pos];
+            let prev = slot.cwd.clone();
+            // Dropping `channel` kills the subprocess via kill_on_drop.
+            slot.state.channel = None;
+            slot.state.attach_pending = None;
+            slot.state.awaiting_reply = false;
+            slot.state.turn_started = None;
+            slot.state.status = Some(
+                format!(
+                    "changing cwd to {}…",
+                    shorten_cwd_for_display(&new_cwd),
+                )
+                .into(),
+            );
+            slot.cwd = new_cwd.clone();
+            // The agent-side session was bound to the old cwd; a fresh
+            // session/new is the right resume strategy.
+            slot.resume_id = None;
+            prev
+        };
+
+        // Phase 2: build a fresh agent session at the new cwd.
+        if self.session_server.is_some() {
+            // Server path: close old session, create new one at new cwd.
+            let old_sid = {
+                if let Some(ring) = self.agent_ring_mut() {
+                    ring.slots.get_mut(pos).and_then(|s| s.server_session_id.take())
+                } else {
+                    None
+                }
+            };
+            if let Some(old_sid) = &old_sid {
+                if let Some(server) = &self.session_server {
+                    let _ = server.close_session(old_sid);
+                }
+            }
+            let result = {
+                let server = self.session_server.as_ref().unwrap();
+                self.create_agent_session_via_server(
+                    server,
+                    None,
+                    "respawned",
+                    new_cwd.clone(),
+                )
+            };
+            let (_fresh, server_sid) = result;
+            if let Some(ring) = self.agent_ring_mut() {
+                if let Some(slot) = ring.slots.get_mut(pos) {
+                    slot.server_session_id = server_sid;
+                    slot.state.attach_pending = None;
+                    slot.state.channel = None;
+                    slot.state.status = Some(
+                        format!(
+                            "cwd → {}, fresh session",
+                            shorten_cwd_for_display(&new_cwd),
+                        )
+                        .into(),
+                    );
+                }
+            }
+        } else {
+            // Direct-spawn path: graft a throwaway AgentState's
+            // channel + pump into the existing slot.
+            let fresh = self.create_agent_session(
+                None,
+                new_cwd.clone(),
+                slot_index,
+                cx,
+            );
+            if let Some(ring) = self.agent_ring_mut() {
+                if let Some(slot) = ring.slots.get_mut(pos) {
+                    slot.state.attach_pending = fresh.attach_pending;
+                    slot.state._pump = fresh._pump;
+                    slot.state.status = Some(
+                        format!(
+                            "cwd → {}, fresh session",
+                            shorten_cwd_for_display(&new_cwd),
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        let _ = prev_cwd;
         self.save_agent_ring();
         cx.notify();
     }
@@ -6049,14 +6977,22 @@ impl SketchGpuiView {
 
     /// Close the active session. If the ring is now empty, exit Claude.
     fn close_active_agent_session(&mut self, cx: &mut Context<Self>) {
-        let is_empty = {
+        let (is_empty, server_sid) = {
             let ring = match self.agent_ring_mut() {
                 Some(r) => r,
                 None => return,
             };
-            let _dropped = ring.close_active(); // AgentState drops → pump task cancelled
-            ring.is_empty()
+            let dropped = ring.close_active(); // AgentSlot drops → pump task cancelled
+            let sid = dropped.as_ref().and_then(|s| s.server_session_id.clone());
+            drop(dropped);
+            (ring.is_empty(), sid)
         };
+        // Close the server-side session if applicable.
+        if let Some(sid) = &server_sid {
+            if let Some(server) = &self.session_server {
+                let _ = server.close_session(sid);
+            }
+        }
         if is_empty {
             // Last slot closed: wipe the cwd entry so reboot doesn't
             // resurrect anything, then drop the Claude screen.
@@ -6083,38 +7019,39 @@ impl SketchGpuiView {
         save_persisted_acp_sessions(&cwd, ring);
     }
 
-    /// Build a `AgentState` with ACP attach thread and pump task.
-    /// The returned state is ready to be pushed into a `AgentRing`.
+    /// Build a `AgentState` with ACP attach thread and pump task. The
+    /// returned state is ready to be pushed into a `AgentRing`. `cwd` is
+    /// the per-session working directory (spec-agent-cwd.md §3) — both the
+    /// `NewSessionRequest` payload and the OS-level subprocess cwd come
+    /// from this single argument. `session_index` is the monotonic
+    /// `AgentSlot::index` the pump task will use to find this slot every
+    /// tick; callers MUST pass the value that `AgentRing::push` will (or
+    /// did) assign to this slot. Passing the wrong value silently strands
+    /// the slot's attach (the pump drains some other slot's
+    /// `attach_pending` and this slot's channel stays `None` forever).
     fn create_agent_session(
         &mut self,
         resume_id: Option<String>,
+        cwd: PathBuf,
+        session_index: usize,
         cx: &mut Context<Self>,
     ) -> AgentState {
         let (attach_tx, attach_rx) =
             std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
         let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
-        let cwd = std::env::current_dir().ok();
+        let spawn_cwd = Some(cwd);
         let _ = std::thread::Builder::new()
             .name("sketch-acp-attach".into())
             .spawn(move || {
                 let _ = attach_tx.send(AcpChannelClient::spawn_with_resume_in(
                     &cmd,
-                    cwd,
+                    spawn_cwd,
                     resume_id,
                     sketch::acp_channel::SketchFrontend::Gpui,
                 ));
             });
 
         let editor = Editor::new(String::new(), PathBuf::from("*claude*"));
-
-        // We'll assign the session index after push — use a sentinel
-        // that the pump will look up dynamically. The pump captures
-        // a stable session_index once the ring assigns one.
-        // For now, peek the next_index from the ring.
-        let session_index = match self.agent_ring() {
-            Some(ring) => ring.next_index,
-            None => 0, // first session — ring doesn't exist yet
-        };
 
         let pump = cx.spawn(async move |this, cx| {
             use futures::FutureExt;
@@ -6200,8 +7137,213 @@ impl SketchGpuiView {
             focused_subagent: None,
             tasklist_open: false,
             subagents_open: false,
+            server_managed: false,
             _pump: Some(pump),
         }
+    }
+
+    /// Create an agent session via the session server. Returns
+    /// `(AgentState, server_session_id)`. The session server owns the ACP
+    /// subprocess; the GUI just receives events through the shared
+    /// `SessionServerClient::try_recv()` notification channel. No per-slot
+    /// pump task is needed — the unified `pump_server_sessions` task routes
+    /// events by `session_id`.
+    fn create_agent_session_via_server(
+        &self,
+        server: &SessionServerClient,
+        resume_id: Option<String>,
+        label: &str,
+        cwd: PathBuf,
+    ) -> (AgentState, Option<String>) {
+        let info = match server.create_session(cwd, label.to_string(), resume_id) {
+            Ok(info) => info,
+            Err(e) => {
+                let editor = Editor::new(String::new(), PathBuf::from("*claude*"));
+                let mut state = AgentState {
+                    editor,
+                    channel: None,
+                    attach_pending: None,
+                    mode: EditMode::Insert,
+                    keybinds: KeybindManager::default(),
+                    list_state: gpui::ListState::new(
+                        0,
+                        gpui::ListAlignment::Bottom,
+                        gpui::px(256.0),
+                    ),
+                    list_item_count: 0,
+                    status: Some(format!("server create failed: {e}").into()),
+                    awaiting_reply: false,
+                    turn_started: None,
+                    last_seen_turns: 0,
+                    tool_calls: std::collections::HashMap::new(),
+                    tool_call_order: Vec::new(),
+                    tool_call_anchor_line: std::collections::HashMap::new(),
+                    expanded_tool_calls: std::collections::HashSet::new(),
+                    block_ranges: Vec::new(),
+                    block_cache: std::collections::HashMap::new(),
+                    block_cache_frozen_count: 0,
+                    input_mode: InputMode::Chatbox,
+                    chatbox: Some(Chatbox::new()),
+                    current_plan: None,
+                    agent_mode: None,
+                    usage: None,
+                    subagents: Vec::new(),
+                    focused_subagent: None,
+                    tasklist_open: false,
+                    subagents_open: false,
+                    server_managed: true,
+                    _pump: None,
+                };
+                state.editor.begin_insert();
+                return (state, None);
+            }
+        };
+
+        let server_session_id = info.session_id.clone();
+
+        // Attach to the session's notification stream.
+        if let Err(e) = server.attach(&server_session_id) {
+            eprintln!("[sketch-gpui] attach to server session failed: {e}");
+        }
+
+        let editor = Editor::new(String::new(), PathBuf::from("*claude*"));
+        let state = AgentState {
+            editor,
+            channel: None,
+            attach_pending: None,
+            mode: EditMode::Insert,
+            keybinds: KeybindManager::default(),
+            list_state: gpui::ListState::new(
+                0,
+                gpui::ListAlignment::Bottom,
+                gpui::px(256.0),
+            ),
+            list_item_count: 0,
+            status: Some("attaching to ACP agent via session server…".into()),
+            awaiting_reply: false,
+            turn_started: None,
+            last_seen_turns: 0,
+            tool_calls: std::collections::HashMap::new(),
+            tool_call_order: Vec::new(),
+            tool_call_anchor_line: std::collections::HashMap::new(),
+            expanded_tool_calls: std::collections::HashSet::new(),
+            block_ranges: Vec::new(),
+            block_cache: std::collections::HashMap::new(),
+            block_cache_frozen_count: 0,
+            input_mode: InputMode::Chatbox,
+            chatbox: Some(Chatbox::new()),
+            current_plan: None,
+            agent_mode: None,
+            usage: None,
+            subagents: Vec::new(),
+            focused_subagent: None,
+            tasklist_open: false,
+            subagents_open: false,
+            server_managed: true,
+            _pump: None,
+        };
+
+        (state, Some(server_session_id))
+    }
+
+    /// Unified pump task for the session server path. Drains all
+    /// notifications from `SessionServerClient::try_recv()` and routes
+    /// them to the correct `AgentSlot` by `server_session_id`. Runs as a
+    /// single GPUI background task per view (not per-slot).
+    fn start_server_pump(&self, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            let idle_delay = Duration::from_millis(16);
+            let yield_delay = Duration::from_millis(1);
+            let min_cycle = Duration::from_millis(16);
+            loop {
+                let cycle_start = std::time::Instant::now();
+                cx.background_executor().timer(idle_delay).await;
+
+                // Drain up to 64 notifications per cycle.
+                let mut batch: Vec<ServerNotification> = Vec::new();
+                let _ = this.update(cx, |this, _cx| {
+                    if let Some(server) = &this.session_server {
+                        while batch.len() < 64 {
+                            match server.try_recv() {
+                                Some(note) => batch.push(note),
+                                None => break,
+                            }
+                        }
+                    }
+                });
+
+                if batch.is_empty() {
+                    let elapsed = cycle_start.elapsed();
+                    if elapsed < min_cycle {
+                        cx.background_executor()
+                            .timer(min_cycle - elapsed)
+                            .await;
+                    }
+                    continue;
+                }
+
+                // Route each notification to the correct slot.
+                let result = this.update(cx, |this, cx| {
+                    let ring = match this.agent_ring_mut() {
+                        Some(r) => r,
+                        None => return,
+                    };
+
+                    for note in batch {
+                        match note {
+                            ServerNotification::ReplyEvent { session_id, event } => {
+                                if let Some(slot) = ring.slot_by_server_session_id_mut(&session_id) {
+                                    Self::apply_reply_events(&mut slot.state, vec![event]);
+                                    // Auto-scroll.
+                                    let claude = &mut slot.state;
+                                    let line_count = claude.editor.document().line_count();
+                                    let cursor_at_eof = claude.editor.cursor().line + 1 >= line_count;
+                                    let follow = match claude.input_mode {
+                                        InputMode::Chatbox => true,
+                                        InputMode::Worksheet => cursor_at_eof,
+                                    };
+                                    if follow && claude.list_item_count > 0 {
+                                        claude.list_state.scroll_to_reveal_item(
+                                            claude.list_item_count - 1,
+                                        );
+                                    }
+                                }
+                            }
+                            ServerNotification::TurnEnded { session_id, turn_count } => {
+                                if let Some(slot) = ring.slot_by_server_session_id_mut(&session_id) {
+                                    let claude = &mut slot.state;
+                                    // Drain any trailing events from the apply.
+                                    finalize_agent_turn(&mut claude.editor);
+                                    claude.last_seen_turns = turn_count;
+                                    claude.awaiting_reply = false;
+                                    claude.turn_started = None;
+                                }
+                            }
+                            ServerNotification::SessionAttached { session_id, acp_session_id } => {
+                                if let Some(slot) = ring.slot_by_server_session_id_mut(&session_id) {
+                                    let label = acp_session_id
+                                        .as_deref()
+                                        .unwrap_or("connected");
+                                    slot.state.status = Some(format!("attached: {label}").into());
+                                }
+                            }
+                            ServerNotification::SessionDetached { session_id, reason } => {
+                                if let Some(slot) = ring.slot_by_server_session_id_mut(&session_id) {
+                                    slot.state.status = Some(format!("detached: {reason}").into());
+                                }
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+
+                if result.is_err() {
+                    return; // View dropped.
+                }
+
+                cx.background_executor().timer(yield_delay).await;
+            }
+        })
     }
 
     /// Pump a specific session by its monotonic index. Returns `true` if
@@ -6564,16 +7706,22 @@ impl SketchGpuiView {
             }
         }
 
+        // Use the active slot's per-session cwd (spec-agent-cwd.md §3)
+        // rather than the process cwd, so a slot that lives at /foo
+        // re-attaches at /foo and not at sketch's launch directory.
+        let slot_cwd = match self.agent_ring() {
+            Some(r) => Some(r.active().cwd.clone()),
+            None => return,
+        };
         let (attach_tx, attach_rx) =
             std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
         let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
-        let cwd = std::env::current_dir().ok();
         let _ = std::thread::Builder::new()
             .name("sketch-acp-attach".into())
             .spawn(move || {
                 let _ = attach_tx.send(AcpChannelClient::spawn_with_resume_in(
                     &cmd,
-                    cwd,
+                    slot_cwd,
                     None,
                     sketch::acp_channel::SketchFrontend::Gpui,
                 ));
@@ -6751,11 +7899,15 @@ impl SketchGpuiView {
     /// spacers — and tag each with `TurnId::User(k)` so the gutter shows
     /// `Uk`. If the body is empty, no-op with a footer hint.
     fn submit_worksheet(&mut self, cx: &mut Context<Self>) {
+        // Capture server path info before borrowing agent_mut.
+        let server_sid = self.active_server_session_id();
+
         let claude = match self.agent_mut() {
             Some(c) => c,
             None => return,
         };
-        if claude.channel.is_none() {
+        // Check sendability: either direct channel or server session.
+        if claude.channel.is_none() && server_sid.is_none() {
             claude.status = Some("no channel attached".into());
             cx.notify();
             return;
@@ -6803,15 +7955,32 @@ impl SketchGpuiView {
                 .insert(anchor, TurnId::User(turn_k));
         }
 
-        // Send and update bookkeeping. `last_seen_turns` only ticks up
-        // when the agent's prompt response resolves, so we don't bump it
-        // here — `awaiting_reply` flips on instead.
-        if let Some(channel) = claude.channel.as_mut() {
-            let _ = channel.send(&prompt_body);
-            claude.awaiting_reply = true;
-            claude.turn_started = Some(std::time::Instant::now());
+        // Send and update bookkeeping.
+        let sent = if let Some(sid) = &server_sid {
+            // Server path: prompt via session server.
+            self.session_server.as_ref()
+                .and_then(|s| s.prompt(sid, &prompt_body).ok())
+                .is_some()
+        } else if let Some(claude) = self.agent_mut() {
+            // Direct path: send via AcpChannelClient.
+            if let Some(channel) = claude.channel.as_mut() {
+                channel.send(&prompt_body).is_ok()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if sent {
+            if let Some(claude) = self.agent_mut() {
+                claude.awaiting_reply = true;
+                claude.turn_started = Some(std::time::Instant::now());
+            }
         }
-        claude.editor.clear_selection();
+        if let Some(claude) = self.agent_mut() {
+            claude.editor.clear_selection();
+        }
         cx.notify();
     }
 
@@ -6820,6 +7989,9 @@ impl SketchGpuiView {
     /// `TurnId::User(k)`, send via the channel, clear the chatbox. Mode
     /// stays `Chatbox`.
     fn submit_chatbox(&mut self, cx: &mut Context<Self>) {
+        // Capture server path info before borrowing agent_mut.
+        let server_sid = self.active_server_session_id();
+
         let claude = match self.agent_mut() {
             Some(c) => c,
             None => return,
@@ -6833,7 +8005,7 @@ impl SketchGpuiView {
             cx.notify();
             return;
         }
-        if claude.channel.is_none() {
+        if claude.channel.is_none() && server_sid.is_none() {
             claude.status = Some("no channel attached".into());
             cx.notify();
             return;
@@ -6871,14 +8043,31 @@ impl SketchGpuiView {
 
         // Send.
         let prompt_body = text.trim_end_matches('\n').to_string();
-        if let Some(channel) = claude.channel.as_mut() {
-            let _ = channel.send(&prompt_body);
-            claude.awaiting_reply = true;
-            claude.turn_started = Some(std::time::Instant::now());
+        let sent = if let Some(sid) = &server_sid {
+            self.session_server.as_ref()
+                .and_then(|s| s.prompt(sid, &prompt_body).ok())
+                .is_some()
+        } else if let Some(claude) = self.agent_mut() {
+            if let Some(channel) = claude.channel.as_mut() {
+                channel.send(&prompt_body).is_ok()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if sent {
+            if let Some(claude) = self.agent_mut() {
+                claude.awaiting_reply = true;
+                claude.turn_started = Some(std::time::Instant::now());
+            }
         }
 
         // Reset the chatbox to empty; cursor stays inside.
-        claude.chatbox = Some(Chatbox::new());
+        if let Some(claude) = self.agent_mut() {
+            claude.chatbox = Some(Chatbox::new());
+        }
         cx.notify();
     }
 
@@ -6894,6 +8083,12 @@ impl SketchGpuiView {
         cx: &mut Context<Self>,
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
+
+        // Session switcher overlay intercepts all keys when open.
+        if self.session_switcher.is_some() {
+            self.handle_session_switcher_key(ev, _w, cx);
+            return;
+        }
 
         // Esc with a focused sub-agent: return to the parent transcript
         // (§27). Otherwise Esc falls through — the project rule is
@@ -7048,8 +8243,11 @@ impl Focusable for SketchGpuiView {
 
 impl Render for SketchGpuiView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.viewport_width_px = f32::from(_window.viewport_size().width);
+
         let has_overlay = self.menu.is_some()
             || self.buffer_switcher.is_some()
+            || self.session_switcher.is_some()
             || self.rename_overlay.is_some();
 
         // Build the screen content. When an overlay is OPEN, focus moves up
@@ -7126,6 +8324,22 @@ impl Render for SketchGpuiView {
                 }))
                 .child(screen_view)
                 .child(self.render_buffer_switcher(cx))
+                .into_any_element();
+        }
+
+        // Session switcher takes priority over menu.
+        if self.session_switcher.is_some() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("SessionSwitcherView")
+                .size_full()
+                .bg(editor_bg)
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_session_switcher_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_session_switcher(cx))
                 .into_any_element();
         }
 
@@ -7652,17 +8866,15 @@ impl SketchGpuiView {
         ring: &mut AgentRing,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let session_count = ring.len();
-        let active_session_idx = ring.active;
-
-        // Sidebar data snapshot (collected before we borrow the active slot).
-        let sidebar_entries: Vec<(usize, String, bool, bool, bool)> = ring.iter().enumerate().map(|(i, slot)| {
-            let is_active = i == active_session_idx;
-            let has_channel = slot.state.channel.is_some();
-            (slot.index, slot.label.clone(), is_active, slot.has_unseen_activity, has_channel)
-        }).collect();
+        // Legacy multi-session sidebar removed; the workspace tabs/splits
+        // model is the surface for running multiple agents. Sessions
+        // within a single ring remain reachable via Ctrl-]/Ctrl-[.
 
         let active_slot_label = ring.active().label.clone();
+        // Per-slot cwd (spec-agent-cwd.md §6). Cloned before the
+        // active_mut() reborrow so the Status Strip render can compare
+        // against the process cwd without holding two borrows on the ring.
+        let active_slot_cwd = ring.active().cwd.clone();
         let c = &mut ring.active_mut().state;
 
         let cursor = c.editor.cursor();
@@ -8127,6 +9339,16 @@ impl SketchGpuiView {
                 .child(SharedString::from(active_slot_label.clone())),
         );
 
+        // Session-server indicator.
+        if c.server_managed {
+            strip = strip.child(
+                div()
+                    .pr_2()
+                    .text_color(strip_dim)
+                    .child(SharedString::new_static("server")),
+            );
+        }
+
         // Sub-agent breadcrumb (only when focused).
         if let Some(idx) = c.focused_subagent {
             if let Some(sa) = c.subagents.get(idx) {
@@ -8138,6 +9360,22 @@ impl SketchGpuiView {
                         .child(SharedString::from(crumb)),
                 );
             }
+        }
+
+        // Per-slot cwd (spec-agent-cwd.md §6). Hidden when the slot cwd
+        // matches the process cwd — surfacing the implicit default on
+        // every session is noise. Tooltip with the absolute path is a
+        // follow-up (GPUI tooltip support is patchy on this version);
+        // for now the shortened display is the only affordance.
+        let proc_cwd = process_cwd();
+        if active_slot_cwd != proc_cwd {
+            let shortened = shorten_cwd_for_display(&active_slot_cwd);
+            strip = strip.child(
+                div()
+                    .pr_2()
+                    .text_color(strip_dim)
+                    .child(SharedString::from(shortened)),
+            );
         }
 
         // Model id (best-effort: agent_mode → channel description).
@@ -8291,7 +9529,13 @@ impl SketchGpuiView {
             .child(SharedString::from(hints));
 
         // Chatbox panel — rendered between body and footer when active.
-        let compose_panel = if let Some(tb) = &c.chatbox {
+        //
+        // Each line is rendered as a single non-wrapping row with horizontal
+        // viewport tracking. The cursor line scrolls horizontally so the
+        // caret is always on-screen; other lines render from column 0. This
+        // avoids the flex-wrap failure mode where long unbreakable tokens
+        // (URLs, paths, etc.) push the cursor off the visible area.
+        let compose_panel = if let Some(tb) = &mut c.chatbox {
             let compose_lines: Vec<String> = {
                 let doc = tb.editor.document();
                 (0..doc.line_count().max(1))
@@ -8309,8 +9553,19 @@ impl SketchGpuiView {
             let sep_color: Hsla = rgb(0x6272a4).into();
             let compose_bg: Hsla = rgb(0x1e1e2e).into();
             let compose_cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
-            let compose_base_style = self.theme.paragraph;
             let compose_code_font = self.code_font.clone();
+
+            // Visible columns computed from the actual window viewport width.
+            // Subtract padding (px_4 = 16px each side = 32px) plus some
+            // chrome margin. SF Mono at 13px is ~7.8px per glyph.
+            let compose_padding_px = 48.0f32; // px_4 + border + margin
+            let glyph_w = 7.8f32;
+            let usable_px = (self.viewport_width_px - compose_padding_px).max(100.0);
+            let visible_cols = ((usable_px / glyph_w) as usize).max(20);
+
+            // Update horizontal scroll to keep cursor visible.
+            tb.ensure_cursor_visible(compose_cursor_col, visible_cols);
+            let h_scroll = tb.h_scroll_col;
 
             let sep_label = if compose_mode == EditMode::Insert {
                 "── compose (insert) ──"
@@ -8326,9 +9581,11 @@ impl SketchGpuiView {
                 .font_family(compose_code_font.clone())
                 .child(SharedString::from(sep_label));
 
-            let max_visible_h = 8.0 * 18.0f32; // ~8 lines at 13px text
+            let max_visible_h = 8.0 * 18.0f32;
 
             let mut compose_inner = div()
+                .w_full()
+                .min_w_0()
                 .px_4()
                 .py(px(4.0))
                 .bg(compose_bg)
@@ -8337,49 +9594,56 @@ impl SketchGpuiView {
                 .text_color(rgb(DEFAULT_FG));
 
             for (i, line_text) in compose_lines.iter().enumerate() {
-                // Build segments with selection highlighting (same path as
-                // the main chat body).
-                let mut segs: Vec<Segment> =
-                    vec![(line_text.clone(), compose_base_style)];
-                if let Some(sel) = compose_sel {
-                    let line_chars = line_text.chars().count();
-                    if let Some((s, e_col)) =
-                        line_selection_range(sel, i, line_chars)
-                    {
-                        if e_col > s {
-                            segs =
-                                apply_selection_bg(&segs, s, e_col, SELECTION_BG);
-                        }
-                    }
-                }
+                let is_cursor_line = i == compose_cursor_line;
+                let line_chars: Vec<char> = line_text.chars().collect();
+                let total_cols = line_chars.len();
 
-                compose_inner = compose_inner.child(build_wrapped_line(
-                    &segs,
-                    line_text,
-                    i == compose_cursor_line,
-                    compose_cursor_col,
+                // On the cursor line, apply horizontal scroll. Other lines
+                // start at column 0 (no scroll).
+                let scroll_start = if is_cursor_line { h_scroll } else { 0 };
+
+                // Visible slice of the line.
+                let vis_start = scroll_start.min(total_cols);
+                let vis_text: String = line_chars[vis_start..].iter().collect();
+
+                // Cursor position relative to the visible window.
+                let vis_cursor_col = if is_cursor_line {
+                    compose_cursor_col.saturating_sub(scroll_start)
+                } else {
+                    0
+                };
+
+                // Build the visible line as a single-row element with the
+                // cursor inlined (no flex-wrap needed — the container clips).
+                let line_el = build_chatbox_line(
+                    &vis_text,
+                    is_cursor_line,
+                    vis_cursor_col,
                     compose_mode,
                     compose_cursor_color,
-                    compose_base_style,
-                    DEFAULT_FG,
+                    compose_sel,
+                    i,
+                    scroll_start,
+                    total_cols,
                     &compose_code_font,
-                ));
+                );
+
+                compose_inner = compose_inner.child(line_el);
             }
 
-            // Wrap in a scroll container with max height so compose
-            // doesn't consume the entire screen. GPUI's native scroll
-            // handles wrapped lines correctly (fixed pixel height +
-            // manual line windowing can't account for flex-wrap).
             let compose_scroll = tb.scroll_handle.clone();
             compose_scroll.scroll_to_item(compose_cursor_line);
             let compose_body = div()
                 .id("compose-scroll")
+                .w_full()
+                .min_w_0()
                 .max_h(px(max_visible_h))
                 .overflow_y_scroll()
+                .overflow_x_hidden()
                 .track_scroll(&compose_scroll)
                 .child(compose_inner);
 
-            Some(div().child(separator).child(compose_body))
+            Some(div().w_full().min_w_0().child(separator).child(compose_body))
         } else {
             None
         };
@@ -8543,154 +9807,38 @@ impl SketchGpuiView {
             None
         };
 
-        // Session sidebar — visible when more than one session exists.
-        let editor_bg = self.editor_bg();
-        let editor_fg = self.editor_fg();
-        let content_area: gpui::AnyElement = if session_count > 1 {
-            let weak_self = cx.entity().downgrade();
-            let mut sidebar = div()
-                .id("session-sidebar")
-                .flex()
-                .flex_col()
-                .w(px(160.0))
-                .min_w(px(160.0))
-                .border_r_1()
-                .border_color(rgb(0x44475a))
-                .bg(editor_bg)
-                .py_1()
-                .overflow_y_scroll();
-
-            for (slot_index, label, is_active, has_unseen, has_channel) in &sidebar_entries {
-                let slot_index = *slot_index;
-                let truncated: String = if label.len() > 16 {
-                    format!("{}…", &label[..15])
-                } else {
-                    label.clone()
-                };
-                let prefix = if *is_active {
-                    "● "
-                } else if *has_unseen {
-                    "• "
-                } else {
-                    "  "
-                };
-                let suffix = if !has_channel { " [d]" } else { "" };
-                let display = format!("{prefix}{truncated}{suffix}");
-
-                let weak = weak_self.clone();
-                let mut row = div()
-                    .id(SharedString::from(format!("session-{slot_index}")))
-                    .px_2()
-                    .py(px(2.0))
-                    .text_size(px(12.0))
-                    .cursor_pointer()
-                    .on_click(move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
-                        let _ = weak.update(app, |this, cx| {
-                            if let Some(ring) = this.agent_ring_mut() {
-                                if let Some(pos) = ring.slot_by_index(slot_index) {
-                                    ring.active = pos;
-                                    ring.slots[pos].has_unseen_activity = false;
-                                }
-                            }
-                            cx.notify();
-                        });
-                    });
-
-                if *is_active {
-                    row = row
-                        .bg(rgb(0x44475a))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(editor_fg);
-                } else if *has_unseen {
-                    row = row.text_color(rgb(0xf1fa8c));
-                } else {
-                    row = row.text_color(rgb(0x6272a4));
-                }
-
-                row = row.child(SharedString::from(display));
-                sidebar = sidebar.child(row);
-            }
-
-            // [+] button at the bottom
-            let weak_new = cx.entity().downgrade();
-            sidebar = sidebar.child(
+        let mut transcript_row = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .child(
                 div()
-                    .id("session-new-btn")
-                    .px_2()
-                    .py(px(2.0))
-                    .text_size(px(12.0))
-                    .text_color(rgb(0x6272a4))
-                    .cursor_pointer()
-                    .child("  [+] new")
-                    .on_click(move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
-                        let _ = weak_new.update(app, |this, cx| {
-                            this.new_agent_session(cx);
-                        });
-                    }),
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(body),
             );
+        if let Some(p) = tasklist_pane {
+            transcript_row = transcript_row.child(p);
+        }
+        if let Some(p) = subagents_pane {
+            transcript_row = transcript_row.child(p);
+        }
 
-            // Transcript row: body | tasklist | subagents (panes only
-            // appear when open per §1–§2). Below the row, the chatbox
-            // panel spans full width.
-            let mut transcript_row = div()
-                .flex()
-                .flex_row()
-                .flex_1()
-                .min_h_0()
-                .child(div().flex_1().min_w_0().child(body));
-            if let Some(p) = tasklist_pane {
-                transcript_row = transcript_row.child(p);
-            }
-            if let Some(p) = subagents_pane {
-                transcript_row = transcript_row.child(p);
-            }
-
-            let mut right_col = div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h_0()
-                .min_w_0()
-                .child(transcript_row);
-            if let Some(panel) = compose_panel {
-                right_col = right_col.child(panel);
-            }
-
-            div()
-                .flex()
-                .flex_row()
-                .flex_1()
-                .min_h_0()
-                .child(sidebar)
-                .child(right_col)
-                .into_any_element()
-        } else {
-            // No session sidebar. Same transcript-row + chatbox stack
-            // as the multi-session branch, without the left column.
-            let mut transcript_row = div()
-                .flex()
-                .flex_row()
-                .flex_1()
-                .min_h_0()
-                .child(div().flex_1().min_w_0().child(body));
-            if let Some(p) = tasklist_pane {
-                transcript_row = transcript_row.child(p);
-            }
-            if let Some(p) = subagents_pane {
-                transcript_row = transcript_row.child(p);
-            }
-
-            let mut col = div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h_0()
-                .child(transcript_row);
-            if let Some(panel) = compose_panel {
-                col = col.child(panel);
-            }
-            col.into_any_element()
-        };
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(transcript_row);
+        if let Some(panel) = compose_panel {
+            col = col.child(panel);
+        }
+        let content_area: gpui::AnyElement = col.into_any_element();
 
         root
             .key_context("AgentView")

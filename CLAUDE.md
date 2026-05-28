@@ -1,6 +1,59 @@
 # Sketch
 
-A terminal-based markdown editor built with Rust, ratatui, and crossterm.
+A markdown editor built with Rust. Ships as two binaries: a GPUI desktop GUI
+(`sketch-gpui`) and a terminal TUI (`sketch`) built on ratatui + crossterm.
+
+## Default surface: the GUI
+
+**Work on the GUI by default.** Unless the user says "TUI" or names the TUI by
+feature (debug overlay, viewport wrap math, etc.), assume new work targets
+`sketch-gpui`. Both binaries share the document/editor/render crates under
+`src/`, but the user-facing surface is the GPUI app.
+
+`cargo run --bin sketch-gpui [path]` launches it.
+
+### GUI layout
+
+- `src/bin/sketch-gpui/main.rs` — single ~7.9k-line file containing the GPUI
+  `Render` impl, every screen builder, action handlers, and key bindings.
+  The render path branches on `WindowContent` (Doc / Edit / Browser /
+  ClaudeSession), each with its own `key_context` (`SketchView`, `EditView`,
+  `BrowserView`, `ClaudeView`) and its own `on_action` wiring.
+- `src/bin/sketch-gpui/workspace.rs` — tab strip + n-ary split tree
+  (`Workspace<C>`, `FocusedWindow`, etc.). See `docs/specs/spec-tabs-and-splits.md`.
+
+### GUI screens
+
+- **Doc view (`SketchView`)** — rendered markdown, block-by-block. Cursor
+  is a left orange bar on the focused block; j/k or arrows move block focus.
+  Built from `RenderedBlock`s via `block_element` / `block_inner` /
+  `styled_line_element`.
+- **Edit view (`EditView`)** — raw markdown editing, two sub-views toggleable
+  with Ctrl-W:
+  - `EditView::Code` (RAW): monospace, line-number gutter, `md_highlight`
+    source colors.
+  - `EditView::WordProcessor` (WP): proportional font, per-line typographic
+    classification (`classify_wp_line`) for headings/lists/blockquote/code.
+- **Browser view (`BrowserView`)** — file picker for `Cmd+O`.
+- **Claude session (`ClaudeView`)** — ACP chat panel for the active session.
+
+### GUI key conventions
+
+Per-screen vim-style bindings live with `Some("SketchView")` etc. contexts.
+Global Cmd shortcuts (Quit, OpenBrowser, OpenClaude, tab/split management,
+zoom) are registered with `None` context and **must** have a matching
+`on_action(Self::handler)` on every screen's root so the dispatch lands.
+
+### Document text zoom
+
+`Cmd-=` / `Cmd-+` zoom in, `Cmd--` zooms out, `Cmd-0` resets. Implementation
+is a `text_scale: f32` on `SketchGpuiView` (clamped `[MIN_TEXT_SCALE, MAX_TEXT_SCALE]`,
+step `TEXT_SCALE_STEP = 1.1`) that multiplies the body `text_size(px(14.0))`
+and every heading size. Threaded into `RenderCtx::text_scale` for block
+rendering. **Chrome stays fixed** — status bars, tab strip, browser rows,
+Claude session blocks all render at their native sizes. To extend the zoom
+to a new surface, multiply that surface's base `text_size` by `self.text_scale`
+and add `on_action(Self::zoom_in/out/reset)` to its root.
 
 ## Naming Conventions
 
@@ -15,7 +68,11 @@ Two top-level modes:
 
 In code, `ViewMode::Rendered` corresponds to View Mode, and `ViewMode::Raw` corresponds to Edit Mode. `AppMode::Normal` and `AppMode::Insert` are the Edit Mode submodes.
 
-## Architecture
+(The TUI uses the View/Edit terminology above. The GPUI app uses the screen
+names from "GUI screens" — they don't perfectly correspond, since the GUI's
+EditView itself has Code/WordProcessor sub-modes that the TUI doesn't have.)
+
+## TUI Architecture
 
 - `app.rs` — main application loop, input handling, state management
 - `view.rs` — rendering (both rendered and raw modes)
@@ -28,7 +85,7 @@ In code, `ViewMode::Rendered` corresponds to View Mode, and `ViewMode::Raw` corr
 - `theme.rs` — color themes
 - `blocks.rs` — rendered block types (Heading, Paragraph, Table, etc.)
 
-## Debug Overlay
+## Debug Overlay (TUI)
 
 Run with `SKETCH_DEBUG=1` to capture per-frame ground-truth state from the
 renderer to a JSON-lines log:
