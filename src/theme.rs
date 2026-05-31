@@ -102,6 +102,90 @@ pub struct Theme {
     /// Default foreground used when a span has no explicit color (or
     /// `Color::Reset`). The GPUI binary's `DEFAULT_FG` fallback.
     pub editor_fg: Color,
+    /// Agent session window theming — colors for the Claude chat surface.
+    pub agent: AgentTheme,
+}
+
+/// Colors and accents for the agent (Claude) session window. Every
+/// hardcoded hex in the old `render_agent` path has been lifted here
+/// so light/dark themes can customise the entire chat surface.
+#[derive(Debug, Clone)]
+pub struct AgentTheme {
+    // -- left margin indicators --
+    /// Left bar color for frozen (Claude) lines.
+    pub frozen_bar: Color,
+    /// Left bar color for user-authored lines.
+    pub user_bar: Color,
+    /// Gutter label color for tool-call anchors.
+    pub tool_label: Color,
+    /// Dim/muted accent for gutters, arrows, etc.
+    pub dim: Color,
+
+    // -- author tints applied to base-style text --
+    /// Tint applied to Claude prose (lines with no syntax highlight).
+    pub agent_tint: Color,
+    /// Tint applied to user prose.
+    pub user_tint: Color,
+    /// Text color for frozen (Claude) lines.
+    pub frozen_fg: Color,
+
+    // -- turn card backgrounds --
+    /// Background tint for Claude turn cards (subtle).
+    pub agent_turn_bg: Color,
+    /// Background tint for user turn cards (subtle).
+    pub user_turn_bg: Color,
+
+    // -- turn separator --
+    /// Color of the turn header label ("Claude" / "You").
+    pub turn_header_agent: Color,
+    pub turn_header_user: Color,
+    /// Color of the horizontal rule in turn separators.
+    pub turn_rule: Color,
+
+    // -- tool call cards --
+    /// Background for tool call card containers.
+    pub tool_card_bg: Color,
+    /// Border color for tool call cards.
+    pub tool_card_border: Color,
+    /// Tool status glyphs.
+    pub tool_completed: Color,
+    pub tool_in_progress: Color,
+    pub tool_failed: Color,
+    pub tool_pending: Color,
+
+    // -- tool body panes --
+    /// Background for tool input/content panes.
+    pub tool_body_bg: Color,
+    /// Background for tool output panes.
+    pub tool_output_bg: Color,
+    /// Text color inside tool body panes.
+    pub tool_body_fg: Color,
+
+    // -- diff highlighting in tool output --
+    /// Color for `+` (added) lines in diffs.
+    pub diff_add: Color,
+    /// Color for `-` (removed) lines in diffs.
+    pub diff_remove: Color,
+    /// Color for diff header (`---` / `+++` / `@@`) lines.
+    pub diff_header: Color,
+
+    // -- compose panel --
+    /// Background for the compose (chatbox) input area.
+    pub compose_bg: Color,
+    /// Separator line above the compose panel.
+    pub compose_separator: Color,
+    /// Cursor color in the agent window.
+    pub cursor: Color,
+
+    // -- sidepane chrome --
+    /// Background for sidepanes (tasklist, subagents).
+    pub pane_bg: Color,
+    /// Border between sidepanes and the main transcript.
+    pub pane_border: Color,
+    /// Header text color in sidepanes.
+    pub pane_header: Color,
+    /// Active/warm accent (in-flight timer, focused subagent).
+    pub warm_accent: Color,
 }
 
 impl Theme {
@@ -194,6 +278,7 @@ impl Theme {
             line_number_current: Style::default().fg(Color::Rgb(248, 248, 242)),
             editor_bg: Color::Rgb(40, 42, 54),
             editor_fg: Color::Rgb(248, 248, 242),
+            agent: AgentTheme::dracula(),
         }
     }
 
@@ -309,6 +394,7 @@ impl Theme {
             line_number_current: Style::default().fg(Color::Rgb(0xd8, 0xde, 0xe9)),
             editor_bg: Color::Rgb(0x13, 0x1a, 0x24),
             editor_fg: Color::Rgb(0xcd, 0xce, 0xcf),
+            agent: AgentTheme::nightfox(),
         }
     }
 
@@ -399,6 +485,7 @@ impl Theme {
             line_number_current: Style::default().fg(Color::Rgb(0x00, 0x2b, 0x36)),
             editor_bg: Color::Rgb(0xfd, 0xf6, 0xe3), // base3
             editor_fg: Color::Rgb(0x58, 0x6e, 0x75), // base01
+            agent: AgentTheme::solarized_light(),
         }
     }
 
@@ -489,6 +576,7 @@ impl Theme {
             line_number_current: Style::default().fg(Color::Rgb(0xfd, 0xf6, 0xe3)),
             editor_bg: Color::Rgb(0x00, 0x2b, 0x36), // base03
             editor_fg: Color::Rgb(0x83, 0x94, 0x96), // base0
+            agent: AgentTheme::solarized_dark(),
         }
     }
 
@@ -578,6 +666,7 @@ impl Theme {
             line_number_current: Style::default().fg(Color::Rgb(0xeb, 0xdb, 0xb2)),
             editor_bg: Color::Rgb(0x1d, 0x20, 0x21),
             editor_fg: Color::Rgb(0xeb, 0xdb, 0xb2),
+            agent: AgentTheme::gruvbox_dark(),
         }
     }
 
@@ -672,6 +761,7 @@ impl Theme {
             line_number_current: Style::default().fg(Color::Rgb(0x33, 0x30, 0x2e)),
             editor_bg: Color::Rgb(0xff, 0xf1, 0xe5), // paper
             editor_fg: Color::Rgb(0x33, 0x30, 0x2e), // slate
+            agent: AgentTheme::financial_times(),
         }
     }
 
@@ -765,6 +855,7 @@ impl Theme {
             line_number_current: Style::default().fg(Color::Rgb(0xff, 0xf1, 0xe5)),
             editor_bg: Color::Rgb(0x1a, 0x1a, 0x1a), // charcoal
             editor_fg: Color::Rgb(0xf2, 0xdf, 0xce), // wheat
+            agent: AgentTheme::financial_times_dark(),
         }
     }
 
@@ -781,5 +872,322 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self::dracula()
+    }
+}
+
+impl AgentTheme {
+    /// Dracula agent palette — cyan/green accents on the classic dark surface.
+    pub fn dracula() -> Self {
+        Self {
+            frozen_bar: Color::Rgb(0x8b, 0xe9, 0xfd),    // cyan
+            user_bar: Color::Rgb(0x50, 0xfa, 0x7b),      // green
+            tool_label: Color::Rgb(0xf1, 0xfa, 0x8c),    // yellow
+            dim: Color::Rgb(0x62, 0x72, 0xa4),            // comment
+
+            agent_tint: Color::Rgb(0xa9, 0xd0, 0xe0),    // cool gray-blue
+            user_tint: Color::Rgb(0xb8, 0xe0, 0x9a),     // warm green
+            frozen_fg: Color::Rgb(0xb6, 0xc4, 0xd6),     // muted blue-gray
+
+            agent_turn_bg: Color::Rgb(0x23, 0x27, 0x36),  // subtle cool tint
+            user_turn_bg: Color::Rgb(0x24, 0x2b, 0x24),   // subtle warm tint
+
+            turn_header_agent: Color::Rgb(0x8b, 0xe9, 0xfd),
+            turn_header_user: Color::Rgb(0x50, 0xfa, 0x7b),
+            turn_rule: Color::Rgb(0x44, 0x47, 0x5a),
+
+            tool_card_bg: Color::Rgb(0x21, 0x22, 0x2c),
+            tool_card_border: Color::Rgb(0x44, 0x47, 0x5a),
+            tool_completed: Color::Rgb(0x50, 0xfa, 0x7b),
+            tool_in_progress: Color::Rgb(0xf1, 0xfa, 0x8c),
+            tool_failed: Color::Rgb(0xff, 0x55, 0x55),
+            tool_pending: Color::Rgb(0x62, 0x72, 0xa4),
+
+            tool_body_bg: Color::Rgb(0x1e, 0x1f, 0x29),
+            tool_output_bg: Color::Rgb(0x28, 0x2a, 0x36),
+            tool_body_fg: Color::Rgb(0xbf, 0xbf, 0xbf),
+
+            diff_add: Color::Rgb(0x50, 0xfa, 0x7b),
+            diff_remove: Color::Rgb(0xff, 0x55, 0x55),
+            diff_header: Color::Rgb(0xbd, 0x93, 0xf9),    // purple
+
+            compose_bg: Color::Rgb(0x1e, 0x1e, 0x2e),
+            compose_separator: Color::Rgb(0x62, 0x72, 0xa4),
+            cursor: Color::Rgb(0xff, 0x55, 0x55),
+
+            pane_bg: Color::Rgb(0x21, 0x22, 0x2c),
+            pane_border: Color::Rgb(0x44, 0x47, 0x5a),
+            pane_header: Color::Rgb(0x8b, 0xe9, 0xfd),
+            warm_accent: Color::Rgb(0xf1, 0xfa, 0x8c),
+        }
+    }
+
+    /// Nightfox agent palette — cool blues and greens on deep navy.
+    pub fn nightfox() -> Self {
+        Self {
+            frozen_bar: Color::Rgb(0x63, 0xcd, 0xcf),    // cyan
+            user_bar: Color::Rgb(0x81, 0xb2, 0x9a),      // green
+            tool_label: Color::Rgb(0xdb, 0xc0, 0x74),    // yellow
+            dim: Color::Rgb(0x39, 0x50, 0x6d),            // bg4
+
+            agent_tint: Color::Rgb(0x9a, 0xbe, 0xd0),
+            user_tint: Color::Rgb(0xa3, 0xc9, 0xb3),
+            frozen_fg: Color::Rgb(0xa0, 0xb4, 0xc8),
+
+            agent_turn_bg: Color::Rgb(0x16, 0x1f, 0x2d),
+            user_turn_bg: Color::Rgb(0x17, 0x20, 0x1e),
+
+            turn_header_agent: Color::Rgb(0x63, 0xcd, 0xcf),
+            turn_header_user: Color::Rgb(0x81, 0xb2, 0x9a),
+            turn_rule: Color::Rgb(0x2b, 0x3b, 0x51),      // sel0
+
+            tool_card_bg: Color::Rgb(0x17, 0x1e, 0x28),
+            tool_card_border: Color::Rgb(0x2b, 0x3b, 0x51),
+            tool_completed: Color::Rgb(0x81, 0xb2, 0x9a),
+            tool_in_progress: Color::Rgb(0xdb, 0xc0, 0x74),
+            tool_failed: Color::Rgb(0xc9, 0x4f, 0x6d),
+            tool_pending: Color::Rgb(0x39, 0x50, 0x6d),
+
+            tool_body_bg: Color::Rgb(0x14, 0x1b, 0x25),
+            tool_output_bg: Color::Rgb(0x19, 0x23, 0x30),
+            tool_body_fg: Color::Rgb(0xae, 0xaf, 0xb0),
+
+            diff_add: Color::Rgb(0x81, 0xb2, 0x9a),
+            diff_remove: Color::Rgb(0xc9, 0x4f, 0x6d),
+            diff_header: Color::Rgb(0x9d, 0x79, 0xd6),
+
+            compose_bg: Color::Rgb(0x14, 0x1b, 0x25),
+            compose_separator: Color::Rgb(0x39, 0x50, 0x6d),
+            cursor: Color::Rgb(0xc9, 0x4f, 0x6d),
+
+            pane_bg: Color::Rgb(0x17, 0x1e, 0x28),
+            pane_border: Color::Rgb(0x2b, 0x3b, 0x51),
+            pane_header: Color::Rgb(0x63, 0xcd, 0xcf),
+            warm_accent: Color::Rgb(0xdb, 0xc0, 0x74),
+        }
+    }
+
+    /// Solarized Light agent palette — warm beige with muted accents.
+    pub fn solarized_light() -> Self {
+        Self {
+            frozen_bar: Color::Rgb(0x26, 0x8b, 0xd2),    // blue
+            user_bar: Color::Rgb(0x85, 0x99, 0x00),       // green
+            tool_label: Color::Rgb(0xb5, 0x89, 0x00),     // yellow
+            dim: Color::Rgb(0x93, 0xa1, 0xa1),             // base1
+
+            agent_tint: Color::Rgb(0x3b, 0x6e, 0x8c),
+            user_tint: Color::Rgb(0x5a, 0x6e, 0x20),
+            frozen_fg: Color::Rgb(0x47, 0x60, 0x6e),
+
+            agent_turn_bg: Color::Rgb(0xf0, 0xeb, 0xdd),  // barely darker than paper
+            user_turn_bg: Color::Rgb(0xef, 0xf0, 0xdc),   // barely green tint
+
+            turn_header_agent: Color::Rgb(0x26, 0x8b, 0xd2),
+            turn_header_user: Color::Rgb(0x85, 0x99, 0x00),
+            turn_rule: Color::Rgb(0xd3, 0xcc, 0xbc),
+
+            tool_card_bg: Color::Rgb(0xee, 0xe8, 0xd5),   // base2
+            tool_card_border: Color::Rgb(0xd3, 0xcc, 0xbc),
+            tool_completed: Color::Rgb(0x85, 0x99, 0x00),
+            tool_in_progress: Color::Rgb(0xb5, 0x89, 0x00),
+            tool_failed: Color::Rgb(0xdc, 0x32, 0x2f),
+            tool_pending: Color::Rgb(0x93, 0xa1, 0xa1),
+
+            tool_body_bg: Color::Rgb(0xee, 0xe8, 0xd5),
+            tool_output_bg: Color::Rgb(0xfd, 0xf6, 0xe3),
+            tool_body_fg: Color::Rgb(0x65, 0x7b, 0x83),
+
+            diff_add: Color::Rgb(0x85, 0x99, 0x00),
+            diff_remove: Color::Rgb(0xdc, 0x32, 0x2f),
+            diff_header: Color::Rgb(0x6c, 0x71, 0xc4),    // violet
+
+            compose_bg: Color::Rgb(0xee, 0xe8, 0xd5),
+            compose_separator: Color::Rgb(0x93, 0xa1, 0xa1),
+            cursor: Color::Rgb(0xdc, 0x32, 0x2f),
+
+            pane_bg: Color::Rgb(0xee, 0xe8, 0xd5),
+            pane_border: Color::Rgb(0xd3, 0xcc, 0xbc),
+            pane_header: Color::Rgb(0x26, 0x8b, 0xd2),
+            warm_accent: Color::Rgb(0xb5, 0x89, 0x00),
+        }
+    }
+
+    /// Solarized Dark agent palette — deep teal surface with solar accents.
+    pub fn solarized_dark() -> Self {
+        Self {
+            frozen_bar: Color::Rgb(0x26, 0x8b, 0xd2),
+            user_bar: Color::Rgb(0x85, 0x99, 0x00),
+            tool_label: Color::Rgb(0xb5, 0x89, 0x00),
+            dim: Color::Rgb(0x58, 0x6e, 0x75),
+
+            agent_tint: Color::Rgb(0x6e, 0x9e, 0xb5),
+            user_tint: Color::Rgb(0x8a, 0x9e, 0x50),
+            frozen_fg: Color::Rgb(0x78, 0x8e, 0x96),
+
+            agent_turn_bg: Color::Rgb(0x02, 0x30, 0x3c),
+            user_turn_bg: Color::Rgb(0x04, 0x2e, 0x30),
+
+            turn_header_agent: Color::Rgb(0x26, 0x8b, 0xd2),
+            turn_header_user: Color::Rgb(0x85, 0x99, 0x00),
+            turn_rule: Color::Rgb(0x07, 0x42, 0x4e),
+
+            tool_card_bg: Color::Rgb(0x04, 0x2d, 0x38),
+            tool_card_border: Color::Rgb(0x07, 0x42, 0x4e),
+            tool_completed: Color::Rgb(0x85, 0x99, 0x00),
+            tool_in_progress: Color::Rgb(0xb5, 0x89, 0x00),
+            tool_failed: Color::Rgb(0xdc, 0x32, 0x2f),
+            tool_pending: Color::Rgb(0x58, 0x6e, 0x75),
+
+            tool_body_bg: Color::Rgb(0x01, 0x27, 0x32),
+            tool_output_bg: Color::Rgb(0x00, 0x2b, 0x36),
+            tool_body_fg: Color::Rgb(0x83, 0x94, 0x96),
+
+            diff_add: Color::Rgb(0x85, 0x99, 0x00),
+            diff_remove: Color::Rgb(0xdc, 0x32, 0x2f),
+            diff_header: Color::Rgb(0x6c, 0x71, 0xc4),
+
+            compose_bg: Color::Rgb(0x01, 0x27, 0x32),
+            compose_separator: Color::Rgb(0x58, 0x6e, 0x75),
+            cursor: Color::Rgb(0xdc, 0x32, 0x2f),
+
+            pane_bg: Color::Rgb(0x04, 0x2d, 0x38),
+            pane_border: Color::Rgb(0x07, 0x42, 0x4e),
+            pane_header: Color::Rgb(0x26, 0x8b, 0xd2),
+            warm_accent: Color::Rgb(0xb5, 0x89, 0x00),
+        }
+    }
+
+    /// Gruvbox Dark agent palette — warm earthy tones on a dark surface.
+    pub fn gruvbox_dark() -> Self {
+        Self {
+            frozen_bar: Color::Rgb(0x83, 0xa5, 0x98),    // blue
+            user_bar: Color::Rgb(0xb8, 0xbb, 0x26),      // green
+            tool_label: Color::Rgb(0xfa, 0xbd, 0x2f),    // yellow
+            dim: Color::Rgb(0x50, 0x49, 0x45),            // bg2
+
+            agent_tint: Color::Rgb(0x9b, 0xb5, 0xa8),
+            user_tint: Color::Rgb(0xc0, 0xc4, 0x6e),
+            frozen_fg: Color::Rgb(0xb0, 0xaa, 0x8e),
+
+            agent_turn_bg: Color::Rgb(0x20, 0x24, 0x26),
+            user_turn_bg: Color::Rgb(0x24, 0x24, 0x1e),
+
+            turn_header_agent: Color::Rgb(0x83, 0xa5, 0x98),
+            turn_header_user: Color::Rgb(0xb8, 0xbb, 0x26),
+            turn_rule: Color::Rgb(0x3c, 0x38, 0x36),      // bg1
+
+            tool_card_bg: Color::Rgb(0x1f, 0x1e, 0x1e),
+            tool_card_border: Color::Rgb(0x3c, 0x38, 0x36),
+            tool_completed: Color::Rgb(0xb8, 0xbb, 0x26),
+            tool_in_progress: Color::Rgb(0xfa, 0xbd, 0x2f),
+            tool_failed: Color::Rgb(0xfb, 0x49, 0x34),
+            tool_pending: Color::Rgb(0x50, 0x49, 0x45),
+
+            tool_body_bg: Color::Rgb(0x1a, 0x1a, 0x1a),
+            tool_output_bg: Color::Rgb(0x1d, 0x20, 0x21),
+            tool_body_fg: Color::Rgb(0xa8, 0x99, 0x84),
+
+            diff_add: Color::Rgb(0xb8, 0xbb, 0x26),
+            diff_remove: Color::Rgb(0xfb, 0x49, 0x34),
+            diff_header: Color::Rgb(0xd3, 0x86, 0x9b),    // purple
+
+            compose_bg: Color::Rgb(0x1a, 0x1a, 0x1a),
+            compose_separator: Color::Rgb(0x50, 0x49, 0x45),
+            cursor: Color::Rgb(0xfb, 0x49, 0x34),
+
+            pane_bg: Color::Rgb(0x1f, 0x1e, 0x1e),
+            pane_border: Color::Rgb(0x3c, 0x38, 0x36),
+            pane_header: Color::Rgb(0xfa, 0xbd, 0x2f),
+            warm_accent: Color::Rgb(0xfa, 0xbd, 0x2f),
+        }
+    }
+
+    /// Financial Times agent palette — salmon paper with claret/oxford accents.
+    pub fn financial_times() -> Self {
+        Self {
+            frozen_bar: Color::Rgb(0x0f, 0x54, 0x99),    // oxford
+            user_bar: Color::Rgb(0x0d, 0x76, 0x80),       // teal
+            tool_label: Color::Rgb(0xff, 0x88, 0x33),      // mandarin
+            dim: Color::Rgb(0xcc, 0xc1, 0xb7),
+
+            agent_tint: Color::Rgb(0x2a, 0x5a, 0x80),
+            user_tint: Color::Rgb(0x1a, 0x5e, 0x62),
+            frozen_fg: Color::Rgb(0x44, 0x42, 0x40),
+
+            agent_turn_bg: Color::Rgb(0xf8, 0xec, 0xdd),
+            user_turn_bg: Color::Rgb(0xf0, 0xf2, 0xe0),
+
+            turn_header_agent: Color::Rgb(0x0f, 0x54, 0x99),
+            turn_header_user: Color::Rgb(0x0d, 0x76, 0x80),
+            turn_rule: Color::Rgb(0xd8, 0xd0, 0xc4),
+
+            tool_card_bg: Color::Rgb(0xf2, 0xdf, 0xce),   // wheat
+            tool_card_border: Color::Rgb(0xd8, 0xd0, 0xc4),
+            tool_completed: Color::Rgb(0x0d, 0x76, 0x80),
+            tool_in_progress: Color::Rgb(0xff, 0x88, 0x33),
+            tool_failed: Color::Rgb(0x99, 0x0f, 0x3d),
+            tool_pending: Color::Rgb(0xcc, 0xc1, 0xb7),
+
+            tool_body_bg: Color::Rgb(0xf2, 0xdf, 0xce),
+            tool_output_bg: Color::Rgb(0xff, 0xf1, 0xe5),
+            tool_body_fg: Color::Rgb(0x33, 0x30, 0x2e),
+
+            diff_add: Color::Rgb(0x0d, 0x76, 0x80),
+            diff_remove: Color::Rgb(0x99, 0x0f, 0x3d),
+            diff_header: Color::Rgb(0x0f, 0x54, 0x99),
+
+            compose_bg: Color::Rgb(0xf2, 0xdf, 0xce),
+            compose_separator: Color::Rgb(0xcc, 0xc1, 0xb7),
+            cursor: Color::Rgb(0x99, 0x0f, 0x3d),
+
+            pane_bg: Color::Rgb(0xf2, 0xdf, 0xce),
+            pane_border: Color::Rgb(0xd8, 0xd0, 0xc4),
+            pane_header: Color::Rgb(0x99, 0x0f, 0x3d),
+            warm_accent: Color::Rgb(0xff, 0x88, 0x33),
+        }
+    }
+
+    /// Financial Times Dark agent palette — warm charcoal with bright accents.
+    pub fn financial_times_dark() -> Self {
+        Self {
+            frozen_bar: Color::Rgb(0x5e, 0xa7, 0xd9),    // oxford-bright
+            user_bar: Color::Rgb(0x34, 0xb0, 0xb8),       // teal-bright
+            tool_label: Color::Rgb(0xff, 0x88, 0x33),
+            dim: Color::Rgb(0x4a, 0x44, 0x40),
+
+            agent_tint: Color::Rgb(0x80, 0xb0, 0xcc),
+            user_tint: Color::Rgb(0x5a, 0xb8, 0xb0),
+            frozen_fg: Color::Rgb(0xc0, 0xb4, 0xa8),
+
+            agent_turn_bg: Color::Rgb(0x1e, 0x1d, 0x1c),
+            user_turn_bg: Color::Rgb(0x1c, 0x1f, 0x1e),
+
+            turn_header_agent: Color::Rgb(0x5e, 0xa7, 0xd9),
+            turn_header_user: Color::Rgb(0x34, 0xb0, 0xb8),
+            turn_rule: Color::Rgb(0x36, 0x32, 0x2e),
+
+            tool_card_bg: Color::Rgb(0x22, 0x1f, 0x1d),
+            tool_card_border: Color::Rgb(0x36, 0x32, 0x2e),
+            tool_completed: Color::Rgb(0x34, 0xb0, 0xb8),
+            tool_in_progress: Color::Rgb(0xff, 0x88, 0x33),
+            tool_failed: Color::Rgb(0xd6, 0x3b, 0x6a),
+            tool_pending: Color::Rgb(0x4a, 0x44, 0x40),
+
+            tool_body_bg: Color::Rgb(0x1e, 0x1b, 0x19),
+            tool_output_bg: Color::Rgb(0x1a, 0x1a, 0x1a),
+            tool_body_fg: Color::Rgb(0xa8, 0x9d, 0x95),
+
+            diff_add: Color::Rgb(0x34, 0xb0, 0xb8),
+            diff_remove: Color::Rgb(0xd6, 0x3b, 0x6a),
+            diff_header: Color::Rgb(0x5e, 0xa7, 0xd9),
+
+            compose_bg: Color::Rgb(0x1e, 0x1b, 0x19),
+            compose_separator: Color::Rgb(0x4a, 0x44, 0x40),
+            cursor: Color::Rgb(0xd6, 0x3b, 0x6a),
+
+            pane_bg: Color::Rgb(0x22, 0x1f, 0x1d),
+            pane_border: Color::Rgb(0x36, 0x32, 0x2e),
+            pane_header: Color::Rgb(0xd6, 0x3b, 0x6a),
+            warm_accent: Color::Rgb(0xff, 0x88, 0x33),
+        }
     }
 }

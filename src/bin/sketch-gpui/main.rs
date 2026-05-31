@@ -247,6 +247,13 @@ const TEXT_SCALE_STEP: f32 = 1.1;
 const MIN_TEXT_SCALE: f32 = 0.5;
 const MAX_TEXT_SCALE: f32 = 3.0;
 
+/// Convert a `NColor` to `Hsla`, using a hardcoded white fallback for
+/// `Reset` / `Indexed` variants. Suitable for agent theme colors which
+/// are always `Color::Rgb` and never need a real fallback.
+fn nc(c: NColor) -> Hsla {
+    ncolor_to_hsla(c, DEFAULT_FG)
+}
+
 fn ncolor_to_hsla(c: NColor, fallback: u32) -> Hsla {
     match c {
         NColor::Reset => rgb(fallback).into(),
@@ -2117,6 +2124,12 @@ enum FlatItem {
     /// A structurally-rendered block (table or fenced code block) that
     /// replaces a range of frozen lines with proper layout.
     Block(RenderedBlock),
+    /// Visual separator inserted between turns (Claude→You, You→Claude).
+    /// The label is "Claude" or "You" and rendered as a centered legend.
+    TurnSeparator {
+        label: &'static str,
+        is_agent: bool,
+    },
 }
 
 /// Free-function variant of `SketchGpuiView::build_tool_block` that
@@ -2130,15 +2143,17 @@ fn build_tool_block_with_weak(
     expanded: bool,
     code_font: &SharedString,
     weak_view: gpui::WeakEntity<SketchGpuiView>,
+    at: &sketch::theme::AgentTheme,
 ) -> AnyElement {
     use sketch::acp_channel::ToolCallStatus;
     let (status_glyph, status_color): (&str, Hsla) = match tc.status {
-        ToolCallStatus::Pending => ("○", rgb(0x6272a4).into()),
-        ToolCallStatus::InProgress => ("◐", rgb(0xf1fa8c).into()),
-        ToolCallStatus::Completed => ("●", rgb(0x50fa7b).into()),
-        ToolCallStatus::Failed => ("✗", rgb(0xff5555).into()),
-        _ => ("·", rgb(0x6272a4).into()),
+        ToolCallStatus::Pending => ("○", nc(at.tool_pending)),
+        ToolCallStatus::InProgress => ("◐", nc(at.tool_in_progress)),
+        ToolCallStatus::Completed => ("●", nc(at.tool_completed)),
+        ToolCallStatus::Failed => ("✗", nc(at.tool_failed)),
+        _ => ("·", nc(at.tool_pending)),
     };
+    let dim_color = nc(at.dim);
     let policy = tool_render_policy(tc);
     let title = if tc.title.is_empty() {
         "(tool)".to_string()
@@ -2159,16 +2174,17 @@ fn build_tool_block_with_weak(
         .flex_row()
         .items_center()
         .gap_2()
-        .py_1()
-        .child(div().text_color(rgb(0x6272a4)).child(arrow))
+        .py(px(5.0))
+        .px_2()
+        .child(div().text_color(dim_color).child(arrow))
         .child(div().text_color(status_color).child(status_glyph))
         .child(
             div()
-                .text_color(rgb(0xbfbfbf))
+                .text_color(nc(at.tool_body_fg))
                 .text_size(px(12.0))
                 .child(format!("[{:?}]", tc.kind).to_lowercase()),
         )
-        .child(div().flex_1().text_color(rgb(DEFAULT_FG)).child(title));
+        .child(div().flex_1().text_color(nc(at.frozen_fg)).child(title));
 
     if has_body {
         let id_for_click = id_str.clone();
@@ -2193,9 +2209,10 @@ fn build_tool_block_with_weak(
         .flex()
         .flex_col()
         .my_1()
-        .pl_4()
+        .pl_2()
+        .ml_2()
         .border_l_2()
-        .border_color(rgb(0x44475a))
+        .border_color(nc(at.tool_card_border))
         .child(summary_row);
 
     if expanded && has_body {
@@ -2203,6 +2220,12 @@ fn build_tool_block_with_weak(
             ToolRenderPolicy::Truncated { max_lines } => Some(max_lines),
             _ => None,
         };
+        let body_bg = nc(at.tool_body_bg);
+        let output_bg = nc(at.tool_output_bg);
+        let body_fg = nc(at.tool_body_fg);
+        let diff_add = nc(at.diff_add);
+        let diff_remove = nc(at.diff_remove);
+        let diff_header = nc(at.diff_header);
         if let Some(input) = &tc.raw_input {
             let pretty =
                 serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
@@ -2210,8 +2233,12 @@ fn build_tool_block_with_weak(
                 "input",
                 &pretty,
                 None,
-                rgb(0x1e1f29),
+                body_bg,
+                body_fg,
                 code_font,
+                diff_add,
+                diff_remove,
+                diff_header,
             ));
         }
         let content_text = render_tool_content_blocks(&tc.content);
@@ -2220,8 +2247,12 @@ fn build_tool_block_with_weak(
                 "content",
                 &content_text,
                 max_lines,
-                rgb(0x1e1f29),
+                body_bg,
+                body_fg,
                 code_font,
+                diff_add,
+                diff_remove,
+                diff_header,
             ));
         }
         if let Some(output) = &tc.raw_output {
@@ -2231,8 +2262,12 @@ fn build_tool_block_with_weak(
                 "output",
                 &pretty,
                 max_lines,
-                rgb(0x282a36),
+                output_bg,
+                body_fg,
                 code_font,
+                diff_add,
+                diff_remove,
+                diff_header,
             ));
         }
     }
@@ -2247,22 +2282,57 @@ fn tool_body_pane_free(
     label: &str,
     body: &str,
     max_lines: Option<usize>,
-    bg: gpui::Rgba,
+    bg: Hsla,
+    fg: Hsla,
     code_font: &SharedString,
+    diff_add: Hsla,
+    diff_remove: Hsla,
+    diff_header: Hsla,
 ) -> gpui::Div {
     let display = match max_lines {
         Some(n) => truncate_lines(body, n),
         None => body.to_string(),
     };
-    div()
+
+    // Build diff-highlighted lines: color +/- lines and diff headers.
+    let mut container = div()
         .mt_1()
+        .mx_2()
         .px_2()
         .py_1()
+        .rounded_sm()
         .bg(bg)
         .text_size(px(11.0))
-        .text_color(rgb(0xbfbfbf))
-        .font_family(code_font.clone())
-        .child(format!("{}:\n{}", label, display))
+        .text_color(fg)
+        .font_family(code_font.clone());
+
+    // Label
+    container = container.child(
+        div()
+            .text_size(px(10.0))
+            .pb(px(2.0))
+            .child(SharedString::from(format!("{}:", label))),
+    );
+
+    // Diff-highlighted body lines.
+    for line in display.lines() {
+        let color = if line.starts_with("+ ") || line.starts_with("+\t") || line == "+" {
+            diff_add
+        } else if line.starts_with("- ") || line.starts_with("-\t") || line == "-" {
+            diff_remove
+        } else if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("@@ ") {
+            diff_header
+        } else {
+            fg
+        };
+        container = container.child(
+            div()
+                .text_color(color)
+                .child(SharedString::from(line.to_string())),
+        );
+    }
+
+    container
 }
 
 /// How much of a tool call's body to render when expanded. Mirrors the
@@ -8881,13 +8951,14 @@ impl SketchGpuiView {
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
         let line_count = c.editor.document().line_count();
-        let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
-        let dim_fg: Hsla = rgb(0x6272a4).into();
+        let at = &self.theme.agent; // shorthand for agent theme
+        let cursor_color: Hsla = nc(at.cursor);
+        let dim_fg: Hsla = nc(at.dim);
         // Frozen Claude prose vs user-authored content get distinct bars so
         // the read/write boundary reads at a glance — same idiom as the
         // rendered-mode focused-block bar.
-        let frozen_bar: Hsla = rgb(0x8be9fd).into();
-        let user_bar: Hsla = rgb(0x50fa7b).into();
+        let frozen_bar: Hsla = nc(at.frozen_bar);
+        let user_bar: Hsla = nc(at.user_bar);
 
         let lines: Vec<String> = (0..line_count.max(1))
             .map(|i| {
@@ -8982,8 +9053,25 @@ impl SketchGpuiView {
         // Flat ordering: line_0, tool_group_at[0], line_1, …
         // Lines inside a detected block range are replaced by one
         // FlatItem::Block at the range start; interior lines are skipped.
+        // Turn separators are inserted when the author (LLM vs User) changes.
         let mut flat_items: Vec<FlatItem> = Vec::with_capacity(lines.len() * 2);
+        let mut prev_author: Option<bool> = None; // true = agent, false = user
         for line_idx in 0..lines.len() {
+            // Detect author transition and insert a separator.
+            let cur_tag = gutter_tag_per_line.get(line_idx).copied().flatten();
+            let cur_author = match cur_tag {
+                Some(TurnId::Llm(_)) => Some(true),
+                Some(TurnId::User(_)) => Some(false),
+                _ => None,
+            };
+            if let Some(is_agent) = cur_author {
+                if prev_author.is_some() && prev_author != Some(is_agent) {
+                    let label = if is_agent { "Claude" } else { "You" };
+                    flat_items.push(FlatItem::TurnSeparator { label, is_agent });
+                }
+                prev_author = Some(is_agent);
+            }
+
             if let Some(block) = block_at_start.remove(&line_idx) {
                 flat_items.push(FlatItem::Block(block));
             } else if !in_block.contains(&line_idx) {
@@ -9028,6 +9116,8 @@ impl SketchGpuiView {
         let code_font_snap = self.code_font.clone();
         let body_font_snap = self.body_font.clone();
         let theme_snap = self.theme.clone();
+        let at_snap = self.theme.agent.clone();
+        let self_editor_fg = self.editor_fg();
         let weak_self = cx.entity().downgrade();
         let flat_items_arc: std::rc::Rc<Vec<FlatItem>> =
             std::rc::Rc::new(flat_items);
@@ -9057,9 +9147,9 @@ impl SketchGpuiView {
                             .cloned()
                             .unwrap_or_else(|| vec![(line_str.clone(), base_style)]);
                         let author_tint: NColor = if is_frozen {
-                            NColor::Rgb(0xa9, 0xd0, 0xe0)
+                            at_snap.agent_tint
                         } else {
-                            NColor::Rgb(0xb8, 0xe0, 0x9a)
+                            at_snap.user_tint
                         };
                         for (_text, style) in segs.iter_mut() {
                             if *style == base_style {
@@ -9100,9 +9190,9 @@ impl SketchGpuiView {
                             rgba(0x00000000).into()
                         };
                         let line_text_color = if is_frozen {
-                            rgb(0xb6c4d6)
+                            nc(at_snap.frozen_fg)
                         } else {
-                            rgb(DEFAULT_FG)
+                            self_editor_fg
                         };
 
                         // Gutter tag from the editor's per-line `TurnId`
@@ -9122,14 +9212,24 @@ impl SketchGpuiView {
                             ),
                             Some(TurnId::Tool(n)) => (
                                 format!("{:>3}", format!("T{}", n)).into(),
-                                rgb(0xf1fa8c).into(),
+                                nc(at_snap.tool_label),
                             ),
-                            None => ("   ".into(), rgb(0x6272a4).into()),
+                            None => ("   ".into(), dim_fg),
+                        };
+                        // Turn card background: agent vs user tint, with
+                        // cursor-line highlight layered on top.
+                        let turn_bg: Hsla = match tag {
+                            Some(TurnId::Llm(_)) => nc(at_snap.agent_turn_bg),
+                            Some(TurnId::User(_)) => nc(at_snap.user_turn_bg),
+                            _ => rgba(0x00000000).into(),
                         };
                         let row_bg: Hsla = if line_idx == cursor_line {
-                            rgba(0x44475a55).into()
+                            // Blend cursor highlight on top of turn bg.
+                            let mut h = nc(at_snap.dim);
+                            h.a = 0.2;
+                            h
                         } else {
-                            rgba(0x00000000).into()
+                            turn_bg
                         };
 
                         div()
@@ -9178,13 +9278,13 @@ impl SketchGpuiView {
                         let has_in_progress = calls.iter().any(|tc| tc.status == ToolCallStatus::InProgress);
                         let all_completed = calls.iter().all(|tc| tc.status == ToolCallStatus::Completed);
                         let (group_glyph, group_color): (&str, Hsla) = if has_failed {
-                            ("✗", rgb(0xff5555).into())
+                            ("✗", nc(at_snap.tool_failed))
                         } else if has_in_progress {
-                            ("◐", rgb(0xf1fa8c).into())
+                            ("◐", nc(at_snap.tool_in_progress))
                         } else if all_completed {
-                            ("●", rgb(0x50fa7b).into())
+                            ("●", nc(at_snap.tool_completed))
                         } else {
-                            ("○", rgb(0x6272a4).into())
+                            ("○", nc(at_snap.tool_pending))
                         };
 
                         let header_title: String = if count == 1 {
@@ -9213,12 +9313,12 @@ impl SketchGpuiView {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .py_1()
-                            .pl_4()
+                            .py(px(6.0))
+                            .px_2()
                             .cursor_pointer()
-                            .child(div().text_color(rgb(0x6272a4)).child(arrow))
+                            .child(div().text_color(dim_fg).child(arrow))
                             .child(div().text_color(group_color).child(group_glyph))
-                            .child(div().flex_1().text_color(rgb(DEFAULT_FG)).text_size(px(12.0)).child(header_title))
+                            .child(div().flex_1().text_color(self_editor_fg).text_size(px(12.0)).child(header_title))
                             .on_click(
                                 move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
                                     let id = click_id.clone();
@@ -9238,9 +9338,12 @@ impl SketchGpuiView {
                         let mut block = div()
                             .flex()
                             .flex_col()
-                            .my_1()
-                            .border_l_2()
-                            .border_color(rgb(0x44475a))
+                            .my(px(6.0))
+                            .mx_4()
+                            .rounded_md()
+                            .bg(nc(at_snap.tool_card_bg))
+                            .border_1()
+                            .border_color(nc(at_snap.tool_card_border))
                             .child(header_row);
 
                         // Expanded: show individual tool calls.
@@ -9253,6 +9356,7 @@ impl SketchGpuiView {
                                         expanded_detail,
                                         &code_font_snap,
                                         weak_self.clone(),
+                                        &at_snap,
                                     ),
                                 );
                             }
@@ -9282,6 +9386,46 @@ impl SketchGpuiView {
                         div()
                             .py_1()
                             .child(inner)
+                            .into_any_element()
+                    }
+                    FlatItem::TurnSeparator { label, is_agent } => {
+                        // Centered legend-style separator: ─── Label ───
+                        let label_color = if *is_agent {
+                            nc(at_snap.turn_header_agent)
+                        } else {
+                            nc(at_snap.turn_header_user)
+                        };
+                        let rule_color = nc(at_snap.turn_rule);
+
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .w_full()
+                            .pt(px(12.0))
+                            .pb(px(4.0))
+                            .px_4()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .h(px(1.0))
+                                    .bg(rule_color),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(label_color)
+                                    .font_weight(FontWeight::BOLD)
+                                    .font_family(body_font_snap.clone())
+                                    .child(SharedString::from(*label)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .h(px(1.0))
+                                    .bg(rule_color),
+                            )
                             .into_any_element()
                     }
                 }
@@ -9316,8 +9460,8 @@ impl SketchGpuiView {
         // whose underlying signal is absent renders nothing — no
         // placeholder, no `?`. The strip is at most as wide as the
         // data it has.
-        let strip_dim: Hsla = rgb(0x6272a4).into();
-        let strip_warm: Hsla = rgb(0xf1fa8c).into();
+        let strip_dim: Hsla = nc(at.dim);
+        let strip_warm: Hsla = nc(at.warm_accent);
         let strip_fg = fg_or(top, STATUS_FG);
 
         let mut strip = div()
@@ -9506,7 +9650,7 @@ impl SketchGpuiView {
             left_status.push_str(msg);
             left_status.push(']');
         }
-        let _ = dim_fg; // (reserved for future per-line dim styling)
+        // dim_fg is now used actively via agent theme
 
         let hints = if in_chatbox {
             "Ctrl-Enter send · Ctrl-Alt-Enter worksheet · esc normal"
@@ -9550,9 +9694,9 @@ impl SketchGpuiView {
             let compose_cursor_col = tb.editor.cursor().col;
             let compose_mode = tb.mode;
             let compose_sel = tb.editor.selection_range();
-            let sep_color: Hsla = rgb(0x6272a4).into();
-            let compose_bg: Hsla = rgb(0x1e1e2e).into();
-            let compose_cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
+            let sep_color: Hsla = nc(at.compose_separator);
+            let compose_bg: Hsla = nc(at.compose_bg);
+            let compose_cursor_color: Hsla = nc(at.cursor);
             let compose_code_font = self.code_font.clone();
 
             // Visible columns computed from the actual window viewport width.
@@ -9643,7 +9787,23 @@ impl SketchGpuiView {
                 .track_scroll(&compose_scroll)
                 .child(compose_inner);
 
-            Some(div().w_full().min_w_0().child(separator).child(compose_body))
+            // Top edge: a 1px darker rule creates a subtle
+            // visual separation between the scrolling transcript
+            // and the fixed compose panel.
+            let edge_color = {
+                let mut h = sep_color;
+                h.a = 0.4;
+                h
+            };
+            Some(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .border_t_1()
+                    .border_color(edge_color)
+                    .child(separator)
+                    .child(compose_body),
+            )
         } else {
             None
         };
@@ -9655,10 +9815,10 @@ impl SketchGpuiView {
         // the transcript area's flex-1 shrinks to make room. Panes only
         // render when their `*_open` flag is true.
         let pane_width = px(28.0 * 7.0); // ~28 monospace cols at 13px = ~196px
-        let pane_border: Hsla = rgb(0x44475a).into();
-        let pane_header_fg: Hsla = rgb(0x8be9fd).into();
-        let pane_dim_fg: Hsla = rgb(0x6272a4).into();
-        let pane_bg: Hsla = rgb(0x21222c).into();
+        let pane_border: Hsla = nc(at.pane_border);
+        let pane_header_fg: Hsla = nc(at.pane_header);
+        let pane_dim_fg: Hsla = nc(at.dim);
+        let pane_bg: Hsla = nc(at.pane_bg);
 
         let tasklist_pane = if c.tasklist_open {
             let mut pane = div()
@@ -9776,12 +9936,14 @@ impl SketchGpuiView {
                     let row_text = format!("▸ {} {}", glyph, trunc_label);
                     let is_focused = focused_idx == Some(i);
                     let row_fg: Hsla = if is_focused {
-                        rgb(0xf1fa8c).into()
+                        nc(at.warm_accent)
                     } else {
-                        rgb(DEFAULT_FG).into()
+                        self.editor_fg()
                     };
                     let row_bg: Hsla = if is_focused {
-                        rgba(0x44475a55).into()
+                        let mut h = nc(at.dim);
+                        h.a = 0.2;
+                        h
                     } else {
                         rgba(0x00000000).into()
                     };
