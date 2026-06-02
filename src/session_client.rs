@@ -16,14 +16,23 @@ use std::time::Duration;
 use crate::acp_channel::PermissionMode;
 use crate::session_proto::*;
 
+pub use crate::session_proto::AttachMode;
+
 /// Client connection to the session server. One per GUI instance,
 /// shared across all agent slots.
 pub struct SessionServerClient {
     /// Outbound requests. The writer thread picks these up and sends
     /// them over the socket.
     request_tx: std_mpsc::Sender<(Frame, Option<std_mpsc::Sender<Response>>)>,
-    /// Inbound notifications from the server.
-    notification_rx: std_mpsc::Receiver<Notification>,
+    /// Inbound notifications from the server. `Option` so the pump task can
+    /// `take` it and drain the channel *outside* the GUI model lock — channel
+    /// reads need no `&mut SketchGpuiView`, so taking the lock to call
+    /// `try_recv` was pure contention.
+    notification_rx: Option<std_mpsc::Receiver<Notification>>,
+    /// Event-driven wake signal. The reader thread pushes `()` after every
+    /// notification so the pump can wake immediately (via `select_biased!`)
+    /// instead of polling on a fixed timer. Taken once by the pump task.
+    wake_rx: Option<futures::channel::mpsc::UnboundedReceiver<()>>,
     /// Connection liveness.
     connected: Arc<AtomicBool>,
     /// Monotonic request id counter.
@@ -33,6 +42,21 @@ pub struct SessionServerClient {
     _writer: Option<JoinHandle<()>>,
     /// Pending response channels, keyed by request id.
     pending: Arc<Mutex<std::collections::HashMap<u64, std_mpsc::Sender<Response>>>>,
+}
+
+/// Drop every pending response channel, unblocking any thread parked in
+/// [`SessionServerClient::request`]. Called the instant either background
+/// thread observes a dead socket — otherwise a blocking request (e.g.
+/// `close_session`) parks on its 30s timeout while the GPUI main thread is
+/// frozen. Dropping the sender makes the waiting `recv_timeout` return
+/// `Err(Disconnected)` immediately, which surfaces as a `BrokenPipe` error
+/// the caller can react to (reconnect) instead of a multi-second hang.
+fn fail_all_pending(
+    pending: &Arc<Mutex<std::collections::HashMap<u64, std_mpsc::Sender<Response>>>>,
+) {
+    if let Ok(mut map) = pending.lock() {
+        map.clear();
+    }
 }
 
 impl SessionServerClient {
@@ -95,6 +119,7 @@ impl SessionServerClient {
         let pending: Arc<Mutex<std::collections::HashMap<u64, std_mpsc::Sender<Response>>>> =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
         let (notification_tx, notification_rx) = std_mpsc::channel();
+        let (wake_tx, wake_rx) = futures::channel::mpsc::unbounded::<()>();
         let (request_tx, request_rx) =
             std_mpsc::channel::<(Frame, Option<std_mpsc::Sender<Response>>)>();
 
@@ -129,6 +154,10 @@ impl SessionServerClient {
                             if notification_tx.send(note).is_err() {
                                 break;
                             }
+                            // Wake the pump. Unbounded send never blocks; an
+                            // error just means the pump dropped its receiver,
+                            // which is harmless (it falls back to its timer).
+                            let _ = wake_tx.unbounded_send(());
                         }
                         Frame::Request { .. } => {
                             // Server should not send requests to GUI.
@@ -136,6 +165,8 @@ impl SessionServerClient {
                     }
                 }
                 connected_r.store(false, Ordering::SeqCst);
+                // Socket closed / EOF: unblock anyone parked in `request`.
+                fail_all_pending(&pending_r);
             })?;
 
         // Writer thread: sends outbound requests and registers pending slots.
@@ -164,17 +195,69 @@ impl SessionServerClient {
                         break;
                     }
                 }
+                // Writer exiting (send error or request_tx dropped): unblock
+                // any in-flight blocking request so it fails fast.
+                fail_all_pending(&pending_w);
             })?;
 
         Ok(Self {
             request_tx,
-            notification_rx,
+            notification_rx: Some(notification_rx),
+            wake_rx: Some(wake_rx),
             connected,
             next_id: AtomicU64::new(1),
             _reader: Some(reader),
             _writer: Some(writer),
             pending,
         })
+    }
+
+    /// Re-establish the connection in place after a disconnect. Rebuilds the
+    /// socket, reader/writer threads, and the notification/wake channels. On
+    /// success the notification + wake receivers are `Some` again, so the pump
+    /// must re-take them via [`take_notification_receiver`] /
+    /// [`take_wake_receiver`] and re-attach every live slot (the server
+    /// replays each session's full event log on attach, so the GUI rebuilds
+    /// its transcript from scratch).
+    ///
+    /// Returns the freshly-built receivers on success so the caller can splice
+    /// them into the running pump without a second lock round-trip.
+    pub fn reconnect(
+        &mut self,
+    ) -> io::Result<(
+        std_mpsc::Receiver<Notification>,
+        futures::channel::mpsc::UnboundedReceiver<()>,
+    )> {
+        let path = socket_path();
+        let stream = Self::connect_or_launch(&path)?;
+        let fresh = Self::from_stream(stream)?;
+        // Replace our internals wholesale. Assigning `*self` drops the old
+        // value (its threads have already exited — that's why we're
+        // reconnecting — and its `pending` map was drained on disconnect), and
+        // moves `fresh` in without running its destructor.
+        *self = fresh;
+        let note_rx = self
+            .notification_rx
+            .take()
+            .expect("from_stream always sets notification_rx");
+        let wake_rx = self
+            .wake_rx
+            .take()
+            .expect("from_stream always sets wake_rx");
+        Ok((note_rx, wake_rx))
+    }
+
+    /// Move the notification receiver out for exclusive ownership by the pump
+    /// task. After this, `try_recv` returns `None`. Call once.
+    pub fn take_notification_receiver(&mut self) -> Option<std_mpsc::Receiver<Notification>> {
+        self.notification_rx.take()
+    }
+
+    /// Move the wake receiver out for the pump task. Call once.
+    pub fn take_wake_receiver(
+        &mut self,
+    ) -> Option<futures::channel::mpsc::UnboundedReceiver<()>> {
+        self.wake_rx.take()
     }
 
     /// Send a request and wait for the response (blocking).
@@ -194,7 +277,19 @@ impl SessionServerClient {
 
         resp_rx
             .recv_timeout(Duration::from_secs(30))
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request timed out"))
+            .map_err(|e| match e {
+                // The reader/writer thread dropped our pending sender on
+                // disconnect — fail fast as BrokenPipe so callers can
+                // distinguish "server gone" (→ reconnect) from a genuine
+                // 30s stall on a live connection.
+                std_mpsc::RecvTimeoutError::Disconnected => {
+                    self.connected.store(false, Ordering::SeqCst);
+                    io::Error::new(io::ErrorKind::BrokenPipe, "session server disconnected")
+                }
+                std_mpsc::RecvTimeoutError::Timeout => {
+                    io::Error::new(io::ErrorKind::TimedOut, "request timed out")
+                }
+            })
     }
 
     /// Send a request without waiting for a response (fire-and-forget).
@@ -253,8 +348,24 @@ impl SessionServerClient {
         }
     }
 
-    pub fn attach(&self, session_id: &str) -> io::Result<()> {
+    /// Attach to a session as `Owner` (can drive) or `Observer` (read-only
+    /// mirror). The server replays the full event log before the Ack, so the
+    /// pump picks up the entire transcript on its first drain cycle.
+    pub fn attach(&self, session_id: &str, mode: AttachMode) -> io::Result<()> {
         match self.request(Request::Attach {
+            session_id: session_id.to_string(),
+            mode,
+        })? {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+        }
+    }
+
+    /// Claim ownership of a session this connection is observing. Succeeds
+    /// only once the previous owner has disconnected (server reports the
+    /// session as ownerless). Used by a candidate GUI to take over.
+    pub fn promote(&self, session_id: &str) -> io::Result<()> {
+        match self.request(Request::Promote {
             session_id: session_id.to_string(),
         })? {
             Response::Ok { .. } => Ok(()),
@@ -272,13 +383,32 @@ impl SessionServerClient {
     }
 
     pub fn prompt(&self, session_id: &str, text: &str) -> io::Result<()> {
-        match self.request(Request::Prompt {
+        // Fire-and-forget: the server only returns an Ack and we don't
+        // need it. Blocking here stalls the GPUI main thread and
+        // prevents the server pump from draining reply notifications,
+        // making the UI appear to miss messages.
+        self.request_fire(Request::Prompt {
             session_id: session_id.to_string(),
             text: text.to_string(),
-        })? {
-            Response::Ok { .. } => Ok(()),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
-        }
+        })
+    }
+
+    /// Interrupt the in-flight turn for `session_id`. Fire-and-forget,
+    /// same as [`prompt`] — the server only Acks and blocking would stall
+    /// the GPUI main thread.
+    pub fn cancel(&self, session_id: &str) -> io::Result<()> {
+        self.request_fire(Request::Cancel {
+            session_id: session_id.to_string(),
+        })
+    }
+
+    /// Force-restart the agent subprocess for `session_id` (kill + resume).
+    /// Fire-and-forget: the server respawns off-thread and broadcasts a
+    /// `SessionAttached` when the replacement is live.
+    pub fn restart_session(&self, session_id: &str) -> io::Result<()> {
+        self.request_fire(Request::RestartSession {
+            session_id: session_id.to_string(),
+        })
     }
 
     pub fn set_permission_mode(
@@ -293,6 +423,13 @@ impl SessionServerClient {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
         }
+    }
+
+    pub fn rename_session(&self, session_id: &str, label: &str) -> io::Result<()> {
+        self.request_fire(Request::RenameSession {
+            session_id: session_id.to_string(),
+            label: label.to_string(),
+        })
     }
 
     pub fn close_session(&self, session_id: &str) -> io::Result<()> {
@@ -313,6 +450,15 @@ impl SessionServerClient {
 
     /// Non-blocking poll for the next server notification.
     pub fn try_recv(&self) -> Option<Notification> {
-        self.notification_rx.try_recv().ok()
+        self.notification_rx.as_ref()?.try_recv().ok()
+    }
+}
+
+impl Drop for SessionServerClient {
+    fn drop(&mut self) {
+        // Unblock any parked request and let the writer thread observe the
+        // dropped `request_tx` so it exits cleanly.
+        self.connected.store(false, Ordering::SeqCst);
+        fail_all_pending(&self.pending);
     }
 }

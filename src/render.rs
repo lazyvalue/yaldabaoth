@@ -156,7 +156,7 @@ impl<'a, 't> Renderer<'a, 't> {
                         self.plain_code_lines(&code_text)
                     };
 
-                    blocks.push(RenderedBlock::CodeBlock { language, lines });
+                    blocks.push(RenderedBlock::CodeBlock { language, lines, source_file: false });
                 }
                 Event::Start(Tag::Table(alignments)) => {
                     let aligns: Vec<ColumnAlignment> = alignments

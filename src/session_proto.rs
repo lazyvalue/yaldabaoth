@@ -16,6 +16,22 @@ use crate::acp_channel::{PermissionMode, ReplyEvent};
 /// Server-assigned stable session handle (UUID string).
 pub type ServerSessionId = String;
 
+/// How a GUI connection attaches to a session.
+///
+/// At most one `Owner` may be attached at a time (the connection allowed to
+/// send prompts / change permission mode / close the session). Any number of
+/// `Observer`s may attach concurrently — they receive the full replayed
+/// transcript and the live event stream but cannot drive the session. This is
+/// the basis for the blue-green build loop: a freshly built "candidate" GUI
+/// attaches as an `Observer` to mirror live sessions, then `Promote`s to
+/// `Owner` once the previous owner disconnects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachMode {
+    Owner,
+    Observer,
+}
+
 // ── Envelope types ─────────────────────────────────────────────────
 
 /// A framed message on the wire. Every line is one of these.
@@ -50,16 +66,39 @@ pub enum Request {
     },
 
     #[serde(rename = "attach")]
-    Attach { session_id: ServerSessionId },
+    Attach {
+        session_id: ServerSessionId,
+        /// Owner (drives the session) or Observer (read-only mirror).
+        mode: AttachMode,
+    },
 
     #[serde(rename = "detach")]
     Detach { session_id: ServerSessionId },
+
+    /// An attached `Observer` claims ownership of a session. Succeeds only
+    /// when the session currently has no owner (i.e. the previous owner
+    /// disconnected). Used by a candidate GUI to take over after the old
+    /// instance closes.
+    #[serde(rename = "promote")]
+    Promote { session_id: ServerSessionId },
 
     #[serde(rename = "prompt")]
     Prompt {
         session_id: ServerSessionId,
         text: String,
     },
+
+    /// Interrupt the in-flight turn (ACP `session/cancel`). Owner-only,
+    /// like `Prompt`. The session stays alive; the current turn resolves
+    /// with `StopReason::Cancelled`.
+    #[serde(rename = "cancel")]
+    Cancel { session_id: ServerSessionId },
+
+    /// Hard recovery: kill + respawn the agent subprocess, resuming the same
+    /// ACP session. Owner-only. The escalation when a graceful `Cancel`
+    /// won't unstick a turn wedged on a hung upstream request.
+    #[serde(rename = "restart_session")]
+    RestartSession { session_id: ServerSessionId },
 
     #[serde(rename = "set_permission_mode")]
     SetPermissionMode {
@@ -69,6 +108,12 @@ pub enum Request {
 
     #[serde(rename = "close_session")]
     CloseSession { session_id: ServerSessionId },
+
+    #[serde(rename = "rename_session")]
+    RenameSession {
+        session_id: ServerSessionId,
+        label: String,
+    },
 }
 
 // ── Server → GUI responses ─────────────────────────────────────────
@@ -105,6 +150,9 @@ pub struct SessionInfo {
     pub turns: usize,
     pub connected: bool,
     pub permission_mode: PermissionMode,
+    /// Whether some connection currently owns (can drive) this session.
+    /// A candidate GUI uses this to decide whether it can `Promote`.
+    pub has_owner: bool,
 }
 
 // ── Server → GUI notifications (no response expected) ──────────────
@@ -127,6 +175,14 @@ pub enum Notification {
         turn_count: usize,
     },
 
+    /// The user submitted a prompt. Logged so re-attaching GUIs can
+    /// replay user turns alongside agent replies.
+    #[serde(rename = "user_prompt")]
+    UserPrompt {
+        session_id: ServerSessionId,
+        text: String,
+    },
+
     /// Session handshake complete — agent subprocess is live.
     #[serde(rename = "session_attached")]
     SessionAttached {
@@ -139,6 +195,36 @@ pub enum Notification {
     SessionDetached {
         session_id: ServerSessionId,
         reason: String,
+    },
+
+    /// Ownership of a session changed. Broadcast to all attached connections
+    /// (owner and observers). When `has_owner` flips to `false`, an observer
+    /// may `Promote` to claim the session — this is the signal a candidate
+    /// GUI waits for after the previous owner closes.
+    #[serde(rename = "owner_changed")]
+    OwnerChanged {
+        session_id: ServerSessionId,
+        has_owner: bool,
+    },
+
+    /// A session was created. Broadcast to **every** connection (not just
+    /// attached ones) over the manager-level channel so any GUI can keep its
+    /// session list in sync without polling `list_sessions`.
+    #[serde(rename = "session_created")]
+    SessionCreated { session: SessionInfo },
+
+    /// A session was closed/removed server-side. Broadcast to every
+    /// connection so each GUI drops the matching slot from every panel,
+    /// regardless of which connection initiated the close.
+    #[serde(rename = "session_closed")]
+    SessionClosed { session_id: ServerSessionId },
+
+    /// A session's label changed. Broadcast to every connection so the new
+    /// label propagates to every panel and every GUI instance.
+    #[serde(rename = "session_renamed")]
+    SessionRenamed {
+        session_id: ServerSessionId,
+        label: String,
     },
 }
 
@@ -161,4 +247,10 @@ pub fn socket_path() -> PathBuf {
 pub fn pid_file_path() -> PathBuf {
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
     PathBuf::from(format!("/tmp/sketch-session-{user}.pid"))
+}
+
+/// Path to the JSON file where the session server persists session metadata
+/// across restarts. Lives in the cache dir alongside other sketch state.
+pub fn session_server_persist_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("sketch").join("session_server.json"))
 }

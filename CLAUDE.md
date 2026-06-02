@@ -3,6 +3,22 @@
 A markdown editor built with Rust. Ships as two binaries: a GPUI desktop GUI
 (`sketch-gpui`) and a terminal TUI (`sketch`) built on ratatui + crossterm.
 
+## Worktree workflow (default)
+
+**Do substantial work in a git worktree, not the main checkout.** Each task /
+feature / agent gets its own worktree + branch so the main working dir stays
+clean and parallel work can't collide. Place worktrees under
+`./.claude/worktrees/` (NOT as siblings of the repo in `~/ws/` — that clutters
+the workspace dir). The harness already uses `./.claude/worktrees/` for agent
+isolation; task worktrees live there too. `./.claude/worktrees/` is gitignored.
+
+```
+git worktree add .claude/worktrees/<task-slug> -b <task-slug>
+```
+
+Trivial one-file edits and conversational answers don't need a worktree; new
+features, multi-file changes, and anything you'd run agents on do.
+
 ## Default surface: the GUI
 
 **Work on the GUI by default.** Unless the user says "TUI" or names the TUI by

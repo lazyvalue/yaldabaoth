@@ -1,6 +1,5 @@
 ---
 source: tests/snapshot_test.rs
-assertion_line: 16
 expression: blocks
 ---
 [
@@ -822,6 +821,7 @@ expression: blocks
                 ],
             },
         ],
+        source_file: false,
     },
     CodeBlock {
         language: Some(
@@ -1811,6 +1811,7 @@ expression: blocks
                 ],
             },
         ],
+        source_file: false,
     },
     CodeBlock {
         language: None,
@@ -1837,6 +1838,7 @@ expression: blocks
                 ],
             },
         ],
+        source_file: false,
     },
     Heading {
         level: 2,

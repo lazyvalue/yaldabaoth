@@ -167,6 +167,12 @@ pub enum ReplyEvent {
     /// the *emitter* in the notification handler is gated on the upstream
     /// `unstable_session_usage` feature (spec-agent-window.md §31).
     UsageUpdated(UsageSnapshot),
+    /// Transient status line, not part of the transcript. Emitted by the
+    /// driver loop when a turn hits a retryable API error ("overloaded",
+    /// rate limit, …) and is being retried, or when it finally fails. The
+    /// App surfaces it in the footer status slot rather than splicing it
+    /// into the buffer.
+    Notice(String),
 }
 
 /// How sketch responds to `session/request_permission` from the agent.
@@ -257,6 +263,11 @@ pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-code-acp", "claude-agent-
 pub struct AcpChannelClient {
     /// Outbound prompts: `App::claude_acp_send_text` → worker.
     prompt_tx: std_mpsc::Sender<String>,
+    /// Cancel signal: `App::stop_agent` → worker driver loop. Each `()`
+    /// pushed here makes the driver send an ACP `session/cancel` for the
+    /// in-flight turn. `unbounded_send` is callable from the sync App side
+    /// without an async context, mirroring [`wake_rx`].
+    cancel_tx: futures::channel::mpsc::UnboundedSender<()>,
     /// Inbound timeline events (text chunks + tool-call activity):
     /// worker → `App::pump_acp_replies`. Order on the channel is the
     /// chronological order in which the agent emitted them, so the
@@ -449,6 +460,11 @@ impl AcpChannelClient {
         // pump after attach succeeds.
         let (wake_tx, wake_rx) = futures::channel::mpsc::unbounded::<()>();
 
+        // Cancel channel: the App pushes `()` to interrupt the in-flight
+        // turn; the worker's driver loop selects on the receiver and sends
+        // ACP `session/cancel`.
+        let (cancel_tx, cancel_rx) = futures::channel::mpsc::unbounded::<()>();
+
         let worker_cwd = cwd.clone();
         let worker = thread::Builder::new()
             .name("sketch-acp-worker".into())
@@ -465,6 +481,7 @@ impl AcpChannelClient {
                     resume_session_id,
                     permission_mode_for_worker,
                     wake_tx,
+                    cancel_rx,
                     frontend,
                 );
             })?;
@@ -483,6 +500,7 @@ impl AcpChannelClient {
 
         Ok(Self {
             prompt_tx,
+            cancel_tx,
             reply_rx,
             connected,
             turns,
@@ -556,6 +574,15 @@ impl AcpChannelClient {
             self.connected.store(false, Ordering::SeqCst);
             io::Error::new(io::ErrorKind::BrokenPipe, "ACP worker channel closed")
         })
+    }
+
+    /// Request cancellation of the in-flight turn. Sends ACP
+    /// `session/cancel` to the agent, which resolves the current
+    /// `session/prompt` with `StopReason::Cancelled` — ending the turn
+    /// without killing the session (unlike `Drop`). Best-effort: a no-op if
+    /// the worker has already exited or nothing is in flight.
+    pub fn cancel(&self) {
+        let _ = self.cancel_tx.unbounded_send(());
     }
 
     /// Pull one queued reply event (text chunk or tool-call activity) if
@@ -653,6 +680,54 @@ fn resolve_via_login_shell(command: &str) -> Option<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Whether a failed `session/prompt` is worth retrying. The Claude Agent
+/// SDK surfaces upstream API trouble (Anthropic "overloaded_error" / 529,
+/// rate limits / 429, gateway 5xx, transient network drops) as the JSON-RPC
+/// error's message/data. We match on those substrings so an overloaded API
+/// becomes a brief auto-retry instead of a turn that silently hangs.
+/// Deterministic failures (bad request, auth, model refusal) are *not*
+/// matched — retrying those just burns time.
+fn is_retryable_error(e: &agent_client_protocol::Error) -> bool {
+    let mut hay = e.message.to_lowercase();
+    if let Some(data) = &e.data {
+        hay.push(' ');
+        hay.push_str(&data.to_string().to_lowercase());
+    }
+    const NEEDLES: &[&str] = &[
+        "overload",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "429",
+        "529",
+        "503",
+        "service unavailable",
+        "service_unavailable",
+        "temporarily unavailable",
+        "timeout",
+        "timed out",
+        "econnreset",
+        "connection reset",
+        "connection refused",
+        "fetch failed",
+    ];
+    NEEDLES.iter().any(|n| hay.contains(n))
+}
+
+/// Trim an ACP error to a single short clause for the footer Notice — the
+/// full message can carry a multi-line provider payload we don't want in a
+/// status line.
+fn short_err(e: &agent_client_protocol::Error) -> String {
+    let msg = e.message.replace('\n', " ");
+    let msg = msg.trim();
+    if msg.chars().count() > 80 {
+        let truncated: String = msg.chars().take(77).collect();
+        format!("{truncated}…")
+    } else {
+        msg.to_string()
+    }
+}
+
 fn run_worker(
     parts: Vec<String>,
     cwd: PathBuf,
@@ -665,6 +740,7 @@ fn run_worker(
     resume_session_id: Option<String>,
     permission_mode: Arc<AtomicU8>,
     wake_tx: futures::channel::mpsc::UnboundedSender<()>,
+    cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
     frontend: SketchFrontend,
 ) {
     // Build a small multi-thread runtime — the ACP crate spawns several
@@ -698,6 +774,7 @@ fn run_worker(
             resume_session_id,
             permission_mode,
             wake_tx,
+            cancel_rx,
             frontend,
         )
         .await
@@ -727,6 +804,7 @@ async fn worker_async(
     resume_session_id: Option<String>,
     permission_mode: Arc<AtomicU8>,
     wake_tx: futures::channel::mpsc::UnboundedSender<()>,
+    mut cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
     frontend: SketchFrontend,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1) Spawn the agent process.
@@ -843,6 +921,9 @@ async fn worker_async(
     // 4) Run the ACP client. The closure passed to connect_with stays alive
     //    until we explicitly return — that's our "session lifetime".
     let event_tx_for_handlers = event_tx.clone();
+    // Separate clone for the driver loop so it can emit transient Notice
+    // events (retry/failed status) alongside the handler's stream events.
+    let event_tx_for_driver = event_tx.clone();
     let connect_result = Client
         .builder()
         .name("sketch")
@@ -1164,29 +1245,105 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
 
                     // === Driver loop: forward prompts as session/prompt
                     //     requests until the App side closes the channel.  ===
+                    use futures::StreamExt as _;
+                    // Cap on transient-error retries before giving up on a
+                    // turn. Backoff is exponential (0.5s, 1s, 2s, 4s, 8s).
+                    const MAX_RETRIES: u32 = 5;
                     while let Some(prompt) = async_prompt_rx.recv().await {
                         acp_debug!("prompt → agent: {prompt:?}");
-                        // Each prompt is a turn — fire and forget the
-                        // request future. Streamed chunks reach the user
-                        // through the notification handler, which doesn't
-                        // need to live inside this loop.
-                        let req = agent_client_protocol::schema::PromptRequest::new(
-                            session_id.clone(),
-                            vec![ContentBlock::Text(
-                                agent_client_protocol::schema::TextContent::new(prompt),
-                            )],
-                        );
-                        // Block on the prompt response (turn end) before
-                        // accepting the next prompt — simpler than
-                        // managing concurrent in-flight turns and matches
-                        // how a chat UI flows.
-                        match connection.send_request(req).block_task().await {
-                            Ok(resp) => acp_debug!("prompt response: {resp:?}"),
-                            Err(e) => eprintln!("[sketch-acp] prompt failed: {e}"),
+                        // Drop any cancel signal that queued while idle so a
+                        // stale Stop click can't abort the turn we're about
+                        // to start.
+                        while let Ok(Some(_)) = cancel_rx.try_next() {}
+
+                        let mut attempt: u32 = 0;
+                        loop {
+                            let req = agent_client_protocol::schema::PromptRequest::new(
+                                session_id.clone(),
+                                vec![ContentBlock::Text(
+                                    agent_client_protocol::schema::TextContent::new(
+                                        prompt.clone(),
+                                    ),
+                                )],
+                            );
+                            // Await the prompt response (turn end), but stay
+                            // responsive to a cancel request: on the first
+                            // `()` from cancel_rx we fire `session/cancel`,
+                            // then keep awaiting — the agent resolves the
+                            // turn with StopReason::Cancelled.
+                            let resp_fut = connection.send_request(req).block_task();
+                            tokio::pin!(resp_fut);
+                            let mut cancelled = false;
+                            // Once cancel_rx yields (a `()` or channel close)
+                            // we disable that select branch so a closed
+                            // channel can't spin the loop.
+                            let mut cancel_done = false;
+                            let outcome = loop {
+                                tokio::select! {
+                                    r = &mut resp_fut => break r,
+                                    sig = cancel_rx.next(), if !cancel_done => {
+                                        cancel_done = true;
+                                        if sig.is_some() {
+                                            cancelled = true;
+                                            acp_debug!("cancel → session/cancel");
+                                            let _ = connection.send_notification(
+                                                agent_client_protocol::schema::CancelNotification::new(
+                                                    session_id.clone(),
+                                                ),
+                                            );
+                                        }
+                                        // else: App dropped the cancel sender
+                                        // (tearing down) — just await resp_fut.
+                                    }
+                                }
+                            };
+                            match outcome {
+                                Ok(resp) => {
+                                    acp_debug!("prompt response: {resp:?}");
+                                    break;
+                                }
+                                Err(e) => {
+                                    // A cancel races the agent into an error
+                                    // sometimes — treat it as a finished turn,
+                                    // not a retryable failure.
+                                    if cancelled {
+                                        acp_debug!("turn cancelled: {e}");
+                                        break;
+                                    }
+                                    if attempt < MAX_RETRIES && is_retryable_error(&e) {
+                                        attempt += 1;
+                                        let backoff_ms =
+                                            (500u64 << (attempt - 1)).min(8_000);
+                                        eprintln!(
+                                            "[sketch-acp] prompt failed (retry {attempt}/{MAX_RETRIES} in {backoff_ms}ms): {e}"
+                                        );
+                                        let _ = event_tx_for_driver.send(WorkerEvent::Reply(
+                                            ReplyEvent::Notice(format!(
+                                                "API error — retrying {attempt}/{MAX_RETRIES} in {}s ({})",
+                                                backoff_ms / 1000,
+                                                short_err(&e),
+                                            )),
+                                        ));
+                                        tokio::time::sleep(
+                                            std::time::Duration::from_millis(backoff_ms),
+                                        )
+                                        .await;
+                                        continue; // resend the same prompt
+                                    }
+                                    eprintln!("[sketch-acp] prompt failed: {e}");
+                                    let _ = event_tx_for_driver.send(WorkerEvent::Reply(
+                                        ReplyEvent::Notice(format!(
+                                            "agent error: {}",
+                                            short_err(&e),
+                                        )),
+                                    ));
+                                    break;
+                                }
+                            }
                         }
-                        // Bump the turn counter regardless of success — the
-                        // turn is "complete" either way (the user can send
-                        // again). Errors are surfaced via stderr above.
+                        // Bump the turn counter once the turn settles
+                        // (success, cancel, or exhausted retries) — the user
+                        // can send again either way.
                         turns.fetch_add(1, Ordering::SeqCst);
                     }
                     acp_debug!("driver loop exiting");

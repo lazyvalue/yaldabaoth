@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use sketch::editor::EditorCore;
+use sketch::file_browser::FileBrowser;
 
 pub type FileBufferId = u64;
 pub type WindowId = u64;
@@ -120,6 +121,27 @@ impl<C> Layout<C> {
         }
     }
 
+    /// Search every leaf's content for the first match. Returns the mapped
+    /// value from `f` on the first `Some` return, or `None` if no leaf
+    /// matches.
+    pub fn find_map_leaf_content_mut<R, F: FnMut(&mut C) -> Option<R>>(
+        &mut self,
+        f: &mut F,
+    ) -> Option<R> {
+        match self {
+            Layout::Empty => None,
+            Layout::Leaf(w) => f(&mut w.content),
+            Layout::Split { children, .. } => {
+                for (_, c) in children {
+                    if let Some(r) = c.find_map_leaf_content_mut(f) {
+                        return Some(r);
+                    }
+                }
+                None
+            }
+        }
+    }
+
     /// Find the path from root to the leaf with `target` id, expressed as a
     /// sequence of child-indices to follow at each `Split` node. An empty
     /// path means the root itself is the target leaf. Returns `None` if the
@@ -196,6 +218,91 @@ fn renormalize(children: &mut [(f32, impl Sized)]) {
     }
 }
 
+/// Which edge of the tab a rail anchors to (spec-rail.md §10). Default `Left`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RailSide {
+    Left,
+    Right,
+}
+
+impl Default for RailSide {
+    fn default() -> Self {
+        RailSide::Left
+    }
+}
+
+/// Derived outline: heading entries from the focused window (spec-rail.md §13).
+/// `entries` is `(heading depth 1–6, display text, block index or line
+/// number)`. Re-derived on the render frames where the focused window changed.
+pub struct OutlineState {
+    pub entries: Vec<(u8, String, usize)>,
+    pub selected: usize,
+}
+
+impl OutlineState {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            selected: 0,
+        }
+    }
+}
+
+impl Default for OutlineState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What the rail is showing (spec-rail.md "Data model"). Extend this enum to
+/// add new rail kinds — each variant needs a render arm in `render_rail` and a
+/// toggle binding. No framework changes required.
+pub enum RailContent {
+    FileBrowser(FileBrowser),
+    Outline(OutlineState),
+}
+
+impl RailContent {
+    /// Stable discriminant used for toggle equality (open-same-kind closes,
+    /// open-different-kind replaces) without exposing the inner state.
+    pub fn is_file_browser(&self) -> bool {
+        matches!(self, RailContent::FileBrowser(_))
+    }
+
+    pub fn is_outline(&self) -> bool {
+        matches!(self, RailContent::Outline(_))
+    }
+}
+
+/// Default rail width in px (spec-rail.md §9). v1 has no drag-to-resize, but
+/// the value is stored so a future resize handle can mutate it in place.
+pub const RAIL_DEFAULT_WIDTH: f32 = 200.0;
+
+/// Per-tab rail state (spec-rail.md "Data model"). A tab has at most one rail
+/// open at a time; opening a different kind replaces it in place.
+pub struct RailState {
+    pub content: RailContent,
+    pub side: RailSide,
+    /// Column width in px. Default [`RAIL_DEFAULT_WIDTH`]. Stored for a future
+    /// drag-resize handle; v1 does not expose one.
+    pub width_px: f32,
+    /// True when the rail div holds `track_focus`. When false, the main
+    /// content leaf holds focus as usual (two-state model, spec §5).
+    pub focused: bool,
+}
+
+impl RailState {
+    pub fn new(content: RailContent, side: RailSide) -> Self {
+        Self {
+            content,
+            side,
+            width_px: RAIL_DEFAULT_WIDTH,
+            focused: true,
+        }
+    }
+}
+
 /// One tab in the workspace's tab strip.
 pub struct Tab<C> {
     /// Monotonic auto-name set at create (e.g. "tab-1"). Survives rename so
@@ -205,6 +312,9 @@ pub struct Tab<C> {
     pub display_name: Option<String>,
     pub layout: Layout<C>,
     pub focused: WindowId,
+    /// Persistent side column (spec-rail.md). `None` when no rail is open.
+    /// Per-tab — switching tabs shows/hides the arriving/departing tab's rail.
+    pub rail: Option<RailState>,
 }
 
 impl<C> Tab<C> {
@@ -307,6 +417,7 @@ impl<C> Workspace<C> {
             display_name: None,
             layout: Layout::Leaf(Window { id, content }),
             focused: id,
+            rail: None,
         });
         self.active_tab = self.tabs.len() - 1;
         id
@@ -850,6 +961,7 @@ mod tests {
             display_name: None,
             layout,
             focused,
+            rail: None,
         });
         // Ensure window-id allocator skips past the ids we hand-rolled.
         let max_id = ws.tabs[0].layout.leaf_ids().into_iter().max().unwrap_or(0);

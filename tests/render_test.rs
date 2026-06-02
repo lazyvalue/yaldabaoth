@@ -128,7 +128,7 @@ fn test_render_code_block() {
     let theme = Theme::dark();
     let blocks = render(md, &theme);
     match &blocks[0] {
-        RenderedBlock::CodeBlock { language, lines } => {
+        RenderedBlock::CodeBlock { language, lines, .. } => {
             assert_eq!(language.as_deref(), Some("rust"));
             assert!(!lines.is_empty());
         }

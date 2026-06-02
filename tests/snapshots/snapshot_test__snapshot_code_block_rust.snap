@@ -1,6 +1,5 @@
 ---
 source: tests/snapshot_test.rs
-assertion_line: 23
 expression: blocks
 ---
 [
@@ -390,5 +389,6 @@ expression: blocks
                 ],
             },
         ],
+        source_file: false,
     },
 ]

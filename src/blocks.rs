@@ -38,6 +38,11 @@ pub enum RenderedBlock {
     CodeBlock {
         language: Option<String>,
         lines: Vec<StyledLine>,
+        /// True when this block represents an entire source file opened
+        /// directly (`.rs`, `.py`, etc.) rather than a fenced code block
+        /// inside markdown. Renderers should skip container chrome
+        /// (background, padding, rounded corners) for source-file blocks.
+        source_file: bool,
     },
     BlockQuote {
         blocks: Vec<RenderedBlock>,

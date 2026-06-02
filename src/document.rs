@@ -22,6 +22,10 @@ pub struct Document {
     rope: Rope,
     pub file_path: PathBuf,
     modified: bool,
+    /// Monotonic counter bumped on every content mutation (inserts, deletes,
+    /// undo, redo). Cheap O(1) signal that lets readers — notably the GUI
+    /// highlight cache — skip work when the text is unchanged. Never reset.
+    edit_seq: u64,
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
     /// Pending undo group: snapshot taken at begin_undo_group
@@ -34,10 +38,25 @@ impl Document {
             rope: Rope::from_str(&text),
             file_path,
             modified: false,
+            edit_seq: 0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             pending_undo: None,
         }
+    }
+
+    /// Current edit generation. Increases on every content mutation; equal
+    /// values across two observations guarantee the text is byte-identical.
+    pub fn edit_seq(&self) -> u64 {
+        self.edit_seq
+    }
+
+    /// Mark the document mutated: flips `modified` and bumps `edit_seq`.
+    /// Every rope-mutating method funnels through here so no edit can change
+    /// the text without advancing the generation counter.
+    fn touch(&mut self) {
+        self.modified = true;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
     }
 
     pub fn rope(&self) -> &Rope {
@@ -105,7 +124,7 @@ impl Document {
     pub fn insert_char(&mut self, line: usize, col: usize, ch: char) {
         let char_idx = self.line_col_to_char(line, col);
         self.rope.insert_char(char_idx, ch);
-        self.modified = true;
+        self.touch();
         self.redo_stack.clear();
     }
 
@@ -113,7 +132,7 @@ impl Document {
         let char_idx = self.line_col_to_char(line, col);
         if char_idx < self.rope.len_chars() {
             self.rope.remove(char_idx..char_idx + 1);
-            self.modified = true;
+            self.touch();
             self.redo_stack.clear();
         }
     }
@@ -125,7 +144,7 @@ impl Document {
         let e = end_char.min(len);
         if s < e {
             self.rope.remove(s..e);
-            self.modified = true;
+            self.touch();
             self.redo_stack.clear();
         }
     }
@@ -134,7 +153,7 @@ impl Document {
     pub fn insert_str(&mut self, line: usize, col: usize, text: &str) {
         let char_idx = self.line_col_to_char(line, col);
         self.rope.insert(char_idx, text);
-        self.modified = true;
+        self.touch();
         self.redo_stack.clear();
     }
 
@@ -144,7 +163,7 @@ impl Document {
         let len = self.rope.len_chars();
         let idx = char_idx.min(len);
         self.rope.insert(idx, text);
-        self.modified = true;
+        self.touch();
         self.redo_stack.clear();
     }
 
@@ -167,7 +186,7 @@ impl Document {
                 self.rope.remove(prev_end - 1..prev_end);
             }
         }
-        self.modified = true;
+        self.touch();
         self.redo_stack.clear();
     }
 
@@ -184,7 +203,7 @@ impl Document {
         }
         self.rope.remove(start..end_char);
         self.rope.insert(start, new_text);
-        self.modified = true;
+        self.touch();
         self.redo_stack.clear();
     }
 
@@ -243,6 +262,7 @@ impl Document {
         // Restore previous text
         self.rope = Rope::from_str(&entry.before_text);
         self.modified = !self.undo_stack.is_empty();
+        self.edit_seq = self.edit_seq.wrapping_add(1);
         Some((
             entry.cursor_before_line,
             entry.cursor_before_col,
@@ -270,6 +290,7 @@ impl Document {
         self.undo_stack.push(undo_entry);
         self.rope = Rope::from_str(&entry.before_text);
         self.modified = true;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
         Some((
             entry.cursor_before_line,
             entry.cursor_before_col,

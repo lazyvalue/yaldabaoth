@@ -56,4 +56,33 @@ impl Highlighter {
 
         Some(lines)
     }
+
+    /// Highlight a single line of code without cross-line state.
+    ///
+    /// Each call creates a fresh `HighlightLines`, so multi-line constructs
+    /// (block comments, heredocs) won't carry state across calls. This is the
+    /// right trade-off for the incremental per-line cache in `md_highlight`,
+    /// where re-highlighting from the fence opener would be O(block_size).
+    pub fn highlight_line_stateless(
+        &self,
+        language: &str,
+        line: &str,
+        bg_style: Style,
+    ) -> Option<Vec<(String, Style)>> {
+        let syntax = self.syntax_set.find_syntax_by_token(language)?;
+        let mut h = HighlightLines::new(syntax, &self.theme);
+        let ranges = h.highlight_line(line, &self.syntax_set).ok()?;
+        let segs: Vec<(String, Style)> = ranges
+            .into_iter()
+            .map(|(style, text)| {
+                let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+                (text.to_string(), bg_style.fg(fg))
+            })
+            .collect();
+        if segs.is_empty() {
+            Some(vec![(String::new(), bg_style)])
+        } else {
+            Some(segs)
+        }
+    }
 }

@@ -1,1 +1,4 @@
 /target
+
+# Claude Code worktrees (per CLAUDE.md worktree workflow)
+/.claude/worktrees/

@@ -1240,15 +1240,37 @@ impl Editor {
 
         let line_text = doc.line_text(last_llm_line);
         if line_text.ends_with('\n') {
-            if last_llm_line + 1 >= total_lines {
+            let next = last_llm_line + 1;
+            if next >= total_lines {
+                total_chars
+            } else if self.line_tagged_other_turn::<T>(next, turn_tag) {
+                // The line immediately after our last tagged line belongs to a
+                // *different* turn — e.g. a tool-call block anchored on its own
+                // line between two stretches of this turn's prose. Don't splice
+                // into it (that interleaves the tool line with our text and
+                // corrupts both); append on a fresh line at EOF instead.
                 total_chars
             } else {
-                doc.line_col_to_char(last_llm_line + 1, 0)
+                doc.line_col_to_char(next, 0)
             }
         } else {
             let line_len = doc.line_len_chars(last_llm_line);
             doc.line_col_to_char(last_llm_line, line_len)
         }
+    }
+
+    /// True if `line` carries a metadata tag of type `T` that differs from
+    /// `turn_tag`. Untagged lines (e.g. the empty trailing line) return false,
+    /// preserving the normal same-turn continuation path.
+    fn line_tagged_other_turn<T: Any + Send + Sync + PartialEq>(
+        &self,
+        line: usize,
+        turn_tag: &T,
+    ) -> bool {
+        self.core
+            .anchor_for_line_opt(line)
+            .and_then(|a| self.core.metadata::<T>().get(a).map(|v| v != turn_tag))
+            .unwrap_or(false)
     }
 
     pub fn document(&self) -> &Document {
@@ -1485,6 +1507,69 @@ mod tests {
     enum TurnId {
         Llm(usize),
         User(usize),
+        Tool(usize),
+    }
+
+    /// Mimic `main.rs::anchor_for_new_tool_call` + its `Tool(k)` re-tag: a
+    /// tool block lands on its own dedicated blank line tagged with a turn
+    /// distinct from the surrounding `Llm` prose.
+    fn simulate_tool_call(ed: &mut Editor, turn: usize) {
+        if !ed.document().full_text().is_empty()
+            && !ed.document().full_text().ends_with('\n')
+        {
+            let len = ed.document().rope().len_chars();
+            ed.programmatic_insert(len, "\n");
+        }
+        let len = ed.document().rope().len_chars();
+        ed.programmatic_insert(len, "\n");
+        let tool_line = ed.document().line_count().saturating_sub(2);
+        let anchor = ed.anchor_for_line(tool_line);
+        ed.metadata_mut::<TurnId>().insert(anchor, TurnId::Tool(turn));
+    }
+
+    #[test]
+    fn post_tool_chunk_does_not_clobber_pre_tool_line() {
+        // Regression: streamed prose, a tool call, then more prose in the
+        // same turn. The post-tool chunk must start a fresh line after the
+        // tool block — not splice into an earlier Llm line (the "ThereLet" /
+        // "Found key line" garble).
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "The key line is here.");
+        simulate_tool_call(&mut ed, 1);
+        ed.append_llm_chunk(TurnId::Llm(1), "Found it elsewhere.");
+
+        let text = ed.document().full_text();
+        assert!(text.contains("The key line is here."), "pre-tool intact: {text:?}");
+        assert!(text.contains("Found it elsewhere."), "post-tool present: {text:?}");
+        // No splice/merge of the two stretches.
+        assert!(
+            !text.contains("The key line is here.Found")
+                && !text.contains("FoundThe")
+                && !text.contains("hereFound"),
+            "post-tool text must not merge into the pre-tool line: {text:?}"
+        );
+        let pre = text.lines().position(|l| l.contains("key line")).unwrap();
+        let post = text.lines().position(|l| l.contains("Found it")).unwrap();
+        assert!(post > pre, "post-tool prose must come after pre-tool: {text:?}");
+
+        // Collect per-line tags (immutable borrow snapshot).
+        let tags: Vec<Option<TurnId>> = (0..ed.document().line_count())
+            .map(|l| {
+                ed.anchor_for_line_opt(l)
+                    .and_then(|a| ed.metadata::<TurnId>().get(a).copied())
+            })
+            .collect();
+        let tool_line = tags
+            .iter()
+            .position(|t| matches!(t, Some(TurnId::Tool(1))))
+            .expect("tool line should be tagged Tool(1)");
+        // The discriminating checks: post-tool prose lands on its OWN line
+        // (tagged Llm(1)), strictly after the tool line — not spliced onto the
+        // tool's line. Reverting the find_llm_insertion_point skip fails here.
+        assert_ne!(post, tool_line, "post-tool prose landed on the tool line: {text:?}");
+        assert!(pre < tool_line && tool_line < post, "expected pre < tool < post: {text:?}");
+        assert_eq!(tags[post], Some(TurnId::Llm(1)), "post-tool line keeps Llm(1): {text:?}");
+        assert_eq!(tags[pre], Some(TurnId::Llm(1)), "pre-tool line keeps Llm(1): {text:?}");
     }
 
     fn new_editor(text: &str) -> Editor {
@@ -1654,5 +1739,186 @@ mod tests {
         assert!(!ed.is_frozen_line(2));
         // The new chunk line (line 1) should be frozen.
         assert!(ed.is_frozen_line(1));
+    }
+
+    // ---- Comprehensive buffer-pumping / append_llm_chunk tests -----
+
+    #[test]
+    fn rapid_single_char_chunks_reassemble_correctly() {
+        let mut ed = new_editor("");
+        let msg = "Hello, world!\n";
+        for ch in msg.chars() {
+            ed.append_llm_chunk(TurnId::Llm(1), &ch.to_string());
+        }
+        assert_eq!(ed.document().full_text(), msg);
+    }
+
+    #[test]
+    fn many_rapid_chunks_same_turn() {
+        let mut ed = new_editor("");
+        for i in 0..100 {
+            ed.append_llm_chunk(TurnId::Llm(1), &format!("chunk{i} "));
+        }
+        let text = ed.document().full_text();
+        for i in 0..100 {
+            assert!(text.contains(&format!("chunk{i} ")), "missing chunk{i}");
+        }
+    }
+
+    #[test]
+    fn alternating_turns_preserve_all_content() {
+        let mut ed = new_editor("");
+        for i in 1..=20 {
+            ed.append_llm_chunk(TurnId::Llm(i), &format!("turn-{i}\n"));
+        }
+        let text = ed.document().full_text();
+        for i in 1..=20 {
+            assert!(
+                text.contains(&format!("turn-{i}\n")),
+                "missing turn-{i}"
+            );
+        }
+        assert_eq!(ed.document().line_count(), 21); // 20 lines + trailing empty
+    }
+
+    #[test]
+    fn large_single_chunk_appended_correctly() {
+        let mut ed = new_editor("");
+        let big = "x".repeat(10_000) + "\n";
+        ed.append_llm_chunk(TurnId::Llm(1), &big);
+        assert_eq!(ed.document().full_text(), big);
+        assert!(ed.is_frozen_line(0));
+    }
+
+    #[test]
+    fn multi_line_chunk_freezes_all_lines() {
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "line1\nline2\nline3\n");
+        assert_eq!(ed.document().full_text(), "line1\nline2\nline3\n");
+        for i in 0..3 {
+            assert!(ed.is_frozen_line(i), "line {i} should be frozen");
+            let a = ed.anchor_for_line(i);
+            assert_eq!(
+                ed.metadata::<TurnId>().get(a),
+                Some(&TurnId::Llm(1)),
+                "line {i} should be tagged Llm(1)"
+            );
+        }
+    }
+
+    #[test]
+    fn chunks_without_trailing_newline_join_correctly() {
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "Hello");
+        ed.append_llm_chunk(TurnId::Llm(1), ", ");
+        ed.append_llm_chunk(TurnId::Llm(1), "world!");
+        ed.append_llm_chunk(TurnId::Llm(1), "\n");
+        assert_eq!(ed.document().full_text(), "Hello, world!\n");
+    }
+
+    #[test]
+    fn empty_chunks_are_no_ops() {
+        let mut ed = new_editor("existing\n");
+        let before = ed.document().full_text();
+        ed.append_llm_chunk(TurnId::Llm(1), "");
+        ed.append_llm_chunk(TurnId::Llm(1), "");
+        assert_eq!(ed.document().full_text(), before);
+    }
+
+    #[test]
+    fn interleaved_user_and_llm_content() {
+        // Simulate: LLM writes turn 1, user types, LLM writes turn 2.
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "Agent reply 1\n");
+
+        // Simulate user typing at EOF (editable region).
+        let eof = ed.document().rope().len_chars();
+        ed.programmatic_insert(eof, "user message\n");
+
+        // Now LLM turn 2 arrives — should go to EOF, after user content.
+        ed.append_llm_chunk(TurnId::Llm(2), "Agent reply 2\n");
+        let text = ed.document().full_text();
+        assert!(text.contains("Agent reply 1\n"));
+        assert!(text.contains("user message\n"));
+        assert!(text.contains("Agent reply 2\n"));
+    }
+
+    #[test]
+    fn continuation_chunk_after_newline_goes_to_next_line() {
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "first line\n");
+        ed.append_llm_chunk(TurnId::Llm(1), "second line\n");
+        assert_eq!(
+            ed.document().full_text(),
+            "first line\nsecond line\n"
+        );
+        assert!(ed.is_frozen_line(0));
+        assert!(ed.is_frozen_line(1));
+    }
+
+    #[test]
+    fn stress_many_small_chunks_many_turns() {
+        let mut ed = new_editor("");
+        for turn in 1..=50 {
+            for chunk_idx in 0..10 {
+                let text = if chunk_idx == 9 {
+                    format!("t{turn}c{chunk_idx}\n")
+                } else {
+                    format!("t{turn}c{chunk_idx}-")
+                };
+                ed.append_llm_chunk(TurnId::Llm(turn), &text);
+            }
+        }
+        let text = ed.document().full_text();
+        // Verify every turn's content is present.
+        for turn in 1..=50 {
+            assert!(
+                text.contains(&format!("t{turn}c0-")),
+                "missing start of turn {turn}"
+            );
+            assert!(
+                text.contains(&format!("t{turn}c9\n")),
+                "missing end of turn {turn}"
+            );
+        }
+        // 50 turns, each ending with \n, so 50 content lines.
+        assert_eq!(
+            text.lines().count(),
+            50,
+            "expected 50 lines, got {}",
+            text.lines().count()
+        );
+    }
+
+    #[test]
+    fn chunk_with_only_newlines() {
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "before");
+        ed.append_llm_chunk(TurnId::Llm(1), "\n\n\n");
+        ed.append_llm_chunk(TurnId::Llm(1), "after\n");
+        let text = ed.document().full_text();
+        assert!(text.starts_with("before\n\n\n"));
+        assert!(text.contains("after\n"));
+    }
+
+    #[test]
+    fn frozen_lines_count_matches_content() {
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "a\nb\nc\nd\ne\n");
+        let frozen: Vec<(usize, usize)> = ed.frozen_lines().to_vec();
+        let frozen_count: usize = frozen.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(frozen_count, 5, "5 content lines should be frozen");
+    }
+
+    #[test]
+    fn append_to_editor_with_preexisting_content_no_tags() {
+        // Editor has content but no frozen/tagged lines. Chunk should
+        // append at EOF.
+        let mut ed = new_editor("preexisting content\n");
+        ed.append_llm_chunk(TurnId::Llm(1), "agent says hi\n");
+        assert_eq!(
+            ed.document().full_text(),
+            "preexisting content\nagent says hi\n"
+        );
     }
 }

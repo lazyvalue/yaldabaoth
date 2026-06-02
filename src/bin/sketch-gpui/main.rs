@@ -66,8 +66,10 @@
 //!   s                    cycle sort order (name / date↓ / date↑)
 //!   q / Esc              close browser (returns to doc, or quits)
 
+mod highlight_cache;
 mod workspace;
 
+use highlight_cache::{HighlightCache, LineHl};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -78,7 +80,7 @@ use gpui::{
     actions, div, point, px, rgb, rgba, size, AnyElement, App, AppContext, Application,
     Bounds, Context, FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight,
     Hsla, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke, Menu,
-    MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    ListScrollEvent, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
     Render, ScrollHandle, SharedString, StatefulInteractiveElement, StrikethroughStyle,
     Styled, StyledText, Task, TextLayout, TextRun, TitlebarOptions, UnderlineStyle, Window,
     WindowBounds, WindowOptions,
@@ -91,13 +93,46 @@ use sketch::editor::{Editor, LineAnchor};
 use sketch::file_browser::{BrowserEntry, FileBrowser};
 use sketch::keybind::KeybindManager;
 use sketch::keys::{Key, KeyPress, Modifiers as KMods};
-use sketch::md_highlight::{highlight_markdown_lines, Segment};
+use sketch::md_highlight::{
+    highlight_markdown_lines_syn, highlight_markdown_lines_stripped_syn,
+    Segment,
+};
 use sketch::menu::{MenuNode, MenuNodeKind, MenuState};
 use sketch::render;
 use sketch::session_client::SessionServerClient;
+use sketch::session_proto::AttachMode;
 use sketch::session_proto::Notification as ServerNotification;
 use sketch::style::{Color as NColor, Modifier, Style as NStyle};
-use sketch::theme::{Theme, ThemeName};
+use sketch::theme::{OverlayTheme, Theme, ThemeName};
+
+// ----------------------------------------------------------------------------
+// Render performance knobs (env-gated, read once)
+// ----------------------------------------------------------------------------
+
+/// `true` when `SKETCH_PERF` is set to anything other than `0`/empty. Enables
+/// per-frame timing breakdowns from the agent pane render path (extract /
+/// highlight / snapshot / total), printed to stderr. Read once and cached.
+fn perf_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(std::env::var("SKETCH_PERF"), Ok(v) if v != "0" && !v.is_empty())
+    })
+}
+
+/// `false` only when `SKETCH_HL_CACHE` is explicitly `0`/`off`/`false`. The
+/// incremental highlight cache is ON by default; this lets us A/B it against
+/// the old full-recompute path at runtime without a rebuild.
+fn hl_cache_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("SKETCH_HL_CACHE").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    })
+}
 
 // ----------------------------------------------------------------------------
 // Actions
@@ -121,6 +156,7 @@ actions!(
         OpenAgent,
         OpenMenu,
         Quit,
+        Restart,
         // Buffer cycling
         NextBuffer,
         PrevBuffer,
@@ -157,8 +193,12 @@ actions!(
         ZoomIn,
         ZoomOut,
         ZoomReset,
-        // View-mode mouse text selection
+        // Copy selected text to system clipboard (all screens)
+        CopySelection,
+        // View-mode mouse text selection (doc view only, legacy alias)
         CopyDocSelection,
+        // Paste from system clipboard into active editor
+        PasteFromClipboard,
         // Open the rename input overlay for the active tab.
         RenameTab,
         // Agent window: send the current draft. Worksheet sweep (§12) or
@@ -171,6 +211,23 @@ actions!(
         ToggleTasklist,
         // Agent window: open/close the Subagents sidepane (§32). Cmd-2.
         ToggleSubagents,
+        // Agent window: interrupt the in-flight turn (ACP session/cancel).
+        // Bound to Cmd-. and surfaced as a Stop button while a reply is
+        // pending.
+        StopAgent,
+        // Rail (persistent side column, spec-rail.md).
+        // Toggles (global, `None` context):
+        ToggleFileBrowserRail,
+        ToggleOutlineRail,
+        FlipRailSide,
+        // Rail-focused navigation (`RailView` context):
+        RailDown,
+        RailUp,
+        RailSelect,
+        RailClose,
+        RailParent,
+        RailToggleHidden,
+        RailCycleSort,
     ]
 );
 
@@ -278,6 +335,33 @@ fn ncolor_to_hsla(c: NColor, fallback: u32) -> Hsla {
     }
 }
 
+/// RGB-packed `u32` for an `NColor`, mirroring [`ncolor_to_hsla`]'s palette.
+/// Used where a downstream API wants a `u32` base color (e.g.
+/// `styled_line_element`) rather than an `Hsla` — so the theme's foreground
+/// reaches per-span text runs instead of the hardcoded `DEFAULT_FG`.
+fn ncolor_to_u32(c: NColor, fallback: u32) -> u32 {
+    match c {
+        NColor::Reset | NColor::Indexed(_) => fallback,
+        NColor::Black => 0x000000,
+        NColor::Red => 0xff5555,
+        NColor::Green => 0x50fa7b,
+        NColor::Yellow => 0xf1fa8c,
+        NColor::Blue => 0x6272a4,
+        NColor::Magenta => 0xff79c6,
+        NColor::Cyan => 0x8be9fd,
+        NColor::Gray => 0xbfbfbf,
+        NColor::DarkGray => 0x6272a4,
+        NColor::LightRed => 0xff6e6e,
+        NColor::LightGreen => 0x69ff94,
+        NColor::LightYellow => 0xffffa5,
+        NColor::LightBlue => 0xd6acff,
+        NColor::LightMagenta => 0xff92df,
+        NColor::LightCyan => 0xa4ffff,
+        NColor::White => 0xffffff,
+        NColor::Rgb(r, g, b) => ((r as u32) << 16) | ((g as u32) << 8) | (b as u32),
+    }
+}
+
 fn fg_or(s: NStyle, fallback: u32) -> Hsla {
     match s.fg {
         Some(c) => ncolor_to_hsla(c, fallback),
@@ -289,6 +373,18 @@ fn bg_or(s: NStyle, fallback: u32) -> Hsla {
     match s.bg {
         Some(c) => ncolor_to_hsla(c, fallback),
         None => rgb(fallback).into(),
+    }
+}
+
+/// Tint a background color by blending in a hue at `saturation` and
+/// shifting lightness by `lightness_delta`. Used to derive subtle per-turn
+/// card backgrounds from the theme's editor_bg.
+fn tint_bg(base: Hsla, hue: f32, saturation: f32, lightness_delta: f32) -> Hsla {
+    Hsla {
+        h: hue,
+        s: saturation,
+        l: (base.l + lightness_delta).clamp(0.0, 1.0),
+        a: base.a,
     }
 }
 
@@ -750,25 +846,33 @@ fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElement {
             }
             col.into_any_element()
         }
-        RenderedBlock::CodeBlock { language, lines } => {
-            let bg = ctx.theme.code_block_bg;
+        RenderedBlock::CodeBlock { language, lines, source_file } => {
             let mut col = div()
                 .flex()
                 .flex_col()
-                .p_2()
-                .rounded_md()
-                .bg(bg_or(bg, BG))
                 .font_family(ctx.code_font.clone())
                 .text_color(rgb(DEFAULT_FG));
-            if let Some(lang) = language {
-                if !lang.is_empty() {
-                    col = col.child(
-                        div()
-                            .text_color(rgb(0x6272a4))
-                            .text_size(px(11.0))
-                            .pb_1()
-                            .child(format!("[{}]", lang)),
-                    );
+            if *source_file {
+                // Source file: no container chrome — code IS the document.
+            } else {
+                // Fenced code block inside markdown: tinted background + padding.
+                let bg = ctx.theme.code_block_bg;
+                col = col
+                    .p_2()
+                    .rounded_md()
+                    .bg(bg_or(bg, BG));
+            }
+            if !*source_file {
+                if let Some(lang) = language {
+                    if !lang.is_empty() {
+                        col = col.child(
+                            div()
+                                .text_color(rgb(0x6272a4))
+                                .text_size(px(11.0))
+                                .pb_1()
+                                .child(format!("[{}]", lang)),
+                        );
+                    }
                 }
             }
             let row_style = NStyle::default();
@@ -1101,12 +1205,89 @@ fn styled_line_char_count(line: &StyledLine) -> usize {
 /// link and is left alone for now.
 const WIKI_LINK_PREFIX: &str = "wiki:";
 
+/// Map a file extension to a syntect language token. Returns `None` for
+/// markdown and unknown extensions — those are rendered as prose.
+fn lang_for_path(path: &std::path::Path) -> Option<&'static str> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("rs") => Some("rust"),
+        Some("py") | Some("pyi") => Some("python"),
+        Some("js") | Some("mjs") | Some("cjs") => Some("javascript"),
+        Some("ts") | Some("mts") | Some("cts") => Some("typescript"),
+        Some("tsx") => Some("tsx"),
+        Some("jsx") => Some("jsx"),
+        Some("c") | Some("h") => Some("c"),
+        Some("cpp") | Some("cc") | Some("cxx") | Some("hpp") | Some("hxx") | Some("hh") => {
+            Some("cpp")
+        }
+        Some("go") => Some("go"),
+        Some("java") => Some("java"),
+        Some("rb") => Some("ruby"),
+        Some("sh") | Some("bash") | Some("zsh") => Some("bash"),
+        Some("css") => Some("css"),
+        Some("html") | Some("htm") => Some("html"),
+        Some("json") => Some("json"),
+        Some("xml") => Some("xml"),
+        Some("yaml") | Some("yml") => Some("yaml"),
+        Some("toml") => Some("toml"),
+        Some("sql") => Some("sql"),
+        Some("swift") => Some("swift"),
+        Some("kt") | Some("kts") => Some("kotlin"),
+        Some("lua") => Some("lua"),
+        Some("r") | Some("R") => Some("r"),
+        Some("zig") => Some("zig"),
+        Some("hs") => Some("haskell"),
+        Some("ex") | Some("exs") => Some("elixir"),
+        Some("erl") => Some("erlang"),
+        Some("ml") | Some("mli") => Some("ocaml"),
+        Some("scala") | Some("sc") => Some("scala"),
+        Some("cs") => Some("c#"),
+        Some("fs") | Some("fsx") => Some("f#"),
+        Some("pl") | Some("pm") => Some("perl"),
+        Some("php") => Some("php"),
+        Some("dart") => Some("dart"),
+        Some("m") => Some("objective-c"),
+        Some("clj") | Some("cljs") => Some("clojure"),
+        Some("el") => Some("lisp"),
+        Some("vim") => Some("viml"),
+        Some("cmake") => Some("cmake"),
+        Some("dockerfile") | Some("Dockerfile") => Some("dockerfile"),
+        Some("tf") | Some("hcl") => Some("hcl"),
+        Some("proto") => Some("protobuf"),
+        Some("graphql") | Some("gql") => Some("graphql"),
+        _ => None,
+    }
+}
+
 /// Render markdown to blocks + post-process `[[name]]` / `[[name|display]]`
 /// patterns into link-bearing spans. pulldown-cmark doesn't understand
 /// wiki links, so they arrive as plain text and we rewrite them after
 /// rendering. Reuses the existing `StyledSpan.link` channel so click
 /// handling stays uniform with regular markdown links.
-fn render_with_wiki(text: &str, theme: &Theme) -> Vec<RenderedBlock> {
+///
+/// When `path` points to a recognised source file (`.rs`, `.py`, etc.),
+/// the text is highlighted with syntect and returned as a single
+/// `CodeBlock` with `source_file: true` so the renderer skips container
+/// chrome (background tint, padding, rounded corners).
+fn render_with_wiki(text: &str, theme: &Theme, path: Option<&std::path::Path>) -> Vec<RenderedBlock> {
+    if let Some(lang) = path.and_then(lang_for_path) {
+        let hl = sketch::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
+        // Use a transparent base style — source files render against the
+        // normal document background, not the code-block tint.
+        let base = sketch::style::Style::default();
+        let lines = hl
+            .highlight(lang, text, base)
+            .unwrap_or_else(|| {
+                // Fallback: plain text with default style.
+                text.lines()
+                    .map(|l| StyledLine::new(vec![StyledSpan::new(l, theme.paragraph)]))
+                    .collect()
+            });
+        return vec![RenderedBlock::CodeBlock {
+            language: Some(lang.to_string()),
+            lines,
+            source_file: true,
+        }];
+    }
     let mut blocks = render::render(text, theme);
     expand_wiki_links_in_blocks(&mut blocks, theme);
     blocks
@@ -1234,8 +1415,8 @@ fn re_render_layout_docs(layout: &mut workspace::Layout<WindowContent>, theme: &
             if let WindowContent::Doc(d) = &mut win.content {
                 let path = PathBuf::from(d.file_label.as_ref());
                 let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let doc = Document::from_text(text, path);
-                d.blocks = render_with_wiki(&doc.full_text(), theme);
+                let doc = Document::from_text(text, path.clone());
+                d.blocks = render_with_wiki(&doc.full_text(), theme, Some(&path));
             }
             // Browser's underlying-stashed content is also restyled if it
             // happens to be a Doc — otherwise reverting via Esc lands on
@@ -1245,8 +1426,8 @@ fn re_render_layout_docs(layout: &mut workspace::Layout<WindowContent>, theme: &
                     if let WindowContent::Doc(d) = under {
                         let path = PathBuf::from(d.file_label.as_ref());
                         let text = std::fs::read_to_string(&path).unwrap_or_default();
-                        let doc = Document::from_text(text, path);
-                        d.blocks = render_with_wiki(&doc.full_text(), theme);
+                        let doc = Document::from_text(text, path.clone());
+                        d.blocks = render_with_wiki(&doc.full_text(), theme, Some(&path));
                     }
                 }
             }
@@ -1559,6 +1740,11 @@ fn process_cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
 }
 
+/// Whether this process was launched as a build-loop candidate.
+fn is_candidate_launch() -> bool {
+    std::env::var("SKETCH_CANDIDATE").as_deref() == Ok("1")
+}
+
 /// Connect to the session server if `SKETCH_SESSION_SERVER=1` is set.
 /// Returns `None` when the env var is absent/empty, or when the connection
 /// fails (falls back to direct AcpChannelClient spawning silently).
@@ -1698,6 +1884,37 @@ fn preferences_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("sketch").join("preferences.json"))
 }
 
+/// Where the agent info bar sits relative to the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum AgentStatusPosition {
+    Top,
+    #[default]
+    Bottom,
+}
+
+impl AgentStatusPosition {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Top => Self::Bottom,
+            Self::Bottom => Self::Top,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        match s {
+            "top" => Self::Top,
+            _ => Self::Bottom,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct Preferences {
     /// Kebab-case theme identifier — `ThemeName::as_kebab()` /
@@ -1705,6 +1922,9 @@ struct Preferences {
     /// the value from config.kdl (or the built-in default)."
     #[serde(default, skip_serializing_if = "Option::is_none")]
     theme: Option<String>,
+    /// Agent info bar placement: "top" or "bottom".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_status_position: Option<String>,
 }
 
 fn load_preferences() -> Preferences {
@@ -1767,12 +1987,43 @@ enum PersistedLayout {
     },
 }
 
+/// Persisted rail kind tag (spec-rail.md §14). Outline rails persist only
+/// their kind — the heading list re-derives on restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedRailKind {
+    FileBrowser,
+    Outline,
+}
+
+/// Persisted per-tab rail (spec-rail.md §14). Optional on `PersistedTab` so
+/// snapshots written before rails existed still load (serde default → `None`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedRail {
+    kind: PersistedRailKind,
+    #[serde(default)]
+    side: workspace::RailSide,
+    /// Column width in px. Older/partial entries default to the standard width.
+    #[serde(default = "default_rail_width")]
+    width: f32,
+    /// File-browser rail: directory it was rooted at. Absent for outline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cwd: Option<PathBuf>,
+}
+
+fn default_rail_width() -> f32 {
+    workspace::RAIL_DEFAULT_WIDTH
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedTab {
     auto_name: String,
     display_name: Option<String>,
     focused_window: workspace::WindowId,
     layout: PersistedLayout,
+    /// Optional rail (spec-rail.md §14). Absent in old snapshots → no rail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rail: Option<PersistedRail>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1833,6 +2084,47 @@ fn snapshot_layout(layout: &workspace::Layout<WindowContent>) -> PersistedLayout
     }
 }
 
+/// Snapshot a live rail into its persisted shadow (spec-rail.md §14).
+fn snapshot_rail(rail: &workspace::RailState) -> PersistedRail {
+    match &rail.content {
+        workspace::RailContent::FileBrowser(fb) => PersistedRail {
+            kind: PersistedRailKind::FileBrowser,
+            side: rail.side,
+            width: rail.width_px,
+            cwd: Some(fb.current_dir().to_path_buf()),
+        },
+        workspace::RailContent::Outline(_) => PersistedRail {
+            kind: PersistedRailKind::Outline,
+            side: rail.side,
+            width: rail.width_px,
+            cwd: None,
+        },
+    }
+}
+
+/// Reconstruct a live rail from its persisted shadow (spec-rail.md §14). The
+/// restored rail is unfocused (focus stays on the content leaf on restore).
+fn restore_rail(p: PersistedRail) -> workspace::RailState {
+    let content = match p.kind {
+        PersistedRailKind::FileBrowser => {
+            let dir = match p.cwd {
+                Some(d) if d.is_dir() => d,
+                _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            };
+            workspace::RailContent::FileBrowser(FileBrowser::new(dir))
+        }
+        PersistedRailKind::Outline => {
+            workspace::RailContent::Outline(workspace::OutlineState::new())
+        }
+    };
+    workspace::RailState {
+        content,
+        side: p.side,
+        width_px: p.width,
+        focused: false,
+    }
+}
+
 /// Snapshot a live workspace into a fully serializable shape.
 fn snapshot_workspace(ws: &workspace::Workspace<WindowContent>) -> PersistedWorkspace {
     PersistedWorkspace {
@@ -1844,6 +2136,7 @@ fn snapshot_workspace(ws: &workspace::Workspace<WindowContent>) -> PersistedWork
                 display_name: t.display_name.clone(),
                 focused_window: t.focused,
                 layout: snapshot_layout(&t.layout),
+                rail: t.rail.as_ref().map(snapshot_rail),
             })
             .collect(),
         active_tab: ws.active_tab,
@@ -2124,12 +2417,19 @@ enum FlatItem {
     /// A structurally-rendered block (table or fenced code block) that
     /// replaces a range of frozen lines with proper layout.
     Block(RenderedBlock),
-    /// Visual separator inserted between turns (Claude→You, You→Claude).
-    /// The label is "Claude" or "You" and rendered as a centered legend.
-    TurnSeparator {
-        label: &'static str,
-        is_agent: bool,
+    /// Visual divider at a turn boundary: role label + faint rule.
+    TurnHeader {
+        role: TurnRole,
     },
+    /// Pulsing indicator shown at transcript tail while awaiting reply.
+    ThinkingIndicator,
+}
+
+/// Role shown in a `TurnHeader`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnRole {
+    Claude,
+    User,
 }
 
 /// Free-function variant of `SketchGpuiView::build_tool_block` that
@@ -2384,6 +2684,108 @@ fn tool_render_policy(tc: &sketch::acp_channel::ToolCall) -> ToolRenderPolicy {
     }
 }
 
+/// Extract a short detail string from a tool call's input for inline
+/// display in the group header. Returns the file path for Read/Edit/Write,
+/// truncated command for Execute, query for Search, etc.
+fn tool_inline_detail(tc: &sketch::acp_channel::ToolCall) -> Option<String> {
+    let input = tc.raw_input.as_ref()?;
+    // Try file_path first (Read, Edit, Write, Glob).
+    if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
+        // Show just the filename or last path component to keep it short.
+        let short = std::path::Path::new(fp)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(fp);
+        return Some(short.to_string());
+    }
+    // Execute/Bash: show truncated command.
+    if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+        let first_line = cmd.lines().next().unwrap_or(cmd);
+        let truncated = if first_line.len() > 60 {
+            format!("{}…", &first_line[..60])
+        } else {
+            first_line.to_string()
+        };
+        return Some(truncated);
+    }
+    // Search (Grep/Glob): show pattern.
+    if let Some(pat) = input.get("pattern").and_then(|v| v.as_str()) {
+        let truncated = if pat.len() > 40 {
+            format!("{}…", &pat[..40])
+        } else {
+            pat.to_string()
+        };
+        return Some(truncated);
+    }
+    None
+}
+
+/// Append a tool call's body panes directly to a container div.
+/// Used for single-tool groups where we skip the nested sub-header.
+fn append_tool_body(
+    mut block: gpui::Div,
+    tc: &sketch::acp_channel::ToolCall,
+    policy: ToolRenderPolicy,
+    code_font: &SharedString,
+    at: &sketch::theme::AgentTheme,
+) -> gpui::Div {
+    let max_lines = match policy {
+        ToolRenderPolicy::Truncated { max_lines } => Some(max_lines),
+        _ => None,
+    };
+    let body_bg = nc(at.tool_body_bg);
+    let output_bg = nc(at.tool_output_bg);
+    let body_fg = nc(at.tool_body_fg);
+    let diff_add = nc(at.diff_add);
+    let diff_remove = nc(at.diff_remove);
+    let diff_header = nc(at.diff_header);
+    if let Some(input) = &tc.raw_input {
+        let pretty =
+            serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
+        block = block.child(tool_body_pane_free(
+            "input",
+            &pretty,
+            None,
+            body_bg,
+            body_fg,
+            code_font,
+            diff_add,
+            diff_remove,
+            diff_header,
+        ));
+    }
+    let content_text = render_tool_content_blocks(&tc.content);
+    if !content_text.trim().is_empty() {
+        block = block.child(tool_body_pane_free(
+            "content",
+            &content_text,
+            max_lines,
+            body_bg,
+            body_fg,
+            code_font,
+            diff_add,
+            diff_remove,
+            diff_header,
+        ));
+    }
+    if let Some(output) = &tc.raw_output {
+        let pretty =
+            serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
+        block = block.child(tool_body_pane_free(
+            "output",
+            &pretty,
+            max_lines,
+            output_bg,
+            body_fg,
+            code_font,
+            diff_add,
+            diff_remove,
+            diff_header,
+        ));
+    }
+    block
+}
+
 /// Flatten a tool call's `Vec<ToolCallContent>` into a single human-
 /// readable string. Splits diffs into a labelled `--- path` header plus
 /// old/new bodies; treats terminal embeds as a one-line placeholder.
@@ -2484,11 +2886,18 @@ fn anchor_for_new_tool_call(editor: &mut Editor) -> LineAnchor {
         let len = editor.document().rope().len_chars();
         editor.programmatic_insert(len, "\n");
     }
+    // Append a dedicated blank line for the tool block to anchor on, rather
+    // than reusing the trailing LLM content line. Tagging the anchor line
+    // `Tool(k)` (for the gutter) would otherwise steal that line's `Llm(k)`
+    // tag, and `find_llm_insertion_point` keys off the last `Llm`-tagged line
+    // to place the turn's next chunk — stealing it makes post-tool prose
+    // splice into an earlier line (the "ThereLet" / "Found key line" clobber).
+    let len = editor.document().rope().len_chars();
+    editor.programmatic_insert(len, "\n");
     let line_count = editor.document().line_count();
-    // After ensuring trailing `\n`, the last actual content line is
-    // line_count - 2 (line_count - 1 is the empty trailing line).
-    // saturating_sub guards an empty doc, where there's no content to
-    // anchor to and we just put the tool block at the top.
+    // The dedicated blank line we just created is line_count - 2
+    // (line_count - 1 is the empty trailing line). saturating_sub guards an
+    // empty doc, where the tool block just anchors at the top.
     let line = line_count.saturating_sub(2);
     editor.anchor_for_line(line)
 }
@@ -2516,6 +2925,7 @@ fn cursor_visible_child_index(
     c: &AgentState,
     doc_line: usize,
     block_ranges: &[(usize, usize)],
+    turn_headers_before: usize,
 ) -> usize {
     // Count distinct anchor lines before doc_line (each = one ToolGroup item).
     // `LineAnchor` is opaque; resolve to a current line index via the editor.
@@ -2539,7 +2949,37 @@ fn cursor_visible_child_index(
             lines_collapsed += (e - s) - 1; // N lines → 1 block = N-1 fewer items
         }
     }
-    doc_line - lines_collapsed + anchors_before.len()
+    doc_line - lines_collapsed + anchors_before.len() + turn_headers_before
+}
+
+/// Count `TurnHeader` items that would be inserted before `before_line`
+/// during the flat-items build. Must match the insertion logic in
+/// `render_agent`'s flat-items loop.
+fn count_turn_headers_before(tags: &[Option<TurnId>], before_line: usize) -> usize {
+    let mut count = 0usize;
+    let mut prev: Option<TurnId> = None;
+    for i in 0..before_line.min(tags.len()) {
+        if let Some(tid) = tags[i] {
+            let dominated_by = match tid {
+                TurnId::Tool(_) => None,
+                other => Some(other),
+            };
+            if let Some(dt) = dominated_by {
+                let changed = match prev {
+                    Some(p) => p != dt,
+                    None => true,
+                };
+                if changed {
+                    count += 1;
+                    prev = Some(dt);
+                }
+            }
+        } else if prev.is_some() {
+            count += 1;
+            prev = None;
+        }
+    }
+    count
 }
 
 /// Detect line ranges in `lines` that should be rendered as structured
@@ -2617,7 +3057,7 @@ fn parse_block_range(
     theme: &Theme,
 ) -> Option<RenderedBlock> {
     let slice: String = lines[start..end].join("\n");
-    let blocks = render_with_wiki(&slice, theme);
+    let blocks = render_with_wiki(&slice, theme, None);
     // Take the first Table or CodeBlock produced.
     for b in blocks {
         match &b {
@@ -2847,139 +3287,173 @@ fn build_wrapped_line(
 /// Build the cursor caret element. Pulled out so the empty-line, mid-line,
 /// and end-of-line code paths all produce identical-looking carets.
 ///
-/// Render a single chatbox line with horizontal viewport tracking.
+/// Render a single chatbox logical line as a wrapping row.
 ///
-/// Unlike `build_wrapped_line` (which relies on flex-wrap and breaks at
-/// word boundaries), this function renders the visible portion of a line
-/// as a single non-wrapping row. The caller pre-slices the text to the
-/// visible window; this function just builds the inline elements with
-/// cursor and selection highlighting.
+/// Long lines wrap at whitespace boundaries (flex_wrap), so the cursor stays
+/// visible without horizontal scrolling. The caret is emitted inline as its
+/// own flex child between the before/after halves of the containing token,
+/// so wrap behaviour stays consistent across cursor and non-cursor lines.
 fn build_chatbox_line(
-    vis_text: &str,
+    full_text: &str,
     is_cursor_line: bool,
-    vis_cursor_col: usize,
+    cursor_col: usize,
     mode: EditMode,
     cursor_color: Hsla,
     sel: Option<((usize, usize), (usize, usize))>,
     line_idx: usize,
-    scroll_start: usize,
     total_line_chars: usize,
     code_font: &SharedString,
+    text_color: Hsla,
 ) -> AnyElement {
     let line_h = px(18.0);
-    let fg: Hsla = rgb(DEFAULT_FG).into();
+    let fg: Hsla = text_color;
     let sel_bg: Hsla = ncolor_to_hsla(SELECTION_BG, BG);
 
-    let vis_chars: Vec<char> = vis_text.chars().collect();
-    let vis_len = vis_chars.len();
+    let chars: Vec<char> = full_text.chars().collect();
+    let char_count = chars.len();
 
-    // Compute selection range in visible coordinates.
-    let vis_sel = sel.and_then(|s| {
-        line_selection_range(s, line_idx, total_line_chars)
-    }).and_then(|(abs_start, abs_end)| {
-        // Convert absolute column range to visible-window-relative.
-        let vs = abs_start.saturating_sub(scroll_start);
-        let ve = abs_end.saturating_sub(scroll_start);
-        if ve > vs { Some((vs.min(vis_len), ve.min(vis_len))) } else { None }
-    });
+    // Selection range projected onto this line.
+    let line_sel = sel
+        .and_then(|s| line_selection_range(s, line_idx, total_line_chars))
+        .and_then(|(s, e)| {
+            if e > s {
+                Some((s.min(char_count), e.min(char_count)))
+            } else {
+                None
+            }
+        });
+
+    // Tokenize into whitespace vs non-whitespace runs so flex_wrap can break
+    // at token boundaries. Each token becomes its own flex child.
+    let mut tokens: Vec<String> = Vec::new();
+    {
+        let mut current = String::new();
+        let mut current_ws = false;
+        for ch in chars.iter().copied() {
+            let is_ws = ch == ' ' || ch == '\t';
+            if current.is_empty() {
+                current_ws = is_ws;
+                current.push(ch);
+            } else if current_ws == is_ws {
+                current.push(ch);
+            } else {
+                tokens.push(std::mem::take(&mut current));
+                current_ws = is_ws;
+                current.push(ch);
+            }
+        }
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+    }
 
     let mut row = div()
         .flex()
         .flex_row()
-        .h(line_h)
+        .flex_wrap()
         .items_center()
+        .min_w_0()
+        .w_full()
+        .min_h(line_h)
         .font_family(code_font.clone())
         .text_size(px(13.0))
         .text_color(fg);
 
-    if vis_text.is_empty() && !is_cursor_line {
-        // Empty non-cursor line — just take up space.
-        row = row.child(" ");
+    // Emit a chunk of text with the on-line selection highlight painted
+    // through any overlapping range. `chunk_start_col` is the column at
+    // which `text` begins on the logical line.
+    let emit_chunk = |row: gpui::Div, text: String, chunk_start_col: usize| -> gpui::Div {
+        if text.is_empty() {
+            return row;
+        }
+        let chunk_chars: Vec<char> = text.chars().collect();
+        let chunk_len = chunk_chars.len();
+        let chunk_end_col = chunk_start_col + chunk_len;
+        if let Some((ss, se)) = line_sel {
+            if se > chunk_start_col && ss < chunk_end_col {
+                let local_ss = ss.saturating_sub(chunk_start_col).min(chunk_len);
+                let local_se = se.saturating_sub(chunk_start_col).min(chunk_len);
+                let mut r = row;
+                if local_ss > 0 {
+                    let pre: String = chunk_chars[..local_ss].iter().collect();
+                    r = r.child(pre);
+                }
+                if local_se > local_ss {
+                    let in_sel: String = chunk_chars[local_ss..local_se].iter().collect();
+                    r = r.child(div().bg(sel_bg).child(in_sel));
+                }
+                if local_se < chunk_len {
+                    let post: String = chunk_chars[local_se..].iter().collect();
+                    r = r.child(post);
+                }
+                return r;
+            }
+        }
+        row.child(text)
+    };
+
+    // Empty line: just emit a placeholder space + (cursor if needed) so the
+    // row still occupies a visual line.
+    if tokens.is_empty() {
+        if is_cursor_line {
+            row = row.child(make_caret(mode, ' ', cursor_color));
+        } else {
+            row = row.child(" ");
+        }
         return row.into_any_element();
     }
 
     if !is_cursor_line {
-        // Non-cursor line: render as a single span, with optional selection.
-        if let Some((ss, se)) = vis_sel {
-            if ss > 0 {
-                let before: String = vis_chars[..ss].iter().collect();
-                row = row.child(before);
-            }
-            let selected: String = vis_chars[ss..se].iter().collect();
-            row = row.child(
-                div()
-                    .bg(sel_bg)
-                    .child(selected),
-            );
-            if se < vis_len {
-                let after: String = vis_chars[se..].iter().collect();
-                row = row.child(after);
-            }
-        } else {
-            row = row.child(vis_text.to_string());
+        let mut col_so_far = 0usize;
+        for token in &tokens {
+            let token_len = token.chars().count();
+            row = emit_chunk(row, token.clone(), col_so_far);
+            col_so_far += token_len;
         }
         return row.into_any_element();
     }
 
-    // Cursor line: split text around cursor position.
-    let clamped_cursor = vis_cursor_col.min(vis_len);
+    // Cursor line: walk tokens by column and inject the caret at the cursor's
+    // column boundary, splitting the containing token if needed.
+    let cursor_col = cursor_col.min(char_count);
+    let mut col_so_far = 0usize;
+    let mut caret_emitted = false;
+    for token in &tokens {
+        let token_chars: Vec<char> = token.chars().collect();
+        let token_len = token_chars.len();
+        let token_end_col = col_so_far + token_len;
+        let caret_in_token =
+            !caret_emitted && cursor_col >= col_so_far && cursor_col <= token_end_col;
 
-    // Build three segments: before cursor, cursor, after cursor.
-    // Interleave selection highlighting.
-    let before: String = vis_chars[..clamped_cursor].iter().collect();
-    let cursor_char = vis_chars.get(clamped_cursor).copied().unwrap_or(' ');
-    let after_start = match mode {
-        EditMode::Normal => (clamped_cursor + 1).min(vis_len),
-        EditMode::Insert => clamped_cursor,
-    };
-    let after: String = vis_chars[after_start..].iter().collect();
-
-    // Before-cursor text (with selection overlay if applicable).
-    if !before.is_empty() {
-        if let Some((ss, se)) = vis_sel {
-            // Selection may overlap the before-cursor region.
-            let b_len = before.chars().count();
-            let sel_s = ss.min(b_len);
-            let sel_e = se.min(b_len);
-            if sel_s < sel_e {
-                let pre_sel: String = vis_chars[..sel_s].iter().collect();
-                if !pre_sel.is_empty() { row = row.child(pre_sel); }
-                let in_sel: String = vis_chars[sel_s..sel_e].iter().collect();
-                row = row.child(div().bg(sel_bg).child(in_sel));
-                let post_sel: String = vis_chars[sel_e..clamped_cursor].iter().collect();
-                if !post_sel.is_empty() { row = row.child(post_sel); }
-            } else {
-                row = row.child(before);
+        if caret_in_token {
+            let split_point = cursor_col - col_so_far;
+            let before: String = token_chars[..split_point].iter().collect();
+            if !before.is_empty() {
+                row = emit_chunk(row, before, col_so_far);
+            }
+            let cursor_char = token_chars.get(split_point).copied().unwrap_or(' ');
+            row = row.child(make_caret(mode, cursor_char, cursor_color));
+            caret_emitted = true;
+            // In Normal mode the cursor cell consumed the char at split_point;
+            // in Insert mode the caret is a zero-width beam so the char at
+            // split_point still belongs to the after-stream.
+            let after_start = match mode {
+                EditMode::Normal => split_point + 1,
+                EditMode::Insert => split_point,
+            };
+            if after_start < token_len {
+                let after: String = token_chars[after_start..].iter().collect();
+                row = emit_chunk(row, after, col_so_far + after_start);
             }
         } else {
-            row = row.child(before);
+            row = emit_chunk(row, token.clone(), col_so_far);
         }
+        col_so_far = token_end_col;
     }
 
-    // Cursor caret.
-    row = row.child(make_caret(mode, cursor_char, cursor_color));
-
-    // After-cursor text.
-    if !after.is_empty() {
-        if let Some((ss, se)) = vis_sel {
-            let a_start = after_start;
-            let a_chars: Vec<char> = after.chars().collect();
-            let a_len = a_chars.len();
-            let rel_ss = ss.saturating_sub(a_start).min(a_len);
-            let rel_se = se.saturating_sub(a_start).min(a_len);
-            if rel_ss < rel_se {
-                let pre: String = a_chars[..rel_ss].iter().collect();
-                if !pre.is_empty() { row = row.child(pre); }
-                let in_sel: String = a_chars[rel_ss..rel_se].iter().collect();
-                row = row.child(div().bg(sel_bg).child(in_sel));
-                let post: String = a_chars[rel_se..].iter().collect();
-                if !post.is_empty() { row = row.child(post); }
-            } else {
-                row = row.child(after);
-            }
-        } else {
-            row = row.child(after);
-        }
+    // Cursor sits past the last char (e.g., end-of-line in Insert mode).
+    if !caret_emitted {
+        row = row.child(make_caret(mode, ' ', cursor_color));
     }
 
     row.into_any_element()
@@ -3061,6 +3535,21 @@ fn doc_char_to_line_col(doc: &Document, char_idx: usize) -> (usize, usize) {
     let line = rope.char_to_line(i);
     let line_start = rope.line_to_char(line);
     (line, i - line_start)
+}
+
+/// Wire a `ListState`'s scroll handler to update the shared `follow_output`
+/// flag. When the user scrolls up (`is_scrolled == true`), follow is disabled.
+/// When they scroll back to the bottom (`is_scrolled == false`), it re-enables.
+fn setup_list_follow_handler(
+    list_state: &gpui::ListState,
+    follow: &std::rc::Rc<std::cell::Cell<bool>>,
+) {
+    let flag = follow.clone();
+    list_state.set_scroll_handler(move |ev: &gpui::ListScrollEvent, _w, _cx| {
+        // `is_scrolled` is false when the list is pinned to the bottom
+        // (logical_scroll_top == None in GPUI's ListState internals).
+        flag.set(!ev.is_scrolled);
+    });
 }
 
 /// Called when the ACP turn ends (the agent's `session/prompt` response
@@ -3233,15 +3722,7 @@ struct Chatbox {
     editor: Editor,
     mode: EditMode,
     scroll_handle: ScrollHandle,
-    /// First visible column on the cursor's line — updated every render to
-    /// keep the cursor horizontally in view. Only the cursor line scrolls;
-    /// other lines always start at column 0.
-    h_scroll_col: usize,
 }
-
-/// Right-margin in columns: when the cursor hits this many columns from the
-/// right edge, start scrolling.
-const CHATBOX_H_MARGIN_COLS: usize = 4;
 
 impl Chatbox {
     fn new() -> Self {
@@ -3249,29 +3730,11 @@ impl Chatbox {
             editor: Editor::new(String::new(), std::path::PathBuf::from("*chatbox*")),
             mode: EditMode::Insert,
             scroll_handle: ScrollHandle::new(),
-            h_scroll_col: 0,
         }
     }
 
     fn text(&self) -> String {
         self.editor.document().full_text()
-    }
-
-    /// Update `h_scroll_col` so the cursor column is visible within
-    /// `visible_cols` columns. Call before rendering.
-    fn ensure_cursor_visible(&mut self, cursor_col: usize, visible_cols: usize) {
-        if visible_cols == 0 {
-            self.h_scroll_col = 0;
-            return;
-        }
-        let right_edge = self.h_scroll_col + visible_cols.saturating_sub(CHATBOX_H_MARGIN_COLS);
-        if cursor_col >= right_edge {
-            // Cursor past right edge — scroll right.
-            self.h_scroll_col = cursor_col.saturating_sub(visible_cols.saturating_sub(CHATBOX_H_MARGIN_COLS));
-        } else if cursor_col < self.h_scroll_col {
-            // Cursor past left edge — scroll left.
-            self.h_scroll_col = cursor_col;
-        }
     }
 }
 
@@ -3375,9 +3838,9 @@ struct AgentState {
     /// this, render scaled with total transcript length and made input
     /// laggy on long sessions because every cx.notify re-tokenized
     /// every line for word-wrap. `ListAlignment::Bottom` gives the
-    /// chat-style auto-pin: new items at the end stay anchored to the
-    /// bottom of view, but a user scrolling up to read history isn't
-    /// snapped back when more chunks land.
+    /// chat-style initial pin. The `follow_output` flag (maintained by
+    /// the scroll handler) gates pump-driven auto-scroll so the user
+    /// can scroll up to read history without being yanked to the bottom.
     list_state: gpui::ListState,
     /// Total number of items currently registered in `list_state`. We
     /// track it separately so we can splice in new items as the
@@ -3394,6 +3857,15 @@ struct AgentState {
     /// cleared on finalize or channel drop. Drives the elapsed timer
     /// in the header.
     turn_started: Option<std::time::Instant>,
+    /// Last moment any reply activity (chunk / tool update / notice) landed
+    /// for the in-flight turn. Drives the "quiet for M:SS" reading in the
+    /// thinking indicator so a slow-but-streaming turn reads differently
+    /// from a stalled one. Reset on each submit and on turn end.
+    last_event_at: Option<std::time::Instant>,
+    /// When the user first pressed Stop for the in-flight turn. A second
+    /// Stop while this is set (and still awaiting) escalates from a graceful
+    /// `session/cancel` to a hard kill + resume. Cleared on turn end / submit.
+    stop_requested_at: Option<std::time::Instant>,
     /// Last-seen turn count. The pump compares this against the live counter
     /// each tick — when it ticks up, the in-flight turn just ended, which is
     /// our cue to finalize the buffer (ensure an editable line below the
@@ -3424,6 +3896,10 @@ struct AgentState {
     block_cache: std::collections::HashMap<(usize, usize), RenderedBlock>,
     /// Frozen line count when `block_cache` was last populated.
     block_cache_frozen_count: usize,
+    /// Incremental highlight cache for the transcript. Re-highlights only the
+    /// lines that changed between renders instead of the whole buffer every
+    /// `cx.notify()`. Bypassed when `SKETCH_HL_CACHE=0`.
+    highlight_cache: HighlightCache,
     /// Which input surface the user is currently using (§4). Per the
     /// spec, new sessions start at `Chatbox` to match today's compose-box-
     /// first feel; the user toggles with `Ctrl-Alt-Enter` (§5).
@@ -3453,6 +3929,11 @@ struct AgentState {
     /// `Some`, the main transcript area swaps to show that sub-agent's
     /// content instead of the root agent's (§27).
     focused_subagent: Option<usize>,
+    /// Whether auto-scroll should follow new output. Defaults to `true`
+    /// (pinned to bottom). Set to `false` when the user scrolls up in the
+    /// transcript, re-enabled when they scroll back to the bottom or send
+    /// a new message. Shared with the ListState scroll handler via Rc.
+    follow_output: std::rc::Rc<std::cell::Cell<bool>>,
     /// Whether the Tasklist sidepane is open (§24).
     tasklist_open: bool,
     /// Whether the Subagents sidepane is open (§28).
@@ -3468,6 +3949,39 @@ struct AgentState {
     /// warnings — the field IS used (its Drop runs on screen exit), but
     /// no method reads it.
     _pump: Option<Task<()>>,
+}
+
+impl AgentState {
+    /// Reset all transcript-derived state to the empty baseline so that a
+    /// server re-attach — which replays the session's full `event_log` — can
+    /// rebuild the transcript from scratch without duplicating what's already
+    /// on screen. Used by the reconnect path. Preserves the live channel /
+    /// attach handle, input mode, follow-output preference, and pump handle;
+    /// only the rendered transcript and its derived caches are cleared.
+    fn reset_for_replay(&mut self) {
+        self.editor = Editor::new(String::new(), PathBuf::from("*claude*"));
+        self.list_state =
+            gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0));
+        setup_list_follow_handler(&self.list_state, &self.follow_output);
+        self.list_item_count = 0;
+        self.awaiting_reply = false;
+        self.turn_started = None;
+        self.last_event_at = None;
+        self.stop_requested_at = None;
+        self.last_seen_turns = 0;
+        self.tool_calls.clear();
+        self.tool_call_order.clear();
+        self.tool_call_anchor_line.clear();
+        self.expanded_tool_calls.clear();
+        self.block_ranges.clear();
+        self.block_cache.clear();
+        self.block_cache_frozen_count = 0;
+        self.highlight_cache = HighlightCache::new();
+        self.current_plan = None;
+        self.subagents.clear();
+        self.focused_subagent = None;
+        self.usage = None;
+    }
 }
 
 /// A named wrapper around `AgentState` for multi-session support.
@@ -3636,6 +4150,21 @@ impl AgentRing {
             s.server_session_id.as_deref() == Some(sid)
         })
     }
+
+    /// Position of the slot for `sid`, if any. Used to remove it via
+    /// [`close_at`] when the server broadcasts that the session closed.
+    fn position_by_server_session_id(&self, sid: &str) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|s| s.server_session_id.as_deref() == Some(sid))
+    }
+
+    /// True if any slot holds `sid`. Used to avoid attaching the same session
+    /// twice (a second Owner attach from the same connection silently strands
+    /// one panel's stream — see `open_agent_inner`).
+    fn has_server_session(&self, sid: &str) -> bool {
+        self.position_by_server_session_id(sid).is_some()
+    }
 }
 
 /// Overlay popup that lets the user pick a top-level command by single
@@ -3705,6 +4234,12 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("n", "new session", "claude-new"),
                 MenuNode::entry("l", "list sessions", "claude-list"),
                 MenuNode::entry("x", "close session", "claude-close"),
+                MenuNode::entry("r", "rename session", "claude-rename"),
+                MenuNode::entry("w", "toggle worksheet/chatbox (Ctrl-Alt-Enter)", "agent-input-toggle"),
+                MenuNode::separator(),
+                MenuNode::label("Build loop"),
+                MenuNode::entry("p", "promote: build & launch candidate", "dev-build-candidate"),
+                MenuNode::entry("P", "take over sessions (candidate)", "dev-take-over"),
             ],
         ),
         MenuNode::separator(),
@@ -3715,6 +4250,7 @@ fn gpui_menu() -> Vec<MenuNode> {
         MenuNode::separator(),
         MenuNode::label("View"),
         MenuNode::entry("v", "back to doc", "back-to-doc"),
+        MenuNode::entry("s", "toggle agent status bar position", "claude-status-bar"),
         MenuNode::submenu(
             "t",
             "theme",
@@ -3726,6 +4262,7 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("L", "Solarized Dark", "theme-solarized-dark"),
                 MenuNode::entry("f", "Financial Times", "theme-financial-times"),
                 MenuNode::entry("F", "Financial Times Dark", "theme-financial-times-dark"),
+                MenuNode::entry("o", "Folio", "theme-folio"),
             ],
         ),
         MenuNode::separator(),
@@ -3807,6 +4344,26 @@ struct SketchGpuiView {
     /// restarts). Activated by `SKETCH_SESSION_SERVER=1`. When `None`, the
     /// GUI spawns `AcpChannelClient` directly (legacy path).
     session_server: Option<SessionServerClient>,
+    /// Where the agent info bar renders: above or below the transcript.
+    agent_status_position: AgentStatusPosition,
+    /// True when this instance was launched as a build-loop *candidate*
+    /// (`SKETCH_CANDIDATE=1`). A candidate attaches to live sessions as a
+    /// read-only `Observer` (mirrors the transcript, can't drive), shows a
+    /// banner, and refuses to submit prompts until it takes over — which it
+    /// can do only once the original owner window closes. See
+    /// `build_and_launch_candidate` / `candidate_take_over`.
+    is_candidate: bool,
+    /// For a candidate: whether the mirrored sessions have been released by
+    /// the original owner (i.e. an `OwnerChanged{has_owner:false}` arrived),
+    /// meaning take-over will now succeed. Drives the banner color. Purely a
+    /// display hint — `candidate_take_over` re-checks authoritatively.
+    candidate_promote_ready: bool,
+    /// Splash screen shown at startup. `Some(deadline)` while visible;
+    /// `None` after dismissal (auto-timeout or keypress).
+    splash_until: Option<std::time::Instant>,
+    /// Shared syntect highlighter for code block syntax coloring in Edit Mode
+    /// and the agent transcript pane. Loaded once at startup.
+    syntect_hl: sketch::highlight::Highlighter,
 }
 
 impl SketchGpuiView {
@@ -3839,6 +4396,11 @@ impl SketchGpuiView {
             doc_selection: None,
             line_layouts: RefCell::new(HashMap::new()),
             session_server: connect_session_server(),
+            agent_status_position: AgentStatusPosition::default(),
+            is_candidate: is_candidate_launch(),
+            candidate_promote_ready: false,
+            splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
+            syntect_hl: sketch::highlight::Highlighter::new(),
         }
     }
 
@@ -3859,6 +4421,11 @@ impl SketchGpuiView {
             doc_selection: None,
             line_layouts: RefCell::new(HashMap::new()),
             session_server: connect_session_server(),
+            agent_status_position: AgentStatusPosition::default(),
+            is_candidate: is_candidate_launch(),
+            candidate_promote_ready: false,
+            splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
+            syntect_hl: sketch::highlight::Highlighter::new(),
         }
     }
 
@@ -3895,6 +4462,7 @@ impl SketchGpuiView {
                 display_name: ptab.display_name,
                 focused: ptab.focused_window,
                 layout,
+                rail: ptab.rail.map(restore_rail),
             });
             ws.next_tab_index += 1;
         }
@@ -3948,7 +4516,7 @@ impl SketchGpuiView {
                 let label: SharedString = path.display().to_string().into();
                 let text = std::fs::read_to_string(&path).unwrap_or_default();
                 let doc = Document::from_text(text, path.clone());
-                let blocks = render_with_wiki(&doc.full_text(), &self.theme);
+                let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
                 WindowContent::Doc(DocState {
                     blocks,
                     file_label: label,
@@ -4052,7 +4620,7 @@ impl SketchGpuiView {
         };
         let label: SharedString = canon.into();
         let doc = Document::from_text(text, path.clone());
-        let blocks = render_with_wiki(&doc.full_text(), &self.theme);
+        let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
         let new_content = WindowContent::Doc(DocState {
             blocks,
             file_label: label,
@@ -4226,6 +4794,164 @@ impl SketchGpuiView {
         cx.quit();
     }
 
+    /// Re-exec the current binary with the same arguments, then quit.
+    /// Useful for picking up a freshly compiled build without leaving
+    /// the window manager flow.
+    fn restart(&mut self, _: &Restart, _w: &mut Window, cx: &mut Context<Self>) {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let mut cmd = std::process::Command::new(exe);
+        for arg in std::env::args().skip(1) {
+            cmd.arg(arg);
+        }
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(_) => cx.quit(),
+            Err(e) => {
+                if let Some(c) = self.agent_mut() {
+                    c.status = Some(format!("restart failed: {e}").into());
+                }
+            }
+        }
+    }
+
+    /// Set the focused agent slot's status line (build-loop feedback). No-op
+    /// if the focused window isn't an agent screen, but always logs so the
+    /// message isn't lost when triggered from a doc/edit view.
+    fn set_agent_status(&mut self, msg: &str, cx: &mut Context<Self>) {
+        eprintln!("[sketch-gpui] {msg}");
+        if let Some(c) = self.agent_mut() {
+            c.status = Some(msg.to_string().into());
+        }
+        cx.notify();
+    }
+
+    /// Build-loop step 1 (the `promote` command). Compile `sketch-gpui`, and
+    /// on success spawn the freshly built binary as a read-only *candidate*
+    /// (`SKETCH_CANDIDATE=1`) **without quitting** this instance. Both
+    /// processes share the running session server, so the candidate mirrors
+    /// every live ACP session. Verify the candidate, then close this window
+    /// to hand off ownership; the candidate takes over with full transcripts
+    /// intact. The session server binary is intentionally left untouched —
+    /// only the GUI is hot-swapped, so agents never restart.
+    fn build_and_launch_candidate(&mut self, cx: &mut Context<Self>) {
+        if self.is_candidate {
+            self.set_agent_status("already running as a candidate", cx);
+            return;
+        }
+        if self.session_server.is_none() {
+            self.set_agent_status(
+                "session server not active — relaunch with SKETCH_SESSION_SERVER=1",
+                cx,
+            );
+            return;
+        }
+        self.set_agent_status("building candidate: cargo build --bin sketch-gpui…", cx);
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR").to_string();
+        let exe = std::env::current_exe().ok();
+        let args: Vec<String> = std::env::args().skip(1).collect();
+
+        cx.spawn(async move |this, cx| {
+            // Run the (slow, blocking) build on a background thread.
+            let built = cx
+                .background_executor()
+                .spawn(async move {
+                    std::process::Command::new("cargo")
+                        .args(["build", "--bin", "sketch-gpui"])
+                        .current_dir(&manifest_dir)
+                        .output()
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| match built {
+                Ok(out) if out.status.success() => match exe {
+                    Some(exe) => {
+                        let mut cmd = std::process::Command::new(exe);
+                        cmd.args(&args);
+                        cmd.env("SKETCH_CANDIDATE", "1");
+                        cmd.stdin(std::process::Stdio::null());
+                        cmd.stdout(std::process::Stdio::null());
+                        cmd.stderr(std::process::Stdio::inherit());
+                        match cmd.spawn() {
+                            Ok(_) => this.set_agent_status(
+                                "candidate launched — verify it, then close this window to hand off",
+                                cx,
+                            ),
+                            Err(e) => {
+                                this.set_agent_status(&format!("candidate spawn failed: {e}"), cx)
+                            }
+                        }
+                    }
+                    None => this.set_agent_status("cannot locate current executable", cx),
+                },
+                Ok(out) => {
+                    // Surface the tail of stderr so the failure is actionable.
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
+                    let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+                    this.set_agent_status(&format!("build failed: {tail}"), cx);
+                }
+                Err(e) => this.set_agent_status(&format!("build error: {e}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Build-loop step 2 (the candidate's "take over"). Claim ownership of
+    /// every session this candidate is mirroring. Succeeds only once the
+    /// original owner window has closed (the server reports the sessions as
+    /// ownerless); otherwise reports which sessions are still held so the
+    /// user knows to close the original first. On success the candidate
+    /// sheds its read-only state and becomes the live driver.
+    fn candidate_take_over(&mut self, cx: &mut Context<Self>) {
+        if self.session_server.is_none() {
+            self.set_agent_status("session server not active", cx);
+            return;
+        }
+        let sids: Vec<String> = match self.agent_ring() {
+            Some(r) => r
+                .slots
+                .iter()
+                .filter_map(|s| s.server_session_id.clone())
+                .collect(),
+            None => Vec::new(),
+        };
+        if sids.is_empty() {
+            self.set_agent_status("no mirrored sessions to take over", cx);
+            return;
+        }
+
+        let mut failures = Vec::new();
+        if let Some(server) = self.session_server.as_ref() {
+            for sid in &sids {
+                if let Err(e) = server.promote(sid) {
+                    failures.push(format!("{}: {e}", &sid[..8.min(sid.len())]));
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            self.is_candidate = false;
+            self.candidate_promote_ready = false;
+            self.set_agent_status(
+                &format!("took over {} session(s) — you now own them", sids.len()),
+                cx,
+            );
+        } else {
+            self.set_agent_status(
+                &format!(
+                    "close the original window first — still owned: {}",
+                    failures.join(", ")
+                ),
+                cx,
+            );
+        }
+    }
+
     fn zoom_in(&mut self, _: &ZoomIn, _w: &mut Window, cx: &mut Context<Self>) {
         self.set_text_scale(self.text_scale * TEXT_SCALE_STEP, cx);
     }
@@ -4275,6 +5001,7 @@ impl SketchGpuiView {
         }
         save_preferences(&Preferences {
             theme: Some(name.as_kebab().to_string()),
+            agent_status_position: Some(self.agent_status_position.as_str().to_string()),
         });
         cx.notify();
     }
@@ -4429,6 +5156,103 @@ impl SketchGpuiView {
             }
         }
         Some(out)
+    }
+
+    /// Paste system clipboard contents into the active editor at the cursor.
+    /// Works in Edit, Agent (worksheet + chatbox) screens — anywhere there's
+    /// an editor in Insert mode.
+    fn paste_from_clipboard(
+        &mut self,
+        _: &PasteFromClipboard,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(text) = Self::read_from_clipboard() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        // Find the active editor + mode. Chatbox takes priority in chatbox mode.
+        let pasted = match self.workspace.focused_content_mut() {
+            Some(WindowContent::Edit(e)) => {
+                if e.mode == EditMode::Insert {
+                    for ch in text.chars() {
+                        e.editor.insert_char(ch);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(WindowContent::Agent(ring)) => {
+                let c = &mut ring.active_mut().state;
+                if c.input_mode == InputMode::Chatbox {
+                    if let Some(ref mut cb) = c.chatbox {
+                        if cb.mode == EditMode::Insert {
+                            for ch in text.chars() {
+                                cb.editor.insert_char(ch);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else if c.mode == EditMode::Insert {
+                    for ch in text.chars() {
+                        c.editor.insert_char(ch);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if pasted {
+            cx.notify();
+        }
+    }
+
+    /// Copy the current selection to the system clipboard. Dispatches based
+    /// on which screen is active: doc view uses mouse selection, edit/agent
+    /// views use editor selection.
+    fn copy_selection(
+        &mut self,
+        _: &CopySelection,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Doc view: delegate to existing mouse-selection copy.
+        if let Some(sel) = self.doc_selection {
+            if let Some(text) = self.collect_doc_selection_text(&sel) {
+                if !text.is_empty() {
+                    Self::yank_to_clipboard(&text);
+                    return;
+                }
+            }
+        }
+        // Edit / Agent views: copy editor selection.
+        let text = match self.workspace.focused_content() {
+            Some(WindowContent::Edit(e)) => e.editor.selection_text(),
+            Some(WindowContent::Agent(ring)) => {
+                let c = &ring.active().state;
+                if c.input_mode == InputMode::Chatbox {
+                    c.chatbox.as_ref().and_then(|cb| cb.editor.selection_text())
+                } else {
+                    c.editor.selection_text()
+                }
+            }
+            _ => None,
+        };
+        if let Some(t) = text {
+            if !t.is_empty() {
+                Self::yank_to_clipboard(&t);
+            }
+        }
+        let _ = cx;
     }
 
     /// Drop every live `AcpChannelClient` we hold so its `Drop` impl can
@@ -4587,8 +5411,8 @@ impl SketchGpuiView {
             let editor = Editor::new(text, path);
             WindowContent::Edit(EditState::new(editor, label, EditView::Code))
         } else {
-            let doc = Document::from_text(text, path);
-            let blocks = render_with_wiki(&doc.full_text(), &self.theme);
+            let doc = Document::from_text(text, path.clone());
+            let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
             WindowContent::Doc(DocState {
                 blocks,
                 file_label: label,
@@ -4778,6 +5602,216 @@ impl SketchGpuiView {
         }
     }
 
+    // ---- Rail (persistent side column, spec-rail.md) -----------------------
+
+    /// `&mut` to the active tab's rail state, if a rail is open.
+    fn rail_mut(&mut self) -> Option<&mut workspace::RailState> {
+        self.workspace.active_tab_mut()?.rail.as_mut()
+    }
+
+    /// True when the active tab has a rail open AND it currently holds focus.
+    fn rail_is_focused(&self) -> bool {
+        self.workspace
+            .active_tab()
+            .and_then(|t| t.rail.as_ref())
+            .map(|r| r.focused)
+            .unwrap_or(false)
+    }
+
+    /// Toggle the file-browser rail (Cmd-B). Two-state model (spec §5):
+    /// - closed / different kind  → open-and-focus a file browser at cwd.
+    /// - file-browser already open → close it, return focus to content.
+    fn toggle_file_browser_rail(
+        &mut self,
+        _: &ToggleFileBrowserRail,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.workspace.active_tab_mut() else {
+            return;
+        };
+        match &tab.rail {
+            Some(r) if r.content.is_file_browser() => {
+                tab.rail = None;
+            }
+            existing => {
+                let side = existing.as_ref().map(|r| r.side).unwrap_or_default();
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let content = workspace::RailContent::FileBrowser(FileBrowser::new(cwd));
+                tab.rail = Some(workspace::RailState::new(content, side));
+            }
+        }
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    /// Toggle the outline rail (Cmd-Shift-O). Two-state model (spec §5). The
+    /// heading list is derived lazily on render from the focused window.
+    fn toggle_outline_rail(
+        &mut self,
+        _: &ToggleOutlineRail,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.workspace.active_tab_mut() else {
+            return;
+        };
+        match &tab.rail {
+            Some(r) if r.content.is_outline() => {
+                tab.rail = None;
+            }
+            existing => {
+                let side = existing.as_ref().map(|r| r.side).unwrap_or_default();
+                let content = workspace::RailContent::Outline(workspace::OutlineState::new());
+                tab.rail = Some(workspace::RailState::new(content, side));
+            }
+        }
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    /// Flip which edge the rail anchors to (Cmd-Shift-B). No-op when no rail
+    /// is open. Persisted in the workspace snapshot.
+    fn flip_rail_side(&mut self, _: &FlipRailSide, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(r) = self.rail_mut() {
+            r.side = match r.side {
+                workspace::RailSide::Left => workspace::RailSide::Right,
+                workspace::RailSide::Right => workspace::RailSide::Left,
+            };
+            self.save_workspace_state();
+            cx.notify();
+        }
+    }
+
+    /// Close the rail and return focus to the previously-focused split-tree
+    /// leaf (spec §7 — `tab.focused` is the single source of truth).
+    fn rail_close(&mut self, _: &RailClose, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.workspace.active_tab_mut() {
+            if tab.rail.is_some() {
+                tab.rail = None;
+                self.save_workspace_state();
+                cx.notify();
+            }
+        }
+    }
+
+    fn rail_down(&mut self, _: &RailDown, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(r) = self.rail_mut() {
+            match &mut r.content {
+                workspace::RailContent::FileBrowser(fb) => fb.move_down(),
+                workspace::RailContent::Outline(o) => {
+                    if !o.entries.is_empty() {
+                        o.selected = (o.selected + 1) % o.entries.len();
+                    }
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    fn rail_up(&mut self, _: &RailUp, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(r) = self.rail_mut() {
+            match &mut r.content {
+                workspace::RailContent::FileBrowser(fb) => fb.move_up(),
+                workspace::RailContent::Outline(o) => {
+                    if !o.entries.is_empty() {
+                        o.selected = if o.selected == 0 {
+                            o.entries.len() - 1
+                        } else {
+                            o.selected - 1
+                        };
+                    }
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    /// Enter the selected rail entry. File browser: open a file (rail stays
+    /// open) or navigate into a directory. Outline: scroll the focused window
+    /// to the heading's block/line.
+    fn rail_select(&mut self, _: &RailSelect, _w: &mut Window, cx: &mut Context<Self>) {
+        // File browser: collect the action without holding the rail borrow.
+        let to_open = match self.rail_mut() {
+            Some(r) => match &mut r.content {
+                workspace::RailContent::FileBrowser(fb) => fb.enter_selected(),
+                workspace::RailContent::Outline(_) => None,
+            },
+            None => return,
+        };
+        if let Some(path) = to_open {
+            // Selecting a file opens it in the focused leaf; the rail stays
+            // open but yields focus back to the content (spec §7, §12).
+            // `open_file` replaces a transient Browser pane in place or
+            // pushes a new tab otherwise.
+            self.open_file(path);
+            if let Some(r) = self.rail_mut() {
+                r.focused = false;
+            }
+            cx.notify();
+            return;
+        }
+
+        // Outline: jump the focused window to the selected heading.
+        let target = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.rail.as_ref())
+            .and_then(|r| match &r.content {
+                workspace::RailContent::Outline(o) => o.entries.get(o.selected).map(|(_, _, idx)| *idx),
+                _ => None,
+            });
+        if let Some(idx) = target {
+            match self.workspace.focused_content_mut() {
+                Some(WindowContent::Doc(d)) => {
+                    d.cursor_block = idx.min(d.blocks.len().saturating_sub(1));
+                    d.scroll_handle.scroll_to_item(d.cursor_block);
+                }
+                Some(WindowContent::Edit(e)) => {
+                    let lines = e.editor.document().line_count();
+                    let line = idx.min(lines.saturating_sub(1));
+                    e.editor.cursor_mut().line = line;
+                    e.editor.cursor_mut().col = 0;
+                    e.scroll_handle.scroll_to_item(line);
+                }
+                _ => {}
+            }
+            cx.notify();
+        }
+    }
+
+    fn rail_parent(&mut self, _: &RailParent, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(r) = self.rail_mut() {
+            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
+                fb.go_parent();
+                cx.notify();
+            }
+        }
+    }
+
+    fn rail_toggle_hidden(
+        &mut self,
+        _: &RailToggleHidden,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(r) = self.rail_mut() {
+            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
+                fb.toggle_hidden();
+                cx.notify();
+            }
+        }
+    }
+
+    fn rail_cycle_sort(&mut self, _: &RailCycleSort, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(r) = self.rail_mut() {
+            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
+                fb.cycle_sort();
+                cx.notify();
+            }
+        }
+    }
+
     // ---- Edit mode ---------------------------------------------------------
 
     /// `Some(edit)` if currently editing, else `None`.
@@ -4841,8 +5875,9 @@ impl SketchGpuiView {
             .expect("workspace has no focused window");
         match prev {
             WindowContent::Edit(edit) => {
+                let edit_path = PathBuf::from(edit.file_label.as_ref());
                 let blocks =
-                    render_with_wiki(&edit.editor.document().full_text(), &self.theme);
+                    render_with_wiki(&edit.editor.document().full_text(), &self.theme, Some(&edit_path));
                 let file_label = edit.file_label.clone();
                 self.set_screen(WindowContent::Doc(DocState {
                     blocks,
@@ -4926,8 +5961,8 @@ impl SketchGpuiView {
             .display()
             .to_string();
         let label: SharedString = canon.into();
-        let doc = Document::from_text(text, path);
-        let blocks = render_with_wiki(&doc.full_text(), &self.theme);
+        let doc = Document::from_text(text, path.clone());
+        let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
         self.set_screen(WindowContent::Doc(DocState {
             blocks,
             file_label: label,
@@ -4984,8 +6019,8 @@ impl SketchGpuiView {
                 WindowContent::Edit(es)
             }
             Kind::Doc => {
-                let doc = Document::from_text(text, path);
-                let blocks = render_with_wiki(&doc.full_text(), &self.theme);
+                let doc = Document::from_text(text, path.clone());
+                let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
                 WindowContent::Doc(DocState {
                     blocks,
                     file_label: label,
@@ -5428,6 +6463,8 @@ impl SketchGpuiView {
             "claude-rename" => self.open_rename_overlay(cx),
             "claude-new-here" => self.open_new_agent_session_cwd_overlay(cx),
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
+            "dev-build-candidate" => self.build_and_launch_candidate(cx),
+            "dev-take-over" => self.candidate_take_over(cx),
             "compose-toggle" | "agent-input-toggle" => {
                 if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
                     self.toggle_agent_input_mode(cx);
@@ -5443,6 +6480,17 @@ impl SketchGpuiView {
             "theme-gruvbox-dark" => self.set_theme(ThemeName::GruvboxDark, cx),
             "theme-financial-times" => self.set_theme(ThemeName::FinancialTimes, cx),
             "theme-financial-times-dark" => self.set_theme(ThemeName::FinancialTimesDark, cx),
+            "theme-folio" => self.set_theme(ThemeName::Folio, cx),
+            "claude-status-bar" => {
+                self.agent_status_position = self.agent_status_position.toggle();
+                save_preferences(&Preferences {
+                    theme: Some(self.theme.name.as_kebab().to_string()),
+                    agent_status_position: Some(
+                        self.agent_status_position.as_str().to_string(),
+                    ),
+                });
+                cx.notify();
+            }
             // Window splits + focus + sizing — same logic the keyboard
             // handlers run, so behavior is identical via either path.
             "split-h" => {
@@ -5676,15 +6724,40 @@ impl SketchGpuiView {
                 // Close the selected session (without switching to it first).
                 let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
                 if count > 0 {
-                    let server_sid = {
-                        let ring = self.agent_ring_mut().unwrap();
-                        let dropped = ring.close_at(selected);
-                        dropped.and_then(|s| s.server_session_id)
-                    };
+                    // Confirm the server close BEFORE removing the slot (same
+                    // ordering as `close_active_agent_session`) so a failed
+                    // close can't orphan the server session behind a vanished
+                    // slot.
+                    let server_sid = self
+                        .agent_ring()
+                        .and_then(|r| r.slots.get(selected))
+                        .and_then(|s| s.server_session_id.clone());
                     if let Some(sid) = &server_sid {
                         if let Some(server) = &self.session_server {
-                            let _ = server.close_session(sid);
+                            match server.close_session(sid) {
+                                Ok(()) => {}
+                                Err(e)
+                                    if matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::BrokenPipe
+                                            | std::io::ErrorKind::TimedOut
+                                    ) =>
+                                {
+                                    if let Some(claude) = self.agent_mut() {
+                                        claude.status =
+                                            Some(format!("close failed: {e}").into());
+                                    }
+                                    cx.notify();
+                                    return;
+                                }
+                                Err(_) => {
+                                    let _ = server.detach(sid);
+                                }
+                            }
                         }
+                    }
+                    if let Some(ring) = self.agent_ring_mut() {
+                        ring.close_at(selected);
                     }
                     let new_count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
                     if new_count == 0 {
@@ -5714,13 +6787,14 @@ impl SketchGpuiView {
         };
         let ring = self.agent_ring().unwrap();
 
-        let menu_bg: Hsla = rgb(0x1e1e3a).into();
-        let label_fg: Hsla = rgb(0x6272a4).into();
-        let active_fg: Hsla = rgb(0x8be9fd).into();
-        let selected_bg: Hsla = rgb(0x383a4f).into();
-        let normal_fg: Hsla = rgb(0xcccccc).into();
-        let popup_border: Hsla = rgb(0x383a4f).into();
-        let busy_fg: Hsla = rgb(0xffb86c).into();
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let label_fg: Hsla = nc(ov.label);
+        let active_fg: Hsla = nc(ov.accent);
+        let selected_bg: Hsla = nc(ov.selected_bg);
+        let normal_fg: Hsla = nc(ov.fg);
+        let popup_border: Hsla = nc(ov.border);
+        let busy_fg: Hsla = nc(ov.modified);
 
         let header_text = format!("SESSIONS ({})", ring.len());
         let header_row = div()
@@ -5917,10 +6991,20 @@ impl SketchGpuiView {
         }
         match target {
             RenameTarget::AgentSlot { index } => {
-                if let Some(ring) = self.agent_ring_mut() {
-                    if let Some(slot) = ring.slot_by_index_mut(index) {
-                        slot.label = new_label;
-                    }
+                // Update the label in the local ring and, if this session
+                // is managed by the session server, push the new label
+                // there so it persists across GUI restarts.
+                let server_sid = self
+                    .agent_ring_mut()
+                    .and_then(|ring| {
+                        let slot = ring.slot_by_index_mut(index)?;
+                        slot.label = new_label.clone();
+                        slot.server_session_id.clone()
+                    });
+                if let (Some(server), Some(sid)) =
+                    (&self.session_server, server_sid)
+                {
+                    let _ = server.rename_session(&sid, &new_label);
                 }
                 self.close_rename_overlay();
                 self.save_agent_ring();
@@ -6350,18 +7434,299 @@ impl SketchGpuiView {
             .into_any_element()
     }
 
+    /// Inject the active tab's rail beside the split-tree content (spec-rail.md
+    /// §8). When no rail is open this is a no-op passthrough. `rail_focusable`
+    /// is false when an overlay owns focus — the rail still renders as
+    /// background but is not focusable (constraint §4).
+    ///
+    /// The rail's selectable content (outline entries) is re-derived from the
+    /// focused window here, every frame — cheap and always-fresh (spec §13).
+    fn wrap_with_rail(
+        &mut self,
+        screen_view: AnyElement,
+        rail_focusable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self
+            .workspace
+            .active_tab()
+            .map(|t| t.rail.is_none())
+            .unwrap_or(true)
+        {
+            return screen_view;
+        }
+
+        // Re-derive the outline (if the rail is an outline) before reading.
+        self.refresh_outline_rail();
+
+        let (side, focused) = {
+            let r = self
+                .workspace
+                .active_tab()
+                .and_then(|t| t.rail.as_ref())
+                .expect("rail present");
+            (r.side, r.focused && rail_focusable)
+        };
+
+        let rail = self.render_rail(focused, cx);
+
+        let content_slot = div().flex_1().min_w_0().min_h_0().child(screen_view);
+
+        let row = div().size_full().flex().flex_row().min_w_0().min_h_0();
+        let row = match side {
+            workspace::RailSide::Left => row.child(rail).child(content_slot),
+            workspace::RailSide::Right => row.child(content_slot).child(rail),
+        };
+        row.into_any_element()
+    }
+
+    /// Re-derive the outline rail's heading entries from the focused window
+    /// (spec §13). No-op when the rail is closed or showing the file browser.
+    fn refresh_outline_rail(&mut self) {
+        let is_outline = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.rail.as_ref())
+            .map(|r| r.content.is_outline())
+            .unwrap_or(false);
+        if !is_outline {
+            return;
+        }
+        let entries = self.derive_outline();
+        if let Some(r) = self.rail_mut() {
+            if let workspace::RailContent::Outline(o) = &mut r.content {
+                o.entries = entries;
+                if o.selected >= o.entries.len() {
+                    o.selected = o.entries.len().saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    /// Build `(depth, text, block_index_or_line)` heading entries from the
+    /// focused window's content (spec §13).
+    fn derive_outline(&self) -> Vec<(u8, String, usize)> {
+        match self.workspace.focused_content() {
+            Some(WindowContent::Doc(d)) => {
+                let mut out = Vec::new();
+                for (idx, block) in d.blocks.iter().enumerate() {
+                    if let RenderedBlock::Heading { level, content } = block {
+                        out.push((*level, styled_line_plain(content), idx));
+                    }
+                }
+                out
+            }
+            Some(WindowContent::Edit(e)) => {
+                let text = e.editor.document().full_text();
+                let mut out = Vec::new();
+                for (line_no, line) in text.lines().enumerate() {
+                    if let Some((level, heading)) = atx_heading(line) {
+                        out.push((level, heading, line_no));
+                    }
+                }
+                out
+            }
+            // Agent / Browser have no outline.
+            _ => Vec::new(),
+        }
+    }
+
+    /// Render the rail column for the active tab (spec §9, §11–§13). Chrome
+    /// styling — text is fixed at 12px and does NOT scale with `text_scale`.
+    fn render_rail(&self, focused: bool, cx: &mut Context<Self>) -> gpui::Div {
+        let rail = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.rail.as_ref())
+            .expect("rail present");
+
+        let top_bar = self.theme.top_bar;
+        let rail_bg: Hsla = bg_or(top_bar, STATUS_BG);
+        let label_fg: Hsla = nc(self.theme.overlay.label);
+        let accent_fg: Hsla = nc(self.theme.overlay.accent);
+        let selected_bg: Hsla = self.editor_bg();
+        let selected_fg: Hsla = rgb(STATUS_FG).into();
+        let border_color: Hsla = rgb(0x6272a4).into();
+        let side = rail.side;
+        let width = rail.width_px;
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(width))
+            .min_w(px(width))
+            .h_full()
+            .min_h_0()
+            .overflow_hidden()
+            .bg(rail_bg)
+            .text_size(px(12.0))
+            .font_family(self.body_font.clone());
+
+        // Content-facing border (right when Left, left when Right).
+        col = match side {
+            workspace::RailSide::Left => col.border_r_1().border_color(border_color),
+            workspace::RailSide::Right => col.border_l_1().border_color(border_color),
+        };
+
+        // When focused, attach the focus handle inside the RailView key
+        // context so its context-scoped bindings (j/k/enter/…) match.
+        let mut col = col.key_context("RailView");
+        if focused {
+            col = col.track_focus(&self.focus_handle);
+        }
+        col = col
+            .on_action(cx.listener(Self::rail_down))
+            .on_action(cx.listener(Self::rail_up))
+            .on_action(cx.listener(Self::rail_select))
+            .on_action(cx.listener(Self::rail_close))
+            .on_action(cx.listener(Self::rail_parent))
+            .on_action(cx.listener(Self::rail_toggle_hidden))
+            .on_action(cx.listener(Self::rail_cycle_sort))
+            // Global actions forwarded so they keep working while the rail is
+            // focused (same pattern as every other screen root).
+            .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::restart))
+            .on_action(cx.listener(Self::open_browser))
+            .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::paste_from_clipboard))
+            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::toggle_file_browser_rail))
+            .on_action(cx.listener(Self::toggle_outline_rail))
+            .on_action(cx.listener(Self::flip_rail_side));
+
+        match &rail.content {
+            workspace::RailContent::FileBrowser(fb) => {
+                let dir_str = fb.current_dir().display().to_string();
+                let header = div()
+                    .px_2()
+                    .py_1()
+                    .flex_none()
+                    .text_color(accent_fg)
+                    .font_weight(FontWeight::BOLD)
+                    .overflow_hidden()
+                    .child(SharedString::from(format!("▸ {}", dir_str)));
+
+                let mut list = div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden();
+
+                let entries = fb.visible_entries();
+                let selected = fb.selected();
+                if entries.is_empty() {
+                    list = list.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_color(label_fg)
+                            .child(SharedString::new_static("  (empty)")),
+                    );
+                } else {
+                    let visible_rows = 40usize;
+                    let scroll = scroll_to_keep_visible(selected, visible_rows, entries.len());
+                    for (i, entry) in
+                        entries.iter().enumerate().skip(scroll).take(visible_rows)
+                    {
+                        let is_sel = i == selected;
+                        let suffix = if entry.is_dir { "/" } else { "" };
+                        let name = format!("{}{}", entry.name, suffix);
+                        let (rbg, rfg) = if is_sel {
+                            (selected_bg, selected_fg)
+                        } else if entry.is_dir {
+                            (rail_bg, accent_fg)
+                        } else {
+                            (rail_bg, label_fg)
+                        };
+                        list = list.child(
+                            div()
+                                .w_full()
+                                .px_2()
+                                .py_0p5()
+                                .bg(rbg)
+                                .text_color(rfg)
+                                .overflow_hidden()
+                                .child(SharedString::from(name)),
+                        );
+                    }
+                }
+                col.child(header).child(list)
+            }
+            workspace::RailContent::Outline(o) => {
+                let header = div()
+                    .px_2()
+                    .py_1()
+                    .flex_none()
+                    .text_color(accent_fg)
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::new_static("OUTLINE"));
+
+                let mut list = div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden();
+
+                if o.entries.is_empty() {
+                    list = list.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_color(label_fg)
+                            .child(SharedString::new_static("(no outline)")),
+                    );
+                } else {
+                    let visible_rows = 40usize;
+                    let scroll =
+                        scroll_to_keep_visible(o.selected, visible_rows, o.entries.len());
+                    for (i, (level, text, _)) in
+                        o.entries.iter().enumerate().skip(scroll).take(visible_rows)
+                    {
+                        let is_sel = i == o.selected;
+                        // Indent by heading depth; depth-1 headings are
+                        // section headers (accent + bold).
+                        let indent = "  ".repeat((*level as usize).saturating_sub(1));
+                        let label_text = format!("{}{}", indent, text);
+                        let mut row = div()
+                            .w_full()
+                            .px_2()
+                            .py_0p5()
+                            .overflow_hidden();
+                        if is_sel {
+                            row = row.bg(selected_bg).text_color(selected_fg);
+                        } else if *level == 1 {
+                            row = row.text_color(accent_fg).font_weight(FontWeight::BOLD);
+                        } else {
+                            row = row.text_color(label_fg);
+                        }
+                        list = list.child(row.child(SharedString::from(label_text)));
+                    }
+                }
+                col.child(header).child(list)
+            }
+        }
+    }
+
     fn render_menu_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let m = match &self.menu {
             Some(m) => m,
             None => unreachable!(),
         };
 
-        let menu_bg: Hsla = rgb(0x1e1e3a).into();
-        let label_fg: Hsla = rgb(0x6272a4).into();
-        let key_fg: Hsla = rgb(0xbd93f9).into();
-        let label_text_fg: Hsla = rgb(0xcccccc).into();
-        let submenu_fg: Hsla = rgb(0x8be9fd).into();
-        let popup_border: Hsla = rgb(0x383a4f).into();
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let label_fg: Hsla = nc(ov.label);
+        let key_fg: Hsla = nc(ov.key);
+        let label_text_fg: Hsla = nc(ov.fg);
+        let submenu_fg: Hsla = nc(ov.accent);
+        let popup_border: Hsla = nc(ov.border);
 
         let nodes = m.state.current_nodes(&m.menu);
         let breadcrumb = m
@@ -6394,7 +7759,7 @@ impl SketchGpuiView {
                 MenuNodeKind::Separator => div()
                     .h(px(8.0))
                     .border_b_1()
-                    .border_color(rgb(0x383a4f))
+                    .border_color(popup_border)
                     .my_1()
                     .into_any_element(),
                 MenuNodeKind::Label => div()
@@ -6474,14 +7839,15 @@ impl SketchGpuiView {
             None => unreachable!(),
         };
 
-        let menu_bg: Hsla = rgb(0x1e1e3a).into();
-        let label_fg: Hsla = rgb(0x6272a4).into();
-        let active_fg: Hsla = rgb(0x8be9fd).into();
-        let selected_bg: Hsla = rgb(0x383a4f).into();
-        let normal_fg: Hsla = rgb(0xcccccc).into();
-        let modified_fg: Hsla = rgb(0xffb86c).into();
-        let popup_border: Hsla = rgb(0x383a4f).into();
-        let filter_fg: Hsla = rgb(0xf1fa8c).into();
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let label_fg: Hsla = nc(ov.label);
+        let active_fg: Hsla = nc(ov.accent);
+        let selected_bg: Hsla = nc(ov.selected_bg);
+        let normal_fg: Hsla = nc(ov.fg);
+        let modified_fg: Hsla = nc(ov.modified);
+        let popup_border: Hsla = nc(ov.border);
+        let filter_fg: Hsla = nc(ov.input);
 
         let filtered = self.filtered_buffer_indices();
         let total = self.workspace.tabs.len();
@@ -6629,10 +7995,11 @@ impl SketchGpuiView {
             Some(o) => o,
             None => unreachable!(),
         };
-        let menu_bg: Hsla = rgb(0x1e1e3a).into();
-        let popup_border: Hsla = rgb(0x383a4f).into();
-        let label_fg: Hsla = rgb(0x6272a4).into();
-        let input_fg: Hsla = rgb(0xf1fa8c).into();
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let popup_border: Hsla = nc(ov.border);
+        let label_fg: Hsla = nc(ov.label);
+        let input_fg: Hsla = nc(ov.input);
 
         let header_label = match o.target {
             RenameTarget::AgentSlot { .. } => "RENAME SESSION",
@@ -6699,6 +8066,17 @@ impl SketchGpuiView {
         }
     }
 
+    /// Best-effort read via macOS `pbpaste`. Returns `None` on failure.
+    fn read_from_clipboard() -> Option<String> {
+        use std::process::Command;
+        let output = Command::new("pbpaste").output().ok()?;
+        if output.status.success() {
+            String::from_utf8(output.stdout).ok()
+        } else {
+            None
+        }
+    }
+
     // ---- Claude (ACP) screen ----------------------------------------------
 
     /// Open the Claude screen and attempt to attach to an ACP agent. Bound
@@ -6743,6 +8121,12 @@ impl SketchGpuiView {
             let matching: Vec<_> = existing
                 .into_iter()
                 .filter(|s| s.cwd == proc_cwd)
+                // Skip sessions already shown in another panel — re-attaching
+                // the same session from this one connection would duplicate
+                // event delivery and strand a slot. When every cwd session is
+                // already open elsewhere this leaves `matching` empty, so the
+                // branch below opens a fresh session for this panel instead.
+                .filter(|s| !self.workspace_has_server_session(&s.session_id))
                 .collect();
 
             if matching.is_empty() {
@@ -6760,9 +8144,25 @@ impl SketchGpuiView {
                     } else {
                         format!("claude-{}", i + 1)
                     };
-                    // Attach to existing server session.
-                    if let Err(e) = self.session_server.as_ref().unwrap().attach(&info.session_id) {
+                    // Attach to existing server session. The server
+                    // replays its buffered event_log as notifications
+                    // before sending the Ack, so the pump will pick up
+                    // the full transcript on its first drain cycle. A
+                    // candidate attaches read-only so it mirrors the live
+                    // owner without contending for control.
+                    let mode = if self.is_candidate {
+                        AttachMode::Observer
+                    } else {
+                        AttachMode::Owner
+                    };
+                    if let Err(e) = self.session_server.as_ref().unwrap().attach(&info.session_id, mode) {
                         eprintln!("[sketch-gpui] re-attach failed for {}: {e}", &info.session_id[..8]);
+                    } else {
+                        eprintln!(
+                            "[sketch-gpui] re-attached to server session {} (turns={})",
+                            &info.session_id[..8],
+                            info.turns,
+                        );
                     }
                     let editor = Editor::new(String::new(), PathBuf::from("*claude*"));
                     let status_msg = if info.connected {
@@ -6785,7 +8185,14 @@ impl SketchGpuiView {
                         status: Some(status_msg.into()),
                         awaiting_reply: false,
                         turn_started: None,
-                        last_seen_turns: info.turns,
+                        last_event_at: None,
+                        stop_requested_at: None,
+                        // Start at 0 so the replayed event_log's TurnEnded
+                        // events progressively restore the counter. Using the
+                        // persisted `info.turns` here would cause UserPrompt
+                        // and Chunk events to tag with the wrong turn number
+                        // during replay (turn_k = last_seen_turns + 1).
+                        last_seen_turns: 0,
                         tool_calls: std::collections::HashMap::new(),
                         tool_call_order: Vec::new(),
                         tool_call_anchor_line: std::collections::HashMap::new(),
@@ -6793,6 +8200,7 @@ impl SketchGpuiView {
                         block_ranges: Vec::new(),
                         block_cache: std::collections::HashMap::new(),
                         block_cache_frozen_count: 0,
+                        highlight_cache: HighlightCache::new(),
                         input_mode: InputMode::Chatbox,
                         chatbox: Some(Chatbox::new()),
                         current_plan: None,
@@ -6803,8 +8211,10 @@ impl SketchGpuiView {
                         tasklist_open: false,
                         subagents_open: false,
                         server_managed: true,
+                        follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
                         _pump: None,
                     };
+                    setup_list_follow_handler(&state.list_state, &state.follow_output);
                     ring.push(
                         label,
                         state,
@@ -6877,7 +8287,12 @@ impl SketchGpuiView {
     fn new_agent_session(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
         let (label, session_index) = match self.agent_ring() {
             Some(r) => (format!("claude-{}", r.next_index + 1), r.next_index),
-            None => return,
+            None => {
+                // Not on the Agent screen yet — bootstrap it (which creates
+                // a fresh session as part of setup), then we're done.
+                self.open_agent_inner(cx);
+                return;
+            }
         };
         let slot_cwd = cwd.unwrap_or_else(process_cwd);
 
@@ -6950,13 +8365,12 @@ impl SketchGpuiView {
             slot.state.attach_pending = None;
             slot.state.awaiting_reply = false;
             slot.state.turn_started = None;
-            slot.state.status = Some(
-                format!(
-                    "changing cwd to {}…",
-                    shorten_cwd_for_display(&new_cwd),
-                )
-                .into(),
+            let msg = format!(
+                "changing cwd to {}…",
+                shorten_cwd_for_display(&new_cwd),
             );
+            Self::append_system_notice(&mut slot.state, &msg);
+            slot.state.status = Some(msg.into());
             slot.cwd = new_cwd.clone();
             // The agent-side session was bound to the old cwd; a fresh
             // session/new is the right resume strategy.
@@ -6994,13 +8408,12 @@ impl SketchGpuiView {
                     slot.server_session_id = server_sid;
                     slot.state.attach_pending = None;
                     slot.state.channel = None;
-                    slot.state.status = Some(
-                        format!(
-                            "cwd → {}, fresh session",
-                            shorten_cwd_for_display(&new_cwd),
-                        )
-                        .into(),
+                    let msg = format!(
+                        "cwd → {}, fresh session",
+                        shorten_cwd_for_display(&new_cwd),
                     );
+                    Self::append_system_notice(&mut slot.state, &msg);
+                    slot.state.status = Some(msg.into());
                 }
             }
         } else {
@@ -7016,13 +8429,12 @@ impl SketchGpuiView {
                 if let Some(slot) = ring.slots.get_mut(pos) {
                     slot.state.attach_pending = fresh.attach_pending;
                     slot.state._pump = fresh._pump;
-                    slot.state.status = Some(
-                        format!(
-                            "cwd → {}, fresh session",
-                            shorten_cwd_for_display(&new_cwd),
-                        )
-                        .into(),
+                    let msg = format!(
+                        "cwd → {}, fresh session",
+                        shorten_cwd_for_display(&new_cwd),
                     );
+                    Self::append_system_notice(&mut slot.state, &msg);
+                    slot.state.status = Some(msg.into());
                 }
             }
         }
@@ -7047,22 +8459,55 @@ impl SketchGpuiView {
 
     /// Close the active session. If the ring is now empty, exit Claude.
     fn close_active_agent_session(&mut self, cx: &mut Context<Self>) {
-        let (is_empty, server_sid) = {
+        // For server sessions, confirm the close server-side BEFORE dropping
+        // the local slot. The old optimistic order (drop locally, then fire
+        // the close) left an orphaned server session behind a vanished slot
+        // whenever the close failed (not owner, or disconnected) — which then
+        // reappeared as a zombie on the next open. Identify the active slot's
+        // sid without mutating yet:
+        let server_sid = self
+            .agent_ring()
+            .filter(|r| !r.is_empty())
+            .and_then(|r| r.active().server_session_id.clone());
+
+        if let Some(sid) = &server_sid {
+            if let Some(server) = &self.session_server {
+                match server.close_session(sid) {
+                    // Confirmed. The SessionClosed broadcast reconciles this
+                    // slot out of every panel; the local drop below is the
+                    // immediate-feedback path and makes that broadcast a no-op.
+                    Ok(()) => {}
+                    // Connection problem — keep the slot intact and let the
+                    // reconnect path recover rather than silently dropping it.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        if let Some(claude) = self.agent_mut() {
+                            claude.status = Some(format!("close failed: {e}").into());
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    // Logical error (we're an observer, or it's already gone
+                    // server-side): detach best-effort, then drop locally.
+                    Err(_) => {
+                        let _ = server.detach(sid);
+                    }
+                }
+            }
+        }
+
+        let is_empty = {
             let ring = match self.agent_ring_mut() {
                 Some(r) => r,
                 None => return,
             };
-            let dropped = ring.close_active(); // AgentSlot drops → pump task cancelled
-            let sid = dropped.as_ref().and_then(|s| s.server_session_id.clone());
-            drop(dropped);
-            (ring.is_empty(), sid)
+            let _dropped = ring.close_active(); // AgentSlot drops → pump task cancelled
+            ring.is_empty()
         };
-        // Close the server-side session if applicable.
-        if let Some(sid) = &server_sid {
-            if let Some(server) = &self.session_server {
-                let _ = server.close_session(sid);
-            }
-        }
         if is_empty {
             // Last slot closed: wipe the cwd entry so reboot doesn't
             // resurrect anything, then drop the Claude screen.
@@ -7083,10 +8528,14 @@ impl SketchGpuiView {
         let Ok(cwd) = std::env::current_dir() else {
             return;
         };
-        let Some(ring) = self.agent_ring() else {
-            return;
-        };
-        save_persisted_acp_sessions(&cwd, ring);
+        // Save agent rings from ALL panes, not just the focused one.
+        if let Some(tab) = self.workspace.active_tab() {
+            tab.layout.for_each_leaf(&mut |window| {
+                if let WindowContent::Agent(ring) = &window.content {
+                    save_persisted_acp_sessions(&cwd, ring);
+                }
+            });
+        }
     }
 
     /// Build a `AgentState` with ACP attach thread and pump task. The
@@ -7129,6 +8578,12 @@ impl SketchGpuiView {
             let idle_delay = Duration::from_millis(16);
             let yield_delay = Duration::from_millis(1);
             let min_cycle = Duration::from_millis(16);
+            // Local throttle for the thinking-indicator animation: while a
+            // turn is in flight we re-render at ~8fps even without events so
+            // the elapsed/quiet timers stay live through a stall. Kept local
+            // so the idle path doesn't grab the model lock every 16ms.
+            let anim_period = Duration::from_millis(120);
+            let mut last_anim = std::time::Instant::now();
             let mut wake_rx: Option<futures::channel::mpsc::UnboundedReceiver<()>> =
                 None;
             loop {
@@ -7155,16 +8610,33 @@ impl SketchGpuiView {
                     });
                 }
                 loop {
+                    let t_apply = perf_enabled().then(std::time::Instant::now);
                     let more = match this.update(cx, |this, cx| {
                         this.pump_session(session_index, cx)
                     }) {
                         Ok(more) => more,
                         Err(_) => return,
                     };
+                    if let Some(t) = t_apply {
+                        eprintln!(
+                            "[perf] acp-pump drain+apply lock_held={:.2}ms more={more}",
+                            t.elapsed().as_secs_f64() * 1e3,
+                        );
+                    }
                     if !more {
                         break;
                     }
                     cx.background_executor().timer(yield_delay).await;
+                }
+                // Animation heartbeat: keep the thinking timer ticking even
+                // when no events arrived this cycle.
+                if last_anim.elapsed() >= anim_period {
+                    last_anim = std::time::Instant::now();
+                    let _ = this.update(cx, |this, cx| {
+                        if this.any_agent_awaiting() {
+                            cx.notify();
+                        }
+                    });
                 }
                 let elapsed = cycle_start.elapsed();
                 if elapsed < min_cycle {
@@ -7175,7 +8647,7 @@ impl SketchGpuiView {
             }
         });
 
-        AgentState {
+        let state = AgentState {
             editor,
             channel: None,
             attach_pending: Some(attach_rx),
@@ -7190,6 +8662,8 @@ impl SketchGpuiView {
             status: Some("attaching to ACP agent…".into()),
             awaiting_reply: false,
             turn_started: None,
+            last_event_at: None,
+            stop_requested_at: None,
             last_seen_turns: 0,
             tool_calls: std::collections::HashMap::new(),
             tool_call_order: Vec::new(),
@@ -7198,6 +8672,7 @@ impl SketchGpuiView {
             block_ranges: Vec::new(),
             block_cache: std::collections::HashMap::new(),
             block_cache_frozen_count: 0,
+            highlight_cache: HighlightCache::new(),
             input_mode: InputMode::Chatbox,
             chatbox: Some(Chatbox::new()),
             current_plan: None,
@@ -7208,8 +8683,11 @@ impl SketchGpuiView {
             tasklist_open: false,
             subagents_open: false,
             server_managed: false,
+            follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: Some(pump),
-        }
+        };
+        setup_list_follow_handler(&state.list_state, &state.follow_output);
+        state
     }
 
     /// Create an agent session via the session server. Returns
@@ -7244,6 +8722,8 @@ impl SketchGpuiView {
                     status: Some(format!("server create failed: {e}").into()),
                     awaiting_reply: false,
                     turn_started: None,
+                    last_event_at: None,
+                    stop_requested_at: None,
                     last_seen_turns: 0,
                     tool_calls: std::collections::HashMap::new(),
                     tool_call_order: Vec::new(),
@@ -7252,6 +8732,7 @@ impl SketchGpuiView {
                     block_ranges: Vec::new(),
                     block_cache: std::collections::HashMap::new(),
                     block_cache_frozen_count: 0,
+                    highlight_cache: HighlightCache::new(),
                     input_mode: InputMode::Chatbox,
                     chatbox: Some(Chatbox::new()),
                     current_plan: None,
@@ -7262,8 +8743,10 @@ impl SketchGpuiView {
                     tasklist_open: false,
                     subagents_open: false,
                     server_managed: true,
+                    follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
                     _pump: None,
                 };
+                setup_list_follow_handler(&state.list_state, &state.follow_output);
                 state.editor.begin_insert();
                 return (state, None);
             }
@@ -7271,8 +8754,9 @@ impl SketchGpuiView {
 
         let server_session_id = info.session_id.clone();
 
-        // Attach to the session's notification stream.
-        if let Err(e) = server.attach(&server_session_id) {
+        // Attach to the session's notification stream. We just created this
+        // session, so we own it (even a candidate owns sessions it creates).
+        if let Err(e) = server.attach(&server_session_id, AttachMode::Owner) {
             eprintln!("[sketch-gpui] attach to server session failed: {e}");
         }
 
@@ -7292,6 +8776,8 @@ impl SketchGpuiView {
             status: Some("attaching to ACP agent via session server…".into()),
             awaiting_reply: false,
             turn_started: None,
+            last_event_at: None,
+            stop_requested_at: None,
             last_seen_turns: 0,
             tool_calls: std::collections::HashMap::new(),
             tool_call_order: Vec::new(),
@@ -7300,6 +8786,7 @@ impl SketchGpuiView {
             block_ranges: Vec::new(),
             block_cache: std::collections::HashMap::new(),
             block_cache_frozen_count: 0,
+            highlight_cache: HighlightCache::new(),
             input_mode: InputMode::Chatbox,
             chatbox: Some(Chatbox::new()),
             current_plan: None,
@@ -7310,10 +8797,75 @@ impl SketchGpuiView {
             tasklist_open: false,
             subagents_open: false,
             server_managed: true,
+            follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         };
+        setup_list_follow_handler(&state.list_state, &state.follow_output);
 
         (state, Some(server_session_id))
+    }
+
+    /// Re-establish the session-server connection after a drop, then
+    /// re-subscribe every live slot. Returns the fresh notification + wake
+    /// receivers so the pump can splice them in and keep running; returns
+    /// `None` when the reconnect itself failed (server still down — the pump
+    /// retries on its backoff).
+    ///
+    /// Each slot's transcript is reset before re-attach: the server replays
+    /// the full `event_log` on attach, so resetting lets that replay rebuild
+    /// the on-screen transcript cleanly instead of duplicating it.
+    fn reconnect_session_server(
+        &mut self,
+    ) -> Option<(
+        std::sync::mpsc::Receiver<ServerNotification>,
+        futures::channel::mpsc::UnboundedReceiver<()>,
+    )> {
+        let (note_rx, wake_rx) = match self.session_server.as_mut()?.reconnect() {
+            Ok(rx) => rx,
+            Err(e) => {
+                eprintln!("[sketch-gpui] session-server reconnect failed: {e}");
+                return None;
+            }
+        };
+
+        // Reset every server-backed slot's transcript and collect the sids to
+        // re-attach. (Borrow of `session_server` above has ended.)
+        let mut sids: Vec<String> = Vec::new();
+        for tab in self.workspace.tabs.iter_mut() {
+            tab.layout.for_each_leaf_content_mut(&mut |content| {
+                if let WindowContent::Agent(ring) = content {
+                    for slot in ring.slots.iter_mut() {
+                        if let Some(sid) = slot.server_session_id.clone() {
+                            slot.state.reset_for_replay();
+                            Self::append_system_notice(&mut slot.state, "reconnecting…");
+                            slot.state.status = Some("reconnecting…".into());
+                            sids.push(sid);
+                        }
+                    }
+                }
+            });
+        }
+
+        let mode = if self.is_candidate {
+            AttachMode::Observer
+        } else {
+            AttachMode::Owner
+        };
+        if let Some(server) = self.session_server.as_ref() {
+            for sid in &sids {
+                if let Err(e) = server.attach(sid, mode) {
+                    eprintln!(
+                        "[sketch-gpui] re-attach after reconnect failed for {}: {e}",
+                        &sid[..sid.len().min(8)],
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "[sketch-gpui] session-server reconnected; re-attached {} session(s)",
+            sids.len(),
+        );
+        Some((note_rx, wake_rx))
     }
 
     /// Unified pump task for the session server path. Drains all
@@ -7322,98 +8874,424 @@ impl SketchGpuiView {
     /// single GPUI background task per view (not per-slot).
     fn start_server_pump(&self, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
-            let idle_delay = Duration::from_millis(16);
-            let yield_delay = Duration::from_millis(1);
-            let min_cycle = Duration::from_millis(16);
-            loop {
-                let cycle_start = std::time::Instant::now();
-                cx.background_executor().timer(idle_delay).await;
+            use futures::stream::StreamExt;
+            use futures::FutureExt;
 
-                // Drain up to 64 notifications per cycle.
-                let mut batch: Vec<ServerNotification> = Vec::new();
-                let _ = this.update(cx, |this, _cx| {
-                    if let Some(server) = &this.session_server {
-                        while batch.len() < 64 {
-                            match server.try_recv() {
-                                Some(note) => batch.push(note),
-                                None => break,
+            // Take exclusive ownership of the notification + wake receivers
+            // once (Phase 2 of spec-pump-fix-synthesis.md). Channel reads
+            // need no `&mut SketchGpuiView`, so the old pattern of grabbing
+            // the model lock just to call `try_recv` was pure contention with
+            // keystrokes and render. After this, the loop only takes the lock
+            // to *apply* a pre-drained batch.
+            let (mut note_rx, mut wake_rx) = match this.update(cx, |this, _cx| {
+                this.session_server.as_mut().map(|s| {
+                    (s.take_notification_receiver(), s.take_wake_receiver())
+                })
+            }) {
+                Ok(Some((Some(rx), wake))) => (rx, wake),
+                // No server, or receivers already taken — nothing to pump.
+                _ => return,
+            };
+
+            // Reconnect backoff: once the wake channel closes (server gone) we
+            // retry the connection on this cadence rather than hammering it.
+            let reconnect_backoff = Duration::from_millis(1000);
+            let mut last_reconnect: Option<std::time::Instant> = None;
+
+            // Per-cycle cap so a runaway producer can't starve other tasks;
+            // when we hit it we skip the wait and immediately drain more.
+            const DRAIN_CAP: usize = 4096;
+            let heartbeat = Duration::from_millis(100);
+            let poll_fallback = Duration::from_millis(16);
+            let yield_delay = Duration::from_millis(1);
+            let anim_period = Duration::from_millis(120);
+            let mut last_anim = std::time::Instant::now();
+            let mut more_pending = false;
+
+            loop {
+                // 1. WAIT — event-driven when we have a wake channel, else
+                // poll. Skipped entirely when the last cycle hit the cap.
+                if !more_pending {
+                    let mut wake_closed = false;
+                    if let Some(rx) = wake_rx.as_mut() {
+                        let timer = cx.background_executor().timer(heartbeat);
+                        futures::select_biased! {
+                            v = rx.next().fuse() => {
+                                if v.is_some() {
+                                    // Collapse coalesced wakes; one drain covers them.
+                                    while rx.next().now_or_never().flatten().is_some() {}
+                                } else {
+                                    wake_closed = true;
+                                }
                             }
+                            _ = timer.fuse() => {}
+                        }
+                    } else {
+                        cx.background_executor().timer(poll_fallback).await;
+                    }
+                    // Wake channel closed (server reader thread gone): degrade
+                    // to polling rather than spinning on an instant `None`.
+                    if wake_closed {
+                        wake_rx = None;
+                    }
+                }
+
+                // RECONNECT — when the wake channel is gone the connection
+                // dropped. Try to re-establish it (rate-limited) and, on
+                // success, splice the fresh receivers back into the loop and
+                // re-attach every slot so the durable session resumes.
+                if wake_rx.is_none() {
+                    let now = std::time::Instant::now();
+                    let due = last_reconnect
+                        .map_or(true, |t| now.duration_since(t) >= reconnect_backoff);
+                    if due {
+                        last_reconnect = Some(now);
+                        match this.update(cx, |this, _cx| this.reconnect_session_server()) {
+                            Ok(Some((new_note, new_wake))) => {
+                                note_rx = new_note;
+                                wake_rx = Some(new_wake);
+                                last_reconnect = None;
+                                let _ = this.update(cx, |_t, cx| cx.notify());
+                            }
+                            Ok(None) => {} // still down — retry after backoff
+                            Err(_) => return, // view dropped
                         }
                     }
-                });
+                }
 
+                // 2. EXTRACT — drain the channel with no model lock held.
+                let mut batch: Vec<ServerNotification> = Vec::new();
+                while batch.len() < DRAIN_CAP {
+                    match note_rx.try_recv() {
+                        Ok(note) => batch.push(note),
+                        Err(_) => break,
+                    }
+                }
+                more_pending = batch.len() >= DRAIN_CAP;
                 if batch.is_empty() {
-                    let elapsed = cycle_start.elapsed();
-                    if elapsed < min_cycle {
-                        cx.background_executor()
-                            .timer(min_cycle - elapsed)
-                            .await;
+                    more_pending = false;
+                    // No events — but if a turn is in flight, tick the
+                    // thinking animation so the elapsed/quiet timers stay
+                    // live during a stall.
+                    if last_anim.elapsed() >= anim_period {
+                        last_anim = std::time::Instant::now();
+                        let _ = this.update(cx, |this, cx| {
+                            if this.any_agent_awaiting() {
+                                cx.notify();
+                            }
+                        });
                     }
                     continue;
                 }
 
-                // Route each notification to the correct slot.
-                let result = this.update(cx, |this, cx| {
-                    let ring = match this.agent_ring_mut() {
-                        Some(r) => r,
-                        None => return,
-                    };
-
-                    for note in batch {
-                        match note {
-                            ServerNotification::ReplyEvent { session_id, event } => {
-                                if let Some(slot) = ring.slot_by_server_session_id_mut(&session_id) {
-                                    Self::apply_reply_events(&mut slot.state, vec![event]);
-                                    // Auto-scroll.
-                                    let claude = &mut slot.state;
-                                    let line_count = claude.editor.document().line_count();
-                                    let cursor_at_eof = claude.editor.cursor().line + 1 >= line_count;
-                                    let follow = match claude.input_mode {
-                                        InputMode::Chatbox => true,
-                                        InputMode::Worksheet => cursor_at_eof,
-                                    };
-                                    if follow && claude.list_item_count > 0 {
-                                        claude.list_state.scroll_to_reveal_item(
-                                            claude.list_item_count - 1,
-                                        );
-                                    }
-                                }
-                            }
-                            ServerNotification::TurnEnded { session_id, turn_count } => {
-                                if let Some(slot) = ring.slot_by_server_session_id_mut(&session_id) {
-                                    let claude = &mut slot.state;
-                                    // Drain any trailing events from the apply.
-                                    finalize_agent_turn(&mut claude.editor);
-                                    claude.last_seen_turns = turn_count;
-                                    claude.awaiting_reply = false;
-                                    claude.turn_started = None;
-                                }
-                            }
-                            ServerNotification::SessionAttached { session_id, acp_session_id } => {
-                                if let Some(slot) = ring.slot_by_server_session_id_mut(&session_id) {
-                                    let label = acp_session_id
-                                        .as_deref()
-                                        .unwrap_or("connected");
-                                    slot.state.status = Some(format!("attached: {label}").into());
-                                }
-                            }
-                            ServerNotification::SessionDetached { session_id, reason } => {
-                                if let Some(slot) = ring.slot_by_server_session_id_mut(&session_id) {
-                                    slot.state.status = Some(format!("detached: {reason}").into());
-                                }
-                            }
-                        }
-                    }
-                    cx.notify();
-                });
-
-                if result.is_err() {
-                    return; // View dropped.
+                // 3. APPLY — one model-lock acquisition for the whole cycle.
+                // `apply_server_batch` notifies once if anything changed.
+                let perf = perf_enabled();
+                let batch_len = batch.len();
+                let t_apply = perf.then(std::time::Instant::now);
+                if this
+                    .update(cx, |this, cx| this.apply_server_batch(batch, cx))
+                    .is_err()
+                {
+                    return; // view dropped
+                }
+                if let Some(t) = t_apply {
+                    eprintln!(
+                        "[perf] server-pump apply events={batch_len} \
+                         lock_held={:.2}ms more_pending={more_pending}",
+                        t.elapsed().as_secs_f64() * 1e3,
+                    );
                 }
 
-                cx.background_executor().timer(yield_delay).await;
+                // Yield between mega-batches so GPUI can repaint.
+                if more_pending {
+                    cx.background_executor().timer(yield_delay).await;
+                }
             }
         })
+    }
+
+    /// Find an agent slot by its server session id across ALL tabs and panes,
+    /// running `f` on the first match. Returns `true` if a slot was found.
+    ///
+    /// A single shared `SessionServerClient` multiplexes every session's
+    /// notifications onto one pump (`start_server_pump`), so routing must
+    /// search the whole workspace — not just the active tab — or a session
+    /// living in a background tab silently drops its streamed output. The
+    /// scan is cheap: a handful of tabs × panes × slots.
+    fn with_server_session_slot(
+        &mut self,
+        sid: &str,
+        mut f: impl FnMut(&mut AgentSlot),
+    ) -> bool {
+        for tab in self.workspace.tabs.iter_mut() {
+            let found = tab.layout.find_map_leaf_content_mut(&mut |content| {
+                if let WindowContent::Agent(ring) = content {
+                    if let Some(slot) = ring.slot_by_server_session_id_mut(sid) {
+                        f(slot);
+                        return Some(());
+                    }
+                }
+                None
+            });
+            if found.is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Run `f` on the slot for `sid` in *every* panel that has one (unlike
+    /// [`with_server_session_slot`], which stops at the first match). A session
+    /// observed in multiple panes must fan its events out to all of them.
+    /// Returns the number of slots visited.
+    fn for_each_server_session_slot(
+        &mut self,
+        sid: &str,
+        mut f: impl FnMut(&mut AgentSlot),
+    ) -> usize {
+        let mut count = 0;
+        for tab in self.workspace.tabs.iter_mut() {
+            tab.layout.for_each_leaf_content_mut(&mut |content| {
+                if let WindowContent::Agent(ring) = content {
+                    if let Some(slot) = ring.slot_by_server_session_id_mut(sid) {
+                        f(slot);
+                        count += 1;
+                    }
+                }
+            });
+        }
+        count
+    }
+
+    /// True if any panel in any tab already shows the server session `sid`.
+    /// A session lives in exactly one panel per GUI: attaching the same
+    /// session twice from one connection spawns a duplicate server-side
+    /// forwarder (events arrive twice) and strands a slot (routing resolves a
+    /// sid to a single slot), so re-opening must not clone it.
+    fn workspace_has_server_session(&self, sid: &str) -> bool {
+        self.workspace.tabs.iter().any(|tab| {
+            let mut found = false;
+            tab.layout.for_each_leaf(&mut |w| {
+                if let WindowContent::Agent(ring) = &w.content {
+                    if ring.has_server_session(sid) {
+                        found = true;
+                    }
+                }
+            });
+            found
+        })
+    }
+
+    /// Reconcile a server-side close into the local model: drop the slot for
+    /// `sid` from every panel's ring. A ring left empty is replaced in place
+    /// with its stashed underlying screen (or a fresh browser) so no panel is
+    /// ever left holding an empty `AgentRing`, which would panic on render.
+    /// Returns whether anything changed.
+    fn reconcile_session_closed(&mut self, sid: &str) -> bool {
+        let mut changed = false;
+        for tab in self.workspace.tabs.iter_mut() {
+            tab.layout.for_each_leaf_content_mut(&mut |content| {
+                // Compute the replacement (if the ring empties) *before*
+                // reassigning, so the `ring` borrow ends first.
+                let restore: Option<Option<WindowContent>> =
+                    if let WindowContent::Agent(ring) = content {
+                        if let Some(pos) = ring.position_by_server_session_id(sid) {
+                            ring.close_at(pos);
+                            changed = true;
+                            if ring.is_empty() {
+                                Some(ring.underlying.take().map(|b| *b))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(under) = restore {
+                    *content = under.unwrap_or_else(|| {
+                        WindowContent::Browser(BrowserWindow::standalone(
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                        ))
+                    });
+                }
+            });
+        }
+        changed
+    }
+
+    /// Reconcile a server-side rename: update the label on the matching slot in
+    /// every panel. Returns whether anything changed.
+    fn reconcile_session_renamed(&mut self, sid: &str, label: &str) -> bool {
+        let mut changed = false;
+        self.for_each_server_session_slot(sid, |slot| {
+            if slot.label != label {
+                slot.label = label.to_string();
+                changed = true;
+            }
+        });
+        changed
+    }
+
+    /// Apply a pre-drained batch of server notifications to the model. Called
+    /// inside a single `this.update()` so the model lock is held only for the
+    /// state mutation, never for channel I/O. Returns whether anything
+    /// changed and emits exactly one `cx.notify()` for the whole batch.
+    fn apply_server_batch(
+        &mut self,
+        batch: Vec<ServerNotification>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let is_candidate = self.is_candidate;
+        let mut ready_change: Option<bool> = None;
+
+        let warn_unrouted = |routed: bool, sid: &str| {
+            if !routed {
+                eprintln!(
+                    "[sketch-gpui] pump: no slot for server session {}",
+                    &sid[..sid.len().min(8)],
+                );
+            }
+        };
+
+        // A single shared `SessionServerClient` multiplexes every session's
+        // notifications onto this one pump, so each note is routed by its
+        // `session_id` across the *whole* workspace (all tabs and panes), not
+        // just the active tab — otherwise a session living in a background
+        // tab silently drops its streamed output.
+        let did_work = !batch.is_empty();
+        for note in batch {
+            match note {
+                ServerNotification::ReplyEvent { session_id, event } => {
+                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                        let claude = &mut slot.state;
+                        Self::apply_reply_events(claude, vec![event.clone()]);
+                        let line_count = claude.editor.document().line_count();
+                        let cursor_at_eof = claude.editor.cursor().line + 1 >= line_count;
+                        let follow = match claude.input_mode {
+                            InputMode::Chatbox => claude.follow_output.get(),
+                            InputMode::Worksheet => cursor_at_eof,
+                        };
+                        if follow && claude.list_item_count > 0 {
+                            claude
+                                .list_state
+                                .scroll_to_reveal_item(claude.list_item_count - 1);
+                        }
+                    });
+                    warn_unrouted(routed, &session_id);
+                }
+                ServerNotification::TurnEnded { session_id, turn_count } => {
+                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                        let claude = &mut slot.state;
+                        finalize_agent_turn(&mut claude.editor);
+                        claude.last_seen_turns = turn_count;
+                        claude.awaiting_reply = false;
+                        claude.turn_started = None;
+                        claude.last_event_at = None;
+                        claude.stop_requested_at = None;
+                    });
+                    warn_unrouted(routed, &session_id);
+                }
+                ServerNotification::UserPrompt { session_id, text } => {
+                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                        let claude = &mut slot.state;
+                        let incoming = text.trim_end_matches('\n');
+                        let already_present = {
+                            let existing = claude.editor.document().full_text();
+                            !incoming.is_empty() && existing.trim_end().ends_with(incoming)
+                        };
+                        if already_present {
+                            return;
+                        }
+                        if !claude.editor.document().full_text().ends_with('\n')
+                            && !claude.editor.document().full_text().is_empty()
+                        {
+                            let eof = claude.editor.document().rope().len_chars();
+                            claude.editor.programmatic_insert(eof, "\n");
+                        }
+                        let start_line =
+                            claude.editor.document().line_count().saturating_sub(1);
+                        let to_append = text.strip_suffix('\n').unwrap_or(&text);
+                        let eof = claude.editor.document().rope().len_chars();
+                        claude.editor.programmatic_insert(eof, to_append);
+                        if !claude.editor.document().full_text().ends_with('\n') {
+                            let eof2 = claude.editor.document().rope().len_chars();
+                            claude.editor.programmatic_insert(eof2, "\n");
+                        }
+                        let end_line = claude.editor.document().line_count();
+                        let turn_k = claude.last_seen_turns + 1;
+                        claude.editor.add_frozen_lines(start_line, end_line);
+                        for l in start_line..end_line {
+                            let anchor = claude.editor.anchor_for_line(l);
+                            claude
+                                .editor
+                                .metadata_mut::<TurnId>()
+                                .insert(anchor, TurnId::User(turn_k));
+                        }
+                    });
+                    warn_unrouted(routed, &session_id);
+                }
+                ServerNotification::SessionAttached { session_id, acp_session_id } => {
+                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                        let label = acp_session_id.as_deref().unwrap_or("connected");
+                        let msg = format!("attached: {label}");
+                        Self::append_system_notice(&mut slot.state, &msg);
+                        slot.state.status = Some(msg.into());
+                    });
+                    warn_unrouted(routed, &session_id);
+                }
+                ServerNotification::SessionDetached { session_id, reason } => {
+                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                        let msg = format!("detached: {reason}");
+                        Self::append_system_notice(&mut slot.state, &msg);
+                        slot.state.status = Some(msg.into());
+                    });
+                    warn_unrouted(routed, &session_id);
+                }
+                ServerNotification::OwnerChanged { session_id, has_owner } => {
+                    if is_candidate {
+                        ready_change = Some(!has_owner);
+                        self.with_server_session_slot(&session_id, |slot| {
+                            let msg = if has_owner {
+                                "mirroring (original active) — read-only"
+                            } else {
+                                "original released — menu → claude → take over"
+                            };
+                            Self::append_system_notice(&mut slot.state, msg);
+                            slot.state.status = Some(msg.into());
+                        });
+                    }
+                }
+                ServerNotification::SessionCreated { session } => {
+                    // List-level signal that some connection created a session.
+                    // The primary GUI does not auto-add it to unrelated panels
+                    // (a new session belongs to the panel that opened it, which
+                    // already has its slot from the create response). Kept as a
+                    // no-op hook for a future "available sessions" view / for
+                    // mirror GUIs that want to surface every live session.
+                    let _ = &session;
+                }
+                ServerNotification::SessionClosed { session_id } => {
+                    // A session closed somewhere (this GUI, another panel, or
+                    // another GUI instance). Drop its slot from every panel so
+                    // the lists stay consistent.
+                    self.reconcile_session_closed(&session_id);
+                }
+                ServerNotification::SessionRenamed { session_id, label } => {
+                    self.reconcile_session_renamed(&session_id, &label);
+                }
+            }
+        }
+        // Deferred apply outside the layout borrow.
+        if let Some(ready) = ready_change {
+            self.candidate_promote_ready = ready;
+        }
+        if did_work {
+            cx.notify();
+        }
+        did_work
     }
 
     /// Pump a specific session by its monotonic index. Returns `true` if
@@ -7426,19 +9304,41 @@ impl SketchGpuiView {
         // Scoped borrow: all mutable access to the ring/slot/claude happens
         // inside this block. Returns (has_events, more_pending, attached_with_id,
         // is_active) so post-borrow work (persistence, activity flag) can proceed.
+        //
+        // Search ALL panes (not just the focused one) so that agent sessions
+        // in unfocused split panes keep pumping events.
         let (has_events, more_pending, attached_with_id, is_active) = {
-            let ring = match self.agent_ring_mut() {
-                Some(r) => r,
+            // Find the slot across every pane in EVERY tab (not just the
+            // active tab) so agent sessions in background tabs and unfocused
+            // split panes keep pumping events.
+            let mut found = None;
+            for tab in self.workspace.tabs.iter_mut() {
+                found = tab.layout.find_map_leaf_content_mut(&mut |content| {
+                    if let WindowContent::Agent(ring) = content {
+                        let is_active_in_ring = ring.slots.get(ring.active)
+                            .map(|s| s.index == session_index)
+                            .unwrap_or(false);
+                        if let Some(slot) = ring.slot_by_index_mut(session_index) {
+                            // SAFETY: pointer is valid for the scoped-borrow
+                            // block below — we don't structurally mutate the
+                            // layout.
+                            let ptr = &mut slot.state as *mut AgentState;
+                            return Some((ptr, is_active_in_ring));
+                        }
+                    }
+                    None
+                });
+                if found.is_some() {
+                    break;
+                }
+            }
+            let (state_ptr, is_active) = match found {
+                Some(f) => f,
                 None => return false,
             };
-            let is_active = ring.slots.get(ring.active)
-                .map(|s| s.index == session_index)
-                .unwrap_or(false);
-            let slot = match ring.slot_by_index_mut(session_index) {
-                Some(s) => s,
-                None => return false,
-            };
-            let claude = &mut slot.state;
+            // SAFETY: the layout isn't mutated during this block; the
+            // pointer remains valid until the scoped borrow ends.
+            let claude = unsafe { &mut *state_ptr };
 
             // 1) Resolve pending attach.
             let mut attach_resolved = false;
@@ -7451,20 +9351,23 @@ impl SketchGpuiView {
                             attached_with_id = true;
                         }
                         claude.channel = Some(client);
-                        claude.status = Some(format!("attached: {label}").into());
+                        let msg = format!("attached: {label}");
+                        Self::append_system_notice(claude, &msg);
+                        claude.status = Some(msg.into());
                         attach_resolved = true;
                     }
                     Ok(Err(e)) => {
                         claude.channel = None;
-                        claude.status = Some(
-                            format!("attach failed: {e} (set SKETCH_ACP_AGENT=...?)").into(),
-                        );
+                        let msg = format!("attach failed: {e} (set SKETCH_ACP_AGENT=...?)");
+                        Self::append_system_notice(claude, &msg);
+                        claude.status = Some(msg.into());
                         attach_resolved = true;
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        claude.status =
-                            Some("attach worker died before reporting result".into());
+                        let msg = "attach worker died before reporting result";
+                        Self::append_system_notice(claude, msg);
+                        claude.status = Some(msg.into());
                         attach_resolved = true;
                     }
                 }
@@ -7482,6 +9385,7 @@ impl SketchGpuiView {
             if stale {
                 claude.channel = None;
                 claude.turn_started = None;
+                Self::append_system_notice(claude, "agent disconnected");
                 claude.status = Some("agent disconnected".into());
                 cx.notify();
                 return false;
@@ -7522,6 +9426,8 @@ impl SketchGpuiView {
                     claude.last_seen_turns = current_turns;
                     claude.awaiting_reply = false;
                     claude.turn_started = None;
+                    claude.last_event_at = None;
+                    claude.stop_requested_at = None;
                 }
                 // Spec §19 auto-scroll. In Chatbox mode the user's
                 // cursor isn't in the transcript so chunks land with
@@ -7533,7 +9439,7 @@ impl SketchGpuiView {
                 let line_count = claude.editor.document().line_count();
                 let cursor_at_eof = claude.editor.cursor().line + 1 >= line_count;
                 let follow_chunks = match claude.input_mode {
-                    InputMode::Chatbox => true,
+                    InputMode::Chatbox => claude.follow_output.get(),
                     InputMode::Worksheet => cursor_at_eof,
                 };
                 if follow_chunks && claude.list_item_count > 0 {
@@ -7555,12 +9461,16 @@ impl SketchGpuiView {
             self.save_agent_ring();
         }
 
-        // Mark inactive sessions with unseen activity.
+        // Mark inactive sessions with unseen activity (cross-tab, cross-pane).
         if has_events && !is_active {
-            if let Some(ring) = self.agent_ring_mut() {
-                if let Some(slot) = ring.slot_by_index_mut(session_index) {
-                    slot.has_unseen_activity = true;
-                }
+            for tab in self.workspace.tabs.iter_mut() {
+                tab.layout.for_each_leaf_content_mut(&mut |content| {
+                    if let WindowContent::Agent(ring) = content {
+                        if let Some(slot) = ring.slot_by_index_mut(session_index) {
+                            slot.has_unseen_activity = true;
+                        }
+                    }
+                });
             }
         }
 
@@ -7568,6 +9478,16 @@ impl SketchGpuiView {
             cx.notify();
         }
         more_pending
+    }
+
+    /// Insert a lifecycle notice into the agent buffer as a frozen line.
+    /// The `―` prefix distinguishes system notices from agent prose.
+    fn append_system_notice(claude: &mut AgentState, msg: &str) {
+        let current_turn = claude.last_seen_turns + 1;
+        let notice_line = format!("\n― {msg}\n");
+        claude
+            .editor
+            .append_llm_chunk(TurnId::Llm(current_turn), &notice_line);
     }
 
     /// Apply a batch of reply events to the AgentState. Text chunks are
@@ -7580,6 +9500,11 @@ impl SketchGpuiView {
         events: Vec<sketch::acp_channel::ReplyEvent>,
     ) {
         use sketch::acp_channel::ReplyEvent;
+        // Any inbound activity refreshes the quiet-clock the thinking
+        // indicator reads, so a streaming turn never looks stalled.
+        if !events.is_empty() {
+            claude.last_event_at = Some(std::time::Instant::now());
+        }
         // In-progress turn for tagging streamed content. `last_seen_turns`
         // only ticks up when the agent's prompt response resolves; while
         // chunks are streaming for the turn in flight, that turn is k =
@@ -7592,6 +9517,12 @@ impl SketchGpuiView {
                     // tagged with this turn (mid-line for in-progress
                     // continuation, EOF for a new turn). Editable user
                     // lines anywhere else in the document stay put.
+                    if perf_enabled() {
+                        eprintln!("[chunklog gui] turn={current_turn} {text:?}");
+                    }
+                    // Real content means a retry (if any) succeeded — drop
+                    // the transient "retrying…" notice.
+                    claude.status = None;
                     claude
                         .editor
                         .append_llm_chunk(TurnId::Llm(current_turn), text.as_str());
@@ -7668,6 +9599,12 @@ impl SketchGpuiView {
                 ReplyEvent::UsageUpdated(snap) => {
                     claude.usage = Some(snap);
                 }
+                ReplyEvent::Notice(ref msg) => {
+                    // Driver status (retry/failed) — show inline in the
+                    // buffer and in the footer status slot.
+                    Self::append_system_notice(claude, msg);
+                    claude.status = Some(msg.clone().into());
+                }
             }
         }
     }
@@ -7723,7 +9660,9 @@ impl SketchGpuiView {
         };
         match new_mode {
             Some(m) => {
-                claude.status = Some(format!("permission mode → {}", m.short_label()).into());
+                let msg = format!("permission mode → {}", m.short_label());
+                Self::append_system_notice(claude, &msg);
+                claude.status = Some(msg.into());
             }
             None => {
                 claude.status = Some("permission mode: no agent attached".into());
@@ -7757,6 +9696,7 @@ impl SketchGpuiView {
         claude.attach_pending = None;
         claude.awaiting_reply = false;
         claude.turn_started = None;
+        Self::append_system_notice(claude, "session detached");
         claude.status = Some("session detached".into());
         self.save_agent_ring();
         cx.notify();
@@ -7801,6 +9741,7 @@ impl SketchGpuiView {
             ring.active_mut().resume_id = None;
             let claude = &mut ring.active_mut().state;
             claude.attach_pending = Some(attach_rx);
+            Self::append_system_notice(claude, "attaching new session…");
             claude.status = Some("attaching new session…".into());
         }
         self.save_agent_ring();
@@ -7953,14 +9894,167 @@ impl SketchGpuiView {
     /// Chatbox submit (§18) takes the chatbox text, appends + freezes it
     /// at EOF of the transcript, then sends and clears the chatbox.
     fn submit_agent(&mut self, cx: &mut Context<Self>) {
+        if self.is_candidate {
+            self.set_agent_status(
+                "read-only mirror — close the original window, then menu → claude → take over",
+                cx,
+            );
+            return;
+        }
         let mode = match self.agent_mut() {
-            Some(c) => c.input_mode,
+            Some(c) => {
+                // Re-enable auto-scroll when the user sends a message.
+                c.follow_output.set(true);
+                c.input_mode
+            }
             None => return,
         };
         match mode {
             InputMode::Worksheet => self.submit_worksheet(cx),
             InputMode::Chatbox => self.submit_chatbox(cx),
         }
+    }
+
+    /// Whether any agent slot (across all tabs/panes) is mid-turn. Cheap
+    /// traversal the pumps use to decide whether an idle animation tick is
+    /// worth a re-render.
+    fn any_agent_awaiting(&mut self) -> bool {
+        let mut awaiting = false;
+        for tab in self.workspace.tabs.iter_mut() {
+            tab.layout.for_each_leaf_content_mut(&mut |content| {
+                if let WindowContent::Agent(ring) = content {
+                    if ring.slots.iter().any(|s| s.state.awaiting_reply) {
+                        awaiting = true;
+                    }
+                }
+            });
+        }
+        awaiting
+    }
+
+    /// Interrupt the in-flight agent turn (ACP `session/cancel`). Routes
+    /// through the active path — session server when one owns the slot,
+    /// otherwise the direct `AcpChannelClient`. The agent resolves the turn
+    /// with `StopReason::Cancelled`, which bumps the turn counter and clears
+    /// `awaiting_reply` on the next pump tick. No-op when nothing is in
+    /// flight. Bound to `StopAgent` (Cmd-.) and the footer Stop button.
+    fn stop_agent(&mut self, _: &StopAgent, _w: &mut Window, cx: &mut Context<Self>) {
+        // Read-only mirrors can't drive the session.
+        if self.is_candidate {
+            return;
+        }
+        // Only meaningful mid-turn.
+        let awaiting = self.agent_mut().map(|c| c.awaiting_reply).unwrap_or(false);
+        if !awaiting {
+            if let Some(claude) = self.agent_mut() {
+                claude.status = Some("nothing to stop".into());
+            }
+            cx.notify();
+            return;
+        }
+
+        // Second Stop while a cancel is already pending escalates to a hard
+        // kill + resume — for a turn wedged on a hung upstream request the
+        // cooperative `session/cancel` may never land.
+        let escalate = self
+            .agent_mut()
+            .map(|c| c.stop_requested_at.is_some())
+            .unwrap_or(false);
+        if escalate {
+            self.force_restart_agent(cx);
+            return;
+        }
+
+        // First Stop → graceful ACP session/cancel.
+        let server_sid = self.active_server_session_id();
+        let sent = if let Some(sid) = &server_sid {
+            self.session_server
+                .as_ref()
+                .and_then(|s| s.cancel(sid).ok())
+                .is_some()
+        } else if let Some(claude) = self.agent_mut() {
+            match claude.channel.as_ref() {
+                Some(channel) => {
+                    channel.cancel();
+                    true
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+        if let Some(claude) = self.agent_mut() {
+            claude.stop_requested_at = Some(std::time::Instant::now());
+            claude.status = Some(if sent {
+                "stopping… (⌘. again to force-restart)".into()
+            } else {
+                "nothing to stop".into()
+            });
+        }
+        cx.notify();
+    }
+
+    /// Hard recovery for a wedged turn: kill the agent subprocess and respawn
+    /// it, resuming the same ACP session so prior context survives. The
+    /// escalation behind a second Stop press. Routes to the session server
+    /// (which owns the subprocess) in server mode, otherwise drops and
+    /// re-attaches the direct channel.
+    fn force_restart_agent(&mut self, cx: &mut Context<Self>) {
+        if let Some(sid) = self.active_server_session_id() {
+            let ok = self
+                .session_server
+                .as_ref()
+                .and_then(|s| s.restart_session(&sid).ok())
+                .is_some();
+            if let Some(claude) = self.agent_mut() {
+                claude.awaiting_reply = false;
+                claude.turn_started = None;
+                claude.last_event_at = None;
+                claude.stop_requested_at = None;
+                claude.status = Some(if ok {
+                    "force-restarting agent (resuming session)…".into()
+                } else {
+                    "force-restart request failed".into()
+                });
+            }
+            cx.notify();
+            return;
+        }
+
+        // Direct mode: resume the current ACP session id on a fresh
+        // subprocess; dropping the old channel kills the wedged one.
+        let resume_id = self
+            .agent_mut()
+            .and_then(|c| c.channel.as_ref().and_then(|ch| ch.session_id()));
+        let slot_cwd = self.agent_ring().map(|r| r.active().cwd.clone());
+        let (attach_tx, attach_rx) =
+            std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
+        let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
+        let resume_for_worker = resume_id.clone();
+        let _ = std::thread::Builder::new()
+            .name("sketch-acp-force-restart".into())
+            .spawn(move || {
+                let _ = attach_tx.send(AcpChannelClient::spawn_with_resume_in(
+                    &cmd,
+                    slot_cwd,
+                    resume_for_worker,
+                    sketch::acp_channel::SketchFrontend::Gpui,
+                ));
+            });
+        if let Some(ring) = self.agent_ring_mut() {
+            ring.active_mut().resume_id = resume_id;
+            let claude = &mut ring.active_mut().state;
+            claude.channel = None; // Drop → kills the wedged subprocess.
+            claude.attach_pending = Some(attach_rx);
+            claude.awaiting_reply = false;
+            claude.turn_started = None;
+            claude.last_event_at = None;
+            claude.stop_requested_at = None;
+            Self::append_system_notice(claude, "force-restarting agent (resuming session)…");
+            claude.status = Some("force-restarting agent (resuming session)…".into());
+        }
+        self.save_agent_ring();
+        cx.notify();
     }
 
     /// Worksheet submit per §12. Sweep every editable line in document
@@ -8045,7 +10139,10 @@ impl SketchGpuiView {
         if sent {
             if let Some(claude) = self.agent_mut() {
                 claude.awaiting_reply = true;
-                claude.turn_started = Some(std::time::Instant::now());
+                let now = std::time::Instant::now();
+                claude.turn_started = Some(now);
+                claude.last_event_at = Some(now);
+                claude.stop_requested_at = None;
             }
         }
         if let Some(claude) = self.agent_mut() {
@@ -8130,7 +10227,10 @@ impl SketchGpuiView {
         if sent {
             if let Some(claude) = self.agent_mut() {
                 claude.awaiting_reply = true;
-                claude.turn_started = Some(std::time::Instant::now());
+                let now = std::time::Instant::now();
+                claude.turn_started = Some(now);
+                claude.last_event_at = Some(now);
+                claude.stop_requested_at = None;
             }
         }
 
@@ -8286,7 +10386,16 @@ impl SketchGpuiView {
         if let Some(c) = self.agent_mut() {
             let cursor_line = c.editor.cursor().line;
             let ranges = c.block_ranges.clone();
-            let target = cursor_visible_child_index(c, cursor_line, &ranges);
+            let line_count = c.editor.document().line_count();
+            let gutter_tags: Vec<Option<TurnId>> = (0..line_count)
+                .map(|i| {
+                    c.editor
+                        .anchor_for_line_opt(i)
+                        .and_then(|a| c.editor.metadata::<TurnId>().get(a).copied())
+                })
+                .collect();
+            let th_before = count_turn_headers_before(&gutter_tags, cursor_line);
+            let target = cursor_visible_child_index(c, cursor_line, &ranges, th_before);
             c.list_state.scroll_to_reveal_item(target);
         }
 
@@ -8305,6 +10414,69 @@ impl SketchGpuiView {
     }
 }
 
+impl SketchGpuiView {
+    fn render_splash(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let bg = self.editor_bg();
+        let fg = self.editor_fg();
+
+        div()
+            .track_focus(&self.focus_handle)
+            .key_context("SplashView")
+            .size_full()
+            .bg(bg)
+            .flex()
+            .items_center()
+            .justify_center()
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                // Ignore bare modifier presses (shift, ctrl, etc.) — only
+                // dismiss on a real key.
+                let modifier_only = ev.keystroke.key.as_str().is_empty()
+                    || matches!(
+                        ev.keystroke.key.as_str(),
+                        "shift" | "control" | "alt" | "meta" | "fn"
+                    );
+                if modifier_only {
+                    return;
+                }
+                this.splash_until = None;
+                cx.notify();
+                cx.stop_propagation();
+            }))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _w, cx| {
+                this.splash_until = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .font_family(self.body_font.clone())
+                            .text_size(px(48.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(fg)
+                            .child("sketch"),
+                    )
+                    .child(
+                        div()
+                            .font_family(self.body_font.clone())
+                            .text_size(px(14.0))
+                            .text_color(Hsla {
+                                h: 0.0,
+                                s: 0.0,
+                                l: 0.5,
+                                a: 1.0,
+                            })
+                            .child("a markdown editor"),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
 impl Focusable for SketchGpuiView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -8314,6 +10486,16 @@ impl Focusable for SketchGpuiView {
 impl Render for SketchGpuiView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport_width_px = f32::from(_window.viewport_size().width);
+
+        // Auto-clear expired splash.
+        if let Some(deadline) = self.splash_until {
+            if std::time::Instant::now() >= deadline {
+                self.splash_until = None;
+            }
+        }
+        if self.splash_until.is_some() {
+            return self.render_splash(cx);
+        }
 
         let has_overlay = self.menu.is_some()
             || self.buffer_switcher.is_some()
@@ -8343,7 +10525,19 @@ impl Render for SketchGpuiView {
             .bg(editor_bg)
             .text_color(editor_fg);
 
-        let screen_view: AnyElement = self.render_focused_window(screen_root, !has_overlay, cx);
+        // When the rail holds focus, the content leaf must NOT attach the
+        // shared focus handle — otherwise both the rail and the leaf would
+        // claim it, and the leaf's context-scoped bindings (SketchView, …)
+        // would shadow the rail's (spec §6, two-state model §5).
+        let rail_focused = !has_overlay && self.rail_is_focused();
+        let leaf_attach_focus = !has_overlay && !rail_focused;
+        let screen_view: AnyElement =
+            self.render_focused_window(screen_root, leaf_attach_focus, cx);
+
+        // Slot the persistent side column (rail) between the split tree and
+        // the tab strip (spec-rail.md §8). No-op passthrough when no rail is
+        // open. The rail is focusable only when no overlay owns focus (§4).
+        let screen_view = self.wrap_with_rail(screen_view, !has_overlay, cx);
 
         // When there's more than one tab, stack the tab strip above the
         // screen view. Single-tab workspaces render no strip — matches the
@@ -8551,6 +10745,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_menu))
             .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::next_buffer))
             .on_action(cx.listener(Self::prev_buffer))
             .on_action(cx.listener(Self::next_tab))
@@ -8574,7 +10769,12 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
             .on_action(cx.listener(Self::copy_doc_selection))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::toggle_file_browser_rail))
+            .on_action(cx.listener(Self::toggle_outline_rail))
+            .on_action(cx.listener(Self::flip_rail_side))
             .child(header)
             .child(body)
             .child(footer)
@@ -8676,13 +10876,25 @@ impl SketchGpuiView {
         root.key_context("EditView")
             .on_key_down(cx.listener(Self::handle_edit_key))
             .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
             .on_action(cx.listener(Self::close_window))
+            .on_action(cx.listener(Self::focus_left))
+            .on_action(cx.listener(Self::focus_right))
+            .on_action(cx.listener(Self::focus_up))
+            .on_action(cx.listener(Self::focus_down))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::toggle_file_browser_rail))
+            .on_action(cx.listener(Self::toggle_outline_rail))
+            .on_action(cx.listener(Self::flip_rail_side))
             .child(header)
             .child(body)
             .child(footer)
@@ -8708,7 +10920,7 @@ impl SketchGpuiView {
                     .replace('\t', "    ")
             })
             .collect();
-        let highlighted = highlight_markdown_lines(&lines, &self.theme);
+        let highlighted = highlight_markdown_lines_syn(&lines, &self.theme, &self.syntect_hl);
 
         let mut body = div()
             .id("edit-body")
@@ -8786,7 +10998,7 @@ impl SketchGpuiView {
                     .replace('\t', "    ")
             })
             .collect();
-        let highlighted = highlight_markdown_lines(&lines, &self.theme);
+        let highlighted = highlight_markdown_lines_syn(&lines, &self.theme, &self.syntect_hl);
 
         let mut body = div()
             .id("edit-body-wp")
@@ -8959,7 +11171,27 @@ impl SketchGpuiView {
         // rendered-mode focused-block bar.
         let frozen_bar: Hsla = nc(at.frozen_bar);
         let user_bar: Hsla = nc(at.user_bar);
+        // Theme-derived background tints for turn cards. Blend a faint
+        // tint into the editor background so cards work on any theme.
+        let base_bg: Hsla = self.editor_bg();
+        let claude_turn_bg: Hsla = nc(at.agent_turn_bg);
+        let user_turn_bg: Hsla = nc(at.user_turn_bg);
+        let _frozen_fg: Hsla = self.editor_fg();
+        let compose_panel_bg: Hsla = tint_bg(base_bg, 0.55, 0.1, 0.03);
+        // Compose input text uses the theme's editor foreground so it stays
+        // legible against `compose_panel_bg` on light themes (folio, FT,
+        // solarized-light) — not the hardcoded Dracula light gray, which
+        // vanished into the near-white panel.
+        let compose_fg: Hsla = self.editor_fg();
 
+        let perf = perf_enabled();
+        // Whole-body timer: covers extract + highlight + gutter tags + block
+        // parse + flat_items build + element-tree assembly (everything in
+        // render_agent up to the return). GPUI's own layout/paint happens
+        // after we return and is not captured here.
+        let t_render0 = perf.then(std::time::Instant::now);
+        let t_extract0 = perf.then(std::time::Instant::now);
+        let edit_seq = c.editor.document().edit_seq();
         let lines: Vec<String> = (0..line_count.max(1))
             .map(|i| {
                 c.editor
@@ -8969,12 +11201,36 @@ impl SketchGpuiView {
                     .replace('\t', "    ")
             })
             .collect();
-        // Run md_highlight so Claude's markdown (`**bold**`, `` `code` ``,
-        // headings, lists, blockquotes) renders styled instead of as raw
-        // asterisks/backticks. The agent commonly returns markdown for
-        // formatted text; without this pass it all reads as prose with
-        // syntax noise.
-        let highlighted = highlight_markdown_lines(&lines, &self.theme);
+        let t_extract = t_extract0.map(|t| t.elapsed());
+
+        // Per-line highlight, raw + stripped. The incremental cache
+        // re-highlights only changed lines and hands back a cheap `Rc`
+        // snapshot; the bypass path (SKETCH_HL_CACHE=0) recomputes both
+        // passes in full every frame, feeding the identical closure shape so
+        // the two paths are directly comparable.
+        let t_hl0 = perf.then(std::time::Instant::now);
+        let hl_snap: std::rc::Rc<Vec<std::rc::Rc<LineHl>>> = if hl_cache_enabled() {
+            c.highlight_cache.snapshot_syn(&lines, &self.theme, edit_seq, &self.syntect_hl)
+        } else {
+            let raw = highlight_markdown_lines_syn(&lines, &self.theme, &self.syntect_hl);
+            let stripped = highlight_markdown_lines_stripped_syn(&lines, &self.theme, &self.syntect_hl);
+            std::rc::Rc::new(
+                raw.into_iter()
+                    .zip(stripped)
+                    .map(|(raw, stripped)| std::rc::Rc::new(LineHl { raw, stripped }))
+                    .collect(),
+            )
+        };
+        // Stash the per-section timings; the consolidated trace prints at the
+        // end of render_agent so we can attribute cost across the whole body.
+        let perf_hl_ms = t_hl0.map(|t| t.elapsed().as_secs_f64() * 1e3);
+        let perf_extract_ms = t_extract.map(|d| d.as_secs_f64() * 1e3);
+        let (perf_recomputed, perf_skip) = if hl_cache_enabled() {
+            (c.highlight_cache.last_recomputed, c.highlight_cache.last_was_skip)
+        } else {
+            (lines.len(), false)
+        };
+        let perf_lines = lines.len();
         let base_style = self.theme.paragraph;
 
         // Per-line gutter tag, sourced from the editor's `TurnId` metadata
@@ -9050,26 +11306,48 @@ impl SketchGpuiView {
             }
         }
 
-        // Flat ordering: line_0, tool_group_at[0], line_1, …
+        // Flat ordering: TurnHeader?, line_0, tool_group_at[0], line_1, …
         // Lines inside a detected block range are replaced by one
         // FlatItem::Block at the range start; interior lines are skipped.
-        // Turn separators are inserted when the author (LLM vs User) changes.
+        // TurnHeader items are inserted at turn boundaries (role changes).
         let mut flat_items: Vec<FlatItem> = Vec::with_capacity(lines.len() * 2);
-        let mut prev_author: Option<bool> = None; // true = agent, false = user
+        let mut prev_turn: Option<TurnId> = None;
         for line_idx in 0..lines.len() {
-            // Detect author transition and insert a separator.
-            let cur_tag = gutter_tag_per_line.get(line_idx).copied().flatten();
-            let cur_author = match cur_tag {
-                Some(TurnId::Llm(_)) => Some(true),
-                Some(TurnId::User(_)) => Some(false),
-                _ => None,
-            };
-            if let Some(is_agent) = cur_author {
-                if prev_author.is_some() && prev_author != Some(is_agent) {
-                    let label = if is_agent { "Claude" } else { "You" };
-                    flat_items.push(FlatItem::TurnSeparator { label, is_agent });
+            // Insert a TurnHeader whenever the dominant turn changes.
+            let cur_turn = gutter_tag_per_line.get(line_idx).copied().flatten();
+            if let Some(tid) = cur_turn {
+                let dominated_by = match tid {
+                    TurnId::Tool(_) => None, // tools don't get their own header
+                    other => Some(other),
+                };
+                if let Some(dt) = dominated_by {
+                    let changed = match prev_turn {
+                        Some(prev) => prev != dt,
+                        None => true,
+                    };
+                    if changed {
+                        let role = match dt {
+                            TurnId::Llm(_) => TurnRole::Claude,
+                            TurnId::User(_) => TurnRole::User,
+                            TurnId::Tool(_) => unreachable!(),
+                        };
+                        flat_items.push(FlatItem::TurnHeader { role });
+                        prev_turn = Some(dt);
+                    }
                 }
-                prev_author = Some(is_agent);
+            } else if prev_turn.is_some() {
+                // Editable (untagged) lines after frozen content = user input.
+                // Suppress the "You" header when the editable tail is all
+                // blank — in Chatbox mode the compose area is separate, so
+                // an empty transcript tail is just whitespace, not a turn.
+                let remaining_non_empty = (line_idx..lines.len())
+                    .any(|j| !lines[j].trim().is_empty());
+                if remaining_non_empty {
+                    flat_items.push(FlatItem::TurnHeader {
+                        role: TurnRole::User,
+                    });
+                }
+                prev_turn = None;
             }
 
             if let Some(block) = block_at_start.remove(&line_idx) {
@@ -9086,25 +11364,102 @@ impl SketchGpuiView {
             }
         }
 
+        // Collapse blank lines: (a) strip blank frozen (Claude) Lines
+        // entirely — they're protocol padding with no visual purpose,
+        // (b) strip blank Lines adjacent to ToolGroup / TurnHeader /
+        // Block items, and (c) collapse runs of consecutive blank
+        // user Lines to at most one.
+        {
+            let is_blank_line = |item: &FlatItem| -> bool {
+                matches!(item, FlatItem::Line(idx) if lines.get(*idx).map_or(true, |s| s.trim().is_empty()))
+            };
+            let is_frozen_line = |item: &FlatItem| -> bool {
+                matches!(item, FlatItem::Line(idx) if frozen_ranges.iter().any(|&(s, e)| *idx >= s && *idx < e))
+            };
+            let is_structural = |item: &FlatItem| -> bool {
+                matches!(
+                    item,
+                    FlatItem::ToolGroup { .. }
+                        | FlatItem::TurnHeader { .. }
+                        | FlatItem::Block(_)
+                )
+            };
+            let mut keep = vec![true; flat_items.len()];
+            for i in 0..flat_items.len() {
+                if !is_blank_line(&flat_items[i]) {
+                    continue;
+                }
+                // Blank frozen lines are always stripped — they're just
+                // anchor padding inserted by the ACP splice logic.
+                if is_frozen_line(&flat_items[i]) {
+                    keep[i] = false;
+                    continue;
+                }
+                // Drop blank line if adjacent to a structural item.
+                let adj_structural = (i > 0 && is_structural(&flat_items[i - 1]))
+                    || (i + 1 < flat_items.len() && is_structural(&flat_items[i + 1]));
+                if adj_structural {
+                    keep[i] = false;
+                    continue;
+                }
+                // Collapse consecutive blanks to one.
+                if i > 0 && is_blank_line(&flat_items[i - 1]) && keep[i - 1] {
+                    keep[i] = false;
+                }
+            }
+            let mut j = 0;
+            for i in 0..flat_items.len() {
+                if keep[i] {
+                    flat_items.swap(i, j);
+                    j += 1;
+                }
+            }
+            flat_items.truncate(j);
+        }
+
+        // Thinking indicator at the tail while waiting for Claude.
+        if c.awaiting_reply {
+            flat_items.push(FlatItem::ThinkingIndicator);
+        }
+
         // Splice ListState to match new item count. When block ranges
         // are active, line count can shrink unpredictably, so always
         // reset. Otherwise use incremental splice for height cache.
         let new_count = flat_items.len();
         let old_count = c.list_item_count;
         if new_count != old_count {
+            let grew = new_count > old_count;
             if !block_ranges.is_empty() || new_count < old_count {
                 c.list_state.reset(new_count);
             } else {
                 c.list_state.splice(old_count..old_count, new_count - old_count);
             }
             c.list_item_count = new_count;
+
+            // Re-scroll with the fresh count when new items were added.
+            // The pump functions also scroll, but they fire before
+            // render so their count is stale — this catches unfocused
+            // panes that missed the pump's scroll.
+            if grew && new_count > 0 {
+                let line_count = c.editor.document().line_count();
+                let cursor_at_eof = c.editor.cursor().line + 1 >= line_count;
+                let follow = match c.input_mode {
+                    InputMode::Chatbox => c.follow_output.get(),
+                    InputMode::Worksheet => cursor_at_eof,
+                };
+                if follow {
+                    c.list_state.scroll_to_reveal_item(new_count - 1);
+                }
+            }
         }
 
         // Snapshot data for the render closure. Cloned once per
         // render_agent call; the closure is then called only for
         // visible items.
         let lines_snap = lines.clone();
-        let highlighted_snap = highlighted.clone();
+        // O(1) pointer clone of the per-line highlight snapshot; the closure
+        // owns it for the frame and indexes `.raw` / `.stripped` per line.
+        let hl_snap = hl_snap;
         let gutter_tag_snap = gutter_tag_per_line.clone();
         let tool_calls_snap = c.tool_calls.clone();
         let expanded_snap = c.expanded_tool_calls.clone();
@@ -9118,6 +11473,14 @@ impl SketchGpuiView {
         let theme_snap = self.theme.clone();
         let at_snap = self.theme.agent.clone();
         let self_editor_fg = self.editor_fg();
+        // u32 base colors for `styled_line_element`, which falls back to the
+        // base for spans without an explicit fg. Theme-derived so plain
+        // editable / frozen text stays legible on light themes (folio, FT)
+        // instead of using the hardcoded Dracula `DEFAULT_FG`.
+        let editor_fg_u32 = ncolor_to_u32(self.theme.editor_fg, DEFAULT_FG);
+        let frozen_fg_u32 = ncolor_to_u32(self.theme.agent.frozen_fg, DEFAULT_FG);
+        let turn_started_snap = c.turn_started;
+        let last_event_at_snap = c.last_event_at;
         let weak_self = cx.entity().downgrade();
         let flat_items_arc: std::rc::Rc<Vec<FlatItem>> =
             std::rc::Rc::new(flat_items);
@@ -9141,11 +11504,14 @@ impl SketchGpuiView {
                         let is_locked = line_idx < lockable_through_snap;
                         let _ = is_locked; // kept for future visual cue parity
 
-                        // md_highlight segments + author tint.
-                        let mut segs: Vec<Segment> = highlighted_snap
-                            .get(line_idx)
-                            .cloned()
-                            .unwrap_or_else(|| vec![(line_str.clone(), base_style)]);
+                        // md_highlight segments + author tint. Frozen (Claude)
+                        // lines use stripped highlights (no raw delimiters);
+                        // editable (user) lines use raw highlights.
+                        let mut segs: Vec<Segment> = match hl_snap.get(line_idx) {
+                            Some(hl) if is_frozen => hl.stripped.clone(),
+                            Some(hl) => hl.raw.clone(),
+                            None => vec![(line_str.clone(), base_style)],
+                        };
                         let author_tint: NColor = if is_frozen {
                             at_snap.agent_tint
                         } else {
@@ -9163,12 +11529,23 @@ impl SketchGpuiView {
                             {
                                 if e_col > s {
                                     segs = apply_selection_bg(
-                                        &segs, s, e_col, SELECTION_BG,
+                                        &segs, s, e_col, at_snap.selection_bg,
                                     );
                                 }
                             }
                         }
 
+                        // Per-line rendering uses monospace (code_font)
+                        // for all lines — the token-based flex-wrap in
+                        // build_wrapped_line doesn't play well with
+                        // proportional fonts. Proportional rendering is
+                        // handled by the FlatItem::Block path which uses
+                        // body_font through block_inner/doc_styled_line_element.
+                        let line_base_fg = if is_frozen {
+                            frozen_fg_u32
+                        } else {
+                            editor_fg_u32
+                        };
                         let content = build_wrapped_line(
                             &segs,
                             &line_str,
@@ -9177,7 +11554,7 @@ impl SketchGpuiView {
                             mode_snap,
                             cursor_color,
                             base_style,
-                            DEFAULT_FG,
+                            line_base_fg,
                             &code_font_snap,
                         );
 
@@ -9199,29 +11576,40 @@ impl SketchGpuiView {
                         // metadata (spec §11): `N` for LLM lines, `Un`
                         // for user lines, `Tn` for tool-call anchor
                         // lines, blank for currently-editable
-                        // (unsubmitted) lines.
+                        // (unsubmitted) lines. Only show the label on the
+                        // first line of each contiguous turn block.
                         let tag = gutter_tag_snap.get(line_idx).copied().flatten();
-                        let (label_text, label_color): (SharedString, Hsla) = match tag {
-                            Some(TurnId::Llm(n)) => (
-                                format!("{:>3}", n).into(),
-                                frozen_bar,
-                            ),
-                            Some(TurnId::User(n)) => (
-                                format!("{:>3}", format!("U{}", n)).into(),
-                                user_bar,
-                            ),
-                            Some(TurnId::Tool(n)) => (
-                                format!("{:>3}", format!("T{}", n)).into(),
-                                nc(at_snap.tool_label),
-                            ),
-                            None => ("   ".into(), dim_fg),
+                        let prev_tag = if line_idx > 0 {
+                            gutter_tag_snap.get(line_idx - 1).copied().flatten()
+                        } else {
+                            None
                         };
-                        // Turn card background: agent vs user tint, with
-                        // cursor-line highlight layered on top.
-                        let turn_bg: Hsla = match tag {
-                            Some(TurnId::Llm(_)) => nc(at_snap.agent_turn_bg),
-                            Some(TurnId::User(_)) => nc(at_snap.user_turn_bg),
-                            _ => rgba(0x00000000).into(),
+                        let is_first_in_turn = tag != prev_tag;
+                        let (label_text, label_color): (SharedString, Hsla) = if !is_first_in_turn {
+                            ("   ".into(), dim_fg)
+                        } else {
+                            match tag {
+                                Some(TurnId::Llm(n)) => (
+                                    format!("{:>3}", n).into(),
+                                    frozen_bar,
+                                ),
+                                Some(TurnId::User(n)) => (
+                                    format!("{:>3}", format!("U{}", n)).into(),
+                                    user_bar,
+                                ),
+                                Some(TurnId::Tool(n)) => (
+                                    format!("{:>3}", format!("T{}", n)).into(),
+                                    nc(at_snap.tool_label),
+                                ),
+                                None => ("   ".into(), dim_fg),
+                            }
+                        };
+                        let card_bg: Hsla = match tag {
+                            Some(TurnId::Llm(_)) => claude_turn_bg,
+                            Some(TurnId::User(_)) => user_turn_bg,
+                            // Tool-anchor lines and untagged lines float on
+                            // the base editor_bg — no turn tint (Constraint 6).
+                            Some(TurnId::Tool(_)) | None => rgba(0x00000000).into(),
                         };
                         let row_bg: Hsla = if line_idx == cursor_line {
                             // Blend cursor highlight on top of turn bg.
@@ -9229,7 +11617,7 @@ impl SketchGpuiView {
                             h.a = 0.2;
                             h
                         } else {
-                            turn_bg
+                            card_bg
                         };
 
                         div()
@@ -9237,6 +11625,7 @@ impl SketchGpuiView {
                             .flex_row()
                             .items_start()
                             .w_full()
+                            .py(px(2.0))
                             .bg(row_bg)
                             .text_color(line_text_color)
                             .child(
@@ -9289,25 +11678,40 @@ impl SketchGpuiView {
 
                         let header_title: String = if count == 1 {
                             let tc = calls[0];
-                            if tc.title.is_empty() { "(tool)".into() } else { tc.title.clone() }
+                            let base = if tc.title.is_empty() { "(tool)".to_string() } else { tc.title.clone() };
+                            // Append a useful detail for single-tool groups so
+                            // the user doesn't need to expand to see *what* was
+                            // read/edited/executed.
+                            if let Some(detail) = tool_inline_detail(tc) {
+                                format!("{} {}", base, detail)
+                            } else {
+                                base
+                            }
                         } else {
                             format!("Ran {} tool calls", count)
                         };
 
-                        let arrow = if count > 1 {
-                            if group_expanded { "▼" } else { "▶" }
+                        // For single-tool groups: determine if the inner tool
+                        // has a body worth showing. If HeaderOnly, the header
+                        // line is the entire UI — no expand arrow, no nesting.
+                        let single_policy = if count == 1 {
+                            Some(tool_render_policy(calls[0]))
                         } else {
-                            let tc = calls[0];
-                            let policy = tool_render_policy(tc);
-                            if matches!(policy, ToolRenderPolicy::HeaderOnly) {
-                                " "
-                            } else if group_expanded { "▼" } else { "▶" }
+                            None
                         };
+                        let expandable = if count > 1 {
+                            true
+                        } else {
+                            !matches!(single_policy, Some(ToolRenderPolicy::HeaderOnly))
+                        };
+                        let arrow = if !expandable {
+                            " "
+                        } else if group_expanded { "▼" } else { "▶" };
 
                         let anchor_str = anchor.to_string();
                         let weak = weak_self.clone();
                         let click_id = anchor_str.clone();
-                        let header_row = div()
+                        let mut header_row = div()
                             .id(SharedString::from(format!("tool-group-{}", anchor)))
                             .flex()
                             .flex_row()
@@ -9315,11 +11719,12 @@ impl SketchGpuiView {
                             .gap_2()
                             .py(px(6.0))
                             .px_2()
-                            .cursor_pointer()
                             .child(div().text_color(dim_fg).child(arrow))
                             .child(div().text_color(group_color).child(group_glyph))
-                            .child(div().flex_1().text_color(self_editor_fg).text_size(px(12.0)).child(header_title))
-                            .on_click(
+                            .child(div().flex_1().text_color(self_editor_fg).text_size(px(12.0)).child(header_title));
+
+                        if expandable {
+                            header_row = header_row.cursor_pointer().on_click(
                                 move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
                                     let id = click_id.clone();
                                     let _ = weak.update(app, |this, cx| {
@@ -9334,31 +11739,42 @@ impl SketchGpuiView {
                                     });
                                 },
                             );
+                        }
 
                         let mut block = div()
                             .flex()
                             .flex_col()
-                            .my(px(6.0))
+                            .mt(px(16.0))
+                            .mb(px(8.0))
                             .mx_4()
-                            .rounded_md()
-                            .bg(nc(at_snap.tool_card_bg))
-                            .border_1()
-                            .border_color(nc(at_snap.tool_card_border))
                             .child(header_row);
 
-                        // Expanded: show individual tool calls.
-                        if group_expanded {
-                            for tc in &calls {
-                                let expanded_detail = expanded_snap.contains(&tc.tool_call_id.0.to_string());
-                                block = block.child(
-                                    build_tool_block_with_weak(
-                                        tc,
-                                        expanded_detail,
-                                        &code_font_snap,
-                                        weak_self.clone(),
-                                        &at_snap,
-                                    ),
+                        // Expanded: show contents.
+                        if group_expanded && expandable {
+                            if count == 1 {
+                                // Single-tool group: render body directly
+                                // under the header — no nested sub-header.
+                                let tc = calls[0];
+                                block = append_tool_body(
+                                    block,
+                                    tc,
+                                    single_policy.unwrap_or(ToolRenderPolicy::Full),
+                                    &code_font_snap,
+                                    &at_snap,
                                 );
+                            } else {
+                                for tc in &calls {
+                                    let expanded_detail = expanded_snap.contains(&tc.tool_call_id.0.to_string());
+                                    block = block.child(
+                                        build_tool_block_with_weak(
+                                            tc,
+                                            expanded_detail,
+                                            &code_font_snap,
+                                            weak_self.clone(),
+                                            &at_snap,
+                                        ),
+                                    );
+                                }
                             }
                         }
 
@@ -9384,47 +11800,114 @@ impl SketchGpuiView {
                         };
                         let inner = block_inner(&ctx, rendered_block);
                         div()
-                            .py_1()
+                            .mt(px(4.0))
+                            .mb(px(4.0))
                             .child(inner)
                             .into_any_element()
                     }
-                    FlatItem::TurnSeparator { label, is_agent } => {
-                        // Centered legend-style separator: ─── Label ───
-                        let label_color = if *is_agent {
-                            nc(at_snap.turn_header_agent)
-                        } else {
-                            nc(at_snap.turn_header_user)
+                    FlatItem::TurnHeader { role } => {
+                        let (label, accent): (&str, Hsla) = match role {
+                            TurnRole::Claude => ("Claude", nc(at_snap.turn_header_agent)),
+                            TurnRole::User => ("You", nc(at_snap.turn_header_user)),
                         };
                         let rule_color = nc(at_snap.turn_rule);
-
+                        // TurnHeaders float on editor_bg — no turn tint
+                        // (Constraint 6). The neutral gap between tinted
+                        // text bands is the visual separator.
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
                             .w_full()
-                            .pt(px(12.0))
-                            .pb(px(4.0))
+                            .pt(px(32.0))
+                            .pb(px(8.0))
                             .px_4()
                             .gap_3()
                             .child(
                                 div()
-                                    .flex_1()
-                                    .h(px(1.0))
-                                    .bg(rule_color),
-                            )
-                            .child(
-                                div()
                                     .text_size(px(11.0))
-                                    .text_color(label_color)
+                                    .text_color(accent)
                                     .font_weight(FontWeight::BOLD)
                                     .font_family(body_font_snap.clone())
-                                    .child(SharedString::from(*label)),
+                                    .child(SharedString::from(label)),
                             )
                             .child(
                                 div()
                                     .flex_1()
                                     .h(px(1.0))
                                     .bg(rule_color),
+                            )
+                            .into_any_element()
+                    }
+                    FlatItem::ThinkingIndicator => {
+                        // Pulsing dot: opacity cycles 0.3–1.0 on a sine wave.
+                        let phase = if let Some(t) = turn_started_snap {
+                            let ms = t.elapsed().as_millis() as f64;
+                            ((ms / 750.0).sin() * 0.5 + 0.5) as f32
+                        } else {
+                            1.0
+                        };
+                        let alpha = 0.3 + phase * 0.7;
+
+                        // Live elapsed (since the prompt was sent) and quiet
+                        // time (since the last streamed event). A streaming
+                        // turn keeps `quiet` near zero; a stall lets it climb,
+                        // which is the tell that the API — not sketch — is
+                        // wedged. Past STALL_WARN_S we switch to an explicit
+                        // warning so the user knows it's abnormal.
+                        const STALL_WARN_S: u64 = 30;
+                        let elapsed_s =
+                            turn_started_snap.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                        let quiet_s =
+                            last_event_at_snap.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                        let fmt_ms = |s: u64| format!("{}:{:02}", s / 60, s % 60);
+                        let stalled = quiet_s >= STALL_WARN_S;
+
+                        let dot_color = if stalled {
+                            // Amber when stalled, regardless of pulse phase.
+                            nc(at_snap.warm_accent)
+                        } else {
+                            Hsla { h: 0.53, s: 0.9, l: 0.76, a: alpha }
+                        };
+                        let (label, label_color) = if stalled {
+                            (
+                                format!(
+                                    "No reply for {} (running {}) — the API may be overloaded. ⌘. to stop · ⌘. again to force-restart",
+                                    fmt_ms(quiet_s),
+                                    fmt_ms(elapsed_s),
+                                ),
+                                nc(at_snap.warm_accent),
+                            )
+                        } else {
+                            (
+                                format!("Thinking\u{2026} {}", fmt_ms(elapsed_s)),
+                                Hsla { h: 0.0, s: 0.0, l: 0.6, a: alpha },
+                            )
+                        };
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_start()
+                            .w_full()
+                            .pt_3()
+                            .pb_2()
+                            .pl_1()
+                            .pr_4()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .text_color(dot_color)
+                                    .child("●"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(12.0))
+                                    .text_color(label_color)
+                                    .font_family(body_font_snap.clone())
+                                    .child(SharedString::from(label)),
                             )
                             .into_any_element()
                     }
@@ -9438,8 +11921,8 @@ impl SketchGpuiView {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .px_4()
-            .py_2()
+            .px_6()
+            .py_3()
             .text_size(px(13.0))
             .font_family(self.code_font.clone())
             .text_color(self.editor_fg())
@@ -9620,6 +12103,127 @@ impl SketchGpuiView {
 
         let header = strip;
 
+        // ---- Agent Info Bar ----
+        // Dedicated status bar showing context-window size, cwd, and active
+        // subagents. Position (top/bottom) is a user preference.
+        let info_bar = {
+            use sketch::acp_channel::ToolCallStatus;
+
+            // Context window segment.
+            let ctx_text: String = if let Some(usage) = &c.usage {
+                let used_k = (usage.tokens_used as f64) / 1000.0;
+                let total_k = (usage.tokens_total as f64) / 1000.0;
+                let pct = if usage.tokens_total > 0 {
+                    (usage.tokens_used as f64 / usage.tokens_total as f64) * 100.0
+                } else {
+                    0.0
+                };
+                format!("{:.1}k / {:.0}k ({:.0}%)", used_k, total_k, pct)
+            } else {
+                "\u{2014}".to_string()
+            };
+
+            // Cwd segment — always shown.
+            let cwd_text = shorten_cwd_for_display(&active_slot_cwd);
+
+            // Subagents segment — show in-progress agents with glyphs.
+            let agents_text: String = {
+                let active: Vec<String> = c
+                    .subagents
+                    .iter()
+                    .filter(|sa| {
+                        matches!(
+                            sa.status,
+                            ToolCallStatus::InProgress | ToolCallStatus::Pending
+                        )
+                    })
+                    .map(|sa| {
+                        let glyph = match sa.status {
+                            ToolCallStatus::InProgress => "\u{25d0}",
+                            ToolCallStatus::Pending => "\u{25cb}",
+                            _ => "\u{00b7}",
+                        };
+                        let label: String = if sa.label.chars().count() > 16 {
+                            let head: String = sa.label.chars().take(15).collect();
+                            format!("{}\u{2026}", head)
+                        } else {
+                            sa.label.clone()
+                        };
+                        format!("{}{}", glyph, label)
+                    })
+                    .collect();
+                if active.is_empty() {
+                    "\u{2014}".to_string()
+                } else {
+                    active.join("  ")
+                }
+            };
+
+            let sep_color: Hsla = nc(at.turn_rule);
+
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .py_1()
+                .h(px(22.0))
+                .bg(bg_or(bot, STATUS_BG))
+                .text_color(fg_or(bot, 0x666666))
+                .text_size(px(11.0))
+                .font_family(self.code_font.clone())
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_color(strip_dim)
+                                .child(SharedString::new_static("ctx")),
+                        )
+                        .child(SharedString::from(ctx_text)),
+                )
+                .child(
+                    div()
+                        .text_color(sep_color)
+                        .child(SharedString::new_static("\u{00b7}")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_color(strip_dim)
+                                .child(SharedString::new_static("cwd")),
+                        )
+                        .child(SharedString::from(cwd_text)),
+                )
+                .child(
+                    div()
+                        .text_color(sep_color)
+                        .child(SharedString::new_static("\u{00b7}")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_color(strip_dim)
+                                .child(SharedString::new_static("agents")),
+                        )
+                        .child(SharedString::from(agents_text)),
+                )
+        };
+
         let in_chatbox = c.input_mode == InputMode::Chatbox && c.chatbox.is_some();
         let mode_label = if in_chatbox {
             match c.chatbox.as_ref().unwrap().mode {
@@ -9658,6 +12262,44 @@ impl SketchGpuiView {
             "Ctrl-Enter send · Ctrl-Alt-Enter chatbox · Ctrl-V back · i insert · esc normal"
         };
 
+        // Right side of the footer: a Stop button (only while a reply is in
+        // flight) followed by the key hints. The button dispatches the same
+        // StopAgent path as Cmd-. — ACP session/cancel for the active turn.
+        let stop_fg: Hsla = nc(at.tool_failed);
+        let mut footer_right = div().flex().flex_row().items_center().gap_2();
+        if c.awaiting_reply {
+            // After a graceful cancel is already pending, the button (and
+            // ⌘.) escalate to a hard kill + resume.
+            let escalating = c.stop_requested_at.is_some();
+            let stop_label = if escalating {
+                "■ Force-restart ⌘."
+            } else {
+                "■ Stop ⌘."
+            };
+            let weak_stop = cx.entity().downgrade();
+            footer_right = footer_right.child(
+                div()
+                    .id("agent-stop-btn")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px_2()
+                    .py(px(1.0))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(stop_fg)
+                    .text_color(stop_fg)
+                    .cursor_pointer()
+                    .on_click(move |_ev: &gpui::ClickEvent, window: &mut Window, app: &mut App| {
+                        let _ = weak_stop.update(app, |this, cx| {
+                            this.stop_agent(&StopAgent, window, cx);
+                        });
+                    })
+                    .child(SharedString::from(stop_label)),
+            );
+        }
+        footer_right = footer_right.child(SharedString::from(hints));
+
         let footer = div()
             .flex()
             .flex_row()
@@ -9670,15 +12312,15 @@ impl SketchGpuiView {
             .text_color(fg_or(bot, 0x666666))
             .text_size(px(11.0))
             .child(left_status)
-            .child(SharedString::from(hints));
+            .child(footer_right);
 
         // Chatbox panel — rendered between body and footer when active.
         //
-        // Each line is rendered as a single non-wrapping row with horizontal
-        // viewport tracking. The cursor line scrolls horizontally so the
-        // caret is always on-screen; other lines render from column 0. This
-        // avoids the flex-wrap failure mode where long unbreakable tokens
-        // (URLs, paths, etc.) push the cursor off the visible area.
+        // Each line is rendered as a non-wrapping row inside a per-line
+        // overflow_hidden clip container. The cursor line is shifted left
+        // via a negative pixel margin so the caret stays visible. The clip
+        // container inherits its width from the flex layout — no need to
+        // know the pixel width at render time.
         let compose_panel = if let Some(tb) = &mut c.chatbox {
             let compose_lines: Vec<String> = {
                 let doc = tb.editor.document();
@@ -9695,89 +12337,28 @@ impl SketchGpuiView {
             let compose_mode = tb.mode;
             let compose_sel = tb.editor.selection_range();
             let sep_color: Hsla = nc(at.compose_separator);
-            let compose_bg: Hsla = nc(at.compose_bg);
             let compose_cursor_color: Hsla = nc(at.cursor);
             let compose_code_font = self.code_font.clone();
 
-            // Visible columns computed from the actual window viewport width.
-            // Subtract padding (px_4 = 16px each side = 32px) plus some
-            // chrome margin. SF Mono at 13px is ~7.8px per glyph.
-            let compose_padding_px = 48.0f32; // px_4 + border + margin
-            let glyph_w = 7.8f32;
-            let usable_px = (self.viewport_width_px - compose_padding_px).max(100.0);
-            let visible_cols = ((usable_px / glyph_w) as usize).max(20);
-
-            // Update horizontal scroll to keep cursor visible.
-            tb.ensure_cursor_visible(compose_cursor_col, visible_cols);
-            let h_scroll = tb.h_scroll_col;
-
-            let sep_label = if compose_mode == EditMode::Insert {
-                "── compose (insert) ──"
-            } else {
-                "── compose ──"
-            };
-
             let separator = div()
-                .px_4()
-                .py(px(2.0))
-                .text_color(sep_color)
-                .text_size(px(11.0))
-                .font_family(compose_code_font.clone())
-                .child(SharedString::from(sep_label));
+                .w_full()
+                .h(px(1.0))
+                .bg(dim_fg);
 
+            // Cap height at ~8 logical lines, then vertical scroll kicks in.
+            // Wrapped lines may exceed one row visually, so the actual cap
+            // can show fewer logical lines when text wraps — that's fine,
+            // overflow_y_scroll handles it.
             let max_visible_h = 8.0 * 18.0f32;
 
-            let mut compose_inner = div()
-                .w_full()
-                .min_w_0()
-                .px_4()
-                .py(px(4.0))
-                .bg(compose_bg)
-                .font_family(compose_code_font.clone())
-                .text_size(px(13.0))
-                .text_color(rgb(DEFAULT_FG));
-
-            for (i, line_text) in compose_lines.iter().enumerate() {
-                let is_cursor_line = i == compose_cursor_line;
-                let line_chars: Vec<char> = line_text.chars().collect();
-                let total_cols = line_chars.len();
-
-                // On the cursor line, apply horizontal scroll. Other lines
-                // start at column 0 (no scroll).
-                let scroll_start = if is_cursor_line { h_scroll } else { 0 };
-
-                // Visible slice of the line.
-                let vis_start = scroll_start.min(total_cols);
-                let vis_text: String = line_chars[vis_start..].iter().collect();
-
-                // Cursor position relative to the visible window.
-                let vis_cursor_col = if is_cursor_line {
-                    compose_cursor_col.saturating_sub(scroll_start)
-                } else {
-                    0
-                };
-
-                // Build the visible line as a single-row element with the
-                // cursor inlined (no flex-wrap needed — the container clips).
-                let line_el = build_chatbox_line(
-                    &vis_text,
-                    is_cursor_line,
-                    vis_cursor_col,
-                    compose_mode,
-                    compose_cursor_color,
-                    compose_sel,
-                    i,
-                    scroll_start,
-                    total_cols,
-                    &compose_code_font,
-                );
-
-                compose_inner = compose_inner.child(line_el);
-            }
-
             let compose_scroll = tb.scroll_handle.clone();
+            // scroll_to_item only sees direct children of the scroll
+            // container, so each logical line is added straight to
+            // `compose_body` (no intermediate wrapper) — that's what keeps
+            // the cursor in view when the user types past the visible area.
             compose_scroll.scroll_to_item(compose_cursor_line);
-            let compose_body = div()
+
+            let mut compose_body = div()
                 .id("compose-scroll")
                 .w_full()
                 .min_w_0()
@@ -9785,7 +12366,35 @@ impl SketchGpuiView {
                 .overflow_y_scroll()
                 .overflow_x_hidden()
                 .track_scroll(&compose_scroll)
-                .child(compose_inner);
+                .px_4()
+                .py(px(8.0))
+                .bg(compose_panel_bg)
+                .border_1()
+                .border_color(dim_fg)
+                .rounded_md()
+                .mx_2()
+                .mb_1()
+                .font_family(compose_code_font.clone())
+                .text_size(px(13.0))
+                .text_color(compose_fg);
+
+            for (i, line_text) in compose_lines.iter().enumerate() {
+                let is_cursor_line = i == compose_cursor_line;
+                let total_chars = line_text.chars().count();
+                let line_el = build_chatbox_line(
+                    line_text,
+                    is_cursor_line,
+                    compose_cursor_col,
+                    compose_mode,
+                    compose_cursor_color,
+                    compose_sel,
+                    i,
+                    total_chars,
+                    &compose_code_font,
+                    compose_fg,
+                );
+                compose_body = compose_body.child(line_el);
+            }
 
             // Top edge: a 1px darker rule creates a subtle
             // visual separation between the scrolling transcript
@@ -10002,15 +12611,53 @@ impl SketchGpuiView {
         }
         let content_area: gpui::AnyElement = col.into_any_element();
 
-        root
+        // Build-loop candidate banner. Sits above the status strip so a
+        // read-only mirror is unmistakable. Amber while the original owner
+        // still holds the sessions; green once it has closed and take-over
+        // will succeed.
+        let candidate_banner = if self.is_candidate {
+            let (bar_bg, text): (Hsla, &'static str) = if self.candidate_promote_ready {
+                (
+                    rgb(0x50fa7b).into(),
+                    "✓ CANDIDATE · original closed — menu → claude → take over (P) to go live",
+                )
+            } else {
+                (
+                    rgb(0xffb86c).into(),
+                    "🔭 CANDIDATE · read-only mirror — close the original window, then menu → claude → take over (P)",
+                )
+            };
+            Some(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .w_full()
+                    .px_4()
+                    .py_1()
+                    .h(px(24.0))
+                    .bg(bar_bg)
+                    .text_color(rgb(0x1e1e2e))
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::new_static(text)),
+            )
+        } else {
+            None
+        };
+
+        let mut root = root
             .key_context("AgentView")
             .on_key_down(cx.listener(Self::handle_claude_key))
             .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(|this, _: &ToggleTasklist, _w, cx| {
@@ -10019,9 +12666,52 @@ impl SketchGpuiView {
             .on_action(cx.listener(|this, _: &ToggleSubagents, _w, cx| {
                 this.toggle_subagents(cx);
             }))
-            .child(header)
-            .child(content_area)
-            .child(footer)
+            .on_action(cx.listener(|this, _: &ToggleAgentInputMode, _w, cx| {
+                this.toggle_agent_input_mode(cx);
+            }))
+            .on_action(cx.listener(Self::stop_agent))
+            .on_action(cx.listener(Self::focus_left))
+            .on_action(cx.listener(Self::focus_right))
+            .on_action(cx.listener(Self::focus_up))
+            .on_action(cx.listener(Self::focus_down))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::toggle_file_browser_rail))
+            .on_action(cx.listener(Self::toggle_outline_rail))
+            .on_action(cx.listener(Self::flip_rail_side));
+        if let Some(banner) = candidate_banner {
+            root = root.child(banner);
+        }
+        let out = match self.agent_status_position {
+            AgentStatusPosition::Top => root
+                .child(header)
+                .child(info_bar)
+                .child(content_area)
+                .child(footer),
+            AgentStatusPosition::Bottom => root
+                .child(header)
+                .child(content_area)
+                .child(info_bar)
+                .child(footer),
+        };
+
+        if let Some(t0) = t_render0 {
+            let total_ms = t0.elapsed().as_secs_f64() * 1e3;
+            let extract_ms = perf_extract_ms.unwrap_or(0.0);
+            let hl_ms = perf_hl_ms.unwrap_or(0.0);
+            // `rest` = the untimed remainder inside render_agent: gutter tags,
+            // block detect/parse, flat_items build, element-tree assembly.
+            // If total is large but extract+hl are small, the cost is here
+            // (or in GPUI layout after we return — not captured).
+            let rest_ms = (total_ms - extract_ms - hl_ms).max(0.0);
+            eprintln!(
+                "[perf] agent-render lines={perf_lines} total={total_ms:.2}ms \
+                 extract={extract_ms:.2}ms hl={hl_ms:.2}ms rest={rest_ms:.2}ms \
+                 recomputed={perf_recomputed} skip={perf_skip} cache={}",
+                if hl_cache_enabled() { "on" } else { "off" },
+            );
+        }
+        out
     }
 
     fn render_browser(
@@ -10034,6 +12724,8 @@ impl SketchGpuiView {
         let selected = b.fb.selected();
         let dir_str = b.fb.current_dir().display().to_string();
 
+        let ov = &self.theme.overlay;
+
         // ---- Header (breadcrumb path) ----
         let header = div()
             .flex()
@@ -10042,8 +12734,8 @@ impl SketchGpuiView {
             .px_4()
             .py_1()
             .h(px(28.0))
-            .bg(rgb(0x282a36))
-            .text_color(rgb(0x8be9fd))
+            .bg(nc(ov.bg))
+            .text_color(nc(ov.accent))
             .font_weight(FontWeight::BOLD)
             .child(format!("▸ {}", dir_str));
 
@@ -10062,7 +12754,7 @@ impl SketchGpuiView {
                 div()
                     .px_4()
                     .py_2()
-                    .text_color(rgb(0x666666))
+                    .text_color(nc(ov.label))
                     .child(SharedString::new_static("  (empty)")),
             );
         } else {
@@ -10071,7 +12763,7 @@ impl SketchGpuiView {
             let visible_rows = 28usize; // approx; height-dependent layout is overkill here
             let scroll = scroll_to_keep_visible(selected, visible_rows, entries.len());
             for (i, entry) in entries.iter().enumerate().skip(scroll).take(visible_rows) {
-                list = list.child(browser_row(entry, i == selected, &self.code_font));
+                list = list.child(browser_row(entry, i == selected, &self.code_font, ov));
             }
         }
 
@@ -10083,8 +12775,8 @@ impl SketchGpuiView {
             .px_4()
             .py_1()
             .h(px(22.0))
-            .bg(rgb(0x191928))
-            .text_color(rgb(0x6272a4))
+            .bg(nc(ov.bg))
+            .text_color(nc(ov.label))
             .text_size(px(11.0))
             .child(format!(
                 "enter:open · -:parent · .:hidden · s:sort({}) · q:close",
@@ -10101,16 +12793,55 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::open_menu))
             .on_action(cx.listener(Self::browser_close))
             .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
             .on_action(cx.listener(Self::close_window))
+            .on_action(cx.listener(Self::focus_left))
+            .on_action(cx.listener(Self::focus_right))
+            .on_action(cx.listener(Self::focus_up))
+            .on_action(cx.listener(Self::focus_down))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::toggle_file_browser_rail))
+            .on_action(cx.listener(Self::toggle_outline_rail))
+            .on_action(cx.listener(Self::flip_rail_side))
             .child(header)
             .child(list)
             .child(hint)
     }
+}
+
+/// Concatenate a `StyledLine`'s span texts into a plain string. Used by the
+/// outline rail to label headings without their styling.
+fn styled_line_plain(line: &StyledLine) -> String {
+    line.spans.iter().map(|s| s.text.as_str()).collect()
+}
+
+/// Parse an ATX heading line (`#{1,6}\s+text`) into `(level, text)`. Returns
+/// `None` for non-heading lines. Cheaper than a full markdown parse for the
+/// Edit-view outline (spec §13).
+fn atx_heading(line: &str) -> Option<(u8, String)> {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &trimmed[hashes..];
+    // Require whitespace after the hashes (ATX requires a space).
+    if !rest.starts_with(' ') && !rest.starts_with('\t') {
+        return None;
+    }
+    let text = rest.trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some((hashes as u8, text))
 }
 
 /// Choose `scroll_offset` so `selected` sits inside `[scroll, scroll+rows)`.
@@ -10129,19 +12860,19 @@ fn scroll_to_keep_visible(selected: usize, rows: usize, total: usize) -> usize {
 }
 
 /// One row in the file-browser list.
-fn browser_row(entry: &BrowserEntry, selected: bool, code_font: &SharedString) -> AnyElement {
+fn browser_row(entry: &BrowserEntry, selected: bool, code_font: &SharedString, ov: &OverlayTheme) -> AnyElement {
     let row_bg = if selected {
-        rgb(0x32334a)
+        nc(ov.selected_bg)
     } else {
-        rgb(0x1e1e2e)
+        nc(ov.bg)
     };
-    let marker_color = rgb(0xbd93f9);
+    let marker_color = nc(ov.key);
     let name_color = if entry.is_dir {
-        rgb(0x8be9fd)
+        nc(ov.accent)
     } else {
-        rgb(0xcccccc)
+        nc(ov.fg)
     };
-    let meta_color = rgb(0x6272a4);
+    let meta_color = nc(ov.label);
 
     let suffix = if entry.is_dir { "/" } else { "" };
     let name_text = format!("{}{}", entry.name, suffix);
@@ -10364,7 +13095,7 @@ fn main() {
                 .display()
                 .to_string();
             let doc = Document::from_text(text, path.clone());
-            let blocks = render_with_wiki(&doc.full_text(), &theme);
+            let blocks = render_with_wiki(&doc.full_text(), &theme, Some(&path));
             println!("sketch-gpui: loaded {} ({} blocks)", canon, blocks.len());
             Some((blocks, canon))
         }
@@ -10417,12 +13148,15 @@ fn main() {
         // application-wide commands.
         app.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-shift-ctrl-r", Restart, None),
             KeyBinding::new("cmd-o", OpenBrowser, None),
             KeyBinding::new("cmd-k", OpenAgent, None),
             // Agent-window sidepane toggles (§32). Scoped to AgentView
             // so Cmd-1/Cmd-2 don't shadow anything in other screens.
             KeyBinding::new("cmd-1", ToggleTasklist, Some("AgentView")),
             KeyBinding::new("cmd-2", ToggleSubagents, Some("AgentView")),
+            KeyBinding::new("ctrl-alt-enter", ToggleAgentInputMode, Some("AgentView")),
+            KeyBinding::new("cmd-.", StopAgent, Some("AgentView")),
             // Workspace-level tab switching — app-global so the strip is
             // reachable from every screen and overlay (per spec Interfaces
             // table; bind also `Ctrl-Tab`/`Ctrl-Shift-Tab` for keyboard-only
@@ -10466,9 +13200,18 @@ fn main() {
             // Copy the view-mode mouse selection. Scoped to SketchView so it
             // doesn't shadow edit-mode yank or other surfaces' copy paths.
             KeyBinding::new("cmd-c", CopyDocSelection, Some("SketchView")),
+            // Copy active selection to system clipboard (all screens).
+            KeyBinding::new("cmd-c", CopySelection, None),
+            // Paste from system clipboard into active editor.
+            KeyBinding::new("cmd-v", PasteFromClipboard, None),
             // Rename the active tab. Global so it works from any screen
             // (and the menu's "rename tab" entry uses the same path).
             KeyBinding::new("cmd-shift-r", RenameTab, None),
+            // Rail toggles (spec-rail.md §1, §10). Global so they work from
+            // any screen and from inside the rail itself.
+            KeyBinding::new("cmd-b", ToggleFileBrowserRail, None),
+            KeyBinding::new("cmd-shift-o", ToggleOutlineRail, None),
+            KeyBinding::new("cmd-shift-b", FlipRailSide, None),
         ]);
 
         // Browser-view bindings.
@@ -10490,6 +13233,22 @@ fn main() {
             KeyBinding::new("space", OpenMenu, Some("BrowserView")),
             KeyBinding::new("q", BrowserClose, Some("BrowserView")),
             KeyBinding::new("escape", BrowserClose, Some("BrowserView")),
+        ]);
+
+        // Rail-view bindings (spec-rail.md §6). Active only while the rail
+        // holds focus (its root attaches `track_focus` inside this context).
+        app.bind_keys([
+            KeyBinding::new("j", RailDown, Some("RailView")),
+            KeyBinding::new("down", RailDown, Some("RailView")),
+            KeyBinding::new("ctrl-n", RailDown, Some("RailView")),
+            KeyBinding::new("k", RailUp, Some("RailView")),
+            KeyBinding::new("up", RailUp, Some("RailView")),
+            KeyBinding::new("ctrl-p", RailUp, Some("RailView")),
+            KeyBinding::new("enter", RailSelect, Some("RailView")),
+            KeyBinding::new("escape", RailClose, Some("RailView")),
+            KeyBinding::new("-", RailParent, Some("RailView")),
+            KeyBinding::new(".", RailToggleHidden, Some("RailView")),
+            KeyBinding::new("s", RailCycleSort, Some("RailView")),
         ]);
 
         // Quit when the last window closes. macOS apps typically stay
@@ -10536,6 +13295,10 @@ fn main() {
                             focus_handle,
                         ),
                     };
+                    // Agent info bar placement from preferences.
+                    if let Some(pos) = prefs.agent_status_position.as_deref() {
+                        view.agent_status_position = AgentStatusPosition::parse(pos);
+                    }
                     // If we were launched with no explicit file arg, try to
                     // restore the saved workspace for this cwd. With an
                     // explicit arg the user wants that file, so the saved
@@ -10552,6 +13315,22 @@ fn main() {
                     if std::env::var("SKETCH_OPEN_CLAUDE").is_ok() {
                         view.open_agent_inner(cx);
                     }
+                    // Set splash deadline AFTER all init (workspace
+                    // restoration, agent attach) so the countdown starts
+                    // from the moment the window is ready to paint.
+                    view.splash_until =
+                        Some(std::time::Instant::now() + Duration::from_millis(1500));
+                    // Auto-dismiss splash after 1.5s.
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1500))
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            this.splash_until = None;
+                            cx.notify();
+                        });
+                    })
+                    .detach();
                     view
                 })
             },
@@ -10928,13 +13707,15 @@ mod tests {
         let expected = [
             "open-browser",
             "buffer-list",
-            "open-claude",
-            "claude-send",
-            "claude-reboot",
-            "claude-mode-cycle",
-            "claude-clear",
+            "claude-new",
+            "claude-list",
+            "claude-close",
+            "claude-rename",
+            "agent-input-toggle",
+            "claude-status-bar",
             "enter-edit",
             "enter-wp",
+            "reload-file",
             "back-to-doc",
             "quit",
         ];
@@ -10960,9 +13741,9 @@ mod tests {
     }
 
     #[test]
-    fn menu_c_o_resolves_to_open_agent() {
-        // `k` opens the claude submenu; `o` then resolves to open-claude.
-        // Regression check that the Label node preceding `k` doesn't shadow
+    fn menu_c_n_resolves_to_claude_new() {
+        // `c` opens the claude submenu; `n` then resolves to claude-new.
+        // Regression check that the Label node preceding `c` doesn't shadow
         // it (process_key must skip Labels).
         let mut state = MenuState::new();
         state.open();
@@ -10970,20 +13751,18 @@ mod tests {
         let after_c = state.process_key(KeyPress::new(Key::Char('c'), KMods::NONE), &menu);
         assert_eq!(after_c, None, "c alone should open the claude submenu");
         assert!(state.is_active(), "submenu open keeps menu state active");
-        let cmd = state.process_key(KeyPress::new(Key::Char('o'), KMods::NONE), &menu);
-        assert_eq!(cmd, Some("open-claude".to_string()));
+        let cmd = state.process_key(KeyPress::new(Key::Char('n'), KMods::NONE), &menu);
+        assert_eq!(cmd, Some("claude-new".to_string()));
     }
 
     #[test]
-    fn menu_c_s_resolves_to_claude_send() {
-        // The reason this submenu exists: `<space> c s` is the muscle-memory
-        // shortcut for "send the current draft to claude".
+    fn menu_c_l_resolves_to_claude_list() {
         let mut state = MenuState::new();
         state.open();
         let menu = gpui_menu();
         state.process_key(KeyPress::new(Key::Char('c'), KMods::NONE), &menu);
-        let cmd = state.process_key(KeyPress::new(Key::Char('s'), KMods::NONE), &menu);
-        assert_eq!(cmd, Some("claude-send".to_string()));
+        let cmd = state.process_key(KeyPress::new(Key::Char('l'), KMods::NONE), &menu);
+        assert_eq!(cmd, Some("claude-list".to_string()));
     }
 
     #[test]
