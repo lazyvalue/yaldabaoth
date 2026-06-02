@@ -304,8 +304,15 @@ impl RailState {
 }
 
 /// One tab in the workspace's tab strip.
+///
+/// User-facing name: **"Workspace"**. The product presents each `Tab` as a
+/// named, swappable desktop (its own split layout, focus, and rail); the
+/// container that owns the list of these is `Workspace<C>` (an unfortunate
+/// internal name collision — a full rename is out of scope, so user-facing
+/// strings say "workspace" while the type stays `Tab`). See
+/// `docs/specs/spec-workspaces-tagging.md` (Phase 1).
 pub struct Tab<C> {
-    /// Monotonic auto-name set at create (e.g. "tab-1"). Survives rename so
+    /// Monotonic auto-name set at create (e.g. "workspace-1"). Survives rename so
     /// the user can clear `display_name` and recover the auto-name.
     pub auto_name: String,
     /// User-set display name. `None` means render `auto_name`.
@@ -680,6 +687,120 @@ impl<C> Workspace<C> {
         }
     }
 
+    /// Detach the focused window from the active tab's layout, returning the
+    /// owned `Window<C>` (content travels with it — no cloning). Used by the
+    /// "move pane to workspace" verb.
+    ///
+    /// Returns `Ok((window, source_now_empty))`:
+    /// - `window` — the relocated leaf, ready to insert elsewhere.
+    /// - `source_now_empty` — true when the focused leaf was the tab's root,
+    ///   so the active tab's layout is left as `Layout::Empty` and the caller
+    ///   should remove the tab (or leave it if it's the only one).
+    ///
+    /// On the non-root case the split is pruned exactly like `close_focused`
+    /// (collapse single-child splits, renormalize, re-focus a sibling).
+    ///
+    /// `Err(())` — no active tab / no focused window.
+    pub fn detach_focused(&mut self) -> Result<(Window<C>, bool), ()> {
+        let tab = self.active_tab_mut().ok_or(())?;
+        let focused = tab.focused;
+        let path = tab.layout.path_to(focused).ok_or(())?;
+
+        if path.is_empty() {
+            // Focused leaf is the root — take it, leave the tab empty.
+            let root = std::mem::take(&mut tab.layout);
+            let Layout::Leaf(window) = root else {
+                // path_to said empty path means root is the target leaf, so
+                // this is unreachable; restore and bail defensively.
+                tab.layout = root;
+                return Err(());
+            };
+            return Ok((window, true));
+        }
+
+        let (parent_path, tail) = path.split_at(path.len() - 1);
+        let leaf_idx = tail[0];
+        let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+        let Layout::Split { children, .. } = parent else {
+            return Err(());
+        };
+        let (_w, removed) = {
+            let entry = children.remove(leaf_idx);
+            (entry.0, entry.1)
+        };
+        let Layout::Leaf(window) = removed else {
+            // The focused path pointed at a Split, not a Leaf — shouldn't
+            // happen for a focused window id.
+            return Err(());
+        };
+
+        // Re-focus a sibling (same successor rule as close_focused).
+        let new_focus = if children.is_empty() {
+            return Err(());
+        } else if leaf_idx > 0 {
+            children[leaf_idx - 1].1.leaf_ids().last().copied()
+        } else {
+            children[0].1.leaf_ids().first().copied()
+        };
+
+        let collapse = children.len() == 1;
+        if collapse {
+            let only_child = std::mem::take(&mut children[0].1);
+            let parent_slot = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
+            *parent_slot = only_child;
+        } else {
+            renormalize(children);
+        }
+
+        if let Some(id) = new_focus {
+            tab.focused = id;
+        }
+        Ok((window, false))
+    }
+
+    /// Append `window` as a new leaf in the tab at `tab_idx`, focusing it
+    /// there. The window keeps its existing `id` (ids are workspace-unique).
+    ///
+    /// Placement mirrors `split_focused`'s root case: if the target layout is
+    /// a single leaf, it is wrapped in a vertical `Split` so the arriving pane
+    /// sits beside it; if it is already a `Split`, the leaf is appended as a
+    /// new child and weights renormalize; an `Empty` target (a tab whose sole
+    /// pane was just moved away) simply adopts the leaf as its root.
+    ///
+    /// Returns `Err(())` if `tab_idx` is out of range.
+    pub fn insert_leaf_into_tab(
+        &mut self,
+        tab_idx: usize,
+        window: Window<C>,
+    ) -> Result<(), ()> {
+        let id = window.id;
+        let tab = self.tabs.get_mut(tab_idx).ok_or(())?;
+        let root = std::mem::take(&mut tab.layout);
+        tab.layout = match root {
+            Layout::Empty => Layout::Leaf(window),
+            Layout::Leaf(existing) => Layout::Split {
+                dir: SplitDir::V,
+                children: vec![
+                    (0.5, Layout::Leaf(existing)),
+                    (0.5, Layout::Leaf(window)),
+                ],
+            },
+            Layout::Split { dir, mut children } => {
+                let avg = if children.is_empty() {
+                    1.0
+                } else {
+                    children.iter().map(|(w, _)| *w).sum::<f32>()
+                        / children.len() as f32
+                };
+                children.push((avg, Layout::Leaf(window)));
+                renormalize(&mut children);
+                Layout::Split { dir, children }
+            }
+        };
+        tab.focused = id;
+        Ok(())
+    }
+
     /// Close every window in the active tab except the focused one. The
     /// focused leaf becomes the tab's root. Returns `Err(())` if there is no
     /// focused window.
@@ -862,9 +983,10 @@ impl<C> Default for Workspace<C> {
     }
 }
 
-/// Helper for new tab auto-naming.
+/// Helper for new workspace auto-naming. User-facing default label for a
+/// freshly-created workspace (today's `Tab`) when the user hasn't renamed it.
 pub fn auto_tab_name(idx: usize) -> String {
-    format!("tab-{idx}")
+    format!("workspace-{idx}")
 }
 
 #[cfg(test)]
@@ -1238,5 +1360,103 @@ mod tests {
             "clean buffer with refcount 0 should be dropped"
         );
         assert!(ws.path_index.is_empty());
+    }
+
+    // --- Relocate (move pane to workspace) ---------------------------------
+
+    #[test]
+    fn detach_focused_root_leaves_tab_empty() {
+        let mut ws = ws_with_layout(leaf(1, "a"), 1);
+        let (window, empty) = ws.detach_focused().unwrap();
+        assert_eq!(window.id, 1);
+        assert_eq!(window.content.0, "a");
+        assert!(empty, "detaching the root leaf empties the tab");
+        assert!(matches!(ws.tabs[0].layout, Layout::Empty));
+    }
+
+    #[test]
+    fn detach_focused_in_split_prunes_and_refocuses() {
+        // [a | b]  → detach focused (b) → root collapses to Leaf(a), focus → a.
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![(0.5, leaf(1, "a")), (0.5, leaf(2, "b"))],
+        };
+        let mut ws = ws_with_layout(layout, 2);
+        let (window, empty) = ws.detach_focused().unwrap();
+        assert_eq!(window.id, 2);
+        assert!(!empty, "tab still has the sibling");
+        match &ws.tabs[0].layout {
+            Layout::Leaf(w) => assert_eq!(w.id, 1),
+            _ => panic!("expected collapsed Leaf(1)"),
+        }
+        assert_eq!(ws.tabs[0].focused, 1);
+    }
+
+    #[test]
+    fn insert_leaf_into_empty_tab_adopts_root() {
+        let mut ws = ws_with_layout(leaf(1, "a"), 1);
+        // Give it a second, empty tab.
+        ws.tabs.push(Tab {
+            auto_name: "workspace-2".into(),
+            display_name: None,
+            layout: Layout::Empty,
+            focused: 0,
+            rail: None,
+        });
+        let w = Window { id: 9, content: TestContent("moved") };
+        ws.insert_leaf_into_tab(1, w).unwrap();
+        match &ws.tabs[1].layout {
+            Layout::Leaf(w) => assert_eq!(w.id, 9),
+            _ => panic!("empty tab should adopt the leaf as root"),
+        }
+        assert_eq!(ws.tabs[1].focused, 9);
+    }
+
+    #[test]
+    fn insert_leaf_into_leaf_tab_wraps_in_split() {
+        let mut ws = ws_with_layout(leaf(1, "a"), 1);
+        ws.tabs.push(Tab {
+            auto_name: "workspace-2".into(),
+            display_name: None,
+            layout: leaf(5, "x"),
+            focused: 5,
+            rail: None,
+        });
+        let w = Window { id: 9, content: TestContent("moved") };
+        ws.insert_leaf_into_tab(1, w).unwrap();
+        match &ws.tabs[1].layout {
+            Layout::Split { children, .. } => {
+                assert_eq!(children.len(), 2);
+                assert_eq!(children[0].1.leaf_ids(), vec![5]);
+                assert_eq!(children[1].1.leaf_ids(), vec![9]);
+            }
+            _ => panic!("expected a 2-child split"),
+        }
+        assert_eq!(ws.tabs[1].focused, 9);
+    }
+
+    #[test]
+    fn move_focused_leaf_across_tabs_roundtrip() {
+        // Source tab [a | b]; move focused b to a second (empty) tab.
+        let layout = Layout::Split {
+            dir: SplitDir::V,
+            children: vec![(0.5, leaf(1, "a")), (0.5, leaf(2, "b"))],
+        };
+        let mut ws = ws_with_layout(layout, 2);
+        ws.tabs.push(Tab {
+            auto_name: "workspace-2".into(),
+            display_name: None,
+            layout: Layout::Empty,
+            focused: 0,
+            rail: None,
+        });
+        let (window, empty) = ws.detach_focused().unwrap();
+        assert!(!empty);
+        ws.insert_leaf_into_tab(1, window).unwrap();
+        // Source collapsed to a.
+        assert_eq!(ws.tabs[0].layout.leaf_ids(), vec![1]);
+        // Target now holds the moved leaf.
+        assert_eq!(ws.tabs[1].layout.leaf_ids(), vec![2]);
+        assert_eq!(ws.tabs[1].focused, 2);
     }
 }

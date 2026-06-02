@@ -165,6 +165,15 @@ actions!(
         PrevTab,
         NewTab,
         CloseTab,
+        // Move the focused pane to another workspace (Ctrl-W m). Opens the
+        // workspace picker; selecting a target relocates the focused leaf
+        // (content travels with it). See spec-workspaces-tagging.md Phase 1.
+        MovePane,
+        // Also-show the focused (file-backed) pane in another workspace
+        // (Ctrl-W M / shift). Opens the same picker; selecting a target
+        // creates a second view onto the same file there, leaving the
+        // original in place. Agent/Browser panes are single-home (rejected).
+        AlsoShowPane,
         // Splits (Ctrl-W chord prefix per spec-tabs-and-splits.md §12)
         SplitH,
         SplitV,
@@ -4189,6 +4198,31 @@ struct SessionSwitcher {
     selected: usize,
 }
 
+/// What the workspace picker will do with the chosen target. Drives the
+/// header copy and the commit branch so one picker overlay serves both
+/// "move pane" (Ctrl-W m) and "also-show pane" (Ctrl-W M).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkspacePickerMode {
+    /// Relocate the focused leaf into the target workspace (content travels;
+    /// works for every pane kind). Spec-workspaces-tagging.md Phase 1.
+    Move,
+    /// Open a second view onto the focused file-backed pane's file in the
+    /// target workspace (file-backed panes only). The original stays put.
+    AlsoShow,
+}
+
+/// Picker overlay for "move pane to workspace" / "also-show pane in
+/// workspace". Lists existing workspaces by display label, plus a trailing
+/// "+ new workspace" entry that creates an empty workspace as the target.
+/// The currently-active workspace is shown but selecting it is a no-op
+/// (you can't move a pane to where it already lives).
+struct WorkspacePicker {
+    mode: WorkspacePickerMode,
+    /// Index into the entry list: `0..tabs.len()` are existing workspaces,
+    /// `tabs.len()` is the "+ new workspace" entry.
+    selected: usize,
+}
+
 /// Single-line input overlay used by both Claude-session rename and
 /// tab rename. Pre-filled with the current label; Enter commits, Esc
 /// cancels, empty input cancels.
@@ -4268,7 +4302,7 @@ fn gpui_menu() -> Vec<MenuNode> {
         MenuNode::separator(),
         MenuNode::submenu(
             "W",
-            "window (splits/tabs)",
+            "window (splits/workspaces)",
             vec![
                 MenuNode::label("Split"),
                 MenuNode::entry("s", "split horizontal (Ctrl-W s)", "split-h"),
@@ -4289,12 +4323,14 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("+", "grow (Ctrl-W +)", "resize-grow"),
                 MenuNode::entry("=", "equalize (Ctrl-W =)", "equalize"),
                 MenuNode::separator(),
-                MenuNode::label("Tabs"),
-                MenuNode::entry("t", "new tab (Cmd-T)", "new-tab"),
-                MenuNode::entry("x", "close tab (Cmd-Shift-W)", "close-tab"),
-                MenuNode::entry("]", "next tab (Ctrl-Tab)", "next-tab"),
-                MenuNode::entry("[", "prev tab (Ctrl-Shift-Tab)", "prev-tab"),
-                MenuNode::entry("r", "rename tab (Cmd-Shift-R)", "rename-tab"),
+                MenuNode::label("Workspaces"),
+                MenuNode::entry("t", "new workspace (Cmd-T)", "new-tab"),
+                MenuNode::entry("x", "close workspace (Cmd-Shift-W)", "close-tab"),
+                MenuNode::entry("]", "next workspace (Ctrl-Tab)", "next-tab"),
+                MenuNode::entry("[", "prev workspace (Ctrl-Shift-Tab)", "prev-tab"),
+                MenuNode::entry("r", "rename workspace (Cmd-Shift-R)", "rename-tab"),
+                MenuNode::entry("m", "move pane to workspace (Ctrl-W m)", "move-pane"),
+                MenuNode::entry("M", "also-show pane in workspace (Ctrl-W M)", "also-show-pane"),
             ],
         ),
         MenuNode::separator(),
@@ -4323,6 +4359,12 @@ struct SketchGpuiView {
     buffer_switcher: Option<BufferSwitcher>,
     /// Claude session picker overlay — open while `Some`.
     session_switcher: Option<SessionSwitcher>,
+    /// Workspace picker overlay for move/also-show pane — open while `Some`.
+    workspace_picker: Option<WorkspacePicker>,
+    /// One-shot footer message (e.g. "Only documents can be shown in multiple
+    /// workspaces (yet)"). Rendered as a small toast in the bottom-right;
+    /// cleared on the next overlay dismissal. Display-only.
+    transient_status: Option<SharedString>,
     /// Single-line rename input overlay for the active claude session.
     /// `Some` while the input box is open; cleared on Enter (commit) or
     /// Esc (cancel).
@@ -4391,6 +4433,8 @@ impl SketchGpuiView {
             menu: None,
             buffer_switcher: None,
             session_switcher: None,
+            workspace_picker: None,
+            transient_status: None,
             rename_overlay: None,
             workspace: workspace::Workspace::with_initial(initial),
             doc_selection: None,
@@ -4416,6 +4460,8 @@ impl SketchGpuiView {
             menu: None,
             buffer_switcher: None,
             session_switcher: None,
+            workspace_picker: None,
+            transient_status: None,
             rename_overlay: None,
             workspace: workspace::Workspace::with_initial(initial),
             doc_selection: None,
@@ -5352,6 +5398,16 @@ impl SketchGpuiView {
 
     fn rename_tab(&mut self, _: &RenameTab, _w: &mut Window, cx: &mut Context<Self>) {
         self.open_rename_active_tab_overlay(cx);
+    }
+
+    /// `Ctrl-W m` — open the workspace picker to MOVE the focused pane.
+    fn move_pane(&mut self, _: &MovePane, _w: &mut Window, cx: &mut Context<Self>) {
+        self.open_workspace_picker(WorkspacePickerMode::Move, cx);
+    }
+
+    /// `Ctrl-W M` — open the workspace picker to ALSO-SHOW the focused pane.
+    fn also_show_pane(&mut self, _: &AlsoShowPane, _w: &mut Window, cx: &mut Context<Self>) {
+        self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx);
     }
 
     /// `Ctrl-W s` — horizontal split: new pane below the focused one.
@@ -6387,6 +6443,8 @@ impl SketchGpuiView {
         if self.menu.is_some() {
             return;
         }
+        // Opening the menu dismisses any lingering toast.
+        self.transient_status = None;
         let mut state = MenuState::new();
         state.open();
         self.menu = Some(MenuOverlay {
@@ -6605,6 +6663,8 @@ impl SketchGpuiView {
                     cx.notify();
                 }
             }
+            "move-pane" => self.open_workspace_picker(WorkspacePickerMode::Move, cx),
+            "also-show-pane" => self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx),
             "quit" | "force-quit" => cx.quit(),
             _ => {
                 // Unknown command — keep the menu closed but no-op so the
@@ -6630,6 +6690,259 @@ impl SketchGpuiView {
 
     fn close_buffer_switcher(&mut self) {
         self.buffer_switcher = None;
+    }
+
+    // ---- Workspace picker (move / also-show pane) -------------------------
+
+    /// Count how many distinct **workspaces** show a view of `label` (the
+    /// file path backing a Doc/Edit pane). This is the live equivalent of
+    /// "how many workspaces reference this `FileBufferId`" — the buffer pool
+    /// isn't wired into the live content model, so membership is derived from
+    /// the layout trees by file label (spec-workspaces-tagging.md C-derived).
+    ///
+    /// Counts a workspace once even if it holds several views of the same
+    /// file, so the multi-home dot means "also lives in another desktop",
+    /// not "appears N times here".
+    fn workspaces_showing_file(&self, label: &str) -> usize {
+        self.workspace
+            .tabs
+            .iter()
+            .filter(|tab| {
+                let mut found = false;
+                tab.layout.for_each_leaf(&mut |w| {
+                    if let Some(l) = screen_file_label(&w.content) {
+                        if l.as_ref() == label {
+                            found = true;
+                        }
+                    }
+                });
+                found
+            })
+            .count()
+    }
+
+    /// A small accent dot element when `label` is shown in more than one
+    /// workspace (multi-home indicator), else an empty placeholder.
+    fn multi_home_dot(&self, label: &str) -> gpui::Div {
+        if self.workspaces_showing_file(label) > 1 {
+            let accent: Hsla = nc(self.theme.overlay.accent);
+            div()
+                .ml_2()
+                .text_color(accent)
+                .child(SharedString::new_static("\u{25cf}"))
+        } else {
+            div()
+        }
+    }
+
+    /// True when the focused pane is file-backed (Doc or Edit) and so can be
+    /// "also-shown" in another workspace (Agent/Browser are single-home).
+    fn focused_is_file_backed(&self) -> bool {
+        matches!(
+            self.workspace.focused_content(),
+            Some(WindowContent::Doc(_)) | Some(WindowContent::Edit(_))
+        )
+    }
+
+    /// Open the workspace picker overlay. For `AlsoShow`, reject non-file
+    /// panes up front with a footer message (the picker never opens).
+    fn open_workspace_picker(
+        &mut self,
+        mode: WorkspacePickerMode,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_picker.is_some() {
+            return;
+        }
+        // A fresh picker attempt clears any prior toast.
+        self.transient_status = None;
+        if self.workspace.focused_window_id().is_none() {
+            return;
+        }
+        if mode == WorkspacePickerMode::AlsoShow && !self.focused_is_file_backed() {
+            self.transient_status =
+                Some("Only documents can be shown in multiple workspaces (yet)".into());
+            cx.notify();
+            return;
+        }
+        // Pre-select the first workspace that isn't the active one (you can't
+        // move/also-show into the workspace the pane already lives in); fall
+        // back to the "+ new workspace" entry when there's only one.
+        let active = self.workspace.active_tab;
+        let selected = (0..self.workspace.tabs.len())
+            .find(|&i| i != active)
+            .unwrap_or(self.workspace.tabs.len());
+        self.workspace_picker = Some(WorkspacePicker { mode, selected });
+        cx.notify();
+    }
+
+    fn close_workspace_picker(&mut self) {
+        self.workspace_picker = None;
+    }
+
+    /// Number of selectable entries in the picker: every workspace plus the
+    /// trailing "+ new workspace" entry.
+    fn workspace_picker_entry_count(&self) -> usize {
+        self.workspace.tabs.len() + 1
+    }
+
+    fn handle_workspace_picker_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        let count = self.workspace_picker_entry_count();
+        let selected = match &self.workspace_picker {
+            Some(p) => p.selected,
+            None => return,
+        };
+        match press.key {
+            Key::Esc | Key::Char('q') => {
+                self.close_workspace_picker();
+            }
+            Key::Char('j') | Key::Down => {
+                if let Some(p) = &mut self.workspace_picker {
+                    if count > 0 {
+                        p.selected = (p.selected + 1) % count;
+                    }
+                }
+            }
+            Key::Char('k') | Key::Up => {
+                if let Some(p) = &mut self.workspace_picker {
+                    if count > 0 {
+                        p.selected = if p.selected == 0 { count - 1 } else { p.selected - 1 };
+                    }
+                }
+            }
+            Key::Char('g') => {
+                if let Some(p) = &mut self.workspace_picker {
+                    p.selected = 0;
+                }
+            }
+            Key::Char('G') => {
+                if let Some(p) = &mut self.workspace_picker {
+                    if count > 0 {
+                        p.selected = count - 1;
+                    }
+                }
+            }
+            Key::Enter | Key::Char('l') => {
+                self.commit_workspace_picker(selected, cx);
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Apply the picker selection. `entry` is the chosen index into the entry
+    /// list (`tabs.len()` means "+ new workspace").
+    fn commit_workspace_picker(&mut self, entry: usize, cx: &mut Context<Self>) {
+        let mode = match &self.workspace_picker {
+            Some(p) => p.mode,
+            None => return,
+        };
+        let n_tabs = self.workspace.tabs.len();
+        let active = self.workspace.active_tab;
+
+        // Resolve the target tab index, creating a new workspace if "+ new"
+        // was chosen. A new workspace starts Empty; the relocated/also-shown
+        // leaf becomes its first pane.
+        let make_new = entry >= n_tabs;
+        let target = if make_new {
+            self.push_empty_workspace();
+            self.workspace.tabs.len() - 1
+        } else {
+            entry
+        };
+
+        // Selecting the active workspace is a no-op (the pane is already here).
+        if !make_new && target == active {
+            self.close_workspace_picker();
+            cx.notify();
+            return;
+        }
+
+        match mode {
+            WorkspacePickerMode::Move => {
+                self.move_focused_to_workspace(target);
+            }
+            WorkspacePickerMode::AlsoShow => {
+                self.also_show_focused_in_workspace(target);
+            }
+        }
+        self.close_workspace_picker();
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    /// Append a new empty workspace (today's `Tab`) with an auto-name and an
+    /// `Empty` layout. Does NOT change the active workspace — the caller picks
+    /// what to do next (relocate a leaf into it, etc.).
+    fn push_empty_workspace(&mut self) {
+        let name = workspace::auto_tab_name(self.workspace.next_tab_index);
+        self.workspace.next_tab_index += 1;
+        self.workspace.tabs.push(workspace::Tab {
+            auto_name: name,
+            display_name: None,
+            layout: workspace::Layout::Empty,
+            focused: 0,
+            rail: None,
+        });
+    }
+
+    /// MOVE: relocate the focused leaf out of the active workspace into
+    /// `target`. If the source workspace is left empty, remove it (unless it's
+    /// the only workspace, which we leave empty). Focus follows the pane to
+    /// the target workspace.
+    fn move_focused_to_workspace(&mut self, target: usize) {
+        let (window, source_empty) = match self.workspace.detach_focused() {
+            Ok(v) => v,
+            Err(()) => return,
+        };
+        // `detach_focused` may shift nothing, but if it removed the active
+        // tab's only pane the target index could still be valid (target was
+        // resolved before detach and detach never removes tabs). Insert first,
+        // then prune the empty source so indices stay stable during insert.
+        let _ = self.workspace.insert_leaf_into_tab(target, window);
+
+        let source = self.workspace.active_tab;
+        if source_empty {
+            if self.workspace.tabs.len() > 1 {
+                // Removing the source shifts indices; recompute the target's
+                // position so we can land focus there.
+                let target_after = if target > source { target - 1 } else { target };
+                self.workspace.close_tab(source);
+                self.workspace.active_tab = target_after.min(self.workspace.tabs.len() - 1);
+            } else {
+                // Only workspace: leave it empty and stay on it (matches the
+                // existing single-tab close behavior — we don't quit here).
+                self.workspace.active_tab = target.min(self.workspace.tabs.len() - 1);
+            }
+        } else {
+            // Source still has panes; follow the moved pane to the target.
+            self.workspace.active_tab = target.min(self.workspace.tabs.len() - 1);
+        }
+    }
+
+    /// ALSO-SHOW: open a second view onto the focused file-backed pane's file
+    /// in `target`, leaving the original in place. The new view reads the
+    /// file from disk (independent cursor/scroll), mirroring how splits clone
+    /// a file pane today. Switches to the target workspace so the user sees
+    /// the new view.
+    fn also_show_focused_in_workspace(&mut self, target: usize) {
+        if !self.focused_is_file_backed() {
+            self.transient_status =
+                Some("Only documents can be shown in multiple workspaces (yet)".into());
+            return;
+        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let content = self.clone_focused_for_split(&cwd);
+        let id = self.workspace.alloc_window_id();
+        let window = workspace::Window { id, content };
+        let _ = self.workspace.insert_leaf_into_tab(target, window);
+        self.workspace.active_tab = target.min(self.workspace.tabs.len() - 1);
     }
 
     // ---- Session switcher overlay -----------------------------------------
@@ -6883,6 +7196,134 @@ impl SketchGpuiView {
 
         div()
             .id("session-switcher")
+            .absolute()
+            .top(px(34.0))
+            .left(px(40.0))
+            .right(px(40.0))
+            .max_h(px(400.0))
+            .bg(menu_bg)
+            .border_1()
+            .border_color(popup_border)
+            .rounded_md()
+            .shadow_lg()
+            .overflow_y_scroll()
+            .child(header_row)
+            .child(entries_col)
+            .child(hints_row)
+    }
+
+    fn render_workspace_picker(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let picker = match &self.workspace_picker {
+            Some(p) => p,
+            None => unreachable!(),
+        };
+
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let label_fg: Hsla = nc(ov.label);
+        let active_fg: Hsla = nc(ov.accent);
+        let selected_bg: Hsla = nc(ov.selected_bg);
+        let normal_fg: Hsla = nc(ov.fg);
+        let popup_border: Hsla = nc(ov.border);
+
+        let verb = match picker.mode {
+            WorkspacePickerMode::Move => "MOVE PANE TO WORKSPACE",
+            WorkspacePickerMode::AlsoShow => "ALSO-SHOW PANE IN WORKSPACE",
+        };
+        let header_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_4()
+            .py_1()
+            .h(px(28.0))
+            .text_color(label_fg)
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::from(verb.to_string()));
+
+        let mut entries_col = div()
+            .flex()
+            .flex_col()
+            .px_4()
+            .py_2()
+            .text_size(px(14.0))
+            .font_family(self.code_font.clone());
+
+        let active = self.workspace.active_tab;
+        let n_tabs = self.workspace.tabs.len();
+        for (i, tab) in self.workspace.tabs.iter().enumerate() {
+            let is_selected = i == picker.selected;
+            let is_active = i == active;
+            let marker = if is_selected { "\u{25b8} " } else { "  " };
+            let here = if is_active { " (here)" } else { "" };
+            let label_text = format!("{}{}", tab_strip_label(tab), here);
+            let name_color = if is_active { label_fg } else { normal_fg };
+
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_2()
+                .py_0p5();
+            if is_selected {
+                row = row.bg(selected_bg);
+            }
+            row = row
+                .child(
+                    div()
+                        .text_color(label_fg)
+                        .child(SharedString::from(marker.to_string())),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_color(name_color)
+                        .child(SharedString::from(label_text)),
+                );
+            entries_col = entries_col.child(row);
+        }
+
+        // "+ new workspace" entry.
+        {
+            let is_selected = picker.selected == n_tabs;
+            let marker = if is_selected { "\u{25b8} " } else { "  " };
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_2()
+                .py_0p5();
+            if is_selected {
+                row = row.bg(selected_bg);
+            }
+            row = row
+                .child(
+                    div()
+                        .text_color(label_fg)
+                        .child(SharedString::from(marker.to_string())),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_color(active_fg)
+                        .child(SharedString::new_static("+ new workspace")),
+                );
+            entries_col = entries_col.child(row);
+        }
+
+        let hints_row = div()
+            .px_4()
+            .py_1()
+            .text_size(px(11.0))
+            .text_color(label_fg)
+            .child("j/k move · enter select · q/esc cancel");
+
+        div()
+            .id("workspace-picker")
             .absolute()
             .top(px(34.0))
             .left(px(40.0))
@@ -7595,6 +8036,8 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::move_pane))
+            .on_action(cx.listener(Self::also_show_pane))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side));
@@ -8003,7 +8446,7 @@ impl SketchGpuiView {
 
         let header_label = match o.target {
             RenameTarget::AgentSlot { .. } => "RENAME SESSION",
-            RenameTarget::Tab { .. } => "RENAME TAB",
+            RenameTarget::Tab { .. } => "RENAME WORKSPACE",
             RenameTarget::AgentNewSessionCwd => "NEW SESSION AT…",
             RenameTarget::AgentChangeCwd { .. } => "CHANGE SESSION CWD",
         };
@@ -10500,6 +10943,7 @@ impl Render for SketchGpuiView {
         let has_overlay = self.menu.is_some()
             || self.buffer_switcher.is_some()
             || self.session_switcher.is_some()
+            || self.workspace_picker.is_some()
             || self.rename_overlay.is_some();
 
         // Build the screen content. When an overlay is OPEN, focus moves up
@@ -10545,6 +10989,39 @@ impl Render for SketchGpuiView {
         // suppresses it for the most common case (one-tab session) while
         // tab-creation commands are still landing.
         let screen_view = self.wrap_with_tab_strip(screen_view, cx);
+
+        // Overlay a one-shot transient status toast (e.g. an also-show
+        // rejection for a non-file pane) in the bottom-right.
+        let screen_view = if let Some(msg) = self.transient_status.clone() {
+            let ov = &self.theme.overlay;
+            let toast_bg: Hsla = nc(ov.bg);
+            let toast_fg: Hsla = nc(ov.fg);
+            let toast_border: Hsla = nc(ov.border);
+            div()
+                .size_full()
+                .relative()
+                .child(screen_view)
+                .child(
+                    div()
+                        .absolute()
+                        .bottom(px(16.0))
+                        .right(px(16.0))
+                        .max_w(px(360.0))
+                        .px_3()
+                        .py_2()
+                        .bg(toast_bg)
+                        .text_color(toast_fg)
+                        .text_size(px(12.0))
+                        .border_1()
+                        .border_color(toast_border)
+                        .rounded_md()
+                        .shadow_lg()
+                        .child(msg),
+                )
+                .into_any_element()
+        } else {
+            screen_view
+        };
 
         if !has_overlay {
             return screen_view;
@@ -10604,6 +11081,22 @@ impl Render for SketchGpuiView {
                 }))
                 .child(screen_view)
                 .child(self.render_session_switcher(cx))
+                .into_any_element();
+        }
+
+        // Workspace picker (move / also-show pane).
+        if self.workspace_picker.is_some() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("WorkspacePickerView")
+                .size_full()
+                .bg(editor_bg)
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_workspace_picker_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_workspace_picker(cx))
                 .into_any_element();
         }
 
@@ -10708,7 +11201,8 @@ impl SketchGpuiView {
             .bg(bg_or(top, STATUS_BG))
             .text_color(fg_or(top, STATUS_FG))
             .font_weight(FontWeight::BOLD)
-            .child(format!("sketch-gpui — {}", d.file_label));
+            .child(format!("sketch-gpui — {}", d.file_label))
+            .child(self.multi_home_dot(d.file_label.as_ref()));
 
         let footer = div()
             .flex()
@@ -10772,6 +11266,8 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::move_pane))
+            .on_action(cx.listener(Self::also_show_pane))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
@@ -10820,7 +11316,8 @@ impl SketchGpuiView {
             .bg(bg_or(top, STATUS_BG))
             .text_color(fg_or(top, STATUS_FG))
             .font_weight(FontWeight::BOLD)
-            .child(format!("sketch-gpui [{}] — {}", header_view_label, e.file_label));
+            .child(format!("sketch-gpui [{}] — {}", header_view_label, e.file_label))
+            .child(self.multi_home_dot(e.file_label.as_ref()));
 
         let dirty_mark = if e.editor.document().is_modified() { "•" } else { " " };
         let extend_mark = if e.editor.extend_mode() { " EXT" } else { "" };
@@ -10885,6 +11382,8 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::move_pane))
+            .on_action(cx.listener(Self::also_show_pane))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
@@ -12659,6 +13158,8 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::move_pane))
+            .on_action(cx.listener(Self::also_show_pane))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(|this, _: &ToggleTasklist, _w, cx| {
                 this.toggle_tasklist(cx);
@@ -12801,6 +13302,8 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::move_pane))
+            .on_action(cx.listener(Self::also_show_pane))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
@@ -13177,6 +13680,11 @@ fn main() {
             // than quit, per the "no surprise quits" rule).
             KeyBinding::new("cmd-w", CloseWindow, None),
             KeyBinding::new("ctrl-w o", OnlyWindow, None),
+            // Move / also-show the focused pane in another workspace
+            // (spec-workspaces-tagging.md Phase 1). `m` moves (pane leaves
+            // here), `M` (shift) also-shows a second view of a file pane.
+            KeyBinding::new("ctrl-w m", MovePane, None),
+            KeyBinding::new("ctrl-w shift-m", AlsoShowPane, None),
             // Vim-style focus motion across split panes.
             KeyBinding::new("ctrl-w h", FocusLeft, None),
             KeyBinding::new("ctrl-w l", FocusRight, None),
