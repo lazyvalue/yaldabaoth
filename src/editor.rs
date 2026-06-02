@@ -47,21 +47,30 @@ impl LineAnchorStore {
         if inserted_nl == 0 {
             return;
         }
-        let mut new_by_anchor: BTreeMap<LineAnchor, usize> = BTreeMap::new();
-        let mut new_by_line: BTreeMap<usize, LineAnchor> = BTreeMap::new();
-        for (&a, &line) in self.by_anchor.iter() {
-            let new_line = if line < eff_line {
-                line
-            } else if line == eff_line {
-                if eff_col == 0 { line + inserted_nl } else { line }
-            } else {
-                line + inserted_nl
-            };
-            new_by_anchor.insert(a, new_line);
-            new_by_line.insert(new_line, a);
+        // Perf: shift only the affected suffix in place instead of cloning both
+        // maps every chunk. An insert with N newlines at `eff_line` moves every
+        // anchor at-or-below the insertion point down by `inserted_nl`; lines
+        // strictly above are untouched. For the common streaming case (append at
+        // EOF) the affected suffix is empty/tiny, so this is ~O(1) rather than
+        // O(total anchors). This turns O(A^2) streaming into O(A).
+        //
+        // The first line shifts only when the insert is at column 0 (a pure
+        // line break before it); a mid-line insert keeps `eff_line` in place.
+        let first_shifted = if eff_col == 0 { eff_line } else { eff_line + 1 };
+
+        // Collect the affected tail keys, remove them, and re-insert shifted.
+        // Iterating descending avoids transient key collisions in by_line.
+        let affected: Vec<usize> = self
+            .by_line
+            .range(first_shifted..)
+            .map(|(&line, _)| line)
+            .collect();
+        for line in affected.into_iter().rev() {
+            let a = self.by_line.remove(&line).expect("line present");
+            let new_line = line + inserted_nl;
+            self.by_line.insert(new_line, a);
+            self.by_anchor.insert(a, new_line);
         }
-        self.by_anchor = new_by_anchor;
-        self.by_line = new_by_line;
     }
 
     /// Shift anchors for a delete that started at `(start_line, start_col)`
@@ -186,6 +195,14 @@ pub struct EditorCore {
     /// Typed sparse map from `LineAnchor` to per-type payloads (§E2). The
     /// Worksheet gutter reads `TurnId` via this store keyed by line anchors.
     line_metadata: LineMetadataStore,
+    /// Perf: cached tail line of the in-progress LLM turn, so `append_llm_chunk`
+    /// doesn't reverse-scan the entire anchor store per streamed chunk
+    /// (`last_line_with_meta` is O(distance from EOF to the LLM tail), unbounded
+    /// as trailing user/tool lines accumulate). Updated when a chunk is
+    /// appended, shifted in lock-step by the insert/delete paths, and reset on
+    /// turn finalize / anchor reset. Treated as a hint: the caller re-validates
+    /// the tag before trusting it and falls back to the full scan on a miss.
+    last_llm_line: Option<usize>,
 }
 
 /// Per-window cursor, selection, and insert-mode state attached to an
@@ -229,6 +246,7 @@ impl EditorCore {
             lockable_through_line: 0,
             line_anchors: LineAnchorStore::default(),
             line_metadata: LineMetadataStore::default(),
+            last_llm_line: None,
         }
     }
 
@@ -385,6 +403,23 @@ impl EditorCore {
     pub fn reset_line_anchors(&mut self) {
         self.line_anchors = LineAnchorStore::default();
         self.line_metadata = LineMetadataStore::default();
+        // Perf cache: the anchors it referenced are gone.
+        self.last_llm_line = None;
+    }
+
+    /// Perf cache accessor: cached tail line of the in-progress LLM turn.
+    fn cached_llm_line(&self) -> Option<usize> {
+        self.last_llm_line
+    }
+
+    /// Perf cache mutator: record the LLM turn's tail line after appending.
+    fn set_cached_llm_line(&mut self, line: usize) {
+        self.last_llm_line = Some(line);
+    }
+
+    /// Perf cache: clear the LLM-tail hint (called on turn finalize).
+    pub fn clear_cached_llm_line(&mut self) {
+        self.last_llm_line = None;
     }
 
     /// True if `line` is in any frozen range.
@@ -501,6 +536,15 @@ impl EditorCore {
 
         self.line_anchors
             .shift_for_insert(eff_line, eff_col, inserted_nl);
+
+        // Perf cache: keep the LLM-tail hint in lock-step with the same shift
+        // applied to the anchor store (lines at-or-below the insert move down).
+        if let Some(ref mut llm) = self.last_llm_line {
+            let first_shifted = if eff_col == 0 { eff_line } else { eff_line + 1 };
+            if *llm >= first_shifted {
+                *llm += inserted_nl;
+            }
+        }
     }
 
     /// Recompute frozen line ranges after deleting `[del_s, del_e)`. Caller
@@ -536,6 +580,19 @@ impl EditorCore {
             .shift_for_delete(start_line, start_col, deleted_nl);
         for a in dropped {
             self.line_metadata.drop_anchor(a);
+        }
+
+        // Perf cache: mirror the delete on the LLM-tail hint. Lines wholly
+        // consumed by the delete invalidate it; lines below shift up. Boundary
+        // semantics match shift_for_delete (start line survives iff start_col>0).
+        if let Some(llm) = self.last_llm_line {
+            let consumed_lo = if start_col == 0 { start_line } else { start_line + 1 };
+            let consumed_hi = start_line + deleted_nl; // inclusive
+            if llm >= consumed_lo && llm <= consumed_hi {
+                self.last_llm_line = None;
+            } else if llm > consumed_hi {
+                self.last_llm_line = Some(llm - deleted_nl);
+            }
         }
     }
 
@@ -1158,6 +1215,12 @@ impl Editor {
         self.core.programmatic_insert(char_idx, text);
     }
 
+    /// Perf cache (finding 2): drop the in-progress LLM-tail hint at turn end so
+    /// the next turn's first chunk doesn't reuse a stale line index.
+    pub fn clear_cached_llm_line(&mut self) {
+        self.core.clear_cached_llm_line();
+    }
+
     pub fn programmatic_delete(&mut self, del_s: usize, del_e: usize) {
         self.core.programmatic_delete(del_s, del_e);
     }
@@ -1224,6 +1287,13 @@ impl Editor {
             let a = self.core.anchor_for_line(l);
             self.core.metadata_mut::<T>().insert(a, turn_tag.clone());
         }
+
+        // Perf cache (finding 2): record this turn's tail line so the next chunk
+        // can find its insertion point in O(1) instead of reverse-scanning the
+        // whole anchor store. The tail is the last line we just tagged.
+        if end_line > start_line {
+            self.core.set_cached_llm_line(end_line - 1);
+        }
     }
 
     fn find_llm_insertion_point<T: Any + Send + Sync + PartialEq>(
@@ -1234,7 +1304,15 @@ impl Editor {
         let total_chars = doc.rope().len_chars();
         let total_lines = doc.line_count();
 
-        let Some(last_llm_line) = self.core.last_line_with_meta::<T>(turn_tag) else {
+        // Perf (finding 2): try the O(1) cached tail first, validating it still
+        // carries this turn's tag (a delete/edit may have invalidated it). On a
+        // miss fall back to the reverse anchor scan.
+        let cached = self
+            .core
+            .cached_llm_line()
+            .filter(|&l| l < total_lines && self.line_tagged_this_turn::<T>(l, turn_tag));
+        let Some(last_llm_line) = cached.or_else(|| self.core.last_line_with_meta::<T>(turn_tag))
+        else {
             return total_chars;
         };
 
@@ -1270,6 +1348,19 @@ impl Editor {
         self.core
             .anchor_for_line_opt(line)
             .and_then(|a| self.core.metadata::<T>().get(a).map(|v| v != turn_tag))
+            .unwrap_or(false)
+    }
+
+    /// True if `line`'s anchor carries a `T` tag equal to `turn_tag`. Used to
+    /// validate the cached LLM-tail hint (finding 2) before trusting it.
+    fn line_tagged_this_turn<T: Any + Send + Sync + PartialEq>(
+        &self,
+        line: usize,
+        turn_tag: &T,
+    ) -> bool {
+        self.core
+            .anchor_for_line_opt(line)
+            .and_then(|a| self.core.metadata::<T>().get(a).map(|v| v == turn_tag))
             .unwrap_or(false)
     }
 

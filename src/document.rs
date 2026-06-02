@@ -92,6 +92,23 @@ impl Document {
         self.rope.to_string()
     }
 
+    /// O(1) tail probe: the last char of the document, or `None` if empty.
+    /// Lets callers test trailing-newline / emptiness without cloning the whole
+    /// rope to a String (`full_text`), which is O(n) in the transcript length.
+    pub fn last_char(&self) -> Option<char> {
+        let len = self.rope.len_chars();
+        if len == 0 {
+            None
+        } else {
+            self.rope.get_char(len - 1)
+        }
+    }
+
+    /// O(1): true if the document holds no characters.
+    pub fn is_empty(&self) -> bool {
+        self.rope.len_chars() == 0
+    }
+
     pub fn is_modified(&self) -> bool {
         self.modified
     }

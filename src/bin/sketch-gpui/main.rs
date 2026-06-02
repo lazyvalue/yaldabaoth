@@ -2880,9 +2880,36 @@ fn truncate_lines(body: &str, max_lines: usize) -> String {
 /// the document, per spec-agent-window.md §E1. The renderer resolves it to
 /// a line index via `editor.line_for_anchor(a)`; a `None` (line consumed)
 /// falls back to EOF rendering.
+/// Perf (finding 4): O(k) equivalent of `doc.full_text().trim_end().ends_with(s)`
+/// where k = chars scanned. Walks back over the rope's trailing whitespace, then
+/// compares only the last `s.chars().count()` chars — never materializing the
+/// whole transcript as a String.
+fn document_trimmed_end_ends_with(doc: &Document, s: &str) -> bool {
+    let want = s.chars().count();
+    if want == 0 {
+        return true;
+    }
+    let rope = doc.rope();
+    let total = rope.len_chars();
+    // Find the index one past the last non-whitespace char (the trim_end point).
+    let mut end = total;
+    while end > 0 {
+        match rope.get_char(end - 1) {
+            Some(c) if c.is_whitespace() => end -= 1,
+            _ => break,
+        }
+    }
+    if want > end {
+        return false;
+    }
+    let tail = rope.slice((end - want)..end);
+    tail.chars().eq(s.chars())
+}
+
 fn anchor_for_new_tool_call(editor: &mut Editor) -> LineAnchor {
-    let doc_text = editor.document().full_text();
-    if !doc_text.is_empty() && !doc_text.ends_with('\n') {
+    // Perf (finding 5): O(1) tail probe instead of cloning the whole transcript
+    // (`full_text`) just to test emptiness + trailing newline per tool call.
+    if !editor.document().is_empty() && editor.document().last_char() != Some('\n') {
         let len = editor.document().rope().len_chars();
         editor.programmatic_insert(len, "\n");
     }
@@ -3570,6 +3597,9 @@ fn finalize_agent_turn(editor: &mut Editor) {
     if needs_newline {
         editor.programmatic_insert(total_len, "\n");
     }
+    // Perf cache (finding 2): the turn is over; invalidate the LLM-tail hint so
+    // the next turn re-anchors from scratch instead of trusting a stale line.
+    editor.clear_cached_llm_line();
 }
 
 // ----------------------------------------------------------------------------
@@ -3896,6 +3926,15 @@ struct AgentState {
     block_cache: std::collections::HashMap<(usize, usize), RenderedBlock>,
     /// Frozen line count when `block_cache` was last populated.
     block_cache_frozen_count: usize,
+    /// Cached per-line transcript text (trimmed + tab-expanded) used by
+    /// `render_agent`. Perf: building this `Vec<String>` allocates a String
+    /// per transcript line on every `cx.notify()` (cursor blink, cross-pane
+    /// wakeups, every streamed chunk), an O(L) cost regardless of how few
+    /// lines changed. Cache it keyed on `edit_seq` so unchanged frames reuse
+    /// the prior vec instead of re-extracting + re-allocating the whole doc.
+    lines_cache: std::rc::Rc<Vec<String>>,
+    /// `edit_seq` the `lines_cache` was built at; `u64::MAX` = never built.
+    lines_cache_seq: u64,
     /// Incremental highlight cache for the transcript. Re-highlights only the
     /// lines that changed between renders instead of the whole buffer every
     /// `cx.notify()`. Bypassed when `SKETCH_HL_CACHE=0`.
@@ -3976,6 +4015,8 @@ impl AgentState {
         self.block_ranges.clear();
         self.block_cache.clear();
         self.block_cache_frozen_count = 0;
+        self.lines_cache = std::rc::Rc::new(Vec::new());
+        self.lines_cache_seq = u64::MAX;
         self.highlight_cache = HighlightCache::new();
         self.current_plan = None;
         self.subagents.clear();
@@ -8200,6 +8241,8 @@ impl SketchGpuiView {
                         block_ranges: Vec::new(),
                         block_cache: std::collections::HashMap::new(),
                         block_cache_frozen_count: 0,
+                        lines_cache: std::rc::Rc::new(Vec::new()),
+                        lines_cache_seq: u64::MAX,
                         highlight_cache: HighlightCache::new(),
                         input_mode: InputMode::Chatbox,
                         chatbox: Some(Chatbox::new()),
@@ -8672,6 +8715,8 @@ impl SketchGpuiView {
             block_ranges: Vec::new(),
             block_cache: std::collections::HashMap::new(),
             block_cache_frozen_count: 0,
+            lines_cache: std::rc::Rc::new(Vec::new()),
+            lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
             input_mode: InputMode::Chatbox,
             chatbox: Some(Chatbox::new()),
@@ -8732,6 +8777,8 @@ impl SketchGpuiView {
                     block_ranges: Vec::new(),
                     block_cache: std::collections::HashMap::new(),
                     block_cache_frozen_count: 0,
+                    lines_cache: std::rc::Rc::new(Vec::new()),
+                    lines_cache_seq: u64::MAX,
                     highlight_cache: HighlightCache::new(),
                     input_mode: InputMode::Chatbox,
                     chatbox: Some(Chatbox::new()),
@@ -8786,6 +8833,8 @@ impl SketchGpuiView {
             block_ranges: Vec::new(),
             block_cache: std::collections::HashMap::new(),
             block_cache_frozen_count: 0,
+            lines_cache: std::rc::Rc::new(Vec::new()),
+            lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
             input_mode: InputMode::Chatbox,
             chatbox: Some(Chatbox::new()),
@@ -8906,6 +8955,12 @@ impl SketchGpuiView {
             let yield_delay = Duration::from_millis(1);
             let anim_period = Duration::from_millis(120);
             let mut last_anim = std::time::Instant::now();
+            // Last thinking-indicator second-fingerprint we repainted for. The
+            // probe still runs every `anim_period` (cheap traversal), but we
+            // only `cx.notify()` — which forces a full O(transcript) re-render —
+            // when the displayed whole-second clock actually changes (~1Hz),
+            // not on every 120ms tick.
+            let mut last_anim_fp: Option<u64> = None;
             let mut more_pending = false;
 
             loop {
@@ -8976,8 +9031,17 @@ impl SketchGpuiView {
                     if last_anim.elapsed() >= anim_period {
                         last_anim = std::time::Instant::now();
                         let _ = this.update(cx, |this, cx| {
-                            if this.any_agent_awaiting() {
+                            // Only repaint when the whole-second indicator clock
+                            // changed; an unchanged fingerprint means the visible
+                            // "Thinking… mm:ss" label is identical, so the full
+                            // transcript rebuild a notify() triggers would be
+                            // wasted (this is the dominant idle-stall cost).
+                            let fp = this.awaiting_anim_fingerprint();
+                            if fp.is_some() && fp != last_anim_fp {
+                                last_anim_fp = fp;
                                 cx.notify();
+                            } else if fp.is_none() {
+                                last_anim_fp = None;
                             }
                         });
                     }
@@ -9162,24 +9226,50 @@ impl SketchGpuiView {
         // just the active tab — otherwise a session living in a background
         // tab silently drops its streamed output.
         let did_work = !batch.is_empty();
-        for note in batch {
+        // Sessions that received at least one ReplyEvent in this batch. The
+        // follow-scroll is hoisted out of the per-event loop and applied once
+        // per affected session below: only the *final* scroll position matters,
+        // and a batch can hold thousands of chunk events (DRAIN_CAP), so doing
+        // the workspace walk + scroll bookkeeping per event was O(events ×
+        // workspace) wasted work during fast streaming.
+        let mut scrolled_sessions: Vec<String> = Vec::new();
+        // Perf: a streaming batch is overwhelmingly a run of ReplyEvent chunks
+        // for the SAME session. Previously each chunk re-walked every tab+pane
+        // to find the slot (O(events*panes)) and cloned the event String into a
+        // throwaway `vec![event.clone()]`. Coalesce consecutive same-session
+        // ReplyEvents into one slot lookup + one `apply_reply_events` call,
+        // moving the events by value (no per-chunk clone). This keeps ordering
+        // relative to other event kinds (we only merge adjacent ReplyEvents)
+        // while collapsing routing to O(distinct_runs*panes) and shortening the
+        // model-lock hold time.
+        let mut batch = batch.into_iter().peekable();
+        while let Some(note) = batch.next() {
             match note {
                 ServerNotification::ReplyEvent { session_id, event } => {
+                    // Drain the contiguous run of ReplyEvents for this session.
+                    let mut events = vec![event];
+                    while let Some(ServerNotification::ReplyEvent {
+                        session_id: next_sid,
+                        ..
+                    }) = batch.peek()
+                    {
+                        if *next_sid != session_id {
+                            break;
+                        }
+                        match batch.next() {
+                            Some(ServerNotification::ReplyEvent { event, .. }) => {
+                                events.push(event)
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
                     let routed = self.with_server_session_slot(&session_id, |slot| {
                         let claude = &mut slot.state;
-                        Self::apply_reply_events(claude, vec![event.clone()]);
-                        let line_count = claude.editor.document().line_count();
-                        let cursor_at_eof = claude.editor.cursor().line + 1 >= line_count;
-                        let follow = match claude.input_mode {
-                            InputMode::Chatbox => claude.follow_output.get(),
-                            InputMode::Worksheet => cursor_at_eof,
-                        };
-                        if follow && claude.list_item_count > 0 {
-                            claude
-                                .list_state
-                                .scroll_to_reveal_item(claude.list_item_count - 1);
-                        }
+                        Self::apply_reply_events(claude, std::mem::take(&mut events));
                     });
+                    if routed && !scrolled_sessions.iter().any(|s| s == &session_id) {
+                        scrolled_sessions.push(session_id.clone());
+                    }
                     warn_unrouted(routed, &session_id);
                 }
                 ServerNotification::TurnEnded { session_id, turn_count } => {
@@ -9198,16 +9288,24 @@ impl SketchGpuiView {
                     let routed = self.with_server_session_slot(&session_id, |slot| {
                         let claude = &mut slot.state;
                         let incoming = text.trim_end_matches('\n');
+                        // Perf (finding 4): the dedupe suffix check ignores
+                        // trailing whitespace, so compare only the relevant tail
+                        // slice of the rope instead of cloning the whole
+                        // transcript via full_text(). We probe back from the last
+                        // non-whitespace char by at most `incoming` length.
                         let already_present = {
-                            let existing = claude.editor.document().full_text();
-                            !incoming.is_empty() && existing.trim_end().ends_with(incoming)
+                            !incoming.is_empty()
+                                && document_trimmed_end_ends_with(
+                                    claude.editor.document(),
+                                    incoming,
+                                )
                         };
                         if already_present {
                             return;
                         }
-                        if !claude.editor.document().full_text().ends_with('\n')
-                            && !claude.editor.document().full_text().is_empty()
-                        {
+                        // Perf (finding 4): O(1) tail probes for the
+                        // trailing-newline / emptiness checks.
+                        if claude.editor.document().last_char().is_some_and(|c| c != '\n') {
                             let eof = claude.editor.document().rope().len_chars();
                             claude.editor.programmatic_insert(eof, "\n");
                         }
@@ -9216,7 +9314,7 @@ impl SketchGpuiView {
                         let to_append = text.strip_suffix('\n').unwrap_or(&text);
                         let eof = claude.editor.document().rope().len_chars();
                         claude.editor.programmatic_insert(eof, to_append);
-                        if !claude.editor.document().full_text().ends_with('\n') {
+                        if claude.editor.document().last_char() != Some('\n') {
                             let eof2 = claude.editor.document().rope().len_chars();
                             claude.editor.programmatic_insert(eof2, "\n");
                         }
@@ -9283,6 +9381,27 @@ impl SketchGpuiView {
                     self.reconcile_session_renamed(&session_id, &label);
                 }
             }
+        }
+        // Single follow-scroll per session that streamed this batch, instead of
+        // once per chunk event. Uses the stale `list_item_count` exactly as the
+        // per-event path did (the authoritative re-scroll with the fresh count
+        // happens later in render_agent after the ListState splice); this just
+        // keeps unfocused panes that miss render's scroll roughly pinned.
+        for sid in &scrolled_sessions {
+            self.with_server_session_slot(sid, |slot| {
+                let claude = &mut slot.state;
+                let line_count = claude.editor.document().line_count();
+                let cursor_at_eof = claude.editor.cursor().line + 1 >= line_count;
+                let follow = match claude.input_mode {
+                    InputMode::Chatbox => claude.follow_output.get(),
+                    InputMode::Worksheet => cursor_at_eof,
+                };
+                if follow && claude.list_item_count > 0 {
+                    claude
+                        .list_state
+                        .scroll_to_reveal_item(claude.list_item_count - 1);
+                }
+            });
         }
         // Deferred apply outside the layout borrow.
         if let Some(ready) = ready_change {
@@ -9932,6 +10051,42 @@ impl SketchGpuiView {
         awaiting
     }
 
+    /// Whole-second fingerprint of the thinking-indicator clock across all
+    /// awaiting agents, or `None` if nothing is awaiting. The indicator only
+    /// displays `mm:ss`-granular elapsed/quiet timers, so the pump uses this to
+    /// notify (and trigger the full transcript re-render) at most ~1Hz instead
+    /// of every 120ms — 8x fewer O(transcript) rebuilds during a stall. We fold
+    /// elapsed + quiet seconds into one value so a change in either repaints.
+    fn awaiting_anim_fingerprint(&mut self) -> Option<u64> {
+        let mut any = false;
+        let mut fp: u64 = 0;
+        for tab in self.workspace.tabs.iter_mut() {
+            tab.layout.for_each_leaf_content_mut(&mut |content| {
+                if let WindowContent::Agent(ring) = content {
+                    for s in ring.slots.iter() {
+                        if s.state.awaiting_reply {
+                            any = true;
+                            let elapsed = s
+                                .state
+                                .turn_started
+                                .map(|t| t.elapsed().as_secs())
+                                .unwrap_or(0);
+                            let quiet = s
+                                .state
+                                .last_event_at
+                                .map(|t| t.elapsed().as_secs())
+                                .unwrap_or(0);
+                            // Combine without losing either's transitions.
+                            fp = fp.wrapping_add(elapsed).wrapping_mul(1_000_003)
+                                ^ quiet.wrapping_add(1);
+                        }
+                    }
+                }
+            });
+        }
+        any.then_some(fp)
+    }
+
     /// Interrupt the in-flight agent turn (ACP `session/cancel`). Routes
     /// through the active path — session server when one owns the slot,
     /// otherwise the direct `AcpChannelClient`. The agent resolves the turn
@@ -10179,9 +10334,10 @@ impl SketchGpuiView {
         }
 
         // Ensure the transcript ends with a newline so the appended draft
-        // starts on its own line.
-        if !claude.editor.document().full_text().ends_with('\n')
-            && !claude.editor.document().full_text().is_empty()
+        // starts on its own line. Perf: O(1) tail probes instead of full_text()
+        // (rope.to_string(), an O(transcript) allocation).
+        if !claude.editor.document().is_empty()
+            && claude.editor.document().last_char() != Some('\n')
         {
             let eof = claude.editor.document().rope().len_chars();
             claude.editor.programmatic_insert(eof, "\n");
@@ -10191,7 +10347,7 @@ impl SketchGpuiView {
         let eof = claude.editor.document().rope().len_chars();
         claude.editor.programmatic_insert(eof, &to_append);
         // Ensure terminating newline so the next chunk starts cleanly.
-        if !claude.editor.document().full_text().ends_with('\n') {
+        if claude.editor.document().last_char() != Some('\n') {
             let eof2 = claude.editor.document().rope().len_chars();
             claude.editor.programmatic_insert(eof2, "\n");
         }
@@ -11192,15 +11348,29 @@ impl SketchGpuiView {
         let t_render0 = perf.then(std::time::Instant::now);
         let t_extract0 = perf.then(std::time::Instant::now);
         let edit_seq = c.editor.document().edit_seq();
-        let lines: Vec<String> = (0..line_count.max(1))
-            .map(|i| {
-                c.editor
-                    .document()
-                    .line_text(i)
-                    .trim_end_matches('\n')
-                    .replace('\t', "    ")
-            })
-            .collect();
+        // Perf: only re-extract the per-line transcript text when the document
+        // actually changed. On cursor-blink / cross-pane notifies edit_seq is
+        // unchanged, so reuse the cached Rc verbatim instead of re-allocating a
+        // String per line (an O(L) cost that previously ran every frame). The
+        // Rc clone below is O(1).
+        let lines_rc: std::rc::Rc<Vec<String>> = if c.lines_cache_seq == edit_seq {
+            c.lines_cache.clone()
+        } else {
+            let built: Vec<String> = (0..line_count.max(1))
+                .map(|i| {
+                    c.editor
+                        .document()
+                        .line_text(i)
+                        .trim_end_matches('\n')
+                        .replace('\t', "    ")
+                })
+                .collect();
+            let rc = std::rc::Rc::new(built);
+            c.lines_cache = rc.clone();
+            c.lines_cache_seq = edit_seq;
+            rc
+        };
+        let lines: &Vec<String> = &lines_rc;
         let t_extract = t_extract0.map(|t| t.elapsed());
 
         // Per-line highlight, raw + stripped. The incremental cache
@@ -11210,10 +11380,10 @@ impl SketchGpuiView {
         // the two paths are directly comparable.
         let t_hl0 = perf.then(std::time::Instant::now);
         let hl_snap: std::rc::Rc<Vec<std::rc::Rc<LineHl>>> = if hl_cache_enabled() {
-            c.highlight_cache.snapshot_syn(&lines, &self.theme, edit_seq, &self.syntect_hl)
+            c.highlight_cache.snapshot_syn(lines, &self.theme, edit_seq, &self.syntect_hl)
         } else {
-            let raw = highlight_markdown_lines_syn(&lines, &self.theme, &self.syntect_hl);
-            let stripped = highlight_markdown_lines_stripped_syn(&lines, &self.theme, &self.syntect_hl);
+            let raw = highlight_markdown_lines_syn(lines, &self.theme, &self.syntect_hl);
+            let stripped = highlight_markdown_lines_stripped_syn(lines, &self.theme, &self.syntect_hl);
             std::rc::Rc::new(
                 raw.into_iter()
                     .zip(stripped)
@@ -11238,13 +11408,20 @@ impl SketchGpuiView {
         // (currently-editable, not yet swept by Submit) render as a blank
         // gutter. Lines whose anchor hasn't been allocated count as
         // untagged — happens for editable lines the user just typed.
-        let gutter_tag_per_line: Vec<Option<TurnId>> = (0..lines.len())
-            .map(|i| {
-                c.editor
-                    .anchor_for_line_opt(i)
-                    .and_then(|a| c.editor.metadata::<TurnId>().get(a).copied())
-            })
-            .collect();
+        // Hoist the metadata view out of the per-line loop: `metadata::<TurnId>()`
+        // does a HashMap-by-TypeId lookup and builds a fresh view each call, so
+        // calling it once per line was O(n) view constructions per frame. Build
+        // it once and reuse it across all lines.
+        let gutter_tag_per_line: Vec<Option<TurnId>> = {
+            let turn_meta = c.editor.metadata::<TurnId>();
+            (0..lines.len())
+                .map(|i| {
+                    c.editor
+                        .anchor_for_line_opt(i)
+                        .and_then(|a| turn_meta.get(a).copied())
+                })
+                .collect()
+        };
 
         // ============ Virtualised list build ============
         //
@@ -11276,14 +11453,14 @@ impl SketchGpuiView {
         let frozen_line_count: usize = frozen_ranges.iter().map(|(s, e)| e - s).sum();
 
         if frozen_line_count != c.block_cache_frozen_count {
-            let block_ranges = detect_block_ranges(&lines, &frozen_ranges);
+            let block_ranges = detect_block_ranges(lines, &frozen_ranges);
             let mut new_cache: std::collections::HashMap<(usize, usize), RenderedBlock> =
                 std::collections::HashMap::new();
             for &(start, end) in &block_ranges {
                 // Reuse existing cache entry if the range is unchanged.
                 if let Some(cached) = c.block_cache.get(&(start, end)) {
                     new_cache.insert((start, end), cached.clone());
-                } else if let Some(block) = parse_block_range(&lines, start, end, &self.theme) {
+                } else if let Some(block) = parse_block_range(lines, start, end, &self.theme) {
                     new_cache.insert((start, end), block);
                 }
             }
@@ -11456,11 +11633,17 @@ impl SketchGpuiView {
         // Snapshot data for the render closure. Cloned once per
         // render_agent call; the closure is then called only for
         // visible items.
-        let lines_snap = lines.clone();
+        // O(1) pointer clone — the closure shares the cached line vec for the
+        // frame instead of deep-copying every transcript line each render.
+        let lines_snap: std::rc::Rc<Vec<String>> = lines_rc.clone();
         // O(1) pointer clone of the per-line highlight snapshot; the closure
         // owns it for the frame and indexes `.raw` / `.stripped` per line.
         let hl_snap = hl_snap;
-        let gutter_tag_snap = gutter_tag_per_line.clone();
+        // Perf (finding 3d): move the gutter-tag vec into an `Rc` instead of
+        // deep-cloning it into the closure. `gutter_tag_per_line` isn't read
+        // after this point, so hand ownership to the frame's `Rc` (O(1)).
+        let gutter_tag_snap: std::rc::Rc<Vec<Option<TurnId>>> =
+            std::rc::Rc::new(gutter_tag_per_line);
         let tool_calls_snap = c.tool_calls.clone();
         let expanded_snap = c.expanded_tool_calls.clone();
         let frozen_lines_snap: Vec<(usize, usize)> =

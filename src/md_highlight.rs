@@ -154,6 +154,62 @@ pub fn highlight_one_line(
     (segs, next)
 }
 
+/// Compute the fence state *after* `line` without doing any highlighting.
+///
+/// This is the fence-tracking half of `highlight_one_line`, extracted so that
+/// incremental callers (the agent transcript highlight cache) can advance the
+/// running `FenceState` across unchanged lines with only a cheap byte scan,
+/// instead of paying for a full inline tokenization + segment allocation per
+/// line just to carry the state forward. The branches here mirror
+/// `highlight_one_line` exactly so the carried state stays byte-identical to
+/// the batch path.
+pub fn advance_fence(line: &str, fence: &FenceState) -> FenceState {
+    let trimmed_start = line.trim_start();
+    let opens_or_closes_fence =
+        trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~");
+
+    if fence.in_fence {
+        if opens_or_closes_fence {
+            // Closing fence.
+            return FenceState {
+                in_fence: false,
+                lang: None,
+            };
+        }
+        // Still inside the fence — language unchanged.
+        return FenceState {
+            in_fence: true,
+            lang: fence.lang.clone(),
+        };
+    }
+
+    if opens_or_closes_fence {
+        // Opening fence — extract language tag (same logic as highlight_one_line).
+        let marker_char = trimmed_start.as_bytes()[0];
+        let marker_end = trimmed_start
+            .bytes()
+            .take_while(|&b| b == marker_char)
+            .count();
+        let info = trimmed_start[marker_end..].trim();
+        let lang_token = info.split_whitespace().next().unwrap_or("");
+        let lang = if lang_token.is_empty() {
+            None
+        } else {
+            Some(lang_token.to_string())
+        };
+        return FenceState {
+            in_fence: true,
+            lang,
+        };
+    }
+
+    // Normal line — leaves the (not-in-fence) state unchanged.
+    FenceState {
+        in_fence: false,
+        lang: None,
+    }
+}
+
 fn highlight_source_line(line: &str, theme: &Theme, strip: bool) -> Vec<Segment> {
     if line.is_empty() {
         return vec![(String::new(), theme.paragraph)];

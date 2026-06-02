@@ -22,7 +22,7 @@
 use std::rc::Rc;
 
 use sketch::highlight::Highlighter;
-use sketch::md_highlight::{highlight_one_line, FenceState, Segment};
+use sketch::md_highlight::{advance_fence, highlight_one_line, FenceState, Segment};
 use sketch::style::Style;
 use sketch::theme::Theme;
 
@@ -220,9 +220,14 @@ impl HighlightCache {
                 self.fence_before[i] = entry_fp;
                 recomputed += 1;
             }
-            // Advance fence state regardless of reuse.
-            let (_, next_fence) = highlight_one_line(&lines[i], &fence, theme, false, None);
-            fence = next_fence;
+            // Advance fence state regardless of reuse. Use the cheap byte-scan
+            // `advance_fence` rather than a full `highlight_one_line`: during
+            // live streaming `edit_seq` bumps every chunk so the fast-skip path
+            // is missed and this loop runs every frame. Calling the full
+            // highlighter here would re-tokenize + re-allocate every non-fence
+            // line each frame, making the reconcile O(transcript) instead of
+            // O(changed). `advance_fence` mirrors the fence branches exactly.
+            fence = advance_fence(&lines[i], &fence);
         }
 
         // Cloning `Vec<Rc<LineHl>>` is N pointer copies (refcount bumps), no
