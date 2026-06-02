@@ -646,10 +646,14 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
         .spawn(move || {
             let mut last_turns: usize = 0;
             let mut synced_gen: u64 = 0;
+            // Drain-then-sleep: only park the thread when a full cycle
+            // produced no work, so the first token of a turn isn't held
+            // for a fixed tick. When a cycle drains events (or more remain
+            // queued past our budget) we loop immediately. Mirrors the GUI
+            // pump's `more_pending` fast-loop.
+            const PUMP_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(16);
 
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(16));
-
                 let mut sessions = manager.sessions.lock().unwrap();
                 let Some(session) = sessions.get_mut(&session_id) else {
                     return; // Session was closed.
@@ -664,7 +668,8 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                 }
                 let Some(channel) = &session.channel else {
                     drop(sessions);
-                    continue; // Not yet spawned.
+                    std::thread::sleep(PUMP_IDLE_SLEEP); // Not yet spawned — idle.
+                    continue;
                 };
 
                 // Check liveness.
@@ -717,6 +722,7 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                 let fence = session.replay_fence;
                 if fence > 0 && current_turns <= fence {
                     // Still replaying — discard events silently.
+                    let drained = !events.is_empty();
                     if turn_ended {
                         last_turns = current_turns;
                         if current_turns == fence {
@@ -730,8 +736,16 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                         }
                     }
                     drop(sessions);
+                    // Drained discarded replay events this cycle (or more are
+                    // queued past the budget) → loop immediately; otherwise idle.
+                    if !drained && !more_pending {
+                        std::thread::sleep(PUMP_IDLE_SLEEP);
+                    }
                     continue;
                 }
+
+                // Did this cycle produce any work? Drives drain-then-sleep.
+                let drained_events = !events.is_empty();
 
                 // Broadcast events first.
                 for ev in events {
@@ -771,6 +785,13 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                 }
 
                 drop(sessions);
+
+                // Sleep ONLY when this cycle was fully idle: no events drained,
+                // no more queued past the budget, and no turn-end fired. When we
+                // did real work, loop immediately — more may already be queued.
+                if !drained_events && !more_pending && !turn_ended {
+                    std::thread::sleep(PUMP_IDLE_SLEEP);
+                }
             }
         })
         .ok();
@@ -1029,15 +1050,20 @@ async fn forward_notifications(
             }
         };
         if !new.is_empty() {
-            let mut w = writer.lock().await;
+            // Serialize the whole tail snapshot into one buffer and issue a
+            // single write — same bytes/order, far fewer syscalls under
+            // streaming. (Failed serializations are skipped, as before.)
+            let mut buf = String::new();
             for note in &new {
                 let frame = Frame::Notification { note: note.clone() };
-                if let Ok(mut line) = serde_json::to_string(&frame) {
-                    line.push('\n');
-                    if w.write_all(line.as_bytes()).await.is_err() {
-                        return;
-                    }
+                if let Ok(line) = serde_json::to_string(&frame) {
+                    buf.push_str(&line);
+                    buf.push('\n');
                 }
+            }
+            let mut w = writer.lock().await;
+            if w.write_all(buf.as_bytes()).await.is_err() {
+                return;
             }
             drop(w);
             sent += new.len();
@@ -1082,15 +1108,17 @@ async fn forward_notifications(
                     }
                 };
                 if !tail.is_empty() {
-                    let mut w = writer.lock().await;
+                    let mut buf = String::new();
                     for note in &tail {
                         let frame = Frame::Notification { note: note.clone() };
-                        if let Ok(mut line) = serde_json::to_string(&frame) {
-                            line.push('\n');
-                            if w.write_all(line.as_bytes()).await.is_err() {
-                                return;
-                            }
+                        if let Ok(line) = serde_json::to_string(&frame) {
+                            buf.push_str(&line);
+                            buf.push('\n');
                         }
+                    }
+                    let mut w = writer.lock().await;
+                    if w.write_all(buf.as_bytes()).await.is_err() {
+                        return;
                     }
                 }
                 return;

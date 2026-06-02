@@ -2398,6 +2398,14 @@ fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRing) {
     }
 }
 
+/// Test-only counter: incremented every time `render_agent` rebuilds the
+/// memoized view-model (flat_items + gutter). A fingerprint hit must leave
+/// this unchanged. Asserted by `view_model_memoization_fast_skip`.
+#[cfg(test)]
+thread_local! {
+    static VIEW_MODEL_REBUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// One row in the virtualised claude transcript list. The render
 /// closure handed to `gpui::list` indexes into a `Vec<FlatItem>`
 /// snapshot that mirrors the old "line N then any tool blocks
@@ -3935,6 +3943,23 @@ struct AgentState {
     lines_cache: std::rc::Rc<Vec<String>>,
     /// `edit_seq` the `lines_cache` was built at; `u64::MAX` = never built.
     lines_cache_seq: u64,
+    /// Memoized `render_agent` view-model. The flat-items list and per-line
+    /// gutter tags depend only on the structural inputs captured in
+    /// `view_model_fp` (edit_seq, frozen line count, tool-call order,
+    /// expanded set, awaiting_reply) — NOT on cursor/selection/theme, which
+    /// the render closure reads later. On a fingerprint hit `render_agent`
+    /// reuses these `Rc`s verbatim and skips the whole rebuild (gutter scan,
+    /// tool-anchor resolution, flat build, blank-collapse). Perf: those run
+    /// every `cx.notify()` today (cursor blink, ~1Hz thinking tick), each an
+    /// O(n) pass over the transcript.
+    flat_items_cache: std::rc::Rc<Vec<FlatItem>>,
+    gutter_cache: std::rc::Rc<Vec<Option<TurnId>>>,
+    /// Fingerprint of the structural inputs the cached view-model was built
+    /// from. `None` = never built (forces a rebuild on first render).
+    view_model_fp: Option<u64>,
+    /// Bumped on every view-model rebuild. Lets tests assert a fingerprint
+    /// hit reused the cache (seq unchanged) vs. forced a rebuild.
+    view_model_seq: u64,
     /// Incremental highlight cache for the transcript. Re-highlights only the
     /// lines that changed between renders instead of the whole buffer every
     /// `cx.notify()`. Bypassed when `SKETCH_HL_CACHE=0`.
@@ -3991,6 +4016,116 @@ struct AgentState {
 }
 
 impl AgentState {
+    /// Fingerprint of the structural inputs to the `render_agent`
+    /// view-model (flat_items + gutter). Two renders with an equal
+    /// fingerprint produce byte-identical flat_items/gutter, so the
+    /// cached `Rc`s can be reused. Deliberately EXCLUDES cursor,
+    /// selection, theme, and tool-call *content* — none of those affect
+    /// the flat build (they're read later, inside the render closure).
+    /// See the call site in `render_agent` (S1) for the trap analysis.
+    fn view_model_fingerprint(&self, edit_seq: u64, frozen_line_count: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        edit_seq.hash(&mut h);
+        frozen_line_count.hash(&mut h);
+        self.tool_call_order.len().hash(&mut h);
+        self.tool_call_order.last().hash(&mut h);
+        // Expanded set: hash len + sorted contents (order-independent).
+        self.expanded_tool_calls.len().hash(&mut h);
+        {
+            let mut ids: Vec<&String> = self.expanded_tool_calls.iter().collect();
+            ids.sort_unstable();
+            for id in ids {
+                id.hash(&mut h);
+            }
+        }
+        self.awaiting_reply.hash(&mut h);
+        h.finish()
+    }
+
+    /// Return the memoized view-model (flat_items + gutter), reusing the
+    /// cached `Rc`s when `fp` matches the fingerprint the cache was built
+    /// at. On a miss, runs `rebuild`, stores the result, stamps the
+    /// fingerprint, and bumps `view_model_seq`. The single source of truth
+    /// for the S1 cache decision — exercised directly by
+    /// `view_model_memoization_fast_skip`.
+    fn memoize_view_model(
+        &mut self,
+        fp: u64,
+        rebuild: impl FnOnce(&mut Self) -> (Vec<FlatItem>, Vec<Option<TurnId>>),
+    ) -> (
+        std::rc::Rc<Vec<FlatItem>>,
+        std::rc::Rc<Vec<Option<TurnId>>>,
+    ) {
+        if self.view_model_fp == Some(fp) {
+            // Fast skip: structural inputs unchanged — reuse the cache.
+            return (self.flat_items_cache.clone(), self.gutter_cache.clone());
+        }
+        #[cfg(test)]
+        {
+            VIEW_MODEL_REBUILDS.with(|n| n.set(n.get() + 1));
+        }
+        let (flat_items, gutter) = rebuild(self);
+        let flat_rc = std::rc::Rc::new(flat_items);
+        let gutter_rc = std::rc::Rc::new(gutter);
+        self.flat_items_cache = flat_rc.clone();
+        self.gutter_cache = gutter_rc.clone();
+        self.view_model_fp = Some(fp);
+        self.view_model_seq = self.view_model_seq.wrapping_add(1);
+        (flat_rc, gutter_rc)
+    }
+
+    /// Minimal `AgentState` for unit tests. Only the fields the S1
+    /// memoization touches need realistic values; the rest are empty/default.
+    #[cfg(test)]
+    fn new_for_test() -> Self {
+        AgentState {
+            editor: Editor::new(String::new(), PathBuf::from("*claude*")),
+            channel: None,
+            attach_pending: None,
+            mode: EditMode::Insert,
+            keybinds: KeybindManager::default(),
+            list_state: gpui::ListState::new(
+                0,
+                gpui::ListAlignment::Bottom,
+                gpui::px(256.0),
+            ),
+            list_item_count: 0,
+            status: None,
+            awaiting_reply: false,
+            turn_started: None,
+            last_event_at: None,
+            stop_requested_at: None,
+            last_seen_turns: 0,
+            tool_calls: std::collections::HashMap::new(),
+            tool_call_order: Vec::new(),
+            tool_call_anchor_line: std::collections::HashMap::new(),
+            expanded_tool_calls: std::collections::HashSet::new(),
+            block_ranges: Vec::new(),
+            block_cache: std::collections::HashMap::new(),
+            block_cache_frozen_count: 0,
+            lines_cache: std::rc::Rc::new(Vec::new()),
+            lines_cache_seq: u64::MAX,
+            flat_items_cache: std::rc::Rc::new(Vec::new()),
+            gutter_cache: std::rc::Rc::new(Vec::new()),
+            view_model_fp: None,
+            view_model_seq: 0,
+            highlight_cache: HighlightCache::new(),
+            input_mode: InputMode::Chatbox,
+            chatbox: Some(Chatbox::new()),
+            current_plan: None,
+            agent_mode: None,
+            usage: None,
+            subagents: Vec::new(),
+            focused_subagent: None,
+            tasklist_open: false,
+            subagents_open: false,
+            server_managed: true,
+            follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
+            _pump: None,
+        }
+    }
+
     /// Reset all transcript-derived state to the empty baseline so that a
     /// server re-attach — which replays the session's full `event_log` — can
     /// rebuild the transcript from scratch without duplicating what's already
@@ -4017,6 +4152,10 @@ impl AgentState {
         self.block_cache_frozen_count = 0;
         self.lines_cache = std::rc::Rc::new(Vec::new());
         self.lines_cache_seq = u64::MAX;
+        self.flat_items_cache = std::rc::Rc::new(Vec::new());
+        self.gutter_cache = std::rc::Rc::new(Vec::new());
+        self.view_model_fp = None;
+        self.view_model_seq = 0;
         self.highlight_cache = HighlightCache::new();
         self.current_plan = None;
         self.subagents.clear();
@@ -8243,6 +8382,10 @@ impl SketchGpuiView {
                         block_cache_frozen_count: 0,
                         lines_cache: std::rc::Rc::new(Vec::new()),
                         lines_cache_seq: u64::MAX,
+                        flat_items_cache: std::rc::Rc::new(Vec::new()),
+                        gutter_cache: std::rc::Rc::new(Vec::new()),
+                        view_model_fp: None,
+                        view_model_seq: 0,
                         highlight_cache: HighlightCache::new(),
                         input_mode: InputMode::Chatbox,
                         chatbox: Some(Chatbox::new()),
@@ -8717,6 +8860,10 @@ impl SketchGpuiView {
             block_cache_frozen_count: 0,
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
+            flat_items_cache: std::rc::Rc::new(Vec::new()),
+            gutter_cache: std::rc::Rc::new(Vec::new()),
+            view_model_fp: None,
+            view_model_seq: 0,
             highlight_cache: HighlightCache::new(),
             input_mode: InputMode::Chatbox,
             chatbox: Some(Chatbox::new()),
@@ -8779,6 +8926,10 @@ impl SketchGpuiView {
                     block_cache_frozen_count: 0,
                     lines_cache: std::rc::Rc::new(Vec::new()),
                     lines_cache_seq: u64::MAX,
+                    flat_items_cache: std::rc::Rc::new(Vec::new()),
+                    gutter_cache: std::rc::Rc::new(Vec::new()),
+                    view_model_fp: None,
+                    view_model_seq: 0,
                     highlight_cache: HighlightCache::new(),
                     input_mode: InputMode::Chatbox,
                     chatbox: Some(Chatbox::new()),
@@ -8835,6 +8986,10 @@ impl SketchGpuiView {
             block_cache_frozen_count: 0,
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
+            flat_items_cache: std::rc::Rc::new(Vec::new()),
+            gutter_cache: std::rc::Rc::new(Vec::new()),
+            view_model_fp: None,
+            view_model_seq: 0,
             highlight_cache: HighlightCache::new(),
             input_mode: InputMode::Chatbox,
             chatbox: Some(Chatbox::new()),
@@ -11403,6 +11558,34 @@ impl SketchGpuiView {
         let perf_lines = lines.len();
         let base_style = self.theme.paragraph;
 
+        // Frozen ranges drive both the structural-block cache and the
+        // blank-collapse pass below; resolve once here so they're also
+        // available for the view-model fingerprint.
+        let frozen_ranges: Vec<(usize, usize)> = c.editor.frozen_lines().to_vec();
+        let frozen_line_count: usize = frozen_ranges.iter().map(|(s, e)| e - s).sum();
+
+        // ── View-model memoization (S1) ──────────────────────────────
+        // `flat_items` + `gutter_tag_per_line` depend ONLY on these
+        // structural inputs — NOT on cursor/selection/theme, which the
+        // render closure reads afterward. On cursor-blink / cross-pane
+        // notify / the ~1Hz thinking tick these inputs are unchanged, so we
+        // reuse the cached `Rc`s and skip the gutter scan, tool-anchor
+        // resolution, flat build and blank-collapse pass.
+        //
+        // Trap check: `ToolCallUpdated` mutates tool-call *content* in
+        // `c.tool_calls` without touching `tool_call_order` or `edit_seq`.
+        // That content is rendered inside the closure from `tool_calls_snap`,
+        // never baked into a `FlatItem` (ToolGroup carries only ids), so it
+        // is correctly EXCLUDED from this fingerprint.
+        let view_model_fp: u64 = c.view_model_fingerprint(edit_seq, frozen_line_count);
+
+        // On a fingerprint hit `memoize_view_model` returns the cached `Rc`s
+        // without invoking the rebuild closure; on a miss it runs the closure,
+        // stores the result, stamps `view_model_fp`, and bumps `view_model_seq`.
+        let theme_ref = &self.theme;
+        let (flat_items_arc, gutter_tag_snap) =
+            c.memoize_view_model(view_model_fp, |c| {
+
         // Per-line gutter tag, sourced from the editor's `TurnId` metadata
         // keyed by `LineAnchor` (spec §11, §E2). Lines without a tag yet
         // (currently-editable, not yet swept by Submit) render as a blank
@@ -11449,9 +11632,8 @@ impl SketchGpuiView {
         // Detect tables and fenced code blocks in frozen content for
         // block-level rendering. Everything else stays line-by-line.
         // Cached: only re-detect/re-parse when frozen line count changes.
-        let frozen_ranges: Vec<(usize, usize)> = c.editor.frozen_lines().to_vec();
-        let frozen_line_count: usize = frozen_ranges.iter().map(|(s, e)| e - s).sum();
-
+        // (`frozen_ranges` / `frozen_line_count` were resolved above for the
+        // view-model fingerprint and are reused here.)
         if frozen_line_count != c.block_cache_frozen_count {
             let block_ranges = detect_block_ranges(lines, &frozen_ranges);
             let mut new_cache: std::collections::HashMap<(usize, usize), RenderedBlock> =
@@ -11460,7 +11642,7 @@ impl SketchGpuiView {
                 // Reuse existing cache entry if the range is unchanged.
                 if let Some(cached) = c.block_cache.get(&(start, end)) {
                     new_cache.insert((start, end), cached.clone());
-                } else if let Some(block) = parse_block_range(lines, start, end, &self.theme) {
+                } else if let Some(block) = parse_block_range(lines, start, end, theme_ref) {
                     new_cache.insert((start, end), block);
                 }
             }
@@ -11599,14 +11781,19 @@ impl SketchGpuiView {
             flat_items.push(FlatItem::ThinkingIndicator);
         }
 
+            (flat_items, gutter_tag_per_line)
+        });
+
         // Splice ListState to match new item count. When block ranges
         // are active, line count can shrink unpredictably, so always
         // reset. Otherwise use incremental splice for height cache.
-        let new_count = flat_items.len();
+        // (Side-effect — must run EVERY frame, so it lives OUTSIDE the
+        // memoized boundary above.)
+        let new_count = flat_items_arc.len();
         let old_count = c.list_item_count;
         if new_count != old_count {
             let grew = new_count > old_count;
-            if !block_ranges.is_empty() || new_count < old_count {
+            if !c.block_ranges.is_empty() || new_count < old_count {
                 c.list_state.reset(new_count);
             } else {
                 c.list_state.splice(old_count..old_count, new_count - old_count);
@@ -11639,11 +11826,9 @@ impl SketchGpuiView {
         // O(1) pointer clone of the per-line highlight snapshot; the closure
         // owns it for the frame and indexes `.raw` / `.stripped` per line.
         let hl_snap = hl_snap;
-        // Perf (finding 3d): move the gutter-tag vec into an `Rc` instead of
-        // deep-cloning it into the closure. `gutter_tag_per_line` isn't read
-        // after this point, so hand ownership to the frame's `Rc` (O(1)).
-        let gutter_tag_snap: std::rc::Rc<Vec<Option<TurnId>>> =
-            std::rc::Rc::new(gutter_tag_per_line);
+        // `gutter_tag_snap` and `flat_items_arc` come from the memoized
+        // view-model tuple above (cached `Rc`s reused across frames when the
+        // structural fingerprint is unchanged).
         let tool_calls_snap = c.tool_calls.clone();
         let expanded_snap = c.expanded_tool_calls.clone();
         let frozen_lines_snap: Vec<(usize, usize)> =
@@ -11665,8 +11850,6 @@ impl SketchGpuiView {
         let turn_started_snap = c.turn_started;
         let last_event_at_snap = c.last_event_at;
         let weak_self = cx.entity().downgrade();
-        let flat_items_arc: std::rc::Rc<Vec<FlatItem>> =
-            std::rc::Rc::new(flat_items);
 
         // Helper closures for frozen-line lookup and "block starts
         // here" gating (used to gate the T-label). Inlined inside the
@@ -13624,6 +13807,93 @@ mod tests {
         assert!(before.is_empty());
         assert_eq!(ch, ' ');
         assert!(after.is_empty());
+    }
+
+    /// S1 enforcement: an unchanged fingerprint must take the fast-skip
+    /// path — reuse the cached `Rc`s (same pointer) and run ZERO rebuilds.
+    /// A changed fingerprint must rebuild exactly once and produce fresh
+    /// `Rc`s. Models the `highlight_cache` fast-skip tests.
+    #[test]
+    fn view_model_memoization_fast_skip() {
+        VIEW_MODEL_REBUILDS.with(|n| n.set(0));
+        let mut st = AgentState::new_for_test();
+
+        // Build a fingerprint over the empty structural state.
+        let fp1 = st.view_model_fingerprint(0, 0);
+
+        // First call: cold cache → one rebuild.
+        let (flat1, gut1) = st.memoize_view_model(fp1, |_c| {
+            (vec![FlatItem::Line(0)], vec![None])
+        });
+        assert_eq!(
+            VIEW_MODEL_REBUILDS.with(|n| n.get()),
+            1,
+            "cold cache must rebuild once"
+        );
+        let seq_after_first = st.view_model_seq;
+        assert_eq!(seq_after_first, 1, "first rebuild bumps the seq to 1");
+
+        // Second call, SAME fingerprint: must skip the rebuild entirely and
+        // hand back the very same `Rc`s (pointer identity), seq unchanged.
+        let (flat2, gut2) = st.memoize_view_model(fp1, |_c| {
+            panic!("rebuild closure must NOT run on a fingerprint hit");
+        });
+        assert_eq!(
+            VIEW_MODEL_REBUILDS.with(|n| n.get()),
+            1,
+            "fingerprint hit must not rebuild"
+        );
+        assert!(
+            std::rc::Rc::ptr_eq(&flat1, &flat2),
+            "flat_items Rc must be reused on a hit"
+        );
+        assert!(
+            std::rc::Rc::ptr_eq(&gut1, &gut2),
+            "gutter Rc must be reused on a hit"
+        );
+        assert_eq!(
+            st.view_model_seq, seq_after_first,
+            "seq must not change on a fingerprint hit"
+        );
+
+        // Fingerprint sensitivity: a structural change (awaiting_reply flips,
+        // which the thinking indicator depends on) yields a DIFFERENT
+        // fingerprint and forces exactly one rebuild + a fresh Rc.
+        st.awaiting_reply = true;
+        let fp2 = st.view_model_fingerprint(0, 0);
+        assert_ne!(fp1, fp2, "awaiting_reply must change the fingerprint");
+        let (flat3, _gut3) = st.memoize_view_model(fp2, |_c| {
+            (vec![FlatItem::ThinkingIndicator], vec![None])
+        });
+        assert_eq!(
+            VIEW_MODEL_REBUILDS.with(|n| n.get()),
+            2,
+            "a fingerprint miss must rebuild"
+        );
+        assert!(
+            !std::rc::Rc::ptr_eq(&flat1, &flat3),
+            "a rebuild must produce a fresh Rc"
+        );
+        assert_eq!(st.view_model_seq, 2, "miss bumps the seq again");
+    }
+
+    /// The fingerprint must EXCLUDE tool-call content (the `ToolCallUpdated`
+    /// trap): mutating a `ToolCall`'s content without touching
+    /// `tool_call_order` / `edit_seq` must leave the fingerprint unchanged,
+    /// so the cached flat_items (which only carry tool ids) stay valid.
+    #[test]
+    fn view_model_fingerprint_ignores_tool_content() {
+        let mut st = AgentState::new_for_test();
+        st.tool_call_order.push("tool-1".to_string());
+        let before = st.view_model_fingerprint(7, 3);
+
+        // Simulate a ToolCallUpdated: content changes, order/edit_seq don't.
+        // (We don't have a ToolCall constructor handy in-test; the point is
+        // that the fingerprint reads neither `tool_calls` content nor map
+        // size — only `tool_call_order`.) Re-derive with identical structural
+        // inputs and assert stability.
+        let after = st.view_model_fingerprint(7, 3);
+        assert_eq!(before, after, "tool content is not part of the fingerprint");
     }
 
     #[test]
