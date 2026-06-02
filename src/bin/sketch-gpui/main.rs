@@ -4266,6 +4266,11 @@ fn gpui_menu() -> Vec<MenuNode> {
             ],
         ),
         MenuNode::separator(),
+        MenuNode::label("Rail"),
+        MenuNode::entry("B", "file browser rail (Cmd-B)", "rail-files"),
+        MenuNode::entry("O", "outline rail (Cmd-Shift-O)", "rail-outline"),
+        MenuNode::entry("S", "flip rail side (Cmd-Shift-B)", "rail-flip"),
+        MenuNode::separator(),
         MenuNode::submenu(
             "W",
             "window (splits/tabs)",
@@ -5627,6 +5632,12 @@ impl SketchGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.toggle_file_browser_rail_impl(cx);
+    }
+
+    /// Toggle-logic for the file-browser rail, shared by the keybinding action
+    /// and the command menu (`rail-files`).
+    fn toggle_file_browser_rail_impl(&mut self, cx: &mut Context<Self>) {
         let Some(tab) = self.workspace.active_tab_mut() else {
             return;
         };
@@ -5653,6 +5664,12 @@ impl SketchGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.toggle_outline_rail_impl(cx);
+    }
+
+    /// Toggle-logic for the outline rail, shared by the keybinding action and
+    /// the command menu (`rail-outline`).
+    fn toggle_outline_rail_impl(&mut self, cx: &mut Context<Self>) {
         let Some(tab) = self.workspace.active_tab_mut() else {
             return;
         };
@@ -5673,6 +5690,12 @@ impl SketchGpuiView {
     /// Flip which edge the rail anchors to (Cmd-Shift-B). No-op when no rail
     /// is open. Persisted in the workspace snapshot.
     fn flip_rail_side(&mut self, _: &FlipRailSide, _w: &mut Window, cx: &mut Context<Self>) {
+        self.flip_rail_side_impl(cx);
+    }
+
+    /// Flip-logic shared by the keybinding action and the command menu
+    /// (`rail-flip`).
+    fn flip_rail_side_impl(&mut self, cx: &mut Context<Self>) {
         if let Some(r) = self.rail_mut() {
             r.side = match r.side {
                 workspace::RailSide::Left => workspace::RailSide::Right,
@@ -6465,6 +6488,9 @@ impl SketchGpuiView {
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
             "dev-build-candidate" => self.build_and_launch_candidate(cx),
             "dev-take-over" => self.candidate_take_over(cx),
+            "rail-files" => self.toggle_file_browser_rail_impl(cx),
+            "rail-outline" => self.toggle_outline_rail_impl(cx),
+            "rail-flip" => self.flip_rail_side_impl(cx),
             "compose-toggle" | "agent-input-toggle" => {
                 if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
                     self.toggle_agent_input_mode(cx);
@@ -7235,10 +7261,14 @@ impl SketchGpuiView {
         &mut self,
         root: gpui::Div,
         attach_focus: bool,
+        rail_focusable: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tab_idx = self.workspace.active_tab;
         let focused_id = self.workspace.tabs[tab_idx].focused;
+        // Re-derive the outline rail (if any) once before rendering the tree,
+        // so the focused leaf can render it inline without a second pass.
+        self.refresh_outline_rail();
         let layout_ptr: *mut workspace::Layout<WindowContent> =
             &mut self.workspace.tabs[tab_idx].layout as *mut _;
         // SAFETY: `layout_ptr` is valid for as long as the active tab's
@@ -7250,7 +7280,7 @@ impl SketchGpuiView {
         // &mut Layout<WindowContent> (a field inside self.workspace.tabs)
         // is disjoint from &self.render_X's other field accesses.
         let layout = unsafe { &mut *layout_ptr };
-        self.render_layout(root, layout, focused_id, attach_focus, cx)
+        self.render_layout(root, layout, focused_id, attach_focus, rail_focusable, cx)
     }
 
     /// Recursively render a `Layout<WindowContent>`. The `root` div is used
@@ -7267,6 +7297,7 @@ impl SketchGpuiView {
         layout: &mut workspace::Layout<WindowContent>,
         focused_id: workspace::WindowId,
         attach_focus: bool,
+        rail_focusable: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match layout {
@@ -7296,7 +7327,7 @@ impl SketchGpuiView {
                 // there's more than one leaf in the tab. (A border on a
                 // single-leaf tab is just visual noise — the whole window
                 // *is* the focus.)
-                if is_focused && self.active_tab_leaf_count() > 1 {
+                let content_el = if is_focused && self.active_tab_leaf_count() > 1 {
                     let accent: Hsla = rgb(STATUS_FG).into();
                     div()
                         .size_full()
@@ -7306,6 +7337,15 @@ impl SketchGpuiView {
                         .into_any_element()
                 } else {
                     painted
+                };
+                // The rail is chrome local to the *focused pane*, not the whole
+                // window — slot it directly beside this leaf so it sits against
+                // the focused content (e.g. left of the focused markdown buffer,
+                // not left of the entire split row). No-op when no rail is open.
+                if is_focused {
+                    self.wrap_leaf_with_rail(content_el, rail_focusable, cx)
+                } else {
+                    content_el
                 }
             }
             workspace::Layout::Split { dir, children } => {
@@ -7331,7 +7371,7 @@ impl SketchGpuiView {
                         .bg(editor_bg)
                         .text_color(editor_fg);
                     let child_el =
-                        self.render_layout(child_root, child, focused_id, attach_focus, cx);
+                        self.render_layout(child_root, child, focused_id, attach_focus, rail_focusable, cx);
                     let mut slot = div().min_w_0().min_h_0();
                     {
                         let style = slot.style();
@@ -7434,16 +7474,19 @@ impl SketchGpuiView {
             .into_any_element()
     }
 
-    /// Inject the active tab's rail beside the split-tree content (spec-rail.md
-    /// §8). When no rail is open this is a no-op passthrough. `rail_focusable`
-    /// is false when an overlay owns focus — the rail still renders as
-    /// background but is not focusable (constraint §4).
+    /// Inject the active tab's rail beside the **focused leaf's** content
+    /// (spec-rail.md §8, adjusted: the rail is chrome local to the focused
+    /// pane, not the whole window — so in a split it sits against the focused
+    /// content, not at the window edge). `content_el` is the already-rendered
+    /// focused-leaf element. No-op passthrough when no rail is open.
+    /// `rail_focusable` is false when an overlay owns focus — the rail still
+    /// renders as background but is not focusable (constraint §4).
     ///
-    /// The rail's selectable content (outline entries) is re-derived from the
-    /// focused window here, every frame — cheap and always-fresh (spec §13).
-    fn wrap_with_rail(
+    /// The outline entries are re-derived once per frame in
+    /// `render_focused_window` before this runs (spec §13).
+    fn wrap_leaf_with_rail(
         &mut self,
-        screen_view: AnyElement,
+        content_el: AnyElement,
         rail_focusable: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -7453,11 +7496,8 @@ impl SketchGpuiView {
             .map(|t| t.rail.is_none())
             .unwrap_or(true)
         {
-            return screen_view;
+            return content_el;
         }
-
-        // Re-derive the outline (if the rail is an outline) before reading.
-        self.refresh_outline_rail();
 
         let (side, focused) = {
             let r = self
@@ -7470,7 +7510,7 @@ impl SketchGpuiView {
 
         let rail = self.render_rail(focused, cx);
 
-        let content_slot = div().flex_1().min_w_0().min_h_0().child(screen_view);
+        let content_slot = div().flex_1().min_w_0().min_h_0().child(content_el);
 
         let row = div().size_full().flex().flex_row().min_w_0().min_h_0();
         let row = match side {
@@ -7542,7 +7582,13 @@ impl SketchGpuiView {
 
         let top_bar = self.theme.top_bar;
         let rail_bg: Hsla = bg_or(top_bar, STATUS_BG);
-        let label_fg: Hsla = nc(self.theme.overlay.label);
+        // Unselected entry text: use the brighter overlay *foreground* rather
+        // than the dim `overlay.label` token — the label color reads too
+        // low-contrast against the rail background. `overlay.fg` is the same
+        // high-contrast body color the command menu uses for its entries.
+        let label_fg: Hsla = nc(self.theme.overlay.fg);
+        // Placeholder text ("(empty)", "(no outline)") stays intentionally dim.
+        let muted_fg: Hsla = nc(self.theme.overlay.label);
         let accent_fg: Hsla = nc(self.theme.overlay.accent);
         let selected_bg: Hsla = self.editor_bg();
         let selected_fg: Hsla = rgb(STATUS_FG).into();
@@ -7625,7 +7671,7 @@ impl SketchGpuiView {
                         div()
                             .px_2()
                             .py_1()
-                            .text_color(label_fg)
+                            .text_color(muted_fg)
                             .child(SharedString::new_static("  (empty)")),
                     );
                 } else {
@@ -7679,7 +7725,7 @@ impl SketchGpuiView {
                         div()
                             .px_2()
                             .py_1()
-                            .text_color(label_fg)
+                            .text_color(muted_fg)
                             .child(SharedString::new_static("(no outline)")),
                     );
                 } else {
@@ -10531,13 +10577,11 @@ impl Render for SketchGpuiView {
         // would shadow the rail's (spec §6, two-state model §5).
         let rail_focused = !has_overlay && self.rail_is_focused();
         let leaf_attach_focus = !has_overlay && !rail_focused;
+        // The rail is now injected beside the focused leaf *inside*
+        // `render_focused_window` (so it's local to the focused pane, not the
+        // whole window). It's focusable only when no overlay owns focus (§4).
         let screen_view: AnyElement =
-            self.render_focused_window(screen_root, leaf_attach_focus, cx);
-
-        // Slot the persistent side column (rail) between the split tree and
-        // the tab strip (spec-rail.md §8). No-op passthrough when no rail is
-        // open. The rail is focusable only when no overlay owns focus (§4).
-        let screen_view = self.wrap_with_rail(screen_view, !has_overlay, cx);
+            self.render_focused_window(screen_root, leaf_attach_focus, !has_overlay, cx);
 
         // When there's more than one tab, stack the tab strip above the
         // screen view. Single-tab workspaces render no strip — matches the
