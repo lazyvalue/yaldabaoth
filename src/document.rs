@@ -3,10 +3,35 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// One primitive text edit recorded for undo: at `start` (a rope char index in
+/// the state *before* this splice applied) the run of `removed` text was
+/// replaced by the `inserted` text.
+///
+/// This is the delta that finding #4 replaces the old whole-rope `before_text`
+/// snapshot with: storing only the affected region keeps every recorded edit
+/// O(edit) rather than O(document), so typing one character into a buffer that
+/// also holds a multi-thousand-line frozen transcript no longer snapshots the
+/// whole transcript per keystroke.
+#[derive(Debug, Clone)]
+struct Splice {
+    /// Char index where the edit began (in the pre-splice rope).
+    start: usize,
+    /// Text that occupied `[start, start + removed.chars().count())` before the
+    /// edit — what undo must put back.
+    removed: String,
+    /// Text the edit inserted at `start`. Undo removes
+    /// `[start, start + inserted.chars().count())`; redo re-inserts it. Stored
+    /// in full (still O(edit), never O(document)) so redo is exactly symmetric.
+    inserted: String,
+}
+
+/// Ordered deltas for one undo group, recorded in application order. Undo
+/// inverts them in reverse; redo re-applies them in forward order. Replaces the
+/// old `before_text: String` whole-rope snapshot — the snapshot state is now
+/// unrepresentable.
 #[derive(Debug, Clone)]
 pub struct UndoEntry {
-    /// Snapshot of the rope text before this undo group
-    before_text: String,
+    splices: Vec<Splice>,
     cursor_before_line: usize,
     cursor_before_col: usize,
     cursor_after_line: usize,
@@ -57,6 +82,36 @@ impl Document {
     fn touch(&mut self) {
         self.modified = true;
         self.edit_seq = self.edit_seq.wrapping_add(1);
+    }
+
+    /// Record one primitive splice into the pending undo group, if a group is
+    /// open. `start` is the char index, `removed_chars` the count of chars that
+    /// lived in `[start, start + removed_chars)` *before* the edit, and
+    /// `inserted` the text the edit places at `start`. Cost is
+    /// O(removed + inserted), never O(document) — the point of finding #4.
+    ///
+    /// Callers must invoke this *before* mutating the rope, so the removed text
+    /// can be read from the current (pre-edit) rope.
+    fn record_splice(&mut self, start: usize, removed_chars: usize, inserted: &str) {
+        if self.pending_undo.is_none() {
+            return;
+        }
+        let len = self.rope.len_chars();
+        let s = start.min(len);
+        let e = (start + removed_chars).min(len);
+        let removed = if s < e {
+            self.rope.slice(s..e).to_string()
+        } else {
+            String::new()
+        };
+        // Borrow after the immutable rope reads above are done.
+        if let Some(entry) = self.pending_undo.as_mut() {
+            entry.splices.push(Splice {
+                start: s,
+                removed,
+                inserted: inserted.to_string(),
+            });
+        }
     }
 
     pub fn rope(&self) -> &Rope {
@@ -140,6 +195,8 @@ impl Document {
 
     pub fn insert_char(&mut self, line: usize, col: usize, ch: char) {
         let char_idx = self.line_col_to_char(line, col);
+        let mut buf = [0u8; 4];
+        self.record_splice(char_idx, 0, ch.encode_utf8(&mut buf));
         self.rope.insert_char(char_idx, ch);
         self.touch();
         self.redo_stack.clear();
@@ -148,6 +205,7 @@ impl Document {
     pub fn delete_char(&mut self, line: usize, col: usize) {
         let char_idx = self.line_col_to_char(line, col);
         if char_idx < self.rope.len_chars() {
+            self.record_splice(char_idx, 1, "");
             self.rope.remove(char_idx..char_idx + 1);
             self.touch();
             self.redo_stack.clear();
@@ -160,6 +218,7 @@ impl Document {
         let s = start_char.min(len);
         let e = end_char.min(len);
         if s < e {
+            self.record_splice(s, e - s, "");
             self.rope.remove(s..e);
             self.touch();
             self.redo_stack.clear();
@@ -169,6 +228,7 @@ impl Document {
     /// Insert a string at a (line, col) position.
     pub fn insert_str(&mut self, line: usize, col: usize, text: &str) {
         let char_idx = self.line_col_to_char(line, col);
+        self.record_splice(char_idx, 0, text);
         self.rope.insert(char_idx, text);
         self.touch();
         self.redo_stack.clear();
@@ -179,6 +239,7 @@ impl Document {
     pub fn insert_str_at_char(&mut self, char_idx: usize, text: &str) {
         let len = self.rope.len_chars();
         let idx = char_idx.min(len);
+        self.record_splice(idx, 0, text);
         self.rope.insert(idx, text);
         self.touch();
         self.redo_stack.clear();
@@ -195,11 +256,13 @@ impl Document {
             self.rope.len_chars()
         };
         if start < end {
+            self.record_splice(start, end - start, "");
             self.rope.remove(start..end);
         } else if line > 0 {
             // Last line with no trailing newline — remove the newline before it
             let prev_end = self.rope.line_to_char(line);
             if prev_end > 0 {
+                self.record_splice(prev_end - 1, 1, "");
                 self.rope.remove(prev_end - 1..prev_end);
             }
         }
@@ -218,7 +281,11 @@ impl Document {
         if line_slice.len_chars() > 0 && line_slice.char(line_slice.len_chars() - 1) == '\n' {
             end_char -= 1;
         }
-        self.rope.remove(start..end_char);
+        if end_char > start {
+            self.record_splice(start, end_char - start, "");
+            self.rope.remove(start..end_char);
+        }
+        self.record_splice(start, 0, new_text);
         self.rope.insert(start, new_text);
         self.touch();
         self.redo_stack.clear();
@@ -237,7 +304,7 @@ impl Document {
         lockable_through_line: usize,
     ) {
         self.pending_undo = Some(UndoEntry {
-            before_text: self.rope.to_string(),
+            splices: Vec::new(),
             cursor_before_line: cursor_line,
             cursor_before_col: cursor_col,
             cursor_after_line: 0,
@@ -247,12 +314,51 @@ impl Document {
         });
     }
 
-    /// End an undo group. Pushes it to the undo stack.
+    /// End an undo group. Pushes it to the undo stack. A group that recorded no
+    /// splices (no actual text change) is dropped, matching the old behavior
+    /// where an identical before/after snapshot was a no-op on undo.
     pub fn end_undo_group(&mut self, cursor_line: usize, cursor_col: usize) {
         if let Some(mut entry) = self.pending_undo.take() {
+            if entry.splices.is_empty() {
+                return;
+            }
             entry.cursor_after_line = cursor_line;
             entry.cursor_after_col = cursor_col;
             self.undo_stack.push(entry);
+        }
+    }
+
+    /// Invert one group's splices in reverse application order, mutating the
+    /// rope back to its pre-group state. Cost is O(sum of edit sizes), never
+    /// O(document). Used by `undo`.
+    fn apply_inverse(&mut self, entry: &UndoEntry) {
+        for sp in entry.splices.iter().rev() {
+            let rm_end = (sp.start + sp.inserted.chars().count()).min(self.rope.len_chars());
+            let rm_start = sp.start.min(rm_end);
+            if rm_start < rm_end {
+                self.rope.remove(rm_start..rm_end);
+            }
+            if !sp.removed.is_empty() {
+                let at = sp.start.min(self.rope.len_chars());
+                self.rope.insert(at, &sp.removed);
+            }
+        }
+    }
+
+    /// Re-apply one group's splices in forward application order, mutating the
+    /// rope back to its post-group state. Cost is O(sum of edit sizes). Used by
+    /// `redo`.
+    fn apply_forward(&mut self, entry: &UndoEntry) {
+        for sp in entry.splices.iter() {
+            let rm_end = (sp.start + sp.removed.chars().count()).min(self.rope.len_chars());
+            let rm_start = sp.start.min(rm_end);
+            if rm_start < rm_end {
+                self.rope.remove(rm_start..rm_end);
+            }
+            if !sp.inserted.is_empty() {
+                let at = sp.start.min(self.rope.len_chars());
+                self.rope.insert(at, &sp.inserted);
+            }
         }
     }
 
@@ -264,10 +370,14 @@ impl Document {
         current_lockable_through_line: usize,
     ) -> Option<(usize, usize, Vec<(usize, usize)>, usize)> {
         let entry = self.undo_stack.pop()?;
-        // Save current state for redo (snapshot the editor's CURRENT frozen
-        // state so a future redo can restore what we're about to undo away).
+        // Invert the group's splices to walk the rope back to its pre-group
+        // state — O(edit), not O(document) (finding #4).
+        self.apply_inverse(&entry);
+        // Push a redo record. The same splices replay forward on redo; we only
+        // swap in the editor's CURRENT (post-group) frozen state as the state a
+        // future redo should restore, mirroring the old snapshot behavior.
         let redo_entry = UndoEntry {
-            before_text: self.rope.to_string(),
+            splices: entry.splices.clone(),
             cursor_before_line: entry.cursor_after_line,
             cursor_before_col: entry.cursor_after_col,
             cursor_after_line: entry.cursor_before_line,
@@ -276,8 +386,6 @@ impl Document {
             lockable_through_line_before: current_lockable_through_line,
         };
         self.redo_stack.push(redo_entry);
-        // Restore previous text
-        self.rope = Rope::from_str(&entry.before_text);
         self.modified = !self.undo_stack.is_empty();
         self.edit_seq = self.edit_seq.wrapping_add(1);
         Some((
@@ -295,8 +403,11 @@ impl Document {
         current_lockable_through_line: usize,
     ) -> Option<(usize, usize, Vec<(usize, usize)>, usize)> {
         let entry = self.redo_stack.pop()?;
+        // Push the undo record *before* re-applying, capturing the current
+        // (pre-group) frozen state so a later undo restores it — matching the
+        // old snapshot ordering.
         let undo_entry = UndoEntry {
-            before_text: self.rope.to_string(),
+            splices: entry.splices.clone(),
             cursor_before_line: entry.cursor_after_line,
             cursor_before_col: entry.cursor_after_col,
             cursor_after_line: entry.cursor_before_line,
@@ -305,7 +416,8 @@ impl Document {
             lockable_through_line_before: current_lockable_through_line,
         };
         self.undo_stack.push(undo_entry);
-        self.rope = Rope::from_str(&entry.before_text);
+        // Replay the group's splices forward to the post-group rope — O(edit).
+        self.apply_forward(&entry);
         self.modified = true;
         self.edit_seq = self.edit_seq.wrapping_add(1);
         Some((
@@ -333,5 +445,143 @@ impl Document {
         self.file_path = path.to_path_buf();
         self.modified = false;
         Ok(())
+    }
+
+    /// Test-only: total bytes the top undo-stack entry retains (removed +
+    /// inserted text across its splices). Guards finding #4: this must be
+    /// O(edit), not O(document).
+    #[cfg(test)]
+    pub fn last_undo_entry_bytes(&self) -> Option<usize> {
+        self.undo_stack.last().map(|e| {
+            e.splices
+                .iter()
+                .map(|s| s.removed.len() + s.inserted.len())
+                .sum()
+        })
+    }
+
+    #[cfg(test)]
+    pub fn undo_stack_len(&self) -> usize {
+        self.undo_stack.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(text: &str) -> Document {
+        Document::from_text(text.to_string(), PathBuf::from("test.md"))
+    }
+
+    /// Finding #4: the undo record for a single-char insert into a large
+    /// document must store O(edit) bytes, NOT a full-document snapshot.
+    #[test]
+    fn insert_undo_entry_is_o_edit_not_o_document() {
+        // A big "frozen transcript" plus a tiny compose line, all one Document.
+        let big = "lorem ipsum dolor sit amet\n".repeat(5000);
+        let mut d = doc(&big);
+        let n_bytes = d.len_bytes();
+        assert!(n_bytes > 100_000, "fixture must be large: {n_bytes}");
+
+        // Type one character inside an undo group (mirrors begin_insert).
+        d.begin_undo_group(0, 0, &[], 0);
+        d.insert_char(0, 0, 'X');
+        d.end_undo_group(0, 1);
+
+        let bytes = d.last_undo_entry_bytes().expect("one undo entry");
+        // One inserted char, nothing removed.
+        assert!(
+            bytes <= 8,
+            "undo entry must be O(edit) ({bytes} bytes), not O(document) ({n_bytes})"
+        );
+    }
+
+    #[test]
+    fn delete_range_undo_entry_is_o_edit() {
+        let big = "abcdefghij\n".repeat(4000);
+        let mut d = doc(&big);
+        let n_bytes = d.len_bytes();
+        d.begin_undo_group(0, 0, &[], 0);
+        d.delete_range(0, 5); // remove "abcde"
+        d.end_undo_group(0, 0);
+        let bytes = d.last_undo_entry_bytes().expect("entry");
+        assert!(bytes < 64, "delta should hold only the removed slice: {bytes}");
+        assert!(n_bytes > 40_000);
+    }
+
+    #[test]
+    fn undo_redo_roundtrip_insert() {
+        let mut d = doc("hello\nworld\n");
+        let before = d.full_text();
+        d.begin_undo_group(0, 5, &[], 0);
+        d.insert_str(0, 5, " there");
+        d.end_undo_group(0, 11);
+        let after = d.full_text();
+        assert_eq!(after, "hello there\nworld\n");
+
+        d.undo(&[], 0);
+        assert_eq!(d.full_text(), before);
+        d.redo(&[], 0);
+        assert_eq!(d.full_text(), after);
+        d.undo(&[], 0);
+        assert_eq!(d.full_text(), before);
+    }
+
+    #[test]
+    fn undo_redo_roundtrip_multi_op_group() {
+        // A group with several mixed ops must undo/redo as one atomic step.
+        let mut d = doc("one\ntwo\nthree\n");
+        let before = d.full_text();
+        d.begin_undo_group(0, 0, &[], 0);
+        d.insert_str(0, 0, "ZERO\n"); // insert a line
+        d.delete_line(3); // delete a line ("two" shifted to idx? recompute)
+        d.replace_line_text(0, "AAAA"); // overwrite line 0
+        d.end_undo_group(1, 0);
+        let after = d.full_text();
+        assert_ne!(after, before);
+
+        d.undo(&[], 0);
+        assert_eq!(d.full_text(), before, "multi-op group must fully revert");
+        d.redo(&[], 0);
+        assert_eq!(d.full_text(), after, "redo must replay the whole group");
+    }
+
+    #[test]
+    fn undo_redo_roundtrip_unicode() {
+        let mut d = doc("héllo 世界\n");
+        let before = d.full_text();
+        d.begin_undo_group(0, 0, &[], 0);
+        d.insert_str(0, 0, "→★ "); // multibyte insert
+        d.delete_char(0, 3);
+        d.end_undo_group(0, 0);
+        let after = d.full_text();
+        d.undo(&[], 0);
+        assert_eq!(d.full_text(), before);
+        d.redo(&[], 0);
+        assert_eq!(d.full_text(), after);
+    }
+
+    #[test]
+    fn empty_group_is_dropped() {
+        let mut d = doc("x\n");
+        d.begin_undo_group(0, 0, &[], 0);
+        // no edits
+        d.end_undo_group(0, 0);
+        assert_eq!(d.undo_stack_len(), 0, "no-op group must not push an entry");
+    }
+
+    #[test]
+    fn frozen_state_restored_on_undo() {
+        let mut d = doc("a\nb\nc\n");
+        let frozen = vec![(0usize, 2usize)];
+        d.begin_undo_group(0, 0, &frozen, 1);
+        d.insert_str(2, 0, "X\n");
+        d.end_undo_group(0, 0);
+        // Undo with a *different* current frozen state; we should get the
+        // snapshotted pre-group frozen back.
+        let (_l, _c, restored_frozen, restored_lockable) = d.undo(&[(0, 5)], 3).unwrap();
+        assert_eq!(restored_frozen, frozen);
+        assert_eq!(restored_lockable, 1);
     }
 }
