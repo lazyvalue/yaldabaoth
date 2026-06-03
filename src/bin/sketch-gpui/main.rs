@@ -75,6 +75,7 @@ use highlight_cache::{HighlightCache, LineHl};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::process;
 use std::time::Duration;
 
@@ -1430,6 +1431,7 @@ fn re_render_layout_docs(layout: &mut workspace::Layout<WindowContent>, theme: &
                 let text = std::fs::read_to_string(&path).unwrap_or_default();
                 let doc = Document::from_text(text, path.clone());
                 d.blocks = render_with_wiki(&doc.full_text(), theme, Some(&path));
+                d.invalidate_blocks_snapshot();
             }
             // Browser's underlying-stashed content is also restyled if it
             // happens to be a Doc — otherwise reverting via Esc lands on
@@ -1441,6 +1443,7 @@ fn re_render_layout_docs(layout: &mut workspace::Layout<WindowContent>, theme: &
                         let text = std::fs::read_to_string(&path).unwrap_or_default();
                         let doc = Document::from_text(text, path.clone());
                         d.blocks = render_with_wiki(&doc.full_text(), theme, Some(&path));
+                        d.invalidate_blocks_snapshot();
                     }
                 }
             }
@@ -2189,7 +2192,10 @@ fn restore_content(
                 blocks,
                 file_label: label,
                 cursor_block: 0,
-                scroll_handle: ScrollHandle::new(),
+                list_state: DocState::new_list_state(0),
+                list_item_count: std::cell::Cell::new(0),
+                blocks_snapshot: RefCell::new(None),
+                last_cursor_block: std::cell::Cell::new(None),
                 edit_cache: None,
             })
         }
@@ -3717,18 +3723,72 @@ struct DocState {
     blocks: Vec<RenderedBlock>,
     file_label: SharedString,
     cursor_block: usize,
-    /// Native scroll handle for the body. Renders all blocks into one
-    /// overflow-y-scroll container — j/k/ctrl-d/u/g/G drive
-    /// `scroll_handle.scroll_to_item(idx)` instead of slicing the block
-    /// list, which lets users actually reach the bottom of long files
-    /// (the prior block-skip approach couldn't reveal content below the
-    /// last block when that block alone overflowed the viewport).
-    scroll_handle: ScrollHandle,
+    /// Variable-height virtualized list driving the doc body. Only the
+    /// visible block window is built/laid-out per frame (not one element
+    /// per block, as the old `overflow_y_scroll` container did), so render
+    /// is O(visible) instead of O(blocks+spans). j/k/g/G/ctrl-d/u navigation
+    /// reveals the focused block via `scroll_to_reveal_item`. Spliced/reset
+    /// to `blocks.len()` each render.
+    list_state: gpui::ListState,
+    /// Item count currently registered in `list_state`; lets render splice
+    /// only when the block count changed. `Cell` because `render_doc` takes
+    /// `&DocState` (the list itself splices through `&self`).
+    list_item_count: std::cell::Cell<usize>,
+    /// O(1)-cloneable snapshot of `blocks` handed to the `'static` list
+    /// render closure. Rebuilt lazily (a single full clone) only when the
+    /// block list changes — invalidated via `invalidate_blocks_snapshot`
+    /// wherever `blocks` is reassigned. Steady-state frames pay only a
+    /// pointer clone, matching the agent transcript's `lines_rc` pattern.
+    blocks_snapshot: RefCell<Option<Rc<Vec<RenderedBlock>>>>,
+    /// `cursor_block` value last revealed during render. When the focused
+    /// block changes, render re-issues `scroll_to_reveal_item` with the
+    /// freshly-spliced item count — catching nav actions that fired before
+    /// the list was populated (stale count) and keeping the cursor bar
+    /// on-screen. `None` until the first render.
+    last_cursor_block: std::cell::Cell<Option<usize>>,
     /// Stashed editor from a prior Edit-mode session in the same file,
     /// preserved across Ctrl-V round-trips so unsaved edits aren't lost
     /// when previewing the rendered view. `None` for files that have
     /// only been viewed (never edited) or that came in fresh from disk.
     edit_cache: Option<EditState>,
+}
+
+impl DocState {
+    /// A fresh, empty variable-height `ListState` for a new Doc pane. Mirrors
+    /// the agent transcript's list construction; `Top` alignment keeps the
+    /// document anchored at its first block (unlike the agent's `Bottom`).
+    fn new_list_state(count: usize) -> gpui::ListState {
+        gpui::ListState::new(count, gpui::ListAlignment::Top, gpui::px(512.0))
+    }
+
+    /// Drop the cached `Rc` snapshot so the next render rebuilds it from the
+    /// current `blocks`. Call after any mutation of `blocks`.
+    fn invalidate_blocks_snapshot(&self) {
+        self.blocks_snapshot.borrow_mut().take();
+    }
+
+    /// O(1) pointer clone of the blocks snapshot, rebuilding it (one full
+    /// clone) on the first call after an invalidation.
+    fn blocks_rc(&self) -> Rc<Vec<RenderedBlock>> {
+        let mut slot = self.blocks_snapshot.borrow_mut();
+        if let Some(rc) = slot.as_ref() {
+            return rc.clone();
+        }
+        let rc = Rc::new(self.blocks.clone());
+        *slot = Some(rc.clone());
+        rc
+    }
+
+    /// Scroll the virtualized list so `idx` is on-screen. Guarded against a
+    /// stale item count (the list is spliced during render; a nav action that
+    /// fires before the first render of a freshly-loaded doc would otherwise
+    /// index past the registered count). The next render also re-reveals via
+    /// `last_cursor_block`, so an early no-op here is harmless.
+    fn reveal_block(&self, idx: usize) {
+        if idx < self.list_item_count.get() {
+            self.list_state.scroll_to_reveal_item(idx);
+        }
+    }
 }
 
 /// State held while the user is browsing the filesystem.
@@ -5184,7 +5244,10 @@ struct SketchGpuiView {
     /// StyledText, cleared at the top of every doc render. Mouse handlers on
     /// the doc body look up `(block_idx, line_idx)` here to hit-test against
     /// the layout's bounds and to map pixels → char offsets.
-    line_layouts: RefCell<HashMap<(usize, usize), TextLayout>>,
+    /// Shared via `Rc` so the virtualized doc `gpui::list` render closure (which
+    /// must be `'static`) can hold a clone and populate it as it builds visible
+    /// lines, while `doc_pos_at` reads the same map between frames.
+    line_layouts: Rc<RefCell<HashMap<(usize, usize), TextLayout>>>,
     /// Session server client. When `Some`, agent sessions are created and
     /// managed through the session server (owned subprocesses survive GUI
     /// restarts). Activated by `SKETCH_SESSION_SERVER=1`. When `None`, the
@@ -5224,7 +5287,10 @@ impl SketchGpuiView {
             blocks,
             file_label: label.clone(),
             cursor_block: 0,
-            scroll_handle: ScrollHandle::new(),
+            list_state: DocState::new_list_state(0),
+            list_item_count: std::cell::Cell::new(0),
+            blocks_snapshot: RefCell::new(None),
+            last_cursor_block: std::cell::Cell::new(None),
             edit_cache: None,
         });
         Self {
@@ -5242,7 +5308,7 @@ impl SketchGpuiView {
             rename_overlay: None,
             workspace: workspace::Workspace::with_initial(initial),
             doc_selection: None,
-            line_layouts: RefCell::new(HashMap::new()),
+            line_layouts: Rc::new(RefCell::new(HashMap::new())),
             session_server: connect_session_server(),
             agent_status_position: AgentStatusPosition::default(),
             is_candidate: is_candidate_launch(),
@@ -5269,7 +5335,7 @@ impl SketchGpuiView {
             rename_overlay: None,
             workspace: workspace::Workspace::with_initial(initial),
             doc_selection: None,
-            line_layouts: RefCell::new(HashMap::new()),
+            line_layouts: Rc::new(RefCell::new(HashMap::new())),
             session_server: connect_session_server(),
             agent_status_position: AgentStatusPosition::default(),
             is_candidate: is_candidate_launch(),
@@ -5405,7 +5471,10 @@ impl SketchGpuiView {
             blocks,
             file_label: label,
             cursor_block: 0,
-            scroll_handle: ScrollHandle::new(),
+            list_state: DocState::new_list_state(0),
+            list_item_count: std::cell::Cell::new(0),
+            blocks_snapshot: RefCell::new(None),
+            last_cursor_block: std::cell::Cell::new(None),
             edit_cache: None,
         });
 
@@ -5477,7 +5546,7 @@ impl SketchGpuiView {
         if let Some(d) = self.doc_mut() {
             if d.cursor_block + 1 < d.blocks.len() {
                 d.cursor_block += 1;
-                d.scroll_handle.scroll_to_item(d.cursor_block);
+                d.reveal_block(d.cursor_block);
                 cx.notify();
             }
         }
@@ -5486,7 +5555,7 @@ impl SketchGpuiView {
         if let Some(d) = self.doc_mut() {
             if d.cursor_block > 0 {
                 d.cursor_block -= 1;
-                d.scroll_handle.scroll_to_item(d.cursor_block);
+                d.reveal_block(d.cursor_block);
                 cx.notify();
             }
         }
@@ -5494,14 +5563,14 @@ impl SketchGpuiView {
     fn page_down(&mut self, _: &ScrollPageDown, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(d) = self.doc_mut() {
             d.cursor_block = (d.cursor_block + 8).min(d.blocks.len().saturating_sub(1));
-            d.scroll_handle.scroll_to_top_of_item(d.cursor_block);
+            d.reveal_block(d.cursor_block);
             cx.notify();
         }
     }
     fn page_up(&mut self, _: &ScrollPageUp, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(d) = self.doc_mut() {
             d.cursor_block = d.cursor_block.saturating_sub(8);
-            d.scroll_handle.scroll_to_top_of_item(d.cursor_block);
+            d.reveal_block(d.cursor_block);
             cx.notify();
         }
     }
@@ -5509,7 +5578,7 @@ impl SketchGpuiView {
         if let Some(d) = self.doc_mut() {
             if d.cursor_block + 1 < d.blocks.len() {
                 d.cursor_block += 1;
-                d.scroll_handle.scroll_to_item(d.cursor_block);
+                d.reveal_block(d.cursor_block);
                 cx.notify();
             }
         }
@@ -5518,7 +5587,7 @@ impl SketchGpuiView {
         if let Some(d) = self.doc_mut() {
             if d.cursor_block > 0 {
                 d.cursor_block -= 1;
-                d.scroll_handle.scroll_to_item(d.cursor_block);
+                d.reveal_block(d.cursor_block);
                 cx.notify();
             }
         }
@@ -5526,7 +5595,7 @@ impl SketchGpuiView {
     fn cursor_top(&mut self, _: &CursorTop, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(d) = self.doc_mut() {
             d.cursor_block = 0;
-            d.scroll_handle.scroll_to_top_of_item(0);
+            d.reveal_block(0);
             cx.notify();
         }
     }
@@ -5534,7 +5603,7 @@ impl SketchGpuiView {
         if let Some(d) = self.doc_mut() {
             if !d.blocks.is_empty() {
                 d.cursor_block = d.blocks.len() - 1;
-                d.scroll_handle.scroll_to_item(d.cursor_block);
+                d.reveal_block(d.cursor_block);
                 cx.notify();
             }
         }
@@ -6214,7 +6283,10 @@ impl SketchGpuiView {
                 blocks,
                 file_label: label,
                 cursor_block: 0,
-                scroll_handle: ScrollHandle::new(),
+                list_state: DocState::new_list_state(0),
+                list_item_count: std::cell::Cell::new(0),
+                blocks_snapshot: RefCell::new(None),
+                last_cursor_block: std::cell::Cell::new(None),
                 edit_cache: None,
             })
         }
@@ -6580,7 +6652,7 @@ impl SketchGpuiView {
             match self.workspace.focused_content_mut() {
                 Some(WindowContent::Doc(d)) => {
                     d.cursor_block = idx.min(d.blocks.len().saturating_sub(1));
-                    d.scroll_handle.scroll_to_item(d.cursor_block);
+                    d.reveal_block(d.cursor_block);
                 }
                 Some(WindowContent::Edit(e)) => {
                     let lines = e.editor.line_count();
@@ -6665,6 +6737,43 @@ impl SketchGpuiView {
         (e.highlight_cache.last_recomputed, e.highlight_cache.last_was_skip)
     }
 
+    /// Test-only: install a fresh Doc screen rendering `blocks` so the headless
+    /// harness can drive the real virtualized doc body. Skips the boot splash
+    /// (otherwise `render()` builds the splash screen, not the doc list) and
+    /// resets the per-frame block-build counter so the latency gate measures
+    /// from a clean slate.
+    #[cfg(test)]
+    fn test_open_doc(&mut self, markdown: &str) {
+        let blocks = render_with_wiki(markdown, &self.theme, None);
+        self.set_screen(WindowContent::Doc(DocState {
+            blocks,
+            file_label: SharedString::new_static("harness.md"),
+            cursor_block: 0,
+            list_state: DocState::new_list_state(0),
+            list_item_count: std::cell::Cell::new(0),
+            blocks_snapshot: RefCell::new(None),
+            last_cursor_block: std::cell::Cell::new(None),
+            edit_cache: None,
+        }));
+        // The real doc body only renders once the splash deadline passes; clear
+        // it so the harness exercises the list path immediately.
+        self.splash_until = None;
+        Self::test_reset_doc_block_builds();
+    }
+
+    /// Test-only: zero the virtualized-doc block-build counter.
+    #[cfg(test)]
+    fn test_reset_doc_block_builds() {
+        DOC_BLOCK_BUILDS.with(|c| c.set(0));
+    }
+
+    /// Test-only: how many `block_element`s the doc list built since the last
+    /// reset — the O(visible) latency-gate observable.
+    #[cfg(test)]
+    fn test_doc_block_builds() -> usize {
+        DOC_BLOCK_BUILDS.with(|c| c.get())
+    }
+
     /// Swap from Doc view into Edit screen with the Code (raw markdown) view.
     fn enter_edit(&mut self, _: &EnterEdit, _w: &mut Window, cx: &mut Context<Self>) {
         self.enter_edit_with(EditView::Code, cx);
@@ -6719,7 +6828,10 @@ impl SketchGpuiView {
                 blocks: Vec::new(),
                 file_label: SharedString::new_static(""),
                 cursor_block: 0,
-                scroll_handle: ScrollHandle::new(),
+                list_state: DocState::new_list_state(0),
+                list_item_count: std::cell::Cell::new(0),
+                blocks_snapshot: RefCell::new(None),
+                last_cursor_block: std::cell::Cell::new(None),
                 edit_cache: None,
             }),
         )
@@ -6734,7 +6846,10 @@ impl SketchGpuiView {
                     blocks,
                     file_label,
                     cursor_block: 0,
-                    scroll_handle: ScrollHandle::new(),
+                    list_state: DocState::new_list_state(0),
+                    list_item_count: std::cell::Cell::new(0),
+                    blocks_snapshot: RefCell::new(None),
+                    last_cursor_block: std::cell::Cell::new(None),
                     edit_cache: Some(edit),
                 }));
             }
@@ -6818,7 +6933,10 @@ impl SketchGpuiView {
             blocks,
             file_label: label,
             cursor_block: 0,
-            scroll_handle: ScrollHandle::new(),
+            list_state: DocState::new_list_state(0),
+            list_item_count: std::cell::Cell::new(0),
+            blocks_snapshot: RefCell::new(None),
+            last_cursor_block: std::cell::Cell::new(None),
             edit_cache: None,
         }));
         self.doc_selection = None;
@@ -6890,7 +7008,10 @@ impl SketchGpuiView {
                     blocks,
                     file_label: label,
                     cursor_block: 0,
-                    scroll_handle: ScrollHandle::new(),
+                    list_state: DocState::new_list_state(0),
+                    list_item_count: std::cell::Cell::new(0),
+                    blocks_snapshot: RefCell::new(None),
+                    last_cursor_block: std::cell::Cell::new(None),
                     edit_cache: None,
                 }));
             }
@@ -9413,7 +9534,10 @@ impl SketchGpuiView {
                 blocks: Vec::new(),
                 file_label: SharedString::new_static(""),
                 cursor_block: 0,
-                scroll_handle: ScrollHandle::new(),
+                list_state: DocState::new_list_state(0),
+                list_item_count: std::cell::Cell::new(0),
+                blocks_snapshot: RefCell::new(None),
+                last_cursor_block: std::cell::Cell::new(None),
                 edit_cache: None,
             }))
             .expect("workspace has no focused window");
@@ -12114,6 +12238,14 @@ impl Render for SketchGpuiView {
     }
 }
 
+/// Test-only counter of how many `block_element`s the virtualized doc list
+/// builds. The latency gate (verify_harness) asserts this stays O(visible) —
+/// a few dozen for a 3000-block doc — proving render is no longer O(document).
+#[cfg(test)]
+thread_local! {
+    static DOC_BLOCK_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl SketchGpuiView {
     fn render_doc(
         &self,
@@ -12133,23 +12265,78 @@ impl SketchGpuiView {
             let path = PathBuf::from(d.file_label.as_ref());
             path.parent().map(|p| p.to_path_buf())
         };
-        let ctx = RenderCtx {
-            theme: &self.theme,
-            body_font: self.body_font.clone(),
-            code_font: self.code_font.clone(),
-            text_scale: self.text_scale,
-            cursor_block: Some(d.cursor_block),
-            doc_selection: self.doc_selection,
-            line_layouts: Some(&self.line_layouts),
-            current_block: None,
-            weak_view: Some(cx.entity().downgrade()),
-            doc_dir,
+        // ---- Virtualized doc body (audit #1) ----
+        //
+        // The body is a `gpui::list`: only the visible block window is built
+        // and laid out per frame, not one element per block. This makes a
+        // `cx.notify()` (j/k move, scroll, theme/zoom, and especially every
+        // mouse-move during a selection drag) O(visible) instead of
+        // O(blocks+spans). Audit #2 falls out of this — `line_layouts` only
+        // holds the visible lines, so `doc_pos_at`'s scan collapses to
+        // O(visible) too.
+
+        // Splice the list to the current block count. `blocks` only changes on
+        // load / reload / edit-flush (each calls `invalidate_blocks_snapshot`),
+        // so a count change is the reliable trigger; a plain `reset` is correct
+        // and cheap relative to the per-row work it gates. Must run EVERY frame.
+        let new_count = d.blocks.len();
+        if new_count != d.list_item_count.get() {
+            d.list_state.reset(new_count);
+            d.list_item_count.set(new_count);
+            // Force a re-reveal below (the reset cleared scroll position).
+            d.last_cursor_block.set(None);
+        }
+        // Keep the focused block on-screen when it changed (this also catches
+        // nav actions whose `reveal_block` ran against a stale count before the
+        // list was first populated).
+        if d.last_cursor_block.get() != Some(d.cursor_block) {
+            d.last_cursor_block.set(Some(d.cursor_block));
+            if d.cursor_block < new_count {
+                d.list_state.scroll_to_reveal_item(d.cursor_block);
+            }
+        }
+
+        // Owned snapshots for the `'static` per-row render closure — all cheap
+        // (Theme clone once per frame, Rc pointer clones, SharedString refcount
+        // bumps, Copy values). The closure rebuilds a `RenderCtx` borrowing
+        // these owned locals for each visible block it constructs.
+        let theme = self.theme.clone();
+        let body_font = self.body_font.clone();
+        let code_font = self.code_font.clone();
+        let text_scale = self.text_scale;
+        let cursor_block = d.cursor_block;
+        let doc_selection = self.doc_selection;
+        let line_layouts = self.line_layouts.clone();
+        let weak_view = cx.entity().downgrade();
+        let blocks_rc = d.blocks_rc();
+
+        let render_fn = move |idx: usize, _w: &mut Window, _app: &mut App| -> AnyElement {
+            let Some(block) = blocks_rc.get(idx) else {
+                return div().into_any_element();
+            };
+            #[cfg(test)]
+            DOC_BLOCK_BUILDS.with(|c| c.set(c.get() + 1));
+            let ctx = RenderCtx {
+                theme: &theme,
+                body_font: body_font.clone(),
+                code_font: code_font.clone(),
+                text_scale,
+                cursor_block: Some(cursor_block),
+                doc_selection,
+                line_layouts: Some(&line_layouts),
+                current_block: None,
+                weak_view: Some(weak_view.clone()),
+                doc_dir: doc_dir.clone(),
+            };
+            block_element(&ctx, idx, block)
         };
 
-        // Render every block. The body div is overflow-y-scroll and tracks
-        // a ScrollHandle, so trackpad/mouse scrolling works natively and
-        // j/k/g/G drive `scroll_to_item(cursor_block)` programmatically.
-        let mut body = div()
+        // View-mode mouse selection: anchor on left MouseDown, update head on
+        // every MouseMove while a button is held, release on MouseUp. The
+        // wrapping doc body is the listener for all three; hit-testing falls
+        // through to the registered per-line TextLayouts in `self.line_layouts`
+        // (now populated only for the visible window — audit #2).
+        let body = div()
             .id("doc-body")
             .flex()
             .flex_col()
@@ -12157,19 +12344,9 @@ impl SketchGpuiView {
             .min_h_0()
             .px_8()
             .py_4()
-            .overflow_y_scroll()
-            .track_scroll(&d.scroll_handle)
             .text_size(px(14.0 * self.text_scale))
             .font_family(self.body_font.clone())
-            .text_color(self.editor_fg());
-        for (i, b) in d.blocks.iter().enumerate() {
-            body = body.child(block_element(&ctx, i, b));
-        }
-        // View-mode mouse selection: anchor on left MouseDown, update head on
-        // every MouseMove while a button is held, release on MouseUp. The
-        // doc body is the listener for all three; hit-testing falls through
-        // to the registered per-line TextLayouts in `self.line_layouts`.
-        body = body
+            .text_color(self.editor_fg())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, ev: &MouseDownEvent, _w, cx| {
@@ -12184,6 +12361,12 @@ impl SketchGpuiView {
                 cx.listener(|view, ev: &MouseUpEvent, _w, cx| {
                     view.doc_mouse_up(ev, cx);
                 }),
+            )
+            .child(
+                gpui::list(d.list_state.clone(), render_fn)
+                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                    .flex_1()
+                    .w_full(),
             );
 
         let top = self.theme.top_bar;
