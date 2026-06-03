@@ -7,6 +7,18 @@ use crate::cursor::CursorPos;
 use crate::document::Document;
 use crate::tree::{BlockInfo, TreeState};
 
+/// Test-only instrumentation for finding #9: counts every anchor visited by the
+/// O(transcript) reverse scan in `last_line_with_meta`. The `last_llm_line`
+/// cache should drive this to 0 on the common "continue current turn" streaming
+/// path, proving per-chunk work is independent of transcript size.
+///
+/// Thread-local so `cargo test`'s parallel runner doesn't cross-contaminate the
+/// count between tests — the scan always runs on the calling test's thread.
+#[cfg(test)]
+thread_local! {
+    static ANCHOR_SCAN_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // =============================================================================
 // LineAnchor + LineMetadata
 // =============================================================================
@@ -296,12 +308,20 @@ impl EditorCore {
     /// Walk anchors in descending line order, returning the highest line whose
     /// `T` metadata equals `tag`. Used by `append_llm_chunk` to find the tail
     /// of an in-progress LLM turn.
+    ///
+    /// This is the O(transcript) reverse scan that finding #9's `last_llm_line`
+    /// cache exists to avoid on the hot streaming path. The `ANCHOR_SCAN_VISITS`
+    /// counter (test builds only) tallies every anchor this touches so a test
+    /// can assert the cached common case visits 0 — i.e. work is independent of
+    /// transcript size N.
     fn last_line_with_meta<T: Any + Send + Sync + PartialEq>(
         &self,
         tag: &T,
     ) -> Option<usize> {
         let view = self.metadata::<T>();
         for (&line, &anchor) in self.line_anchors.by_line.iter().rev() {
+            #[cfg(test)]
+            ANCHOR_SCAN_VISITS.with(|c| c.set(c.get() + 1));
             if let Some(v) = view.get(anchor) {
                 if v == tag {
                     return Some(line);
@@ -1601,6 +1621,13 @@ mod tests {
         Tool(usize),
     }
 
+    fn anchor_scan_visits() -> usize {
+        ANCHOR_SCAN_VISITS.with(|c| c.get())
+    }
+    fn reset_anchor_scan_visits() {
+        ANCHOR_SCAN_VISITS.with(|c| c.set(0));
+    }
+
     /// Mimic `main.rs::anchor_for_new_tool_call` + its `Tool(k)` re-tag: a
     /// tool block lands on its own dedicated blank line tagged with a turn
     /// distinct from the surrounding `Llm` prose.
@@ -1830,6 +1857,101 @@ mod tests {
         assert!(!ed.is_frozen_line(2));
         // The new chunk line (line 1) should be frozen.
         assert!(ed.is_frozen_line(1));
+    }
+
+    // ---- Finding #9: O(1) llm insertion-point cache -----
+
+    /// Build an N-line transcript with a frozen, already-tagged in-flight
+    /// `Llm(turn)` line at the very tail — the state during active streaming.
+    fn editor_with_inflight_turn(n_lines: usize, turn: usize) -> Editor {
+        let mut text = String::new();
+        for i in 0..n_lines.saturating_sub(1) {
+            text.push_str(&format!("frozen transcript line {i}\n"));
+        }
+        text.push_str("inflight ");
+        let mut ed = new_editor(&text);
+        let last = ed.document().line_count().saturating_sub(1);
+        // Freeze + tag every prior line so the reverse scan, if it ran, would
+        // have to walk all N anchors before finding the tail.
+        for l in 0..=last {
+            ed.add_frozen_lines(l, l + 1);
+            let a = ed.anchor_for_line(l);
+            ed.metadata_mut::<TurnId>().insert(a, TurnId::Llm(turn));
+        }
+        // Prime the cache as `append_llm_chunk` would after its first chunk.
+        ed.core.set_cached_llm_line(last);
+        ed
+    }
+
+    #[test]
+    fn anchor_scan_cache_makes_streaming_independent_of_transcript_size() {
+        // Two transcripts differing only in N. Per-chunk work (anchor-scan
+        // visits) must be identical — i.e. independent of N — because the
+        // cached tail short-circuits the reverse scan entirely.
+        for &n in &[10usize, 2000usize] {
+            let mut ed = editor_with_inflight_turn(n, 1);
+            reset_anchor_scan_visits();
+            for k in 0..50 {
+                ed.append_llm_chunk(TurnId::Llm(1), &format!("c{k} "));
+            }
+            assert_eq!(
+                anchor_scan_visits(),
+                0,
+                "cached common case must never fall back to the O(N) reverse \
+                 scan (N={n})"
+            );
+            // Correctness: the appended chunks all landed on the tail line.
+            let last = ed.document().line_count() - 1;
+            let tail = ed.document().line_text(last);
+            assert!(tail.starts_with("inflight c0 "), "tail={tail:?}");
+            assert!(tail.contains("c49 "), "tail={tail:?}");
+        }
+    }
+
+    #[test]
+    fn anchor_scan_cache_invalidates_then_rebuilds_on_delete() {
+        let mut ed = editor_with_inflight_turn(200, 1);
+        // A delete that consumes the cached tail line must invalidate the
+        // cache, forcing exactly one fallback scan; correctness must hold.
+        let last = ed.document().line_count() - 1;
+        let start = ed.document().line_col_to_char(last - 1, 0);
+        let end = ed.document().rope().len_chars();
+        ed.programmatic_delete(start, end); // removes the tail (cached) line
+
+        reset_anchor_scan_visits();
+        ed.append_llm_chunk(TurnId::Llm(1), "after delete\n");
+        // The fallback scan ran at least once (cache was invalidated)...
+        assert!(
+            anchor_scan_visits() > 0,
+            "delete consuming the cached line must invalidate the cache"
+        );
+
+        // ...and subsequent chunks are O(1) again (cache rebuilt).
+        reset_anchor_scan_visits();
+        ed.append_llm_chunk(TurnId::Llm(1), "and more\n");
+        assert_eq!(
+            anchor_scan_visits(),
+            0,
+            "cache must be rebuilt after the fallback scan"
+        );
+    }
+
+    #[test]
+    fn anchor_scan_cache_matches_uncached_result() {
+        // Cached and cold paths must produce byte-identical transcripts.
+        let mut cached = new_editor("");
+        for k in 0..30 {
+            cached.append_llm_chunk(TurnId::Llm(1), &format!("w{k} "));
+        }
+
+        let mut cold = new_editor("");
+        for k in 0..30 {
+            // Defeat the cache before each chunk to force the reverse scan.
+            cold.core.clear_cached_llm_line();
+            cold.append_llm_chunk(TurnId::Llm(1), &format!("w{k} "));
+        }
+
+        assert_eq!(cached.document().full_text(), cold.document().full_text());
     }
 
     // ---- Comprehensive buffer-pumping / append_llm_chunk tests -----
