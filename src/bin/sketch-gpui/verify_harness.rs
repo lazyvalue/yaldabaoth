@@ -15,7 +15,7 @@
 
 #![cfg(test)]
 
-use gpui::{AppContext, TestAppContext};
+use gpui::{point, px, AppContext, TestAppContext};
 
 use crate::SketchGpuiView;
 use sketch::theme::Theme;
@@ -206,6 +206,61 @@ fn doc_view_render_is_o_visible(cx: &mut TestAppContext) {
         after_move <= VISIBLE_CEILING,
         "doc render after a cursor-block move must stay O(visible) (<= {VISIBLE_CEILING}), got {after_move}"
     );
+}
+
+/// Regression gate for the `TextLayout::bounds()` panic (runtime-only class the
+/// other gates missed). `doc_pos_at` (mouse hit-testing) iterates **every**
+/// entry in `line_layouts` and calls `.bounds()`, which panics on a layout that
+/// was measured but not prepainted. `ListSizingBehavior::Auto` measured ALL doc
+/// lines, registering thousands of un-prepainted layouts → crash on the next
+/// mouse-over-doc. This drives a hit-test that touches the whole sink to prove
+/// every registered layout is painted (bounds set).
+#[gpui::test]
+fn doc_hit_test_never_touches_unpainted_layout(cx: &mut TestAppContext) {
+    const N: usize = 3000;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        let mut v = SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        );
+        let mut md = String::with_capacity(N * 16);
+        for i in 0..N {
+            md.push_str(&format!("Paragraph block number {i}.\n\n"));
+        }
+        v.test_open_doc(&md);
+        v
+    });
+    vcx.run_until_parked();
+
+    // Sanity: the virtualized list actually rendered lines (not a collapsed,
+    // zero-height body — which removing `Auto` could cause if the parent didn't
+    // bound the height). Otherwise the hit-test below would be vacuous.
+    let registered = view.update(vcx, |v, _cx| v.line_layouts.borrow().len());
+    assert!(registered > 0, "doc body rendered no lines (list collapsed?)");
+    assert!(
+        registered < N,
+        "registered {registered} of {N} layouts — measuring all lines again (Auto regressed?)"
+    );
+
+    // Hit-test FAR BELOW all content: `doc_pos_at` must iterate every registered
+    // layout and call `.bounds()` on each. If any registered line was measured
+    // but not prepainted, this panics → test fails. With visible-only measuring
+    // every registered layout is painted, so it returns None safely.
+    let miss = view.update(vcx, |v, _cx| v.doc_pos_at(point(px(40.0), px(1_000_000.0))));
+    assert!(miss.is_none(), "a point far below all content hits no line");
+
+    // And hit-testing still resolves: a point inside a painted line yields a pos.
+    let p = view.update(vcx, |v, _cx| {
+        let ll = v.line_layouts.borrow();
+        let b = ll.values().next().expect("a painted line").bounds();
+        point(b.left() + px(2.0), b.top() + px(2.0))
+    });
+    let hit = view.update(vcx, |v, _cx| v.doc_pos_at(p));
+    assert!(hit.is_some(), "a point inside a painted line resolves to a DocPos");
 }
 
 // NEXT STONE (not yet built): action-level smokes (e.g. simulate "cmd-b",

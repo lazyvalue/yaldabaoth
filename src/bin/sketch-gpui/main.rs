@@ -86,7 +86,8 @@ use gpui::{
     ListScrollEvent, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
     Render, ScrollHandle, SharedString, StatefulInteractiveElement, StrikethroughStyle,
     Styled, StyledText, Task, TextLayout, TextRun, TitlebarOptions, UnderlineStyle, Window,
-    WindowBounds, WindowOptions,
+    WindowBounds, WindowOptions, Element, ElementId, GlobalElementId,
+    InspectorElementId, LayoutId, Pixels,
 };
 
 use sketch::acp_channel::AcpChannelClient;
@@ -532,8 +533,8 @@ fn doc_styled_line_element(
     line_idx: usize,
 ) -> AnyElement {
     // Reuse the plain element when this ctx isn't set up for doc-view selection.
-    let (block_idx, sink) = match (ctx.current_block, ctx.line_layouts) {
-        (Some(b), Some(s)) => (b, s),
+    let (block_idx, sink) = match (ctx.current_block, ctx.line_layouts.as_ref()) {
+        (Some(b), Some(s)) => (b, s.clone()),
         _ => return styled_line_element(line, base_style, base_fg, body_font, code_font),
     };
 
@@ -632,13 +633,18 @@ fn doc_styled_line_element(
     }
 
     let styled = StyledText::new(text).with_runs(runs);
-    // Clone the TextLayout handle into the side channel so mouse handlers
-    // on the doc body can later hit-test this line.
-    sink.borrow_mut().insert((block_idx, line_idx), styled.layout().clone());
+    // Capture the line's TextLayout handle. It is registered into the hit-test
+    // sink at PAINT time (via RegisterOnPaint), NOT here at build time: the
+    // virtualized `gpui::list` builds/measures lines it never prepaints, and
+    // `doc_pos_at` calling `.bounds()` on an un-prepainted layout panics across
+    // the platform input callback. Registering on paint guarantees every sink
+    // entry has bounds set.
+    let layout = styled.layout().clone();
+    let key = (block_idx, line_idx);
 
     // Plain text path — no wiki links on this line.
     if wiki_link_ranges.is_empty() {
-        return styled.into_any_element();
+        return register_line_on_paint(styled.into_any_element(), sink, key, layout);
     }
 
     // Wrap in InteractiveText so we can attach an on_click handler. Wiki
@@ -656,7 +662,7 @@ fn doc_styled_line_element(
     let element_id = gpui::ElementId::Name(SharedString::from(format!(
         "wiki-line-{block_idx}-{line_idx}"
     )));
-    gpui::InteractiveText::new(element_id, styled)
+    let el = gpui::InteractiveText::new(element_id, styled)
         .on_click(ranges, move |idx, _w, app| {
             let Some(target) = targets.get(idx) else {
                 return;
@@ -667,7 +673,8 @@ fn doc_styled_line_element(
                 view.open_wiki_link(&target, doc_dir.as_deref(), cx);
             });
         })
-        .into_any_element()
+        .into_any_element();
+    register_line_on_paint(el, sink, key, layout)
 }
 
 /// Convert a char-index into its byte offset within `s`. Saturates at
@@ -753,7 +760,7 @@ struct RenderCtx<'a> {
     /// `None` outside the view-mode render path (e.g. edit-mode rendering
     /// and nested ctxes inside blockquotes/lists where v1 doesn't yet
     /// support selection).
-    line_layouts: Option<&'a RefCell<HashMap<(usize, usize), TextLayout>>>,
+    line_layouts: Option<std::rc::Rc<RefCell<HashMap<(usize, usize), TextLayout>>>>,
     /// The top-level block index currently being rendered. Set by
     /// `block_element` and cleared (set to `None`) when `block_inner`
     /// recurses into nested blocks (blockquote/list content), so the v1
@@ -770,6 +777,90 @@ struct RenderCtx<'a> {
     doc_dir: Option<PathBuf>,
 }
 
+/// A transparent element wrapper that registers a doc line's `TextLayout` into
+/// the hit-test sink (`line_layouts`) **only when the line is actually
+/// painted** — i.e. in `paint`, after `prepaint` has set the layout's bounds.
+///
+/// Why this exists: under the virtualized doc `gpui::list`, lines get built (and
+/// sometimes measured) that are never prepainted, so registering at build time
+/// put `bounds == None` layouts in the sink. `doc_pos_at` then iterates the sink
+/// and calls `.bounds()` (which `expect`s prepaint) → panic across the platform
+/// input callback ("cannot unwind" → abort). Registering on paint guarantees
+/// every sink entry has bounds.
+struct RegisterOnPaint {
+    inner: AnyElement,
+    sink: std::rc::Rc<RefCell<HashMap<(usize, usize), TextLayout>>>,
+    key: (usize, usize),
+    layout: TextLayout,
+}
+
+fn register_line_on_paint(
+    inner: AnyElement,
+    sink: std::rc::Rc<RefCell<HashMap<(usize, usize), TextLayout>>>,
+    key: (usize, usize),
+    layout: TextLayout,
+) -> AnyElement {
+    RegisterOnPaint { inner, sink, key, layout }.into_any_element()
+}
+
+impl IntoElement for RegisterOnPaint {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for RegisterOnPaint {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.inner.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.inner.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        _prepaint: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // prepaint has run → the layout's bounds are set. Registering here means
+        // `doc_pos_at` only ever sees prepainted (bounds-Some) layouts.
+        self.sink.borrow_mut().insert(self.key, self.layout.clone());
+        self.inner.paint(window, cx);
+    }
+}
+
 fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlock) -> AnyElement {
     let highlighted = ctx.cursor_block == Some(idx);
     let inner_ctx = RenderCtx {
@@ -779,7 +870,7 @@ fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlock) -> AnyE
         text_scale: ctx.text_scale,
         cursor_block: ctx.cursor_block,
         doc_selection: ctx.doc_selection,
-        line_layouts: ctx.line_layouts,
+        line_layouts: ctx.line_layouts.clone(),
         current_block: Some(idx),
         weak_view: ctx.weak_view.clone(),
         doc_dir: ctx.doc_dir.clone(),
@@ -12323,7 +12414,7 @@ impl SketchGpuiView {
                 text_scale,
                 cursor_block: Some(cursor_block),
                 doc_selection,
-                line_layouts: Some(&line_layouts),
+                line_layouts: Some(line_layouts.clone()),
                 current_block: None,
                 weak_view: Some(weak_view.clone()),
                 doc_dir: doc_dir.clone(),
@@ -12363,8 +12454,16 @@ impl SketchGpuiView {
                 }),
             )
             .child(
+                // Default (visible-only) measuring — NOT `Auto`. `Auto` means
+                // "measure all items" (gpui list.rs), which builds every line to
+                // measure it and registers its `TextLayout` into `line_layouts`,
+                // but only the visible lines get prepainted (bounds set). Then
+                // `doc_pos_at` iterating all of them calls `.bounds()` on an
+                // un-prepainted layout → panic across the input callback. The
+                // agent + Edit lists already use the default; the doc body's
+                // parent is `flex_1().min_h_0()`, so the list fills the viewport
+                // and scrolls without needing to size to content.
                 gpui::list(d.list_state.clone(), render_fn)
-                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
                     .flex_1()
                     .w_full(),
             );
