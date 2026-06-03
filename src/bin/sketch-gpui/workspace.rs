@@ -9,13 +9,23 @@
 //! Scope note: the types live here, but wiring them into the live `App` is
 //! staged in follow-up commits — this file establishes the shapes.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
 use sketch::editor::EditorCore;
 use sketch::file_browser::FileBrowser;
+
+/// Shared handle to a pooled `EditorCore`. Multiple `EditorView`s (one per
+/// window) clone this `Rc` so they all mutate the same rope + undo stack;
+/// each view keeps its own cursor/selection/scroll separately. `RefCell`
+/// gives interior mutability so a view can borrow the core for an edit
+/// without the workspace lending out a `&mut` that would conflict with the
+/// other leaves living in the same layout tree.
+pub type SharedCore = Rc<RefCell<EditorCore>>;
 
 pub type FileBufferId = u64;
 pub type WindowId = u64;
@@ -335,7 +345,10 @@ impl<C> Tab<C> {
 pub struct FileBuffer {
     pub id: FileBufferId,
     pub canonical_path: PathBuf,
-    pub core: EditorCore,
+    /// Shared, reference-counted core. Cloned into each `EditorView`/window
+    /// that binds to this buffer so edits + undo are shared while the pool
+    /// retains its own handle for lookups, modified-checks, and save.
+    pub core: SharedCore,
     pub file_label: String,
     /// Active EditorViews referencing this core.
     pub refcount: usize,
@@ -528,7 +541,7 @@ impl<C> Workspace<C> {
         let buf = FileBuffer {
             id,
             canonical_path: key.clone(),
-            core: EditorCore::new(text, key.clone()),
+            core: Rc::new(RefCell::new(EditorCore::new(text, key.clone()))),
             file_label,
             refcount: 0,
         };
@@ -553,13 +566,58 @@ impl<C> Workspace<C> {
         }
     }
 
+    /// Clone the shared core handle for `id` (does NOT change the refcount).
+    pub fn buffer_core(&self, id: FileBufferId) -> Option<SharedCore> {
+        self.file_buffers.get(&id).map(|b| Rc::clone(&b.core))
+    }
+
+    /// Garbage-collect pooled buffers that no window still references. The
+    /// pool itself holds one `Rc` strong ref per buffer; each live window's
+    /// `SharedCore` clone holds another. So a `strong_count == 1` means no
+    /// window is bound to it. Such a buffer is dropped from the pool unless it
+    /// has unsaved changes (kept for `:buffers` recovery, mirroring
+    /// [`buffer_release`]). This is the app's real liveness mechanism — views
+    /// just drop their `Rc` on close and the next `gc_buffers` reaps the husk,
+    /// so no manual release call has to be threaded through every close path.
+    pub fn gc_buffers(&mut self) {
+        let dead: Vec<FileBufferId> = self
+            .file_buffers
+            .iter()
+            .filter(|(_, b)| {
+                Rc::strong_count(&b.core) == 1 && !b.core.borrow().document().is_modified()
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in dead {
+            if let Some(b) = self.file_buffers.remove(&id) {
+                self.path_index.remove(&b.canonical_path);
+            }
+        }
+    }
+
+    /// Open (pool-lookup or load) `path`, bump its refcount, and hand back the
+    /// buffer id plus a fresh clone of the shared core for a new window to
+    /// bind to. The one-call path for creating a file-backed view: a window
+    /// that holds the returned `(id, core)` must `buffer_release(id)` on close.
+    pub fn open_and_retain(
+        &mut self,
+        path: &Path,
+    ) -> std::io::Result<(FileBufferId, SharedCore)> {
+        let id = self.open_buffer(path)?;
+        self.buffer_retain(id);
+        let core = self
+            .buffer_core(id)
+            .expect("buffer just opened must be present");
+        Ok((id, core))
+    }
+
     /// Decrement the refcount. Drops the buffer from the pool when refcount
     /// hits 0 AND it has no unsaved changes; dirty buffers stay pooled for
     /// recovery via `:buffers` (Behavior 21).
     pub fn buffer_release(&mut self, id: FileBufferId) {
         let drop = if let Some(b) = self.file_buffers.get_mut(&id) {
             b.refcount = b.refcount.saturating_sub(1);
-            b.refcount == 0 && !b.core.document().is_modified()
+            b.refcount == 0 && !b.core.borrow().document().is_modified()
         } else {
             false
         };
@@ -1360,6 +1418,68 @@ mod tests {
             "clean buffer with refcount 0 should be dropped"
         );
         assert!(ws.path_index.is_empty());
+    }
+
+    #[test]
+    fn shared_core_propagates_edits_across_views() {
+        // Two windows of one file get two clones of the SAME core; an edit
+        // through one is visible through the other, and the document's
+        // `edit_seq` (the perf-cache key) advances for both since it's one doc.
+        let mut ws: Workspace<TestContent> = Workspace::new();
+        let p = std::env::temp_dir().join("sketch-shared-edit-test.md");
+        let _ = std::fs::remove_file(&p);
+
+        let (id_a, core_a) = ws.open_and_retain(&p).unwrap();
+        let (id_b, core_b) = ws.open_and_retain(&p).unwrap();
+        assert_eq!(id_a, id_b, "same path pools to one buffer id");
+        assert!(Rc::ptr_eq(&core_a, &core_b), "both views share one core");
+
+        let seq_before = core_a.borrow().document().edit_seq();
+        core_a.borrow_mut().programmatic_insert(0, "hello");
+        // View B sees A's edit (shared rope).
+        assert_eq!(core_b.borrow().document().full_text(), "hello");
+        // The single shared doc's edit_seq advanced — so any view-model cache
+        // keyed on edit_seq invalidates for every view.
+        assert!(core_b.borrow().document().edit_seq() > seq_before);
+    }
+
+    #[test]
+    fn gc_reaps_unreferenced_clean_buffers_keeps_dirty() {
+        let mut ws: Workspace<TestContent> = Workspace::new();
+        let clean = std::env::temp_dir().join("sketch-gc-clean.md");
+        let dirty = std::env::temp_dir().join("sketch-gc-dirty.md");
+        let _ = std::fs::remove_file(&clean);
+        let _ = std::fs::remove_file(&dirty);
+
+        // Clean buffer: open, then drop the view's core handle → only the pool
+        // holds it → gc should reap it.
+        let (clean_id, clean_core) = ws.open_and_retain(&clean).unwrap();
+        drop(clean_core);
+
+        // Dirty buffer: edit it, keep no view handle → gc must KEEP it.
+        let (dirty_id, dirty_core) = ws.open_and_retain(&dirty).unwrap();
+        dirty_core.borrow_mut().programmatic_insert(0, "x");
+        drop(dirty_core);
+
+        ws.gc_buffers();
+        assert!(ws.buffer(clean_id).is_none(), "clean, unreferenced → reaped");
+        assert!(ws.buffer(dirty_id).is_some(), "dirty → retained for recovery");
+    }
+
+    #[test]
+    fn gc_keeps_buffers_a_view_still_holds() {
+        let mut ws: Workspace<TestContent> = Workspace::new();
+        let p = std::env::temp_dir().join("sketch-gc-live.md");
+        let _ = std::fs::remove_file(&p);
+        let (id, core) = ws.open_and_retain(&p).unwrap();
+        ws.gc_buffers();
+        assert!(
+            ws.buffer(id).is_some(),
+            "a buffer a live view still references must not be reaped"
+        );
+        drop(core);
+        ws.gc_buffers();
+        assert!(ws.buffer(id).is_none(), "once the view drops, gc reaps it");
     }
 
     // --- Relocate (move pane to workspace) ---------------------------------
