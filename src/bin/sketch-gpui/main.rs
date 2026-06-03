@@ -3953,6 +3953,11 @@ impl SharedEditor {
     fn full_text(&self) -> String {
         self.core.borrow().document().full_text()
     }
+    /// Monotonic content version of the shared core — bumps on every edit.
+    /// Used as an O(1) change-key (e.g. to gate outline re-derivation).
+    fn edit_seq(&self) -> u64 {
+        self.core.borrow().document().edit_seq()
+    }
 
     // --- Selection / mode (view-only) ---
 
@@ -8642,6 +8647,30 @@ impl SketchGpuiView {
 
     /// Re-derive the outline rail's heading entries from the focused window
     /// (spec §13). No-op when the rail is closed or showing the file browser.
+    /// Change-key for the outline: focused window id + that window's content
+    /// version. Re-deriving the outline is O(document) (an Edit pane allocates
+    /// the whole rope via `full_text()` and scans every line), and the render
+    /// loop runs every frame — including every keystroke. Keying on this lets
+    /// `refresh_outline_rail` skip the work when nothing relevant changed.
+    fn outline_change_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        if let Some(tab) = self.workspace.active_tab() {
+            tab.focused.hash(&mut h); // focus change → re-derive
+        }
+        match self.workspace.focused_content() {
+            // Edit: edit_seq is the exact monotonic content version.
+            Some(WindowContent::Edit(e)) => e.editor.edit_seq().hash(&mut h),
+            // Doc: blocks only change on load/reload/edit-flush; block count is
+            // a cheap proxy (outline is cosmetic, so a same-count content change
+            // leaving it briefly stale is acceptable).
+            Some(WindowContent::Doc(d)) => d.blocks.len().hash(&mut h),
+            // Agent/Browser have no outline; constant so it derives once (empty).
+            _ => 0u64.hash(&mut h),
+        }
+        h.finish()
+    }
+
     fn refresh_outline_rail(&mut self) {
         let is_outline = self
             .workspace
@@ -8652,10 +8681,27 @@ impl SketchGpuiView {
         if !is_outline {
             return;
         }
+        // Skip the O(document) re-derivation when neither the focused window nor
+        // its content changed since the last derive (the common case — cursor
+        // blink, scroll, cross-pane notify, and unrelated keystrokes).
+        let key = self.outline_change_key();
+        let unchanged = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.rail.as_ref())
+            .and_then(|r| match &r.content {
+                workspace::RailContent::Outline(o) => o.last_key,
+                _ => None,
+            })
+            == Some(key);
+        if unchanged {
+            return;
+        }
         let entries = self.derive_outline();
         if let Some(r) = self.rail_mut() {
             if let workspace::RailContent::Outline(o) = &mut r.content {
                 o.entries = entries;
+                o.last_key = Some(key);
                 if o.selected >= o.entries.len() {
                     o.selected = o.entries.len().saturating_sub(1);
                 }

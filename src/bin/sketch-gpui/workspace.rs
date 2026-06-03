@@ -248,6 +248,11 @@ impl Default for RailSide {
 pub struct OutlineState {
     pub entries: Vec<(u8, String, usize)>,
     pub selected: usize,
+    /// Change-key the `entries` were derived at (focused window id + that
+    /// window's content version). The render loop re-derives the outline only
+    /// when this changes — otherwise re-derivation was O(document) per frame
+    /// (and per keystroke, via `full_text()`, with the outline rail open).
+    pub last_key: Option<u64>,
 }
 
 impl OutlineState {
@@ -255,6 +260,7 @@ impl OutlineState {
         Self {
             entries: Vec::new(),
             selected: 0,
+            last_key: None,
         }
     }
 }
