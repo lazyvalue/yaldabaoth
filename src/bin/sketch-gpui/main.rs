@@ -68,6 +68,8 @@
 
 mod highlight_cache;
 mod workspace;
+#[cfg(test)]
+mod verify_harness;
 
 use highlight_cache::{HighlightCache, LineHl};
 use std::cell::RefCell;
