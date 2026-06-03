@@ -2123,6 +2123,10 @@ struct PersistedRail {
     /// File-browser rail: directory it was rooted at. Absent for outline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<PathBuf>,
+    /// Leaf the rail is pinned to. Defaults to 0 for old snapshots (will be
+    /// overridden by the tab's focused_window on restore).
+    #[serde(default)]
+    pinned_to: workspace::WindowId,
 }
 
 fn default_rail_width() -> f32 {
@@ -2206,19 +2210,22 @@ fn snapshot_rail(rail: &workspace::RailState) -> PersistedRail {
             side: rail.side,
             width: rail.width_px,
             cwd: Some(fb.current_dir().to_path_buf()),
+            pinned_to: rail.pinned_to,
         },
         workspace::RailContent::Outline(_) => PersistedRail {
             kind: PersistedRailKind::Outline,
             side: rail.side,
             width: rail.width_px,
             cwd: None,
+            pinned_to: rail.pinned_to,
         },
     }
 }
 
 /// Reconstruct a live rail from its persisted shadow (spec-rail.md §14). The
 /// restored rail is unfocused (focus stays on the content leaf on restore).
-fn restore_rail(p: PersistedRail) -> workspace::RailState {
+/// `fallback_pin` is used when the snapshot predates the `pinned_to` field.
+fn restore_rail(p: PersistedRail, fallback_pin: workspace::WindowId) -> workspace::RailState {
     let content = match p.kind {
         PersistedRailKind::FileBrowser => {
             let dir = match p.cwd {
@@ -2231,11 +2238,13 @@ fn restore_rail(p: PersistedRail) -> workspace::RailState {
             workspace::RailContent::Outline(workspace::OutlineState::new())
         }
     };
+    let pinned_to = if p.pinned_to != 0 { p.pinned_to } else { fallback_pin };
     workspace::RailState {
         content,
         side: p.side,
         width_px: p.width,
         focused: false,
+        pinned_to,
     }
 }
 
@@ -5484,7 +5493,7 @@ impl SketchGpuiView {
                 display_name: ptab.display_name,
                 focused: ptab.focused_window,
                 layout,
-                rail: ptab.rail.map(restore_rail),
+                rail: ptab.rail.map(|r| restore_rail(r, ptab.focused_window)),
             });
             ws.next_tab_index += 1;
         }
@@ -6612,9 +6621,10 @@ impl SketchGpuiView {
             }
             existing => {
                 let side = existing.as_ref().map(|r| r.side).unwrap_or_default();
+                let pinned_to = tab.focused;
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let content = workspace::RailContent::FileBrowser(FileBrowser::new(cwd));
-                tab.rail = Some(workspace::RailState::new(content, side));
+                tab.rail = Some(workspace::RailState::new(content, side, pinned_to));
             }
         }
         self.save_workspace_state();
@@ -6644,8 +6654,9 @@ impl SketchGpuiView {
             }
             existing => {
                 let side = existing.as_ref().map(|r| r.side).unwrap_or_default();
+                let pinned_to = tab.focused;
                 let content = workspace::RailContent::Outline(workspace::OutlineState::new());
-                tab.rail = Some(workspace::RailState::new(content, side));
+                tab.rail = Some(workspace::RailState::new(content, side, pinned_to));
             }
         }
         self.save_workspace_state();
@@ -8760,10 +8771,16 @@ impl SketchGpuiView {
                         self.render_agent(leaf_root, ring, cx).into_any_element()
                     }
                 };
-                // The rail is chrome local to the *focused pane*, not the whole
-                // window — slot it directly beside this leaf so it sits against
-                // the focused content. No-op when no rail is open.
-                let with_rail = if is_focused {
+                // Pin the rail to the leaf it was opened from, not whichever
+                // leaf currently has focus. Falls back to the focused leaf
+                // when no pinned_to is set (single-pane case).
+                let is_rail_pinned = self
+                    .workspace
+                    .active_tab()
+                    .and_then(|t| t.rail.as_ref())
+                    .map(|r| r.pinned_to == window.id)
+                    .unwrap_or(false);
+                let with_rail = if is_rail_pinned {
                     self.wrap_leaf_with_rail(painted, rail_focusable, cx)
                 } else {
                     painted

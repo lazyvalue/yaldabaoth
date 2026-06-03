@@ -306,15 +306,19 @@ pub struct RailState {
     /// True when the rail div holds `track_focus`. When false, the main
     /// content leaf holds focus as usual (two-state model, spec §5).
     pub focused: bool,
+    /// The leaf the rail was opened from. The rail stays visually pinned to
+    /// this leaf even when focus moves to another split pane.
+    pub pinned_to: WindowId,
 }
 
 impl RailState {
-    pub fn new(content: RailContent, side: RailSide) -> Self {
+    pub fn new(content: RailContent, side: RailSide, pinned_to: WindowId) -> Self {
         Self {
             content,
             side,
             width_px: RAIL_DEFAULT_WIDTH,
             focused: true,
+            pinned_to,
         }
     }
 }
