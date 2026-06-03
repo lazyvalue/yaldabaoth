@@ -6621,6 +6621,30 @@ impl SketchGpuiView {
         }
     }
 
+    /// Test-only: install a fresh Edit screen over `text` (Code view, Insert
+    /// mode) so the headless harness can drive keystrokes through the real
+    /// `build_edit_body_code` highlight path.
+    #[cfg(test)]
+    fn test_open_edit(&mut self, text: &str) {
+        let core: workspace::SharedCore = std::rc::Rc::new(std::cell::RefCell::new(
+            sketch::editor::EditorCore::new(text.to_string(), PathBuf::from("/tmp/harness.md")),
+        ));
+        let mut e = EditState::new(SharedEditor::new(1, core), "harness.md".into(), EditView::Code);
+        e.mode = EditMode::Insert;
+        // Skip the boot splash so render() builds the real Edit body, not the
+        // splash screen — the harness needs the highlight path to actually run.
+        self.splash_until = None;
+        self.set_screen(WindowContent::Edit(e));
+    }
+
+    /// Test-only: `(last_recomputed, last_was_skip)` of the focused Edit view's
+    /// incremental highlight cache — the O(changed) latency-gate observable.
+    #[cfg(test)]
+    fn test_edit_cache_stats(&mut self) -> (usize, bool) {
+        let e = self.edit_mut().expect("focused window is not an Edit view");
+        (e.highlight_cache.last_recomputed, e.highlight_cache.last_was_skip)
+    }
+
     /// Swap from Doc view into Edit screen with the Code (raw markdown) view.
     fn enter_edit(&mut self, _: &EnterEdit, _w: &mut Window, cx: &mut Context<Self>) {
         self.enter_edit_with(EditView::Code, cx);
