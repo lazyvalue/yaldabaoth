@@ -69,6 +69,17 @@ Fanning out N agents is not free — they have to converge.
 - **Behavior-changing branches are flagged, not auto-folded.** Behavior-
   preserving perf/cleanup can fold after a build check; anything that changes
   interaction or output waits for human runtime review.
+- **Vary the SURFACE, not just the lens.** Lesson from 2026-06-02: a perf
+  fan-out (workflow + /refactor + tachyon, ~dozens of agents) all missed a
+  textbook O(document)-per-keystroke bug in the Edit view, because every prompt
+  inherited the *reported symptom's* framing ("slows down once an agent session
+  runs") and aimed every agent at the agent-transcript path. Diverse lenses over
+  identical scope = one search run N times, with a shared blind spot. So:
+  - At least one pass per audit must be **invariant-driven, not symptom-driven**
+    — "audit EVERY <surface> for invariant <Y>", deliberately *not* anchored to
+    the reported symptom (e.g. "every render/input path must be O(changed)").
+  - The verification harness is the empirical backstop that doesn't care about
+    framing — it catches what a misframed prompt can't.
 
 ## Verification harness (the top gap)
 
