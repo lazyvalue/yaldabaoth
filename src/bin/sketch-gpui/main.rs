@@ -3950,6 +3950,12 @@ impl SharedEditor {
     fn line_count(&self) -> usize {
         self.core.borrow().document().line_count()
     }
+    /// Monotonic change counter — bumps on every buffer mutation. Used to key
+    /// the Edit view's incremental highlight cache so unchanged frames recompute
+    /// zero lines.
+    fn edit_seq(&self) -> u64 {
+        self.core.borrow().document().edit_seq()
+    }
     fn full_text(&self) -> String {
         self.core.borrow().document().full_text()
     }
@@ -4285,17 +4291,6 @@ impl EditOps for SharedEditor {
 /// Build the trimmed, tab-expanded per-line text for an Edit pane's body,
 /// reading the pooled core's rope once. Mirrors the prior per-line
 /// `document().line_text(i)` loop but takes a single `RefCell` borrow.
-fn edit_lines(e: &EditState, line_count: usize) -> Vec<String> {
-    let core = e.editor.core.borrow();
-    let doc = core.document();
-    (0..line_count.max(1))
-        .map(|i| {
-            doc.line_text(i)
-                .trim_end_matches('\n')
-                .replace('\t', "    ")
-        })
-        .collect()
-}
 
 /// State held while the user is editing a buffer in the GPUI frontend.
 /// Raw buffer + cursor + Insert/Normal toggle + vim-style normal-mode
@@ -4315,6 +4310,18 @@ struct EditState {
     /// Code (raw monospace + syntax highlight) or WordProcessor (live-preview
     /// proportional + typographic styling). Toggled by `Ctrl-W`.
     view: EditView,
+    /// Incremental per-line highlight cache, keyed on the document's
+    /// `edit_seq`. Re-highlights only changed lines instead of the whole
+    /// buffer every frame, so fast typing stays O(changed) rather than
+    /// O(document). Shared between the Code and WordProcessor views — both
+    /// consume the `raw` segments of each `LineHl`.
+    highlight_cache: HighlightCache,
+    /// `edit_seq` the `lines_cache` was extracted at; `u64::MAX` = never built.
+    lines_cache_seq: u64,
+    /// Last extracted (tab-expanded, newline-trimmed) source lines, reused
+    /// verbatim on frames where `edit_seq` is unchanged (cursor blink,
+    /// selection, cross-pane notify) so we don't re-allocate a String per line.
+    lines_cache: std::rc::Rc<Vec<String>>,
 }
 
 impl EditState {
@@ -4327,7 +4334,49 @@ impl EditState {
             scroll_handle: ScrollHandle::new(),
             last_save_msg: None,
             view,
+            highlight_cache: HighlightCache::new(),
+            lines_cache_seq: u64::MAX,
+            lines_cache: std::rc::Rc::new(Vec::new()),
         }
+    }
+
+    /// Extract + highlight the buffer's source lines incrementally. Returns the
+    /// shared source-line vector and a per-line highlight snapshot whose `raw`
+    /// segments are byte-identical to `highlight_markdown_lines_syn`. Both are
+    /// keyed on the document's `edit_seq`, so a frame that didn't edit the
+    /// buffer recomputes zero lines and a single-char edit recomputes ~1.
+    fn highlight_snapshot(
+        &mut self,
+        theme: &Theme,
+        hl: &sketch::highlight::Highlighter,
+    ) -> (
+        std::rc::Rc<Vec<String>>,
+        std::rc::Rc<Vec<std::rc::Rc<LineHl>>>,
+    ) {
+        let line_count = self.editor.line_count();
+        let edit_seq = self.editor.edit_seq();
+        let lines_rc: std::rc::Rc<Vec<String>> = if self.lines_cache_seq == edit_seq {
+            self.lines_cache.clone()
+        } else {
+            let core = self.editor.core.borrow();
+            let doc = core.document();
+            let built: Vec<String> = (0..line_count.max(1))
+                .map(|i| {
+                    doc.line_text(i)
+                        .trim_end_matches('\n')
+                        .replace('\t', "    ")
+                })
+                .collect();
+            drop(core);
+            let rc = std::rc::Rc::new(built);
+            self.lines_cache = rc.clone();
+            self.lines_cache_seq = edit_seq;
+            rc
+        };
+        let snap = self
+            .highlight_cache
+            .snapshot_syn(&lines_rc, theme, edit_seq, hl);
+        (lines_rc, snap)
     }
 }
 
@@ -12143,7 +12192,7 @@ impl SketchGpuiView {
     fn render_edit(
         &self,
         root: gpui::Div,
-        e: &EditState,
+        e: &mut EditState,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let cursor = e.editor.cursor();
@@ -12266,16 +12315,20 @@ impl SketchGpuiView {
     /// Code (raw markdown) view: monospace, gutter with line numbers,
     /// per-line `md_highlight` source colors. Cursor splice via the shared
     /// `build_line_content` helper.
-    fn build_edit_body_code(&self, e: &EditState) -> impl IntoElement {
+    fn build_edit_body_code(&self, e: &mut EditState) -> impl IntoElement {
         let cursor = e.editor.cursor();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
-        let line_count = e.editor.line_count();
         let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
         let dim_fg: Hsla = rgb(0x6272a4).into();
+        let sel = e.editor.selection_range();
+        let scroll_handle = e.scroll_handle.clone();
+        let mode = e.mode;
 
-        let lines = edit_lines(e, line_count);
-        let highlighted = highlight_markdown_lines_syn(&lines, &self.theme, &self.syntect_hl);
+        // Incremental highlight: only changed lines are re-tokenized; unchanged
+        // frames recompute zero. `lines`/`highlighted` are cheap Rc clones.
+        let (lines_rc, hl_snap) = e.highlight_snapshot(&self.theme, &self.syntect_hl);
+        let lines = &*lines_rc;
 
         let mut body = div()
             .id("edit-body")
@@ -12286,17 +12339,16 @@ impl SketchGpuiView {
             .px_4()
             .py_2()
             .overflow_y_scroll()
-            .track_scroll(&e.scroll_handle)
+            .track_scroll(&scroll_handle)
             .text_size(px(14.0 * self.text_scale))
             .font_family(self.code_font.clone())
             .text_color(self.editor_fg());
 
         let base_style = self.theme.paragraph;
-        let sel = e.editor.selection_range();
         for (line_idx, line_str) in lines.iter().enumerate() {
-            let mut segs = highlighted
+            let mut segs = hl_snap
                 .get(line_idx)
-                .cloned()
+                .map(|lh| lh.raw.clone())
                 .unwrap_or_else(|| vec![(line_str.clone(), base_style)]);
             if let Some(sel) = sel {
                 let line_chars = line_str.chars().count();
@@ -12317,7 +12369,7 @@ impl SketchGpuiView {
                 line_str,
                 line_idx == cursor_line,
                 cursor_col,
-                e.mode,
+                mode,
                 cursor_color,
                 base_style,
                 DEFAULT_FG,
@@ -12337,15 +12389,19 @@ impl SketchGpuiView {
     /// `md_highlight`'s segments still carry inline `**bold**`/`*italic*`
     /// modifiers, which `font_for` maps to FontWeight/FontStyle on render.
     /// No gutter — word processors don't show line numbers.
-    fn build_edit_body_wp(&self, e: &EditState) -> impl IntoElement {
+    fn build_edit_body_wp(&self, e: &mut EditState) -> impl IntoElement {
         let cursor = e.editor.cursor();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
-        let line_count = e.editor.line_count();
         let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
+        let sel = e.editor.selection_range();
+        let scroll_handle = e.scroll_handle.clone();
+        let mode = e.mode;
 
-        let lines = edit_lines(e, line_count);
-        let highlighted = highlight_markdown_lines_syn(&lines, &self.theme, &self.syntect_hl);
+        // Incremental highlight: only changed lines are re-tokenized; unchanged
+        // frames recompute zero. `lines`/`hl_snap` are cheap Rc clones.
+        let (lines_rc, hl_snap) = e.highlight_snapshot(&self.theme, &self.syntect_hl);
+        let lines = &*lines_rc;
 
         let mut body = div()
             .id("edit-body-wp")
@@ -12356,13 +12412,12 @@ impl SketchGpuiView {
             .px_8()
             .py_4()
             .overflow_y_scroll()
-            .track_scroll(&e.scroll_handle)
+            .track_scroll(&scroll_handle)
             .text_size(px(14.0 * self.text_scale))
             .font_family(self.body_font.clone())
             .text_color(self.editor_fg());
 
         let base_style = self.theme.paragraph;
-        let sel = e.editor.selection_range();
         let mut in_fence = false;
 
         for (line_idx, line_str) in lines.iter().enumerate() {
@@ -12371,9 +12426,9 @@ impl SketchGpuiView {
                 in_fence = !in_fence;
             }
 
-            let mut segs = highlighted
+            let mut segs = hl_snap
                 .get(line_idx)
-                .cloned()
+                .map(|lh| lh.raw.clone())
                 .unwrap_or_else(|| vec![(line_str.clone(), base_style)]);
             if let Some(sel) = sel {
                 let line_chars = line_str.chars().count();
@@ -12413,7 +12468,7 @@ impl SketchGpuiView {
                 line_str,
                 line_idx == cursor_line,
                 cursor_col,
-                e.mode,
+                mode,
                 cursor_color,
                 base_style,
                 DEFAULT_FG,
