@@ -3,6 +3,22 @@
 A markdown editor built with Rust. Ships as two binaries: a GPUI desktop GUI
 (`sketch-gpui`) and a terminal TUI (`sketch`) built on ratatui + crossterm.
 
+## Dev system (read this for how we work)
+
+`docs/dev-system.md` is the operating manual: the spec → decision → scaffold →
+implement → verify → integrate → log lifecycle, the definition of done, parallel-
+work discipline, and the verification-harness plan. Key artifacts:
+
+- `docs/specs/` — design (what). Skill: `/spec`.
+- `docs/decisions/` — ADRs (why a path was chosen). Skill: `/decision`.
+- `docs/worklog/` + `docs/backlog.md` — what happened / what's open. Skill: `/worklog`.
+- `/integrate` — converge parallel branches into one buildable branch.
+
+**Definition of done:** builds + tests + pasted evidence + runtime-checked-or-
+flagged + artifacts updated. "Compiles" is not done. The GPUI app can't be
+driven headlessly yet, so most UX/perf changes need a human runtime check — say
+so explicitly (building the verification harness is the top backlog item).
+
 ## Worktree workflow (default)
 
 **Do substantial work in a git worktree, not the main checkout.** Each task /
