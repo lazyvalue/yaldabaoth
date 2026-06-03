@@ -102,6 +102,7 @@ use sketch::render;
 use sketch::session_client::SessionServerClient;
 use sketch::session_proto::AttachMode;
 use sketch::session_proto::Notification as ServerNotification;
+use sketch::session_proto::SessionInfo;
 use sketch::style::{Color as NColor, Modifier, Style as NStyle};
 use sketch::theme::{OverlayTheme, Theme, ThemeName};
 
@@ -4135,6 +4136,60 @@ impl AgentState {
         }
     }
 
+    /// Build a fresh server-managed `AgentState` in the empty baseline, with
+    /// `status` shown in the footer. Used for both the "connecting…"
+    /// placeholder a panel renders the instant it opens (before the
+    /// `list_sessions` / `create_session` round-trip lands) and for the
+    /// reconnected/created slots once a `server_session_id` is known. Replaces
+    /// the several copies of this giant struct literal that previously lived
+    /// inline in `open_agent_inner` / `create_agent_session_via_server`. The
+    /// follow handler is wired up before returning.
+    fn new_server_managed(status: Option<SharedString>) -> Self {
+        let state = AgentState {
+            editor: Editor::new(String::new(), PathBuf::from("*claude*")),
+            channel: None,
+            attach_pending: None,
+            mode: EditMode::Insert,
+            keybinds: KeybindManager::default(),
+            list_state: gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0)),
+            list_item_count: 0,
+            status,
+            awaiting_reply: false,
+            turn_started: None,
+            last_event_at: None,
+            stop_requested_at: None,
+            last_seen_turns: 0,
+            tool_calls: std::collections::HashMap::new(),
+            tool_call_order: Vec::new(),
+            tool_call_anchor_line: std::collections::HashMap::new(),
+            expanded_tool_calls: std::collections::HashSet::new(),
+            block_ranges: Vec::new(),
+            block_cache: std::collections::HashMap::new(),
+            block_cache_frozen_count: 0,
+            lines_cache: std::rc::Rc::new(Vec::new()),
+            lines_cache_seq: u64::MAX,
+            flat_items_cache: std::rc::Rc::new(Vec::new()),
+            gutter_cache: std::rc::Rc::new(Vec::new()),
+            view_model_fp: None,
+            view_model_seq: 0,
+            highlight_cache: HighlightCache::new(),
+            input_mode: InputMode::Chatbox,
+            chatbox: Some(Chatbox::new()),
+            current_plan: None,
+            agent_mode: None,
+            usage: None,
+            subagents: Vec::new(),
+            focused_subagent: None,
+            tasklist_open: false,
+            subagents_open: false,
+            server_managed: true,
+            follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
+            _pump: None,
+        };
+        setup_list_follow_handler(&state.list_state, &state.follow_output);
+        state
+    }
+
     /// Reset all transcript-derived state to the empty baseline so that a
     /// server re-attach — which replays the session's full `event_log` — can
     /// rebuild the transcript from scratch without duplicating what's already
@@ -4171,6 +4226,33 @@ impl AgentState {
         self.focused_subagent = None;
         self.usage = None;
     }
+}
+
+/// A re-attachable session resolved by the background half of `open_agent`
+/// (S4). Carries everything the main thread needs to fill or push a slot —
+/// the attach round-trip has already been issued off-thread.
+struct AttachedSlot {
+    label: String,
+    sid: String,
+    /// The ACP session id, used as the slot's `resume_id`.
+    acp_id: Option<String>,
+    /// Footer status string ("reconnected …").
+    status: String,
+}
+
+/// Outcome of the background session-server round-trips kicked off by
+/// `spawn_open_agent_server`. Applied on the paint thread by
+/// `apply_open_agent_resolution`.
+enum OpenResolution {
+    /// Existing cwd sessions were found and re-attached.
+    Attached(Vec<AttachedSlot>),
+    /// No existing session — a fresh one was created.
+    Created {
+        sid: String,
+        acp_id: Option<String>,
+    },
+    /// The list or create round-trip failed; surface it on the placeholder.
+    Failed(String),
 }
 
 /// A named wrapper around `AgentState` for multi-session support.
@@ -4346,13 +4428,6 @@ impl AgentRing {
         self.slots
             .iter()
             .position(|s| s.server_session_id.as_deref() == Some(sid))
-    }
-
-    /// True if any slot holds `sid`. Used to avoid attaching the same session
-    /// twice (a second Owner attach from the same connection silently strands
-    /// one panel's stream — see `open_agent_inner`).
-    fn has_server_session(&self, sid: &str) -> bool {
-        self.position_by_server_session_id(sid).is_some()
     }
 }
 
@@ -7243,37 +7318,15 @@ impl SketchGpuiView {
                 // Close the selected session (without switching to it first).
                 let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
                 if count > 0 {
-                    // Confirm the server close BEFORE removing the slot (same
-                    // ordering as `close_active_agent_session`) so a failed
-                    // close can't orphan the server session behind a vanished
-                    // slot.
+                    // Optimistic close (same as `close_active_agent_session`,
+                    // S4): drop the slot locally and fire the server close
+                    // off-thread so a stalled server can't freeze the switcher.
                     let server_sid = self
                         .agent_ring()
                         .and_then(|r| r.slots.get(selected))
                         .and_then(|s| s.server_session_id.clone());
-                    if let Some(sid) = &server_sid {
-                        if let Some(server) = &self.session_server {
-                            match server.close_session(sid) {
-                                Ok(()) => {}
-                                Err(e)
-                                    if matches!(
-                                        e.kind(),
-                                        std::io::ErrorKind::BrokenPipe
-                                            | std::io::ErrorKind::TimedOut
-                                    ) =>
-                                {
-                                    if let Some(claude) = self.agent_mut() {
-                                        claude.status =
-                                            Some(format!("close failed: {e}").into());
-                                    }
-                                    cx.notify();
-                                    return;
-                                }
-                                Err(_) => {
-                                    let _ = server.detach(sid);
-                                }
-                            }
-                        }
+                    if let Some(sid) = server_sid {
+                        self.spawn_close_session(sid, cx);
                     }
                     if let Some(ring) = self.agent_ring_mut() {
                         ring.close_at(selected);
@@ -8781,130 +8834,41 @@ impl SketchGpuiView {
         let proc_cwd = process_cwd();
 
         if self.session_server.is_some() {
-            // ── Session-server path ──────────────────────────────────
-            // Ask the server for existing sessions (survived a GUI restart).
-            // If none, create a fresh one.
-            let existing = self.session_server.as_ref().unwrap()
-                .list_sessions()
-                .unwrap_or_default();
-            let matching: Vec<_> = existing
-                .into_iter()
-                .filter(|s| s.cwd == proc_cwd)
-                // Skip sessions already shown in another panel — re-attaching
-                // the same session from this one connection would duplicate
-                // event delivery and strand a slot. When every cwd session is
-                // already open elsewhere this leaves `matching` empty, so the
-                // branch below opens a fresh session for this panel instead.
-                .filter(|s| !self.workspace_has_server_session(&s.session_id))
-                .collect();
-
-            if matching.is_empty() {
-                let (state, server_sid) = self.create_agent_session_via_server(
-                    self.session_server.as_ref().unwrap(),
-                    None,
-                    "claude-1",
-                    proc_cwd.clone(),
-                );
-                ring.push("claude-1".into(), state, None, proc_cwd, server_sid);
-            } else {
-                for (i, info) in matching.iter().enumerate() {
-                    let label = if matching.len() == 1 {
-                        "claude-1".to_string()
-                    } else {
-                        format!("claude-{}", i + 1)
-                    };
-                    // Attach to existing server session. The server
-                    // replays its buffered event_log as notifications
-                    // before sending the Ack, so the pump will pick up
-                    // the full transcript on its first drain cycle. A
-                    // candidate attaches read-only so it mirrors the live
-                    // owner without contending for control.
-                    let mode = if self.is_candidate {
-                        AttachMode::Observer
-                    } else {
-                        AttachMode::Owner
-                    };
-                    if let Err(e) = self.session_server.as_ref().unwrap().attach(&info.session_id, mode) {
-                        eprintln!("[sketch-gpui] re-attach failed for {}: {e}", &info.session_id[..8]);
-                    } else {
-                        eprintln!(
-                            "[sketch-gpui] re-attached to server session {} (turns={})",
-                            &info.session_id[..8],
-                            info.turns,
-                        );
-                    }
-                    let editor = Editor::new(String::new(), PathBuf::from("*claude*"));
-                    let status_msg = if info.connected {
-                        format!("reconnected: {}", info.acp_session_id.as_deref().unwrap_or("active"))
-                    } else {
-                        "reconnected (agent spawning…)".to_string()
-                    };
-                    let state = AgentState {
-                        editor,
-                        channel: None,
-                        attach_pending: None,
-                        mode: EditMode::Insert,
-                        keybinds: KeybindManager::default(),
-                        list_state: gpui::ListState::new(
-                            0,
-                            gpui::ListAlignment::Bottom,
-                            gpui::px(256.0),
-                        ),
-                        list_item_count: 0,
-                        status: Some(status_msg.into()),
-                        awaiting_reply: false,
-                        turn_started: None,
-                        last_event_at: None,
-                        stop_requested_at: None,
-                        // Start at 0 so the replayed event_log's TurnEnded
-                        // events progressively restore the counter. Using the
-                        // persisted `info.turns` here would cause UserPrompt
-                        // and Chunk events to tag with the wrong turn number
-                        // during replay (turn_k = last_seen_turns + 1).
-                        last_seen_turns: 0,
-                        tool_calls: std::collections::HashMap::new(),
-                        tool_call_order: Vec::new(),
-                        tool_call_anchor_line: std::collections::HashMap::new(),
-                        expanded_tool_calls: std::collections::HashSet::new(),
-                        block_ranges: Vec::new(),
-                        block_cache: std::collections::HashMap::new(),
-                        block_cache_frozen_count: 0,
-                        lines_cache: std::rc::Rc::new(Vec::new()),
-                        lines_cache_seq: u64::MAX,
-                        flat_items_cache: std::rc::Rc::new(Vec::new()),
-                        gutter_cache: std::rc::Rc::new(Vec::new()),
-                        view_model_fp: None,
-                        view_model_seq: 0,
-                        highlight_cache: HighlightCache::new(),
-                        input_mode: InputMode::Chatbox,
-                        chatbox: Some(Chatbox::new()),
-                        current_plan: None,
-                        agent_mode: None,
-                        usage: None,
-                        subagents: Vec::new(),
-                        focused_subagent: None,
-                        tasklist_open: false,
-                        subagents_open: false,
-                        server_managed: true,
-                        follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
-                        _pump: None,
-                    };
-                    setup_list_follow_handler(&state.list_state, &state.follow_output);
-                    ring.push(
-                        label,
-                        state,
-                        info.acp_session_id.clone(),
-                        proc_cwd.clone(),
-                        Some(info.session_id.clone()),
-                    );
-                }
-            }
-            // Start the unified server pump (one per view, routes by session_id).
-            let _server_pump = self.start_server_pump(cx);
-            // Stash it on the first slot so it lives as long as the ring does.
+            // ── Session-server path (S4: non-blocking) ───────────────
+            // Render IMMEDIATELY in a "connecting…" placeholder, then do the
+            // (potentially slow) list_sessions / attach / create round-trips
+            // on a background thread. The server pump replays each session's
+            // full event_log on attach, so the transcript lands through the
+            // pump — we never have to block the paint thread on an Ack. The
+            // worst case the old synchronous path could hit was a ~30s freeze
+            // (request `recv_timeout`) when the server stalled.
+            let placeholder = AgentState::new_server_managed(Some(
+                "connecting to session server…".into(),
+            ));
+            let placeholder_index = ring.push(
+                "claude-1".into(),
+                placeholder,
+                None,
+                proc_cwd.clone(),
+                None,
+            );
+            // Start the unified server pump (one per view, routes by
+            // session_id) and stash it on the placeholder so it lives as long
+            // as the ring does — events for the soon-to-be-attached sessions
+            // need it running before the attach Ack returns.
+            let server_pump = self.start_server_pump(cx);
             if let Some(slot) = ring.slots.first_mut() {
-                slot.state._pump = Some(_server_pump);
+                slot.state._pump = Some(server_pump);
             }
+
+            self.set_screen(WindowContent::Agent(ring));
+            if let Some(c) = self.agent_mut() {
+                c.editor.begin_insert();
+            }
+            cx.notify();
+
+            self.spawn_open_agent_server(placeholder_index, proc_cwd, cx);
+            return;
         } else {
             // ── Direct-spawn path (legacy) ───────────────────────────
             let persisted = load_persisted_acp_sessions(&proc_cwd);
@@ -8953,6 +8917,198 @@ impl SketchGpuiView {
         cx.notify();
     }
 
+    /// Background half of `open_agent_inner`'s session-server path (S4). Runs
+    /// `list_sessions` and the resulting `attach`/`create_session` round-trips
+    /// off the paint thread, then splices the real slot(s) into the
+    /// placeholder ring via `this.update`. `placeholder_index` identifies the
+    /// "connecting…" slot to fill in place (it owns the pump task, so we
+    /// mutate it rather than replace it). If the window/ring is gone by the
+    /// time the result lands (weak entity dropped, screen switched), every
+    /// `this.update` is a no-op and the work is harmlessly discarded.
+    fn spawn_open_agent_server(
+        &self,
+        placeholder_index: usize,
+        proc_cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
+            return;
+        };
+        let is_candidate = self.is_candidate;
+        // Snapshot the server sids already open in any panel so the background
+        // thread can dedup without touching `self`. Taken now, while we're
+        // still on the (single-threaded) UI thread, so it can't race a
+        // concurrent ring mutation.
+        let mut open_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for tab in self.workspace.tabs.iter() {
+            tab.layout.for_each_leaf(&mut |w| {
+                if let WindowContent::Agent(ring) = &w.content {
+                    for slot in ring.slots.iter() {
+                        if let Some(sid) = &slot.server_session_id {
+                            open_sids.insert(sid.clone());
+                        }
+                    }
+                }
+            });
+        }
+        let attach_mode = if is_candidate {
+            AttachMode::Observer
+        } else {
+            AttachMode::Owner
+        };
+
+        cx.spawn(async move |this, cx| {
+            let cwd = proc_cwd.clone();
+            let resolution = cx
+                .background_executor()
+                .spawn(async move {
+                    // 1. Discover existing sessions for this cwd that aren't
+                    //    already shown elsewhere.
+                    let existing = match handle.list_sessions() {
+                        Ok(v) => v,
+                        Err(e) => return OpenResolution::Failed(format!("list failed: {e}")),
+                    };
+                    let matching: Vec<SessionInfo> = existing
+                        .into_iter()
+                        .filter(|s| s.cwd == cwd)
+                        .filter(|s| !open_sids.contains(&s.session_id))
+                        .collect();
+
+                    if matching.is_empty() {
+                        // 2a. None — create a fresh session. The server
+                        //     registers it and returns the sid immediately
+                        //     (ACP subprocess spawns server-side); attach so
+                        //     the pump receives its events.
+                        match handle.create_session(cwd, "claude-1".to_string(), None) {
+                            Ok(info) => {
+                                if let Err(e) = handle.attach(&info.session_id, AttachMode::Owner)
+                                {
+                                    eprintln!(
+                                        "[sketch-gpui] attach after create failed: {e}"
+                                    );
+                                }
+                                OpenResolution::Created {
+                                    sid: info.session_id,
+                                    acp_id: info.acp_session_id,
+                                }
+                            }
+                            Err(e) => OpenResolution::Failed(format!("create failed: {e}")),
+                        }
+                    } else {
+                        // 2b. Re-attach to each. The server replays the full
+                        //     event_log before the Ack, so the pump rebuilds
+                        //     the transcript on its first drain.
+                        let mut attached = Vec::with_capacity(matching.len());
+                        for (i, info) in matching.iter().enumerate() {
+                            if let Err(e) = handle.attach(&info.session_id, attach_mode) {
+                                eprintln!(
+                                    "[sketch-gpui] re-attach failed for {}: {e}",
+                                    &info.session_id[..info.session_id.len().min(8)],
+                                );
+                            }
+                            let status = if info.connected {
+                                format!(
+                                    "reconnected: {}",
+                                    info.acp_session_id.as_deref().unwrap_or("active")
+                                )
+                            } else {
+                                "reconnected (agent spawning…)".to_string()
+                            };
+                            attached.push(AttachedSlot {
+                                label: if matching.len() == 1 {
+                                    "claude-1".to_string()
+                                } else {
+                                    format!("claude-{}", i + 1)
+                                },
+                                sid: info.session_id.clone(),
+                                acp_id: info.acp_session_id.clone(),
+                                status,
+                            });
+                        }
+                        OpenResolution::Attached(attached)
+                    }
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                this.apply_open_agent_resolution(placeholder_index, resolution, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Apply the result of the background `open_agent` round-trips: fill the
+    /// "connecting…" placeholder slot (preserving its pump) and, for the
+    /// re-attach case, push any additional slots. A no-op if the placeholder
+    /// is gone (screen switched / slot closed before the result returned).
+    fn apply_open_agent_resolution(
+        &mut self,
+        placeholder_index: usize,
+        resolution: OpenResolution,
+        cx: &mut Context<Self>,
+    ) {
+        // Resolve the placeholder's cwd once; it's reused for any extra slots.
+        let proc_cwd = self
+            .agent_ring()
+            .and_then(|r| r.slot_by_index(placeholder_index))
+            .map(|pos| self.agent_ring().unwrap().slots[pos].cwd.clone());
+        let Some(proc_cwd) = proc_cwd else {
+            return; // placeholder gone
+        };
+
+        match resolution {
+            OpenResolution::Failed(msg) => {
+                if let Some(ring) = self.agent_ring_mut() {
+                    if let Some(slot) = ring.slot_by_index_mut(placeholder_index) {
+                        let m = format!("session server error — {msg}");
+                        Self::append_system_notice(&mut slot.state, &m);
+                        slot.state.status = Some(m.into());
+                    }
+                }
+            }
+            OpenResolution::Created { sid, acp_id } => {
+                if let Some(ring) = self.agent_ring_mut() {
+                    if let Some(slot) = ring.slot_by_index_mut(placeholder_index) {
+                        slot.server_session_id = Some(sid);
+                        slot.resume_id = acp_id;
+                        slot.state.status =
+                            Some("attaching to ACP agent via session server…".into());
+                    }
+                }
+            }
+            OpenResolution::Attached(attached) => {
+                let mut iter = attached.into_iter();
+                // First attached session fills the placeholder in place.
+                if let Some(first) = iter.next() {
+                    if let Some(ring) = self.agent_ring_mut() {
+                        if let Some(slot) = ring.slot_by_index_mut(placeholder_index) {
+                            slot.label = first.label;
+                            slot.server_session_id = Some(first.sid);
+                            slot.resume_id = first.acp_id;
+                            slot.state.status = Some(first.status.into());
+                        }
+                    }
+                }
+                // Remaining sessions get their own slots.
+                for a in iter {
+                    let state = AgentState::new_server_managed(Some(a.status.into()));
+                    if let Some(ring) = self.agent_ring_mut() {
+                        ring.push(a.label, state, a.acp_id, proc_cwd.clone(), Some(a.sid));
+                    }
+                }
+                // Re-focus the first slot so the user lands on it, not the
+                // last-pushed one.
+                if let Some(ring) = self.agent_ring_mut() {
+                    if let Some(pos) = ring.slot_by_index(placeholder_index) {
+                        ring.active = pos;
+                    }
+                }
+            }
+        }
+        self.save_agent_ring();
+        cx.notify();
+    }
+
     /// Create a new session and add it to the existing ring. With `cwd =
     /// None`, the new slot inherits the process cwd (today's behavior). With
     /// `cwd = Some(path)`, that already-resolved absolute path becomes the
@@ -8971,16 +9127,15 @@ impl SketchGpuiView {
         };
         let slot_cwd = cwd.unwrap_or_else(process_cwd);
 
-        if let Some(server) = &self.session_server {
-            // Session-server path.
-            let (state, server_sid) = self.create_agent_session_via_server(
-                server,
-                None,
-                &label,
-                slot_cwd.clone(),
-            );
+        if self.session_server.is_some() {
+            // Session-server path (S4: non-blocking). Push a "connecting…"
+            // placeholder immediately and create the session off-thread; the
+            // sid is spliced in when the round-trip returns.
+            let placeholder =
+                AgentState::new_server_managed(Some("connecting to session server…".into()));
             let ring = self.agent_ring_mut().unwrap();
-            ring.push(label, state, None, slot_cwd, server_sid);
+            let placeholder_index = ring.push(label.clone(), placeholder, None, slot_cwd.clone(), None);
+            self.spawn_create_agent_session(placeholder_index, label, slot_cwd, cx);
         } else {
             // Direct-spawn path.
             let state = self.create_agent_session(
@@ -9006,6 +9161,45 @@ impl SketchGpuiView {
         }
         self.save_agent_ring();
         cx.notify();
+    }
+
+    /// Background half of `new_agent_session`'s session-server path (S4).
+    /// Issues the `create_session` + `attach` round-trips off the paint thread
+    /// and fills the "connecting…" placeholder (by `placeholder_index`) when
+    /// they return. No-op if the placeholder is gone by then.
+    fn spawn_create_agent_session(
+        &self,
+        placeholder_index: usize,
+        label: String,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let resolution = cx
+                .background_executor()
+                .spawn(async move {
+                    match handle.create_session(cwd, label, None) {
+                        Ok(info) => {
+                            if let Err(e) = handle.attach(&info.session_id, AttachMode::Owner) {
+                                eprintln!("[sketch-gpui] attach after create failed: {e}");
+                            }
+                            OpenResolution::Created {
+                                sid: info.session_id,
+                                acp_id: info.acp_session_id,
+                            }
+                        }
+                        Err(e) => OpenResolution::Failed(format!("create failed: {e}")),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_open_agent_resolution(placeholder_index, resolution, cx);
+            });
+        })
+        .detach();
     }
 
     /// Respawn the slot identified by `slot_index` (monotonic
@@ -9055,7 +9249,10 @@ impl SketchGpuiView {
 
         // Phase 2: build a fresh agent session at the new cwd.
         if self.session_server.is_some() {
-            // Server path: close old session, create new one at new cwd.
+            // Server path (S4: non-blocking): take the old sid, fire its close
+            // off-thread, mark the slot "connecting…", and create the new
+            // session off-thread. `spawn_create_agent_session` splices the new
+            // sid into this slot (by its monotonic `slot_index`) when ready.
             let old_sid = {
                 if let Some(ring) = self.agent_ring_mut() {
                     ring.slots.get_mut(pos).and_then(|s| s.server_session_id.take())
@@ -9063,34 +9260,27 @@ impl SketchGpuiView {
                     None
                 }
             };
-            if let Some(old_sid) = &old_sid {
-                if let Some(server) = &self.session_server {
-                    let _ = server.close_session(old_sid);
-                }
+            if let Some(old_sid) = old_sid {
+                self.spawn_close_session(old_sid, cx);
             }
-            let result = {
-                let server = self.session_server.as_ref().unwrap();
-                self.create_agent_session_via_server(
-                    server,
-                    None,
-                    "respawned",
-                    new_cwd.clone(),
-                )
-            };
-            let (_fresh, server_sid) = result;
             if let Some(ring) = self.agent_ring_mut() {
                 if let Some(slot) = ring.slots.get_mut(pos) {
-                    slot.server_session_id = server_sid;
                     slot.state.attach_pending = None;
                     slot.state.channel = None;
                     let msg = format!(
-                        "cwd → {}, fresh session",
+                        "cwd → {}, connecting to fresh session…",
                         shorten_cwd_for_display(&new_cwd),
                     );
                     Self::append_system_notice(&mut slot.state, &msg);
                     slot.state.status = Some(msg.into());
                 }
             }
+            self.spawn_create_agent_session(
+                slot_index,
+                "respawned".to_string(),
+                new_cwd.clone(),
+                cx,
+            );
         } else {
             // Direct-spawn path: graft a throwaway AgentState's
             // channel + pump into the existing slot.
@@ -9134,45 +9324,21 @@ impl SketchGpuiView {
 
     /// Close the active session. If the ring is now empty, exit Claude.
     fn close_active_agent_session(&mut self, cx: &mut Context<Self>) {
-        // For server sessions, confirm the close server-side BEFORE dropping
-        // the local slot. The old optimistic order (drop locally, then fire
-        // the close) left an orphaned server session behind a vanished slot
-        // whenever the close failed (not owner, or disconnected) — which then
-        // reappeared as a zombie on the next open. Identify the active slot's
-        // sid without mutating yet:
+        // For server sessions: drop the slot locally NOW (optimistic) and fire
+        // the close round-trip off the paint thread (S4). `close_session`
+        // parks on a 30s `recv_timeout`, so doing it synchronously froze the
+        // window when the server stalled. The server broadcasts `SessionClosed`
+        // on success, which `reconcile_session_closed` already folds into every
+        // panel — so the worst case of an off-thread close that ends up not
+        // landing is a stale entry that the next open's dedup/reconnect path
+        // cleans up, not a frozen UI.
         let server_sid = self
             .agent_ring()
             .filter(|r| !r.is_empty())
             .and_then(|r| r.active().server_session_id.clone());
 
-        if let Some(sid) = &server_sid {
-            if let Some(server) = &self.session_server {
-                match server.close_session(sid) {
-                    // Confirmed. The SessionClosed broadcast reconciles this
-                    // slot out of every panel; the local drop below is the
-                    // immediate-feedback path and makes that broadcast a no-op.
-                    Ok(()) => {}
-                    // Connection problem — keep the slot intact and let the
-                    // reconnect path recover rather than silently dropping it.
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        if let Some(claude) = self.agent_mut() {
-                            claude.status = Some(format!("close failed: {e}").into());
-                        }
-                        cx.notify();
-                        return;
-                    }
-                    // Logical error (we're an observer, or it's already gone
-                    // server-side): detach best-effort, then drop locally.
-                    Err(_) => {
-                        let _ = server.detach(sid);
-                    }
-                }
-            }
+        if let Some(sid) = server_sid {
+            self.spawn_close_session(sid, cx);
         }
 
         let is_empty = {
@@ -9194,6 +9360,40 @@ impl SketchGpuiView {
             self.save_agent_ring();
             cx.notify();
         }
+    }
+
+    /// Fire a `close_session` off the paint thread (S4). The local slot has
+    /// already been dropped (optimistic close); this just tells the server to
+    /// tear down its session. On a logical error (we're an observer, or it's
+    /// already gone) it best-effort detaches. Errors are logged, not surfaced —
+    /// the slot is gone and the `SessionClosed` broadcast reconciles the rest.
+    fn spawn_close_session(&self, sid: String, cx: &mut Context<Self>) {
+        let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                match handle.close_session(&sid) {
+                    Ok(()) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        eprintln!(
+                            "[sketch-gpui] close_session({}) failed (connection): {e}",
+                            &sid[..sid.len().min(8)],
+                        );
+                    }
+                    Err(_) => {
+                        // Logical error — detach best-effort so the server drops
+                        // our subscription even though the session lives on.
+                        let _ = handle.detach(&sid);
+                    }
+                }
+            })
+            .detach();
     }
 
     /// Snapshot the current ring to disk. Called after every ring mutation
@@ -9371,132 +9571,6 @@ impl SketchGpuiView {
         state
     }
 
-    /// Create an agent session via the session server. Returns
-    /// `(AgentState, server_session_id)`. The session server owns the ACP
-    /// subprocess; the GUI just receives events through the shared
-    /// `SessionServerClient::try_recv()` notification channel. No per-slot
-    /// pump task is needed — the unified `pump_server_sessions` task routes
-    /// events by `session_id`.
-    fn create_agent_session_via_server(
-        &self,
-        server: &SessionServerClient,
-        resume_id: Option<String>,
-        label: &str,
-        cwd: PathBuf,
-    ) -> (AgentState, Option<String>) {
-        let info = match server.create_session(cwd, label.to_string(), resume_id) {
-            Ok(info) => info,
-            Err(e) => {
-                let editor = Editor::new(String::new(), PathBuf::from("*claude*"));
-                let mut state = AgentState {
-                    editor,
-                    channel: None,
-                    attach_pending: None,
-                    mode: EditMode::Insert,
-                    keybinds: KeybindManager::default(),
-                    list_state: gpui::ListState::new(
-                        0,
-                        gpui::ListAlignment::Bottom,
-                        gpui::px(256.0),
-                    ),
-                    list_item_count: 0,
-                    status: Some(format!("server create failed: {e}").into()),
-                    awaiting_reply: false,
-                    turn_started: None,
-                    last_event_at: None,
-                    stop_requested_at: None,
-                    last_seen_turns: 0,
-                    tool_calls: std::collections::HashMap::new(),
-                    tool_call_order: Vec::new(),
-                    tool_call_anchor_line: std::collections::HashMap::new(),
-                    expanded_tool_calls: std::collections::HashSet::new(),
-                    block_ranges: Vec::new(),
-                    block_cache: std::collections::HashMap::new(),
-                    block_cache_frozen_count: 0,
-                    lines_cache: std::rc::Rc::new(Vec::new()),
-                    lines_cache_seq: u64::MAX,
-                    flat_items_cache: std::rc::Rc::new(Vec::new()),
-                    gutter_cache: std::rc::Rc::new(Vec::new()),
-                    view_model_fp: None,
-                    view_model_seq: 0,
-                    highlight_cache: HighlightCache::new(),
-                    input_mode: InputMode::Chatbox,
-                    chatbox: Some(Chatbox::new()),
-                    current_plan: None,
-                    agent_mode: None,
-                    usage: None,
-                    subagents: Vec::new(),
-                    focused_subagent: None,
-                    tasklist_open: false,
-                    subagents_open: false,
-                    server_managed: true,
-                    follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
-                    _pump: None,
-                };
-                setup_list_follow_handler(&state.list_state, &state.follow_output);
-                state.editor.begin_insert();
-                return (state, None);
-            }
-        };
-
-        let server_session_id = info.session_id.clone();
-
-        // Attach to the session's notification stream. We just created this
-        // session, so we own it (even a candidate owns sessions it creates).
-        if let Err(e) = server.attach(&server_session_id, AttachMode::Owner) {
-            eprintln!("[sketch-gpui] attach to server session failed: {e}");
-        }
-
-        let editor = Editor::new(String::new(), PathBuf::from("*claude*"));
-        let state = AgentState {
-            editor,
-            channel: None,
-            attach_pending: None,
-            mode: EditMode::Insert,
-            keybinds: KeybindManager::default(),
-            list_state: gpui::ListState::new(
-                0,
-                gpui::ListAlignment::Bottom,
-                gpui::px(256.0),
-            ),
-            list_item_count: 0,
-            status: Some("attaching to ACP agent via session server…".into()),
-            awaiting_reply: false,
-            turn_started: None,
-            last_event_at: None,
-            stop_requested_at: None,
-            last_seen_turns: 0,
-            tool_calls: std::collections::HashMap::new(),
-            tool_call_order: Vec::new(),
-            tool_call_anchor_line: std::collections::HashMap::new(),
-            expanded_tool_calls: std::collections::HashSet::new(),
-            block_ranges: Vec::new(),
-            block_cache: std::collections::HashMap::new(),
-            block_cache_frozen_count: 0,
-            lines_cache: std::rc::Rc::new(Vec::new()),
-            lines_cache_seq: u64::MAX,
-            flat_items_cache: std::rc::Rc::new(Vec::new()),
-            gutter_cache: std::rc::Rc::new(Vec::new()),
-            view_model_fp: None,
-            view_model_seq: 0,
-            highlight_cache: HighlightCache::new(),
-            input_mode: InputMode::Chatbox,
-            chatbox: Some(Chatbox::new()),
-            current_plan: None,
-            agent_mode: None,
-            usage: None,
-            subagents: Vec::new(),
-            focused_subagent: None,
-            tasklist_open: false,
-            subagents_open: false,
-            server_managed: true,
-            follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
-            _pump: None,
-        };
-        setup_list_follow_handler(&state.list_state, &state.follow_output);
-
-        (state, Some(server_session_id))
-    }
 
     /// Re-establish the session-server connection after a drop, then
     /// re-subscribe every live slot. Returns the fresh notification + wake
@@ -9770,25 +9844,6 @@ impl SketchGpuiView {
             });
         }
         count
-    }
-
-    /// True if any panel in any tab already shows the server session `sid`.
-    /// A session lives in exactly one panel per GUI: attaching the same
-    /// session twice from one connection spawns a duplicate server-side
-    /// forwarder (events arrive twice) and strands a slot (routing resolves a
-    /// sid to a single slot), so re-opening must not clone it.
-    fn workspace_has_server_session(&self, sid: &str) -> bool {
-        self.workspace.tabs.iter().any(|tab| {
-            let mut found = false;
-            tab.layout.for_each_leaf(&mut |w| {
-                if let WindowContent::Agent(ring) = &w.content {
-                    if ring.has_server_session(sid) {
-                        found = true;
-                    }
-                }
-            });
-            found
-        })
     }
 
     /// Reconcile a server-side close into the local model: drop the slot for

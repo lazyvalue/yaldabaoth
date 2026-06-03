@@ -35,8 +35,11 @@ pub struct SessionServerClient {
     wake_rx: Option<futures::channel::mpsc::UnboundedReceiver<()>>,
     /// Connection liveness.
     connected: Arc<AtomicBool>,
-    /// Monotonic request id counter.
-    next_id: AtomicU64,
+    /// Monotonic request id counter. `Arc` so a [`SessionServerHandle`] can
+    /// share the same id space — off-thread requests must not collide with
+    /// the main client's ids or two callers could steal each other's
+    /// responses.
+    next_id: Arc<AtomicU64>,
     /// Background threads.
     _reader: Option<JoinHandle<()>>,
     _writer: Option<JoinHandle<()>>,
@@ -205,7 +208,7 @@ impl SessionServerClient {
             notification_rx: Some(notification_rx),
             wake_rx: Some(wake_rx),
             connected,
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
             _reader: Some(reader),
             _writer: Some(writer),
             pending,
@@ -311,6 +314,25 @@ impl SessionServerClient {
 
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    /// Build a cheap, cloneable, `Send + Sync` handle that can issue the same
+    /// blocking requests from any thread. Used by the GUI to move
+    /// `list_sessions` / `create_session` / `close_session` round-trips off
+    /// the GPUI paint thread: those calls park on a 30s `recv_timeout`, so a
+    /// stalled server would otherwise freeze the window. The handle shares the
+    /// writer channel, the pending-response map, the liveness flag, and the
+    /// request-id counter with this client, so responses route correctly and
+    /// the same disconnect logic unblocks both. The notification stream stays
+    /// exclusively on the [`SessionServerClient`] / pump task; a handle never
+    /// reads notifications.
+    pub fn handle(&self) -> SessionServerHandle {
+        SessionServerHandle {
+            request_tx: self.request_tx.clone(),
+            connected: Arc::clone(&self.connected),
+            next_id: Arc::clone(&self.next_id),
+            pending: Arc::clone(&self.pending),
+        }
     }
 
     pub fn list_sessions(&self) -> io::Result<Vec<SessionInfo>> {
@@ -460,5 +482,118 @@ impl Drop for SessionServerClient {
         // dropped `request_tx` so it exits cleanly.
         self.connected.store(false, Ordering::SeqCst);
         fail_all_pending(&self.pending);
+    }
+}
+
+/// A `Send + Sync`, cloneable handle for issuing session-server requests from
+/// a background thread. Created via [`SessionServerClient::handle`]. Holds
+/// clones of the writer channel, liveness flag, request-id counter, and the
+/// pending-response map, so its blocking requests share the exact same routing
+/// and disconnect behaviour as the owning client. It deliberately exposes only
+/// the request/response calls the GUI needs to move off the paint thread; the
+/// notification stream and reconnect logic remain on the owning client.
+#[derive(Clone)]
+pub struct SessionServerHandle {
+    request_tx: std_mpsc::Sender<(Frame, Option<std_mpsc::Sender<Response>>)>,
+    connected: Arc<AtomicBool>,
+    next_id: Arc<AtomicU64>,
+    pending: Arc<Mutex<std::collections::HashMap<u64, std_mpsc::Sender<Response>>>>,
+}
+
+impl SessionServerHandle {
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+
+    /// Blocking request/response — identical semantics to
+    /// [`SessionServerClient::request`] but callable off-thread.
+    fn request(&self, req: Request) -> io::Result<Response> {
+        if !self.is_connected() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session server disconnected",
+            ));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (resp_tx, resp_rx) = std_mpsc::channel();
+        let frame = Frame::Request { id, req };
+        self.request_tx
+            .send((frame, Some(resp_tx)))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer thread gone"))?;
+
+        resp_rx
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|e| match e {
+                std_mpsc::RecvTimeoutError::Disconnected => {
+                    self.connected.store(false, Ordering::SeqCst);
+                    io::Error::new(io::ErrorKind::BrokenPipe, "session server disconnected")
+                }
+                std_mpsc::RecvTimeoutError::Timeout => {
+                    io::Error::new(io::ErrorKind::TimedOut, "request timed out")
+                }
+            })
+    }
+
+    pub fn list_sessions(&self) -> io::Result<Vec<SessionInfo>> {
+        match self.request(Request::ListSessions)? {
+            Response::Ok {
+                data: ResponseData::Sessions { sessions },
+            } => Ok(sessions),
+            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected response",
+            )),
+        }
+    }
+
+    pub fn create_session(
+        &self,
+        cwd: PathBuf,
+        label: String,
+        resume_session_id: Option<String>,
+    ) -> io::Result<SessionInfo> {
+        match self.request(Request::CreateSession {
+            cwd,
+            label,
+            resume_session_id,
+        })? {
+            Response::Ok {
+                data: ResponseData::Session { session },
+            } => Ok(session),
+            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected response",
+            )),
+        }
+    }
+
+    pub fn attach(&self, session_id: &str, mode: AttachMode) -> io::Result<()> {
+        match self.request(Request::Attach {
+            session_id: session_id.to_string(),
+            mode,
+        })? {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+        }
+    }
+
+    pub fn detach(&self, session_id: &str) -> io::Result<()> {
+        match self.request(Request::Detach {
+            session_id: session_id.to_string(),
+        })? {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+        }
+    }
+
+    pub fn close_session(&self, session_id: &str) -> io::Result<()> {
+        match self.request(Request::CloseSession {
+            session_id: session_id.to_string(),
+        })? {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+        }
     }
 }
