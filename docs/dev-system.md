@@ -107,6 +107,7 @@ What to build (backlog item #1):
 | `/worklog` | end-of-session: write the worklog entry + update backlog |
 | `/integrate` | merge feature branches into one buildable branch |
 | `/refactor` | multi-lens design review (⚠ retarget its Fulcrum preamble — see backlog) |
+| `/responsiveness-audit` | symptom-agnostic whole-surface sweep for UI-responsiveness invariant violations ("the tachyon reviewer") |
 | `/verify`, `/code-review`, `/simplify` | built-ins |
 
 ## See also
