@@ -88,8 +88,9 @@ use gpui::{
 
 use sketch::acp_channel::AcpChannelClient;
 use sketch::blocks::{ColumnAlignment, ListItem, RenderedBlock, StyledLine, StyledSpan};
+use sketch::cursor::CursorPos;
 use sketch::document::Document;
-use sketch::editor::{Editor, LineAnchor};
+use sketch::editor::{Editor, EditorCore, EditorView, LineAnchor};
 use sketch::file_browser::{BrowserEntry, FileBrowser};
 use sketch::keybind::KeybindManager;
 use sketch::keys::{Key, KeyPress, Modifiers as KMods};
@@ -2134,6 +2135,99 @@ fn restore_rail(p: PersistedRail) -> workspace::RailState {
     }
 }
 
+/// Reconstruct a persisted layout into live `WindowContent`, opening any
+/// file-backed leaves through `ws`'s buffer pool so two restored views of the
+/// same file share one core. Returns the live layout plus the max window id
+/// seen (so the caller can advance the id allocator past restored ids).
+fn restore_layout(
+    ws: &mut workspace::Workspace<WindowContent>,
+    theme: &Theme,
+    layout: PersistedLayout,
+) -> (workspace::Layout<WindowContent>, workspace::WindowId) {
+    match layout {
+        PersistedLayout::Leaf(leaf) => {
+            let id = leaf.id;
+            let content = restore_content(ws, theme, leaf.kind);
+            (
+                workspace::Layout::Leaf(workspace::Window { id, content }),
+                id,
+            )
+        }
+        PersistedLayout::Split { dir, children } => {
+            let mut max_id: workspace::WindowId = 0;
+            let mut restored_children = Vec::with_capacity(children.len());
+            for (w, child) in children {
+                let (sub, sub_max) = restore_layout(ws, theme, child);
+                if sub_max > max_id {
+                    max_id = sub_max;
+                }
+                restored_children.push((w, sub));
+            }
+            (
+                workspace::Layout::Split {
+                    dir,
+                    children: restored_children,
+                },
+                max_id,
+            )
+        }
+    }
+}
+
+fn restore_content(
+    ws: &mut workspace::Workspace<WindowContent>,
+    theme: &Theme,
+    kind: PersistedKind,
+) -> WindowContent {
+    match kind {
+        PersistedKind::Doc { path } => {
+            let label: SharedString = path.display().to_string().into();
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let doc = Document::from_text(text, path.clone());
+            let blocks = render_with_wiki(&doc.full_text(), theme, Some(&path));
+            WindowContent::Doc(DocState {
+                blocks,
+                file_label: label,
+                cursor_block: 0,
+                scroll_handle: ScrollHandle::new(),
+                edit_cache: None,
+            })
+        }
+        PersistedKind::Edit { path } => {
+            let label: SharedString = path.display().to_string().into();
+            // Restore through the pool — a second restored Edit view of the
+            // same file binds to the same shared core.
+            match ws.open_and_retain(&path) {
+                Ok((id, core)) => WindowContent::Edit(EditState::new(
+                    SharedEditor::new(id, core),
+                    label,
+                    EditView::Code,
+                )),
+                Err(_) => WindowContent::Browser(BrowserWindow::standalone(
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                )),
+            }
+        }
+        PersistedKind::Browser { dir } => {
+            let dir = if dir.is_dir() {
+                dir
+            } else {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            };
+            WindowContent::Browser(BrowserWindow::standalone(dir))
+        }
+        PersistedKind::Agent { .. } => {
+            // Claude restore is its own subsystem (acp_sessions.json +
+            // open_agent_inner). Replace with a Browser stub here so the
+            // tab survives; user can re-attach via the existing Claude
+            // commands.
+            WindowContent::Browser(BrowserWindow::standalone(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ))
+        }
+    }
+}
+
 /// Snapshot a live workspace into a fully serializable shape.
 fn snapshot_workspace(ws: &workspace::Workspace<WindowContent>) -> PersistedWorkspace {
     PersistedWorkspace {
@@ -3816,13 +3910,405 @@ enum EditView {
     WordProcessor,
 }
 
+/// A file-backed editor handle whose `EditorCore` lives in the workspace
+/// buffer pool (`Rc<RefCell<EditorCore>>`) and is therefore shared by every
+/// window viewing the same file. The per-window `EditorView` (cursor,
+/// selection, insert flag) is owned here, so each split / also-shown pane
+/// navigates independently while edits + undo land on one shared rope.
+///
+/// `buffer_id` is the pool key; the owning window must `buffer_release` it on
+/// close so refcounting can drop clean, unreferenced buffers.
+struct SharedEditor {
+    /// Pool key for this file's core. Liveness is tracked via `Rc` strong
+    /// count (see `Workspace::gc_buffers`), so this id isn't needed for
+    /// refcounting; it's kept as the stable handle for future explicit pool
+    /// ops (save-to-pool, `:buffers`).
+    #[allow(dead_code)]
+    buffer_id: workspace::FileBufferId,
+    core: workspace::SharedCore,
+    view: EditorView,
+}
+
+impl SharedEditor {
+    fn new(buffer_id: workspace::FileBufferId, core: workspace::SharedCore) -> Self {
+        Self {
+            buffer_id,
+            core,
+            view: EditorView::new(),
+        }
+    }
+
+    // --- Read accessors (return owned snapshots; can't lend `&` out of the
+    //     RefCell with a `&self` signature). ---
+
+    fn cursor(&self) -> CursorPos {
+        *self.view.cursor()
+    }
+    fn set_cursor(&mut self, line: usize, col: usize) {
+        let c = self.view.cursor_mut();
+        c.line = line;
+        c.col = col;
+    }
+    fn is_modified(&self) -> bool {
+        self.core.borrow().document().is_modified()
+    }
+    fn line_count(&self) -> usize {
+        self.core.borrow().document().line_count()
+    }
+    fn full_text(&self) -> String {
+        self.core.borrow().document().full_text()
+    }
+
+    // --- Selection / mode (view-only) ---
+
+    fn extend_mode(&self) -> bool {
+        self.view.extend_mode()
+    }
+    fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        self.view.selection_range()
+    }
+    fn selection_text(&self) -> Option<String> {
+        self.view.selection_text(&self.core.borrow())
+    }
+    fn clear_selection(&mut self) {
+        self.view.clear_selection();
+    }
+
+    // --- Mutations that EditState drives directly ---
+
+    fn insert_char(&mut self, ch: char) {
+        self.view.insert_char(&mut self.core.borrow_mut(), ch);
+    }
+    fn save(&mut self) -> std::io::Result<()> {
+        self.core.borrow_mut().save()
+    }
+}
+
+/// The dispatch core (`dispatch_normal_core` / `dispatch_insert_core`) is
+/// shared by every text surface — the pooled Edit pane plus the (non-pooled)
+/// Chatbox and Agent transcript. This trait lets the dispatch stay one body
+/// while operating over either an owned [`Editor`] or a pool-backed
+/// [`SharedEditor`]. Every method mirrors the matching `Editor` method; the
+/// `SharedEditor` impl simply borrows its `Rc<RefCell<EditorCore>>` first.
+trait EditOps {
+    fn cursor(&self) -> CursorPos;
+    fn cursor_set(&mut self, line: usize, col: usize);
+    fn cursor_move_left(&mut self);
+    fn cursor_move_up(&mut self);
+    fn cursor_move_line_start(&mut self);
+    fn cursor_jump_top(&mut self);
+    fn line_len_chars(&self, line: usize) -> usize;
+    fn line_text_at_cursor(&self) -> String;
+
+    fn extend_mode(&self) -> bool;
+    fn set_extend_mode(&mut self, on: bool);
+    fn toggle_extend_mode(&mut self);
+    fn selection_range(&self) -> Option<((usize, usize), (usize, usize))>;
+    fn selection_anchor(&self) -> Option<CursorPos>;
+    fn anchor_at_cursor(&mut self);
+    fn clear_selection(&mut self);
+    fn collapse_selection(&mut self);
+    fn flip_selection(&mut self);
+    fn select_all(&mut self);
+    fn extend_by_line(&mut self);
+    fn yank_selection(&self) -> Option<String>;
+
+    fn pre_move(&mut self, creates_selection: bool);
+    fn move_down(&mut self, insert_mode: bool);
+    fn move_right_clamped(&mut self, insert_mode: bool);
+    fn clamp_cursor_col(&mut self, insert_mode: bool);
+    fn move_cursor_line_end(&mut self, insert_mode: bool);
+    fn move_cursor_word_forward(&mut self);
+    fn move_cursor_word_backward(&mut self);
+    fn move_cursor_word_end(&mut self);
+    fn jump_cursor_bottom(&mut self);
+
+    fn begin_insert(&mut self);
+    fn end_insert(&mut self);
+    fn insert_char(&mut self, ch: char);
+    fn backspace(&mut self);
+    fn delete_char_at_cursor(&mut self);
+    fn delete_current_line(&mut self);
+    fn delete_selection(&mut self) -> bool;
+    fn open_line_below(&mut self);
+    fn open_line_above(&mut self);
+    fn undo(&mut self);
+    fn redo(&mut self);
+}
+
+impl EditOps for Editor {
+    fn cursor(&self) -> CursorPos {
+        *Editor::cursor(self)
+    }
+    fn cursor_set(&mut self, line: usize, col: usize) {
+        let c = self.cursor_mut();
+        c.line = line;
+        c.col = col;
+    }
+    fn cursor_move_left(&mut self) {
+        self.cursor_mut().move_left();
+    }
+    fn cursor_move_up(&mut self) {
+        self.cursor_mut().move_up();
+    }
+    fn cursor_move_line_start(&mut self) {
+        self.cursor_mut().move_line_start();
+    }
+    fn cursor_jump_top(&mut self) {
+        self.cursor_mut().jump_top();
+    }
+    fn line_len_chars(&self, line: usize) -> usize {
+        self.document().line_len_chars(line)
+    }
+    fn line_text_at_cursor(&self) -> String {
+        self.document().line_text(Editor::cursor(self).line)
+    }
+    fn extend_mode(&self) -> bool {
+        Editor::extend_mode(self)
+    }
+    fn set_extend_mode(&mut self, on: bool) {
+        Editor::set_extend_mode(self, on);
+    }
+    fn toggle_extend_mode(&mut self) {
+        Editor::toggle_extend_mode(self);
+    }
+    fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        Editor::selection_range(self)
+    }
+    fn selection_anchor(&self) -> Option<CursorPos> {
+        Editor::selection_anchor(self)
+    }
+    fn anchor_at_cursor(&mut self) {
+        Editor::anchor_at_cursor(self);
+    }
+    fn clear_selection(&mut self) {
+        Editor::clear_selection(self);
+    }
+    fn collapse_selection(&mut self) {
+        Editor::collapse_selection(self);
+    }
+    fn flip_selection(&mut self) {
+        Editor::flip_selection(self);
+    }
+    fn select_all(&mut self) {
+        Editor::select_all(self);
+    }
+    fn extend_by_line(&mut self) {
+        Editor::extend_by_line(self);
+    }
+    fn yank_selection(&self) -> Option<String> {
+        Editor::yank_selection(self)
+    }
+    fn pre_move(&mut self, creates_selection: bool) {
+        Editor::pre_move(self, creates_selection);
+    }
+    fn move_down(&mut self, insert_mode: bool) {
+        Editor::move_down(self, insert_mode);
+    }
+    fn move_right_clamped(&mut self, insert_mode: bool) {
+        Editor::move_right_clamped(self, insert_mode);
+    }
+    fn clamp_cursor_col(&mut self, insert_mode: bool) {
+        Editor::clamp_cursor_col(self, insert_mode);
+    }
+    fn move_cursor_line_end(&mut self, insert_mode: bool) {
+        Editor::move_cursor_line_end(self, insert_mode);
+    }
+    fn move_cursor_word_forward(&mut self) {
+        Editor::move_cursor_word_forward(self);
+    }
+    fn move_cursor_word_backward(&mut self) {
+        Editor::move_cursor_word_backward(self);
+    }
+    fn move_cursor_word_end(&mut self) {
+        Editor::move_cursor_word_end(self);
+    }
+    fn jump_cursor_bottom(&mut self) {
+        Editor::jump_cursor_bottom(self);
+    }
+    fn begin_insert(&mut self) {
+        Editor::begin_insert(self);
+    }
+    fn end_insert(&mut self) {
+        Editor::end_insert(self);
+    }
+    fn insert_char(&mut self, ch: char) {
+        Editor::insert_char(self, ch);
+    }
+    fn backspace(&mut self) {
+        Editor::backspace(self);
+    }
+    fn delete_char_at_cursor(&mut self) {
+        Editor::delete_char_at_cursor(self);
+    }
+    fn delete_current_line(&mut self) {
+        Editor::delete_current_line(self);
+    }
+    fn delete_selection(&mut self) -> bool {
+        Editor::delete_selection(self)
+    }
+    fn open_line_below(&mut self) {
+        Editor::open_line_below(self);
+    }
+    fn open_line_above(&mut self) {
+        Editor::open_line_above(self);
+    }
+    fn undo(&mut self) {
+        Editor::undo(self);
+    }
+    fn redo(&mut self) {
+        Editor::redo(self);
+    }
+}
+
+impl EditOps for SharedEditor {
+    fn cursor(&self) -> CursorPos {
+        *self.view.cursor()
+    }
+    fn cursor_set(&mut self, line: usize, col: usize) {
+        let c = self.view.cursor_mut();
+        c.line = line;
+        c.col = col;
+    }
+    fn cursor_move_left(&mut self) {
+        self.view.cursor_mut().move_left();
+    }
+    fn cursor_move_up(&mut self) {
+        self.view.cursor_mut().move_up();
+    }
+    fn cursor_move_line_start(&mut self) {
+        self.view.cursor_mut().move_line_start();
+    }
+    fn cursor_jump_top(&mut self) {
+        self.view.cursor_mut().jump_top();
+    }
+    fn line_len_chars(&self, line: usize) -> usize {
+        self.core.borrow().document().line_len_chars(line)
+    }
+    fn line_text_at_cursor(&self) -> String {
+        let line = self.view.cursor().line;
+        self.core.borrow().document().line_text(line)
+    }
+    fn extend_mode(&self) -> bool {
+        self.view.extend_mode()
+    }
+    fn set_extend_mode(&mut self, on: bool) {
+        self.view.set_extend_mode(on);
+    }
+    fn toggle_extend_mode(&mut self) {
+        self.view.toggle_extend_mode();
+    }
+    fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        self.view.selection_range()
+    }
+    fn selection_anchor(&self) -> Option<CursorPos> {
+        self.view.selection_anchor()
+    }
+    fn anchor_at_cursor(&mut self) {
+        self.view.anchor_at_cursor();
+    }
+    fn clear_selection(&mut self) {
+        self.view.clear_selection();
+    }
+    fn collapse_selection(&mut self) {
+        self.view.collapse_selection();
+    }
+    fn flip_selection(&mut self) {
+        self.view.flip_selection();
+    }
+    fn select_all(&mut self) {
+        self.view.select_all(&self.core.borrow());
+    }
+    fn extend_by_line(&mut self) {
+        self.view.extend_by_line(&self.core.borrow());
+    }
+    fn yank_selection(&self) -> Option<String> {
+        self.view.yank_selection(&self.core.borrow())
+    }
+    fn pre_move(&mut self, creates_selection: bool) {
+        self.view.pre_move(creates_selection);
+    }
+    fn move_down(&mut self, insert_mode: bool) {
+        self.view.move_down(&self.core.borrow(), insert_mode);
+    }
+    fn move_right_clamped(&mut self, insert_mode: bool) {
+        self.view.move_right_clamped(&self.core.borrow(), insert_mode);
+    }
+    fn clamp_cursor_col(&mut self, insert_mode: bool) {
+        self.view.clamp_cursor_col(&self.core.borrow(), insert_mode);
+    }
+    fn move_cursor_line_end(&mut self, insert_mode: bool) {
+        self.view.move_cursor_line_end(&self.core.borrow(), insert_mode);
+    }
+    fn move_cursor_word_forward(&mut self) {
+        self.view.move_cursor_word_forward(&self.core.borrow());
+    }
+    fn move_cursor_word_backward(&mut self) {
+        self.view.move_cursor_word_backward(&self.core.borrow());
+    }
+    fn move_cursor_word_end(&mut self) {
+        self.view.move_cursor_word_end(&self.core.borrow());
+    }
+    fn jump_cursor_bottom(&mut self) {
+        self.view.jump_cursor_bottom(&self.core.borrow());
+    }
+    fn begin_insert(&mut self) {
+        self.view.begin_insert(&mut self.core.borrow_mut());
+    }
+    fn end_insert(&mut self) {
+        self.view.end_insert(&mut self.core.borrow_mut());
+    }
+    fn insert_char(&mut self, ch: char) {
+        self.view.insert_char(&mut self.core.borrow_mut(), ch);
+    }
+    fn backspace(&mut self) {
+        self.view.backspace(&mut self.core.borrow_mut());
+    }
+    fn delete_char_at_cursor(&mut self) {
+        self.view.delete_char_at_cursor(&mut self.core.borrow_mut());
+    }
+    fn delete_current_line(&mut self) {
+        self.view.delete_current_line(&mut self.core.borrow_mut());
+    }
+    fn delete_selection(&mut self) -> bool {
+        self.view.delete_selection(&mut self.core.borrow_mut())
+    }
+    fn open_line_below(&mut self) {
+        self.view.open_line_below(&mut self.core.borrow_mut());
+    }
+    fn open_line_above(&mut self) {
+        self.view.open_line_above(&mut self.core.borrow_mut());
+    }
+    fn undo(&mut self) {
+        self.view.undo(&mut self.core.borrow_mut());
+    }
+    fn redo(&mut self) {
+        self.view.redo(&mut self.core.borrow_mut());
+    }
+}
+
+/// Build the trimmed, tab-expanded per-line text for an Edit pane's body,
+/// reading the pooled core's rope once. Mirrors the prior per-line
+/// `document().line_text(i)` loop but takes a single `RefCell` borrow.
+fn edit_lines(e: &EditState, line_count: usize) -> Vec<String> {
+    let core = e.editor.core.borrow();
+    let doc = core.document();
+    (0..line_count.max(1))
+        .map(|i| {
+            doc.line_text(i)
+                .trim_end_matches('\n')
+                .replace('\t', "    ")
+        })
+        .collect()
+}
+
 /// State held while the user is editing a buffer in the GPUI frontend.
 /// Raw buffer + cursor + Insert/Normal toggle + vim-style normal-mode
 /// actions routed through the shared `KeybindManager`/`Action` vocabulary.
 /// Source lines are syntax-highlighted via `md_highlight`.
 /// Deferred: IME.
 struct EditState {
-    editor: Editor,
+    editor: SharedEditor,
     file_label: SharedString,
     mode: EditMode,
     keybinds: KeybindManager,
@@ -3837,7 +4323,7 @@ struct EditState {
 }
 
 impl EditState {
-    fn new(editor: Editor, file_label: SharedString, view: EditView) -> Self {
+    fn new(editor: SharedEditor, file_label: SharedString, view: EditView) -> Self {
         Self {
             editor,
             file_label,
@@ -4669,7 +5155,12 @@ impl SketchGpuiView {
     /// after every structural mutation (tab add/remove, split, close,
     /// focus change, etc.). Best-effort — failures are silent so a
     /// read-only cache_dir or full disk doesn't break the editor.
-    fn save_workspace_state(&self) {
+    fn save_workspace_state(&mut self) {
+        // Reap pooled buffers no window references anymore. This is the buffer
+        // pool's liveness sweep — called after every structural mutation, so a
+        // closed/relocated Edit pane's clean buffer is dropped promptly while
+        // dirty ones stay pooled for recovery.
+        self.workspace.gc_buffers();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         save_persisted_workspace(&cwd, &self.workspace);
     }
@@ -4686,7 +5177,7 @@ impl SketchGpuiView {
         };
         let mut ws: workspace::Workspace<WindowContent> = workspace::Workspace::new();
         for ptab in snap.tabs {
-            let (layout, max_id) = self.restore_layout(ptab.layout);
+            let (layout, max_id) = restore_layout(&mut ws, &self.theme, ptab.layout);
             ws.next_window_id = ws.next_window_id.max(max_id + 1);
             ws.tabs.push(workspace::Tab {
                 auto_name: ptab.auto_name,
@@ -4705,81 +5196,6 @@ impl SketchGpuiView {
         }
         self.workspace = ws;
         true
-    }
-
-    fn restore_layout(
-        &self,
-        layout: PersistedLayout,
-    ) -> (workspace::Layout<WindowContent>, workspace::WindowId) {
-        match layout {
-            PersistedLayout::Leaf(leaf) => {
-                let id = leaf.id;
-                let content = self.restore_content(leaf.kind);
-                (
-                    workspace::Layout::Leaf(workspace::Window { id, content }),
-                    id,
-                )
-            }
-            PersistedLayout::Split { dir, children } => {
-                let mut max_id: workspace::WindowId = 0;
-                let mut restored_children = Vec::with_capacity(children.len());
-                for (w, child) in children {
-                    let (sub, sub_max) = self.restore_layout(child);
-                    if sub_max > max_id {
-                        max_id = sub_max;
-                    }
-                    restored_children.push((w, sub));
-                }
-                (
-                    workspace::Layout::Split {
-                        dir,
-                        children: restored_children,
-                    },
-                    max_id,
-                )
-            }
-        }
-    }
-
-    fn restore_content(&self, kind: PersistedKind) -> WindowContent {
-        match kind {
-            PersistedKind::Doc { path } => {
-                let label: SharedString = path.display().to_string().into();
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let doc = Document::from_text(text, path.clone());
-                let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
-                WindowContent::Doc(DocState {
-                    blocks,
-                    file_label: label,
-                    cursor_block: 0,
-                    scroll_handle: ScrollHandle::new(),
-                    edit_cache: None,
-                })
-            }
-            PersistedKind::Edit { path } => {
-                let label: SharedString = path.display().to_string().into();
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let editor = Editor::new(text, path);
-                WindowContent::Edit(EditState::new(editor, label, EditView::Code))
-            }
-            PersistedKind::Browser { dir } => {
-                let dir = if dir.is_dir() {
-                    dir
-                } else {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-                };
-                WindowContent::Browser(BrowserWindow::standalone(dir))
-            }
-            PersistedKind::Agent { .. } => {
-                // Claude restore is its own subsystem (acp_sessions.json +
-                // open_agent_inner). Replace with a Browser stub here so the
-                // tab survives; user can re-attach via the existing Claude
-                // commands.
-                WindowContent::Browser(BrowserWindow::standalone(
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                ))
-            }
-        }
     }
 
     /// `Some(doc)` if currently viewing a document, else `None`.
@@ -5627,16 +6043,12 @@ impl SketchGpuiView {
         let _ = self.workspace.split_focused(dir, content);
     }
 
-    fn clone_focused_for_split(&self, cwd: &std::path::Path) -> WindowContent {
-        let label = match self.workspace.focused_content() {
-            Some(WindowContent::Doc(d)) => Some(d.file_label.clone()),
-            Some(WindowContent::Edit(e)) => Some(e.file_label.clone()),
-            _ => None,
+    fn clone_focused_for_split(&mut self, cwd: &std::path::Path) -> WindowContent {
+        let (label, is_edit) = match self.workspace.focused_content() {
+            Some(WindowContent::Doc(d)) => (Some(d.file_label.clone()), false),
+            Some(WindowContent::Edit(e)) => (Some(e.file_label.clone()), true),
+            _ => (None, false),
         };
-        let is_edit = matches!(
-            self.workspace.focused_content(),
-            Some(WindowContent::Edit(_))
-        );
         let browser_fallback = || {
             WindowContent::Browser(BrowserWindow::standalone(cwd.to_path_buf()))
         };
@@ -5644,14 +6056,25 @@ impl SketchGpuiView {
             return browser_fallback();
         };
         let path = PathBuf::from(label.as_ref());
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(_) => return browser_fallback(),
-        };
         if is_edit {
-            let editor = Editor::new(text, path);
-            WindowContent::Edit(EditState::new(editor, label, EditView::Code))
+            // Bind the new pane to the SAME pooled core as the source pane:
+            // open_and_retain returns the existing buffer id, so unsaved text
+            // + undo are shared. Only cursor/scroll/selection are independent.
+            match self.workspace.open_and_retain(&path) {
+                Ok((id, core)) => WindowContent::Edit(EditState::new(
+                    SharedEditor::new(id, core),
+                    label,
+                    EditView::Code,
+                )),
+                Err(_) => browser_fallback(),
+            }
         } else {
+            // Doc panes render a disk snapshot (read-only view); no shared
+            // editor state to pool.
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(_) => return browser_fallback(),
+            };
             let doc = Document::from_text(text, path.clone());
             let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
             WindowContent::Doc(DocState {
@@ -6027,10 +6450,9 @@ impl SketchGpuiView {
                     d.scroll_handle.scroll_to_item(d.cursor_block);
                 }
                 Some(WindowContent::Edit(e)) => {
-                    let lines = e.editor.document().line_count();
+                    let lines = e.editor.line_count();
                     let line = idx.min(lines.saturating_sub(1));
-                    e.editor.cursor_mut().line = line;
-                    e.editor.cursor_mut().col = 0;
+                    e.editor.set_cursor(line, 0);
                     e.scroll_handle.scroll_to_item(line);
                 }
                 _ => {}
@@ -6097,17 +6519,25 @@ impl SketchGpuiView {
     /// disk. The chosen `view` is applied either way — switching from Code
     /// → WP without losing cursor/buffer state is just `cached.view = view`.
     fn enter_edit_with(&mut self, view: EditView, cx: &mut Context<Self>) {
-        let mut edit_state = match self.workspace.focused_content_mut().expect("no focused window") {
-            WindowContent::Doc(d) => match d.edit_cache.take() {
-                Some(cached) => cached,
-                None => {
-                    let path: PathBuf = d.file_label.to_string().into();
-                    let text = std::fs::read_to_string(&path).unwrap_or_default();
-                    let editor = Editor::new(text, path);
-                    EditState::new(editor, d.file_label.clone(), view)
-                }
-            },
-            _ => return,
+        // Take the cached EditState (preserving unsaved edits + cursor) without
+        // holding a mutable borrow across the pool mutation below.
+        let (cached, label): (Option<EditState>, SharedString) =
+            match self.workspace.focused_content_mut() {
+                Some(WindowContent::Doc(d)) => (d.edit_cache.take(), d.file_label.clone()),
+                _ => return,
+            };
+        let mut edit_state = match cached {
+            Some(cached) => cached,
+            None => {
+                // Bind a fresh view to the file's pooled core (shared text +
+                // undo with any other window on the same file).
+                let path: PathBuf = label.to_string().into();
+                let (id, core) = match self.workspace.open_and_retain(&path) {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                EditState::new(SharedEditor::new(id, core), label, view)
+            }
         };
         edit_state.view = view;
         self.set_screen(WindowContent::Edit(edit_state));
@@ -6136,7 +6566,7 @@ impl SketchGpuiView {
             WindowContent::Edit(edit) => {
                 let edit_path = PathBuf::from(edit.file_label.as_ref());
                 let blocks =
-                    render_with_wiki(&edit.editor.document().full_text(), &self.theme, Some(&edit_path));
+                    render_with_wiki(&edit.editor.full_text(), &self.theme, Some(&edit_path));
                 let file_label = edit.file_label.clone();
                 self.set_screen(WindowContent::Doc(DocState {
                     blocks,
@@ -6242,54 +6672,67 @@ impl SketchGpuiView {
     /// to. Read failures log to stderr (consistent with the existing open
     /// path) and leave the buffer untouched.
     fn reload_focused_from_disk(&mut self, cx: &mut Context<Self>) {
-        // Two passes: extract the path from the focused window without
-        // holding a mutable borrow across the file I/O + workspace mutation.
-        // Preserves the Edit sub-view (Code vs. WordProcessor) so reload
-        // doesn't yank the user out of WP mode.
-        enum Kind {
-            Doc,
-            Edit(EditView),
+        // Extract the path (and, for Edit, the shared core handle) from the
+        // focused window without holding a mutable borrow across file I/O +
+        // workspace mutation.
+        enum FocusKind {
+            Doc(PathBuf, SharedString),
+            Edit(workspace::SharedCore, PathBuf),
         }
-        let (path, label, kind) = match self.workspace.focused_content() {
-            Some(WindowContent::Doc(d)) => (
+        let focus_kind = match self.workspace.focused_content() {
+            Some(WindowContent::Doc(d)) => FocusKind::Doc(
                 PathBuf::from(d.file_label.as_ref()),
                 d.file_label.clone(),
-                Kind::Doc,
             ),
-            Some(WindowContent::Edit(e)) => (
+            Some(WindowContent::Edit(e)) => FocusKind::Edit(
+                std::rc::Rc::clone(&e.editor.core),
                 PathBuf::from(e.file_label.as_ref()),
-                e.file_label.clone(),
-                Kind::Edit(e.view),
             ),
             _ => return,
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(err) => {
-                eprintln!("reload: cannot read {}: {}", path.display(), err);
-                return;
+        match focus_kind {
+            // Edit reload resets the SHARED core in place, so every view of
+            // the file (splits, also-shown panes) sees the disk version — not
+            // a fresh, un-shared buffer. The pane keeps its own cursor/scroll
+            // and Code/WP sub-view (we never replace the EditState itself).
+            FocusKind::Edit(core, path) => {
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        eprintln!("reload: cannot read {}: {}", path.display(), err);
+                        return;
+                    }
+                };
+                *core.borrow_mut() = EditorCore::new(text, path);
+                // The text may have shrunk; reset the focused view's cursor to
+                // the top so it can't dangle past the new end (matches the old
+                // reload-replaces-editor behavior). Other shared views keep
+                // their own cursors.
+                if let Some(WindowContent::Edit(e)) = self.workspace.focused_content_mut() {
+                    e.editor.set_cursor(0, 0);
+                    e.editor.clear_selection();
+                }
             }
-        };
-        let new_content = match kind {
-            Kind::Edit(view) => {
-                let editor = Editor::new(text, path);
-                let mut es = EditState::new(editor, label, EditView::Code);
-                es.view = view;
-                WindowContent::Edit(es)
-            }
-            Kind::Doc => {
+            // Doc reload re-renders a fresh disk snapshot.
+            FocusKind::Doc(path, label) => {
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        eprintln!("reload: cannot read {}: {}", path.display(), err);
+                        return;
+                    }
+                };
                 let doc = Document::from_text(text, path.clone());
                 let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
-                WindowContent::Doc(DocState {
+                self.set_screen(WindowContent::Doc(DocState {
                     blocks,
                     file_label: label,
                     cursor_block: 0,
                     scroll_handle: ScrollHandle::new(),
                     edit_cache: None,
-                })
+                }));
             }
-        };
-        self.set_screen(new_content);
+        }
         self.doc_selection = None;
         self.save_workspace_state();
         cx.notify();
@@ -6412,14 +6855,14 @@ impl SketchGpuiView {
     /// the Edit screen and the Claude (ACP) screen so both have the same
     /// typing semantics. Unlike the wrapper above, this does not call
     /// `cx.notify()` — the caller must.
-    fn dispatch_insert_core(editor: &mut Editor, mode: &mut EditMode, press: KeyPress) {
+    fn dispatch_insert_core<E: EditOps>(editor: &mut E, mode: &mut EditMode, press: KeyPress) {
         match press.key {
             Key::Esc => {
                 editor.end_insert();
                 *mode = EditMode::Normal;
                 // Vim convention: cursor steps back one column on leaving insert.
                 if editor.cursor().col > 0 {
-                    editor.cursor_mut().move_left();
+                    editor.cursor_move_left();
                 }
             }
             Key::Enter => {
@@ -6471,8 +6914,8 @@ impl SketchGpuiView {
     /// shared by the Edit screen and the Claude (ACP) screen. Caller is
     /// responsible for `cx.notify()` and any post-action status messaging
     /// based on the returned `NormalOutcome`.
-    fn dispatch_normal_core(
-        editor: &mut Editor,
+    fn dispatch_normal_core<E: EditOps>(
+        editor: &mut E,
         mode: &mut EditMode,
         keybinds: &mut KeybindManager,
         press: KeyPress,
@@ -6497,12 +6940,12 @@ impl SketchGpuiView {
             }
             "move-up" => {
                 editor.pre_move(false);
-                editor.cursor_mut().move_up();
+                editor.cursor_move_up();
                 editor.clamp_cursor_col(false);
             }
             "move-left" => {
                 editor.pre_move(false);
-                editor.cursor_mut().move_left();
+                editor.cursor_move_left();
             }
             "move-right" => {
                 editor.pre_move(false);
@@ -6510,7 +6953,7 @@ impl SketchGpuiView {
             }
             "move-line-start" => {
                 editor.pre_move(false);
-                editor.cursor_mut().move_line_start();
+                editor.cursor_move_line_start();
             }
             "move-line-end" => {
                 editor.pre_move(false);
@@ -6532,7 +6975,7 @@ impl SketchGpuiView {
             // ---- Doc-level jumps ----
             "goto-top" => {
                 editor.pre_move(false);
-                editor.cursor_mut().jump_top();
+                editor.cursor_jump_top();
             }
             "goto-bottom" => {
                 editor.pre_move(false);
@@ -6541,8 +6984,7 @@ impl SketchGpuiView {
             // ---- Mode switches ----
             "insert-mode" => {
                 if let Some(((sl, sc), _)) = editor.selection_range() {
-                    editor.cursor_mut().line = sl;
-                    editor.cursor_mut().col = sc;
+                    editor.cursor_set(sl, sc);
                     editor.clear_selection();
                 }
                 editor.set_extend_mode(false);
@@ -6551,12 +6993,9 @@ impl SketchGpuiView {
             }
             "insert-after" => {
                 if let Some((_, (el, ec))) = editor.selection_range() {
-                    editor.cursor_mut().line = el;
-                    editor.cursor_mut().col = ec;
-                    let line_len = editor.document().line_len_chars(el);
-                    if editor.cursor().col < line_len {
-                        editor.cursor_mut().col += 1;
-                    }
+                    let line_len = editor.line_len_chars(el);
+                    let new_col = if ec < line_len { ec + 1 } else { ec };
+                    editor.cursor_set(el, new_col);
                     editor.clear_selection();
                 } else {
                     editor.move_right_clamped(true);
@@ -6594,8 +7033,7 @@ impl SketchGpuiView {
                 let text = match editor.yank_selection() {
                     Some(t) if !t.is_empty() => t,
                     _ => editor
-                        .document()
-                        .line_text(editor.cursor().line)
+                        .line_text_at_cursor()
                         .trim_end_matches('\n')
                         .to_string(),
                 };
@@ -6901,10 +7339,12 @@ impl SketchGpuiView {
     // ---- Workspace picker (move / also-show pane) -------------------------
 
     /// Count how many distinct **workspaces** show a view of `label` (the
-    /// file path backing a Doc/Edit pane). This is the live equivalent of
-    /// "how many workspaces reference this `FileBufferId`" — the buffer pool
-    /// isn't wired into the live content model, so membership is derived from
-    /// the layout trees by file label (spec-workspaces-tagging.md C-derived).
+    /// file path backing a Doc/Edit pane). File path is the canonical buffer-
+    /// pool key (`Workspace::canonical_key`), so counting by path is the exact
+    /// equivalent of counting by `FileBufferId` for pooled Edit panes — and it
+    /// additionally captures Doc panes, which render disk snapshots and aren't
+    /// pooled. Hence path, not id, is the right unifying membership key
+    /// (spec-workspaces-tagging.md C-derived).
     ///
     /// Counts a workspace once even if it holds several views of the same
     /// file, so the multi-home dot means "also lives in another desktop",
@@ -8178,7 +8618,7 @@ impl SketchGpuiView {
                 out
             }
             Some(WindowContent::Edit(e)) => {
-                let text = e.editor.document().full_text();
+                let text = e.editor.full_text();
                 let mut out = Vec::new();
                 for (line_no, line) in text.lines().enumerate() {
                     if let Some((level, heading)) = atx_heading(line) {
@@ -11674,7 +12114,7 @@ impl SketchGpuiView {
             .child(format!("sketch-gpui [{}] — {}", header_view_label, e.file_label))
             .child(self.multi_home_dot(e.file_label.as_ref()));
 
-        let dirty_mark = if e.editor.document().is_modified() { "•" } else { " " };
+        let dirty_mark = if e.editor.is_modified() { "•" } else { " " };
         let extend_mark = if e.editor.extend_mode() { " EXT" } else { "" };
         let sel_size: Option<usize> = e.editor.selection_range().map(|((sl, sc), (el, ec))| {
             // Cheap size summary: char count for single-line, line count otherwise.
@@ -11761,19 +12201,11 @@ impl SketchGpuiView {
         let cursor = e.editor.cursor();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
-        let line_count = e.editor.document().line_count();
+        let line_count = e.editor.line_count();
         let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
         let dim_fg: Hsla = rgb(0x6272a4).into();
 
-        let lines: Vec<String> = (0..line_count.max(1))
-            .map(|i| {
-                e.editor
-                    .document()
-                    .line_text(i)
-                    .trim_end_matches('\n')
-                    .replace('\t', "    ")
-            })
-            .collect();
+        let lines = edit_lines(e, line_count);
         let highlighted = highlight_markdown_lines_syn(&lines, &self.theme, &self.syntect_hl);
 
         let mut body = div()
@@ -11840,18 +12272,10 @@ impl SketchGpuiView {
         let cursor = e.editor.cursor();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
-        let line_count = e.editor.document().line_count();
+        let line_count = e.editor.line_count();
         let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
 
-        let lines: Vec<String> = (0..line_count.max(1))
-            .map(|i| {
-                e.editor
-                    .document()
-                    .line_text(i)
-                    .trim_end_matches('\n')
-                    .replace('\t', "    ")
-            })
-            .collect();
+        let lines = edit_lines(e, line_count);
         let highlighted = highlight_markdown_lines_syn(&lines, &self.theme, &self.syntect_hl);
 
         let mut body = div()
@@ -13937,11 +14361,11 @@ fn screen_file_label(screen: &WindowContent) -> Option<SharedString> {
 /// Check whether the screen's underlying editor has unsaved modifications.
 fn screen_is_modified(screen: &WindowContent) -> bool {
     match screen {
-        WindowContent::Edit(e) => e.editor.document().is_modified(),
+        WindowContent::Edit(e) => e.editor.is_modified(),
         WindowContent::Doc(d) => d
             .edit_cache
             .as_ref()
-            .map_or(false, |ec| ec.editor.document().is_modified()),
+            .map_or(false, |ec| ec.editor.is_modified()),
         _ => false,
     }
 }
