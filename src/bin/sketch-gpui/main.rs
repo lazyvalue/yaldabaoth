@@ -302,7 +302,7 @@ fn keystroke_to_keypress(ks: &Keystroke) -> KeyPress {
 /// have a `Reset` color, so we pick concrete defaults.
 const BG: u32 = 0x282a36;
 const DEFAULT_FG: u32 = 0xf8f8f2;
-const CURSOR_BAR_COLOR: u32 = 0xff5555;
+const CURSOR_BAR_COLOR: u32 = 0xff3030;
 const STATUS_BG: u32 = 0x16213e;
 const STATUS_FG: u32 = 0x8be9fd;
 /// Selection background (matches TUI's `view::apply_selection_bg`). Dracula's
@@ -1690,23 +1690,20 @@ fn build_line_content(
     let col = cursor_col.min(total_chars);
     let (before, (at_char, _at_style), after) = split_segments_at_col(segs, col);
 
-    let caret = match mode {
-        EditMode::Insert => div()
-            .w(px(2.0))
-            .h(px(18.0))
-            .bg(cursor_color)
-            .into_any_element(),
-        EditMode::Normal => div()
-            .w(px(8.0))
-            .h(px(18.0))
-            .bg(cursor_color)
-            .text_color(rgb(BG))
-            .child(at_char.to_string())
-            .into_any_element(),
-    };
+    // Block cursor in both modes — character under the cursor is shown
+    // inside the block. In insert mode the block sits *before* the at_char
+    // (the character shifts right); in normal mode the block *replaces* it.
+    let caret = div()
+        .flex_none()
+        .w(px(8.0))
+        .h(px(18.0))
+        .bg(cursor_color)
+        .text_color(rgb(BG))
+        .child(if mode == EditMode::Normal { at_char.to_string() } else { " ".into() })
+        .into_any_element();
 
-    // For insert mode the beam is zero-width, so the at_char gets folded
-    // into the after-stream (with its original style).
+    // In insert mode the at_char isn't consumed by the block so it appears
+    // in the after-stream with its original style.
     let after_segs = match mode {
         EditMode::Normal => after,
         EditMode::Insert => {
@@ -3606,22 +3603,17 @@ fn build_chatbox_line(
 /// typical text caret because, on a wrapped row of monospace text, a 1-2px
 /// strip is easy to miss between adjacent glyphs.
 fn make_caret(mode: EditMode, cursor_char: char, cursor_color: Hsla) -> AnyElement {
-    match mode {
-        EditMode::Insert => div()
-            .flex_none()
-            .w(px(3.0))
-            .h(px(18.0))
-            .bg(cursor_color)
-            .into_any_element(),
-        EditMode::Normal => div()
-            .flex_none()
-            .w(px(8.0))
-            .h(px(18.0))
-            .bg(cursor_color)
-            .text_color(rgb(BG))
-            .child(cursor_char.to_string())
-            .into_any_element(),
-    }
+    // Block cursor in both modes. In insert mode the block is a solid
+    // rectangle (character stays in the after-stream); in normal mode the
+    // character under the cursor is drawn inside the block.
+    div()
+        .flex_none()
+        .w(px(8.0))
+        .h(px(18.0))
+        .bg(cursor_color)
+        .text_color(rgb(BG))
+        .child(if mode == EditMode::Normal { cursor_char.to_string() } else { " ".into() })
+        .into_any_element()
 }
 
 /// Format a menu node's key sequence for display (`"f"`, `"g g"`,
@@ -8439,29 +8431,41 @@ impl SketchGpuiView {
                         self.render_agent(leaf_root, ring, cx).into_any_element()
                     }
                 };
-                // Add a thin focus indicator around the focused leaf when
-                // there's more than one leaf in the tab. (A border on a
-                // single-leaf tab is just visual noise — the whole window
-                // *is* the focus.)
-                let content_el = if is_focused && self.active_tab_leaf_count() > 1 {
-                    let accent: Hsla = rgb(STATUS_FG).into();
-                    div()
-                        .size_full()
-                        .border_1()
-                        .border_color(accent)
-                        .child(painted)
-                        .into_any_element()
+                // The rail is chrome local to the *focused pane*, not the whole
+                // window — slot it directly beside this leaf so it sits against
+                // the focused content. No-op when no rail is open.
+                let with_rail = if is_focused {
+                    self.wrap_leaf_with_rail(painted, rail_focusable, cx)
                 } else {
                     painted
                 };
-                // The rail is chrome local to the *focused pane*, not the whole
-                // window — slot it directly beside this leaf so it sits against
-                // the focused content (e.g. left of the focused markdown buffer,
-                // not left of the entire split row). No-op when no rail is open.
-                if is_focused {
-                    self.wrap_leaf_with_rail(content_el, rail_focusable, cx)
+                // Focus indicator: thick border around the whole pane+rail
+                // group when there's more than one leaf, plus a small "focused"
+                // tag in the upper-right corner.
+                if is_focused && self.active_tab_leaf_count() > 1 {
+                    let accent: Hsla = rgb(STATUS_FG).into();
+                    let tag = div()
+                        .absolute()
+                        .top_1()
+                        .right_1()
+                        .px_1p5()
+                        .py_0p5()
+                        .bg(accent)
+                        .text_color(rgb(BG))
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::BOLD)
+                        .rounded_sm()
+                        .child("focused");
+                    div()
+                        .size_full()
+                        .relative()
+                        .border_2()
+                        .border_color(accent)
+                        .child(with_rail)
+                        .child(tag)
+                        .into_any_element()
                 } else {
-                    content_el
+                    with_rail
                 }
             }
             workspace::Layout::Split { dir, children } => {
@@ -8488,7 +8492,7 @@ impl SketchGpuiView {
                         .text_color(editor_fg);
                     let child_el =
                         self.render_layout(child_root, child, focused_id, attach_focus, rail_focusable, cx);
-                    let mut slot = div().min_w_0().min_h_0();
+                    let mut slot = div().min_w_0().min_h_0().overflow_hidden();
                     {
                         let style = slot.style();
                         style.flex_grow = Some(w);
@@ -8761,7 +8765,15 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::also_show_pane))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_outline_rail))
-            .on_action(cx.listener(Self::flip_rail_side));
+            .on_action(cx.listener(Self::flip_rail_side))
+            // Pane focus motion — without these the ctrl-w h/j/k/l chords
+            // are swallowed when the rail holds `track_focus`.
+            .on_action(cx.listener(Self::focus_left))
+            .on_action(cx.listener(Self::focus_right))
+            .on_action(cx.listener(Self::focus_up))
+            .on_action(cx.listener(Self::focus_down))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev));
 
         match &rail.content {
             workspace::RailContent::FileBrowser(fb) => {
