@@ -60,6 +60,77 @@ fn constructs_and_renders_real_view(cx: &mut TestAppContext) {
     assert!(readable, "real SketchGpuiView constructs + renders headlessly");
 }
 
+/// Latency gate (audit #1/#2): prove the Doc view renders **O(visible)**, not
+/// O(document). Open a 3000-block doc and render it — the virtualized
+/// `gpui::list` must build only the visible block window (a few dozen
+/// `block_element`s), NOT one per block. Then move the focused block and
+/// re-render: the build count must stay bounded, never spiking toward 3000.
+/// The assertion is on the deterministic block-build counter, not wall-clock.
+#[gpui::test]
+fn doc_view_render_is_o_visible(cx: &mut TestAppContext) {
+    const N: usize = 3000;
+    // Generous ceiling: a tall window plus list overdraw still builds only a
+    // small constant window. The point is O(visible) << O(document), so this
+    // is far below N. (Empirically a few dozen; 200 leaves slack for overdraw
+    // and future window-size changes without ever approaching N.)
+    const VISIBLE_CEILING: usize = 200;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        let mut v = SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        );
+        // 3000 short paragraph blocks — each is its own `RenderedBlock`, so the
+        // doc list has N items. (One block per non-blank line.)
+        let mut md = String::with_capacity(N * 16);
+        for i in 0..N {
+            md.push_str(&format!("Paragraph block number {i}.\n\n"));
+        }
+        v.test_open_doc(&md);
+        v
+    });
+
+    // --- Cold paint: force a fresh frame and count the blocks built. The
+    //     counter was zeroed by `test_open_doc`; a `notify` + `run_until_parked`
+    //     drives exactly one virtualized render. Virtualization must build only
+    //     the visible window, not all N blocks. ---
+    SketchGpuiView::test_reset_doc_block_builds();
+    view.update(vcx, |_v, cx| cx.notify());
+    vcx.run_until_parked();
+    let cold = SketchGpuiView::test_doc_block_builds();
+    assert!(
+        cold > 0,
+        "doc list must build the visible window (got 0 — splash not cleared / list not rendering)"
+    );
+    assert!(
+        cold <= VISIBLE_CEILING,
+        "cold doc paint must be O(visible) (<= {VISIBLE_CEILING}), got {cold} for a {N}-block doc"
+    );
+    assert!(
+        cold < N / 2,
+        "cold doc paint built {cold} of {N} blocks — virtualization is not in effect"
+    );
+
+    // --- Move the focused block and re-render. The build count must stay
+    //     bounded (still just the visible window), never O(document). ---
+    SketchGpuiView::test_reset_doc_block_builds();
+    view.update(vcx, |v, cx| {
+        if let Some(d) = v.doc_mut() {
+            d.cursor_block = 1500; // jump into the middle of the doc
+        }
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let after_move = SketchGpuiView::test_doc_block_builds();
+    assert!(
+        after_move <= VISIBLE_CEILING,
+        "doc render after a cursor-block move must stay O(visible) (<= {VISIBLE_CEILING}), got {after_move}"
+    );
+}
+
 // NEXT STONE (not yet built): action-level smokes (e.g. simulate "cmd-b",
 // assert the rail opens beside the focused pane). Blocked on a small
 // enablement refactor — the keymap is currently registered inline in `main()`'s
