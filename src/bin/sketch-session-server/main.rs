@@ -50,7 +50,13 @@ struct ManagedSession {
     pending_prompts: Vec<String>,
     /// Every notification ever broadcast for this session, so a
     /// re-attaching GUI can replay the full transcript.
-    event_log: Vec<Notification>,
+    ///
+    /// Wrapped in `Arc` so `attach`/`save_to_disk` clone a *pointer* under the
+    /// global lock, not the whole (unbounded) `Vec`. Pushes go through
+    /// `Arc::make_mut`, which is a cheap in-place mutation whenever the only
+    /// reference is this field (the common case — snapshots are short-lived and
+    /// released before the next push).
+    event_log: Arc<Vec<Notification>>,
     /// Persisted turn count at restore time. The pump thread suppresses
     /// logging while the ACP agent's turn counter is ≤ this value, since
     /// those events are replays of turns already in `event_log`. Once the
@@ -129,21 +135,47 @@ impl SessionManager {
         let Some(path) = session_server_persist_path() else {
             return;
         };
-        let persisted: Vec<PersistedSession> = {
+        // Snapshot lightweight metadata + an `Arc` *pointer* to each session's
+        // event_log under the lock, then release it. The expensive deep copy of
+        // each log into the owned `PersistedSession.event_log` happens off-lock,
+        // so a large/unbounded transcript no longer stalls every other session
+        // for the duration of the clone+serialize.
+        struct Snap {
+            server_session_id: String,
+            acp_session_id: Option<String>,
+            label: String,
+            cwd: PathBuf,
+            turns: usize,
+            permission_mode: PermissionMode,
+            event_log: Arc<Vec<Notification>>,
+        }
+        let snaps: Vec<Snap> = {
             let sessions = self.sessions.lock().unwrap();
             sessions
                 .values()
-                .map(|s| PersistedSession {
+                .map(|s| Snap {
                     server_session_id: s.id.clone(),
                     acp_session_id: s.channel.as_ref().and_then(|c| c.session_id()),
                     label: s.label.clone(),
                     cwd: s.cwd.clone(),
                     turns: s.turns,
                     permission_mode: s.permission_mode,
-                    event_log: s.event_log.clone(),
+                    event_log: Arc::clone(&s.event_log),
                 })
                 .collect()
         };
+        let persisted: Vec<PersistedSession> = snaps
+            .into_iter()
+            .map(|s| PersistedSession {
+                server_session_id: s.server_session_id,
+                acp_session_id: s.acp_session_id,
+                label: s.label,
+                cwd: s.cwd,
+                turns: s.turns,
+                permission_mode: s.permission_mode,
+                event_log: (*s.event_log).clone(),
+            })
+            .collect();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -205,7 +237,7 @@ impl SessionManager {
                 event_tx: event_tx.clone(),
                 owner: None,
                 pending_prompts: Vec::new(),
-                event_log: ps.event_log,
+                event_log: Arc::new(ps.event_log),
                 replay_fence: ps.turns,
             };
 
@@ -247,7 +279,7 @@ impl SessionManager {
                                         session_id: session_id.clone(),
                                         acp_session_id: new_acp_id,
                                     };
-                                    s.event_log.push(note.clone());
+                                    Arc::make_mut(&mut s.event_log).push(note.clone());
                                     let _ = s.event_tx.send(note);
                                 }
                             }
@@ -264,7 +296,7 @@ impl SessionManager {
                                     session_id: session_id.clone(),
                                     reason: format!("resume failed: {e}"),
                                 };
-                                s.event_log.push(note.clone());
+                                Arc::make_mut(&mut s.event_log).push(note.clone());
                                 let _ = s.event_tx.send(note);
                             }
                         }
@@ -299,7 +331,7 @@ impl SessionManager {
             event_tx: event_tx.clone(),
             owner: None,
             pending_prompts: Vec::new(),
-            event_log: Vec::new(),
+            event_log: Arc::new(Vec::new()),
             replay_fence: 0,
         };
 
@@ -358,7 +390,7 @@ impl SessionManager {
                                     session_id: session_id.clone(),
                                     acp_session_id: acp_id,
                                 };
-                                s.event_log.push(note.clone());
+                                Arc::make_mut(&mut s.event_log).push(note.clone());
                                 let _ = s.event_tx.send(note);
                             }
                         }
@@ -372,7 +404,7 @@ impl SessionManager {
                                 session_id: session_id.clone(),
                                 reason: format!("spawn failed: {e}"),
                             };
-                            s.event_log.push(note.clone());
+                            Arc::make_mut(&mut s.event_log).push(note.clone());
                             let _ = s.event_tx.send(note);
                         }
                     }
@@ -409,15 +441,17 @@ impl SessionManager {
     /// Attach a connection to a session. `Owner` mode requires the session
     /// to have no current owner (or already be owned by this connection);
     /// `Observer` mode always succeeds and never touches ownership. Returns
-    /// the live broadcast receiver plus a snapshot of the event log for
-    /// replay — captured atomically under the lock so no events are missed
-    /// or duplicated across the replay/live-subscription seam.
+    /// the live broadcast receiver plus the current event-log length (the
+    /// forwarder re-derives the actual transcript by tailing `event_log` from
+    /// index 0, so the bytes never need to leave the lock — only the count, for
+    /// the attach log line). Subscribing while holding the lock keeps the
+    /// replay/live-subscription seam gap-free.
     fn attach(
         &self,
         session_id: &str,
         mode: AttachMode,
         conn_id: u64,
-    ) -> Result<(broadcast::Receiver<Notification>, Vec<Notification>), String> {
+    ) -> Result<(broadcast::Receiver<Notification>, usize), String> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions
             .get_mut(session_id)
@@ -437,8 +471,8 @@ impl SessionManager {
             }
         }
         let rx = session.event_tx.subscribe();
-        let log = session.event_log.clone();
-        Ok((rx, log))
+        let log_len = session.event_log.len();
+        Ok((rx, log_len))
     }
 
     /// An observer claims ownership of a currently-unowned session.
@@ -486,7 +520,7 @@ impl SessionManager {
         // Only appended to event_log (not broadcast) — the live GUI
         // already inserted the text locally in submit_chatbox before
         // calling prompt(). Broadcasting would duplicate it.
-        session.event_log.push(Notification::UserPrompt {
+        Arc::make_mut(&mut session.event_log).push(Notification::UserPrompt {
             session_id: session_id.to_string(),
             text: text.to_string(),
         });
@@ -571,7 +605,7 @@ impl SessionManager {
                                 session_id: sid.clone(),
                                 acp_session_id: acp_id,
                             };
-                            s.event_log.push(note.clone());
+                            Arc::make_mut(&mut s.event_log).push(note.clone());
                             let _ = s.event_tx.send(note);
                             old
                         };
@@ -584,7 +618,7 @@ impl SessionManager {
                                 session_id: sid.clone(),
                                 reason: format!("restart failed: {e}"),
                             };
-                            s.event_log.push(note.clone());
+                            Arc::make_mut(&mut s.event_log).push(note.clone());
                             let _ = s.event_tx.send(note);
                         }
                     }
@@ -678,7 +712,7 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                         session_id: session_id.clone(),
                         reason: "agent disconnected".into(),
                     };
-                    session.event_log.push(note.clone());
+                    Arc::make_mut(&mut session.event_log).push(note.clone());
                     let _ = session.event_tx.send(note);
                     session.channel = None;
                     return;
@@ -758,7 +792,7 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                         session_id: session_id.clone(),
                         event: ev,
                     };
-                    session.event_log.push(note.clone());
+                    Arc::make_mut(&mut session.event_log).push(note.clone());
                     let _ = session.event_tx.send(note);
                 }
 
@@ -771,7 +805,7 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                             session_id: session_id.clone(),
                             event: ev,
                         };
-                        session.event_log.push(note.clone());
+                        Arc::make_mut(&mut session.event_log).push(note.clone());
                         let _ = session.event_tx.send(note);
                     }
                     last_turns = current_turns;
@@ -780,7 +814,7 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                         session_id: session_id.clone(),
                         turn_count: current_turns,
                     };
-                    session.event_log.push(note.clone());
+                    Arc::make_mut(&mut session.event_log).push(note.clone());
                     let _ = session.event_tx.send(note);
                 }
 
@@ -880,17 +914,17 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
 
             Request::Attach { session_id, mode } => {
                 match manager.attach(&session_id, mode, conn_id) {
-                    Ok((rx, replay)) => {
+                    Ok((rx, replay_len)) => {
                         // No explicit replay write here anymore: the forwarder
                         // tails `event_log` from index 0, so it streams the
                         // full history and then live events over one ordered,
-                        // gap-free path. (We still receive `replay` from
-                        // attach for the count log; its contents are
-                        // re-derived by the forwarder.)
+                        // gap-free path. (We still receive the log length from
+                        // attach for the count log; the contents are re-derived
+                        // by the forwarder.)
                         eprintln!(
                             "[session-server] attach {}: forwarder will replay {} logged events",
                             &session_id[..8],
-                            replay.len(),
+                            replay_len,
                         );
                         let w = Arc::clone(&writer);
                         let handle = tokio::spawn(forward_notifications(
