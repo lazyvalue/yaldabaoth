@@ -628,6 +628,10 @@ fn doc_styled_line_element(
         if let Some((s_char, e_char)) = doc_selection_for_line(&sel, block_idx, line_idx, line_chars) {
             let s_byte = char_offset_to_byte_offset(&text, s_char);
             let e_byte = char_offset_to_byte_offset(&text, e_char);
+            #[cfg(test)]
+            DOC_RENDER_TAP.with(|t| {
+                t.borrow_mut().selection.push((block_idx, line_idx, s_byte, e_byte))
+            });
             runs = apply_selection_bg_to_runs(runs, s_byte, e_byte, ncolor_to_hsla(SELECTION_BG, BG));
         }
     }
@@ -857,12 +861,18 @@ impl Element for RegisterOnPaint {
         // prepaint has run → the layout's bounds are set. Registering here means
         // `doc_pos_at` only ever sees prepainted (bounds-Some) layouts.
         self.sink.borrow_mut().insert(self.key, self.layout.clone());
+        #[cfg(test)]
+        DOC_RENDER_TAP.with(|t| t.borrow_mut().painted.push(self.key));
         self.inner.paint(window, cx);
     }
 }
 
 fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlock) -> AnyElement {
     let highlighted = ctx.cursor_block == Some(idx);
+    #[cfg(test)]
+    if highlighted {
+        DOC_RENDER_TAP.with(|t| t.borrow_mut().cursor_bar_block = Some(idx));
+    }
     let inner_ctx = RenderCtx {
         theme: ctx.theme,
         body_font: ctx.body_font.clone(),
@@ -6865,6 +6875,20 @@ impl SketchGpuiView {
         DOC_BLOCK_BUILDS.with(|c| c.get())
     }
 
+    /// Test-only: clear the doc render-decision tap (call before the frame to
+    /// measure).
+    #[cfg(test)]
+    fn test_reset_doc_render_tap() {
+        DOC_RENDER_TAP.with(|t| *t.borrow_mut() = DocRenderTap::default());
+    }
+
+    /// Test-only: snapshot the doc render-decision tap — what the last frame(s)
+    /// since reset decided to paint / select / cursor-bar.
+    #[cfg(test)]
+    fn test_doc_render_tap() -> DocRenderTap {
+        DOC_RENDER_TAP.with(|t| t.borrow().clone())
+    }
+
     /// Swap from Doc view into Edit screen with the Code (raw markdown) view.
     fn enter_edit(&mut self, _: &EnterEdit, _w: &mut Window, cx: &mut Context<Self>) {
         self.enter_edit_with(EditView::Code, cx);
@@ -12335,6 +12359,29 @@ impl Render for SketchGpuiView {
 #[cfg(test)]
 thread_local! {
     static DOC_BLOCK_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only render-decision tap (the substitute for pixel inspection — GPUI's
+/// test platform discards the rendered scene). Records what the doc renderer
+/// *decided* a frame: which `(block,line)`s were actually PAINTED (the
+/// virtualized window), which got the selection background over which byte
+/// range, and which block drew the left cursor bar. The harness asserts against
+/// this to verify selection / cursor / virtualization deterministically,
+/// without rasterizing. Reset + read via the `test_*_doc_render_tap` accessors.
+#[cfg(test)]
+#[derive(Default, Clone)]
+pub(crate) struct DocRenderTap {
+    /// `(block_idx, line_idx)` painted this frame — the visible/virtualized window.
+    pub painted: Vec<(usize, usize)>,
+    /// `(block_idx, line_idx, byte_start, byte_end)` for lines given SELECTION_BG.
+    pub selection: Vec<(usize, usize, usize, usize)>,
+    /// The block that drew the left cursor bar, if any.
+    pub cursor_bar_block: Option<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DOC_RENDER_TAP: RefCell<DocRenderTap> = RefCell::new(DocRenderTap::default());
 }
 
 impl SketchGpuiView {

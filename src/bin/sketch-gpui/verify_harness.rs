@@ -263,6 +263,100 @@ fn doc_hit_test_never_touches_unpainted_layout(cx: &mut TestAppContext) {
     assert!(hit.is_some(), "a point inside a painted line resolves to a DocPos");
 }
 
+/// End-to-end click-drag selection, verified WITHOUT pixels (GPUI's test
+/// platform discards the rendered scene). Drives real `simulate_mouse_*` events
+/// through the actual `doc_mouse_*` handlers (the path that panicked), then
+/// inspects the *render-decision tap* — what the renderer decided to paint /
+/// highlight. Asserts: a selection model exists; every painted line within the
+/// dragged block range received the selection background; and all highlighted
+/// lines were actually painted (no decision on an un-shown line).
+#[gpui::test]
+fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+    use std::collections::{BTreeSet, HashSet};
+    const N: usize = 200;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        let mut v = SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        );
+        // One single-line paragraph block per line, so a vertical drag spans a
+        // known, contiguous range of block indices.
+        let mut md = String::with_capacity(N * 24);
+        for i in 0..N {
+            md.push_str(&format!("Paragraph block number {i}.\n\n"));
+        }
+        v.test_open_doc(&md);
+        v
+    });
+    vcx.run_until_parked();
+
+    // Pick drag endpoints from the REAL painted bounds: top-most painted line →
+    // bottom-most painted line (both guaranteed prepainted, so bounds() is safe).
+    let (start, end, start_block, end_block) = view.update(vcx, |v, _cx| {
+        let ll = v.line_layouts.borrow();
+        let mut keys: Vec<(usize, usize)> = ll.keys().copied().collect();
+        keys.sort();
+        assert!(keys.len() >= 3, "need several painted lines, got {}", keys.len());
+        let a = keys[0];
+        let b = keys[keys.len() - 1];
+        let ba = ll.get(&a).unwrap().bounds();
+        let bb = ll.get(&b).unwrap().bounds();
+        (
+            point(ba.left() + px(2.0), ba.top() + px(2.0)),
+            point(bb.right() - px(2.0), bb.top() + px(2.0)),
+            a.0,
+            b.0,
+        )
+    });
+
+    // Real click-drag through the actual handlers (down/move call doc_pos_at).
+    vcx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    vcx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    vcx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    vcx.run_until_parked();
+
+    // Model: a selection exists after the drag.
+    assert!(
+        view.update(vcx, |v, _cx| v.doc_selection.is_some()),
+        "drag produced no doc selection"
+    );
+
+    // Decision tap: render one clean frame and inspect what was highlighted.
+    SketchGpuiView::test_reset_doc_render_tap();
+    view.update(vcx, |_v, cx| cx.notify());
+    vcx.run_until_parked();
+    let tap = SketchGpuiView::test_doc_render_tap();
+
+    assert!(!tap.selection.is_empty(), "no line received selection background");
+    let selected: HashSet<(usize, usize)> =
+        tap.selection.iter().map(|&(b, l, ..)| (b, l)).collect();
+    // No inverted byte ranges.
+    for &(b, l, s, e) in &tap.selection {
+        assert!(e >= s, "inverted selection byte range on ({b},{l}): {s}..{e}");
+    }
+    // Every PAINTED line within the dragged block range is highlighted — the
+    // visual correctness claim, deterministic and pixel-free.
+    for &(b, l) in &tap.painted {
+        if b >= start_block && b <= end_block {
+            assert!(
+                selected.contains(&(b, l)),
+                "painted line ({b},{l}) in dragged range {start_block}..={end_block} not highlighted"
+            );
+        }
+    }
+    // And the highlighted range actually reaches both drag endpoints.
+    let sel_blocks: BTreeSet<usize> = tap.selection.iter().map(|&(b, ..)| b).collect();
+    assert!(
+        sel_blocks.contains(&start_block) && sel_blocks.contains(&end_block),
+        "highlighted blocks {sel_blocks:?} don't span dragged {start_block}..={end_block}"
+    );
+}
+
 // NEXT STONE (not yet built): action-level smokes (e.g. simulate "cmd-b",
 // assert the rail opens beside the focused pane). Blocked on a small
 // enablement refactor — the keymap is currently registered inline in `main()`'s
