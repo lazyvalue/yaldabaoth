@@ -3950,13 +3950,14 @@ impl SharedEditor {
     fn line_count(&self) -> usize {
         self.core.borrow().document().line_count()
     }
-    fn full_text(&self) -> String {
-        self.core.borrow().document().full_text()
-    }
-    /// Monotonic content version of the shared core — bumps on every edit.
-    /// Used as an O(1) change-key (e.g. to gate outline re-derivation).
+    /// Monotonic change counter — bumps on every buffer mutation. Used to key
+    /// the Edit view's incremental highlight cache so unchanged frames recompute
+    /// zero lines.
     fn edit_seq(&self) -> u64 {
         self.core.borrow().document().edit_seq()
+    }
+    fn full_text(&self) -> String {
+        self.core.borrow().document().full_text()
     }
 
     // --- Selection / mode (view-only) ---
@@ -4290,17 +4291,6 @@ impl EditOps for SharedEditor {
 /// Build the trimmed, tab-expanded per-line text for an Edit pane's body,
 /// reading the pooled core's rope once. Mirrors the prior per-line
 /// `document().line_text(i)` loop but takes a single `RefCell` borrow.
-fn edit_lines(e: &EditState, line_count: usize) -> Vec<String> {
-    let core = e.editor.core.borrow();
-    let doc = core.document();
-    (0..line_count.max(1))
-        .map(|i| {
-            doc.line_text(i)
-                .trim_end_matches('\n')
-                .replace('\t', "    ")
-        })
-        .collect()
-}
 
 /// State held while the user is editing a buffer in the GPUI frontend.
 /// Raw buffer + cursor + Insert/Normal toggle + vim-style normal-mode
@@ -4312,7 +4302,6 @@ struct EditState {
     file_label: SharedString,
     mode: EditMode,
     keybinds: KeybindManager,
-    scroll_handle: ScrollHandle,
     /// Transient footer message — last save outcome ("saved", "save failed: …").
     /// Cleared on the next keystroke that mutates the buffer; persists across
     /// pure motion so the user sees the result for at least one render.
@@ -4320,6 +4309,30 @@ struct EditState {
     /// Code (raw monospace + syntax highlight) or WordProcessor (live-preview
     /// proportional + typographic styling). Toggled by `Ctrl-W`.
     view: EditView,
+    /// Incremental per-line highlight cache, keyed on the document's
+    /// `edit_seq`. Re-highlights only changed lines instead of the whole
+    /// buffer every frame, so fast typing stays O(changed) rather than
+    /// O(document). Shared between the Code and WordProcessor views — both
+    /// consume the `raw` segments of each `LineHl`.
+    highlight_cache: HighlightCache,
+    /// `edit_seq` the `lines_cache` was extracted at; `u64::MAX` = never built.
+    lines_cache_seq: u64,
+    /// Last extracted (tab-expanded, newline-trimmed) source lines, reused
+    /// verbatim on frames where `edit_seq` is unchanged (cursor blink,
+    /// selection, cross-pane notify) so we don't re-allocate a String per line.
+    lines_cache: std::rc::Rc<Vec<String>>,
+    /// Virtualized line list — only the visible rows are built/laid-out each
+    /// frame instead of one element per document line. Variable height (lines
+    /// wrap), so a `ListState` (the agent-transcript pattern) rather than a
+    /// fixed-row viewport. Spliced/reset to the line count each render.
+    list_state: gpui::ListState,
+    /// Item count `list_state` was last sized to; drives incremental splice.
+    list_item_count: usize,
+    /// `(edit_seq, cursor_line)` at the last render. When either changes we
+    /// scroll the list to reveal the cursor line (so typing/motion keeps the
+    /// caret on-screen) without fighting the user's manual scroll on idle
+    /// frames.
+    last_cursor_anchor: Option<(u64, usize)>,
 }
 
 impl EditState {
@@ -4329,10 +4342,56 @@ impl EditState {
             file_label,
             mode: EditMode::Normal,
             keybinds: KeybindManager::default(),
-            scroll_handle: ScrollHandle::new(),
             last_save_msg: None,
             view,
+            highlight_cache: HighlightCache::new(),
+            lines_cache_seq: u64::MAX,
+            lines_cache: std::rc::Rc::new(Vec::new()),
+            // Top-aligned: editing reads from the top of the buffer, unlike the
+            // agent transcript which tails the bottom.
+            list_state: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(256.0)),
+            list_item_count: 0,
+            last_cursor_anchor: None,
         }
+    }
+
+    /// Extract + highlight the buffer's source lines incrementally. Returns the
+    /// shared source-line vector and a per-line highlight snapshot whose `raw`
+    /// segments are byte-identical to `highlight_markdown_lines_syn`. Both are
+    /// keyed on the document's `edit_seq`, so a frame that didn't edit the
+    /// buffer recomputes zero lines and a single-char edit recomputes ~1.
+    fn highlight_snapshot(
+        &mut self,
+        theme: &Theme,
+        hl: &sketch::highlight::Highlighter,
+    ) -> (
+        std::rc::Rc<Vec<String>>,
+        std::rc::Rc<Vec<std::rc::Rc<LineHl>>>,
+    ) {
+        let line_count = self.editor.line_count();
+        let edit_seq = self.editor.edit_seq();
+        let lines_rc: std::rc::Rc<Vec<String>> = if self.lines_cache_seq == edit_seq {
+            self.lines_cache.clone()
+        } else {
+            let core = self.editor.core.borrow();
+            let doc = core.document();
+            let built: Vec<String> = (0..line_count.max(1))
+                .map(|i| {
+                    doc.line_text(i)
+                        .trim_end_matches('\n')
+                        .replace('\t', "    ")
+                })
+                .collect();
+            drop(core);
+            let rc = std::rc::Rc::new(built);
+            self.lines_cache = rc.clone();
+            self.lines_cache_seq = edit_seq;
+            rc
+        };
+        let snap = self
+            .highlight_cache
+            .snapshot_syn(&lines_rc, theme, edit_seq, hl);
+        (lines_rc, snap)
     }
 }
 
@@ -6527,7 +6586,12 @@ impl SketchGpuiView {
                     let lines = e.editor.line_count();
                     let line = idx.min(lines.saturating_sub(1));
                     e.editor.set_cursor(line, 0);
-                    e.scroll_handle.scroll_to_item(line);
+                    // The Edit body is now a virtualized `gpui::list`; reveal
+                    // through the ListState (the old ScrollHandle drove the
+                    // pre-virtualization overflow container).
+                    if line < e.list_item_count {
+                        e.list_state.scroll_to_reveal_item(line);
+                    }
                 }
                 _ => {}
             }
@@ -6575,6 +6639,30 @@ impl SketchGpuiView {
             WindowContent::Edit(e) => Some(e),
             _ => None,
         }
+    }
+
+    /// Test-only: install a fresh Edit screen over `text` (Code view, Insert
+    /// mode) so the headless harness can drive keystrokes through the real
+    /// `build_edit_body_code` highlight path.
+    #[cfg(test)]
+    fn test_open_edit(&mut self, text: &str) {
+        let core: workspace::SharedCore = std::rc::Rc::new(std::cell::RefCell::new(
+            sketch::editor::EditorCore::new(text.to_string(), PathBuf::from("/tmp/harness.md")),
+        ));
+        let mut e = EditState::new(SharedEditor::new(1, core), "harness.md".into(), EditView::Code);
+        e.mode = EditMode::Insert;
+        // Skip the boot splash so render() builds the real Edit body, not the
+        // splash screen — the harness needs the highlight path to actually run.
+        self.splash_until = None;
+        self.set_screen(WindowContent::Edit(e));
+    }
+
+    /// Test-only: `(last_recomputed, last_was_skip)` of the focused Edit view's
+    /// incremental highlight cache — the O(changed) latency-gate observable.
+    #[cfg(test)]
+    fn test_edit_cache_stats(&mut self) -> (usize, bool) {
+        let e = self.edit_mut().expect("focused window is not an Edit view");
+        (e.highlight_cache.last_recomputed, e.highlight_cache.last_was_skip)
     }
 
     /// Swap from Doc view into Edit screen with the Code (raw markdown) view.
@@ -12189,7 +12277,7 @@ impl SketchGpuiView {
     fn render_edit(
         &self,
         root: gpui::Div,
-        e: &EditState,
+        e: &mut EditState,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let cursor = e.editor.cursor();
@@ -12312,37 +12400,58 @@ impl SketchGpuiView {
     /// Code (raw markdown) view: monospace, gutter with line numbers,
     /// per-line `md_highlight` source colors. Cursor splice via the shared
     /// `build_line_content` helper.
-    fn build_edit_body_code(&self, e: &EditState) -> impl IntoElement {
+    ///
+    /// **Virtualized**: rendered through a `gpui::list` so only the visible rows
+    /// are built/laid-out per frame, not one element per document line. Combined
+    /// with the incremental highlight cache this makes a keystroke O(changed),
+    /// not O(document).
+    fn build_edit_body_code(&self, e: &mut EditState) -> impl IntoElement {
         let cursor = e.editor.cursor();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
-        let line_count = e.editor.line_count();
         let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
         let dim_fg: Hsla = rgb(0x6272a4).into();
-
-        let lines = edit_lines(e, line_count);
-        let highlighted = highlight_markdown_lines_syn(&lines, &self.theme, &self.syntect_hl);
-
-        let mut body = div()
-            .id("edit-body")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .px_4()
-            .py_2()
-            .overflow_y_scroll()
-            .track_scroll(&e.scroll_handle)
-            .text_size(px(14.0 * self.text_scale))
-            .font_family(self.code_font.clone())
-            .text_color(self.editor_fg());
-
-        let base_style = self.theme.paragraph;
         let sel = e.editor.selection_range();
-        for (line_idx, line_str) in lines.iter().enumerate() {
-            let mut segs = highlighted
+        let mode = e.mode;
+        let edit_seq = e.editor.edit_seq();
+
+        // Incremental highlight: only changed lines are re-tokenized; unchanged
+        // frames recompute zero. `lines_rc`/`hl_snap` are cheap Rc clones.
+        let (lines_rc, hl_snap) = e.highlight_snapshot(&self.theme, &self.syntect_hl);
+        let line_count = lines_rc.len();
+
+        // Splice the list to the current line count (cheap; preserves the
+        // height cache for unchanged rows) and keep the cursor on-screen when
+        // the buffer or caret moved.
+        let new_count = line_count.max(1);
+        if new_count != e.list_item_count {
+            // Line count can shrink (delete) or grow (insert/paste); a plain
+            // reset is correct and cheap relative to the per-row work it gates.
+            e.list_state.reset(new_count);
+            e.list_item_count = new_count;
+        }
+        let anchor = (edit_seq, cursor_line);
+        if e.last_cursor_anchor != Some(anchor) {
+            e.last_cursor_anchor = Some(anchor);
+            if cursor_line < new_count {
+                e.list_state.scroll_to_reveal_item(cursor_line);
+            }
+        }
+
+        // Owned snapshots for the `'static` per-row render closure — all cheap
+        // (Rc pointer clones / Copy / SharedString refcount bumps).
+        let base_style = self.theme.paragraph;
+        let lines_snap = lines_rc.clone();
+        let hl_snap = hl_snap.clone();
+        let code_font = self.code_font.clone();
+        let editor_fg = self.editor_fg();
+        let text_size = px(14.0 * self.text_scale);
+
+        let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut App| -> AnyElement {
+            let line_str = lines_snap.get(line_idx).cloned().unwrap_or_default();
+            let mut segs = hl_snap
                 .get(line_idx)
-                .cloned()
+                .map(|lh| lh.raw.clone())
                 .unwrap_or_else(|| vec![(line_str.clone(), base_style)]);
             if let Some(sel) = sel {
                 let line_chars = line_str.chars().count();
@@ -12355,26 +12464,43 @@ impl SketchGpuiView {
 
             let gutter = div()
                 .w(px(40.0))
+                .flex_none()
                 .text_color(dim_fg)
                 .child(format!("{:>3} ", line_idx + 1));
 
             let content = build_line_content(
                 &segs,
-                line_str,
+                &line_str,
                 line_idx == cursor_line,
                 cursor_col,
-                e.mode,
+                mode,
                 cursor_color,
                 base_style,
                 DEFAULT_FG,
-                &self.code_font,
-                &self.code_font,
+                &code_font,
+                &code_font,
             );
 
-            body = body.child(div().flex().flex_row().child(gutter).child(content));
-        }
+            div().flex().flex_row().child(gutter).child(content).into_any_element()
+        };
 
-        body
+        div()
+            .id("edit-body")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .px_4()
+            .py_2()
+            .text_size(text_size)
+            .font_family(self.code_font.clone())
+            .text_color(editor_fg)
+            .child(
+                gpui::list(e.list_state.clone(), render_fn)
+                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                    .flex_1()
+                    .w_full(),
+            )
     }
 
     /// Word-Processor view: proportional body font + per-line typographic
@@ -12383,43 +12509,67 @@ impl SketchGpuiView {
     /// `md_highlight`'s segments still carry inline `**bold**`/`*italic*`
     /// modifiers, which `font_for` maps to FontWeight/FontStyle on render.
     /// No gutter — word processors don't show line numbers.
-    fn build_edit_body_wp(&self, e: &EditState) -> impl IntoElement {
+    fn build_edit_body_wp(&self, e: &mut EditState) -> impl IntoElement {
         let cursor = e.editor.cursor();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
-        let line_count = e.editor.line_count();
         let cursor_color: Hsla = rgb(CURSOR_BAR_COLOR).into();
-
-        let lines = edit_lines(e, line_count);
-        let highlighted = highlight_markdown_lines_syn(&lines, &self.theme, &self.syntect_hl);
-
-        let mut body = div()
-            .id("edit-body-wp")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .px_8()
-            .py_4()
-            .overflow_y_scroll()
-            .track_scroll(&e.scroll_handle)
-            .text_size(px(14.0 * self.text_scale))
-            .font_family(self.body_font.clone())
-            .text_color(self.editor_fg());
-
-        let base_style = self.theme.paragraph;
         let sel = e.editor.selection_range();
-        let mut in_fence = false;
+        let mode = e.mode;
+        let edit_seq = e.editor.edit_seq();
 
-        for (line_idx, line_str) in lines.iter().enumerate() {
+        // Incremental highlight: only changed lines are re-tokenized; unchanged
+        // frames recompute zero. `lines_rc`/`hl_snap` are cheap Rc clones.
+        let (lines_rc, hl_snap) = e.highlight_snapshot(&self.theme, &self.syntect_hl);
+        let line_count = lines_rc.len();
+
+        // Per-line typographic kind. `classify_wp_line` carries a running fence
+        // state, so it must be folded over the buffer in order — but it's a
+        // cheap byte scan (no highlighting), and precomputing it lets the
+        // virtualized render closure index any visible line directly. Cheaper
+        // than the per-row *element layout* the list now skips.
+        let mut kinds: Vec<WpLineKind> = Vec::with_capacity(line_count);
+        let mut in_fence = false;
+        for line_str in lines_rc.iter() {
             let kind = classify_wp_line(line_str, in_fence);
             if matches!(kind, WpLineKind::CodeFence) {
                 in_fence = !in_fence;
             }
+            kinds.push(kind);
+        }
 
-            let mut segs = highlighted
+        // Splice the list to line count and keep the cursor visible on edits /
+        // motion (mirrors the Code view).
+        let new_count = line_count.max(1);
+        if new_count != e.list_item_count {
+            e.list_state.reset(new_count);
+            e.list_item_count = new_count;
+        }
+        let anchor = (edit_seq, cursor_line);
+        if e.last_cursor_anchor != Some(anchor) {
+            e.last_cursor_anchor = Some(anchor);
+            if cursor_line < new_count {
+                e.list_state.scroll_to_reveal_item(cursor_line);
+            }
+        }
+
+        // Owned snapshots for the `'static` per-row closure.
+        let base_style = self.theme.paragraph;
+        let lines_snap = lines_rc.clone();
+        let hl_snap = hl_snap.clone();
+        let kinds = std::rc::Rc::new(kinds);
+        let body_font = self.body_font.clone();
+        let code_font = self.code_font.clone();
+        let editor_fg = self.editor_fg();
+        let text_scale = self.text_scale;
+
+        let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut App| -> AnyElement {
+            let line_str = lines_snap.get(line_idx).cloned().unwrap_or_default();
+            let kind = kinds.get(line_idx).copied().unwrap_or(WpLineKind::Paragraph);
+
+            let mut segs = hl_snap
                 .get(line_idx)
-                .cloned()
+                .map(|lh| lh.raw.clone())
                 .unwrap_or_else(|| vec![(line_str.clone(), base_style)]);
             if let Some(sel) = sel {
                 let line_chars = line_str.chars().count();
@@ -12446,25 +12596,25 @@ impl SketchGpuiView {
                 WpLineKind::TableRow => (13.0, FontWeight::NORMAL, 0.0),
                 _ => (14.0, FontWeight::NORMAL, 0.0),
             };
-            let text_size_px = raw_size_px * self.text_scale;
+            let text_size_px = raw_size_px * text_scale;
             let line_font = match kind {
                 WpLineKind::CodeFence | WpLineKind::CodeContent | WpLineKind::TableRow => {
-                    &self.code_font
+                    &code_font
                 }
-                _ => &self.body_font,
+                _ => &body_font,
             };
 
             let content = build_line_content(
                 &segs,
-                line_str,
+                &line_str,
                 line_idx == cursor_line,
                 cursor_col,
-                e.mode,
+                mode,
                 cursor_color,
                 base_style,
                 DEFAULT_FG,
                 line_font,
-                &self.code_font,
+                &code_font,
             );
 
             // Block-level decoration per kind.
@@ -12503,10 +12653,26 @@ impl SketchGpuiView {
                     .child(content),
             };
 
-            body = body.child(line_div);
-        }
+            line_div.into_any_element()
+        };
 
-        body
+        div()
+            .id("edit-body-wp")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .px_8()
+            .py_4()
+            .text_size(px(14.0 * self.text_scale))
+            .font_family(self.body_font.clone())
+            .text_color(editor_fg)
+            .child(
+                gpui::list(e.list_state.clone(), render_fn)
+                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                    .flex_1()
+                    .w_full(),
+            )
     }
 
     /// Render a single ACP tool call as a collapsible block. The

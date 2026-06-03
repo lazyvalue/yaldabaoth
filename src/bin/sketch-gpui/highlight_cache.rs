@@ -468,6 +468,85 @@ mod tests {
         }
     }
 
+    /// The syntect-backed snapshot's `raw` segments must be byte-identical to
+    /// a from-scratch `highlight_markdown_lines_syn` batch — this is the
+    /// correctness contract the Edit view (which consumes `LineHl::raw` via
+    /// `snapshot_syn`) relies on.
+    fn assert_syn_raw_matches_batch(
+        cache_snap: &[Rc<LineHl>],
+        lines: &[String],
+        theme: &Theme,
+        hl: &Highlighter,
+    ) {
+        use sketch::md_highlight::highlight_markdown_lines_syn;
+        let raw = highlight_markdown_lines_syn(lines, theme, hl);
+        assert_eq!(cache_snap.len(), lines.len(), "line count");
+        for i in 0..lines.len() {
+            assert_eq!(
+                cache_snap[i].raw, raw[i],
+                "syn raw mismatch at line {i}: {:?}",
+                lines[i]
+            );
+        }
+    }
+
+    #[test]
+    fn syn_cold_snapshot_matches_batch() {
+        let theme = Theme::default();
+        let hl = Highlighter::new();
+        let mut cache = HighlightCache::new();
+        let ls = lines(
+            "# Heading\nplain **bold** text\n```rust\nlet x = 1;\nfn f() {}\n```\nafter fence",
+        );
+        let snap = cache.snapshot_syn(&ls, &theme, 1, &hl);
+        assert_syn_raw_matches_batch(&snap, &ls, &theme, &hl);
+        assert_eq!(cache.last_recomputed, ls.len());
+    }
+
+    #[test]
+    fn syn_mid_buffer_edit_only_touches_one_line_and_matches_batch() {
+        let theme = Theme::default();
+        let hl = Highlighter::new();
+        let mut cache = HighlightCache::new();
+        let ls = lines("aaa\nbbb\nccc\nddd\neee");
+        cache.snapshot_syn(&ls, &theme, 1, &hl);
+        let mut edited = ls.clone();
+        edited[2] = "ccc changed".into();
+        let snap = cache.snapshot_syn(&edited, &theme, 2, &hl);
+        // One line edited (outside any fence) → exactly one re-highlight.
+        assert_eq!(cache.last_recomputed, 1);
+        assert_syn_raw_matches_batch(&snap, &edited, &theme, &hl);
+    }
+
+    #[test]
+    fn syn_edit_inside_code_block_matches_batch() {
+        // A keystroke inside a fenced rust block must re-highlight just that
+        // line via syntect and stay byte-identical to the batch path.
+        let theme = Theme::default();
+        let hl = Highlighter::new();
+        let mut cache = HighlightCache::new();
+        let ls = lines("intro\n```rust\nlet x = 1;\nlet y = 2;\n```\nouttro");
+        cache.snapshot_syn(&ls, &theme, 1, &hl);
+        let mut edited = ls.clone();
+        edited[3] = "let y = 22;".into();
+        let snap = cache.snapshot_syn(&edited, &theme, 2, &hl);
+        assert_eq!(cache.last_recomputed, 1);
+        assert_syn_raw_matches_batch(&snap, &edited, &theme, &hl);
+    }
+
+    #[test]
+    fn syn_fast_skip_when_edit_seq_unchanged() {
+        let theme = Theme::default();
+        let hl = Highlighter::new();
+        let mut cache = HighlightCache::new();
+        let ls = lines("alpha\n```rust\nlet z = 0;\n```\nbravo");
+        let first = cache.snapshot_syn(&ls, &theme, 7, &hl);
+        let second = cache.snapshot_syn(&ls, &theme, 7, &hl);
+        assert!(cache.last_was_skip);
+        assert_eq!(cache.last_recomputed, 0);
+        assert!(Rc::ptr_eq(&first, &second));
+    }
+
     #[test]
     fn theme_change_invalidates_everything() {
         let mut cache = HighlightCache::new();
