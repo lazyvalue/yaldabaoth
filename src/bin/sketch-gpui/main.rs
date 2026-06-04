@@ -206,6 +206,7 @@ actions!(
         BrowserCycleSort,
         BrowserClose,
         BrowserWorktrees,
+        BrowserFilter,
         // Document text zoom (scales body + headings; chrome stays fixed)
         ZoomIn,
         ZoomOut,
@@ -246,6 +247,7 @@ actions!(
         RailToggleHidden,
         RailCycleSort,
         RailWorktrees,
+        RailFilter,
     ]
 );
 
@@ -6730,6 +6732,95 @@ impl SketchGpuiView {
         }
     }
 
+    fn browser_filter(&mut self, _: &BrowserFilter, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(b) = self.browser_mut() {
+            if b.fb.filter_mode {
+                b.fb.clear_filter();
+            } else {
+                b.fb.filter_mode = true;
+                b.fb.set_filter("");
+            }
+            cx.notify();
+        }
+    }
+
+    /// Key-down handler for browser filter text input.
+    fn handle_browser_filter_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        let Some(b) = self.browser_mut() else { return };
+        if !b.fb.filter_mode {
+            return;
+        }
+        match press.key {
+            Key::Esc => {
+                b.fb.clear_filter();
+                cx.notify();
+                cx.stop_propagation();
+            }
+            Key::Enter => {
+                // Open the selected result and exit filter.
+                let entries: Vec<_> = b.fb.visible_entries().iter().map(|e| e.path.clone()).collect();
+                let selected = b.fb.selected();
+                if let Some(path) = entries.get(selected).cloned() {
+                    let is_dir = path.is_dir();
+                    b.fb.clear_filter();
+                    if is_dir {
+                        b.fb.navigate_to(path);
+                        cx.notify();
+                    } else {
+                        self.open_file(path);
+                        cx.notify();
+                    }
+                } else {
+                    b.fb.clear_filter();
+                    cx.notify();
+                }
+                cx.stop_propagation();
+            }
+            Key::Backspace => {
+                let mut text = b.fb.filter_text().to_string();
+                if text.pop().is_some() {
+                    b.fb.set_filter(&text);
+                } else {
+                    b.fb.clear_filter();
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
+            Key::Char(c) => {
+                let mut text = b.fb.filter_text().to_string();
+                text.push(c);
+                b.fb.set_filter(&text);
+                cx.notify();
+                cx.stop_propagation();
+            }
+            Key::Down => {
+                let count = b.fb.visible_entries().len();
+                if count > 0 {
+                    let sel = (b.fb.selected() + 1) % count;
+                    b.fb.set_selected(sel);
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
+            Key::Up => {
+                let count = b.fb.visible_entries().len();
+                if count > 0 {
+                    let sel = if b.fb.selected() == 0 { count - 1 } else { b.fb.selected() - 1 };
+                    b.fb.set_selected(sel);
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
+            _ => {}
+        }
+    }
+
     // ---- Rail (persistent side column, spec-rail.md) -----------------------
 
     /// `&mut` to the active tab's rail state, if a rail is open.
@@ -7017,6 +7108,103 @@ impl SketchGpuiView {
                 fb.cycle_sort();
                 cx.notify();
             }
+        }
+    }
+
+    fn rail_filter(&mut self, _: &RailFilter, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(r) = self.rail_mut() {
+            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
+                if fb.filter_mode {
+                    fb.clear_filter();
+                } else {
+                    fb.filter_mode = true;
+                    fb.set_filter("");
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Key-down handler for rail filter text input.
+    fn handle_rail_filter_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        let Some(r) = self.rail_mut() else { return };
+        let fb = match &mut r.content {
+            workspace::RailContent::FileBrowser(fb) => fb,
+            _ => return,
+        };
+        if !fb.filter_mode {
+            return;
+        }
+        match press.key {
+            Key::Esc => {
+                fb.clear_filter();
+                cx.notify();
+                cx.stop_propagation();
+            }
+            Key::Enter => {
+                let entries: Vec<_> = fb.visible_entries().iter().map(|e| e.path.clone()).collect();
+                let selected = fb.selected();
+                if let Some(path) = entries.get(selected).cloned() {
+                    let is_dir = path.is_dir();
+                    fb.clear_filter();
+                    if is_dir {
+                        fb.navigate_to(path);
+                        cx.notify();
+                    } else {
+                        self.open_file(path);
+                        cx.notify();
+                    }
+                } else {
+                    let Some(r) = self.rail_mut() else { return };
+                    if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
+                        fb.clear_filter();
+                    }
+                    cx.notify();
+                }
+                cx.stop_propagation();
+            }
+            Key::Backspace => {
+                let mut text = fb.filter_text().to_string();
+                if text.pop().is_some() {
+                    fb.set_filter(&text);
+                } else {
+                    fb.clear_filter();
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
+            Key::Char(c) => {
+                let mut text = fb.filter_text().to_string();
+                text.push(c);
+                fb.set_filter(&text);
+                cx.notify();
+                cx.stop_propagation();
+            }
+            Key::Down => {
+                let count = fb.visible_entries().len();
+                if count > 0 {
+                    let sel = (fb.selected() + 1) % count;
+                    fb.set_selected(sel);
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
+            Key::Up => {
+                let count = fb.visible_entries().len();
+                if count > 0 {
+                    let sel = if fb.selected() == 0 { count - 1 } else { fb.selected() - 1 };
+                    fb.set_selected(sel);
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
+            _ => {}
         }
     }
 
@@ -9334,6 +9522,9 @@ impl SketchGpuiView {
             col = col.track_focus(&self.focus_handle);
         }
         col = col
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                this.handle_rail_filter_key(ev, w, cx);
+            }))
             .on_action(cx.listener(Self::rail_down))
             .on_action(cx.listener(Self::rail_up))
             .on_action(cx.listener(Self::rail_select))
@@ -9342,6 +9533,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::rail_toggle_hidden))
             .on_action(cx.listener(Self::rail_cycle_sort))
             .on_action(cx.listener(Self::rail_worktrees))
+            .on_action(cx.listener(Self::rail_filter))
             // Global actions forwarded so they keep working while the rail is
             // focused (same pattern as every other screen root).
             .on_action(cx.listener(Self::quit))
@@ -9440,6 +9632,11 @@ impl SketchGpuiView {
                 } else {
                     // ── Normal file browser ──────────────────────────
                     let dir_str = fb.current_dir().display().to_string();
+                    let header_text = if fb.filter_mode {
+                        format!("/{}", fb.filter_text())
+                    } else {
+                        format!("▸ {}", dir_str)
+                    };
                     let header = div()
                         .px_2()
                         .py_1()
@@ -9447,7 +9644,7 @@ impl SketchGpuiView {
                         .text_color(accent_fg)
                         .font_weight(FontWeight::BOLD)
                         .overflow_hidden()
-                        .child(SharedString::from(format!("▸ {}", dir_str)));
+                        .child(SharedString::from(header_text));
 
                     let mut list = div()
                         .flex()
@@ -9459,12 +9656,17 @@ impl SketchGpuiView {
                     let entries = fb.visible_entries();
                     let selected = fb.selected();
                     if entries.is_empty() {
+                        let msg = if fb.filter_mode {
+                            "  (no matches)"
+                        } else {
+                            "  (empty)"
+                        };
                         list = list.child(
                             div()
                                 .px_2()
                                 .py_1()
                                 .text_color(muted_fg)
-                                .child(SharedString::new_static("  (empty)")),
+                                .child(SharedString::new_static(msg)),
                         );
                     } else {
                         let visible_rows = 40usize;
@@ -15021,6 +15223,12 @@ impl SketchGpuiView {
             let selected = b.fb.selected();
             let dir_str = b.fb.current_dir().display().to_string();
 
+            let header_text = if b.fb.filter_mode {
+                format!("▸ {} — /{}", dir_str, b.fb.filter_text())
+            } else {
+                format!("▸ {}", dir_str)
+            };
+
             let header = div()
                 .flex()
                 .flex_row()
@@ -15031,7 +15239,7 @@ impl SketchGpuiView {
                 .bg(nc(ov.bg))
                 .text_color(nc(ov.accent))
                 .font_weight(FontWeight::BOLD)
-                .child(format!("▸ {}", dir_str));
+                .child(SharedString::from(header_text));
 
             let mut list = div()
                 .flex()
@@ -15042,41 +15250,76 @@ impl SketchGpuiView {
                 .text_size(px(13.0))
                 .font_family(self.body_font.clone());
 
+            if b.fb.filter_mode {
+                // Show filter input bar
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .px_4()
+                        .py_1()
+                        .bg(nc(ov.selected_bg))
+                        .text_color(nc(ov.input))
+                        .child(SharedString::from(format!("/ {}\u{2588}", b.fb.filter_text()))),
+                );
+            }
+
             if entries.is_empty() {
+                let msg = if b.fb.filter_mode { "  (no matches)" } else { "  (empty)" };
                 list = list.child(
                     div()
                         .px_4()
                         .py_2()
                         .text_color(nc(ov.label))
-                        .child(SharedString::new_static("  (empty)")),
+                        .child(SharedString::new_static(msg)),
                 );
             } else {
-                let visible_rows = 28usize;
+                let visible_rows = if b.fb.filter_mode { 27usize } else { 28usize };
                 let scroll = scroll_to_keep_visible(selected, visible_rows, entries.len());
                 for (i, entry) in entries.iter().enumerate().skip(scroll).take(visible_rows) {
                     list = list.child(browser_row(entry, i == selected, &self.code_font, ov));
                 }
             }
 
-            let hint = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .px_4()
-                .py_1()
-                .h(px(22.0))
-                .bg(nc(ov.bg))
-                .text_color(nc(ov.label))
-                .text_size(px(11.0))
-                .child(format!(
-                    "enter:open · -:parent · .:hidden · s:sort({}) · w:worktrees · q:close",
-                    b.fb.sort_order.label()
-                ));
+            let hint = if b.fb.filter_mode {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px_4()
+                    .py_1()
+                    .h(px(22.0))
+                    .bg(nc(ov.bg))
+                    .text_color(nc(ov.label))
+                    .text_size(px(11.0))
+                    .child(SharedString::new_static(
+                        "enter:open · esc:cancel · type to filter",
+                    ))
+            } else {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px_4()
+                    .py_1()
+                    .h(px(22.0))
+                    .bg(nc(ov.bg))
+                    .text_color(nc(ov.label))
+                    .text_size(px(11.0))
+                    .child(format!(
+                        "enter:open · -:parent · /:filter · .:hidden · s:sort({}) · w:wt · q:close",
+                        b.fb.sort_order.label()
+                    ))
+            };
 
             (header, list, hint)
         };
 
         root.key_context("BrowserView")
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                this.handle_browser_filter_key(ev, w, cx);
+            }))
             .on_action(cx.listener(Self::browser_down))
             .on_action(cx.listener(Self::browser_up))
             .on_action(cx.listener(Self::browser_enter))
@@ -15086,6 +15329,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::open_menu))
             .on_action(cx.listener(Self::browser_close))
             .on_action(cx.listener(Self::browser_worktrees))
+            .on_action(cx.listener(Self::browser_filter))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::open_agent))
@@ -15576,6 +15820,7 @@ fn main() {
             KeyBinding::new("q", BrowserClose, Some("BrowserView")),
             KeyBinding::new("escape", BrowserClose, Some("BrowserView")),
             KeyBinding::new("w", BrowserWorktrees, Some("BrowserView")),
+            KeyBinding::new("/", BrowserFilter, Some("BrowserView")),
         ]);
 
         // Rail-view bindings (spec-rail.md §6). Active only while the rail
@@ -15593,6 +15838,7 @@ fn main() {
             KeyBinding::new(".", RailToggleHidden, Some("RailView")),
             KeyBinding::new("s", RailCycleSort, Some("RailView")),
             KeyBinding::new("w", RailWorktrees, Some("RailView")),
+            KeyBinding::new("/", RailFilter, Some("RailView")),
         ]);
 
         // Quit when the last window closes. macOS apps typically stay
