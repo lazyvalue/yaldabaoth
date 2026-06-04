@@ -70,7 +70,7 @@ use agent_client_protocol::schema::{
 // scope, so anything below this line can refer to them unqualified.
 pub use agent_client_protocol::schema::{
     Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionModeId, ToolCall,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
+    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -173,6 +173,79 @@ pub enum ReplyEvent {
     /// App surfaces it in the footer status slot rather than splicing it
     /// into the buffer.
     Notice(String),
+    /// A user-authored turn observed on the replay stream (`SessionUpdate::
+    /// UserMessageChunk`). Unconditional so the dropped user role is
+    /// unrepresentable via match-exhaustiveness: the replay consumer must
+    /// decide how to reconstruct it. On session/load the agent re-emits the
+    /// whole prior conversation, including the user's own prompts; without
+    /// this variant those turns vanish on resume (Finding 1 / defect B,
+    /// INV-1, INV-6). The App freezes it as a `TurnId::User(k)` turn, with
+    /// a trimmed-suffix dedupe so a *live* echo of a just-submitted prompt
+    /// is not double-inserted.
+    UserMessage(String),
+    /// End-of-replay marker emitted exactly once when `session/load` finishes
+    /// its notification burst (Finding 13, INV-4). On resume the agent
+    /// re-emits the whole prior conversation as `SessionUpdate` notifications
+    /// (the `Chunk` / `UserMessage` events above) and only *then* returns the
+    /// `session/load` response — so this event, sent right after that
+    /// response, is ordered strictly after the last replayed chunk. The pump
+    /// gates `finalize_agent_turn` on it instead of inferring turn-end from a
+    /// transiently-empty queue, so finalize runs once after the last replayed
+    /// chunk and never mid-replay.
+    ReplayComplete,
+}
+
+/// Pure turn-attribution state machine for the replay stream (Findings 3 &
+/// 13, INV-3 / INV-4). Lives in the lib crate (rather than open-coded in the
+/// bin's `apply_reply_events`) so the exact rules — boundary advance,
+/// finalize gate, single source of `k` — are unit-testable; `apply_reply_
+/// events` drives this so the bin can't drift from what the tests pin.
+///
+/// `last_seen` counts settled live turns. `replay_turn` is the replay cursor:
+/// 0 outside a replay, otherwise the turn of the most-recent replayed user
+/// boundary. The current in-flight turn `k` is `replay_turn` when replaying,
+/// else `last_seen + 1` (the turn one past the last settled one) — one source
+/// shared by live submit and replay so gutter tags agree in both regimes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayTurns {
+    pub last_seen: usize,
+    pub replay_turn: usize,
+}
+
+impl ReplayTurns {
+    pub fn new(last_seen: usize) -> Self {
+        Self { last_seen, replay_turn: 0 }
+    }
+
+    /// The in-flight turn number `k` used to tag chunks/tools. Single source
+    /// of `k` for live and replay (INV-3).
+    pub fn current_turn(&self) -> usize {
+        if self.replay_turn > 0 {
+            self.replay_turn
+        } else {
+            self.last_seen + 1
+        }
+    }
+
+    /// A replayed user-message boundary opens the next turn. The first
+    /// boundary seeds from the live counter; each later one steps `k` by one,
+    /// so a 2-user/2-agent replay tags User(1),Llm(1),User(2),Llm(2) rather
+    /// than collapsing onto a single turn (INV-3). Returns the new `k`.
+    pub fn advance_user_boundary(&mut self) -> usize {
+        self.replay_turn = if self.replay_turn == 0 {
+            self.last_seen + 1
+        } else {
+            self.replay_turn + 1
+        };
+        self.replay_turn
+    }
+
+    /// End of replay: fold the replay cursor back into the live counter so
+    /// the next live turn resumes from the right `k`, then leave replay mode.
+    pub fn finish_replay(&mut self) {
+        self.last_seen = self.replay_turn.max(self.last_seen);
+        self.replay_turn = 0;
+    }
 }
 
 /// How sketch responds to `session/request_permission` from the agent.
@@ -932,9 +1005,9 @@ async fn worker_async(
                 acp_debug!("notification: {:?}", notification.update);
                 // Forward the variants the agent window knows how to render.
                 // Variants still parked (AgentThoughtChunk, AvailableCommands-
-                // Update, SessionInfoUpdate, ConfigOptionUpdate, UserMessage-
-                // Chunk) carry explicit drop arms so adding any one of them
-                // later is a one-arm change (spec-agent-window.md §31).
+                // Update, SessionInfoUpdate, ConfigOptionUpdate) carry explicit
+                // drop arms so adding any one of them later is a one-arm change
+                // (spec-agent-window.md §31).
                 match notification.update {
                     SessionUpdate::AgentMessageChunk(ContentChunk {
                         content: ContentBlock::Text(text),
@@ -942,6 +1015,17 @@ async fn worker_async(
                     }) => {
                         let _ = event_tx_for_handlers
                             .send(WorkerEvent::Reply(ReplyEvent::Chunk(text.text)));
+                    }
+                    // User-authored turn echoed on the replay stream. Forward
+                    // it so resumed sessions reconstruct the user's own prompts
+                    // (Finding 1 / defect B, INV-1, INV-6) — the App dedupes a
+                    // live echo of a just-submitted prompt.
+                    SessionUpdate::UserMessageChunk(ContentChunk {
+                        content: ContentBlock::Text(text),
+                        ..
+                    }) => {
+                        let _ = event_tx_for_handlers
+                            .send(WorkerEvent::Reply(ReplyEvent::UserMessage(text.text)));
                     }
                     SessionUpdate::ToolCall(tc) => {
                         let _ = event_tx_for_handlers
@@ -972,11 +1056,11 @@ async fn worker_async(
                             .send(WorkerEvent::Reply(ReplyEvent::UsageUpdated(snap)));
                     }
                     // Parked: explicit no-op arms — promotion is a one-arm
-                    // change. AgentMessageChunk's non-text content variants
-                    // (images, etc.) fall through to the catchall below.
+                    // change. AgentMessageChunk's and UserMessageChunk's
+                    // non-text content variants (images, etc.) fall through to
+                    // the catchall below.
                     SessionUpdate::AgentMessageChunk(_)
                     | SessionUpdate::AgentThoughtChunk(_)
-                    | SessionUpdate::UserMessageChunk(_)
                     | SessionUpdate::AvailableCommandsUpdate(_)
                     | SessionUpdate::SessionInfoUpdate(_)
                     | SessionUpdate::ConfigOptionUpdate(_) => {}
@@ -1184,18 +1268,22 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         match connection.send_request(load_req).block_task().await {
                             Ok(_resp) => {
                                 acp_debug!("session/load ok: {id}");
-                                // Bump the turn counter so the App side
-                                // detects "turn ended" on the next pump
-                                // tick and runs `finalize_claude_turn`.
                                 // session/load synthesises a whole prior
                                 // conversation via session/update
-                                // notifications without ever firing a
-                                // session/prompt response — without
-                                // this bump the buffer would end with
-                                // the cursor stranded on a frozen
-                                // line and no editable space below for
-                                // the user to type their next prompt.
-                                turns.fetch_add(1, Ordering::SeqCst);
+                                // notifications, then returns this response
+                                // *after* the last one — it never fires a
+                                // session/prompt response. Emit an explicit
+                                // end-of-replay marker (Finding 13, INV-4)
+                                // instead of bumping the turn counter and
+                                // letting the App infer turn-end from a
+                                // transiently-empty queue. Ordered strictly
+                                // after the replay burst (all handler events
+                                // and this one share `event_tx`), it tells the
+                                // App to finalize exactly once — ensuring an
+                                // editable line below the frozen content —
+                                // and never mid-replay.
+                                let _ = event_tx_for_driver
+                                    .send(WorkerEvent::Reply(ReplyEvent::ReplayComplete));
                                 SessionId::new(id.clone())
                             }
                             Err(e) => {
@@ -1422,7 +1510,12 @@ while True:
         emit({"jsonrpc": "2.0", "id": msg_id,
               "result": {"sessionId": "sess-1"}})
     elif method == "session/prompt":
-        # Stream two chunks, then return.
+        # Replay the user's own turn (as a real agent does on session/load),
+        # then stream two agent chunks, then return.
+        emit({"jsonrpc": "2.0", "method": "session/update",
+              "params": {"sessionId": "sess-1",
+                         "update": {"sessionUpdate": "user_message_chunk",
+                                    "content": {"type": "text", "text": "remembered prompt"}}}})
         emit({"jsonrpc": "2.0", "method": "session/update",
               "params": {"sessionId": "sess-1",
                          "update": {"sessionUpdate": "agent_message_chunk",
@@ -1495,6 +1588,86 @@ while True:
         );
     }
 
+    /// INV-1 / INV-6 (Finding 1, defect B): a `UserMessageChunk` replayed on
+    /// the stream (as a real agent emits on session/load) must survive the
+    /// channel boundary as `ReplyEvent::UserMessage` *and* reconstruct a
+    /// `TurnId::User` frozen line in the editor. Before the fix the channel
+    /// dropped `UserMessageChunk` into a no-op arm, so resumed user turns
+    /// vanished permanently. This walks the whole replay→freeze path inside
+    /// the lib crate (the `apply_reply_events` glue itself lives in the bin).
+    #[test]
+    fn replayed_user_message_freezes_user_turn() {
+        use crate::editor::Editor;
+
+        // Mirror of the bin's `TurnId` — `freeze_as_user_turn` is generic
+        // over the tag, so the editor side tags lines with this.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum TurnId {
+            User(usize),
+        }
+
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("python3 not available — skipping ACP user-message replay test");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let script = write_fake_agent_script(tmp.path());
+
+        let mut client = AcpChannelClient::spawn(
+            script.to_str().unwrap(),
+            Some(tmp.path().to_path_buf()),
+        )
+        .expect("spawn ACP agent");
+        assert!(client.is_connected());
+
+        client.send("hi there").expect("send prompt");
+
+        // Drain events until the replayed user turn surfaces. The fake agent
+        // emits a `user_message_chunk` ahead of its agent chunks.
+        let mut user_text: Option<String> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match client.try_recv() {
+                Some(ReplyEvent::UserMessage(text)) => {
+                    user_text = Some(text);
+                    break;
+                }
+                Some(_) => {}
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let user_text = user_text.expect(
+            "expected ReplyEvent::UserMessage from a replayed user_message_chunk \
+             (channel must not drop the user role) — INV-1/INV-6",
+        );
+        assert_eq!(user_text, "remembered prompt");
+
+        // The replay consumer freezes it as a `TurnId::User` turn. Assert the
+        // line lands frozen and carries the User tag, proving the role
+        // reconstructs from the replay stream alone.
+        let mut editor = Editor::new(String::new(), std::path::PathBuf::from("test.md"));
+        editor.freeze_as_user_turn(&user_text, TurnId::User(1));
+        assert_eq!(editor.document().full_text(), "remembered prompt\n");
+        assert!(
+            editor.is_frozen_line(0),
+            "replayed user turn line should be frozen"
+        );
+        let anchor = editor.anchor_for_line(0);
+        assert_eq!(
+            editor.metadata::<TurnId>().get(anchor),
+            Some(&TurnId::User(1)),
+            "replayed user turn must be tagged TurnId::User"
+        );
+    }
+
     #[test]
     fn spawn_fails_with_missing_binary() {
         let err = match AcpChannelClient::spawn(
@@ -1535,5 +1708,146 @@ while True:
                 );
             }
         }
+    }
+
+    // === Findings 3 & 13: replay turn attribution + finalize gate ===
+    //
+    // These exercise the `ReplayTurns` state machine the bin's
+    // `apply_reply_events` delegates to. The driver below mirrors that loop
+    // exactly (resolve `current_turn()` per event; `Chunk` → Llm(k);
+    // `UserMessage` → advance boundary, User(k); `ReplayComplete` →
+    // finish_replay + finalize) so the assertions pin the bin's behavior
+    // without the bin's GPUI test harness.
+
+    /// What a frozen line ends up tagged with — a lib-side mirror of the
+    /// bin's `TurnId` (which lives in main.rs).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Tag {
+        User(usize),
+        Llm(usize),
+    }
+
+    /// One replayed event, abstracted to just what drives attribution.
+    enum Ev {
+        User,
+        Chunk,
+        ReplayComplete,
+    }
+
+    /// Replica of the bin's `apply_reply_events` attribution loop. Returns the
+    /// per-line `Tag` sequence and the number of finalize signals raised.
+    fn drive_replay(start_last_seen: usize, events: &[Ev]) -> (Vec<Tag>, usize) {
+        let mut rt = ReplayTurns::new(start_last_seen);
+        let mut tags = Vec::new();
+        let mut finalizes = 0;
+        for ev in events {
+            // current_turn() is re-read per event, exactly as the bin does,
+            // so a mid-stream UserMessage boundary shifts the chunks after it.
+            match ev {
+                Ev::Chunk => tags.push(Tag::Llm(rt.current_turn())),
+                Ev::User => tags.push(Tag::User(rt.advance_user_boundary())),
+                Ev::ReplayComplete => {
+                    rt.finish_replay();
+                    finalizes += 1;
+                }
+            }
+        }
+        (tags, finalizes)
+    }
+
+    /// INV-3 (Finding 3): replaying a 2-user/2-agent `session/load` must tag
+    /// turns `User(1),Llm(1),User(2),Llm(2)` — NOT collapse the whole history
+    /// onto `User(1)/Llm(1)`. Before the fix, attribution read a single
+    /// constant `last_seen_turns + 1` for the whole replay batch, so every
+    /// line was turn 1.
+    #[test]
+    fn replay_attribution_advances_per_user_boundary() {
+        let (tags, finalizes) = drive_replay(
+            0,
+            &[
+                Ev::User,           // first exchange opens turn 1
+                Ev::Chunk,
+                Ev::User,           // second exchange opens turn 2
+                Ev::Chunk,
+                Ev::ReplayComplete, // end-of-replay marker
+            ],
+        );
+        assert_eq!(
+            tags,
+            vec![
+                Tag::User(1),
+                Tag::Llm(1),
+                Tag::User(2),
+                Tag::Llm(2),
+            ],
+            "replayed turns must count up per user boundary, not collapse to all-1s (INV-3)"
+        );
+        // Sanity: the regression we're guarding against is all-1s.
+        assert_ne!(
+            tags,
+            vec![Tag::User(1), Tag::Llm(1), Tag::User(1), Tag::Llm(1)],
+            "regression: whole replay collapsed onto turn 1"
+        );
+        assert_eq!(finalizes, 1, "replay finalizes exactly once");
+    }
+
+    /// INV-4 (Finding 13): replaying many chunks (>64, the bin's per-tick
+    /// drain budget) across bursts must finalize EXACTLY once — after the
+    /// last replayed chunk, never mid-replay on a transiently-empty queue.
+    /// The explicit `ReplayComplete` marker (sent strictly after the last
+    /// chunk) is the gate; an empty queue between bursts no longer infers
+    /// turn-end. Multiple agent chunks under one user boundary all stay on
+    /// the same `Llm(k)`.
+    #[test]
+    fn replay_finalizes_exactly_once_after_last_chunk() {
+        let mut events = Vec::new();
+        events.push(Ev::User);
+        for _ in 0..200 {
+            events.push(Ev::Chunk);
+        }
+        events.push(Ev::ReplayComplete);
+
+        let (tags, finalizes) = drive_replay(0, &events);
+
+        assert_eq!(
+            finalizes, 1,
+            "finalize must run exactly once, gated on ReplayComplete (INV-4)"
+        );
+        // First line is the user boundary; the rest are agent chunks, all on
+        // turn 1 (one user boundary → one Llm turn). No premature boundary
+        // bump from a transient empty queue.
+        assert_eq!(tags.first(), Some(&Tag::User(1)));
+        assert_eq!(tags.len(), 201, "200 chunks + 1 user line");
+        assert!(
+            tags[1..].iter().all(|t| *t == Tag::Llm(1)),
+            "all replayed agent chunks under one user boundary share Llm(1)"
+        );
+    }
+
+    /// `finish_replay` folds the replay cursor into the live counter so the
+    /// NEXT live turn resumes from the right `k` (no off-by-one after a
+    /// resumed multi-turn session).
+    #[test]
+    fn finish_replay_resumes_live_counter() {
+        let mut rt = ReplayTurns::new(0);
+        rt.advance_user_boundary(); // replay turn 1
+        rt.advance_user_boundary(); // replay turn 2
+        assert_eq!(rt.current_turn(), 2);
+        rt.finish_replay();
+        assert_eq!(rt.replay_turn, 0, "replay cursor cleared");
+        assert_eq!(rt.last_seen, 2, "live counter caught up to last replayed turn");
+        // The next live turn in flight is turn 3.
+        assert_eq!(rt.current_turn(), 3);
+    }
+
+    /// `current_turn()` is the single source of `k` shared by live and
+    /// replay (INV-3): outside replay it is `last_seen + 1`; inside replay it
+    /// is the boundary-advanced cursor.
+    #[test]
+    fn current_turn_single_source() {
+        let mut rt = ReplayTurns::new(3);
+        assert_eq!(rt.current_turn(), 4, "live: one past last settled turn");
+        rt.advance_user_boundary();
+        assert_eq!(rt.current_turn(), 4, "replay seeds from the live counter");
     }
 }

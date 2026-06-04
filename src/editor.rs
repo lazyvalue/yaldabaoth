@@ -1316,6 +1316,43 @@ impl Editor {
         }
     }
 
+    /// Append `text` as a frozen user turn — the user-side mirror of
+    /// `append_llm_chunk`. Ensures the transcript ends with a newline so the
+    /// body starts on its own line, inserts `text` (its single trailing
+    /// newline normalized away) at EOF, ensures a terminating newline, then
+    /// freezes the inserted span and tags each inserted line's anchor with
+    /// `turn_tag` (typically a `TurnId::User(k)` payload). Generic over the
+    /// tag type `T` because `TurnId` lives in the binary crate, not the lib.
+    /// See spec-agent-render-pipeline.md (INV-6 reconstruction parity).
+    pub fn freeze_as_user_turn<T>(&mut self, text: &str, turn_tag: T)
+    where
+        T: Any + Send + Sync + Clone + PartialEq,
+    {
+        // Ensure the transcript ends with a newline so the appended body
+        // starts on its own line. O(1) tail probe instead of full_text().
+        if !self.core.document().is_empty()
+            && self.core.document().last_char() != Some('\n')
+        {
+            let eof = self.core.document().rope().len_chars();
+            self.core.programmatic_insert(eof, "\n");
+        }
+        let start_line = self.core.document().line_count().saturating_sub(1);
+        let to_append = text.strip_suffix('\n').unwrap_or(text);
+        let eof = self.core.document().rope().len_chars();
+        self.core.programmatic_insert(eof, to_append);
+        // Ensure a terminating newline so the next chunk starts cleanly.
+        if self.core.document().last_char() != Some('\n') {
+            let eof2 = self.core.document().rope().len_chars();
+            self.core.programmatic_insert(eof2, "\n");
+        }
+        let end_line = self.core.document().line_count();
+        self.core.add_frozen_lines(start_line, end_line);
+        for l in start_line..end_line {
+            let a = self.core.anchor_for_line(l);
+            self.core.metadata_mut::<T>().insert(a, turn_tag.clone());
+        }
+    }
+
     fn find_llm_insertion_point<T: Any + Send + Sync + PartialEq>(
         &self,
         turn_tag: &T,
@@ -1619,6 +1656,21 @@ mod tests {
         Llm(usize),
         User(usize),
         Tool(usize),
+        /// Mirror of `main.rs`'s `TurnId::System`: sketch-local lifecycle
+        /// notices that ride `append_llm_chunk` under a dedicated tag and
+        /// must never perturb agent-turn numbering (Finding 5, INV-3).
+        System,
+    }
+
+    /// Mimic `main.rs::append_system_notice`: splice a lifecycle notice
+    /// tagged `System` (not `Llm(k)`) through the same append door.
+    fn append_system_notice(ed: &mut Editor, msg: &str) {
+        if !ed.document().is_empty() && ed.document().last_char() != Some('\n') {
+            let eof = ed.document().rope().len_chars();
+            ed.programmatic_insert(eof, "\n");
+        }
+        let notice_line = format!("― {msg}\n");
+        ed.append_llm_chunk(TurnId::System, &notice_line);
     }
 
     fn anchor_scan_visits() -> usize {
@@ -1688,6 +1740,66 @@ mod tests {
         assert!(pre < tool_line && tool_line < post, "expected pre < tool < post: {text:?}");
         assert_eq!(tags[post], Some(TurnId::Llm(1)), "post-tool line keeps Llm(1): {text:?}");
         assert_eq!(tags[pre], Some(TurnId::Llm(1)), "pre-tool line keeps Llm(1): {text:?}");
+    }
+
+    #[test]
+    fn system_notices_do_not_change_next_agent_chunk_turn() {
+        // Finding 5 / INV-3: injecting N sketch-local system notices between
+        // an agent chunk and the next one must NOT change the `Llm(k)` the
+        // next agent chunk lands under, nor splice agent prose into a notice
+        // line. The notices ride a dedicated `TurnId::System` tag, so the
+        // `Llm(k)` insertion-point lookup (which keys off the last `Llm`-tagged
+        // line) can't see them.
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "Agent prose for turn one.");
+
+        // Inject several notices — the kind append_system_notice produces.
+        for i in 0..5 {
+            append_system_notice(&mut ed, &format!("notice {i}"));
+        }
+
+        // Next agent chunk for the SAME turn.
+        ed.append_llm_chunk(TurnId::Llm(1), "More turn-one prose.");
+
+        let tags: Vec<Option<TurnId>> = (0..ed.document().line_count())
+            .map(|l| {
+                ed.anchor_for_line_opt(l)
+                    .and_then(|a| ed.metadata::<TurnId>().get(a).copied())
+            })
+            .collect();
+        let text = ed.document().full_text();
+
+        // No System line was ever retagged Llm, and no Llm line became System.
+        for (l, t) in tags.iter().enumerate() {
+            if text.lines().nth(l).is_some_and(|s| s.contains("notice")) {
+                assert_eq!(*t, Some(TurnId::System), "notice line {l} must stay System: {text:?}");
+            }
+        }
+
+        // Both agent stretches are tagged Llm(1) — the notices did not shift
+        // the turn number for the chunk that followed them.
+        let pre = text.lines().position(|l| l.contains("Agent prose")).unwrap();
+        let post = text.lines().position(|l| l.contains("More turn-one")).unwrap();
+        assert_eq!(tags[pre], Some(TurnId::Llm(1)), "pre-notice prose keeps Llm(1): {text:?}");
+        assert_eq!(tags[post], Some(TurnId::Llm(1)), "post-notice chunk keeps Llm(1): {text:?}");
+
+        // The post-notice chunk landed on its own line, not spliced into a
+        // notice line.
+        assert!(post > pre, "post-notice prose after pre: {text:?}");
+        assert!(
+            !text.contains("notice 4More") && !text.contains("Moreusing"),
+            "post-notice prose must not splice into a notice line: {text:?}"
+        );
+
+        // A different agent turn after notices also gets its own correct tag.
+        append_system_notice(&mut ed, "between turns");
+        ed.append_llm_chunk(TurnId::Llm(2), "Turn two prose.");
+        let text2 = ed.document().full_text();
+        let t2_line = text2.lines().position(|l| l.contains("Turn two")).unwrap();
+        let t2_tag = ed
+            .anchor_for_line_opt(t2_line)
+            .and_then(|a| ed.metadata::<TurnId>().get(a).copied());
+        assert_eq!(t2_tag, Some(TurnId::Llm(2)), "turn-two chunk keeps Llm(2): {text2:?}");
     }
 
     fn new_editor(text: &str) -> Editor {
@@ -1857,6 +1969,82 @@ mod tests {
         assert!(!ed.is_frozen_line(2));
         // The new chunk line (line 1) should be frozen.
         assert!(ed.is_frozen_line(1));
+    }
+
+    // ---- Finding #2: freeze_as_user_turn (user-side mirror) -----
+
+    /// Reproduce the exact manual freeze ritual `submit_chatbox` /
+    /// `ServerNotification::UserPrompt` open-coded before extraction, so the
+    /// equivalence check below pins the helper to the live behavior.
+    fn manual_freeze_user_turn(ed: &mut Editor, text: &str, turn_k: usize) {
+        if !ed.document().is_empty() && ed.document().last_char() != Some('\n') {
+            let eof = ed.document().rope().len_chars();
+            ed.programmatic_insert(eof, "\n");
+        }
+        let start_line = ed.document().line_count().saturating_sub(1);
+        let to_append = text.strip_suffix('\n').unwrap_or(text).to_string();
+        let eof = ed.document().rope().len_chars();
+        ed.programmatic_insert(eof, &to_append);
+        if ed.document().last_char() != Some('\n') {
+            let eof2 = ed.document().rope().len_chars();
+            ed.programmatic_insert(eof2, "\n");
+        }
+        let end_line = ed.document().line_count();
+        ed.add_frozen_lines(start_line, end_line);
+        for l in start_line..end_line {
+            let a = ed.anchor_for_line(l);
+            ed.metadata_mut::<TurnId>().insert(a, TurnId::User(turn_k));
+        }
+    }
+
+    /// Snapshot the document text, frozen ranges, and per-line TurnId tags so
+    /// two editors can be compared for structural equivalence.
+    fn snapshot(ed: &mut Editor) -> (String, Vec<(usize, usize)>, Vec<Option<TurnId>>) {
+        let text = ed.document().full_text();
+        let frozen = ed.frozen_lines().to_vec();
+        let tags: Vec<Option<TurnId>> = (0..ed.document().line_count())
+            .map(|l| {
+                ed.anchor_for_line_opt(l)
+                    .and_then(|a| ed.metadata::<TurnId>().get(a).copied())
+            })
+            .collect();
+        (text, frozen, tags)
+    }
+
+    #[test]
+    fn freeze_as_user_turn_matches_manual_ritual_on_empty_editor() {
+        let mut helper = new_editor("");
+        helper.freeze_as_user_turn("hello agent\n", TurnId::User(1));
+        let mut manual = new_editor("");
+        manual_freeze_user_turn(&mut manual, "hello agent\n", 1);
+        assert_eq!(snapshot(&mut helper), snapshot(&mut manual));
+        // Spot-check the expected shape directly too.
+        assert_eq!(helper.document().full_text(), "hello agent\n");
+        let a = helper.anchor_for_line(0);
+        assert_eq!(helper.metadata::<TurnId>().get(a), Some(&TurnId::User(1)));
+        assert!(helper.is_frozen_line(0));
+    }
+
+    #[test]
+    fn freeze_as_user_turn_matches_manual_with_prior_transcript_and_multiline() {
+        // A prior agent reply already frozen + tagged, no trailing newline on
+        // the incoming body, and multiple lines — exercises every branch.
+        let setup = |ed: &mut Editor| {
+            ed.append_llm_chunk(TurnId::Llm(1), "agent reply\n");
+        };
+        let mut helper = new_editor("");
+        setup(&mut helper);
+        helper.freeze_as_user_turn("line one\nline two", TurnId::User(2));
+        let mut manual = new_editor("");
+        setup(&mut manual);
+        manual_freeze_user_turn(&mut manual, "line one\nline two", 2);
+        assert_eq!(snapshot(&mut helper), snapshot(&mut manual));
+        // The two new user lines are frozen and tagged User(2).
+        let lc = helper.document().line_count();
+        let u1 = helper.anchor_for_line(lc - 3);
+        let u2 = helper.anchor_for_line(lc - 2);
+        assert_eq!(helper.metadata::<TurnId>().get(u1), Some(&TurnId::User(2)));
+        assert_eq!(helper.metadata::<TurnId>().get(u2), Some(&TurnId::User(2)));
     }
 
     // ---- Finding #9: O(1) llm insertion-point cache -----

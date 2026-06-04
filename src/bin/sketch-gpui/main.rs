@@ -2637,6 +2637,39 @@ thread_local! {
     static VIEW_MODEL_REBUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Domain newtype for a tool-call identity (Finding 7, parse-don't-validate).
+/// The protocol hands us a typed [`ToolCallId`](sketch::acp_channel::ToolCallId)
+/// (`Arc<str>` under the hood); we parse it into this key ONCE at the boundary
+/// (`apply_reply_events`) and key every tool map on it — `tool_calls`,
+/// `tool_call_order`, `tool_call_anchor_line`, and `FlatItem::ToolGroup.ids`.
+///
+/// Deliberately NO `Deref` to `String`/`str`: a `ToolCallKey` is not
+/// interchangeable with a session id, a label, or an arbitrary string, so a
+/// mismatched key is a compile error rather than a silently-missed HashMap
+/// lookup. Stringification happens only at the render edge (`as_str` /
+/// `to_string`) where a DOM id or display label is needed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ToolCallKey(sketch::acp_channel::ToolCallId);
+
+impl ToolCallKey {
+    /// Parse a protocol `ToolCallId` into the domain key. Cheap: clones an
+    /// `Arc<str>`, no string allocation.
+    fn from_id(id: &sketch::acp_channel::ToolCallId) -> Self {
+        ToolCallKey(id.clone())
+    }
+
+    /// Borrow the underlying id as a `&str` (render edge only).
+    fn as_str(&self) -> &str {
+        &self.0 .0
+    }
+}
+
+impl std::fmt::Display for ToolCallKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One row in the virtualised claude transcript list. The render
 /// closure handed to `gpui::list` indexes into a `Vec<FlatItem>`
 /// snapshot that mirrors the old "line N then any tool blocks
@@ -2651,7 +2684,7 @@ enum FlatItem {
     /// expand/collapse state.
     ToolGroup {
         anchor_line: usize,
-        ids: Vec<String>,
+        ids: Vec<ToolCallKey>,
     },
     /// A structurally-rendered block (table or fenced code block) that
     /// replaces a range of frozen lines with proper layout.
@@ -3227,7 +3260,9 @@ fn count_turn_headers_before(tags: &[Option<TurnId>], before_line: usize) -> usi
     for i in 0..before_line.min(tags.len()) {
         if let Some(tid) = tags[i] {
             let dominated_by = match tid {
-                TurnId::Tool(_) => None,
+                // Mirror the flat-items loop: Tool and System are non-dominant
+                // (no header, no turn-run break) — Finding 5, INV-3.
+                TurnId::Tool(_) | TurnId::System => None,
                 other => Some(other),
             };
             if let Some(dt) = dominated_by {
@@ -3254,6 +3289,18 @@ fn count_turn_headers_before(tags: &[Option<TurnId>], before_line: usize) -> usi
 ///
 /// Returns `Vec<(start, end)>` where `start..end` covers the full block
 /// including delimiters. Ranges are non-overlapping and sorted.
+/// Pure follow-tail policy (F4, INV-13), factored out of `AgentState` so it
+/// can be unit-tested without a GPUI editor/list. In Chatbox mode the user's
+/// cursor is outside the transcript, so following is purely the sticky-bottom
+/// `follow_output` flag; in Worksheet mode the viewport tracks the cursor and
+/// follows only when the cursor is at EOF.
+fn should_follow_tail(input_mode: InputMode, follow_output: bool, cursor_at_eof: bool) -> bool {
+    match input_mode {
+        InputMode::Chatbox => follow_output,
+        InputMode::Worksheet => cursor_at_eof,
+    }
+}
+
 fn detect_block_ranges(
     lines: &[String],
     frozen_ranges: &[(usize, usize)],
@@ -3275,16 +3322,25 @@ fn detect_block_ranges(
         if trimmed.starts_with("```") {
             let start = i;
             i += 1;
-            // Find closing fence
+            // Find closing fence. Track whether we actually matched one —
+            // exhausting the buffer is NOT a close (INV-11). A streaming,
+            // still-open fence must render its arrived lines as plain Lines
+            // until the closing delimiter freezes, so each new line stays
+            // its own FlatItem (keeping the count-keyed scroll path live)
+            // and we avoid an O(block) re-parse-to-EOF every chunk (F12).
+            let mut closed = false;
             while i < lines.len() {
                 if lines[i].trim().starts_with("```") && lines[i].trim().len() <= trimmed.len() + 20 {
                     i += 1; // include the closing fence
+                    closed = true;
                     break;
                 }
                 i += 1;
             }
-            // Only emit if we found a closing fence (i advanced past start+1)
-            if i > start + 1 {
+            // Only emit a block range once the closing fence is present
+            // (symmetric to the >=3-row table rule below). Without a match
+            // the loop ran to EOF, so leave these lines unblocked.
+            if closed && i > start + 1 {
                 ranges.push((start, i));
             }
             continue;
@@ -3316,22 +3372,35 @@ fn detect_block_ranges(
 
 /// Parse a contiguous line range into a single RenderedBlock (table or code
 /// block). Returns `None` if the parser doesn't produce a usable block.
+/// Outcome of trying to render a detected range as a single structured block.
+/// Total over the partition (Finding 10, INV-10): a detected range either
+/// becomes one `Parsed` block or explicitly `FallBackToLines`, so the flat
+/// build emits either the Block or the constituent Lines for every range —
+/// "detected but not emitted" is unrepresentable rather than an `Option::None`
+/// a later reader might forget to expand back into lines.
+enum BlockParse {
+    Parsed(RenderedBlock),
+    FallBackToLines,
+}
+
 fn parse_block_range(
     lines: &[String],
     start: usize,
     end: usize,
     theme: &Theme,
-) -> Option<RenderedBlock> {
+) -> BlockParse {
     let slice: String = lines[start..end].join("\n");
     let blocks = render_with_wiki(&slice, theme, None);
     // Take the first Table or CodeBlock produced.
     for b in blocks {
         match &b {
-            RenderedBlock::Table { .. } | RenderedBlock::CodeBlock { .. } => return Some(b),
+            RenderedBlock::Table { .. } | RenderedBlock::CodeBlock { .. } => {
+                return BlockParse::Parsed(b)
+            }
             _ => {}
         }
     }
-    None
+    BlockParse::FallBackToLines
 }
 
 /// Storage-side ceiling for any single text payload we keep on a tool
@@ -3973,7 +4042,7 @@ struct SubAgent {
     /// Originating tool-call id. The tool call itself stays in
     /// `tool_calls`; the sub-agent entry is an extra view over the same
     /// content.
-    tool_call_id: String,
+    tool_call_id: ToolCallKey,
     /// Best-effort display label: the tool call's `title` if set,
     /// otherwise its `name`, with `subagent-N` as the ultimate fallback.
     label: String,
@@ -4008,7 +4077,7 @@ fn classify_subagent(tc: &sketch::acp_channel::ToolCall) -> Option<SubAgent> {
         title.to_string()
     };
     Some(SubAgent {
-        tool_call_id: tc.tool_call_id.0.to_string(),
+        tool_call_id: ToolCallKey::from_id(&tc.tool_call_id),
         label,
         status: tc.status,
         transcript: tc.content.clone(),
@@ -4028,6 +4097,44 @@ enum TurnId {
     /// Tool-call block originating from turn N. Gutter prints `Tn`.
     /// Lives on the anchor line of a `ToolGroup` flat-item.
     Tool(usize),
+    /// Sketch-local lifecycle notice (attach/detach/disconnect/permission/
+    /// force-restart, retry `Notice`s). NOT agent-authored: it carries no
+    /// turn number, never emits a Claude `TurnHeader`, renders with a blank
+    /// gutter, and is excluded from agent-turn numbering and the live≡replay
+    /// parity contract (which is defined over `{User, Llm, Tool}` only —
+    /// Finding 5, INV-3 / Constraint 5). Kept out of `append_llm_chunk`'s
+    /// `Llm(k)` lane so a notice can never seed or mis-attribute a turn.
+    System,
+}
+
+/// The role a header-owning turn maps to. A header-owning turn is exactly
+/// `{Llm, User}`; `Tool` and `System` turns anchor ToolGroups / lifecycle
+/// notices and never emit a `TurnHeader`. Encoding this as a returned
+/// `Option<HeaderRole>` (rather than an `unreachable!()` arm) makes "Tool
+/// has no header" a compiler-checked total mapping (Finding 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderRole {
+    Claude,
+    User,
+}
+
+impl HeaderRole {
+    /// Total mapping from a turn id to the header it owns (if any).
+    /// `Tool`/`System` -> `None`; `Llm` -> `Claude`; `User` -> `User`.
+    fn from_turn(tid: TurnId) -> Option<HeaderRole> {
+        match tid {
+            TurnId::Llm(_) => Some(HeaderRole::Claude),
+            TurnId::User(_) => Some(HeaderRole::User),
+            TurnId::Tool(_) | TurnId::System => None,
+        }
+    }
+
+    fn into_turn_role(self) -> TurnRole {
+        match self {
+            HeaderRole::Claude => TurnRole::Claude,
+            HeaderRole::User => TurnRole::User,
+        }
+    }
 }
 
 /// Standalone input editor used when `InputMode == Chatbox`. Has its own
@@ -4584,6 +4691,119 @@ enum WindowContent {
     Browser(BrowserWindow),
 }
 
+/// The agent turn lifecycle as one explicit state (Finding 9). Replaces the
+/// loose `(awaiting_reply, turn_started, last_event_at, stop_requested_at)`
+/// quadruple whose valid combinations were unwritten convention — e.g.
+/// `awaiting_reply=false` with `stop_requested_at=Some` was structurally
+/// reachable but meaningless. Each transition site (submit, on-event,
+/// finalize, reset_for_replay, the Stop handler) is now a total function over
+/// this enum, and the thinking indicator / Stop-escalation read the variant
+/// rather than probing flag combinations.
+///
+/// Invariants made unrepresentable: a `since`/`escalated` stop marker can only
+/// exist while the turn is in flight (it lives *inside* `StopRequested`), and
+/// the elapsed/quiet timers (`started`/`last_event`) only exist while awaiting.
+#[derive(Clone, Copy, Debug)]
+enum TurnPhase {
+    /// No turn in flight. The footer shows no spinner; Stop is a no-op.
+    Idle,
+    /// A prompt was sent and we're streaming the reply. `started` drives the
+    /// elapsed timer; `last_event` drives the "quiet for M:SS" stall reading.
+    Awaiting {
+        started: std::time::Instant,
+        last_event: std::time::Instant,
+    },
+    /// The user pressed Stop once; a graceful `session/cancel` is pending but
+    /// the turn is still in flight (timers keep running). A second Stop while
+    /// in this state escalates to a hard kill + resume — captured by setting
+    /// `escalated` on the way into `force_restart_agent`. Carries the same
+    /// `started`/`last_event` so the indicator keeps reading correctly.
+    StopRequested {
+        started: std::time::Instant,
+        last_event: std::time::Instant,
+        since: std::time::Instant,
+        escalated: bool,
+    },
+}
+
+impl TurnPhase {
+    /// True while a reply is in flight (Awaiting or StopRequested). Drives the
+    /// thinking indicator, the Stop button's visibility, and `any_agent_awaiting`.
+    fn is_awaiting(&self) -> bool {
+        !matches!(self, TurnPhase::Idle)
+    }
+
+    /// When the in-flight turn started (elapsed-timer source), or `None` when idle.
+    fn turn_started(&self) -> Option<std::time::Instant> {
+        match self {
+            TurnPhase::Idle => None,
+            TurnPhase::Awaiting { started, .. }
+            | TurnPhase::StopRequested { started, .. } => Some(*started),
+        }
+    }
+
+    /// Last inbound reply activity (quiet-clock source), or `None` when idle.
+    fn last_event_at(&self) -> Option<std::time::Instant> {
+        match self {
+            TurnPhase::Idle => None,
+            TurnPhase::Awaiting { last_event, .. }
+            | TurnPhase::StopRequested { last_event, .. } => Some(*last_event),
+        }
+    }
+
+    /// True once the user pressed Stop for the in-flight turn (a graceful
+    /// cancel is pending). A second Stop in this state escalates.
+    fn stop_requested(&self) -> bool {
+        matches!(self, TurnPhase::StopRequested { .. })
+    }
+
+    /// Refresh the quiet-clock for the in-flight turn (any inbound event). A
+    /// no-op when idle. Preserves a pending Stop request.
+    fn note_event(&mut self, now: std::time::Instant) {
+        match self {
+            TurnPhase::Idle => {}
+            TurnPhase::Awaiting { last_event, .. }
+            | TurnPhase::StopRequested { last_event, .. } => *last_event = now,
+        }
+    }
+
+    /// Enter the awaiting state on a successful submit. Clears any prior Stop.
+    fn begin(now: std::time::Instant) -> Self {
+        TurnPhase::Awaiting {
+            started: now,
+            last_event: now,
+        }
+    }
+
+    /// Record the user's first Stop (graceful cancel pending). No-op if not
+    /// awaiting, or already stop-requested (idempotent on repeat from a stale
+    /// call path — escalation is decided by the handler before this runs).
+    fn request_stop(&mut self, now: std::time::Instant) {
+        if let TurnPhase::Awaiting { started, last_event } = *self {
+            *self = TurnPhase::StopRequested {
+                started,
+                last_event,
+                since: now,
+                escalated: false,
+            };
+        }
+    }
+
+    /// Mark the pending Stop as escalated (a second Stop → hard kill + resume).
+    /// Only meaningful while `StopRequested`; a no-op otherwise. The caller
+    /// then drives `force_restart_agent`, which returns the phase to `Idle`.
+    fn escalate(&mut self) {
+        if let TurnPhase::StopRequested { escalated, .. } = self {
+            *escalated = true;
+        }
+    }
+
+    /// Whether a pending Stop has been escalated to a hard kill (second Stop).
+    fn is_escalated(&self) -> bool {
+        matches!(self, TurnPhase::StopRequested { escalated: true, .. })
+    }
+}
+
 /// State held while the user is conversing with an ACP-attached Claude
 /// agent. The transcript lives in an in-memory `Editor` (no on-disk file);
 /// Claude's replies are spliced in as frozen lines via the same lock-and-
@@ -4623,41 +4843,52 @@ struct AgentState {
     /// Footer status line — attach result, send result, error. Cleared on
     /// the next non-Ctrl keystroke so it persists for at least one frame.
     status: Option<SharedString>,
-    /// Set true when the user sends; cleared once the agent's prompt
-    /// response lands (turn count increments). Drives the "…" indicator in
-    /// the footer.
-    awaiting_reply: bool,
-    /// When the current ACP turn started. Set on successful send,
-    /// cleared on finalize or channel drop. Drives the elapsed timer
-    /// in the header.
-    turn_started: Option<std::time::Instant>,
-    /// Last moment any reply activity (chunk / tool update / notice) landed
-    /// for the in-flight turn. Drives the "quiet for M:SS" reading in the
-    /// thinking indicator so a slow-but-streaming turn reads differently
-    /// from a stalled one. Reset on each submit and on turn end.
-    last_event_at: Option<std::time::Instant>,
-    /// When the user first pressed Stop for the in-flight turn. A second
-    /// Stop while this is set (and still awaiting) escalates from a graceful
-    /// `session/cancel` to a hard kill + resume. Cleared on turn end / submit.
-    stop_requested_at: Option<std::time::Instant>,
+    /// The turn lifecycle as one explicit state (Finding 9). `Idle` between
+    /// turns; `Awaiting` while streaming a reply (carrying the elapsed-timer
+    /// `started` and the quiet-clock `last_event`); `StopRequested` once the
+    /// user pressed Stop (a graceful cancel pending, a second Stop escalates).
+    /// Replaces the prior `(awaiting_reply, turn_started, last_event_at,
+    /// stop_requested_at)` quadruple — see `TurnPhase`.
+    turn_phase: TurnPhase,
     /// Last-seen turn count. The pump compares this against the live counter
     /// each tick — when it ticks up, the in-flight turn just ended, which is
     /// our cue to finalize the buffer (ensure an editable line below the
-    /// frozen content) and clear `awaiting_reply`.
+    /// frozen content) and return the phase to `Idle`.
     last_seen_turns: usize,
+    /// Replay turn cursor (Finding 3, INV-3). On `session/load` the agent
+    /// re-emits the whole prior conversation as a single burst of
+    /// `UserMessage` / `Chunk` events with no per-turn prompt-response to
+    /// advance `last_seen_turns`. Without this the whole replayed history
+    /// collapses into one `TurnId::Llm(1)`. Instead, each replayed
+    /// `UserMessage` boundary advances this cursor so the following agent
+    /// chunks attach to the *next* `Llm(k)`: the sequence becomes
+    /// `User(1),Llm(1),User(2),Llm(2)` rather than all-1s. Zero outside a
+    /// replay; `current_turn()` prefers it when non-zero so live submit and
+    /// replay share one source of `k` (INV-3). `ReplayComplete` folds it back
+    /// into `last_seen_turns` and resets it to 0 so live turns resume cleanly.
+    replay_turn: usize,
+    /// `edit_seq` at which the tail was last revealed by the follow-scroll
+    /// (F4, INV-13). The render-time re-reveal historically fired only when
+    /// the flat-item COUNT changed, so a chunk that grows the last line/block
+    /// without adding a row (agent prose before a `\n`, or a streaming code
+    /// fence) was skipped and the freshly grown tail fell below the fold.
+    /// Tracking the last-scrolled `edit_seq` lets the reveal fire on content
+    /// growth regardless of count delta, while still de-duping idle frames
+    /// (same `edit_seq` ⇒ no re-scroll). `u64::MAX` = never scrolled.
+    last_scrolled_edit_seq: u64,
     /// Live tool calls keyed by `tool_call_id`. Updated in place as the
     /// agent emits `ToolCallUpdate` notifications (status → in_progress →
     /// completed/failed, content arriving incrementally, etc.).
-    tool_calls: std::collections::HashMap<String, sketch::acp_channel::ToolCall>,
+    tool_calls: std::collections::HashMap<ToolCallKey, sketch::acp_channel::ToolCall>,
     /// Display order — `tool_call_id`s in the chronological order they
     /// were first announced. Drives both rendering order and "render
     /// after which buffer line" via [`tool_call_anchor_line`].
-    tool_call_order: Vec<String>,
+    tool_call_order: Vec<ToolCallKey>,
     /// Anchors a tool call to the buffer line that was the last frozen
     /// line at the moment it was announced. The renderer slots the tool
     /// block in just after that line, so tool blocks land between the
     /// chunks that bracketed them in time.
-    tool_call_anchor_line: std::collections::HashMap<String, LineAnchor>,
+    tool_call_anchor_line: std::collections::HashMap<ToolCallKey, LineAnchor>,
     /// Tool calls the user has expanded inline. Default-collapsed; click
     /// the summary header to expand or recollapse.
     expanded_tool_calls: std::collections::HashSet<String>,
@@ -4682,7 +4913,7 @@ struct AgentState {
     /// Memoized `render_agent` view-model. The flat-items list and per-line
     /// gutter tags depend only on the structural inputs captured in
     /// `view_model_fp` (edit_seq, frozen line count, tool-call order,
-    /// expanded set, awaiting_reply) — NOT on cursor/selection/theme, which
+    /// expanded set, turn_phase.is_awaiting()) — NOT on cursor/selection/theme, which
     /// the render closure reads later. On a fingerprint hit `render_agent`
     /// reuses these `Rc`s verbatim and skips the whole rebuild (gutter scan,
     /// tool-anchor resolution, flat build, blank-collapse). Perf: those run
@@ -4766,6 +4997,21 @@ impl AgentState {
         frozen_line_count.hash(&mut h);
         self.tool_call_order.len().hash(&mut h);
         self.tool_call_order.last().hash(&mut h);
+        // Resolved tool anchor lines (Finding 11, INV-8). The flat build
+        // resolves each tool's `LineAnchor` to a current line via
+        // `line_for_anchor` and groups tools by that line, so the resolved
+        // line is a genuine input to the build. Folding it in (in
+        // `tool_call_order` order, the same order the build reads) makes the
+        // memo key name this dependency directly instead of relying on the
+        // unstated invariant "anything that moves an anchor also bumps
+        // `edit_seq`". Cheap: one `line_for_anchor` per live tool call.
+        for id in &self.tool_call_order {
+            let resolved = self
+                .tool_call_anchor_line
+                .get(id)
+                .and_then(|&anchor| self.editor.line_for_anchor(anchor));
+            resolved.hash(&mut h);
+        }
         // Expanded set: hash len + sorted contents (order-independent).
         self.expanded_tool_calls.len().hash(&mut h);
         {
@@ -4775,7 +5021,7 @@ impl AgentState {
                 id.hash(&mut h);
             }
         }
-        self.awaiting_reply.hash(&mut h);
+        self.turn_phase.is_awaiting().hash(&mut h);
         h.finish()
     }
 
@@ -4828,11 +5074,10 @@ impl AgentState {
             ),
             list_item_count: 0,
             status: None,
-            awaiting_reply: false,
-            turn_started: None,
-            last_event_at: None,
-            stop_requested_at: None,
+            turn_phase: TurnPhase::Idle,
             last_seen_turns: 0,
+            replay_turn: 0,
+            last_scrolled_edit_seq: u64::MAX,
             tool_calls: std::collections::HashMap::new(),
             tool_call_order: Vec::new(),
             tool_call_anchor_line: std::collections::HashMap::new(),
@@ -4880,11 +5125,10 @@ impl AgentState {
             list_state: gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0)),
             list_item_count: 0,
             status,
-            awaiting_reply: false,
-            turn_started: None,
-            last_event_at: None,
-            stop_requested_at: None,
+            turn_phase: TurnPhase::Idle,
             last_seen_turns: 0,
+            replay_turn: 0,
+            last_scrolled_edit_seq: u64::MAX,
             tool_calls: std::collections::HashMap::new(),
             tool_call_order: Vec::new(),
             tool_call_anchor_line: std::collections::HashMap::new(),
@@ -4916,6 +5160,97 @@ impl AgentState {
         state
     }
 
+    /// View of `(last_seen_turns, replay_turn)` as the lib-crate
+    /// `ReplayTurns` state machine (Findings 3 & 13). The two fields stay on
+    /// `AgentState` (other call sites read them), but every attribution
+    /// decision routes through `ReplayTurns` so the bin can't drift from the
+    /// unit-tested rules. Mutating helpers below write the result back.
+    fn replay_turns(&self) -> sketch::acp_channel::ReplayTurns {
+        sketch::acp_channel::ReplayTurns {
+            last_seen: self.last_seen_turns,
+            replay_turn: self.replay_turn,
+        }
+    }
+
+    /// Single source of the in-flight turn number `k` (Finding 3, INV-3),
+    /// used by both live submit and replay so gutter tags and TurnHeaders
+    /// are identical in both regimes.
+    fn current_turn(&self) -> usize {
+        self.replay_turns().current_turn()
+    }
+
+    /// Advance the replay cursor at a replayed user-message boundary and
+    /// return the new turn `k` (Finding 3, INV-3).
+    fn advance_replay_user_boundary(&mut self) -> usize {
+        let mut rt = self.replay_turns();
+        let k = rt.advance_user_boundary();
+        self.replay_turn = rt.replay_turn;
+        k
+    }
+
+    /// Auto-scroll follow decision (F4, INV-13). In Chatbox mode the user's
+    /// cursor isn't in the transcript so output streams with sticky-bottom
+    /// behavior gated by `follow_output`; in Worksheet mode the viewport
+    /// stays anchored to the cursor, following only when the cursor sits at
+    /// EOF (the user is typing at the tail and wants to keep seeing fresh
+    /// output). This is the single authority the pump (×2) and render-time
+    /// re-reveal all consult, replacing the byte-identical copy that used to
+    /// live at each site (and drift independently).
+    fn follow_tail(&self) -> bool {
+        let line_count = self.editor.document().line_count();
+        let cursor_at_eof = self.editor.cursor().line + 1 >= line_count;
+        should_follow_tail(self.input_mode, self.follow_output.get(), cursor_at_eof)
+    }
+
+    /// Reveal the tail item if we're following AND content has actually grown
+    /// since the last reveal (F4, INV-13). The trigger keys on `edit_seq`
+    /// (true content growth), NOT on flat-item COUNT, so a chunk that extends
+    /// the last line/block without adding a row still re-pins the viewport.
+    /// Idempotent within a frame: a repeat call at the same `edit_seq` is a
+    /// no-op, so idle ticks don't fight a user who scrolled up. Returns whether
+    /// a reveal was actually requested (exercised by the unit test).
+    fn reveal_tail_if_following(&mut self, count: usize) -> bool {
+        let edit_seq = self.editor.document().edit_seq();
+        if count == 0 || edit_seq == self.last_scrolled_edit_seq || !self.follow_tail() {
+            return false;
+        }
+        self.last_scrolled_edit_seq = edit_seq;
+        self.list_state.scroll_to_reveal_item(count - 1);
+        true
+    }
+
+    /// Reconcile the `(list_state, list_item_count)` pair to a new flat-item
+    /// count, updating BOTH atomically so the GPUI `ListState` GPUI paints and
+    /// the scalar we splice against can never drift (Finding 8, INV-12). When
+    /// block ranges are active the item count can shrink unpredictably, so we
+    /// reset rather than splice; an incremental splice preserves the height
+    /// cache on pure growth. Returns whether the list grew (so callers / the
+    /// follow path can key on growth without re-deriving it). This is the only
+    /// mutator that touches `list_item_count`, so parity is a property of the
+    /// method rather than discipline at each render surface.
+    fn reconcile_list(&mut self, new_count: usize) -> bool {
+        let old_count = self.list_item_count;
+        if new_count != old_count {
+            if !self.block_ranges.is_empty() || new_count < old_count {
+                self.list_state.reset(new_count);
+            } else {
+                self.list_state
+                    .splice(old_count..old_count, new_count - old_count);
+            }
+            self.list_item_count = new_count;
+        }
+        new_count > old_count
+    }
+
+    /// Fold the replay cursor back into the live counter at end-of-replay
+    /// (Finding 13, INV-4).
+    fn finish_replay(&mut self) {
+        let mut rt = self.replay_turns();
+        rt.finish_replay();
+        self.last_seen_turns = rt.last_seen;
+        self.replay_turn = rt.replay_turn;
+    }
+
     /// Reset all transcript-derived state to the empty baseline so that a
     /// server re-attach — which replays the session's full `event_log` — can
     /// rebuild the transcript from scratch without duplicating what's already
@@ -4928,11 +5263,12 @@ impl AgentState {
             gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0));
         setup_list_follow_handler(&self.list_state, &self.follow_output);
         self.list_item_count = 0;
-        self.awaiting_reply = false;
-        self.turn_started = None;
-        self.last_event_at = None;
-        self.stop_requested_at = None;
+        // Fresh editor restarts `edit_seq` at 0; clear the follow-scroll
+        // watermark so the first replayed chunk re-reveals the tail (F4).
+        self.last_scrolled_edit_seq = u64::MAX;
+        self.turn_phase = TurnPhase::Idle;
         self.last_seen_turns = 0;
+        self.replay_turn = 0;
         self.tool_calls.clear();
         self.tool_call_order.clear();
         self.tool_call_anchor_line.clear();
@@ -8558,7 +8894,7 @@ impl SketchGpuiView {
         for (i, slot) in ring.slots.iter().enumerate() {
             let is_selected = i == ss.selected;
             let is_active = i == ring.active;
-            let is_busy = slot.state.awaiting_reply;
+            let is_busy = slot.state.turn_phase.is_awaiting();
 
             let marker = if is_selected { "\u{25b8} " } else { "  " };
             let active_dot = if is_active { "\u{25cf} " } else { "  " };
@@ -10555,8 +10891,7 @@ impl SketchGpuiView {
             // Dropping `channel` kills the subprocess via kill_on_drop.
             slot.state.channel = None;
             slot.state.attach_pending = None;
-            slot.state.awaiting_reply = false;
-            slot.state.turn_started = None;
+            slot.state.turn_phase = TurnPhase::Idle;
             let msg = format!(
                 "changing cwd to {}…",
                 shorten_cwd_for_display(&new_cwd),
@@ -10858,11 +11193,10 @@ impl SketchGpuiView {
             ),
             list_item_count: 0,
             status: Some("attaching to ACP agent…".into()),
-            awaiting_reply: false,
-            turn_started: None,
-            last_event_at: None,
-            stop_requested_at: None,
+            turn_phase: TurnPhase::Idle,
             last_seen_turns: 0,
+            replay_turn: 0,
+            last_scrolled_edit_seq: u64::MAX,
             tool_calls: std::collections::HashMap::new(),
             tool_call_order: Vec::new(),
             tool_call_anchor_line: std::collections::HashMap::new(),
@@ -11287,7 +11621,15 @@ impl SketchGpuiView {
                     }
                     let routed = self.with_server_session_slot(&session_id, |slot| {
                         let claude = &mut slot.state;
-                        Self::apply_reply_events(claude, std::mem::take(&mut events));
+                        // The server path finalizes on its own `TurnEnded`
+                        // notification, but if a `ReplayComplete` marker is
+                        // forwarded in the event stream, honor it here too so
+                        // the resumed transcript finalizes exactly once
+                        // (Finding 13, INV-4).
+                        if Self::apply_reply_events(claude, std::mem::take(&mut events)) {
+                            finalize_agent_turn(&mut claude.editor);
+                            claude.turn_phase = TurnPhase::Idle;
+                        }
                     });
                     if routed && !scrolled_sessions.iter().any(|s| s == &session_id) {
                         scrolled_sessions.push(session_id.clone());
@@ -11299,10 +11641,7 @@ impl SketchGpuiView {
                         let claude = &mut slot.state;
                         finalize_agent_turn(&mut claude.editor);
                         claude.last_seen_turns = turn_count;
-                        claude.awaiting_reply = false;
-                        claude.turn_started = None;
-                        claude.last_event_at = None;
-                        claude.stop_requested_at = None;
+                        claude.turn_phase = TurnPhase::Idle;
                     });
                     warn_unrouted(routed, &session_id);
                 }
@@ -11325,31 +11664,12 @@ impl SketchGpuiView {
                         if already_present {
                             return;
                         }
-                        // Perf (finding 4): O(1) tail probes for the
-                        // trailing-newline / emptiness checks.
-                        if claude.editor.document().last_char().is_some_and(|c| c != '\n') {
-                            let eof = claude.editor.document().rope().len_chars();
-                            claude.editor.programmatic_insert(eof, "\n");
-                        }
-                        let start_line =
-                            claude.editor.document().line_count().saturating_sub(1);
-                        let to_append = text.strip_suffix('\n').unwrap_or(&text);
-                        let eof = claude.editor.document().rope().len_chars();
-                        claude.editor.programmatic_insert(eof, to_append);
-                        if claude.editor.document().last_char() != Some('\n') {
-                            let eof2 = claude.editor.document().rope().len_chars();
-                            claude.editor.programmatic_insert(eof2, "\n");
-                        }
-                        let end_line = claude.editor.document().line_count();
+                        // Append + freeze + tag as turn k's user turn via the
+                        // shared helper (same shape as live submit_chatbox).
                         let turn_k = claude.last_seen_turns + 1;
-                        claude.editor.add_frozen_lines(start_line, end_line);
-                        for l in start_line..end_line {
-                            let anchor = claude.editor.anchor_for_line(l);
-                            claude
-                                .editor
-                                .metadata_mut::<TurnId>()
-                                .insert(anchor, TurnId::User(turn_k));
-                        }
+                        claude
+                            .editor
+                            .freeze_as_user_turn(&text, TurnId::User(turn_k));
                     });
                     warn_unrouted(routed, &session_id);
                 }
@@ -11412,13 +11732,12 @@ impl SketchGpuiView {
         for sid in &scrolled_sessions {
             self.with_server_session_slot(sid, |slot| {
                 let claude = &mut slot.state;
-                let line_count = claude.editor.document().line_count();
-                let cursor_at_eof = claude.editor.cursor().line + 1 >= line_count;
-                let follow = match claude.input_mode {
-                    InputMode::Chatbox => claude.follow_output.get(),
-                    InputMode::Worksheet => cursor_at_eof,
-                };
-                if follow && claude.list_item_count > 0 {
+                // Stale-count pre-pin; the authoritative reveal with the fresh
+                // post-reconcile count runs in render_agent
+                // (`reveal_tail_if_following`). This does NOT stamp
+                // `last_scrolled_edit_seq`, so it never suppresses that
+                // render-time reveal. Shares the `follow_tail` decision (F4).
+                if claude.follow_tail() && claude.list_item_count > 0 {
                     claude
                         .list_state
                         .scroll_to_reveal_item(claude.list_item_count - 1);
@@ -11525,7 +11844,10 @@ impl SketchGpuiView {
                 .unwrap_or(false);
             if stale {
                 claude.channel = None;
-                claude.turn_started = None;
+                // Channel gone → no turn can be in flight; drop to Idle so the
+                // spinner/timer can't strand (Finding 9). The prior code cleared
+                // only `turn_started`, leaving `awaiting_reply` stuck true.
+                claude.turn_phase = TurnPhase::Idle;
                 Self::append_system_notice(claude, "agent disconnected");
                 claude.status = Some("agent disconnected".into());
                 cx.notify();
@@ -11551,39 +11873,38 @@ impl SketchGpuiView {
                 }
                 current_turns = client.turn_count();
             }
+            // A live turn ends when the agent's prompt-response settles and
+            // bumps the turn counter. Replay (`session/load`) never fires a
+            // prompt response — its end is the explicit `ReplayComplete`
+            // marker (Finding 13, INV-4) returned by `apply_reply_events`, so
+            // a transiently-empty queue between notification bursts can no
+            // longer infer turn-end and finalize mid-replay.
             let turn_ended = !more_pending && current_turns > claude.last_seen_turns;
             let has_events = !events.is_empty() || turn_ended;
             if has_events {
-                Self::apply_reply_events(claude, events);
+                let mut replay_complete = Self::apply_reply_events(claude, events);
                 if turn_ended {
+                    // Drain any straggler events that queued after the budget
+                    // cut so they're applied before we finalize.
                     let mut tail: Vec<sketch::acp_channel::ReplyEvent> = Vec::new();
                     if let Some(client) = &claude.channel {
                         while let Some(ev) = client.try_recv() {
                             tail.push(ev);
                         }
                     }
-                    Self::apply_reply_events(claude, tail);
-                    finalize_agent_turn(&mut claude.editor);
+                    replay_complete |= Self::apply_reply_events(claude, tail);
                     claude.last_seen_turns = current_turns;
-                    claude.awaiting_reply = false;
-                    claude.turn_started = None;
-                    claude.last_event_at = None;
-                    claude.stop_requested_at = None;
                 }
-                // Spec §19 auto-scroll. In Chatbox mode the user's
-                // cursor isn't in the transcript so chunks land with
-                // sticky-bottom behavior. In Worksheet mode the
-                // viewport stays anchored to the cursor; the one
-                // exception is the cursor-at-EOF case (the user is
-                // typing at the tail and wants to keep seeing the
-                // freshly streamed output).
-                let line_count = claude.editor.document().line_count();
-                let cursor_at_eof = claude.editor.cursor().line + 1 >= line_count;
-                let follow_chunks = match claude.input_mode {
-                    InputMode::Chatbox => claude.follow_output.get(),
-                    InputMode::Worksheet => cursor_at_eof,
-                };
-                if follow_chunks && claude.list_item_count > 0 {
+                if turn_ended || replay_complete {
+                    finalize_agent_turn(&mut claude.editor);
+                    claude.turn_phase = TurnPhase::Idle;
+                }
+                // Spec §19 auto-scroll. Shares the `follow_tail` decision (F4).
+                // Stale-count pre-pin only; the authoritative reveal with the
+                // fresh post-reconcile count runs in render_agent
+                // (`reveal_tail_if_following`), so this does NOT stamp
+                // `last_scrolled_edit_seq`.
+                if claude.follow_tail() && claude.list_item_count > 0 {
                     claude
                         .list_state
                         .scroll_to_reveal_item(claude.list_item_count - 1);
@@ -11623,12 +11944,27 @@ impl SketchGpuiView {
 
     /// Insert a lifecycle notice into the agent buffer as a frozen line.
     /// The `―` prefix distinguishes system notices from agent prose.
+    /// Splice a sketch-local lifecycle notice into the transcript. Tagged
+    /// `TurnId::System` — NOT `Llm(k)` — so it never masquerades as an agent
+    /// turn: it carries no turn number, emits no Claude `TurnHeader`, renders
+    /// a blank gutter, and is excluded from agent-turn numbering. Because the
+    /// next agent chunk's `Llm(k)` lookup keys off the last `Llm`-tagged line,
+    /// a `System`-tagged notice can't perturb it (Finding 5, INV-3).
     fn append_system_notice(claude: &mut AgentState, msg: &str) {
-        let current_turn = claude.last_seen_turns + 1;
-        let notice_line = format!("\n― {msg}\n");
+        // Ensure the transcript ends on a newline so the notice starts on its
+        // OWN line. Otherwise the notice's leading `\n` splices onto the prior
+        // (possibly in-flight `Llm(k)`) line, and `append_llm_chunk` re-tags
+        // that whole line `System` — silently demoting agent prose. Mirrors
+        // `freeze_as_user_turn`'s boundary guard (Finding 5, INV-3).
+        let doc = claude.editor.document();
+        if !doc.is_empty() && doc.last_char() != Some('\n') {
+            let eof = doc.rope().len_chars();
+            claude.editor.programmatic_insert(eof, "\n");
+        }
+        let notice_line = format!("― {msg}\n");
         claude
             .editor
-            .append_llm_chunk(TurnId::Llm(current_turn), &notice_line);
+            .append_llm_chunk(TurnId::System, &notice_line);
     }
 
     /// Apply a batch of reply events to the AgentState. Text chunks are
@@ -11636,22 +11972,31 @@ impl SketchGpuiView {
     /// anchored to whatever buffer line is the current end-of-frozen so
     /// the renderer can slot the tool block in between text on either
     /// side. Updates merge into existing tool calls via `ToolCall::update`.
+    /// Apply a batch of events, returning `true` if a `ReplayComplete`
+    /// marker was seen (Finding 13, INV-4) — the caller then finalizes the
+    /// turn exactly once. Returning the signal (rather than finalizing here)
+    /// keeps finalize a pump-side decision colocated with the live
+    /// `turn_ended` path.
     fn apply_reply_events(
         claude: &mut AgentState,
         events: Vec<sketch::acp_channel::ReplyEvent>,
-    ) {
+    ) -> bool {
         use sketch::acp_channel::ReplyEvent;
         // Any inbound activity refreshes the quiet-clock the thinking
-        // indicator reads, so a streaming turn never looks stalled.
+        // indicator reads, so a streaming turn never looks stalled. A no-op
+        // when idle (e.g. replay events arriving outside an awaited turn).
         if !events.is_empty() {
-            claude.last_event_at = Some(std::time::Instant::now());
+            claude.turn_phase.note_event(std::time::Instant::now());
         }
-        // In-progress turn for tagging streamed content. `last_seen_turns`
-        // only ticks up when the agent's prompt response resolves; while
-        // chunks are streaming for the turn in flight, that turn is k =
-        // last_seen_turns + 1 (spec §11, §E3).
-        let current_turn = claude.last_seen_turns + 1;
+        let mut replay_complete = false;
         for ev in events {
+            // In-progress turn for tagging streamed content, resolved per
+            // event so a replayed `UserMessage` boundary mid-batch advances
+            // the turn for the chunks that follow it (Finding 3, INV-3).
+            // `current_turn()` is the single source of `k` (live submit and
+            // replay agree): live turns read `last_seen_turns + 1`; during
+            // replay the boundary-advanced `replay_turn` takes over.
+            let current_turn = claude.current_turn();
             match ev {
                 ReplyEvent::Chunk(text) => {
                     // Spec §E3: append at the end of the last frozen line
@@ -11671,7 +12016,10 @@ impl SketchGpuiView {
                 ReplyEvent::ToolCallStarted(mut tc) => {
                     cap_tool_call_payloads(&mut tc);
                     let anchor = anchor_for_new_tool_call(&mut claude.editor);
-                    let id = tc.tool_call_id.0.to_string();
+                    // Parse the protocol id into the domain key ONCE here, at
+                    // the boundary where a ToolCall enters apply_reply_events
+                    // (Finding 7). All tool maps below are keyed on it.
+                    let id = ToolCallKey::from_id(&tc.tool_call_id);
                     claude.tool_call_anchor_line.insert(id.clone(), anchor);
                     // Tag the anchor with `Tool(k)` so the gutter shows
                     // `Tk` on tool-group anchor lines (§11).
@@ -11691,7 +12039,7 @@ impl SketchGpuiView {
                     claude.tool_calls.insert(id, tc);
                 }
                 ReplyEvent::ToolCallUpdated(upd) => {
-                    let id = upd.tool_call_id.0.to_string();
+                    let id = ToolCallKey::from_id(&upd.tool_call_id);
                     if let Some(existing) = claude.tool_calls.get_mut(&id) {
                         existing.update(upd.fields);
                         cap_tool_call_payloads(existing);
@@ -11746,8 +12094,44 @@ impl SketchGpuiView {
                     Self::append_system_notice(claude, msg);
                     claude.status = Some(msg.clone().into());
                 }
+                ReplyEvent::UserMessage(text) => {
+                    // A user-authored turn observed on the replay stream
+                    // (Finding 1 / defect B, INV-1, INV-6). On session/load
+                    // the agent re-emits the prior conversation including the
+                    // user's own prompts; freeze each as a `TurnId::User(k)`
+                    // turn so resumed transcripts reconstruct fully. A *live*
+                    // UserMessageChunk just echoes the prompt Submit already
+                    // inserted — dedupe it via the same trimmed-suffix check
+                    // the ServerNotification::UserPrompt path uses, so live
+                    // echoes are skipped while replayed turns are inserted.
+                    let incoming = text.trim_end_matches('\n');
+                    let already_present = !incoming.is_empty()
+                        && document_trimmed_end_ends_with(claude.editor.document(), incoming);
+                    if already_present {
+                        continue;
+                    }
+                    // A replayed user-message boundary opens the next turn
+                    // (Finding 3, INV-3). Advance the replay cursor *before*
+                    // tagging so this user turn and the agent chunks that
+                    // follow it share `k`: User(1),Llm(1),User(2),Llm(2)…
+                    // rather than collapsing onto a single turn.
+                    let turn_k = claude.advance_replay_user_boundary();
+                    claude
+                        .editor
+                        .freeze_as_user_turn(&text, TurnId::User(turn_k));
+                }
+                ReplyEvent::ReplayComplete => {
+                    // The agent finished re-emitting the prior conversation
+                    // (Finding 13, INV-4). Fold the replay cursor back into
+                    // the live counter so the next live turn continues from
+                    // the right `k`, then signal the pump to finalize once —
+                    // after the last replayed chunk, never mid-replay.
+                    claude.finish_replay();
+                    replay_complete = true;
+                }
             }
         }
+        replay_complete
     }
 
     /// Wipe the local claude buffer + tool-call state, drop the saved
@@ -11835,8 +12219,7 @@ impl SketchGpuiView {
         // fail silently when the connection drops).
         claude.channel = None;
         claude.attach_pending = None;
-        claude.awaiting_reply = false;
-        claude.turn_started = None;
+        claude.turn_phase = TurnPhase::Idle;
         Self::append_system_notice(claude, "session detached");
         claude.status = Some("session detached".into());
         self.save_agent_ring();
@@ -12064,7 +12447,7 @@ impl SketchGpuiView {
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
                 if let WindowContent::Agent(ring) = content {
-                    if ring.slots.iter().any(|s| s.state.awaiting_reply) {
+                    if ring.slots.iter().any(|s| s.state.turn_phase.is_awaiting()) {
                         awaiting = true;
                     }
                 }
@@ -12086,16 +12469,18 @@ impl SketchGpuiView {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
                 if let WindowContent::Agent(ring) = content {
                     for s in ring.slots.iter() {
-                        if s.state.awaiting_reply {
+                        if s.state.turn_phase.is_awaiting() {
                             any = true;
                             let elapsed = s
                                 .state
-                                .turn_started
+                                .turn_phase
+                                .turn_started()
                                 .map(|t| t.elapsed().as_secs())
                                 .unwrap_or(0);
                             let quiet = s
                                 .state
-                                .last_event_at
+                                .turn_phase
+                                .last_event_at()
                                 .map(|t| t.elapsed().as_secs())
                                 .unwrap_or(0);
                             // Combine without losing either's transitions.
@@ -12121,7 +12506,10 @@ impl SketchGpuiView {
             return;
         }
         // Only meaningful mid-turn.
-        let awaiting = self.agent_mut().map(|c| c.awaiting_reply).unwrap_or(false);
+        let awaiting = self
+            .agent_mut()
+            .map(|c| c.turn_phase.is_awaiting())
+            .unwrap_or(false);
         if !awaiting {
             if let Some(claude) = self.agent_mut() {
                 claude.status = Some("nothing to stop".into());
@@ -12135,9 +12523,15 @@ impl SketchGpuiView {
         // cooperative `session/cancel` may never land.
         let escalate = self
             .agent_mut()
-            .map(|c| c.stop_requested_at.is_some())
+            .map(|c| c.turn_phase.stop_requested())
             .unwrap_or(false);
         if escalate {
+            // Record the escalation on the phase before the hard kill so the
+            // transition stays a total function over `TurnPhase` (the marker is
+            // transient — `force_restart_agent` drops to Idle immediately after).
+            if let Some(claude) = self.agent_mut() {
+                claude.turn_phase.escalate();
+            }
             self.force_restart_agent(cx);
             return;
         }
@@ -12161,7 +12555,7 @@ impl SketchGpuiView {
             false
         };
         if let Some(claude) = self.agent_mut() {
-            claude.stop_requested_at = Some(std::time::Instant::now());
+            claude.turn_phase.request_stop(std::time::Instant::now());
             claude.status = Some(if sent {
                 "stopping… (⌘. again to force-restart)".into()
             } else {
@@ -12184,10 +12578,7 @@ impl SketchGpuiView {
                 .and_then(|s| s.restart_session(&sid).ok())
                 .is_some();
             if let Some(claude) = self.agent_mut() {
-                claude.awaiting_reply = false;
-                claude.turn_started = None;
-                claude.last_event_at = None;
-                claude.stop_requested_at = None;
+                claude.turn_phase = TurnPhase::Idle;
                 claude.status = Some(if ok {
                     "force-restarting agent (resuming session)…".into()
                 } else {
@@ -12223,10 +12614,7 @@ impl SketchGpuiView {
             let claude = &mut ring.active_mut().state;
             claude.channel = None; // Drop → kills the wedged subprocess.
             claude.attach_pending = Some(attach_rx);
-            claude.awaiting_reply = false;
-            claude.turn_started = None;
-            claude.last_event_at = None;
-            claude.stop_requested_at = None;
+            claude.turn_phase = TurnPhase::Idle;
             Self::append_system_notice(claude, "force-restarting agent (resuming session)…");
             claude.status = Some("force-restarting agent (resuming session)…".into());
         }
@@ -12315,11 +12703,7 @@ impl SketchGpuiView {
 
         if sent {
             if let Some(claude) = self.agent_mut() {
-                claude.awaiting_reply = true;
-                let now = std::time::Instant::now();
-                claude.turn_started = Some(now);
-                claude.last_event_at = Some(now);
-                claude.stop_requested_at = None;
+                claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
             }
         }
         if let Some(claude) = self.agent_mut() {
@@ -12355,36 +12739,11 @@ impl SketchGpuiView {
             return;
         }
 
-        // Ensure the transcript ends with a newline so the appended draft
-        // starts on its own line. Perf: O(1) tail probes instead of full_text()
-        // (rope.to_string(), an O(transcript) allocation).
-        if !claude.editor.document().is_empty()
-            && claude.editor.document().last_char() != Some('\n')
-        {
-            let eof = claude.editor.document().rope().len_chars();
-            claude.editor.programmatic_insert(eof, "\n");
-        }
-        let start_line = claude.editor.document().line_count().saturating_sub(1);
-        let to_append = text.strip_suffix('\n').unwrap_or(&text).to_string();
-        let eof = claude.editor.document().rope().len_chars();
-        claude.editor.programmatic_insert(eof, &to_append);
-        // Ensure terminating newline so the next chunk starts cleanly.
-        if claude.editor.document().last_char() != Some('\n') {
-            let eof2 = claude.editor.document().rope().len_chars();
-            claude.editor.programmatic_insert(eof2, "\n");
-        }
-
-        let end_line = claude.editor.document().line_count();
+        // Append the chatbox body at EOF, freeze it, and tag it as turn k's
+        // user turn. `last_seen_turns` counts completed turns; the next
+        // submit becomes turn k = last_seen + 1. See Editor::freeze_as_user_turn.
         let turn_k = claude.last_seen_turns + 1;
-        // Freeze + tag each newly appended line.
-        claude.editor.add_frozen_lines(start_line, end_line);
-        for l in start_line..end_line {
-            let anchor = claude.editor.anchor_for_line(l);
-            claude
-                .editor
-                .metadata_mut::<TurnId>()
-                .insert(anchor, TurnId::User(turn_k));
-        }
+        claude.editor.freeze_as_user_turn(&text, TurnId::User(turn_k));
 
         // Send.
         let prompt_body = text.trim_end_matches('\n').to_string();
@@ -12404,11 +12763,7 @@ impl SketchGpuiView {
 
         if sent {
             if let Some(claude) = self.agent_mut() {
-                claude.awaiting_reply = true;
-                let now = std::time::Instant::now();
-                claude.turn_started = Some(now);
-                claude.last_event_at = Some(now);
-                claude.stop_requested_at = None;
+                claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
             }
         }
 
@@ -13693,7 +14048,7 @@ impl SketchGpuiView {
         // fall back to EOF so the tool block still renders, just at the
         // tail of the transcript.
         let eof_line = c.editor.document().line_count().saturating_sub(1);
-        let mut tools_at_line: std::collections::HashMap<usize, Vec<String>> =
+        let mut tools_at_line: std::collections::HashMap<usize, Vec<ToolCallKey>> =
             std::collections::HashMap::new();
         for id in &c.tool_call_order {
             if let Some(&anchor) = c.tool_call_anchor_line.get(id) {
@@ -13712,10 +14067,15 @@ impl SketchGpuiView {
             let mut new_cache: std::collections::HashMap<(usize, usize), RenderedBlock> =
                 std::collections::HashMap::new();
             for &(start, end) in &block_ranges {
-                // Reuse existing cache entry if the range is unchanged.
+                // Reuse existing cache entry if the range is unchanged. A
+                // range that `parse_block_range` rejects (`FallBackToLines`)
+                // gets NO cache entry, so the partition below renders its
+                // source lines individually (Finding 10, INV-10).
                 if let Some(cached) = c.block_cache.get(&(start, end)) {
                     new_cache.insert((start, end), cached.clone());
-                } else if let Some(block) = parse_block_range(lines, start, end, theme_ref) {
+                } else if let BlockParse::Parsed(block) =
+                    parse_block_range(lines, start, end, theme_ref)
+                {
                     new_cache.insert((start, end), block);
                 }
             }
@@ -13724,6 +14084,13 @@ impl SketchGpuiView {
             c.block_cache_frozen_count = frozen_line_count;
         }
 
+        // Build the block/line partition from ONE source: `block_cache` holds
+        // exactly the ranges that became a `Parsed` block. `block_at_start`
+        // (the line that emits a `FlatItem::Block`) and `in_block` (the
+        // interior lines that the Block subsumes) are derived from the same
+        // iteration, so `in_block` cannot disagree with what was emitted — a
+        // detected-but-unparsed range contributes neither, and the flat build
+        // falls back to a Line per source line (Finding 10, INV-10).
         let block_ranges = c.block_ranges.clone();
         let mut block_at_start: std::collections::HashMap<usize, RenderedBlock> =
             std::collections::HashMap::new();
@@ -13747,24 +14114,23 @@ impl SketchGpuiView {
         for line_idx in 0..lines.len() {
             // Insert a TurnHeader whenever the dominant turn changes.
             let cur_turn = gutter_tag_per_line.get(line_idx).copied().flatten();
+            // Tools and sketch-local System notices don't get their own header
+            // and don't break the current turn run — a notice landing mid-turn
+            // must not re-emit a Claude header (Finding 5, INV-3). The
+            // total `HeaderRole::from_turn` returns `None` for those, so the
+            // header-owning turn set `{Llm, User}` is enforced by the type
+            // rather than an `unreachable!()` arm (Finding 6).
             if let Some(tid) = cur_turn {
-                let dominated_by = match tid {
-                    TurnId::Tool(_) => None, // tools don't get their own header
-                    other => Some(other),
-                };
-                if let Some(dt) = dominated_by {
+                if let Some(role) = HeaderRole::from_turn(tid) {
                     let changed = match prev_turn {
-                        Some(prev) => prev != dt,
+                        Some(prev) => prev != tid,
                         None => true,
                     };
                     if changed {
-                        let role = match dt {
-                            TurnId::Llm(_) => TurnRole::Claude,
-                            TurnId::User(_) => TurnRole::User,
-                            TurnId::Tool(_) => unreachable!(),
-                        };
-                        flat_items.push(FlatItem::TurnHeader { role });
-                        prev_turn = Some(dt);
+                        flat_items.push(FlatItem::TurnHeader {
+                            role: role.into_turn_role(),
+                        });
+                        prev_turn = Some(tid);
                     }
                 }
             } else if prev_turn.is_some() {
@@ -13850,7 +14216,7 @@ impl SketchGpuiView {
         }
 
         // Thinking indicator at the tail while waiting for Claude.
-        if c.awaiting_reply {
+        if c.turn_phase.is_awaiting() {
             flat_items.push(FlatItem::ThinkingIndicator);
         }
 
@@ -13863,32 +14229,28 @@ impl SketchGpuiView {
         // (Side-effect — must run EVERY frame, so it lives OUTSIDE the
         // memoized boundary above.)
         let new_count = flat_items_arc.len();
-        let old_count = c.list_item_count;
-        if new_count != old_count {
-            let grew = new_count > old_count;
-            if !c.block_ranges.is_empty() || new_count < old_count {
-                c.list_state.reset(new_count);
-            } else {
-                c.list_state.splice(old_count..old_count, new_count - old_count);
-            }
-            c.list_item_count = new_count;
+        // Reconcile (count parity → splice/reset) stays count-keyed, but the
+        // `(list_state, list_item_count)` mutation is funneled through one
+        // mutator so the two can't drift (Finding 8, INV-12).
+        c.reconcile_list(new_count);
+        // INV-12: after reconcile, the registered count equals what we built.
+        debug_assert!(
+            c.list_item_count == flat_items_arc.len(),
+            "list_item_count ({}) out of sync with flat_items ({})",
+            c.list_item_count,
+            flat_items_arc.len(),
+        );
 
-            // Re-scroll with the fresh count when new items were added.
-            // The pump functions also scroll, but they fire before
-            // render so their count is stale — this catches unfocused
-            // panes that missed the pump's scroll.
-            if grew && new_count > 0 {
-                let line_count = c.editor.document().line_count();
-                let cursor_at_eof = c.editor.cursor().line + 1 >= line_count;
-                let follow = match c.input_mode {
-                    InputMode::Chatbox => c.follow_output.get(),
-                    InputMode::Worksheet => cursor_at_eof,
-                };
-                if follow {
-                    c.list_state.scroll_to_reveal_item(new_count - 1);
-                }
-            }
-        }
+        // Follow-scroll is SEPARATE from reconcile (F4, INV-13). Re-reveal the
+        // tail whenever following AND content grew since the last reveal —
+        // keyed on `edit_seq`, NOT on the count delta — so an intra-line chunk
+        // (agent prose before a `\n`, a streaming code fence) that bumps the
+        // last item's height without adding a row still re-pins the viewport.
+        // The pump functions also scroll, but they fire before render so their
+        // count is stale; this is the authoritative re-reveal with the fresh
+        // post-reconcile count, and also catches unfocused panes that missed
+        // the pump's scroll.
+        c.reveal_tail_if_following(new_count);
 
         // Snapshot data for the render closure. Cloned once per
         // render_agent call; the closure is then called only for
@@ -13920,8 +14282,8 @@ impl SketchGpuiView {
         // instead of using the hardcoded Dracula `DEFAULT_FG`.
         let editor_fg_u32 = ncolor_to_u32(self.theme.editor_fg, DEFAULT_FG);
         let frozen_fg_u32 = ncolor_to_u32(self.theme.agent.frozen_fg, DEFAULT_FG);
-        let turn_started_snap = c.turn_started;
-        let last_event_at_snap = c.last_event_at;
+        let turn_started_snap = c.turn_phase.turn_started();
+        let last_event_at_snap = c.turn_phase.last_event_at();
         let weak_self = cx.entity().downgrade();
 
         // Helper closures for frozen-line lookup and "block starts
@@ -14040,15 +14402,20 @@ impl SketchGpuiView {
                                     format!("{:>3}", format!("T{}", n)).into(),
                                     nc(at_snap.tool_label),
                                 ),
-                                None => ("   ".into(), dim_fg),
+                                // System notices carry no turn number — blank
+                                // gutter, like untagged lines (Finding 5).
+                                Some(TurnId::System) | None => ("   ".into(), dim_fg),
                             }
                         };
                         let card_bg: Hsla = match tag {
                             Some(TurnId::Llm(_)) => claude_turn_bg,
                             Some(TurnId::User(_)) => user_turn_bg,
-                            // Tool-anchor lines and untagged lines float on
-                            // the base editor_bg — no turn tint (Constraint 6).
-                            Some(TurnId::Tool(_)) | None => rgba(0x00000000).into(),
+                            // Tool-anchor, System-notice, and untagged lines
+                            // float on the base editor_bg — no turn tint
+                            // (Constraint 6, Finding 5).
+                            Some(TurnId::Tool(_)) | Some(TurnId::System) | None => {
+                                rgba(0x00000000).into()
+                            }
                         };
                         let row_bg: Hsla = if line_idx == cursor_line {
                             // Blend cursor highlight on top of turn bg.
@@ -14509,19 +14876,20 @@ impl SketchGpuiView {
             .as_ref()
             .map(|ch| ch.turn_count())
             .unwrap_or(0);
-        let display_turn = if c.awaiting_reply {
+        let display_turn = if c.turn_phase.is_awaiting() {
             completed_turns + 1
         } else {
             completed_turns
         };
-        if display_turn > 0 || c.turn_started.is_some() {
-            let elapsed_str = if let Some(t) = c.turn_started {
+        let turn_started = c.turn_phase.turn_started();
+        if display_turn > 0 || turn_started.is_some() {
+            let elapsed_str = if let Some(t) = turn_started {
                 let s = t.elapsed().as_secs();
                 format!("{}:{:02}", s / 60, s % 60)
             } else {
                 String::new()
             };
-            let turn_color = if c.turn_started.is_some() {
+            let turn_color = if turn_started.is_some() {
                 strip_warm
             } else {
                 strip_dim
@@ -14685,7 +15053,7 @@ impl SketchGpuiView {
             cursor_line + 1,
             cursor_col + 1,
         );
-        if c.awaiting_reply {
+        if c.turn_phase.is_awaiting() {
             left_status.push_str(" · …awaiting reply");
         }
         if let Some(msg) = &c.status {
@@ -14706,10 +15074,10 @@ impl SketchGpuiView {
         // StopAgent path as Cmd-. — ACP session/cancel for the active turn.
         let stop_fg: Hsla = nc(at.tool_failed);
         let mut footer_right = div().flex().flex_row().items_center().gap_2();
-        if c.awaiting_reply {
+        if c.turn_phase.is_awaiting() {
             // After a graceful cancel is already pending, the button (and
             // ⌘.) escalate to a hard kill + resume.
-            let escalating = c.stop_requested_at.is_some();
+            let escalating = c.turn_phase.stop_requested();
             let stop_label = if escalating {
                 "■ Force-restart ⌘."
             } else {
@@ -15976,6 +16344,80 @@ mod tests {
         (text.to_string(), NStyle::default())
     }
 
+    /// Finding 9 enforcement hook: the turn lifecycle is a total function over
+    /// `TurnPhase`, and the canonical `submit → stop → stop → finalize`
+    /// sequence pins the escalation behavior that used to live only in a field
+    /// comment. The first Stop moves Awaiting → StopRequested (graceful cancel
+    /// pending, not yet escalated); the second Stop, gated on `stop_requested()`,
+    /// escalates; `finalize` returns to Idle.
+    #[test]
+    fn turn_phase_submit_stop_stop_finalize_pins_escalation() {
+        use std::time::Instant;
+
+        // submit → Awaiting (in flight, no stop yet).
+        let mut phase = TurnPhase::begin(Instant::now());
+        assert!(phase.is_awaiting(), "submit must enter awaiting");
+        assert!(!phase.stop_requested(), "fresh turn has no pending stop");
+        assert!(phase.turn_started().is_some(), "awaiting carries the elapsed timer");
+        assert!(phase.last_event_at().is_some(), "awaiting carries the quiet clock");
+
+        // First Stop → StopRequested, graceful (not escalated). The handler
+        // gate `stop_requested()` is what decides escalate-vs-graceful.
+        let first_stop_escalates = phase.stop_requested();
+        assert!(!first_stop_escalates, "the FIRST stop must be graceful, not a hard kill");
+        phase.request_stop(Instant::now());
+        assert!(phase.is_awaiting(), "a pending stop is still in flight (timers run)");
+        assert!(phase.stop_requested(), "first stop records a pending cancel");
+        assert!(!phase.is_escalated(), "first stop has not escalated");
+        // Timers survive the transition so the indicator keeps reading.
+        assert!(phase.turn_started().is_some());
+        assert!(phase.last_event_at().is_some());
+
+        // Second Stop → the handler sees `stop_requested()` and escalates.
+        let second_stop_escalates = phase.stop_requested();
+        assert!(second_stop_escalates, "the SECOND stop while awaiting must escalate");
+        phase.escalate();
+        assert!(phase.is_escalated(), "second stop marks the phase escalated");
+
+        // finalize (turn end / force-restart) → Idle, all markers cleared.
+        phase = TurnPhase::Idle;
+        assert!(!phase.is_awaiting(), "finalize returns to idle");
+        assert!(!phase.stop_requested(), "idle has no pending stop");
+        assert!(!phase.is_escalated(), "idle is not escalated");
+        assert!(phase.turn_started().is_none(), "idle has no timer");
+        assert!(phase.last_event_at().is_none(), "idle has no quiet clock");
+    }
+
+    /// `request_stop`/`escalate`/`note_event` are no-ops when idle, so a stray
+    /// Stop or stale event can never strand the phase in a contradictory state.
+    #[test]
+    fn turn_phase_idle_transitions_are_noops() {
+        use std::time::Instant;
+        let mut phase = TurnPhase::Idle;
+        phase.request_stop(Instant::now());
+        assert!(matches!(phase, TurnPhase::Idle), "stop on idle is a no-op");
+        phase.escalate();
+        assert!(matches!(phase, TurnPhase::Idle), "escalate on idle is a no-op");
+        phase.note_event(Instant::now());
+        assert!(matches!(phase, TurnPhase::Idle), "event on idle is a no-op");
+
+        // note_event refreshes the quiet clock only while in flight.
+        let t0 = Instant::now();
+        let mut awaiting = TurnPhase::Awaiting { started: t0, last_event: t0 };
+        let later = t0 + std::time::Duration::from_secs(5);
+        awaiting.note_event(later);
+        assert_eq!(
+            awaiting.last_event_at(),
+            Some(later),
+            "note_event advances the quiet clock while awaiting",
+        );
+        assert_eq!(
+            awaiting.turn_started(),
+            Some(t0),
+            "note_event must not disturb the elapsed timer",
+        );
+    }
+
     #[test]
     fn split_segments_at_col_zero_in_first_segment() {
         let segs = vec![s("hello"), s(" "), s("world")];
@@ -16076,12 +16518,12 @@ mod tests {
             "seq must not change on a fingerprint hit"
         );
 
-        // Fingerprint sensitivity: a structural change (awaiting_reply flips,
-        // which the thinking indicator depends on) yields a DIFFERENT
+        // Fingerprint sensitivity: a structural change (turn_phase enters
+        // awaiting, which the thinking indicator depends on) yields a DIFFERENT
         // fingerprint and forces exactly one rebuild + a fresh Rc.
-        st.awaiting_reply = true;
+        st.turn_phase = TurnPhase::begin(std::time::Instant::now());
         let fp2 = st.view_model_fingerprint(0, 0);
-        assert_ne!(fp1, fp2, "awaiting_reply must change the fingerprint");
+        assert_ne!(fp1, fp2, "turn_phase awaiting must change the fingerprint");
         let (flat3, _gut3) = st.memoize_view_model(fp2, |_c| {
             (vec![FlatItem::ThinkingIndicator], vec![None])
         });
@@ -16097,6 +16539,49 @@ mod tests {
         assert_eq!(st.view_model_seq, 2, "miss bumps the seq again");
     }
 
+    /// F7 (parse-don't-validate at the trust boundary): a `ToolCallKey` parsed
+    /// from a protocol `ToolCallId` is the maps' key type, and two keys built
+    /// from the same protocol id are equal + hash-equal, so an insert via one
+    /// and a lookup via another (the live-update path) land on the same entry.
+    /// The type itself is the enforcement hook (no `Deref` to `String`, so an
+    /// arbitrary label can't be substituted for a tool id); this pins the
+    /// round-trip the maps rely on.
+    #[test]
+    fn tool_call_key_round_trips_through_the_maps() {
+        use sketch::acp_channel::ToolCallId;
+
+        let id: ToolCallId = "tool-abc".into();
+        let key_started = ToolCallKey::from_id(&id);
+        // A later `ToolCallUpdated` re-parses the SAME protocol id into a key.
+        let key_updated = ToolCallKey::from_id(&id);
+
+        assert_eq!(
+            key_started, key_updated,
+            "keys parsed from the same protocol id must be equal"
+        );
+        assert_eq!(
+            key_started.as_str(),
+            "tool-abc",
+            "the render edge can recover the id string"
+        );
+        assert_eq!(key_started.to_string(), "tool-abc");
+
+        // Insert on the started key, look up on the (separately parsed) updated
+        // key — the live ToolCallUpdated path. The lookup must hit.
+        let mut map: std::collections::HashMap<ToolCallKey, u32> =
+            std::collections::HashMap::new();
+        map.insert(key_started, 7);
+        assert_eq!(
+            map.get(&key_updated),
+            Some(&7),
+            "a key re-parsed from the same id must resolve the same map entry"
+        );
+
+        // A DIFFERENT id is a distinct key — no accidental collision.
+        let other = ToolCallKey::from_id(&("tool-xyz".into()));
+        assert_eq!(map.get(&other), None, "a different id must miss");
+    }
+
     /// The fingerprint must EXCLUDE tool-call content (the `ToolCallUpdated`
     /// trap): mutating a `ToolCall`'s content without touching
     /// `tool_call_order` / `edit_seq` must leave the fingerprint unchanged,
@@ -16104,7 +16589,7 @@ mod tests {
     #[test]
     fn view_model_fingerprint_ignores_tool_content() {
         let mut st = AgentState::new_for_test();
-        st.tool_call_order.push("tool-1".to_string());
+        st.tool_call_order.push(ToolCallKey::from_id(&"tool-1".into()));
         let before = st.view_model_fingerprint(7, 3);
 
         // Simulate a ToolCallUpdated: content changes, order/edit_seq don't.
@@ -16114,6 +16599,267 @@ mod tests {
         // inputs and assert stability.
         let after = st.view_model_fingerprint(7, 3);
         assert_eq!(before, after, "tool content is not part of the fingerprint");
+    }
+
+    /// F6 / INV (header-owning turns are exactly {Llm, User}): `HeaderRole`
+    /// is a TOTAL mapping over `TurnId` — `Tool`/`System` -> None (no header),
+    /// `Llm` -> Claude, `User` -> User. This replaces the old `unreachable!()`
+    /// arm with a compiler-checked `Option`, so a new `TurnId` variant is a
+    /// compile error, not a paint-path panic.
+    #[test]
+    fn header_role_is_total_over_turn_id() {
+        assert_eq!(HeaderRole::from_turn(TurnId::Tool(3)), None);
+        assert_eq!(HeaderRole::from_turn(TurnId::System), None);
+        assert_eq!(
+            HeaderRole::from_turn(TurnId::Llm(1)),
+            Some(HeaderRole::Claude)
+        );
+        assert_eq!(
+            HeaderRole::from_turn(TurnId::User(2)),
+            Some(HeaderRole::User)
+        );
+        // And the role threads through to the rendered `TurnRole`.
+        assert_eq!(HeaderRole::Claude.into_turn_role(), TurnRole::Claude);
+        assert_eq!(HeaderRole::User.into_turn_role(), TurnRole::User);
+    }
+
+    /// F8 / INV-12 (count parity): `reconcile_list` is the ONLY mutator of
+    /// `(list_state, list_item_count)`, updating both together so they can't
+    /// drift. It returns whether the list grew. After any reconcile the
+    /// registered count equals the requested count.
+    #[test]
+    fn reconcile_list_keeps_count_in_sync_and_reports_growth() {
+        let mut st = AgentState::new_for_test();
+        assert_eq!(st.list_item_count, 0);
+
+        // Growth: count rises, reports grew=true, splices.
+        assert!(st.reconcile_list(5), "0 -> 5 must report growth");
+        assert_eq!(st.list_item_count, 5, "count tracks the requested length");
+
+        // No change: same count, reports grew=false, count unchanged.
+        assert!(!st.reconcile_list(5), "5 -> 5 is not growth");
+        assert_eq!(st.list_item_count, 5);
+
+        // Shrink: count falls, reports grew=false, resets.
+        assert!(!st.reconcile_list(2), "5 -> 2 is not growth");
+        assert_eq!(st.list_item_count, 2, "count tracks a shrink too");
+
+        // With block ranges active, even growth resets (height cache can't be
+        // spliced) — but parity must still hold.
+        st.block_ranges.push((0, 3));
+        assert!(st.reconcile_list(9));
+        assert_eq!(st.list_item_count, 9);
+    }
+
+    /// F10 / INV-10 (block/line partition is total): a range
+    /// `detect_block_ranges` emits but `parse_block_range` rejects must
+    /// `FallBackToLines`, contribute NO entry to the block cache, and so
+    /// leave every one of its source lines to render as a standalone Line.
+    /// Mirrors render_agent's cache + `in_block` construction exactly.
+    #[test]
+    fn unparsed_detected_range_falls_back_to_one_line_per_source_line() {
+        // 3 pipe-delimited rows with NO separator row: `detect_block_ranges`
+        // accepts it (>=3 rows, all `|...|`), but it is NOT a valid markdown
+        // table, so `parse_block_range` rejects it.
+        let lines: Vec<String> = vec![
+            "| a | b |".to_string(),
+            "| c | d |".to_string(),
+            "| e | f |".to_string(),
+        ];
+        let frozen = vec![(0usize, lines.len())];
+        let ranges = detect_block_ranges(&lines, &frozen);
+        assert_eq!(
+            ranges,
+            vec![(0, 3)],
+            "the 3 pipe rows must be DETECTED as a candidate range"
+        );
+
+        let theme = Theme::default();
+        assert!(
+            matches!(
+                parse_block_range(&lines, 0, 3, &theme),
+                BlockParse::FallBackToLines
+            ),
+            "a separator-less pipe block must NOT parse as a table"
+        );
+
+        // Replicate the render_agent partition: block_cache holds only Parsed
+        // ranges; `in_block` is derived from the cache; any line not in a
+        // block is emitted as a Line.
+        let mut block_cache: std::collections::HashMap<(usize, usize), RenderedBlock> =
+            std::collections::HashMap::new();
+        for &(s, e) in &ranges {
+            if let BlockParse::Parsed(b) = parse_block_range(&lines, s, e, &theme) {
+                block_cache.insert((s, e), b);
+            }
+        }
+        let mut in_block: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        for &(s, e) in &ranges {
+            if block_cache.contains_key(&(s, e)) {
+                for li in s..e {
+                    in_block.insert(li);
+                }
+            }
+        }
+        let line_items: Vec<usize> = (0..lines.len())
+            .filter(|i| {
+                !block_cache.keys().any(|&(s, _)| s == *i) && !in_block.contains(i)
+            })
+            .collect();
+        // Count parity over the range: a Line for EVERY source line, no Block.
+        assert!(
+            block_cache.is_empty(),
+            "rejected range must emit no Block item"
+        );
+        assert_eq!(
+            line_items,
+            vec![0, 1, 2],
+            "every source line of an unparsed range must render as a Line"
+        );
+    }
+
+    /// F11 / INV-8 (memo soundness): the fingerprint must change when a
+    /// resolved tool anchor line changes, because the flat build groups tool
+    /// calls by that resolved line. Holding `edit_seq` FIXED across the two
+    /// fingerprint calls isolates the anchor dependency from the `edit_seq`
+    /// co-variation the memo previously leaned on implicitly.
+    #[test]
+    fn fingerprint_tracks_resolved_tool_anchor_line() {
+        let mut st = AgentState::new_for_test();
+        // Seed a few frozen lines so an anchor can resolve to a real line.
+        st.editor
+            .programmatic_insert(0, "line0\nline1\nline2\nline3\n");
+
+        // Anchor a tool call to line 2 and register it in the build's inputs.
+        let anchor = st.editor.anchor_for_line(2);
+        let key = ToolCallKey::from_id(&"tool-1".into());
+        st.tool_call_order.push(key.clone());
+        st.tool_call_anchor_line.insert(key, anchor);
+        assert_eq!(st.editor.line_for_anchor(anchor), Some(2));
+
+        // Fingerprint at a FIXED edit_seq/frozen_count.
+        let fp_before = st.view_model_fingerprint(42, 4);
+
+        // Insert a line ABOVE the anchor: its resolved line moves 2 -> 3.
+        // We pass the SAME edit_seq (42) again, so any fingerprint change is
+        // attributable to the resolved anchor line, not to edit_seq.
+        st.editor.programmatic_insert(0, "header\n");
+        assert_eq!(
+            st.editor.line_for_anchor(anchor),
+            Some(3),
+            "the anchor must have shifted down by one line"
+        );
+        let fp_after = st.view_model_fingerprint(42, 4);
+
+        assert_ne!(
+            fp_before, fp_after,
+            "a moved tool anchor must change the fingerprint even at a fixed edit_seq"
+        );
+    }
+
+    /// F4 / INV-13 enforcement: the tail re-reveal must fire on CONTENT growth
+    /// (`edit_seq` advanced), NOT on a flat-item count delta. A chunk that
+    /// grows the last line without adding a row (agent prose before a `\n`)
+    /// bumps `edit_seq` but leaves the count unchanged; the old count-keyed
+    /// path skipped it. `reveal_tail_if_following` must request the reveal
+    /// anyway, and must NOT re-request at the same `edit_seq` (idle ticks).
+    #[test]
+    fn reveal_tail_keys_on_content_growth_not_count() {
+        let mut st = AgentState::new_for_test();
+        // new_for_test starts in Chatbox with follow_output = true, so the
+        // follow decision is satisfied; we isolate the edit_seq/count behavior.
+        assert!(st.follow_tail(), "Chatbox + follow_output should follow");
+
+        let count = 3usize; // simulated post-reconcile flat-item count
+        let seq0 = st.editor.document().edit_seq();
+
+        // First reveal at the current edit_seq: requested (watermark was MAX).
+        assert!(
+            st.reveal_tail_if_following(count),
+            "first reveal at a new edit_seq must be requested"
+        );
+        assert_eq!(
+            st.last_scrolled_edit_seq, seq0,
+            "reveal stamps the watermark to the current edit_seq"
+        );
+
+        // Idle tick — same edit_seq, same count: must NOT re-reveal (so a
+        // user who scrolled up isn't yanked back every frame).
+        assert!(
+            !st.reveal_tail_if_following(count),
+            "no content growth ⇒ no re-reveal at the same edit_seq"
+        );
+
+        // Append a chunk WITHOUT a trailing newline: grows the last line but
+        // adds no row, so the flat-item count is UNCHANGED. This is exactly
+        // the case the old `new_count != old_count` trigger missed.
+        let char_len = st.editor.document().rope().len_chars();
+        st.editor.programmatic_insert(char_len, "more streamed prose");
+        let seq1 = st.editor.document().edit_seq();
+        assert_ne!(seq1, seq0, "an intra-line insert must advance edit_seq");
+
+        // Count is held constant (no new row) — the reveal must STILL fire,
+        // keyed on the advanced edit_seq, not on a count delta.
+        assert!(
+            st.reveal_tail_if_following(count),
+            "intra-line content growth must re-reveal even with unchanged count"
+        );
+        assert_eq!(st.last_scrolled_edit_seq, seq1);
+
+        // A zero count never reveals (guards the `count - 1` underflow).
+        let seq2_before = st.last_scrolled_edit_seq;
+        st.editor.programmatic_insert(0, "x");
+        assert!(
+            !st.reveal_tail_if_following(0),
+            "an empty list never reveals regardless of growth"
+        );
+        assert_eq!(
+            st.last_scrolled_edit_seq, seq2_before,
+            "a skipped reveal must not advance the watermark"
+        );
+
+        // When following is OFF (user scrolled up in Chatbox), growth alone
+        // must not yank the viewport back.
+        st.follow_output.set(false);
+        assert!(!st.follow_tail());
+        st.editor.programmatic_insert(0, "y");
+        assert!(
+            !st.reveal_tail_if_following(count),
+            "no reveal while the user has scrolled away from the tail"
+        );
+    }
+
+    /// F12 / INV-11 enforcement: an UNTERMINATED code fence must yield NO
+    /// block range, so its arrived lines render as plain Lines (each its own
+    /// FlatItem) until the closing fence freezes. A matched closing fence is
+    /// required, symmetric to the >=3-row table rule.
+    #[test]
+    fn detect_block_ranges_skips_unterminated_fence() {
+        // Open fence, two body lines, NO closing ``` — all frozen.
+        let lines: Vec<String> = vec![
+            "```rust".to_string(),
+            "let x = 1;".to_string(),
+            "let y = 2;".to_string(),
+        ];
+        let frozen = vec![(0usize, lines.len())];
+        let ranges = detect_block_ranges(&lines, &frozen);
+        assert!(
+            ranges.is_empty(),
+            "an unterminated fence must NOT emit a block range, got {ranges:?}"
+        );
+
+        // Sanity: once the closing fence arrives, the range IS emitted so
+        // the closed block still renders as one Block.
+        let mut closed = lines.clone();
+        closed.push("```".to_string());
+        let frozen_closed = vec![(0usize, closed.len())];
+        let ranges_closed = detect_block_ranges(&closed, &frozen_closed);
+        assert_eq!(
+            ranges_closed,
+            vec![(0usize, closed.len())],
+            "a closed fence must emit exactly one block range"
+        );
     }
 
     #[test]
