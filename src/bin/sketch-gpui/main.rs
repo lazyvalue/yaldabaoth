@@ -2252,28 +2252,34 @@ fn restore_rail(p: PersistedRail, fallback_pin: workspace::WindowId) -> workspac
 /// file-backed leaves through `ws`'s buffer pool so two restored views of the
 /// same file share one core. Returns the live layout plus the max window id
 /// seen (so the caller can advance the id allocator past restored ids).
+/// Returns (layout, max_window_id, agent_leaf_ids).
 fn restore_layout(
     ws: &mut workspace::Workspace<WindowContent>,
     theme: &Theme,
     layout: PersistedLayout,
-) -> (workspace::Layout<WindowContent>, workspace::WindowId) {
+) -> (workspace::Layout<WindowContent>, workspace::WindowId, Vec<workspace::WindowId>) {
     match layout {
         PersistedLayout::Leaf(leaf) => {
             let id = leaf.id;
+            let is_agent = matches!(&leaf.kind, PersistedKind::Agent { .. });
             let content = restore_content(ws, theme, leaf.kind);
+            let agents = if is_agent { vec![id] } else { vec![] };
             (
                 workspace::Layout::Leaf(workspace::Window { id, content }),
                 id,
+                agents,
             )
         }
         PersistedLayout::Split { dir, children } => {
             let mut max_id: workspace::WindowId = 0;
+            let mut agents = Vec::new();
             let mut restored_children = Vec::with_capacity(children.len());
             for (w, child) in children {
-                let (sub, sub_max) = restore_layout(ws, theme, child);
+                let (sub, sub_max, sub_agents) = restore_layout(ws, theme, child);
                 if sub_max > max_id {
                     max_id = sub_max;
                 }
+                agents.extend(sub_agents);
                 restored_children.push((w, sub));
             }
             (
@@ -2282,6 +2288,7 @@ fn restore_layout(
                     children: restored_children,
                 },
                 max_id,
+                agents,
             )
         }
     }
@@ -5476,18 +5483,20 @@ impl SketchGpuiView {
 
     /// Replace `self.workspace` with one rebuilt from the persisted snapshot
     /// for `cwd`, if any. Doc/Edit windows reload their files; Browser
-    /// windows reattach to their saved dir; Claude windows are replaced
-    /// with a Browser at cwd (full ACP restore is a follow-up). Returns
-    /// `true` if a snapshot was loaded.
-    fn restore_workspace_from_disk(&mut self) -> bool {
+    /// windows reattach to their saved dir; Claude windows are temporarily
+    /// restored as Browser stubs, then replaced with live agent sessions in
+    /// a post-pass. Returns `true` if a snapshot was loaded.
+    fn restore_workspace_from_disk(&mut self, cx: &mut Context<Self>) -> bool {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let Some(snap) = load_persisted_workspace(&cwd) else {
             return false;
         };
         let mut ws: workspace::Workspace<WindowContent> = workspace::Workspace::new();
+        let mut agent_leaf_ids: Vec<workspace::WindowId> = Vec::new();
         for ptab in snap.tabs {
-            let (layout, max_id) = restore_layout(&mut ws, &self.theme, ptab.layout);
+            let (layout, max_id, agents) = restore_layout(&mut ws, &self.theme, ptab.layout);
             ws.next_window_id = ws.next_window_id.max(max_id + 1);
+            agent_leaf_ids.extend(agents);
             ws.tabs.push(workspace::Tab {
                 auto_name: ptab.auto_name,
                 display_name: ptab.display_name,
@@ -5504,7 +5513,97 @@ impl SketchGpuiView {
             return false;
         }
         self.workspace = ws;
+
+        // Post-pass: replace Browser stubs with live agent sessions.
+        if !agent_leaf_ids.is_empty() {
+            self.restore_agent_leaves(&agent_leaf_ids, cx);
+        }
         true
+    }
+
+    /// Replace Browser stubs at the given leaf IDs with live agent sessions.
+    /// Called as a post-pass after `restore_workspace_from_disk` installs the
+    /// layout — by that point `self.workspace` is populated and we have `cx`.
+    fn restore_agent_leaves(
+        &mut self,
+        leaf_ids: &[workspace::WindowId],
+        cx: &mut Context<Self>,
+    ) {
+        let proc_cwd = process_cwd();
+
+        for &leaf_id in leaf_ids {
+            let mut ring = AgentRing::new(None);
+
+            if self.session_server.is_some() {
+                // Session-server path: placeholder + async attach.
+                let placeholder = AgentState::new_server_managed(Some(
+                    "connecting to session server…".into(),
+                ));
+                let placeholder_index = ring.push(
+                    "claude-1".into(),
+                    placeholder,
+                    None,
+                    proc_cwd.clone(),
+                    None,
+                );
+                let server_pump = self.start_server_pump(cx);
+                if let Some(slot) = ring.slots.first_mut() {
+                    slot.state._pump = Some(server_pump);
+                }
+                // Install the ring, then kick off async attach.
+                for tab in &mut self.workspace.tabs {
+                    if let Some(win) = tab.layout.find_leaf_mut(leaf_id) {
+                        win.content = WindowContent::Agent(ring);
+                        break;
+                    }
+                }
+                self.spawn_open_agent_server(placeholder_index, proc_cwd.clone(), cx);
+            } else {
+                // Legacy direct-spawn path.
+                let persisted = load_persisted_acp_sessions(&proc_cwd);
+                if persisted.is_empty() {
+                    let slot_cwd = proc_cwd.clone();
+                    let session_index = ring.next_index;
+                    let state = self.create_agent_session(
+                        None,
+                        slot_cwd.clone(),
+                        session_index,
+                        cx,
+                    );
+                    ring.push("claude-1".into(), state, None, slot_cwd, None);
+                } else {
+                    let active_pos = persisted
+                        .iter()
+                        .position(|s| s.active)
+                        .unwrap_or(0);
+                    for slot in persisted {
+                        let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
+                        let session_index = ring.next_index;
+                        let mut state = self.create_agent_session(
+                            Some(slot.id.clone()),
+                            slot_cwd.clone(),
+                            session_index,
+                            cx,
+                        );
+                        state.input_mode = slot.mode;
+                        if slot.mode == InputMode::Worksheet {
+                            state.chatbox = None;
+                        }
+                        state.tasklist_open = slot.tasklist_open;
+                        state.subagents_open = slot.subagents_open;
+                        ring.push(slot.label, state, Some(slot.id), slot_cwd, None);
+                    }
+                    ring.active = active_pos.min(ring.slots.len().saturating_sub(1));
+                }
+                for tab in &mut self.workspace.tabs {
+                    if let Some(win) = tab.layout.find_leaf_mut(leaf_id) {
+                        win.content = WindowContent::Agent(ring);
+                        break;
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// `Some(doc)` if currently viewing a document, else `None`.
@@ -6437,21 +6536,25 @@ impl SketchGpuiView {
     /// `Ctrl-W h/j/k/l` — move focus to a sibling split in that direction.
     fn focus_left(&mut self, _: &FocusLeft, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.focus_motion(workspace::FocusDir::Left);
+        self.sync_rail_focus_after_motion();
         self.save_workspace_state();
         cx.notify();
     }
     fn focus_right(&mut self, _: &FocusRight, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.focus_motion(workspace::FocusDir::Right);
+        self.sync_rail_focus_after_motion();
         self.save_workspace_state();
         cx.notify();
     }
     fn focus_up(&mut self, _: &FocusUp, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.focus_motion(workspace::FocusDir::Up);
+        self.sync_rail_focus_after_motion();
         self.save_workspace_state();
         cx.notify();
     }
     fn focus_down(&mut self, _: &FocusDown, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.focus_motion(workspace::FocusDir::Down);
+        self.sync_rail_focus_after_motion();
         self.save_workspace_state();
         cx.notify();
     }
@@ -6459,11 +6562,13 @@ impl SketchGpuiView {
     /// `Ctrl-W w` / `Ctrl-W W` — cycle focus through leaves in tree order.
     fn focus_next(&mut self, _: &FocusNext, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.focus_next();
+        self.sync_rail_focus_after_motion();
         self.save_workspace_state();
         cx.notify();
     }
     fn focus_prev(&mut self, _: &FocusPrev, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.focus_prev();
+        self.sync_rail_focus_after_motion();
         self.save_workspace_state();
         cx.notify();
     }
@@ -6595,6 +6700,14 @@ impl SketchGpuiView {
             .and_then(|t| t.rail.as_ref())
             .map(|r| r.focused)
             .unwrap_or(false)
+    }
+
+    /// Sync `rail.focused` after a focus-motion: the rail holds focus only
+    /// when the newly focused leaf is the one the rail is pinned to.
+    fn sync_rail_focus_after_motion(&mut self) {
+        let Some(tab) = self.workspace.active_tab_mut() else { return };
+        let Some(rail) = tab.rail.as_mut() else { return };
+        rail.focused = tab.focused == rail.pinned_to;
     }
 
     /// Toggle the file-browser rail (Cmd-B). Two-state model (spec §5):
@@ -15273,7 +15386,7 @@ fn main() {
                     // explicit arg the user wants that file, so the saved
                     // snapshot stays on disk for the next no-arg launch.
                     if initial_doc.is_none() {
-                        view.restore_workspace_from_disk();
+                        view.restore_workspace_from_disk(cx);
                     }
                     // Reboot handoff: the previous sketch process set this
                     // env var via `reboot_into_claude` to mean "boot
