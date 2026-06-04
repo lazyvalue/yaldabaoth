@@ -10,11 +10,12 @@ pub struct Worktree {
     pub is_current: bool,
 }
 
-/// List git worktrees by running `git worktree list --porcelain`.
+/// List git worktrees by running `git worktree list --porcelain` from `cwd`.
 /// Returns an empty vec if not in a git repo or git is unavailable.
-pub fn list_worktrees() -> Vec<Worktree> {
+pub fn list_worktrees(cwd: &Path) -> Vec<Worktree> {
     let output = match Command::new("git")
         .args(["worktree", "list", "--porcelain"])
+        .current_dir(cwd)
         .output()
     {
         Ok(o) if o.status.success() => o,

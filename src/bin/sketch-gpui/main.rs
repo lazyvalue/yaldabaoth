@@ -15275,7 +15275,7 @@ impl SketchGpuiView {
                         .child(SharedString::new_static(msg)),
                 );
             } else {
-                let visible_rows = if b.fb.filter_mode { 27usize } else { 28usize };
+                let visible_rows = 80usize;
                 let scroll = scroll_to_keep_visible(selected, visible_rows, entries.len());
                 for (i, entry) in entries.iter().enumerate().skip(scroll).take(visible_rows) {
                     list = list.child(browser_row(entry, i == selected, &self.code_font, ov));
@@ -15390,13 +15390,9 @@ fn scroll_to_keep_visible(selected: usize, rows: usize, total: usize) -> usize {
     if total <= rows {
         return 0;
     }
-    let margin = (rows / 4).max(2);
-    if selected >= rows.saturating_sub(margin) {
-        selected.saturating_sub(rows.saturating_sub(margin) - 1)
-    } else {
-        0
-    }
-    .min(total.saturating_sub(rows))
+    // Keep the selected item centered when the list is long enough to scroll.
+    let half = rows / 2;
+    selected.saturating_sub(half).min(total.saturating_sub(rows))
 }
 
 /// One row in the file-browser list.

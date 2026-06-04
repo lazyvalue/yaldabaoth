@@ -343,7 +343,7 @@ impl FileBrowser {
 
     /// Enter worktree selection mode.
     pub fn enter_worktree_mode(&mut self) {
-        let mut wts = worktree::list_worktrees();
+        let mut wts = worktree::list_worktrees(&self.current_dir);
         worktree::mark_current(&mut wts, &self.current_dir);
         let selected = worktree::best_match_index(&wts, &self.current_dir);
         self.worktree_mode = Some(WorktreeMode {
