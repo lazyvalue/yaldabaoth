@@ -96,6 +96,7 @@ use sketch::cursor::CursorPos;
 use sketch::document::Document;
 use sketch::editor::{Editor, EditorCore, EditorView, LineAnchor};
 use sketch::file_browser::{BrowserEntry, FileBrowser};
+use sketch::worktree;
 use sketch::keybind::KeybindManager;
 use sketch::keys::{Key, KeyPress, Modifiers as KMods};
 use sketch::md_highlight::{
@@ -204,6 +205,7 @@ actions!(
         BrowserToggleHidden,
         BrowserCycleSort,
         BrowserClose,
+        BrowserWorktrees,
         // Document text zoom (scales body + headings; chrome stays fixed)
         ZoomIn,
         ZoomOut,
@@ -243,6 +245,7 @@ actions!(
         RailParent,
         RailToggleHidden,
         RailCycleSort,
+        RailWorktrees,
     ]
 );
 
@@ -6600,17 +6603,32 @@ impl SketchGpuiView {
 
     fn browser_down(&mut self, _: &BrowserDown, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(b) = self.browser_mut() {
-            b.fb.move_down();
+            if let Some(wm) = &mut b.fb.worktree_mode {
+                wm.move_down();
+            } else {
+                b.fb.move_down();
+            }
             cx.notify();
         }
     }
     fn browser_up(&mut self, _: &BrowserUp, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(b) = self.browser_mut() {
-            b.fb.move_up();
+            if let Some(wm) = &mut b.fb.worktree_mode {
+                wm.move_up();
+            } else {
+                b.fb.move_up();
+            }
             cx.notify();
         }
     }
     fn browser_enter(&mut self, _: &BrowserEnter, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(b) = self.browser_mut() {
+            if b.fb.worktree_mode.is_some() {
+                b.fb.select_worktree();
+                cx.notify();
+                return;
+            }
+        }
         let to_open = match self.browser_mut() {
             Some(b) => b.fb.enter_selected(),
             None => return,
@@ -6622,7 +6640,25 @@ impl SketchGpuiView {
     }
     fn browser_parent(&mut self, _: &BrowserParent, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(b) = self.browser_mut() {
+            if b.fb.worktree_mode.is_some() {
+                return; // no-op in worktree mode
+            }
             b.fb.go_parent();
+            cx.notify();
+        }
+    }
+    fn browser_worktrees(
+        &mut self,
+        _: &BrowserWorktrees,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(b) = self.browser_mut() {
+            if b.fb.worktree_mode.is_some() {
+                b.fb.exit_worktree_mode();
+            } else {
+                b.fb.enter_worktree_mode();
+            }
             cx.notify();
         }
     }
@@ -6649,6 +6685,14 @@ impl SketchGpuiView {
         }
     }
     fn browser_close(&mut self, _: &BrowserClose, _w: &mut Window, cx: &mut Context<Self>) {
+        // If in worktree mode, Esc exits that overlay instead of closing.
+        if let Some(b) = self.browser_mut() {
+            if b.fb.worktree_mode.is_some() {
+                b.fb.exit_worktree_mode();
+                cx.notify();
+                return;
+            }
+        }
         let underlying = match self.workspace.focused_content_mut().expect("no focused window") {
             WindowContent::Browser(b) => b.underlying.take(),
             _ => return,
@@ -6798,6 +6842,16 @@ impl SketchGpuiView {
     /// Close the rail and return focus to the previously-focused split-tree
     /// leaf (spec §7 — `tab.focused` is the single source of truth).
     fn rail_close(&mut self, _: &RailClose, _w: &mut Window, cx: &mut Context<Self>) {
+        // If in worktree mode, Esc exits that overlay instead of closing the rail.
+        if let Some(r) = self.rail_mut() {
+            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
+                if fb.worktree_mode.is_some() {
+                    fb.exit_worktree_mode();
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         if let Some(tab) = self.workspace.active_tab_mut() {
             if tab.rail.is_some() {
                 tab.rail = None;
@@ -6810,7 +6864,13 @@ impl SketchGpuiView {
     fn rail_down(&mut self, _: &RailDown, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(r) = self.rail_mut() {
             match &mut r.content {
-                workspace::RailContent::FileBrowser(fb) => fb.move_down(),
+                workspace::RailContent::FileBrowser(fb) => {
+                    if let Some(wm) = &mut fb.worktree_mode {
+                        wm.move_down();
+                    } else {
+                        fb.move_down();
+                    }
+                }
                 workspace::RailContent::Outline(o) => {
                     if !o.entries.is_empty() {
                         o.selected = (o.selected + 1) % o.entries.len();
@@ -6824,7 +6884,13 @@ impl SketchGpuiView {
     fn rail_up(&mut self, _: &RailUp, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(r) = self.rail_mut() {
             match &mut r.content {
-                workspace::RailContent::FileBrowser(fb) => fb.move_up(),
+                workspace::RailContent::FileBrowser(fb) => {
+                    if let Some(wm) = &mut fb.worktree_mode {
+                        wm.move_up();
+                    } else {
+                        fb.move_up();
+                    }
+                }
                 workspace::RailContent::Outline(o) => {
                     if !o.entries.is_empty() {
                         o.selected = if o.selected == 0 {
@@ -6843,6 +6909,16 @@ impl SketchGpuiView {
     /// open) or navigate into a directory. Outline: scroll the focused window
     /// to the heading's block/line.
     fn rail_select(&mut self, _: &RailSelect, _w: &mut Window, cx: &mut Context<Self>) {
+        // Worktree mode: select worktree and navigate.
+        if let Some(r) = self.rail_mut() {
+            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
+                if fb.worktree_mode.is_some() {
+                    fb.select_worktree();
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         // File browser: collect the action without holding the rail borrow.
         let to_open = match self.rail_mut() {
             Some(r) => match &mut r.content {
@@ -6899,7 +6975,23 @@ impl SketchGpuiView {
     fn rail_parent(&mut self, _: &RailParent, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(r) = self.rail_mut() {
             if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
+                if fb.worktree_mode.is_some() {
+                    return; // no-op in worktree mode
+                }
                 fb.go_parent();
+                cx.notify();
+            }
+        }
+    }
+
+    fn rail_worktrees(&mut self, _: &RailWorktrees, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(r) = self.rail_mut() {
+            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
+                if fb.worktree_mode.is_some() {
+                    fb.exit_worktree_mode();
+                } else {
+                    fb.enter_worktree_mode();
+                }
                 cx.notify();
             }
         }
@@ -9249,6 +9341,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::rail_parent))
             .on_action(cx.listener(Self::rail_toggle_hidden))
             .on_action(cx.listener(Self::rail_cycle_sort))
+            .on_action(cx.listener(Self::rail_worktrees))
             // Global actions forwarded so they keep working while the rail is
             // focused (same pattern as every other screen root).
             .on_action(cx.listener(Self::quit))
@@ -9277,62 +9370,133 @@ impl SketchGpuiView {
 
         match &rail.content {
             workspace::RailContent::FileBrowser(fb) => {
-                let dir_str = fb.current_dir().display().to_string();
-                let header = div()
-                    .px_2()
-                    .py_1()
-                    .flex_none()
-                    .text_color(accent_fg)
-                    .font_weight(FontWeight::BOLD)
-                    .overflow_hidden()
-                    .child(SharedString::from(format!("▸ {}", dir_str)));
+                if let Some(wm) = &fb.worktree_mode {
+                    // ── Worktree picker overlay ──────────────────────
+                    let header = div()
+                        .px_2()
+                        .py_1()
+                        .flex_none()
+                        .text_color(accent_fg)
+                        .font_weight(FontWeight::BOLD)
+                        .overflow_hidden()
+                        .child(SharedString::new_static("WORKTREES"));
 
-                let mut list = div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden();
+                    let mut list = div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden();
 
-                let entries = fb.visible_entries();
-                let selected = fb.selected();
-                if entries.is_empty() {
-                    list = list.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .text_color(muted_fg)
-                            .child(SharedString::new_static("  (empty)")),
-                    );
-                } else {
-                    let visible_rows = 40usize;
-                    let scroll = scroll_to_keep_visible(selected, visible_rows, entries.len());
-                    for (i, entry) in
-                        entries.iter().enumerate().skip(scroll).take(visible_rows)
-                    {
-                        let is_sel = i == selected;
-                        let suffix = if entry.is_dir { "/" } else { "" };
-                        let name = format!("{}{}", entry.name, suffix);
-                        let (rbg, rfg) = if is_sel {
-                            (selected_bg, selected_fg)
-                        } else if entry.is_dir {
-                            (rail_bg, accent_fg)
-                        } else {
-                            (rail_bg, label_fg)
-                        };
+                    if wm.worktrees.is_empty() {
                         list = list.child(
                             div()
-                                .w_full()
                                 .px_2()
-                                .py_0p5()
-                                .bg(rbg)
-                                .text_color(rfg)
-                                .overflow_hidden()
-                                .child(SharedString::from(name)),
+                                .py_1()
+                                .text_color(muted_fg)
+                                .child(SharedString::new_static("  (no worktrees)")),
                         );
+                    } else {
+                        let visible_rows = 40usize;
+                        let scroll = scroll_to_keep_visible(
+                            wm.selected,
+                            visible_rows,
+                            wm.worktrees.len(),
+                        );
+                        for (i, wt) in wm
+                            .worktrees
+                            .iter()
+                            .enumerate()
+                            .skip(scroll)
+                            .take(visible_rows)
+                        {
+                            let is_sel = i == wm.selected;
+                            let marker = if wt.is_current {
+                                "* "
+                            } else if is_sel {
+                                "▸ "
+                            } else {
+                                "  "
+                            };
+                            let label = format!("{}{}", marker, wt.label);
+                            let (rbg, rfg) = if is_sel {
+                                (selected_bg, selected_fg)
+                            } else {
+                                (rail_bg, accent_fg)
+                            };
+                            list = list.child(
+                                div()
+                                    .w_full()
+                                    .px_2()
+                                    .py_0p5()
+                                    .bg(rbg)
+                                    .text_color(rfg)
+                                    .overflow_hidden()
+                                    .child(SharedString::from(label)),
+                            );
+                        }
                     }
+                    col.child(header).child(list)
+                } else {
+                    // ── Normal file browser ──────────────────────────
+                    let dir_str = fb.current_dir().display().to_string();
+                    let header = div()
+                        .px_2()
+                        .py_1()
+                        .flex_none()
+                        .text_color(accent_fg)
+                        .font_weight(FontWeight::BOLD)
+                        .overflow_hidden()
+                        .child(SharedString::from(format!("▸ {}", dir_str)));
+
+                    let mut list = div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden();
+
+                    let entries = fb.visible_entries();
+                    let selected = fb.selected();
+                    if entries.is_empty() {
+                        list = list.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_color(muted_fg)
+                                .child(SharedString::new_static("  (empty)")),
+                        );
+                    } else {
+                        let visible_rows = 40usize;
+                        let scroll =
+                            scroll_to_keep_visible(selected, visible_rows, entries.len());
+                        for (i, entry) in
+                            entries.iter().enumerate().skip(scroll).take(visible_rows)
+                        {
+                            let is_sel = i == selected;
+                            let suffix = if entry.is_dir { "/" } else { "" };
+                            let name = format!("{}{}", entry.name, suffix);
+                            let (rbg, rfg) = if is_sel {
+                                (selected_bg, selected_fg)
+                            } else if entry.is_dir {
+                                (rail_bg, accent_fg)
+                            } else {
+                                (rail_bg, label_fg)
+                            };
+                            list = list.child(
+                                div()
+                                    .w_full()
+                                    .px_2()
+                                    .py_0p5()
+                                    .bg(rbg)
+                                    .text_color(rfg)
+                                    .overflow_hidden()
+                                    .child(SharedString::from(name)),
+                            );
+                        }
+                    }
+                    col.child(header).child(list)
                 }
-                col.child(header).child(list)
             }
             workspace::RailContent::Outline(o) => {
                 let header = div()
@@ -14795,68 +14959,122 @@ impl SketchGpuiView {
         b: &BrowserWindow,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let entries: Vec<&BrowserEntry> = b.fb.visible_entries();
-        let selected = b.fb.selected();
-        let dir_str = b.fb.current_dir().display().to_string();
-
         let ov = &self.theme.overlay;
 
-        // ---- Header (breadcrumb path) ----
-        let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .px_4()
-            .py_1()
-            .h(px(28.0))
-            .bg(nc(ov.bg))
-            .text_color(nc(ov.accent))
-            .font_weight(FontWeight::BOLD)
-            .child(format!("▸ {}", dir_str));
+        // ── Worktree-mode overlay ──────────────────────────────────
+        let (header, list, hint) = if let Some(wm) = &b.fb.worktree_mode {
+            let header = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_4()
+                .py_1()
+                .h(px(28.0))
+                .bg(nc(ov.bg))
+                .text_color(nc(ov.accent))
+                .font_weight(FontWeight::BOLD)
+                .child(SharedString::new_static("WORKTREES"));
 
-        // ---- Entry list ----
-        let mut list = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_hidden()
-            .text_size(px(13.0))
-            .font_family(self.body_font.clone());
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .text_size(px(13.0))
+                .font_family(self.body_font.clone());
 
-        if entries.is_empty() {
-            list = list.child(
-                div()
-                    .px_4()
-                    .py_2()
-                    .text_color(nc(ov.label))
-                    .child(SharedString::new_static("  (empty)")),
-            );
-        } else {
-            // Simple per-row layout: marker · name · size · mtime
-            // Keep the visible window around the selected row so j/k scroll.
-            let visible_rows = 28usize; // approx; height-dependent layout is overkill here
-            let scroll = scroll_to_keep_visible(selected, visible_rows, entries.len());
-            for (i, entry) in entries.iter().enumerate().skip(scroll).take(visible_rows) {
-                list = list.child(browser_row(entry, i == selected, &self.code_font, ov));
+            if wm.worktrees.is_empty() {
+                list = list.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_color(nc(ov.label))
+                        .child(SharedString::new_static("  (no worktrees)")),
+                );
+            } else {
+                let visible_rows = 28usize;
+                let scroll = scroll_to_keep_visible(wm.selected, visible_rows, wm.worktrees.len());
+                for (i, wt) in wm.worktrees.iter().enumerate().skip(scroll).take(visible_rows) {
+                    list = list.child(worktree_row(wt, i == wm.selected, ov));
+                }
             }
-        }
 
-        // ---- Hint bar ----
-        let hint = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .px_4()
-            .py_1()
-            .h(px(22.0))
-            .bg(nc(ov.bg))
-            .text_color(nc(ov.label))
-            .text_size(px(11.0))
-            .child(format!(
-                "enter:open · -:parent · .:hidden · s:sort({}) · q:close",
-                b.fb.sort_order.label()
-            ));
+            let hint = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_4()
+                .py_1()
+                .h(px(22.0))
+                .bg(nc(ov.bg))
+                .text_color(nc(ov.label))
+                .text_size(px(11.0))
+                .child(SharedString::new_static(
+                    "enter:switch · w:close · esc:cancel",
+                ));
+
+            (header, list, hint)
+        } else {
+            // ── Normal file-browser view ───────────────────────────────
+            let entries: Vec<&BrowserEntry> = b.fb.visible_entries();
+            let selected = b.fb.selected();
+            let dir_str = b.fb.current_dir().display().to_string();
+
+            let header = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_4()
+                .py_1()
+                .h(px(28.0))
+                .bg(nc(ov.bg))
+                .text_color(nc(ov.accent))
+                .font_weight(FontWeight::BOLD)
+                .child(format!("▸ {}", dir_str));
+
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .text_size(px(13.0))
+                .font_family(self.body_font.clone());
+
+            if entries.is_empty() {
+                list = list.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_color(nc(ov.label))
+                        .child(SharedString::new_static("  (empty)")),
+                );
+            } else {
+                let visible_rows = 28usize;
+                let scroll = scroll_to_keep_visible(selected, visible_rows, entries.len());
+                for (i, entry) in entries.iter().enumerate().skip(scroll).take(visible_rows) {
+                    list = list.child(browser_row(entry, i == selected, &self.code_font, ov));
+                }
+            }
+
+            let hint = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_4()
+                .py_1()
+                .h(px(22.0))
+                .bg(nc(ov.bg))
+                .text_color(nc(ov.label))
+                .text_size(px(11.0))
+                .child(format!(
+                    "enter:open · -:parent · .:hidden · s:sort({}) · w:worktrees · q:close",
+                    b.fb.sort_order.label()
+                ));
+
+            (header, list, hint)
+        };
 
         root.key_context("BrowserView")
             .on_action(cx.listener(Self::browser_down))
@@ -14867,6 +15085,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::browser_cycle_sort))
             .on_action(cx.listener(Self::open_menu))
             .on_action(cx.listener(Self::browser_close))
+            .on_action(cx.listener(Self::browser_worktrees))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::open_agent))
@@ -15003,6 +15222,47 @@ fn browser_row(entry: &BrowserEntry, selected: bool, code_font: &SharedString, o
                 .font_family(code_font.clone())
                 .text_size(px(11.0))
                 .child(SharedString::from(format!("{:>7}", mtime_str))),
+        )
+        .into_any_element()
+}
+
+/// One row in the worktree-picker list.
+fn worktree_row(wt: &worktree::Worktree, selected: bool, ov: &OverlayTheme) -> AnyElement {
+    let row_bg = if selected { nc(ov.selected_bg) } else { nc(ov.bg) };
+    let marker = if wt.is_current { "* " } else if selected { "▸ " } else { "  " };
+    let path_str = wt.path.display().to_string();
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .px_2()
+        .py_0p5()
+        .bg(row_bg)
+        .child(
+            div()
+                .w(px(20.0))
+                .flex_none()
+                .text_color(nc(ov.key))
+                .child(SharedString::from(marker)),
+        )
+        .child(
+            div()
+                .min_w(px(100.0))
+                .flex_none()
+                .text_color(nc(ov.accent))
+                .font_weight(FontWeight::BOLD)
+                .child(SharedString::from(wt.label.clone())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_color(nc(ov.label))
+                .text_size(px(11.0))
+                .child(SharedString::from(path_str)),
         )
         .into_any_element()
 }
@@ -15315,6 +15575,7 @@ fn main() {
             KeyBinding::new("space", OpenMenu, Some("BrowserView")),
             KeyBinding::new("q", BrowserClose, Some("BrowserView")),
             KeyBinding::new("escape", BrowserClose, Some("BrowserView")),
+            KeyBinding::new("w", BrowserWorktrees, Some("BrowserView")),
         ]);
 
         // Rail-view bindings (spec-rail.md §6). Active only while the rail
@@ -15331,6 +15592,7 @@ fn main() {
             KeyBinding::new("-", RailParent, Some("RailView")),
             KeyBinding::new(".", RailToggleHidden, Some("RailView")),
             KeyBinding::new("s", RailCycleSort, Some("RailView")),
+            KeyBinding::new("w", RailWorktrees, Some("RailView")),
         ]);
 
         // Quit when the last window closes. macOS apps typically stay

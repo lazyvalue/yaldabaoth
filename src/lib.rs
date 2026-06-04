@@ -22,6 +22,7 @@ pub mod theme;
 pub mod tree;
 pub mod view;
 pub mod viewport;
+pub mod worktree;
 
 /// Human-readable build identifier produced by build.rs:
 /// `"<crate-version> (<git-sha>[-dirty] <utc-timestamp>)"`.

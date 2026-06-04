@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::worktree;
+
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_SEARCH_DEPTH: usize = 8;
 
@@ -38,6 +40,33 @@ pub struct BrowserEntry {
     pub modified: Option<std::time::SystemTime>,
 }
 
+/// Transient state for the worktree-picker overlay inside the file browser.
+pub struct WorktreeMode {
+    pub worktrees: Vec<worktree::Worktree>,
+    pub selected: usize,
+}
+
+impl WorktreeMode {
+    pub fn move_down(&mut self) {
+        let len = self.worktrees.len();
+        if len > 0 {
+            self.selected = (self.selected + 1) % len;
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        let len = self.worktrees.len();
+        if len == 0 {
+            return;
+        }
+        if self.selected == 0 {
+            self.selected = len - 1;
+        } else {
+            self.selected -= 1;
+        }
+    }
+}
+
 pub struct FileBrowser {
     #[allow(dead_code)]
     root: PathBuf,
@@ -51,6 +80,9 @@ pub struct FileBrowser {
     pub filter_mode: bool,
     pub show_hidden: bool,
     pub sort_order: SortOrder,
+    /// When `Some`, the browser shows a worktree-picker overlay instead of
+    /// the normal directory listing.
+    pub worktree_mode: Option<WorktreeMode>,
 }
 
 impl FileBrowser {
@@ -66,6 +98,7 @@ impl FileBrowser {
             filter_mode: false,
             show_hidden: false,
             sort_order: SortOrder::Name,
+            worktree_mode: None,
         };
         browser.refresh();
         browser
@@ -296,6 +329,77 @@ impl FileBrowser {
                 .then_with(|| a.name.len().cmp(&b.name.len()))
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
+    }
+
+    // ── Worktree mode ────────────────────────────────────────────
+
+    /// Navigate the browser to an arbitrary directory.
+    pub fn navigate_to(&mut self, dir: PathBuf) {
+        self.current_dir = dir;
+        self.selected = 0;
+        self.clear_filter();
+        self.refresh();
+    }
+
+    /// Enter worktree selection mode.
+    pub fn enter_worktree_mode(&mut self) {
+        let mut wts = worktree::list_worktrees();
+        worktree::mark_current(&mut wts, &self.current_dir);
+        let selected = worktree::best_match_index(&wts, &self.current_dir);
+        self.worktree_mode = Some(WorktreeMode {
+            worktrees: wts,
+            selected,
+        });
+    }
+
+    /// Exit worktree mode without selecting.
+    pub fn exit_worktree_mode(&mut self) {
+        self.worktree_mode = None;
+    }
+
+    /// Select the current worktree and navigate to it. Returns true if a
+    /// worktree was selected (the browser's `current_dir` was changed).
+    pub fn select_worktree(&mut self) -> bool {
+        let wm = match self.worktree_mode.take() {
+            Some(wm) => wm,
+            None => return false,
+        };
+        let wt = match wm.worktrees.get(wm.selected) {
+            Some(wt) => wt,
+            None => return false,
+        };
+        let target_root = wt.path.clone();
+
+        // Try to preserve the relative subdirectory the user was browsing.
+        let relative_suffix = self.relative_suffix_in_current_worktree(&wm.worktrees);
+        let mut dest = target_root.clone();
+        if let Some(suffix) = relative_suffix {
+            let candidate = target_root.join(&suffix);
+            if candidate.is_dir() {
+                dest = candidate;
+            }
+        }
+        self.navigate_to(dest);
+        true
+    }
+
+    /// Find the relative path from the best-matching worktree root to
+    /// `current_dir`. Returns `None` if no worktree contains `current_dir`
+    /// or if `current_dir` is exactly at the worktree root.
+    fn relative_suffix_in_current_worktree(
+        &self,
+        worktrees: &[worktree::Worktree],
+    ) -> Option<PathBuf> {
+        let current_wt = worktrees
+            .iter()
+            .filter(|wt| self.current_dir.starts_with(&wt.path))
+            .max_by_key(|wt| wt.path.as_os_str().len())?;
+        let suffix = self.current_dir.strip_prefix(&current_wt.path).ok()?;
+        if suffix.as_os_str().is_empty() {
+            None
+        } else {
+            Some(suffix.to_path_buf())
+        }
     }
 
     fn search_recursive(
