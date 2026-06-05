@@ -16339,6 +16339,168 @@ fn fuzzy_match_gpui(text: &str, query: &str) -> bool {
 // Main
 // ----------------------------------------------------------------------------
 
+/// Register every GPUI key binding for the app. Extracted from `main()`'s
+/// run-closure so the headless verification harness can install the same
+/// bindings on a test window — a window with no keymap can't dispatch actions,
+/// so action-level smokes were impossible while this lived inline. The
+/// production path calls this once from the run-closure; tests call it via
+/// `cx.update(|cx| register_keymap(cx))`.
+fn register_keymap(app: &mut App) {
+    // Document-view bindings.
+    app.bind_keys([
+        KeyBinding::new("j", ScrollDown, Some("SketchView")),
+        KeyBinding::new("down", ScrollDown, Some("SketchView")),
+        KeyBinding::new("ctrl-n", ScrollDown, Some("SketchView")),
+        KeyBinding::new("k", ScrollUp, Some("SketchView")),
+        KeyBinding::new("up", ScrollUp, Some("SketchView")),
+        KeyBinding::new("ctrl-p", ScrollUp, Some("SketchView")),
+        KeyBinding::new("ctrl-d", ScrollPageDown, Some("SketchView")),
+        KeyBinding::new("pagedown", ScrollPageDown, Some("SketchView")),
+        KeyBinding::new("ctrl-u", ScrollPageUp, Some("SketchView")),
+        KeyBinding::new("pageup", ScrollPageUp, Some("SketchView")),
+        KeyBinding::new("l", CursorNextBlock, Some("SketchView")),
+        KeyBinding::new("right", CursorNextBlock, Some("SketchView")),
+        KeyBinding::new("h", CursorPrevBlock, Some("SketchView")),
+        KeyBinding::new("left", CursorPrevBlock, Some("SketchView")),
+        KeyBinding::new("g", CursorTop, Some("SketchView")),
+        KeyBinding::new("shift-g", CursorBottom, Some("SketchView")),
+        KeyBinding::new("ctrl-o", OpenBrowser, Some("SketchView")),
+        KeyBinding::new("ctrl-e", EnterEdit, Some("SketchView")),
+        // Ctrl-W is the split chord prefix (see global bindings below).
+        // Word-processor entry rebinds to Ctrl-Shift-E.
+        KeyBinding::new("ctrl-shift-e", EnterWp, Some("SketchView")),
+        KeyBinding::new("ctrl-k", OpenAgent, Some("SketchView")),
+        KeyBinding::new("space", OpenMenu, Some("SketchView")),
+        // Doc-view Esc and bare `q` used to dispatch `Quit` — that
+        // made it too easy to lose the app by mashing keys. Quit now
+        // lives only on Cmd-Q (the macOS-standard chord). Esc in the
+        // doc view is a no-op so users in normal-mode just stay where
+        // they are; the menu still dismisses on Esc via its own
+        // capture-phase handler.
+        KeyBinding::new("tab", NextBuffer, Some("SketchView")),
+        KeyBinding::new("shift-tab", PrevBuffer, Some("SketchView")),
+    ]);
+
+    // Global Cmd-shortcut bindings — work in every key context, so the
+    // macOS menu-bar items (and the user's muscle memory) reach the
+    // right action regardless of which screen is focused. `None`
+    // context = matches anywhere, identical to how Zed wires its
+    // application-wide commands.
+    app.bind_keys([
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-shift-ctrl-r", Restart, None),
+        KeyBinding::new("cmd-o", OpenBrowser, None),
+        KeyBinding::new("cmd-k", OpenAgent, None),
+        // Agent-window sidepane toggles (§32). Scoped to AgentView
+        // so Cmd-1/Cmd-2 don't shadow anything in other screens.
+        KeyBinding::new("cmd-1", ToggleTasklist, Some("AgentView")),
+        KeyBinding::new("cmd-2", ToggleSubagents, Some("AgentView")),
+        KeyBinding::new("ctrl-alt-enter", ToggleAgentInputMode, Some("AgentView")),
+        KeyBinding::new("cmd-.", StopAgent, Some("AgentView")),
+        // Workspace-level tab switching — app-global so the strip is
+        // reachable from every screen and overlay (per spec Interfaces
+        // table; bind also `Ctrl-Tab`/`Ctrl-Shift-Tab` for keyboard-only
+        // users without Cmd).
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+        KeyBinding::new("cmd-t", NewTab, None),
+        KeyBinding::new("cmd-shift-w", CloseTab, None),
+        // Vim-style split chord prefix (spec-tabs-and-splits.md §12–§14).
+        // GPUI parses "ctrl-w s" as a two-keystroke chord; pressing
+        // Ctrl-W alone never resolves (it's a pure prefix here).
+        KeyBinding::new("ctrl-w s", SplitH, None),
+        KeyBinding::new("ctrl-w v", SplitV, None),
+        KeyBinding::new("ctrl-w c", CloseWindow, None),
+        // Mac-standard close shortcut. Closes the focused pane; falls
+        // through to closing the tab if the pane was the only one in
+        // its tab (unless it's also the only tab — then no-op rather
+        // than quit, per the "no surprise quits" rule).
+        KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("ctrl-w o", OnlyWindow, None),
+        // Move / also-show the focused pane in another workspace
+        // (spec-workspaces-tagging.md Phase 1). `m` moves (pane leaves
+        // here), `M` (shift) also-shows a second view of a file pane.
+        KeyBinding::new("ctrl-w m", MovePane, None),
+        KeyBinding::new("ctrl-w shift-m", AlsoShowPane, None),
+        // Vim-style focus motion across split panes.
+        KeyBinding::new("ctrl-w h", FocusLeft, None),
+        KeyBinding::new("ctrl-w l", FocusRight, None),
+        KeyBinding::new("ctrl-w k", FocusUp, None),
+        KeyBinding::new("ctrl-w j", FocusDown, None),
+        KeyBinding::new("ctrl-w w", FocusNext, None),
+        KeyBinding::new("ctrl-w shift-w", FocusPrev, None),
+        // Resize the focused pane vs. its next sibling.
+        KeyBinding::new("ctrl-w <", ResizeShrink, None),
+        KeyBinding::new("ctrl-w -", ResizeShrink, None),
+        KeyBinding::new("ctrl-w >", ResizeGrow, None),
+        KeyBinding::new("ctrl-w +", ResizeGrow, None),
+        KeyBinding::new("ctrl-w =", Equalize, None),
+        // Document text zoom — same chord set every Mac app uses for
+        // browser/editor zoom (Cmd-=, Cmd-+, Cmd--, Cmd-0). Scales the
+        // doc/edit body + heading sizes; chrome stays fixed.
+        KeyBinding::new("cmd-=", ZoomIn, None),
+        KeyBinding::new("cmd-+", ZoomIn, None),
+        KeyBinding::new("cmd--", ZoomOut, None),
+        KeyBinding::new("cmd-0", ZoomReset, None),
+        // Copy the view-mode mouse selection. Scoped to SketchView so it
+        // doesn't shadow edit-mode yank or other surfaces' copy paths.
+        KeyBinding::new("cmd-c", CopyDocSelection, Some("SketchView")),
+        // Copy active selection to system clipboard (all screens).
+        KeyBinding::new("cmd-c", CopySelection, None),
+        // Paste from system clipboard into active editor.
+        KeyBinding::new("cmd-v", PasteFromClipboard, None),
+        // Rename the active tab. Global so it works from any screen
+        // (and the menu's "rename tab" entry uses the same path).
+        KeyBinding::new("cmd-shift-r", RenameTab, None),
+        // Rail toggles (spec-rail.md §1, §10). Global so they work from
+        // any screen and from inside the rail itself.
+        KeyBinding::new("cmd-b", ToggleFileBrowserRail, None),
+        KeyBinding::new("cmd-shift-o", ToggleOutlineRail, None),
+        KeyBinding::new("cmd-shift-b", FlipRailSide, None),
+    ]);
+
+    // Browser-view bindings.
+    app.bind_keys([
+        KeyBinding::new("j", BrowserDown, Some("BrowserView")),
+        KeyBinding::new("down", BrowserDown, Some("BrowserView")),
+        KeyBinding::new("ctrl-n", BrowserDown, Some("BrowserView")),
+        KeyBinding::new("k", BrowserUp, Some("BrowserView")),
+        KeyBinding::new("up", BrowserUp, Some("BrowserView")),
+        KeyBinding::new("ctrl-p", BrowserUp, Some("BrowserView")),
+        KeyBinding::new("enter", BrowserEnter, Some("BrowserView")),
+        KeyBinding::new("l", BrowserEnter, Some("BrowserView")),
+        KeyBinding::new("right", BrowserEnter, Some("BrowserView")),
+        KeyBinding::new("h", BrowserParent, Some("BrowserView")),
+        KeyBinding::new("left", BrowserParent, Some("BrowserView")),
+        KeyBinding::new("-", BrowserParent, Some("BrowserView")),
+        KeyBinding::new(".", BrowserToggleHidden, Some("BrowserView")),
+        KeyBinding::new("s", BrowserCycleSort, Some("BrowserView")),
+        KeyBinding::new("space", OpenMenu, Some("BrowserView")),
+        KeyBinding::new("q", BrowserClose, Some("BrowserView")),
+        KeyBinding::new("escape", BrowserClose, Some("BrowserView")),
+        KeyBinding::new("w", BrowserWorktrees, Some("BrowserView")),
+        KeyBinding::new("/", BrowserFilter, Some("BrowserView")),
+    ]);
+
+    // Rail-view bindings (spec-rail.md §6). Active only while the rail
+    // holds focus (its root attaches `track_focus` inside this context).
+    app.bind_keys([
+        KeyBinding::new("j", RailDown, Some("RailView")),
+        KeyBinding::new("down", RailDown, Some("RailView")),
+        KeyBinding::new("ctrl-n", RailDown, Some("RailView")),
+        KeyBinding::new("k", RailUp, Some("RailView")),
+        KeyBinding::new("up", RailUp, Some("RailView")),
+        KeyBinding::new("ctrl-p", RailUp, Some("RailView")),
+        KeyBinding::new("enter", RailSelect, Some("RailView")),
+        KeyBinding::new("escape", RailClose, Some("RailView")),
+        KeyBinding::new("-", RailParent, Some("RailView")),
+        KeyBinding::new(".", RailToggleHidden, Some("RailView")),
+        KeyBinding::new("s", RailCycleSort, Some("RailView")),
+        KeyBinding::new("w", RailWorktrees, Some("RailView")),
+        KeyBinding::new("/", RailFilter, Some("RailView")),
+    ]);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let config = sketch::config::Config::load().unwrap_or_default();
@@ -16382,159 +16544,7 @@ fn main() {
     };
 
     Application::new().run(move |app: &mut App| {
-        // Document-view bindings.
-        app.bind_keys([
-            KeyBinding::new("j", ScrollDown, Some("SketchView")),
-            KeyBinding::new("down", ScrollDown, Some("SketchView")),
-            KeyBinding::new("ctrl-n", ScrollDown, Some("SketchView")),
-            KeyBinding::new("k", ScrollUp, Some("SketchView")),
-            KeyBinding::new("up", ScrollUp, Some("SketchView")),
-            KeyBinding::new("ctrl-p", ScrollUp, Some("SketchView")),
-            KeyBinding::new("ctrl-d", ScrollPageDown, Some("SketchView")),
-            KeyBinding::new("pagedown", ScrollPageDown, Some("SketchView")),
-            KeyBinding::new("ctrl-u", ScrollPageUp, Some("SketchView")),
-            KeyBinding::new("pageup", ScrollPageUp, Some("SketchView")),
-            KeyBinding::new("l", CursorNextBlock, Some("SketchView")),
-            KeyBinding::new("right", CursorNextBlock, Some("SketchView")),
-            KeyBinding::new("h", CursorPrevBlock, Some("SketchView")),
-            KeyBinding::new("left", CursorPrevBlock, Some("SketchView")),
-            KeyBinding::new("g", CursorTop, Some("SketchView")),
-            KeyBinding::new("shift-g", CursorBottom, Some("SketchView")),
-            KeyBinding::new("ctrl-o", OpenBrowser, Some("SketchView")),
-            KeyBinding::new("ctrl-e", EnterEdit, Some("SketchView")),
-            // Ctrl-W is the split chord prefix (see global bindings below).
-            // Word-processor entry rebinds to Ctrl-Shift-E.
-            KeyBinding::new("ctrl-shift-e", EnterWp, Some("SketchView")),
-            KeyBinding::new("ctrl-k", OpenAgent, Some("SketchView")),
-            KeyBinding::new("space", OpenMenu, Some("SketchView")),
-            // Doc-view Esc and bare `q` used to dispatch `Quit` — that
-            // made it too easy to lose the app by mashing keys. Quit now
-            // lives only on Cmd-Q (the macOS-standard chord). Esc in the
-            // doc view is a no-op so users in normal-mode just stay where
-            // they are; the menu still dismisses on Esc via its own
-            // capture-phase handler.
-            KeyBinding::new("tab", NextBuffer, Some("SketchView")),
-            KeyBinding::new("shift-tab", PrevBuffer, Some("SketchView")),
-        ]);
-
-        // Global Cmd-shortcut bindings — work in every key context, so the
-        // macOS menu-bar items (and the user's muscle memory) reach the
-        // right action regardless of which screen is focused. `None`
-        // context = matches anywhere, identical to how Zed wires its
-        // application-wide commands.
-        app.bind_keys([
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("cmd-shift-ctrl-r", Restart, None),
-            KeyBinding::new("cmd-o", OpenBrowser, None),
-            KeyBinding::new("cmd-k", OpenAgent, None),
-            // Agent-window sidepane toggles (§32). Scoped to AgentView
-            // so Cmd-1/Cmd-2 don't shadow anything in other screens.
-            KeyBinding::new("cmd-1", ToggleTasklist, Some("AgentView")),
-            KeyBinding::new("cmd-2", ToggleSubagents, Some("AgentView")),
-            KeyBinding::new("ctrl-alt-enter", ToggleAgentInputMode, Some("AgentView")),
-            KeyBinding::new("cmd-.", StopAgent, Some("AgentView")),
-            // Workspace-level tab switching — app-global so the strip is
-            // reachable from every screen and overlay (per spec Interfaces
-            // table; bind also `Ctrl-Tab`/`Ctrl-Shift-Tab` for keyboard-only
-            // users without Cmd).
-            KeyBinding::new("ctrl-tab", NextTab, None),
-            KeyBinding::new("ctrl-shift-tab", PrevTab, None),
-            KeyBinding::new("cmd-t", NewTab, None),
-            KeyBinding::new("cmd-shift-w", CloseTab, None),
-            // Vim-style split chord prefix (spec-tabs-and-splits.md §12–§14).
-            // GPUI parses "ctrl-w s" as a two-keystroke chord; pressing
-            // Ctrl-W alone never resolves (it's a pure prefix here).
-            KeyBinding::new("ctrl-w s", SplitH, None),
-            KeyBinding::new("ctrl-w v", SplitV, None),
-            KeyBinding::new("ctrl-w c", CloseWindow, None),
-            // Mac-standard close shortcut. Closes the focused pane; falls
-            // through to closing the tab if the pane was the only one in
-            // its tab (unless it's also the only tab — then no-op rather
-            // than quit, per the "no surprise quits" rule).
-            KeyBinding::new("cmd-w", CloseWindow, None),
-            KeyBinding::new("ctrl-w o", OnlyWindow, None),
-            // Move / also-show the focused pane in another workspace
-            // (spec-workspaces-tagging.md Phase 1). `m` moves (pane leaves
-            // here), `M` (shift) also-shows a second view of a file pane.
-            KeyBinding::new("ctrl-w m", MovePane, None),
-            KeyBinding::new("ctrl-w shift-m", AlsoShowPane, None),
-            // Vim-style focus motion across split panes.
-            KeyBinding::new("ctrl-w h", FocusLeft, None),
-            KeyBinding::new("ctrl-w l", FocusRight, None),
-            KeyBinding::new("ctrl-w k", FocusUp, None),
-            KeyBinding::new("ctrl-w j", FocusDown, None),
-            KeyBinding::new("ctrl-w w", FocusNext, None),
-            KeyBinding::new("ctrl-w shift-w", FocusPrev, None),
-            // Resize the focused pane vs. its next sibling.
-            KeyBinding::new("ctrl-w <", ResizeShrink, None),
-            KeyBinding::new("ctrl-w -", ResizeShrink, None),
-            KeyBinding::new("ctrl-w >", ResizeGrow, None),
-            KeyBinding::new("ctrl-w +", ResizeGrow, None),
-            KeyBinding::new("ctrl-w =", Equalize, None),
-            // Document text zoom — same chord set every Mac app uses for
-            // browser/editor zoom (Cmd-=, Cmd-+, Cmd--, Cmd-0). Scales the
-            // doc/edit body + heading sizes; chrome stays fixed.
-            KeyBinding::new("cmd-=", ZoomIn, None),
-            KeyBinding::new("cmd-+", ZoomIn, None),
-            KeyBinding::new("cmd--", ZoomOut, None),
-            KeyBinding::new("cmd-0", ZoomReset, None),
-            // Copy the view-mode mouse selection. Scoped to SketchView so it
-            // doesn't shadow edit-mode yank or other surfaces' copy paths.
-            KeyBinding::new("cmd-c", CopyDocSelection, Some("SketchView")),
-            // Copy active selection to system clipboard (all screens).
-            KeyBinding::new("cmd-c", CopySelection, None),
-            // Paste from system clipboard into active editor.
-            KeyBinding::new("cmd-v", PasteFromClipboard, None),
-            // Rename the active tab. Global so it works from any screen
-            // (and the menu's "rename tab" entry uses the same path).
-            KeyBinding::new("cmd-shift-r", RenameTab, None),
-            // Rail toggles (spec-rail.md §1, §10). Global so they work from
-            // any screen and from inside the rail itself.
-            KeyBinding::new("cmd-b", ToggleFileBrowserRail, None),
-            KeyBinding::new("cmd-shift-o", ToggleOutlineRail, None),
-            KeyBinding::new("cmd-shift-b", FlipRailSide, None),
-        ]);
-
-        // Browser-view bindings.
-        app.bind_keys([
-            KeyBinding::new("j", BrowserDown, Some("BrowserView")),
-            KeyBinding::new("down", BrowserDown, Some("BrowserView")),
-            KeyBinding::new("ctrl-n", BrowserDown, Some("BrowserView")),
-            KeyBinding::new("k", BrowserUp, Some("BrowserView")),
-            KeyBinding::new("up", BrowserUp, Some("BrowserView")),
-            KeyBinding::new("ctrl-p", BrowserUp, Some("BrowserView")),
-            KeyBinding::new("enter", BrowserEnter, Some("BrowserView")),
-            KeyBinding::new("l", BrowserEnter, Some("BrowserView")),
-            KeyBinding::new("right", BrowserEnter, Some("BrowserView")),
-            KeyBinding::new("h", BrowserParent, Some("BrowserView")),
-            KeyBinding::new("left", BrowserParent, Some("BrowserView")),
-            KeyBinding::new("-", BrowserParent, Some("BrowserView")),
-            KeyBinding::new(".", BrowserToggleHidden, Some("BrowserView")),
-            KeyBinding::new("s", BrowserCycleSort, Some("BrowserView")),
-            KeyBinding::new("space", OpenMenu, Some("BrowserView")),
-            KeyBinding::new("q", BrowserClose, Some("BrowserView")),
-            KeyBinding::new("escape", BrowserClose, Some("BrowserView")),
-            KeyBinding::new("w", BrowserWorktrees, Some("BrowserView")),
-            KeyBinding::new("/", BrowserFilter, Some("BrowserView")),
-        ]);
-
-        // Rail-view bindings (spec-rail.md §6). Active only while the rail
-        // holds focus (its root attaches `track_focus` inside this context).
-        app.bind_keys([
-            KeyBinding::new("j", RailDown, Some("RailView")),
-            KeyBinding::new("down", RailDown, Some("RailView")),
-            KeyBinding::new("ctrl-n", RailDown, Some("RailView")),
-            KeyBinding::new("k", RailUp, Some("RailView")),
-            KeyBinding::new("up", RailUp, Some("RailView")),
-            KeyBinding::new("ctrl-p", RailUp, Some("RailView")),
-            KeyBinding::new("enter", RailSelect, Some("RailView")),
-            KeyBinding::new("escape", RailClose, Some("RailView")),
-            KeyBinding::new("-", RailParent, Some("RailView")),
-            KeyBinding::new(".", RailToggleHidden, Some("RailView")),
-            KeyBinding::new("s", RailCycleSort, Some("RailView")),
-            KeyBinding::new("w", RailWorktrees, Some("RailView")),
-            KeyBinding::new("/", RailFilter, Some("RailView")),
-        ]);
+        register_keymap(app);
 
         // Quit when the last window closes. macOS apps typically stay
         // alive in the menu bar after every window is dismissed, but

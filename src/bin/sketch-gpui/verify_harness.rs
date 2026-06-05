@@ -502,9 +502,73 @@ fn agent_seam_routes_reply_only_after_session_is_bound(cx: &mut TestAppContext) 
     );
 }
 
-// NEXT STONE (not yet built): action-level smokes (e.g. simulate "cmd-b",
-// assert the rail opens beside the focused pane). Blocked on a small
-// enablement refactor — the keymap is currently registered inline in `main()`'s
-// run-closure (`app.bind_keys([...])`), so a test window has no bindings. Extract
-// a `register_keymap(app: &mut App)` callable from both `main()` and the harness,
-// then `vcx.simulate_keystrokes("cmd-b")` will dispatch through real actions.
+// ---- Action-level smoke (the keymap-extraction payoff) -------------------
+//
+// First end-to-end keystroke→action→state test. It exercises the FULL GPUI
+// dispatch path — real keymap, real action, real handler — that was untestable
+// while the keymap lived inline in `main()`'s run-closure. The rail is the
+// deliberate target: a repeatedly-regressed surface, and a global (`None`-
+// context) binding, so this also proves global Cmd-shortcuts reach a focused
+// screen's `on_action` wiring headlessly.
+
+/// `cmd-b` (`ToggleFileBrowserRail`, a global binding) opens a file-browser
+/// rail on the active tab, and a second `cmd-b` closes it. This only works if
+/// `register_keymap` installed the binding AND the focused screen's root wired
+/// `on_action(toggle_file_browser_rail)` — i.e. the whole dispatch chain.
+#[gpui::test]
+fn cmd_b_toggles_file_browser_rail(cx: &mut TestAppContext) {
+    // Install the production keymap on the test app — the extraction this stone
+    // depended on. Without it, `simulate_keystrokes` would no-op.
+    cx.update(|cx| crate::register_keymap(cx));
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+
+    // Read the rail kind on the active tab: None = no rail, Some(true) = a
+    // file-browser rail, Some(false) = some other rail kind.
+    let rail_kind = |view: &gpui::Entity<SketchGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, _cx| {
+            v.workspace
+                .active_tab()
+                .and_then(|t| t.rail.as_ref())
+                .map(|r| r.content.is_file_browser())
+        })
+    };
+
+    // Precondition: a fresh browser view has no rail open.
+    assert_eq!(rail_kind(&view, vcx), None, "fresh view should have no rail");
+
+    // Dismiss the splash overlay so input dispatches against the real screen
+    // (the production app auto-clears it after 1.5s; do it directly here).
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    // Act: press Cmd-B.
+    vcx.simulate_keystrokes("cmd-b");
+    vcx.run_until_parked();
+    assert_eq!(
+        rail_kind(&view, vcx),
+        Some(true),
+        "cmd-b must open a file-browser rail beside the focused pane"
+    );
+
+    // Act again: a second Cmd-B closes the same rail (two-state toggle).
+    vcx.simulate_keystrokes("cmd-b");
+    vcx.run_until_parked();
+    assert_eq!(
+        rail_kind(&view, vcx),
+        None,
+        "a second cmd-b must close the file-browser rail"
+    );
+}
