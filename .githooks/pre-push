@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Pre-push gate: a push is blocked unless the repo builds and tests pass.
+#
+# Enable once per clone (hooks aren't version-controlled by default):
+#     git config core.hooksPath .githooks
+#
+# Pre-PUSH (not pre-commit) on purpose: a Rust build is too slow to run on every
+# commit, but it must run before anything leaves your machine. Bypass a single
+# push with `git push --no-verify` when you know what you're doing.
+set -euo pipefail
+exec "$(git rev-parse --show-toplevel)/scripts/ci.sh"

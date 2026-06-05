@@ -22,10 +22,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2 # caches ~/.cargo + target/, keeps runs fast
-      - name: Build both binaries
-        run: cargo build --bins
-      - name: Test
-        run: cargo test
+      - name: CI gate (build + test)
+        run: bash scripts/ci.sh # same gate as the local .githooks/pre-push hook
 
   # ── Next tightening (uncomment once the 8 existing warnings are cleared and
   # the tree is `cargo fmt`-clean, so the gate stays green) ───────────────────
