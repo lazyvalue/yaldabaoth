@@ -1,4 +1,5 @@
 pub mod acp_channel;
+pub mod agent_transcript;
 pub mod blocks;
 pub mod buffer;
 pub mod claude_channel;

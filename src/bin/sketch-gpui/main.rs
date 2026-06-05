@@ -1859,6 +1859,73 @@ fn process_cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
 }
 
+/// Canonicalize a path for resume-matching, falling back to the path verbatim
+/// when it can't be resolved (e.g. it no longer exists). Both the stored
+/// session cwd and the current cwd go through this before comparison, so a
+/// symlinked / non-normalized launch directory still matches its saved session
+/// instead of silently falling into the "create a fresh session" branch (which
+/// is what made a resumed session look like it was "replaced" by a new one).
+/// Comparing raw-vs-raw on a canonicalize failure preserves the old exact-match
+/// behavior with no regression.
+fn cwd_match_key(p: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Attach to a server session, retrying an Owner attach briefly when the
+/// server still reports a previous owner.
+///
+/// The session server is persistent and outlives the GUI, so on app reboot the
+/// pre-reboot connection's `detach` — which releases ownership when its socket
+/// closes — can be processed by the server *after* the freshly-launched process
+/// issues its attach. A one-shot Owner attach then loses that race and returns
+/// "another GUI already owns this session"; the old code swallowed the error
+/// and bound the slot anyway, leaving a session that received no events and
+/// whose prompts the server silently rejected (`prompt` is fire-and-forget, so
+/// the rejection never surfaced) — the "resume never responds" bug.
+///
+/// Retrying for a bounded window lets the stale owner clear. If the window
+/// expires still-owned (a genuinely live peer, or a wedged connection), fall
+/// back to an Observer attach so the replay/live stream is at least received,
+/// and report `Ok(false)` so the caller can surface "not the owner". Errors
+/// other than ownership contention are returned immediately.
+///
+/// Runs on the background executor (never the paint thread), so the bounded
+/// `sleep` between tries is safe.
+fn attach_with_owner_retry(
+    handle: &sketch::session_client::SessionServerHandle,
+    sid: &str,
+    want_owner: bool,
+) -> Result<bool, String> {
+    if !want_owner {
+        return handle
+            .attach(sid, AttachMode::Observer)
+            .map(|_| false)
+            .map_err(|e| e.to_string());
+    }
+    let mut last_err = String::new();
+    // ~2.4s total (8 × 300ms) — comfortably longer than the socket-close →
+    // detach window on a clean reboot, short enough not to stall the open.
+    for _ in 0..8 {
+        match handle.attach(sid, AttachMode::Owner) {
+            Ok(()) => return Ok(true),
+            Err(e) => {
+                last_err = e.to_string();
+                // Only ownership contention is transient; anything else is fatal.
+                if !last_err.contains("already own") {
+                    return Err(last_err);
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }
+    }
+    // Still owned after the window: subscribe as an observer so the transcript
+    // still replays, and tell the caller we are not the owner.
+    match handle.attach(sid, AttachMode::Observer) {
+        Ok(()) => Ok(false),
+        Err(e) => Err(format!("{last_err}; observer fallback failed: {e}")),
+    }
+}
+
 /// Whether this process was launched as a build-loop candidate.
 fn is_candidate_launch() -> bool {
     std::env::var("SKETCH_CANDIDATE").as_deref() == Ok("1")
@@ -3188,31 +3255,6 @@ fn truncate_lines(body: &str, max_lines: usize) -> String {
 /// the document, per spec-agent-window.md §E1. The renderer resolves it to
 /// a line index via `editor.line_for_anchor(a)`; a `None` (line consumed)
 /// falls back to EOF rendering.
-/// Perf (finding 4): O(k) equivalent of `doc.full_text().trim_end().ends_with(s)`
-/// where k = chars scanned. Walks back over the rope's trailing whitespace, then
-/// compares only the last `s.chars().count()` chars — never materializing the
-/// whole transcript as a String.
-fn document_trimmed_end_ends_with(doc: &Document, s: &str) -> bool {
-    let want = s.chars().count();
-    if want == 0 {
-        return true;
-    }
-    let rope = doc.rope();
-    let total = rope.len_chars();
-    // Find the index one past the last non-whitespace char (the trim_end point).
-    let mut end = total;
-    while end > 0 {
-        match rope.get_char(end - 1) {
-            Some(c) if c.is_whitespace() => end -= 1,
-            _ => break,
-        }
-    }
-    if want > end {
-        return false;
-    }
-    let tail = rope.slice((end - want)..end);
-    tail.chars().eq(s.chars())
-}
 
 fn anchor_for_new_tool_call(editor: &mut Editor) -> LineAnchor {
     // Perf (finding 5): O(1) tail probe instead of cloning the whole transcript
@@ -5010,6 +5052,19 @@ struct AgentState {
     /// Checked by the status strip and anywhere that needs to distinguish
     /// the two paths from within `AgentState` alone.
     server_managed: bool,
+    /// Order-independent reconciler for user-turn insertions — the single
+    /// authority that de-dupes the three sites a user turn can be announced
+    /// from (optimistic submit, server `UserPrompt`, agent `UserMessage`).
+    /// Replaces the position-dependent `document_trimmed_end_ends_with`
+    /// heuristic that double-rendered input whenever content streamed in
+    /// between the optimistic echo and its stream copy. See `agent_transcript`.
+    reconciler: sketch::agent_transcript::UserTurnReconciler,
+    /// User-turn `k`s inserted since the last `reset_for_replay` generation.
+    /// The M3 runtime tripwire asserts a `k` is never inserted twice — a
+    /// double-render reuses a `k`, so this turns a silent visual regression
+    /// into a loud, located failure. Scoped per generation (cleared on
+    /// transcript wipe) so a reconnect's `k`-restart is not a false positive.
+    user_turn_ks: std::collections::HashSet<usize>,
     /// Background polling task that drains the ACP channel into the editor
     /// every ~50ms. Held only so that dropping `AgentState` (e.g. on
     /// `back_to_doc`) cancels the task. The leading `_` mutes unused-field
@@ -5138,6 +5193,8 @@ impl AgentState {
             tasklist_open: false,
             subagents_open: false,
             server_managed: true,
+            reconciler: sketch::agent_transcript::UserTurnReconciler::new(),
+            user_turn_ks: std::collections::HashSet::new(),
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         }
@@ -5189,6 +5246,8 @@ impl AgentState {
             tasklist_open: false,
             subagents_open: false,
             server_managed: true,
+            reconciler: sketch::agent_transcript::UserTurnReconciler::new(),
+            user_turn_ks: std::collections::HashSet::new(),
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         };
@@ -5222,6 +5281,59 @@ impl AgentState {
         let k = rt.advance_user_boundary();
         self.replay_turn = rt.replay_turn;
         k
+    }
+
+    /// THE single chokepoint for inserting a user turn into the transcript.
+    /// All three announcement sites — the optimistic submit, the server
+    /// `UserPrompt` notification, and the agent's `UserMessage` echo — route
+    /// through here so de-duplication and turn-number attribution have exactly
+    /// one home instead of three drifting copies (the structural cause of the
+    /// double-render regressions). The pure [`UserTurnReconciler`] decides
+    /// insert-vs-skip by origin + content identity (order-independent),
+    /// replacing the position-dependent suffix heuristic.
+    ///
+    /// `advance_boundary` must be `true` only for the direct-channel replay
+    /// path (`!server_managed`), where there is no replayed `TurnEnded` to bump
+    /// the live counter and the [`ReplayTurns`] cursor must be stepped per user
+    /// boundary. It is `false` for every live insertion and for the
+    /// server-managed path (whose boundaries arrive as replayed `TurnEnded`),
+    /// so a live or server turn can never wrongly drive the machine into replay
+    /// mode. A *skipped* echo never advances the boundary — suppression and
+    /// attribution stay decoupled.
+    fn insert_user_turn(
+        &mut self,
+        text: &str,
+        origin: sketch::agent_transcript::UserTurnOrigin,
+        advance_boundary: bool,
+    ) {
+        use sketch::agent_transcript::UserTurnAction;
+        match self.reconciler.reconcile(origin, text, advance_boundary) {
+            UserTurnAction::Skip => {}
+            UserTurnAction::Insert { advance_boundary } => {
+                let k = if advance_boundary {
+                    self.advance_replay_user_boundary()
+                } else {
+                    self.current_turn()
+                };
+                // M3 runtime tripwire: a `k` inserted twice within one
+                // generation means the dedup failed and we are about to
+                // double-render. Panic in dev (located at the exact mutation);
+                // log + drop the duplicate in release rather than ship a double.
+                if !self.user_turn_ks.insert(k) {
+                    debug_assert!(
+                        false,
+                        "double user turn: TurnId::User({k}) inserted twice \
+                         (text={text:?}) — reconciler dedup regression"
+                    );
+                    eprintln!(
+                        "[sketch-gpui] INVARIANT: TurnId::User({k}) already present; \
+                         dropping duplicate user turn (text={text:?})"
+                    );
+                    return;
+                }
+                self.editor.freeze_as_user_turn(text, TurnId::User(k));
+            }
+        }
     }
 
     /// Auto-scroll follow decision (F4, INV-13). In Chatbox mode the user's
@@ -5305,6 +5417,13 @@ impl AgentState {
         self.turn_phase = TurnPhase::Idle;
         self.last_seen_turns = 0;
         self.replay_turn = 0;
+        // The transcript is being rebuilt from the authoritative event_log:
+        // nothing is "pending local" any more, and this starts a fresh
+        // tripwire generation (the replay re-numbers `k` from 1). This clear
+        // MUST happen-before any replayed echo is processed — guaranteed since
+        // reset runs inside the reconnect update before re-attach.
+        self.reconciler.reset();
+        self.user_turn_ks.clear();
         self.tool_calls.clear();
         self.tool_call_order.clear();
         self.tool_call_anchor_line.clear();
@@ -10651,11 +10770,11 @@ impl SketchGpuiView {
         let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
             return;
         };
-        let is_candidate = self.is_candidate;
         // Snapshot the server sids already open in any panel so the background
         // thread can dedup without touching `self`. Taken now, while we're
         // still on the (single-threaded) UI thread, so it can't race a
-        // concurrent ring mutation.
+        // concurrent ring mutation. (Attach — and thus the Owner/Observer mode
+        // choice — is deferred to `spawn_attach_sessions` after the bind.)
         let mut open_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for tab in self.workspace.tabs.iter() {
             tab.layout.for_each_leaf(&mut |w| {
@@ -10668,11 +10787,6 @@ impl SketchGpuiView {
                 }
             });
         }
-        let attach_mode = if is_candidate {
-            AttachMode::Observer
-        } else {
-            AttachMode::Owner
-        };
 
         cx.spawn(async move |this, cx| {
             let cwd = proc_cwd.clone();
@@ -10685,53 +10799,41 @@ impl SketchGpuiView {
                         Ok(v) => v,
                         Err(e) => return OpenResolution::Failed(format!("list failed: {e}")),
                     };
+                    let cwd_key = cwd_match_key(&cwd);
                     let matching: Vec<SessionInfo> = existing
                         .into_iter()
-                        .filter(|s| s.cwd == cwd)
+                        .filter(|s| cwd_match_key(&s.cwd) == cwd_key)
                         .filter(|s| !open_sids.contains(&s.session_id))
                         .collect();
 
                     if matching.is_empty() {
                         // 2a. None — create a fresh session. The server
                         //     registers it and returns the sid immediately
-                        //     (ACP subprocess spawns server-side); attach so
-                        //     the pump receives its events.
+                        //     (ACP subprocess spawns server-side). NOTE: we do
+                        //     NOT attach here. Attaching starts the server's
+                        //     event replay, and the slot's `server_session_id`
+                        //     isn't bound until `apply_open_agent_resolution`
+                        //     runs on the foreground — attaching first races
+                        //     that bind and the pump drops the replay (the
+                        //     "resumed session is wonky/empty" bug). Attach is
+                        //     deferred to after the bind; see `spawn_attach_sessions`.
                         match handle.create_session(cwd, "claude-1".to_string(), None) {
-                            Ok(info) => {
-                                if let Err(e) = handle.attach(&info.session_id, AttachMode::Owner)
-                                {
-                                    eprintln!(
-                                        "[sketch-gpui] attach after create failed: {e}"
-                                    );
-                                }
-                                OpenResolution::Created {
-                                    sid: info.session_id,
-                                    acp_id: info.acp_session_id,
-                                }
-                            }
+                            Ok(info) => OpenResolution::Created {
+                                sid: info.session_id,
+                                acp_id: info.acp_session_id,
+                            },
                             Err(e) => OpenResolution::Failed(format!("create failed: {e}")),
                         }
                     } else {
-                        // 2b. Re-attach to each. The server replays the full
-                        //     event_log before the Ack, so the pump rebuilds
-                        //     the transcript on its first drain.
-                        let mut attached = Vec::with_capacity(matching.len());
-                        for (i, info) in matching.iter().enumerate() {
-                            if let Err(e) = handle.attach(&info.session_id, attach_mode) {
-                                eprintln!(
-                                    "[sketch-gpui] re-attach failed for {}: {e}",
-                                    &info.session_id[..info.session_id.len().min(8)],
-                                );
-                            }
-                            let status = if info.connected {
-                                format!(
-                                    "reconnected: {}",
-                                    info.acp_session_id.as_deref().unwrap_or("active")
-                                )
-                            } else {
-                                "reconnected (agent spawning…)".to_string()
-                            };
-                            attached.push(AttachedSlot {
+                        // 2b. Resume each matching session — bind first, attach
+                        //     later. Same rationale as 2a: deferring the attach
+                        //     until the slot is bound closes the replay-drop
+                        //     race. Owner reclaim + status come from the
+                        //     deferred `spawn_attach_sessions`.
+                        let attached: Vec<AttachedSlot> = matching
+                            .iter()
+                            .enumerate()
+                            .map(|(i, info)| AttachedSlot {
                                 label: if matching.len() == 1 {
                                     "claude-1".to_string()
                                 } else {
@@ -10739,9 +10841,13 @@ impl SketchGpuiView {
                                 },
                                 sid: info.session_id.clone(),
                                 acp_id: info.acp_session_id.clone(),
-                                status,
-                            });
-                        }
+                                status: if info.connected {
+                                    "reconnecting…".to_string()
+                                } else {
+                                    "reconnecting (agent spawning…)".to_string()
+                                },
+                            })
+                            .collect();
                         OpenResolution::Attached(attached)
                     }
                 })
@@ -10770,6 +10876,12 @@ impl SketchGpuiView {
         // collides at 0 across rings — the cause of `pump: no slot for server
         // session`). If the placeholder is gone (screen closed before the
         // round-trip returned), this is a harmless no-op.
+        // Sids whose slot we actually bound in this pass. Collected inside the
+        // ring closure (which only runs if the placeholder still exists) so we
+        // attach EXACTLY the sessions now routable — attaching a sid whose slot
+        // is gone would resurrect the replay-drop race we are fixing.
+        let bound_sids: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let bound_sids_c = bound_sids.clone();
         self.with_open_token_ring(open_token, move |ring| {
             let Some(pos) = ring
                 .slots
@@ -10791,10 +10903,11 @@ impl SketchGpuiView {
                 }
                 OpenResolution::Created { sid, acp_id } => {
                     let slot = &mut ring.slots[pos];
-                    slot.server_session_id = Some(sid);
+                    slot.server_session_id = Some(sid.clone());
                     slot.resume_id = acp_id;
                     slot.state.status =
                         Some("attaching to ACP agent via session server…".into());
+                    bound_sids_c.borrow_mut().push(sid);
                 }
                 OpenResolution::Attached(attached) => {
                     let mut iter = attached.into_iter();
@@ -10802,14 +10915,16 @@ impl SketchGpuiView {
                     if let Some(first) = iter.next() {
                         let slot = &mut ring.slots[pos];
                         slot.label = first.label;
-                        slot.server_session_id = Some(first.sid);
+                        slot.server_session_id = Some(first.sid.clone());
                         slot.resume_id = first.acp_id;
                         slot.state.status = Some(first.status.into());
+                        bound_sids_c.borrow_mut().push(first.sid);
                     }
                     // Remaining sessions get their own slots in the same ring.
                     for a in iter {
                         let state = AgentState::new_server_managed(Some(a.status.into()));
-                        ring.push(a.label, state, a.acp_id, proc_cwd.clone(), Some(a.sid));
+                        ring.push(a.label, state, a.acp_id, proc_cwd.clone(), Some(a.sid.clone()));
+                        bound_sids_c.borrow_mut().push(a.sid);
                     }
                     // Land the user on the placeholder slot, not the last push.
                     ring.active = pos;
@@ -10818,6 +10933,71 @@ impl SketchGpuiView {
         });
         self.save_agent_ring();
         cx.notify();
+
+        // Now that the slots carry their `server_session_id`, attach (which
+        // starts the server's event replay). Routing can no longer drop the
+        // replay because every target is already bound. Deferred off the paint
+        // thread; surfaces ownership/attach failures into the slot status.
+        let targets = std::rc::Rc::try_unwrap(bound_sids)
+            .map(|c| c.into_inner())
+            .unwrap_or_default();
+        if !targets.is_empty() {
+            self.spawn_attach_sessions(targets, cx);
+        }
+    }
+
+    /// Attach (with Owner-reclaim retry) to sessions whose slots were just
+    /// bound by `apply_open_agent_resolution`, off the paint thread. Attaching
+    /// here — AFTER the bind — is what closes the replay-drop race: the pump
+    /// can route every replayed notification because its slot already exists.
+    /// Per-session ownership outcome is reconciled back into the slot status so
+    /// a read-only / failed attach is visible instead of a silently-dead session.
+    fn spawn_attach_sessions(&self, sids: Vec<String>, cx: &mut Context<Self>) {
+        let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
+            return;
+        };
+        let want_owner = !self.is_candidate;
+        cx.spawn(async move |this, cx| {
+            let results: Vec<(String, Result<bool, String>)> = cx
+                .background_executor()
+                .spawn(async move {
+                    sids.into_iter()
+                        .map(|sid| {
+                            let r = attach_with_owner_retry(&handle, &sid, want_owner);
+                            (sid, r)
+                        })
+                        .collect()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                for (sid, r) in results {
+                    let status: Option<SharedString> = match r {
+                        // Owner (or observer-by-design): leave the optimistic
+                        // "reconnecting…"/"attaching…" status to be overwritten
+                        // by the first real event / SessionAttached notice.
+                        Ok(true) => None,
+                        Ok(false) if want_owner => {
+                            Some("read-only — another window owns this session".into())
+                        }
+                        Ok(false) => None,
+                        Err(e) => {
+                            eprintln!(
+                                "[sketch-gpui] attach failed for {}: {e}",
+                                &sid[..sid.len().min(8)]
+                            );
+                            Some("attach failed — session may be unavailable".into())
+                        }
+                    };
+                    if let Some(s) = status {
+                        this.for_each_server_session_slot(&sid, |slot| {
+                            slot.state.status = Some(s.clone());
+                        });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Run `f` on the agent ring holding the placeholder slot stamped with
@@ -10922,16 +11102,15 @@ impl SketchGpuiView {
             let resolution = cx
                 .background_executor()
                 .spawn(async move {
+                    // Create only — attach is deferred to
+                    // `apply_open_agent_resolution` (after the slot binds its
+                    // `server_session_id`) so the bind-before-attach ordering
+                    // is uniform across the open and new-session paths.
                     match handle.create_session(cwd, label, None) {
-                        Ok(info) => {
-                            if let Err(e) = handle.attach(&info.session_id, AttachMode::Owner) {
-                                eprintln!("[sketch-gpui] attach after create failed: {e}");
-                            }
-                            OpenResolution::Created {
-                                sid: info.session_id,
-                                acp_id: info.acp_session_id,
-                            }
-                        }
+                        Ok(info) => OpenResolution::Created {
+                            sid: info.session_id,
+                            acp_id: info.acp_session_id,
+                        },
                         Err(e) => OpenResolution::Failed(format!("create failed: {e}")),
                     }
                 })
@@ -11305,6 +11484,8 @@ impl SketchGpuiView {
             tasklist_open: false,
             subagents_open: false,
             server_managed: false,
+            reconciler: sketch::agent_transcript::UserTurnReconciler::new(),
+            user_turn_ks: std::collections::HashSet::new(),
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: Some(pump),
         };
@@ -11724,6 +11905,9 @@ impl SketchGpuiView {
                     let routed = self.with_server_session_slot(&session_id, |slot| {
                         let claude = &mut slot.state;
                         finalize_agent_turn(&mut claude.editor);
+                        // Turn boundary: clear last-inserted so the next turn's
+                        // user echo isn't mistaken for a duplicate of this one.
+                        claude.reconciler.note_turn_progressed();
                         claude.last_seen_turns = turn_count;
                         claude.turn_phase = TurnPhase::Idle;
                     });
@@ -11731,29 +11915,17 @@ impl SketchGpuiView {
                 }
                 ServerNotification::UserPrompt { session_id, text } => {
                     let routed = self.with_server_session_slot(&session_id, |slot| {
-                        let claude = &mut slot.state;
-                        let incoming = text.trim_end_matches('\n');
-                        // Perf (finding 4): the dedupe suffix check ignores
-                        // trailing whitespace, so compare only the relevant tail
-                        // slice of the rope instead of cloning the whole
-                        // transcript via full_text(). We probe back from the last
-                        // non-whitespace char by at most `incoming` length.
-                        let already_present = {
-                            !incoming.is_empty()
-                                && document_trimmed_end_ends_with(
-                                    claude.editor.document(),
-                                    incoming,
-                                )
-                        };
-                        if already_present {
-                            return;
-                        }
-                        // Append + freeze + tag as turn k's user turn via the
-                        // shared helper (same shape as live submit_chatbox).
-                        let turn_k = claude.last_seen_turns + 1;
-                        claude
-                            .editor
-                            .freeze_as_user_turn(&text, TurnId::User(turn_k));
+                        // Route through the single chokepoint as an `Echo`: the
+                        // reconciler suppresses it when it matches our own
+                        // optimistic submit (live) or a turn already inserted by
+                        // a second source (replay), and inserts it otherwise.
+                        // Server-managed slots never advance the replay boundary
+                        // here — their boundaries arrive as replayed `TurnEnded`.
+                        slot.state.insert_user_turn(
+                            &text,
+                            sketch::agent_transcript::UserTurnOrigin::Echo,
+                            false,
+                        );
                     });
                     warn_unrouted(routed, &session_id);
                 }
@@ -12179,30 +12351,26 @@ impl SketchGpuiView {
                     claude.status = Some(msg.clone().into());
                 }
                 ReplyEvent::UserMessage(text) => {
-                    // A user-authored turn observed on the replay stream
-                    // (Finding 1 / defect B, INV-1, INV-6). On session/load
-                    // the agent re-emits the prior conversation including the
-                    // user's own prompts; freeze each as a `TurnId::User(k)`
-                    // turn so resumed transcripts reconstruct fully. A *live*
-                    // UserMessageChunk just echoes the prompt Submit already
-                    // inserted — dedupe it via the same trimmed-suffix check
-                    // the ServerNotification::UserPrompt path uses, so live
-                    // echoes are skipped while replayed turns are inserted.
-                    let incoming = text.trim_end_matches('\n');
-                    let already_present = !incoming.is_empty()
-                        && document_trimmed_end_ends_with(claude.editor.document(), incoming);
-                    if already_present {
-                        continue;
-                    }
-                    // A replayed user-message boundary opens the next turn
-                    // (Finding 3, INV-3). Advance the replay cursor *before*
-                    // tagging so this user turn and the agent chunks that
-                    // follow it share `k`: User(1),Llm(1),User(2),Llm(2)…
-                    // rather than collapsing onto a single turn.
-                    let turn_k = claude.advance_replay_user_boundary();
-                    claude
-                        .editor
-                        .freeze_as_user_turn(&text, TurnId::User(turn_k));
+                    // A user-authored turn surfaced by the agent's
+                    // `UserMessageChunk` (Finding 1 / defect B, INV-1, INV-6).
+                    // Emitted unconditionally by the worker — both live (an
+                    // echo of the prompt Submit already inserted) and on
+                    // `session/load` replay (reconstructing prior prompts). The
+                    // single chokepoint's reconciler suppresses the live echo
+                    // by content identity (order-independent — the old
+                    // suffix check double-rendered whenever a chunk streamed
+                    // first) and inserts genuine replayed turns. Only the
+                    // direct-channel replay path advances the replay boundary
+                    // (`!server_managed`): there is no replayed `TurnEnded` to
+                    // bump the live counter, so each user boundary must step
+                    // the cursor — User(1),Llm(1),User(2),Llm(2)…. A suppressed
+                    // echo never advances, so the live counter is safe.
+                    let advance = !claude.server_managed;
+                    claude.insert_user_turn(
+                        &text,
+                        sketch::agent_transcript::UserTurnOrigin::Echo,
+                        advance,
+                    );
                 }
                 ReplyEvent::ReplayComplete => {
                     // The agent finished re-emitting the prior conversation
@@ -12211,6 +12379,7 @@ impl SketchGpuiView {
                     // the right `k`, then signal the pump to finalize once —
                     // after the last replayed chunk, never mid-replay.
                     claude.finish_replay();
+                    claude.reconciler.note_turn_progressed();
                     replay_complete = true;
                 }
             }
@@ -12823,15 +12992,17 @@ impl SketchGpuiView {
             return;
         }
 
-        // Append the chatbox body at EOF, freeze it, and tag it as turn k's
-        // user turn. `last_seen_turns` counts completed turns; the next
-        // submit becomes turn k = last_seen + 1. See Editor::freeze_as_user_turn.
-        let turn_k = claude.last_seen_turns + 1;
-        claude.editor.freeze_as_user_turn(&text, TurnId::User(turn_k));
-
-        // Send.
+        // Send FIRST, then freeze the optimistic echo only on success. Freezing
+        // before the send could leave a "phantom" user turn in the transcript
+        // that was never delivered (the old order did this). The send is to a
+        // local socket/pipe, so doing it first costs nothing perceptible.
         let prompt_body = text.trim_end_matches('\n').to_string();
         let sent = if let Some(sid) = &server_sid {
+            // NB: server `prompt` is fire-and-forget — `Ok` means the request
+            // was written, NOT that the server accepted it (a non-owner
+            // rejection is invisible here). Ownership is instead guaranteed on
+            // resume by the retrying attach in `spawn_attach_sessions`, so by
+            // the time the user can type, this connection owns the session.
             self.session_server.as_ref()
                 .and_then(|s| s.prompt(sid, &prompt_body).ok())
                 .is_some()
@@ -12847,13 +13018,24 @@ impl SketchGpuiView {
 
         if sent {
             if let Some(claude) = self.agent_mut() {
+                // Optimistic echo + begin the turn. `LocalSubmit` always
+                // inserts and records the text so the stream echo that follows
+                // (server `UserPrompt` or agent `UserMessage`, in any order
+                // relative to streamed content) is suppressed. Never advances
+                // the replay boundary on a live submit.
+                claude.insert_user_turn(
+                    &text,
+                    sketch::agent_transcript::UserTurnOrigin::LocalSubmit,
+                    false,
+                );
                 claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
+                // Reset the chatbox to empty; cursor stays inside.
+                claude.chatbox = Some(Chatbox::new());
             }
-        }
-
-        // Reset the chatbox to empty; cursor stays inside.
-        if let Some(claude) = self.agent_mut() {
-            claude.chatbox = Some(Chatbox::new());
+        } else if let Some(claude) = self.agent_mut() {
+            // Send failed: leave the chatbox text intact so the user can retry,
+            // and surface it instead of dropping the message into the void.
+            claude.status = Some("send failed — reconnecting; press ⏎ to retry".into());
         }
         cx.notify();
     }
