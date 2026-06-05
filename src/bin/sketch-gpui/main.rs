@@ -1536,8 +1536,7 @@ fn re_render_layout_docs(layout: &mut workspace::Layout<WindowContent>, theme: &
                 let path = PathBuf::from(d.file_label.as_ref());
                 let text = std::fs::read_to_string(&path).unwrap_or_default();
                 let doc = Document::from_text(text, path.clone());
-                d.blocks = render_with_wiki(&doc.full_text(), theme, Some(&path));
-                d.invalidate_blocks_snapshot();
+                d.set_blocks(render_with_wiki(&doc.full_text(), theme, Some(&path)));
             }
             // Browser's underlying-stashed content is also restyled if it
             // happens to be a Doc — otherwise reverting via Esc lands on
@@ -1548,8 +1547,7 @@ fn re_render_layout_docs(layout: &mut workspace::Layout<WindowContent>, theme: &
                         let path = PathBuf::from(d.file_label.as_ref());
                         let text = std::fs::read_to_string(&path).unwrap_or_default();
                         let doc = Document::from_text(text, path.clone());
-                        d.blocks = render_with_wiki(&doc.full_text(), theme, Some(&path));
-                        d.invalidate_blocks_snapshot();
+                        d.set_blocks(render_with_wiki(&doc.full_text(), theme, Some(&path)));
                     }
                 }
             }
@@ -2387,6 +2385,7 @@ fn restore_content(
                 cursor_block: 0,
                 list_state: DocState::new_list_state(0),
                 list_item_count: std::cell::Cell::new(0),
+                blocks_seq: 0,
                 blocks_snapshot: RefCell::new(None),
                 last_cursor_block: std::cell::Cell::new(None),
                 edit_cache: None,
@@ -4003,12 +4002,18 @@ struct DocState {
     /// only when the block count changed. `Cell` because `render_doc` takes
     /// `&DocState` (the list itself splices through `&self`).
     list_item_count: std::cell::Cell<usize>,
+    /// Monotonic version of `blocks`, bumped by `set_blocks` on every
+    /// reassignment. Plays the role `Document.edit_seq` plays for
+    /// `EditState.lines_cache` — the key the render snapshot is memoized on,
+    /// so no caller has to remember a manual invalidation step.
+    blocks_seq: u64,
     /// O(1)-cloneable snapshot of `blocks` handed to the `'static` list
-    /// render closure. Rebuilt lazily (a single full clone) only when the
-    /// block list changes — invalidated via `invalidate_blocks_snapshot`
-    /// wherever `blocks` is reassigned. Steady-state frames pay only a
-    /// pointer clone, matching the agent transcript's `lines_rc` pattern.
-    blocks_snapshot: RefCell<Option<Rc<Vec<RenderedBlock>>>>,
+    /// render closure. Rebuilt lazily (a single full clone) only when
+    /// `blocks_seq` advanced past the stamp it was built at, mirroring
+    /// `EditState.lines_cache` keyed on `edit_seq`. Steady-state frames pay
+    /// only a pointer clone, matching the agent transcript's `lines_rc`
+    /// pattern. Stores the `blocks_seq` it was built at.
+    blocks_snapshot: RefCell<Option<(u64, Rc<Vec<RenderedBlock>>)>>,
     /// `cursor_block` value last revealed during render. When the focused
     /// block changes, render re-issues `scroll_to_reveal_item` with the
     /// freshly-spliced item count — catching nav actions that fired before
@@ -4030,21 +4035,28 @@ impl DocState {
         gpui::ListState::new(count, gpui::ListAlignment::Top, gpui::px(512.0))
     }
 
-    /// Drop the cached `Rc` snapshot so the next render rebuilds it from the
-    /// current `blocks`. Call after any mutation of `blocks`.
-    fn invalidate_blocks_snapshot(&self) {
-        self.blocks_snapshot.borrow_mut().take();
+    /// Replace `blocks` and bump `blocks_seq`. The render snapshot is keyed on
+    /// `blocks_seq` (see `blocks_rc`), so the next render rebuilds it lazily —
+    /// no separate invalidation call to remember. This is the only path that
+    /// mutates `blocks` in place after construction.
+    fn set_blocks(&mut self, blocks: Vec<RenderedBlock>) {
+        self.blocks = blocks;
+        self.blocks_seq = self.blocks_seq.wrapping_add(1);
     }
 
     /// O(1) pointer clone of the blocks snapshot, rebuilding it (one full
-    /// clone) on the first call after an invalidation.
+    /// clone) only when `blocks_seq` has advanced past the version the cached
+    /// snapshot was built at. Mirrors `EditState.lines_cache` keyed on
+    /// `edit_seq`.
     fn blocks_rc(&self) -> Rc<Vec<RenderedBlock>> {
         let mut slot = self.blocks_snapshot.borrow_mut();
-        if let Some(rc) = slot.as_ref() {
-            return rc.clone();
+        if let Some((seq, rc)) = slot.as_ref() {
+            if *seq == self.blocks_seq {
+                return rc.clone();
+            }
         }
         let rc = Rc::new(self.blocks.clone());
-        *slot = Some(rc.clone());
+        *slot = Some((self.blocks_seq, rc.clone()));
         rc
     }
 
@@ -5931,6 +5943,7 @@ impl SketchGpuiView {
             cursor_block: 0,
             list_state: DocState::new_list_state(0),
             list_item_count: std::cell::Cell::new(0),
+            blocks_seq: 0,
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
             edit_cache: None,
@@ -6209,6 +6222,7 @@ impl SketchGpuiView {
             cursor_block: 0,
             list_state: DocState::new_list_state(0),
             list_item_count: std::cell::Cell::new(0),
+            blocks_seq: 0,
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
             edit_cache: None,
@@ -7021,6 +7035,7 @@ impl SketchGpuiView {
                 cursor_block: 0,
                 list_state: DocState::new_list_state(0),
                 list_item_count: std::cell::Cell::new(0),
+                blocks_seq: 0,
                 blocks_snapshot: RefCell::new(None),
                 last_cursor_block: std::cell::Cell::new(None),
                 edit_cache: None,
@@ -7778,6 +7793,7 @@ impl SketchGpuiView {
             cursor_block: 0,
             list_state: DocState::new_list_state(0),
             list_item_count: std::cell::Cell::new(0),
+            blocks_seq: 0,
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
             edit_cache: None,
@@ -7871,6 +7887,7 @@ impl SketchGpuiView {
                 cursor_block: 0,
                 list_state: DocState::new_list_state(0),
                 list_item_count: std::cell::Cell::new(0),
+                blocks_seq: 0,
                 blocks_snapshot: RefCell::new(None),
                 last_cursor_block: std::cell::Cell::new(None),
                 edit_cache: None,
@@ -7889,6 +7906,7 @@ impl SketchGpuiView {
                     cursor_block: 0,
                     list_state: DocState::new_list_state(0),
                     list_item_count: std::cell::Cell::new(0),
+                    blocks_seq: 0,
                     blocks_snapshot: RefCell::new(None),
                     last_cursor_block: std::cell::Cell::new(None),
                     edit_cache: Some(edit),
@@ -7976,6 +7994,7 @@ impl SketchGpuiView {
             cursor_block: 0,
             list_state: DocState::new_list_state(0),
             list_item_count: std::cell::Cell::new(0),
+            blocks_seq: 0,
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
             edit_cache: None,
@@ -8051,6 +8070,7 @@ impl SketchGpuiView {
                     cursor_block: 0,
                     list_state: DocState::new_list_state(0),
                     list_item_count: std::cell::Cell::new(0),
+                    blocks_seq: 0,
                     blocks_snapshot: RefCell::new(None),
                     last_cursor_block: std::cell::Cell::new(None),
                     edit_cache: None,
@@ -10669,6 +10689,7 @@ impl SketchGpuiView {
                 cursor_block: 0,
                 list_state: DocState::new_list_state(0),
                 list_item_count: std::cell::Cell::new(0),
+                blocks_seq: 0,
                 blocks_snapshot: RefCell::new(None),
                 last_cursor_block: std::cell::Cell::new(None),
                 edit_cache: None,
@@ -13532,8 +13553,9 @@ impl SketchGpuiView {
         // O(visible) too.
 
         // Splice the list to the current block count. `blocks` only changes on
-        // load / reload / edit-flush (each calls `invalidate_blocks_snapshot`),
-        // so a count change is the reliable trigger; a plain `reset` is correct
+        // load / reload / edit-flush (each builds a fresh `DocState`) or theme
+        // switch (`set_blocks` bumps `blocks_seq`), so a count change is the
+        // reliable trigger; a plain `reset` is correct
         // and cheap relative to the per-row work it gates. Must run EVERY frame.
         let new_count = d.blocks.len();
         if new_count != d.list_item_count.get() {
