@@ -199,10 +199,12 @@ verifiable.
 
 ### Phase 0 — Enablers (do first; unblock verification)
 - **0.1 CI gate** — ✅ *done* (`.github/workflows/ci.yml`: build both bins + test on every push/PR).
-- **0.2 Keymap extraction** — extract `register_keymap(app)` callable from both
-  `main()` and the test harness, so `vcx.simulate_keystrokes(...)` can drive
-  action handlers headlessly. **This is the single unblock that makes every
-  Tier-2 (gpui-view) step verifiable** instead of "human eyeballs it."
+- **0.2 Keymap extraction** — ✅ *done* (`704e13d`). Extracted `register_keymap(app)`
+  (all 96 bindings, verbatim) callable from both `main()` and the test harness;
+  landed the first headless action smoke (`cmd_b_toggles_file_browser_rail` in
+  `verify_harness.rs`) driving the full keymap→action→handler chain. **This is
+  the single unblock that makes every Tier-2 (gpui-view) step verifiable**
+  instead of "human eyeballs it" — `vcx.simulate_keystrokes(...)` now works.
 
 ### Phase A — Pure, front-loaded, low/med risk (unit-testable, no behavior change)
 1. **`replay_turns` owns its fields.** `AgentState` holds one `ReplayTurns`
@@ -270,9 +272,9 @@ Front-loaded by leverage and verifiability.
 
 **Stop-the-bleeding (days, do now):**
 1. `[x]` CI gate (build + test on push/PR). *(merged via this branch)*
-2. `[ ]` **Keymap extraction → headless action smokes** (Phase 0.2). Highest
-   non-CI leverage — unblocks verifying every GUI change. Add a smoke for the
-   rail (the repeatedly-regressed surface) as the first one.
+2. `[x]` **Keymap extraction → headless action smokes** (Phase 0.2, `704e13d`).
+   Highest non-CI leverage — unblocks verifying every GUI change. Rail smoke
+   (`cmd_b_toggles_file_browser_rail`) landed as the first one.
 3. `[ ]` **Worksheet double-render fix** (Phase A.1, the `replay_turns`/worksheet
    part). Concrete live bug; closes the "single chokepoint with two doors."
 4. `[ ]` Turn on `clippy -D warnings` + `fmt --check` in CI once the 8 existing
