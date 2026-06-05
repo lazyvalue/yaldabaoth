@@ -723,3 +723,97 @@ fn agent_seam_worksheet_unregistered_line_double_renders(cx: &mut TestAppContext
          reconciler chokepoint closes — this is what keeps the suppression test honest)"
     );
 }
+
+/// Regression for the live crash: pipelined worksheet submits — a second prompt
+/// committed before the first turn's `TurnEnded` advances `last_seen` — must get
+/// DISTINCT turn numbers. The naive `k = current_turn() = last_seen + 1` reuses
+/// the same `k` for both (worksheet invites submitting again while the agent is
+/// still working), which trips the M3 double-insert tripwire and aborts the app.
+#[gpui::test]
+fn agent_seam_pipelined_worksheet_submits_get_distinct_turns(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    // Turn 1 has settled (its TurnEnded advanced last_seen to 1).
+    view.update(vcx, |v, _cx| {
+        v.agent_mut().unwrap().last_seen_turns = 1;
+    });
+
+    // First in-flight submit -> turn 2.
+    let k1 = view.update(vcx, |v, _cx| {
+        v.agent_mut()
+            .unwrap()
+            .commit_worksheet_turn(&[(0usize, "alpha".to_string())], "alpha")
+    });
+    assert_eq!(k1, Some(2), "first in-flight submit is turn 2");
+
+    // Second submit BEFORE turn 2's boundary advances last_seen (still 1). It
+    // must be a distinct turn (3), NOT collide on 2 and trip the tripwire.
+    let k2 = view.update(vcx, |v, _cx| {
+        v.agent_mut()
+            .unwrap()
+            .commit_worksheet_turn(&[(0usize, "beta".to_string())], "beta")
+    });
+    assert_eq!(
+        k2,
+        Some(3),
+        "a pipelined submit must get a fresh turn number, not reuse the in-flight turn's k"
+    );
+}
+
+/// Sibling of the pipelined case: a live/server echo that ISN'T suppressed
+/// (its text didn't match a pending submit) and arrives before the in-flight
+/// turn's boundary settles must also mint a DISTINCT turn rather than collide
+/// on `current_turn()` — the same crash class, reached via `origin = Echo`
+/// instead of `LocalSubmit`. Pins the guard to the whole non-replay branch.
+#[gpui::test]
+fn agent_seam_unsuppressed_echo_during_inflight_turn_gets_distinct_k(cx: &mut TestAppContext) {
+    use sketch::agent_transcript::UserTurnOrigin;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+    view.update(vcx, |v, _cx| {
+        v.agent_mut().unwrap().last_seen_turns = 1;
+    });
+
+    // Local submit -> turn 2 (in flight; last_seen still 1).
+    let k1 = view.update(vcx, |v, _cx| {
+        v.agent_mut()
+            .unwrap()
+            .register_user_turn("alpha", UserTurnOrigin::LocalSubmit, false)
+    });
+    assert_eq!(k1, Some(2));
+
+    // A live echo with NON-matching text (not suppressed) before turn 2's
+    // boundary settles. Must be a distinct turn, not a collision on 2.
+    let k2 = view.update(vcx, |v, _cx| {
+        v.agent_mut().unwrap().register_user_turn(
+            "a totally different unsuppressed echo",
+            UserTurnOrigin::Echo,
+            false,
+        )
+    });
+    assert_eq!(
+        k2,
+        Some(3),
+        "an unsuppressed echo during an in-flight turn must mint a fresh k, not reuse it"
+    );
+}

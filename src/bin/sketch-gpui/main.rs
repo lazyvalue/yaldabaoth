@@ -5307,6 +5307,20 @@ impl AgentState {
         k
     }
 
+    /// The lowest turn number not yet issued to a user turn this generation.
+    /// `current_turn()` (`= last_seen + 1`) only advances when a turn's boundary
+    /// (`TurnEnded`) settles `last_seen`, so a NEW local submit made while the
+    /// previous turn is still in flight would otherwise reuse the in-flight
+    /// turn's `k`. Taking `max(current_turn(), next_unused_user_turn())` for a
+    /// local submit gives pipelined submits distinct, monotonic turn numbers
+    /// instead of colliding (and tripping the M3 double-insert tripwire). It is
+    /// a no-op for the common non-pipelined case (`last_seen + 1` is already the
+    /// next unused number). `user_turn_ks` holds every user `k` issued this
+    /// generation and is wiped per replay generation, so this never drifts.
+    fn next_unused_user_turn(&self) -> usize {
+        self.user_turn_ks.iter().max().map_or(1, |m| m + 1)
+    }
+
     /// THE single chokepoint for user-turn **dedup + turn-number attribution**.
     /// All four announcement sites — the chatbox optimistic submit, the
     /// worksheet submit, the server `UserPrompt` notification, and the agent's
@@ -5341,7 +5355,17 @@ impl AgentState {
                 let k = if advance_boundary {
                     self.advance_replay_user_boundary()
                 } else {
-                    self.current_turn()
+                    // Every NON-replay insert mints a fresh turn (a local submit,
+                    // or a live/server echo that wasn't suppressed — dual-source
+                    // echoes for an existing turn already returned `Skip`). It
+                    // should attribute to `current_turn()` (`= last_seen + 1`),
+                    // BUT if that `k` is already taken because the previous turn's
+                    // boundary hasn't advanced `last_seen` yet (a pipelined submit,
+                    // or a content-mismatched echo), take the next unused number
+                    // instead — otherwise two distinct turns collide on one `k`
+                    // and trip the M3 tripwire (the live crash this guards). A
+                    // no-op in the common, non-pipelined case.
+                    self.current_turn().max(self.next_unused_user_turn())
                 };
                 // M3 runtime tripwire: a `k` inserted twice within one
                 // generation means the dedup failed and we are about to
