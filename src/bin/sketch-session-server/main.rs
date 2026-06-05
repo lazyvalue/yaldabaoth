@@ -274,6 +274,11 @@ impl SessionManager {
                             {
                                 let mut sessions = manager.sessions.lock().unwrap();
                                 if let Some(s) = sessions.get_mut(&session_id) {
+                                    // Re-apply the session's permission policy to
+                                    // the freshly spawned channel — a new channel
+                                    // starts at its default, so without this the
+                                    // configured mode silently reverts on resume.
+                                    client.set_permission_mode(s.permission_mode);
                                     s.channel = Some(client);
                                     let note = Notification::SessionAttached {
                                         session_id: session_id.clone(),
@@ -385,6 +390,9 @@ impl SessionManager {
                         {
                             let mut sessions = manager.sessions.lock().unwrap();
                             if let Some(s) = sessions.get_mut(&session_id) {
+                                // Re-apply the session's permission policy to the
+                                // freshly spawned channel (defaults otherwise).
+                                client.set_permission_mode(s.permission_mode);
                                 s.channel = Some(client);
                                 let note = Notification::SessionAttached {
                                     session_id: session_id.clone(),
@@ -598,6 +606,11 @@ impl SessionManager {
                         let old = {
                             let mut sessions = manager.sessions.lock().unwrap();
                             let Some(s) = sessions.get_mut(&sid) else { return };
+                            // Re-apply the session's permission policy to the
+                            // freshly spawned channel — the restart spawns a
+                            // brand-new channel at its default mode, so without
+                            // this the configured policy silently reverts.
+                            client.set_permission_mode(s.permission_mode);
                             let old = s.channel.take();
                             s.channel = Some(client);
                             s.channel_generation = s.channel_generation.wrapping_add(1);
