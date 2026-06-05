@@ -138,6 +138,30 @@ impl SessionManager {
         }
     }
 
+    /// THE single accessor for the shared sessions map — poison-tolerant.
+    ///
+    /// If any thread panics *while holding* the lock, a plain `.lock().unwrap()`
+    /// at every other site would then panic too, so one stray panic cascades
+    /// into "every session is dead" (the failure mode this centralization
+    /// closes). The guarded data is a plain `HashMap` mutated by short,
+    /// non-compound critical sections — there is no half-applied multi-step
+    /// invariant that a mid-mutation panic could leave torn — so recovering the
+    /// guard via `into_inner()` keeps the surviving sessions serving instead of
+    /// taking the whole server down. The recovery is surfaced (once per poison
+    /// observation) rather than swallowed, so the originating panic stays
+    /// visible. Every `sessions` access MUST go through here.
+    fn lock_sessions(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<ServerSessionId, ManagedSession>> {
+        self.sessions.lock().unwrap_or_else(|poisoned| {
+            eprintln!(
+                "[session-server] WARNING: sessions mutex was poisoned by a prior \
+                 panic; recovering the guard to keep other sessions alive"
+            );
+            poisoned.into_inner()
+        })
+    }
+
     /// Subscribe to manager-level session-list notifications. Each connection
     /// calls this once and forwards everything it receives to its GUI.
     fn subscribe_events(&self) -> broadcast::Receiver<Notification> {
@@ -164,7 +188,7 @@ impl SessionManager {
             event_log: Arc<Vec<Notification>>,
         }
         let snaps: Vec<Snap> = {
-            let sessions = self.sessions.lock().unwrap();
+            let sessions = self.lock_sessions();
             sessions
                 .values()
                 .map(|s| Snap {
@@ -261,9 +285,7 @@ impl SessionManager {
                 &acp_session_id[..8.min(acp_session_id.len())],
             );
 
-            self.sessions
-                .lock()
-                .unwrap()
+            self.lock_sessions()
                 .insert(ps.server_session_id.clone(), session);
 
             // Re-spawn the ACP subprocess with --resume.
@@ -286,7 +308,7 @@ impl SessionManager {
                         Ok(client) => {
                             let new_acp_id = client.session_id();
                             {
-                                let mut sessions = manager.sessions.lock().unwrap();
+                                let mut sessions = manager.lock_sessions();
                                 if let Some(s) = sessions.get_mut(&session_id) {
                                     // Re-apply the session's permission policy to
                                     // the freshly spawned channel — a new channel
@@ -307,7 +329,7 @@ impl SessionManager {
                                 "[session-server] failed to resume session {}: {e}",
                                 &session_id[..8],
                             );
-                            let mut sessions = manager.sessions.lock().unwrap();
+                            let mut sessions = manager.lock_sessions();
                             if let Some(s) = sessions.get_mut(&session_id) {
                                 s.record(Notification::SessionDetached {
                                     session_id: session_id.clone(),
@@ -322,7 +344,7 @@ impl SessionManager {
     }
 
     fn list_sessions(&self) -> Vec<SessionInfo> {
-        let sessions = self.sessions.lock().unwrap();
+        let sessions = self.lock_sessions();
         sessions.values().map(|s| s.info()).collect()
     }
 
@@ -351,7 +373,7 @@ impl SessionManager {
         };
 
         let info = session.info();
-        self.sessions.lock().unwrap().insert(id.clone(), session);
+        self.lock_sessions().insert(id.clone(), session);
         let _ = self.events.send(Notification::SessionCreated {
             session: info.clone(),
         });
@@ -384,7 +406,7 @@ impl SessionManager {
                         // we publish the channel, so they're queued at the
                         // ACP driver loop before any future prompt races in.
                         let queued = {
-                            let mut sessions = manager.sessions.lock().unwrap();
+                            let mut sessions = manager.lock_sessions();
                             sessions
                                 .get_mut(&session_id)
                                 .map(|s| std::mem::take(&mut s.pending_prompts))
@@ -398,7 +420,7 @@ impl SessionManager {
                             }
                         }
                         {
-                            let mut sessions = manager.sessions.lock().unwrap();
+                            let mut sessions = manager.lock_sessions();
                             if let Some(s) = sessions.get_mut(&session_id) {
                                 // Re-apply the session's permission policy to the
                                 // freshly spawned channel (defaults otherwise).
@@ -414,7 +436,7 @@ impl SessionManager {
                         spawn_pump_thread(Arc::clone(&manager), session_id);
                     }
                     Err(e) => {
-                        let mut sessions = manager.sessions.lock().unwrap();
+                        let mut sessions = manager.lock_sessions();
                         if let Some(s) = sessions.get_mut(&session_id) {
                             s.record(Notification::SessionDetached {
                                 session_id: session_id.clone(),
@@ -431,7 +453,7 @@ impl SessionManager {
 
     fn close_session(&self, session_id: &str, conn_id: u64) -> Result<(), String> {
         let removed = {
-            let mut sessions = self.sessions.lock().unwrap();
+            let mut sessions = self.lock_sessions();
             match sessions.get(session_id) {
                 Some(s) if s.owner == Some(conn_id) => {
                     // Dropping ManagedSession drops AcpChannelClient → kills subprocess.
@@ -466,7 +488,7 @@ impl SessionManager {
         mode: AttachMode,
         conn_id: u64,
     ) -> Result<(broadcast::Receiver<Notification>, usize), String> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.lock_sessions();
         let session = sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
@@ -491,7 +513,7 @@ impl SessionManager {
 
     /// An observer claims ownership of a currently-unowned session.
     fn promote(&self, session_id: &str, conn_id: u64) -> Result<(), String> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.lock_sessions();
         let session = sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
@@ -510,7 +532,7 @@ impl SessionManager {
     /// `OwnerChanged` is broadcast so observers can promote. Observer detach
     /// is a no-op on ownership (the dropped receiver cleans itself up).
     fn detach(&self, session_id: &str, conn_id: u64) -> Result<(), String> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.lock_sessions();
         let session = sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
@@ -522,7 +544,7 @@ impl SessionManager {
     }
 
     fn prompt(&self, session_id: &str, text: &str, conn_id: u64) -> Result<(), String> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.lock_sessions();
         let session = sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
@@ -557,7 +579,7 @@ impl SessionManager {
     /// if the ACP subprocess is still spawning (no channel yet) there is
     /// nothing in flight to cancel, so it's a no-op.
     fn cancel(&self, session_id: &str, conn_id: u64) -> Result<(), String> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.lock_sessions();
         let session = sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
@@ -579,7 +601,7 @@ impl SessionManager {
     /// live. Owner-only.
     fn restart_session(self: &Arc<Self>, session_id: &str, conn_id: u64) -> Result<(), String> {
         let (cwd, resume_id) = {
-            let sessions = self.sessions.lock().unwrap();
+            let sessions = self.lock_sessions();
             let session = sessions
                 .get(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
@@ -610,7 +632,7 @@ impl SessionManager {
                         // channel; drop the old one *after* releasing the
                         // lock (Drop joins the worker / kills the child).
                         let old = {
-                            let mut sessions = manager.sessions.lock().unwrap();
+                            let mut sessions = manager.lock_sessions();
                             let Some(s) = sessions.get_mut(&sid) else { return };
                             // Re-apply the session's permission policy to the
                             // freshly spawned channel — the restart spawns a
@@ -629,7 +651,7 @@ impl SessionManager {
                         drop(old);
                     }
                     Err(e) => {
-                        let mut sessions = manager.sessions.lock().unwrap();
+                        let mut sessions = manager.lock_sessions();
                         if let Some(s) = sessions.get_mut(&sid) {
                             s.record(Notification::SessionDetached {
                                 session_id: sid.clone(),
@@ -645,7 +667,7 @@ impl SessionManager {
 
     fn rename_session(&self, session_id: &str, label: String) -> Result<(), String> {
         {
-            let mut sessions = self.sessions.lock().unwrap();
+            let mut sessions = self.lock_sessions();
             let session = sessions
                 .get_mut(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
@@ -665,7 +687,7 @@ impl SessionManager {
         mode: PermissionMode,
         conn_id: u64,
     ) -> Result<(), String> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.lock_sessions();
         let session = sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
@@ -703,7 +725,7 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
             const PUMP_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(16);
 
             loop {
-                let mut sessions = manager.sessions.lock().unwrap();
+                let mut sessions = manager.lock_sessions();
                 let Some(session) = sessions.get_mut(&session_id) else {
                     return; // Session was closed.
                 };
@@ -1094,7 +1116,7 @@ async fn forward_notifications(
         //    Snapshot under the lock, then release it before awaiting the
         //    socket write (never hold a std Mutex across `.await`).
         let new: Vec<Notification> = {
-            let sessions = manager.sessions.lock().unwrap();
+            let sessions = manager.lock_sessions();
             match sessions.get(&session_id) {
                 Some(s) if s.event_log.len() > sent => s.event_log[sent..].to_vec(),
                 Some(_) => Vec::new(),
@@ -1151,7 +1173,7 @@ async fn forward_notifications(
                 // Producer gone (session closing). One final tail to flush any
                 // trailing logged events, then exit.
                 let tail: Vec<Notification> = {
-                    let sessions = manager.sessions.lock().unwrap();
+                    let sessions = manager.lock_sessions();
                     match sessions.get(&session_id) {
                         Some(s) if s.event_log.len() > sent => {
                             s.event_log[sent..].to_vec()
@@ -1245,11 +1267,44 @@ async fn main() -> io::Result<()> {
         // so a "reconnect" surfaces here as conn_id > 1 and/or pre-existing
         // sessions — the session count is what tells you the client rejoined
         // live state rather than starting cold.
-        let active_sessions = manager.sessions.lock().unwrap().len();
+        let active_sessions = manager.lock_sessions().len();
         eprintln!(
             "[session-server] client {} (conn {conn_id}); {active_sessions} active session(s)",
             if conn_id == 1 { "connected" } else { "reconnected" },
         );
         tokio::spawn(handle_connection(stream, mgr, conn_id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cascade guard: once any holder panics while holding the sessions
+    /// lock the std `Mutex` is poisoned, and a plain `.lock().unwrap()` at every
+    /// other site would then panic too — one stray panic killing every session.
+    /// `lock_sessions()` must recover the guard so the server keeps serving.
+    #[test]
+    fn lock_sessions_recovers_from_a_poisoned_mutex() {
+        let mgr = SessionManager::new();
+
+        // Poison the mutex: panic while holding the raw lock (caught so the test
+        // process survives — the panic message on stderr is expected noise).
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = mgr.sessions.lock().unwrap();
+            panic!("boom while holding the sessions lock");
+        }));
+        assert!(res.is_err(), "the critical section must have panicked");
+        assert!(mgr.sessions.is_poisoned(), "the mutex must now be poisoned");
+
+        // A plain `.lock().unwrap()` here would cascade-panic; the helper must
+        // hand back a usable, intact map instead (no torn state — the panic
+        // happened before any insert).
+        let guard = mgr.lock_sessions();
+        assert!(guard.is_empty(), "recovered map is intact");
+        drop(guard);
+
+        // Recovery is durable, not one-shot: subsequent accesses keep working.
+        assert!(mgr.lock_sessions().is_empty(), "server keeps serving after poison");
     }
 }
