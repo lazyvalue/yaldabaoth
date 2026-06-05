@@ -1223,6 +1223,15 @@ async fn main() -> io::Result<()> {
         let (stream, _) = listener.accept().await?;
         let mgr = Arc::clone(&manager);
         let conn_id = next_conn_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Every GUI relaunch is a fresh accept (no persistent client identity),
+        // so a "reconnect" surfaces here as conn_id > 1 and/or pre-existing
+        // sessions — the session count is what tells you the client rejoined
+        // live state rather than starting cold.
+        let active_sessions = manager.sessions.lock().unwrap().len();
+        eprintln!(
+            "[session-server] client {} (conn {conn_id}); {active_sessions} active session(s)",
+            if conn_id == 1 { "connected" } else { "reconnected" },
+        );
         tokio::spawn(handle_connection(stream, mgr, conn_id));
     }
 }

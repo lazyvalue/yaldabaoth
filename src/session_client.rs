@@ -7,6 +7,7 @@
 
 use std::io::{self, BufRead, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
@@ -77,12 +78,32 @@ impl SessionServerClient {
             Err(_) => {}
         }
 
-        // Try launching the server.
+        // Launch the server DETACHED so it outlives this GUI: its own process
+        // group (no SIGINT/SIGHUP from the terminal that launched the GUI), and
+        // stdout/stderr go to a log file rather than the GUI's terminal so the
+        // daemon is fully decoupled from the launching session.
         let server_bin = Self::find_server_binary()?;
         let mut cmd = std::process::Command::new(&server_bin);
         cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::inherit());
+        match Self::server_log_file() {
+            Some(log) => {
+                let err = log.try_clone().ok();
+                cmd.stdout(std::process::Stdio::from(log));
+                match err {
+                    Some(err) => {
+                        cmd.stderr(std::process::Stdio::from(err));
+                    }
+                    None => {
+                        cmd.stderr(std::process::Stdio::null());
+                    }
+                }
+            }
+            None => {
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::process::Stdio::null());
+            }
+        }
+        cmd.process_group(0); // detach from the GUI's process group
         cmd.spawn().map_err(|e| {
             io::Error::new(
                 io::ErrorKind::Other,
@@ -103,6 +124,23 @@ impl SessionServerClient {
             io::ErrorKind::ConnectionRefused,
             "session server did not start in time",
         ))
+    }
+
+    /// Append-mode log file for the detached server's stdout/stderr, so the
+    /// daemon's output survives the terminal that launched the GUI. Lives at
+    /// `<cache>/sketch/session-server.log` (macOS: `~/Library/Caches/...`).
+    /// `None` if the cache dir or file can't be opened (caller falls back to
+    /// discarding output).
+    fn server_log_file() -> Option<std::fs::File> {
+        let path = dirs::cache_dir()?.join("sketch").join("session-server.log");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
     }
 
     fn find_server_binary() -> io::Result<PathBuf> {

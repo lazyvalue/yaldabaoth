@@ -1864,11 +1864,15 @@ fn is_candidate_launch() -> bool {
     std::env::var("SKETCH_CANDIDATE").as_deref() == Ok("1")
 }
 
-/// Connect to the session server if `SKETCH_SESSION_SERVER=1` is set.
-/// Returns `None` when the env var is absent/empty, or when the connection
-/// fails (falls back to direct AcpChannelClient spawning silently).
+/// Connect to the session server, the default model: a persistent server owns
+/// the agent subprocesses so sessions survive GUI restarts/crashes, and the
+/// GUI auto-launches a detached one if none is running. Set
+/// `SKETCH_SESSION_SERVER=0` to force the legacy in-process direct-spawn path.
+/// Returns `None` when disabled, or when the connection/launch fails (falls
+/// back to direct spawning so the GUI still starts).
 fn connect_session_server() -> Option<SessionServerClient> {
-    if std::env::var("SKETCH_SESSION_SERVER").as_deref() != Ok("1") {
+    if std::env::var("SKETCH_SESSION_SERVER").as_deref() == Ok("0") {
+        eprintln!("[sketch-gpui] session server disabled (SKETCH_SESSION_SERVER=0); direct spawn");
         return None;
     }
     match SessionServerClient::connect() {
@@ -2990,6 +2994,38 @@ fn tool_inline_detail(tc: &sketch::acp_channel::ToolCall) -> Option<String> {
         return Some(truncated);
     }
     None
+}
+
+/// Short type label for a tool call used in collapsed group headers
+/// (e.g. "grep", "edit", "read"). Prefers the leading word of the title — for
+/// claude-code-acp this is the tool name (Grep / Read / Bash / Edit / …) — and
+/// falls back to the ACP `kind` when the title isn't a clean single token.
+fn tool_type_label(tc: &sketch::acp_channel::ToolCall) -> String {
+    tc.title
+        .split_whitespace()
+        .next()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|w| !w.is_empty() && w.len() <= 12 && w.chars().all(|c| c.is_alphanumeric()))
+        .unwrap_or_else(|| tool_kind_label(&tc.kind))
+}
+
+/// Fallback label derived from the ACP tool kind when the title isn't usable.
+fn tool_kind_label(kind: &sketch::acp_channel::ToolKind) -> String {
+    use sketch::acp_channel::ToolKind;
+    match kind {
+        ToolKind::Read => "read",
+        ToolKind::Edit => "edit",
+        ToolKind::Search => "search",
+        ToolKind::Execute => "run",
+        ToolKind::Move => "move",
+        ToolKind::Delete => "delete",
+        ToolKind::Fetch => "fetch",
+        ToolKind::Think => "think",
+        ToolKind::SwitchMode => "mode",
+        ToolKind::Other => "tool",
+        _ => "tool",
+    }
+    .to_string()
 }
 
 /// Append a tool call's body panes directly to a container div.
@@ -5317,6 +5353,17 @@ enum OpenResolution {
     Failed(String),
 }
 
+/// Process-wide monotonic allocator for `AgentSlot::pending_open_token`.
+/// Tokens are never reused, so an in-flight async server open always binds
+/// back to exactly the placeholder that started it — even across rings whose
+/// per-ring `index` counters both start at 0 (the collision that dropped a
+/// session's events on restore: `pump: no slot for server session`).
+static NEXT_OPEN_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn alloc_open_token() -> u64 {
+    NEXT_OPEN_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A named wrapper around `AgentState` for multi-session support.
 struct AgentSlot {
     /// User-facing label shown in the sidebar.
@@ -5341,6 +5388,12 @@ struct AgentSlot {
     /// When using the session server, this is the server-assigned session id.
     /// `None` when using direct AcpChannelClient spawning.
     server_session_id: Option<String>,
+    /// Set while an async server open/create round-trip for this slot is in
+    /// flight; the resolution binds back to this slot by matching the token
+    /// across the whole workspace. Globally unique (see `alloc_open_token`) so
+    /// it disambiguates two placeholders that share a per-ring `index` of 0.
+    /// Cleared once the round-trip resolves. `None` for settled slots.
+    pending_open_token: Option<u64>,
 }
 
 /// An ordered collection of `AgentSlot`s with one active slot.
@@ -5393,6 +5446,7 @@ impl AgentRing {
             resume_id,
             cwd,
             server_session_id,
+            pending_open_token: None,
         });
         self.active = self.slots.len() - 1;
         index
@@ -5880,7 +5934,8 @@ impl SketchGpuiView {
                 let placeholder = AgentState::new_server_managed(Some(
                     "connecting to session server…".into(),
                 ));
-                let placeholder_index = ring.push(
+                let open_token = alloc_open_token();
+                ring.push(
                     "claude-1".into(),
                     placeholder,
                     None,
@@ -5890,6 +5945,7 @@ impl SketchGpuiView {
                 let server_pump = self.start_server_pump(cx);
                 if let Some(slot) = ring.slots.first_mut() {
                     slot.state._pump = Some(server_pump);
+                    slot.pending_open_token = Some(open_token);
                 }
                 // Install the ring, then kick off async attach.
                 for tab in &mut self.workspace.tabs {
@@ -5898,7 +5954,7 @@ impl SketchGpuiView {
                         break;
                     }
                 }
-                self.spawn_open_agent_server(placeholder_index, proc_cwd.clone(), cx);
+                self.spawn_open_agent_server(open_token, proc_cwd.clone(), cx);
             } else {
                 // Legacy direct-spawn path.
                 let persisted = load_persisted_acp_sessions(&proc_cwd);
@@ -10504,7 +10560,8 @@ impl SketchGpuiView {
             let placeholder = AgentState::new_server_managed(Some(
                 "connecting to session server…".into(),
             ));
-            let placeholder_index = ring.push(
+            let open_token = alloc_open_token();
+            ring.push(
                 "claude-1".into(),
                 placeholder,
                 None,
@@ -10518,6 +10575,7 @@ impl SketchGpuiView {
             let server_pump = self.start_server_pump(cx);
             if let Some(slot) = ring.slots.first_mut() {
                 slot.state._pump = Some(server_pump);
+                slot.pending_open_token = Some(open_token);
             }
 
             self.set_screen(WindowContent::Agent(ring));
@@ -10526,7 +10584,7 @@ impl SketchGpuiView {
             }
             cx.notify();
 
-            self.spawn_open_agent_server(placeholder_index, proc_cwd, cx);
+            self.spawn_open_agent_server(open_token, proc_cwd, cx);
             return;
         } else {
             // ── Direct-spawn path (legacy) ───────────────────────────
@@ -10586,7 +10644,7 @@ impl SketchGpuiView {
     /// `this.update` is a no-op and the work is harmlessly discarded.
     fn spawn_open_agent_server(
         &self,
-        placeholder_index: usize,
+        open_token: u64,
         proc_cwd: PathBuf,
         cx: &mut Context<Self>,
     ) {
@@ -10690,7 +10748,7 @@ impl SketchGpuiView {
                 .await;
 
             let _ = this.update(cx, |this, cx| {
-                this.apply_open_agent_resolution(placeholder_index, resolution, cx);
+                this.apply_open_agent_resolution(open_token, resolution, cx);
             });
         })
         .detach();
@@ -10702,70 +10760,90 @@ impl SketchGpuiView {
     /// is gone (screen switched / slot closed before the result returned).
     fn apply_open_agent_resolution(
         &mut self,
-        placeholder_index: usize,
+        open_token: u64,
         resolution: OpenResolution,
         cx: &mut Context<Self>,
     ) {
-        // Resolve the placeholder's cwd once; it's reused for any extra slots.
-        let proc_cwd = self
-            .agent_ring()
-            .and_then(|r| r.slot_by_index(placeholder_index))
-            .map(|pos| self.agent_ring().unwrap().slots[pos].cwd.clone());
-        let Some(proc_cwd) = proc_cwd else {
-            return; // placeholder gone
-        };
+        // Bind back to the exact placeholder that started this open, searching
+        // the WHOLE workspace (not just the focused ring) and matching the
+        // globally-unique `open_token` (not the per-ring `index`, which
+        // collides at 0 across rings — the cause of `pump: no slot for server
+        // session`). If the placeholder is gone (screen closed before the
+        // round-trip returned), this is a harmless no-op.
+        self.with_open_token_ring(open_token, move |ring| {
+            let Some(pos) = ring
+                .slots
+                .iter()
+                .position(|s| s.pending_open_token == Some(open_token))
+            else {
+                return;
+            };
+            let proc_cwd = ring.slots[pos].cwd.clone();
+            // Consume the token regardless of outcome so a late duplicate
+            // resolution can't re-bind this slot.
+            ring.slots[pos].pending_open_token = None;
 
-        match resolution {
-            OpenResolution::Failed(msg) => {
-                if let Some(ring) = self.agent_ring_mut() {
-                    if let Some(slot) = ring.slot_by_index_mut(placeholder_index) {
-                        let m = format!("session server error — {msg}");
-                        Self::append_system_notice(&mut slot.state, &m);
-                        slot.state.status = Some(m.into());
-                    }
+            match resolution {
+                OpenResolution::Failed(msg) => {
+                    let m = format!("session server error — {msg}");
+                    Self::append_system_notice(&mut ring.slots[pos].state, &m);
+                    ring.slots[pos].state.status = Some(m.into());
                 }
-            }
-            OpenResolution::Created { sid, acp_id } => {
-                if let Some(ring) = self.agent_ring_mut() {
-                    if let Some(slot) = ring.slot_by_index_mut(placeholder_index) {
-                        slot.server_session_id = Some(sid);
-                        slot.resume_id = acp_id;
-                        slot.state.status =
-                            Some("attaching to ACP agent via session server…".into());
-                    }
+                OpenResolution::Created { sid, acp_id } => {
+                    let slot = &mut ring.slots[pos];
+                    slot.server_session_id = Some(sid);
+                    slot.resume_id = acp_id;
+                    slot.state.status =
+                        Some("attaching to ACP agent via session server…".into());
                 }
-            }
-            OpenResolution::Attached(attached) => {
-                let mut iter = attached.into_iter();
-                // First attached session fills the placeholder in place.
-                if let Some(first) = iter.next() {
-                    if let Some(ring) = self.agent_ring_mut() {
-                        if let Some(slot) = ring.slot_by_index_mut(placeholder_index) {
-                            slot.label = first.label;
-                            slot.server_session_id = Some(first.sid);
-                            slot.resume_id = first.acp_id;
-                            slot.state.status = Some(first.status.into());
-                        }
+                OpenResolution::Attached(attached) => {
+                    let mut iter = attached.into_iter();
+                    // First attached session fills the placeholder in place.
+                    if let Some(first) = iter.next() {
+                        let slot = &mut ring.slots[pos];
+                        slot.label = first.label;
+                        slot.server_session_id = Some(first.sid);
+                        slot.resume_id = first.acp_id;
+                        slot.state.status = Some(first.status.into());
                     }
-                }
-                // Remaining sessions get their own slots.
-                for a in iter {
-                    let state = AgentState::new_server_managed(Some(a.status.into()));
-                    if let Some(ring) = self.agent_ring_mut() {
+                    // Remaining sessions get their own slots in the same ring.
+                    for a in iter {
+                        let state = AgentState::new_server_managed(Some(a.status.into()));
                         ring.push(a.label, state, a.acp_id, proc_cwd.clone(), Some(a.sid));
                     }
-                }
-                // Re-focus the first slot so the user lands on it, not the
-                // last-pushed one.
-                if let Some(ring) = self.agent_ring_mut() {
-                    if let Some(pos) = ring.slot_by_index(placeholder_index) {
-                        ring.active = pos;
-                    }
+                    // Land the user on the placeholder slot, not the last push.
+                    ring.active = pos;
                 }
             }
-        }
+        });
         self.save_agent_ring();
         cx.notify();
+    }
+
+    /// Run `f` on the agent ring holding the placeholder slot stamped with
+    /// `token` (see `AgentSlot::pending_open_token`), searching every tab and
+    /// pane. Returns whether a match was found. Lets an async server
+    /// open/create bind back to its originating slot regardless of which
+    /// window happens to be focused when the round-trip returns.
+    fn with_open_token_ring(&mut self, token: u64, f: impl FnOnce(&mut AgentRing)) -> bool {
+        let mut f = Some(f);
+        for tab in self.workspace.tabs.iter_mut() {
+            let found = tab.layout.find_map_leaf_content_mut(&mut |content| {
+                if let WindowContent::Agent(ring) = content {
+                    if ring.slots.iter().any(|s| s.pending_open_token == Some(token)) {
+                        if let Some(f) = f.take() {
+                            f(ring);
+                        }
+                        return Some(());
+                    }
+                }
+                None
+            });
+            if found.is_some() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Create a new session and add it to the existing ring. With `cwd =
@@ -10792,9 +10870,13 @@ impl SketchGpuiView {
             // sid is spliced in when the round-trip returns.
             let placeholder =
                 AgentState::new_server_managed(Some("connecting to session server…".into()));
+            let open_token = alloc_open_token();
             let ring = self.agent_ring_mut().unwrap();
-            let placeholder_index = ring.push(label.clone(), placeholder, None, slot_cwd.clone(), None);
-            self.spawn_create_agent_session(placeholder_index, label, slot_cwd, cx);
+            ring.push(label.clone(), placeholder, None, slot_cwd.clone(), None);
+            if let Some(slot) = ring.slots.last_mut() {
+                slot.pending_open_token = Some(open_token);
+            }
+            self.spawn_create_agent_session(open_token, label, slot_cwd, cx);
         } else {
             // Direct-spawn path.
             let state = self.create_agent_session(
@@ -10828,7 +10910,7 @@ impl SketchGpuiView {
     /// they return. No-op if the placeholder is gone by then.
     fn spawn_create_agent_session(
         &self,
-        placeholder_index: usize,
+        open_token: u64,
         label: String,
         cwd: PathBuf,
         cx: &mut Context<Self>,
@@ -10855,7 +10937,7 @@ impl SketchGpuiView {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.apply_open_agent_resolution(placeholder_index, resolution, cx);
+                this.apply_open_agent_resolution(open_token, resolution, cx);
             });
         })
         .detach();
@@ -10921,10 +11003,12 @@ impl SketchGpuiView {
             if let Some(old_sid) = old_sid {
                 self.spawn_close_session(old_sid, cx);
             }
+            let open_token = alloc_open_token();
             if let Some(ring) = self.agent_ring_mut() {
                 if let Some(slot) = ring.slots.get_mut(pos) {
                     slot.state.attach_pending = None;
                     slot.state.channel = None;
+                    slot.pending_open_token = Some(open_token);
                     let msg = format!(
                         "cwd → {}, connecting to fresh session…",
                         shorten_cwd_for_display(&new_cwd),
@@ -10934,7 +11018,7 @@ impl SketchGpuiView {
                 }
             }
             self.spawn_create_agent_session(
-                slot_index,
+                open_token,
                 "respawned".to_string(),
                 new_cwd.clone(),
                 cx,
@@ -14215,6 +14299,29 @@ impl SketchGpuiView {
             flat_items.truncate(j);
         }
 
+        // Coalesce a contiguous run of tool calls into ONE collapsible group
+        // so a long sequence (grep → grep → edit → read → …) doesn't flood the
+        // transcript. The blank anchor lines between adjacent tool calls were
+        // already stripped by the blank-collapse pass above, so a run shows up
+        // as directly-adjacent `ToolGroup`s; merge their ids into the first.
+        // Any prose Line, Block, or TurnHeader between two runs breaks the run
+        // (those are real content), so tool calls separated by agent text stay
+        // in separate groups. The merged group renders as a typed-count header
+        // (e.g. "4 grep, 3 edit, 7 read"), collapsed by default.
+        {
+            let mut merged: Vec<FlatItem> = Vec::with_capacity(flat_items.len());
+            for item in flat_items.drain(..) {
+                if let FlatItem::ToolGroup { ids, .. } = &item {
+                    if let Some(FlatItem::ToolGroup { ids: prev_ids, .. }) = merged.last_mut() {
+                        prev_ids.extend(ids.iter().cloned());
+                        continue;
+                    }
+                }
+                merged.push(item);
+            }
+            flat_items = merged;
+        }
+
         // Thinking indicator at the tail while waiting for Claude.
         if c.turn_phase.is_awaiting() {
             flat_items.push(FlatItem::ThinkingIndicator);
@@ -14494,7 +14601,23 @@ impl SketchGpuiView {
                                 base
                             }
                         } else {
-                            format!("Ran {} tool calls", count)
+                            // Typed summary of the run: count each tool label in
+                            // first-appearance order → "4 grep, 3 edit, 7 read".
+                            let mut order: Vec<String> = Vec::new();
+                            let mut counts: std::collections::HashMap<String, usize> =
+                                std::collections::HashMap::new();
+                            for tc in &calls {
+                                let label = tool_type_label(tc);
+                                if !counts.contains_key(&label) {
+                                    order.push(label.clone());
+                                }
+                                *counts.entry(label).or_insert(0) += 1;
+                            }
+                            order
+                                .iter()
+                                .map(|l| format!("{} {}", counts[l], l))
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         };
 
                         // For single-tool groups: determine if the inner tool
