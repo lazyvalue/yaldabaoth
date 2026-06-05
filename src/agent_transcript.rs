@@ -389,6 +389,29 @@ mod tests {
     }
 
     #[test]
+    fn worksheet_multiline_local_submit_echo_suppressed() {
+        // A worksheet submit joins its non-blank editable lines with '\n' and
+        // registers that JOINED body as a LocalSubmit (commit_worksheet_turn).
+        // The server then echoes the same multi-line body as a UserPrompt, and
+        // the agent may also echo it as a UserMessage — both must be suppressed
+        // so the in-place worksheet lines aren't re-rendered as an appended
+        // turn. `normalize_user_text` only trim_end()s, so internal newlines are
+        // preserved: this pins the join-vs-echo equivalence at the reconciler
+        // layer (the GUI seam can only cover the single-line case headlessly).
+        let mut m = Model::default();
+        m.user(UserTurnOrigin::LocalSubmit, "first line\nsecond line");
+        m.chunk(); // assistant streams BEFORE the echo (the hard ordering)
+        m.user(UserTurnOrigin::Echo, "first line\nsecond line"); // server UserPrompt
+        m.user(UserTurnOrigin::Echo, "first line\nsecond line"); // agent UserMessage, same turn
+        let users = user_rows(&m);
+        assert_eq!(users.len(), 1, "a multi-line worksheet submit must render exactly once");
+        assert_eq!(
+            users[0],
+            &Row::User { k: 1, text: "first line\nsecond line".into() }
+        );
+    }
+
+    #[test]
     fn direct_replay_identical_consecutive_turns_both_appear() {
         // On the direct-channel replay path each UserMessage is its own turn
         // (single source), so two identical consecutive replayed turns must

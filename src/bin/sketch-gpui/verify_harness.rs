@@ -572,3 +572,154 @@ fn cmd_b_toggles_file_browser_rail(cx: &mut TestAppContext) {
         "a second cmd-b must close the file-browser rail"
     );
 }
+
+// ---- Worksheet-submit double-render seam ---------------------------------
+//
+// The worksheet analogue of `agent_seam_suppresses_double_render_when_chunk_
+// precedes_echo`. `submit_worksheet` used to hand-compute its turn number and
+// freeze the authored lines WITHOUT routing through the reconciler, so the
+// server's `UserPrompt` echo of the same prompt was treated as a new turn and
+// re-rendered (the live worksheet double-render). The fix routes the submit
+// through `commit_worksheet_turn` -> `register_user_turn`, registering the
+// prompt as a `LocalSubmit` so the echo is content-matched and suppressed.
+//
+// We drive the dedup CORE (`commit_worksheet_turn`) directly rather than the
+// full `submit_worksheet`, because the latter only commits inside its `if sent`
+// branch and `sent` can never be true headlessly (no session-server daemon, no
+// real channel) — driving the entrypoint would pass VACUOUSLY. The negative
+// control below proves the assertion actually bites.
+
+/// Seed a single editable (unfrozen) line of `token` into the active agent
+/// slot's transcript editor and put it in Worksheet mode — the authored line a
+/// worksheet submit would freeze.
+#[cfg(test)]
+fn seed_worksheet_line(
+    view: &gpui::Entity<SketchGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    token: &str,
+) {
+    view.update(vcx, |v, _cx| {
+        let claude = v.agent_mut().expect("active agent slot");
+        claude.input_mode = crate::InputMode::Worksheet;
+        for ch in token.chars() {
+            claude.editor.insert_char(ch);
+        }
+    });
+}
+
+/// THE fix: a worksheet submit committed through `commit_worksheet_turn`
+/// suppresses the server `UserPrompt` echo, so the authored prompt renders
+/// exactly once even when an assistant chunk streams before the echo (the
+/// order the old suffix heuristic mishandled).
+#[gpui::test]
+fn agent_seam_worksheet_submit_suppresses_double_render(cx: &mut TestAppContext) {
+    use sketch::acp_channel::ReplyEvent;
+    use sketch::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    // A single editable line, so the joined prompt_body equals the echo body
+    // and suppression is by content identity (the multi-line join equivalence
+    // is pinned by the pure reconciler test in `agent_transcript`).
+    const TOKEN: &str = "WKSHT_PROMPT_TOKEN";
+    seed_worksheet_line(&view, &mut *vcx, TOKEN);
+
+    // Commit the worksheet submit through the shared reconciler core, exactly as
+    // `submit_worksheet` does on send-success: derive k, freeze line 0 in place,
+    // and register the prompt so the echo is suppressed.
+    view.update(vcx, |v, _cx| {
+        let claude = v.agent_mut().unwrap();
+        let collected = vec![(0usize, TOKEN.to_string())];
+        let k = claude.commit_worksheet_turn(&collected, TOKEN);
+        assert_eq!(k, Some(1), "first worksheet submit is turn 1");
+    });
+    assert_eq!(
+        active_transcript_text(&view, &mut *vcx).matches(TOKEN).count(),
+        1,
+        "authored worksheet line should appear once before the echo"
+    );
+
+    // Assistant streams FIRST, then the server's UserPrompt echo arrives. No
+    // TurnEnded before the echo — this is the live in-flight case where the
+    // reconciler must suppress on content identity alone.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            ServerNotification::ReplyEvent {
+                session_id: "S1".into(),
+                event: ReplyEvent::Chunk("assistant reply text".into()),
+            },
+            ServerNotification::UserPrompt {
+                session_id: "S1".into(),
+                text: TOKEN.into(),
+            },
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    let text = active_transcript_text(&view, &mut *vcx);
+    assert_eq!(
+        text.matches(TOKEN).count(),
+        1,
+        "worksheet prompt must render exactly once after the echo; transcript:\n{text}"
+    );
+    assert!(text.contains("assistant reply text"), "assistant chunk missing");
+}
+
+/// Negative control proving the test above is not vacuous: an authored
+/// worksheet line that is NOT registered with the reconciler (the pre-fix
+/// behavior) IS double-rendered by the very same echo. If suppression silently
+/// stopped working, the test above would still need this contrast to be
+/// trustworthy — here the echo is treated as a brand-new turn and appended.
+#[gpui::test]
+fn agent_seam_worksheet_unregistered_line_double_renders(cx: &mut TestAppContext) {
+    use sketch::acp_channel::ReplyEvent;
+    use sketch::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    const TOKEN: &str = "WKSHT_PROMPT_TOKEN";
+    seed_worksheet_line(&view, &mut *vcx, TOKEN);
+    // Deliberately DO NOT call commit_worksheet_turn / register_user_turn — the
+    // reconciler never learns this prompt was locally submitted.
+
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            ServerNotification::ReplyEvent {
+                session_id: "S1".into(),
+                event: ReplyEvent::Chunk("assistant reply text".into()),
+            },
+            ServerNotification::UserPrompt {
+                session_id: "S1".into(),
+                text: TOKEN.into(),
+            },
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    assert_eq!(
+        active_transcript_text(&view, &mut *vcx).matches(TOKEN).count(),
+        2,
+        "an un-registered worksheet prompt is double-rendered by the echo (the bug the \
+         reconciler chokepoint closes — this is what keeps the suppression test honest)"
+    );
+}

@@ -5307,14 +5307,18 @@ impl AgentState {
         k
     }
 
-    /// THE single chokepoint for inserting a user turn into the transcript.
-    /// All three announcement sites — the optimistic submit, the server
-    /// `UserPrompt` notification, and the agent's `UserMessage` echo — route
-    /// through here so de-duplication and turn-number attribution have exactly
-    /// one home instead of three drifting copies (the structural cause of the
-    /// double-render regressions). The pure [`UserTurnReconciler`] decides
-    /// insert-vs-skip by origin + content identity (order-independent),
-    /// replacing the position-dependent suffix heuristic.
+    /// THE single chokepoint for user-turn **dedup + turn-number attribution**.
+    /// All four announcement sites — the chatbox optimistic submit, the
+    /// worksheet submit, the server `UserPrompt` notification, and the agent's
+    /// `UserMessage` echo — route their reconcile through here so suppression
+    /// and `k`-derivation have exactly one home instead of drifting copies (the
+    /// structural cause of the double-render regressions). Returns `Some(k)` —
+    /// the canonical turn number the caller must COMMIT (freeze) however its
+    /// surface lays the turn out — or `None` to skip (the reconciler suppressed
+    /// an echo, or the M3 tripwire fired). The two commit shapes are
+    /// [`insert_user_turn`] (append at EOF) and [`commit_worksheet_turn`]
+    /// (freeze authored lines in place); both share this core so a worksheet
+    /// turn can never drift from a chatbox turn in numbering or dedup.
     ///
     /// `advance_boundary` must be `true` only for the direct-channel replay
     /// path (`!server_managed`), where there is no replayed `TurnEnded` to bump
@@ -5324,15 +5328,15 @@ impl AgentState {
     /// so a live or server turn can never wrongly drive the machine into replay
     /// mode. A *skipped* echo never advances the boundary — suppression and
     /// attribution stay decoupled.
-    fn insert_user_turn(
+    fn register_user_turn(
         &mut self,
         text: &str,
         origin: sketch::agent_transcript::UserTurnOrigin,
         advance_boundary: bool,
-    ) {
+    ) -> Option<usize> {
         use sketch::agent_transcript::UserTurnAction;
         match self.reconciler.reconcile(origin, text, advance_boundary) {
-            UserTurnAction::Skip => {}
+            UserTurnAction::Skip => None,
             UserTurnAction::Insert { advance_boundary } => {
                 let k = if advance_boundary {
                     self.advance_replay_user_boundary()
@@ -5353,11 +5357,66 @@ impl AgentState {
                         "[sketch-gpui] INVARIANT: TurnId::User({k}) already present; \
                          dropping duplicate user turn (text={text:?})"
                     );
-                    return;
+                    return None;
                 }
-                self.editor.freeze_as_user_turn(text, TurnId::User(k));
+                Some(k)
             }
         }
+    }
+
+    /// Insert a user turn into the transcript by APPENDING it at EOF — the
+    /// chatbox optimistic submit, the server `UserPrompt` notification, and the
+    /// agent's `UserMessage` echo all route here. Delegates dedup + attribution
+    /// to [`register_user_turn`] and commits an accepted turn via
+    /// `freeze_as_user_turn`. (Worksheet submits share the same core but freeze
+    /// in place — see [`commit_worksheet_turn`].)
+    fn insert_user_turn(
+        &mut self,
+        text: &str,
+        origin: sketch::agent_transcript::UserTurnOrigin,
+        advance_boundary: bool,
+    ) {
+        if let Some(k) = self.register_user_turn(text, origin, advance_boundary) {
+            self.editor.freeze_as_user_turn(text, TurnId::User(k));
+        }
+    }
+
+    /// Commit a Worksheet-mode submit: derive the canonical turn `k` through the
+    /// shared reconciler core ([`register_user_turn`]) — so the server/agent
+    /// echo of this prompt is content-matched and **suppressed** instead of
+    /// double-rendered — then freeze every collected line IN PLACE under
+    /// `TurnId::User(k)`. Worksheet freezes pre-existing, possibly
+    /// non-contiguous authored lines (blank spacers included) in document order,
+    /// so it does its own per-line freeze rather than the EOF-append
+    /// `freeze_as_user_turn`: the chokepoint supplies the *number*, the
+    /// worksheet supplies the *placement*.
+    ///
+    /// `prompt_body` MUST be the joined body actually sent (not the raw
+    /// per-line text): registering that is what lets `normalize_user_text` match
+    /// the single multi-line echo. Worksheet is a LOCAL submit exactly like the
+    /// chatbox, so `advance_boundary` is `false` and `k = current_turn()` (the
+    /// single source for the in-flight turn number, INV-3) — replacing the old
+    /// hand-rolled `last_seen_turns + 1`, which silently diverged from the
+    /// chokepoint and never armed dedup. Returns the committed `k`, or `None` if
+    /// the M3 tripwire fired (no lines frozen; the caller still clears/notifies).
+    fn commit_worksheet_turn(
+        &mut self,
+        collected: &[(usize, String)],
+        prompt_body: &str,
+    ) -> Option<usize> {
+        let k = self.register_user_turn(
+            prompt_body,
+            sketch::agent_transcript::UserTurnOrigin::LocalSubmit,
+            false,
+        )?;
+        for (l, _) in collected {
+            self.editor.add_frozen_lines(*l, *l + 1);
+            let anchor = self.editor.anchor_for_line(*l);
+            self.editor
+                .metadata_mut::<TurnId>()
+                .insert(anchor, TurnId::User(k));
+        }
+        Some(k)
     }
 
     /// Auto-scroll follow decision (F4, INV-13). In Chatbox mode the user's
@@ -12943,25 +13002,18 @@ impl SketchGpuiView {
             return;
         }
 
-        // Determine the new turn number. `last_seen_turns` counts
-        // completed turns; the next submit becomes turn k = last_seen + 1.
-        let turn_k = claude.last_seen_turns + 1;
-
-        // Freeze every collected line (blanks included) as part of turn k.
-        // Freeze line by line so the line range stays accurate even if
-        // editable lines are non-contiguous.
-        for (l, _) in &collected {
-            claude.editor.add_frozen_lines(*l, *l + 1);
-            let anchor = claude.editor.anchor_for_line(*l);
-            claude
-                .editor
-                .metadata_mut::<TurnId>()
-                .insert(anchor, TurnId::User(turn_k));
-        }
-
-        // Send and update bookkeeping.
+        // Send FIRST, then freeze the authored lines only on success — mirroring
+        // submit_chatbox. The old order computed `last_seen_turns + 1` by hand
+        // and froze the lines BEFORE the send check, which (a) bypassed the
+        // reconciler chokepoint so the server/agent echo of this prompt
+        // re-rendered it (the double-render bug) and (b) left a phantom frozen
+        // turn in place when the send failed. `collected`/`prompt_body` are
+        // owned, captured above, so they survive the agent re-borrow; the send
+        // is fire-and-forget over a socket and never touches the editor, so the
+        // captured line indices stay valid for the post-send freeze.
         let sent = if let Some(sid) = &server_sid {
-            // Server path: prompt via session server.
+            // Server path: prompt via session server (fire-and-forget; `Ok`
+            // means written, not accepted — ownership is reasserted on resume).
             self.session_server.as_ref()
                 .and_then(|s| s.prompt(sid, &prompt_body).ok())
                 .is_some()
@@ -12978,8 +13030,18 @@ impl SketchGpuiView {
 
         if sent {
             if let Some(claude) = self.agent_mut() {
+                // Derive `k` + arm dedup through the shared reconciler core and
+                // freeze the authored lines in place. Registering `prompt_body`
+                // as a LocalSubmit is what suppresses the echo. `None` means the
+                // M3 tripwire fired — leave the lines editable rather than
+                // freeze an unattributed turn.
+                claude.commit_worksheet_turn(&collected, &prompt_body);
                 claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
             }
+        } else if let Some(claude) = self.agent_mut() {
+            // Send failed: keep the authored lines editable so the user can
+            // retry, and surface it rather than dropping the prompt silently.
+            claude.status = Some("send failed — reconnecting; press ⏎ to retry".into());
         }
         if let Some(claude) = self.agent_mut() {
             claude.editor.clear_selection();
