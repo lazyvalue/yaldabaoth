@@ -79,6 +79,20 @@ impl ManagedSession {
         }
     }
 
+    /// Record that an event happened: append it to the durable `event_log`
+    /// (source of truth) **and** fire the broadcast wake in one step. This is
+    /// the single mutator for "a logged event happened" — every log+broadcast
+    /// site routes through here so the two writes can never skew (one appended
+    /// without waking subscribers, or one broadcast without being logged).
+    ///
+    /// The `OwnerChanged` broadcast-only path (`broadcast_owner_changed`) is
+    /// deliberately NOT routed through here: it is transient connection state,
+    /// not transcript, and must never land in `event_log`.
+    fn record(&mut self, note: Notification) {
+        Arc::make_mut(&mut self.event_log).push(note.clone());
+        let _ = self.event_tx.send(note);
+    }
+
     /// Broadcast an `OwnerChanged` to all attached connections. Not appended
     /// to `event_log` — ownership is transient connection state, not part of
     /// the conversation transcript a late observer needs to replay.
@@ -280,12 +294,10 @@ impl SessionManager {
                                     // configured mode silently reverts on resume.
                                     client.set_permission_mode(s.permission_mode);
                                     s.channel = Some(client);
-                                    let note = Notification::SessionAttached {
+                                    s.record(Notification::SessionAttached {
                                         session_id: session_id.clone(),
                                         acp_session_id: new_acp_id,
-                                    };
-                                    Arc::make_mut(&mut s.event_log).push(note.clone());
-                                    let _ = s.event_tx.send(note);
+                                    });
                                 }
                             }
                             spawn_pump_thread(Arc::clone(&manager), session_id);
@@ -297,12 +309,10 @@ impl SessionManager {
                             );
                             let mut sessions = manager.sessions.lock().unwrap();
                             if let Some(s) = sessions.get_mut(&session_id) {
-                                let note = Notification::SessionDetached {
+                                s.record(Notification::SessionDetached {
                                     session_id: session_id.clone(),
                                     reason: format!("resume failed: {e}"),
-                                };
-                                Arc::make_mut(&mut s.event_log).push(note.clone());
-                                let _ = s.event_tx.send(note);
+                                });
                             }
                         }
                     }
@@ -394,12 +404,10 @@ impl SessionManager {
                                 // freshly spawned channel (defaults otherwise).
                                 client.set_permission_mode(s.permission_mode);
                                 s.channel = Some(client);
-                                let note = Notification::SessionAttached {
+                                s.record(Notification::SessionAttached {
                                     session_id: session_id.clone(),
                                     acp_session_id: acp_id,
-                                };
-                                Arc::make_mut(&mut s.event_log).push(note.clone());
-                                let _ = s.event_tx.send(note);
+                                });
                             }
                         }
                         // Start the pump thread now that the channel is live.
@@ -408,12 +416,10 @@ impl SessionManager {
                     Err(e) => {
                         let mut sessions = manager.sessions.lock().unwrap();
                         if let Some(s) = sessions.get_mut(&session_id) {
-                            let note = Notification::SessionDetached {
+                            s.record(Notification::SessionDetached {
                                 session_id: session_id.clone(),
                                 reason: format!("spawn failed: {e}"),
-                            };
-                            Arc::make_mut(&mut s.event_log).push(note.clone());
-                            let _ = s.event_tx.send(note);
+                            });
                         }
                     }
                 }
@@ -614,12 +620,10 @@ impl SessionManager {
                             let old = s.channel.take();
                             s.channel = Some(client);
                             s.channel_generation = s.channel_generation.wrapping_add(1);
-                            let note = Notification::SessionAttached {
+                            s.record(Notification::SessionAttached {
                                 session_id: sid.clone(),
                                 acp_session_id: acp_id,
-                            };
-                            Arc::make_mut(&mut s.event_log).push(note.clone());
-                            let _ = s.event_tx.send(note);
+                            });
                             old
                         };
                         drop(old);
@@ -627,12 +631,10 @@ impl SessionManager {
                     Err(e) => {
                         let mut sessions = manager.sessions.lock().unwrap();
                         if let Some(s) = sessions.get_mut(&sid) {
-                            let note = Notification::SessionDetached {
+                            s.record(Notification::SessionDetached {
                                 session_id: sid.clone(),
                                 reason: format!("restart failed: {e}"),
-                            };
-                            Arc::make_mut(&mut s.event_log).push(note.clone());
-                            let _ = s.event_tx.send(note);
+                            });
                         }
                     }
                 }
@@ -721,12 +723,10 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
 
                 // Check liveness.
                 if !channel.is_connected() {
-                    let note = Notification::SessionDetached {
+                    session.record(Notification::SessionDetached {
                         session_id: session_id.clone(),
                         reason: "agent disconnected".into(),
-                    };
-                    Arc::make_mut(&mut session.event_log).push(note.clone());
-                    let _ = session.event_tx.send(note);
+                    });
                     session.channel = None;
                     return;
                 }
@@ -758,6 +758,18 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                 // counter past what we last reported. Mirrors the direct
                 // path in sketch-gpui's per-session pump.
                 let turn_ended = !more_pending && current_turns > last_turns;
+
+                // If the turn ended, drain any tail events that landed between
+                // our budget drain and the `turn_count()` read *now*, while the
+                // `&session.channel` borrow is still free. Collecting here ends
+                // that borrow before the `session.record` calls below (which
+                // need `&mut session`); the tail is recorded after the budget
+                // events and before TurnEnded, preserving log order.
+                let tail_events: Vec<sketch::acp_channel::ReplyEvent> = if turn_ended {
+                    std::iter::from_fn(|| channel.try_recv()).collect()
+                } else {
+                    Vec::new()
+                };
 
                 // ── Replay fence: suppress duplicate events ──────────
                 // When a session is restored from disk, the persisted
@@ -801,34 +813,27 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                             eprintln!("[chunklog srv] {t:?}");
                         }
                     }
-                    let note = Notification::ReplyEvent {
+                    session.record(Notification::ReplyEvent {
                         session_id: session_id.clone(),
                         event: ev,
-                    };
-                    Arc::make_mut(&mut session.event_log).push(note.clone());
-                    let _ = session.event_tx.send(note);
+                    });
                 }
 
                 if turn_ended {
-                    // Drain any tail events that landed between our budget
-                    // drain and the `turn_count()` read so they reach the
-                    // GUI before the TurnEnded that closes the turn.
-                    while let Some(ev) = channel.try_recv() {
-                        let note = Notification::ReplyEvent {
+                    // Tail events were drained above (while the channel borrow
+                    // was free); record them before TurnEnded closes the turn.
+                    for ev in tail_events {
+                        session.record(Notification::ReplyEvent {
                             session_id: session_id.clone(),
                             event: ev,
-                        };
-                        Arc::make_mut(&mut session.event_log).push(note.clone());
-                        let _ = session.event_tx.send(note);
+                        });
                     }
                     last_turns = current_turns;
                     session.turns = current_turns;
-                    let note = Notification::TurnEnded {
+                    session.record(Notification::TurnEnded {
                         session_id: session_id.clone(),
                         turn_count: current_turns,
-                    };
-                    Arc::make_mut(&mut session.event_log).push(note.clone());
-                    let _ = session.event_tx.send(note);
+                    });
                 }
 
                 drop(sessions);
