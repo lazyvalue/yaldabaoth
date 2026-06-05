@@ -209,13 +209,18 @@ verifiable.
 ### Phase A — Pure, front-loaded, low/med risk (unit-testable, no behavior change)
 1. **`replay_turns` owns its fields.** `AgentState` holds one `ReplayTurns`
    (not loose `last_seen_turns`/`replay_turn`); delete the copy-in/out view
-   reconstruction. **Route the worksheet submit's `k`-derivation + reconciler/
-   `user_turn_ks` registration through `current_turn()`** — *not* through the
-   text-based `insert_user_turn` (worksheet freezes non-contiguous in-place
-   lines, so it needs the same single-`k` source + tripwire coverage **without**
-   the text path). *Fixes the live worksheet double-render.* Verify: new unit
-   test that a worksheet submit with `replay_turn>0` attributes via
-   `current_turn()`; existing reconciler/turn tests stay green.
+   reconstruction. *(Field-ownership refactor still **open**.)*
+   - ✅ **Worksheet submit now routes through the reconciler chokepoint**
+     (`a6f2829`). Extracted `register_user_turn() -> Option<k>` (reconcile +
+     `current_turn()` k-derivation + `user_turn_ks` tripwire) as the shared
+     core; `insert_user_turn` appends, the new `commit_worksheet_turn` freezes
+     authored lines in place. `submit_worksheet` dropped its hand-rolled
+     `last_seen_turns + 1` and sends-first/commits-on-success (also closing a
+     freeze-on-failed-send phantom). *Fixed the live worksheet double-render.*
+     Tests: `agent_seam_worksheet_submit_suppresses_double_render` + a
+     non-vacuous negative control + a pure multi-line reconciler test. ⚠️ The
+     send-first reorder is a send-FAILURE behavior change the headless harness
+     can't verify — **owes a human GUI runtime check**.
 2. **`overlay`: 5 `Option`s → `ActiveOverlay` enum.** Verify: unit test on
    open-replaces-not-stacks + clear.
 3. **`settings` module.** Add `text_scale`/font persistence; **consolidate** the
@@ -275,8 +280,10 @@ Front-loaded by leverage and verifiability.
 2. `[x]` **Keymap extraction → headless action smokes** (Phase 0.2, `704e13d`).
    Highest non-CI leverage — unblocks verifying every GUI change. Rail smoke
    (`cmd_b_toggles_file_browser_rail`) landed as the first one.
-3. `[ ]` **Worksheet double-render fix** (Phase A.1, the `replay_turns`/worksheet
-   part). Concrete live bug; closes the "single chokepoint with two doors."
+3. `[x]` **Worksheet double-render fix** (Phase A.1 worksheet part, `a6f2829`).
+   Closed the "single chokepoint with two doors": `register_user_turn` core +
+   `commit_worksheet_turn`. (The `replay_turns` field-ownership refactor — the
+   other half of A.1 — remains; see item 6.) ⚠️ owes a human runtime check.
 4. `[ ]` Turn on `clippy -D warnings` + `fmt --check` in CI once the 8 existing
    warnings are cleared (uncomment the staged `quality` job).
 
@@ -285,7 +292,8 @@ Front-loaded by leverage and verifiability.
    D4 durability · D5 cwd migration · D6 metadata store + crate boundary.
 
 **Pure extractions (Phase A — each behind CI, no behavior change):**
-6. `[ ]` `replay_turns` owns its fields (A.1) →
+6. `[ ]` `replay_turns` owns its fields (A.1 field-ownership half; the
+   worksheet-routing half landed — item 3) →
    `overlay` enum (A.2) → `settings` (A.3) → `persistence` (A.4) →
    `buffer_pool` (A.5a) → `DocState` auto-derived blocks (A.5b) →
    `tool_calls` (A.6) → `agent_view_model` (A.7) →
