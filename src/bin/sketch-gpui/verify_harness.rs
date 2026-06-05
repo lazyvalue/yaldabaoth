@@ -357,6 +357,151 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
     );
 }
 
+// ---- M0: agent pump/reconciler SEAM tests --------------------------------
+//
+// The double-render and resume bugs both lived in the seam between the pure
+// reconciler (unit-tested in `agent_transcript`) and the impure server pump
+// (`apply_server_batch`) + bind (`apply_open_agent_resolution`). These drive
+// the REAL pump path through a headless view so a regression in the wiring —
+// not just the pure logic — is caught here.
+
+/// Install an agent screen on `view` with one server-managed slot, optionally
+/// bound to `server_sid`. Returns nothing; the active slot is the new one.
+#[cfg(test)]
+fn install_agent_slot(
+    view: &gpui::Entity<SketchGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    server_sid: Option<&str>,
+) {
+    use crate::{AgentRing, AgentState, WindowContent};
+    let sid = server_sid.map(|s| s.to_string());
+    view.update(vcx, |v, _cx| {
+        let mut ring = AgentRing::new(None);
+        let state = AgentState::new_server_managed(None);
+        ring.push("claude-1".into(), state, None, PathBuf::from("."), sid);
+        v.set_screen(WindowContent::Agent(ring));
+    });
+}
+
+#[cfg(test)]
+fn active_transcript_text(
+    view: &gpui::Entity<SketchGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+) -> String {
+    view.update(vcx, |v, _cx| {
+        v.agent_mut()
+            .map(|c| c.editor.document().full_text())
+            .unwrap_or_default()
+    })
+}
+
+/// The double-render regression, driven through the REAL `apply_server_batch`:
+/// an assistant chunk streams BEFORE the server replays the user-prompt echo
+/// (the exact order the old suffix dedup mishandled). The user's text must
+/// appear exactly once.
+#[gpui::test]
+fn agent_seam_suppresses_double_render_when_chunk_precedes_echo(cx: &mut TestAppContext) {
+    use sketch::acp_channel::ReplyEvent;
+    use sketch::agent_transcript::UserTurnOrigin;
+    use sketch::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    view.update(vcx, |v, cx| {
+        // What submit_chatbox does on send success: optimistic echo of "hello".
+        v.agent_mut()
+            .unwrap()
+            .insert_user_turn("hello", UserTurnOrigin::LocalSubmit, false);
+        // Assistant streams FIRST, then the server's UserPrompt echo arrives.
+        let batch = vec![
+            ServerNotification::ReplyEvent {
+                session_id: "S1".into(),
+                event: ReplyEvent::Chunk("world response text".into()),
+            },
+            ServerNotification::UserPrompt {
+                session_id: "S1".into(),
+                text: "hello".into(),
+            },
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    let text = active_transcript_text(&view, &mut *vcx);
+    assert_eq!(
+        text.matches("hello").count(),
+        1,
+        "user input must render exactly once; transcript was:\n{text}"
+    );
+    assert!(text.contains("world response text"), "assistant chunk missing");
+}
+
+/// The resume routing-drop invariant: a ReplyEvent whose `session_id` has no
+/// bound slot is dropped (this is WHY the bind must precede the attach/replay),
+/// and once the slot is bound the same event routes into it. This is the seam
+/// the bind-before-attach restructure relies on.
+#[gpui::test]
+fn agent_seam_routes_reply_only_after_session_is_bound(cx: &mut TestAppContext) {
+    use sketch::acp_channel::ReplyEvent;
+    use sketch::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    // Slot exists but is NOT yet bound to any server session id.
+    install_agent_slot(&view, &mut *vcx, None);
+
+    // Pre-bind: an event for "S1" can't route — it is dropped, not buffered.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::ReplyEvent {
+                session_id: "S1".into(),
+                event: ReplyEvent::Chunk("early-dropped".into()),
+            }],
+            cx,
+        );
+    });
+    assert!(
+        !active_transcript_text(&view, &mut *vcx).contains("early-dropped"),
+        "an event for an unbound session must not route (this is the drop the \
+         bind-before-attach restructure exists to avoid)"
+    );
+
+    // Bind the slot (what apply_open_agent_resolution does), then re-feed.
+    view.update(vcx, |v, _cx| {
+        v.agent_ring_mut().unwrap().slots[0].server_session_id = Some("S1".into());
+    });
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::ReplyEvent {
+                session_id: "S1".into(),
+                event: ReplyEvent::Chunk("late-routed".into()),
+            }],
+            cx,
+        );
+    });
+    assert!(
+        active_transcript_text(&view, &mut *vcx).contains("late-routed"),
+        "once bound, the session's events must route into its slot"
+    );
+}
+
 // NEXT STONE (not yet built): action-level smokes (e.g. simulate "cmd-b",
 // assert the rail opens beside the focused pane). Blocked on a small
 // enablement refactor — the keymap is currently registered inline in `main()`'s
