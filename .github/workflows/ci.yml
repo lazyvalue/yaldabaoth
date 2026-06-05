@@ -1,0 +1,40 @@
+name: CI
+
+# The most minimal gate that would have caught the regression class: every push
+# and PR must COMPILE (both binaries) and PASS TESTS. Nothing more, on purpose —
+# a green-from-day-one gate that turns "a human happens to run the app" into "the
+# machine checked it." Tighten later (see the commented `quality` job below).
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref so a fast push series doesn't queue up.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    # macOS matches the GPUI/darwin target the app actually ships on, and avoids
+    # the Linux GPUI system-dep rabbit hole. Keep it single-OS for minimality.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2 # caches ~/.cargo + target/, keeps runs fast
+      - name: CI gate (build + test)
+        run: bash scripts/ci.sh # same gate as the local .githooks/pre-push hook
+
+  # ── Next tightening (uncomment once the 8 existing warnings are cleared and
+  # the tree is `cargo fmt`-clean, so the gate stays green) ───────────────────
+  #
+  # quality:
+  #   runs-on: macos-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         components: rustfmt, clippy
+  #     - uses: Swatinem/rust-cache@v2
+  #     - run: cargo fmt --all --check
+  #     - run: cargo clippy --all-targets -- -D warnings

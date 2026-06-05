@@ -13,6 +13,19 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
 
 ## Top priority
 
+- **State-first architecture overhaul** — `NEEDS-DECISION`. Root-cause fix for
+  the constant-regression class (30% of state is hand-synced caches/copies). Full
+  state→owner map (162 items), 20-module state-first decomposition, 6 gating
+  decisions (ADRs), and a phased, individually-verifiable migration plan in
+  `docs/specs/spec-state-architecture.md` (+ Appendix A inventory). Immediate
+  items: CI gate (done), keymap-extraction → headless action smokes, worksheet
+  double-render fix. Blocked on D1–D6 for Phase B.
+
+- **CI gate** — `READY`. Minimal `build --bins + test` on push/PR
+  (`.github/workflows/ci.yml`), merging via the `arch-overhaul` branch. Turns the
+  human from the only oracle into the fallback. Next: `clippy -D warnings` +
+  `fmt --check` once the 8 existing warnings clear.
+
 - **Verification harness** — `READY`. Highest leverage: agents can't drive the
   GPUI app, so everything is human-verified. Build a headless/scripted render +
   golden screenshots, a realistic-size perf bench as a gate, and a scripted-input
