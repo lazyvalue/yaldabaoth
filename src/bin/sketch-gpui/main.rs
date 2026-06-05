@@ -4113,8 +4113,12 @@ const SUBAGENT_TOOL_NAMES: &[&str] = &["Task", "Subagent", "Spawn"];
 
 /// Sketch-side classification of a `ToolCall` that represents a sub-agent
 /// transcript (§26). Produced by the heuristic in `classify_subagent`; the
-/// `Subagents` sidepane lists these, and `focused_subagent` indexes into
-/// `AgentState.subagents` to swap the main transcript view.
+/// `Subagents` sidepane lists these, and `focused_subagent` keys into the
+/// derived list (by `tool_call_id`) to swap the main transcript view.
+///
+/// Not stored: `AgentState::subagents()` derives this list on demand by
+/// folding over `tool_call_order` + `tool_calls`, so it can never drift
+/// from the underlying tool-call state (ADR-0006 quick win #1).
 #[derive(Clone)]
 struct SubAgent {
     /// Originating tool-call id. The tool call itself stays in
@@ -4126,9 +4130,6 @@ struct SubAgent {
     label: String,
     /// Mirrors the underlying tool call's status.
     status: sketch::acp_channel::ToolCallStatus,
-    /// Accumulated content blocks. Sketch caps these to the same per-
-    /// payload budget as main-transcript tool calls (§26).
-    transcript: Vec<sketch::acp_channel::ToolCallContent>,
 }
 
 /// Heuristic classifier (§25). v1: anything with `kind == ToolKind::Other`
@@ -4158,7 +4159,6 @@ fn classify_subagent(tc: &sketch::acp_channel::ToolCall) -> Option<SubAgent> {
         tool_call_id: ToolCallKey::from_id(&tc.tool_call_id),
         label,
         status: tc.status,
-        transcript: tc.content.clone(),
     })
 }
 
@@ -5029,15 +5029,15 @@ struct AgentState {
     /// when the upstream `unstable_session_usage` feature is on; otherwise
     /// stays `None` and the Status Strip omits these fields per §30.
     usage: Option<sketch::acp_channel::UsageSnapshot>,
-    /// Classified sub-agents — `ToolCall`s the heuristic flagged as
-    /// representing a sub-agent transcript (§25–§26). Ordered by
-    /// first-seen. Each carries the originating tool-call id, label,
-    /// status mirror, and accumulated content.
-    subagents: Vec<SubAgent>,
-    /// Index into `subagents` of the currently focused sub-agent. When
-    /// `Some`, the main transcript area swaps to show that sub-agent's
-    /// content instead of the root agent's (§27).
-    focused_subagent: Option<usize>,
+    /// `tool_call_id` of the currently focused sub-agent. When `Some`, the
+    /// main transcript area swaps to show that sub-agent's content instead
+    /// of the root agent's (§27). Keyed by a stable `ToolCallKey` rather
+    /// than a positional index so it survives any reordering of the derived
+    /// `subagents()` list (ADR-0006 quick win #1).
+    ///
+    /// The sub-agent list itself is NOT stored — see `subagents()`, which
+    /// derives it from `tool_call_order` + `tool_calls`.
+    focused_subagent: Option<ToolCallKey>,
     /// Whether auto-scroll should follow new output. Defaults to `true`
     /// (pinned to bottom). Set to `false` when the user scrolls up in the
     /// transcript, re-enabled when they scroll back to the bottom or send
@@ -5074,6 +5074,20 @@ struct AgentState {
 }
 
 impl AgentState {
+    /// Derived list of classified sub-agents (§25–§26), folded over
+    /// `tool_call_order` + `tool_calls` in first-seen order. This is a pure
+    /// projection of the tool-call state — there is no stored mirror to keep
+    /// in sync, so it can never drift (ADR-0006 quick win #1). Each entry
+    /// carries the originating tool-call id, label, and status, all read
+    /// live from the underlying `ToolCall`.
+    fn subagents(&self) -> Vec<SubAgent> {
+        self.tool_call_order
+            .iter()
+            .filter_map(|id| self.tool_calls.get(id))
+            .filter_map(classify_subagent)
+            .collect()
+    }
+
     /// Fingerprint of the structural inputs to the `render_agent`
     /// view-model (flat_items + gutter). Two renders with an equal
     /// fingerprint produce byte-identical flat_items/gutter, so the
@@ -5188,7 +5202,6 @@ impl AgentState {
             current_plan: None,
             agent_mode: None,
             usage: None,
-            subagents: Vec::new(),
             focused_subagent: None,
             tasklist_open: false,
             subagents_open: false,
@@ -5241,7 +5254,6 @@ impl AgentState {
             current_plan: None,
             agent_mode: None,
             usage: None,
-            subagents: Vec::new(),
             focused_subagent: None,
             tasklist_open: false,
             subagents_open: false,
@@ -5439,7 +5451,6 @@ impl AgentState {
         self.view_model_seq = 0;
         self.highlight_cache = HighlightCache::new();
         self.current_plan = None;
-        self.subagents.clear();
         self.focused_subagent = None;
         self.usage = None;
     }
@@ -11479,7 +11490,6 @@ impl SketchGpuiView {
             current_plan: None,
             agent_mode: None,
             usage: None,
-            subagents: Vec::new(),
             focused_subagent: None,
             tasklist_open: false,
             subagents_open: false,
@@ -12283,12 +12293,9 @@ impl SketchGpuiView {
                         .editor
                         .metadata_mut::<TurnId>()
                         .insert(anchor, TurnId::Tool(current_turn));
-                    // Sub-agent classification (§25). Flat — nested tool
-                    // calls also classify here and become top-level
-                    // sub-agent entries.
-                    if let Some(sa) = classify_subagent(&tc) {
-                        claude.subagents.push(sa);
-                    }
+                    // Sub-agent classification (§25) is derived on demand
+                    // from `tool_call_order` + `tool_calls` — see
+                    // `AgentState::subagents()`. Nothing to push here.
                     if !claude.tool_calls.contains_key(&id) {
                         claude.tool_call_order.push(id.clone());
                     }
@@ -12299,17 +12306,9 @@ impl SketchGpuiView {
                     if let Some(existing) = claude.tool_calls.get_mut(&id) {
                         existing.update(upd.fields);
                         cap_tool_call_payloads(existing);
-                        // Keep sub-agent mirror up to date: status +
-                        // accumulated content. Done after the mutation
-                        // so the latest state lands in the sidepane.
-                        if let Some(sa) = claude
-                            .subagents
-                            .iter_mut()
-                            .find(|s| s.tool_call_id == id)
-                        {
-                            sa.status = existing.status;
-                            sa.transcript = existing.content.clone();
-                        }
+                        // No sub-agent mirror to update: `subagents()`
+                        // derives label + status live from the tool call we
+                        // just mutated (ADR-0006 quick win #1).
                     } else {
                         // Update arrived for a tool call we never saw the
                         // start for (rare, but possible if the worker
@@ -12327,9 +12326,8 @@ impl SketchGpuiView {
                             .editor
                             .metadata_mut::<TurnId>()
                             .insert(anchor, TurnId::Tool(current_turn));
-                        if let Some(sa) = classify_subagent(&tc) {
-                            claude.subagents.push(sa);
-                        }
+                        // Sub-agent entry (if any) is derived by
+                        // `subagents()` from the maps below.
                         claude.tool_call_order.push(id.clone());
                         claude.tool_calls.insert(id, tc);
                     }
@@ -12584,12 +12582,15 @@ impl SketchGpuiView {
         cx.notify();
     }
 
-    /// Set focused sub-agent index (§27). The main transcript swap is
-    /// purely a render-time decision; this just flips the field.
-    fn focus_subagent(&mut self, idx: usize, cx: &mut Context<Self>) {
+    /// Set the focused sub-agent by its stable tool-call key (§27). The
+    /// main transcript swap is purely a render-time decision; this just
+    /// flips the field. Keying by `ToolCallKey` (not a positional index)
+    /// keeps focus pinned to the same sub-agent regardless of how the
+    /// derived `subagents()` list is ordered (ADR-0006 quick win #1).
+    fn focus_subagent(&mut self, key: ToolCallKey, cx: &mut Context<Self>) {
         if let Some(c) = self.agent_mut() {
-            if idx < c.subagents.len() {
-                c.focused_subagent = Some(idx);
+            if c.tool_calls.contains_key(&key) {
+                c.focused_subagent = Some(key);
             }
         }
         cx.notify();
@@ -15088,8 +15089,8 @@ impl SketchGpuiView {
         }
 
         // Sub-agent breadcrumb (only when focused).
-        if let Some(idx) = c.focused_subagent {
-            if let Some(sa) = c.subagents.get(idx) {
+        if let Some(key) = c.focused_subagent.as_ref() {
+            if let Some(sa) = c.tool_calls.get(key).and_then(classify_subagent) {
                 let crumb = format!(" ⏵ {} ◂", sa.label);
                 strip = strip.child(
                     div()
@@ -15241,7 +15242,7 @@ impl SketchGpuiView {
             // Subagents segment — show in-progress agents with glyphs.
             let agents_text: String = {
                 let active: Vec<String> = c
-                    .subagents
+                    .subagents()
                     .iter()
                     .filter(|sa| {
                         matches!(
@@ -15629,7 +15630,8 @@ impl SketchGpuiView {
                     .font_weight(FontWeight::BOLD)
                     .child(SharedString::new_static("Subagents")),
             );
-            if c.subagents.is_empty() {
+            let subagents = c.subagents();
+            if subagents.is_empty() {
                 pane = pane.child(
                     div()
                         .px_2()
@@ -15639,8 +15641,8 @@ impl SketchGpuiView {
                 );
             } else {
                 use sketch::acp_channel::ToolCallStatus;
-                let focused_idx = c.focused_subagent;
-                for (i, sa) in c.subagents.iter().enumerate() {
+                let focused_key = c.focused_subagent.clone();
+                for (i, sa) in subagents.iter().enumerate() {
                     let glyph: &'static str = match sa.status {
                         ToolCallStatus::Completed => "✓",
                         ToolCallStatus::Failed => "✗",
@@ -15655,7 +15657,7 @@ impl SketchGpuiView {
                         sa.label.clone()
                     };
                     let row_text = format!("▸ {} {}", glyph, trunc_label);
-                    let is_focused = focused_idx == Some(i);
+                    let is_focused = focused_key.as_ref() == Some(&sa.tool_call_id);
                     let row_fg: Hsla = if is_focused {
                         nc(at.warm_accent)
                     } else {
@@ -15669,6 +15671,7 @@ impl SketchGpuiView {
                         rgba(0x00000000).into()
                     };
                     let weak = cx.entity().downgrade();
+                    let row_key = sa.tool_call_id.clone();
                     let row = div()
                         .id(SharedString::from(format!("subagent-row-{}", i)))
                         .px_2()
@@ -15677,8 +15680,9 @@ impl SketchGpuiView {
                         .text_color(row_fg)
                         .bg(row_bg)
                         .on_click(move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
+                            let key = row_key.clone();
                             let _ = weak.update(app, |this, cx| {
-                                this.focus_subagent(i, cx);
+                                this.focus_subagent(key, cx);
                             });
                         })
                         .child(SharedString::from(row_text));
