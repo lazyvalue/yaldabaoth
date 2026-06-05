@@ -183,15 +183,14 @@ impl FileBrowser {
 
     pub fn set_filter(&mut self, text: &str) {
         self.filter_text = text.to_string();
-        self.update_search();
+        self.rebuild_filtered();
         self.selected = 0;
     }
 
     pub fn clear_filter(&mut self) {
         self.filter_text.clear();
-        self.filtered_indices.clear();
-        self.search_results.clear();
         self.filter_mode = false;
+        self.rebuild_filtered();
         self.selected = 0;
     }
 
@@ -202,23 +201,20 @@ impl FileBrowser {
     pub fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
         self.refresh();
-        if !self.filter_text.is_empty() {
-            self.update_search();
-        }
         self.selected = 0;
     }
 
     pub fn cycle_sort(&mut self) {
         self.sort_order = self.sort_order.cycle();
         self.refresh();
-        if !self.filter_text.is_empty() {
-            self.update_search();
-        }
         self.selected = 0;
     }
 
+    /// Reload `entries` from disk, then rebuild the derived filtered/search
+    /// lists so they always reflect the current `(entries, filter_text)`.
     fn refresh(&mut self) {
         self.entries = Self::list_directory(&self.current_dir, self.show_hidden, self.sort_order);
+        self.rebuild_filtered();
     }
 
     fn list_directory(dir: &Path, show_hidden: bool, sort_order: SortOrder) -> Vec<BrowserEntry> {
@@ -289,13 +285,28 @@ impl FileBrowser {
         result
     }
 
-    /// Recursively search for files matching the query.
-    fn update_search(&mut self) {
+    /// Single source of truth for the two derived lists. Rebuilds both
+    /// `filtered_indices` (indices into `entries` whose name matches the
+    /// filter) and `search_results` (recursive matches) from the current
+    /// `(entries, filter_text)`. Call this at every filter/dir-change site.
+    fn rebuild_filtered(&mut self) {
+        self.filtered_indices.clear();
         self.search_results.clear();
         if self.filter_text.is_empty() {
             return;
         }
         let query = self.filter_text.to_lowercase();
+
+        // Shallow filter over the current directory's entries.
+        self.filtered_indices = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.name.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect();
+
+        // Recursive search results.
         Self::search_recursive(
             &self.current_dir,
             &self.current_dir,
