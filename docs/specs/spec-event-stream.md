@@ -1,8 +1,11 @@
 # Spec: Agent event-stream foundation
 
-- **Status:** Revised — hardening pass 1. The 9 holes from the first adversarial
-  review are resolved below (§10 maps each). Pending one adversarial
-  re-validation before it becomes the implementation blueprint.
+- **Status:** Revised — hardening pass 2. Pass 1 resolved the 9 original holes;
+  an adversarial re-validation found them holding at 7/9 but flagged two
+  under-specified seams (server-restart authority, ownerless compaction) plus
+  plumbing blast-radius. Pass 2 closes those (§5, §6, §10 pass-2 table, §12).
+  **Design-level solid**; the remaining items are implementation-time plumbing,
+  enumerated in §12.
 - **Date:** 2026-06-05
 - **Provenance:** 4-aspect parallel review → architect synthesis → adversarial
   critique (verdict: needs-revision) → this hardening pass.
@@ -111,6 +114,12 @@ scheduling can make them disagree. This is principle "one atomic mutator per
 coupled invariant" applied to `(seq, enqueue, log, watermark)`. The slow-
 subscriber guard (§6) is therefore a synchronized, deterministic read, not racy.
 
+**The critical section is `await`-free** — a std `Mutex` held across an `.await`
+is the documented pump footgun. `emit()` does only seq/turn-assign + enqueue
+(and, on the server, log-append + broadcast + watermark-read) and returns. On the
+server this *lengthens* the existing `sessions`-lock section that `record()`
+already holds, so it must stay short and await-free (§11).
+
 ---
 
 ## 4. Generation lifecycle — ride the first event (resolves H1)
@@ -131,6 +140,16 @@ whose `generation` is strictly greater than its current one MUST run
 guarantees that bump arrives first; the rule still holds if any later event is
 the first observed (idempotent reset). This single rule replaces the server-pump
 reset and closes the post-respawn wedge identically on the server and direct paths.
+
+**Emission site (precise — resolves N2):** `ChannelOpened` is emitted from the
+connection closure *before* the worker sends `session/load`/`session/new` (~`acp_channel.rs:1135`,
+before `:1268`) — **not** from the notification handler, which can fire the
+instant the load RPC is in flight and would race the agent's first replay chunk.
+**Generation allocation:** the *server* allocates `generation` (monotonic per
+session, persisted with it) and passes it to `spawn_with_resume_in(.., generation)`
+at **all three** spawn sites — create (`main.rs:374`), restore (`:280`), and
+force-restart (`:601`) — bumping on every (re)spawn (a new worker process is a
+new channel). Today only force-restart bumps and restore sets `0`; both must allocate.
 
 ---
 
@@ -153,6 +172,20 @@ exists). There, and only there, turn-numbering is a deterministic inference from
 the replay stream via the surviving `ReplayTurns` helper. `ReplayTurns` is thus
 demoted to "the logless-resume fallback," not a per-consumer mechanism.
 
+**Two replay directions, distinct authority (resolves N4 — the server-restart
+double-ingest).** "Forward verbatim" applies to exactly one direction:
+1. *server → GUI* (re-attach): the server forwards its durable log **verbatim**
+   (it already carries `gen`/`turn`/`seq`). This is the common resume.
+2. *agent → worker* (`--resume`): happens **only** when the server itself
+   restarts and re-spawns the worker. There the **reloaded durable log is
+   authoritative**; the worker **suppresses** its agent-replayed events up to the
+   log's persisted tip and emits/append only genuinely-new (post-tip) events.
+   This is today's `replay_fence` (server `main.rs:781-804`) generalized from a
+   turn count to a `(generation, seq)` **watermark** handed to the worker at
+   spawn. The worker's `--resume` stream is fenced, never re-ingested — so the
+   reloaded log and the agent's replay can't fight (the unresolved tension in
+   pass 1). The fence is suppression-at-source, not a content/identity dedup.
+
 `ReplayEnd` flips `turn_phase` to `Idle` **only if no live turn is in flight** —
 which, during a pure replay burst, it never is; with verbatim turns there is no
 ambiguity.
@@ -174,14 +207,20 @@ wake. Guarantees are **stated, not conventional**:
   compaction-past-cursor, and force-restart through a single comparison,
   evaluated server-side under the §3 lock (no TOCTOU — `log_base` can't advance
   during the decision).
-- **Compaction watermark, role-based (resolves H4, H7):** the compaction floor
-  is the **owner's** `acked_seq` — *the owner is never gapped*. Observers that
-  fall past a high-water backlog threshold are **disconnected** (forced clean
-  from-0 reconnect), **never silently gapped**; high-water disconnect fires
-  *before* any gap-marker. If even the owner wedges past high-water, it too is
-  forced to a clean reconnect (from-0), never gapped. So a slow/wedged consumer
-  costs a reconnect, never a hole in an authoritative transcript, and a wedged
-  observer can't pin unbounded growth.
+- **Compaction watermark (resolves H4, H7, and the ownerless case N3):** the
+  floor is `min(acked_seq)` over all **live** subscribers, computed **under the
+  §3 lock** so an ownership handoff/`promote` can't change the floor authority
+  mid-pass. An **owner, if present, is a hard ceiling** — never compact past
+  `owner.acked_seq`, so the owner is never gapped. A subscriber past the
+  high-water backlog threshold is **disconnected** (forced clean from-0
+  reconnect) and thereby dropped from the `min`, so a wedged consumer can't pin
+  unbounded growth; high-water disconnect fires *before* any gap-marker.
+  - **No owner** (a `detach`, or the entire candidate→promote handoff window —
+    the *normal* steady state during a promote): floor = `min` over the live
+    observers; ownership handoff is atomic under the §3 lock.
+  - **No live subscribers** (e.g. a server-restored session nobody has attached
+    yet): the session produces no events (prompting requires an owner), so there
+    is nothing to compact — floor = tip.
 - **Multi-subscriber:** owner + N observers each hold their own cursor; all fan
   from the one `event_log`. (Real today via the candidate/promote co-attach.)
 - **TranscriptTruncated** is surfaced as the `CompactedSummary` reducer arm (§7),
@@ -215,10 +254,12 @@ unit-only (drops payload) — both unacceptable for a **durably-logged,
 cross-version-forwarded** vocabulary (the candidate/promote flow co-attaches a
 new and an old GUI to one server session). So:
 
-- A concrete **`Unknown { tag, raw: serde_json::Value }`** catch-all (custom
-  `Deserialize`) **preserves the bytes**. A node that can't render a newer
-  variant still forwards/round-trips it verbatim — it never corrupts the durable
-  log it passes on.
+- A concrete **`Unknown { tag, raw: serde_json::Value }`** catch-all **preserves
+  the bytes**, via BOTH a custom `Deserialize` (lands unknown tags here) **and a
+  matching custom `Serialize` that re-emits `raw` under its original `tag`** —
+  NOT as `{"kind":"unknown",..}` (Nit-1). Deserialize-only would re-wrap on the
+  way out and corrupt the forwarded log; the pair makes a node that can't *render*
+  a newer variant still *round-trip* it verbatim.
 - Variants are **additive only**; never renumber/repurpose. `serde(rename)`
   pins wire tags. Payload fields are added as `#[serde(default)]`.
 - Rendering is best-effort across versions; the durable log is byte-faithful
@@ -253,12 +294,48 @@ agreement between the forwarded event and the inference for a few real sessions
 | H8 | serde unknown-tag errors / drops payload | §8 `Unknown{tag,raw}` byte-preserving catch-all; additive-only |
 | H9 | racy backpressure read | §3: watermark read under the same lock as `record()` |
 
+### Pass 2 — re-validation findings resolved
+
+| # | Finding | Resolution |
+|---|---|---|
+| N1 | `emit()` lock across the async handler / server-lock lengthening | §3: critical section stated `await`-free; §11 server-lock note |
+| N2 | `ChannelOpened` ordering + restore-path generation undefined | §4: emit before the load RPC; server allocates generation at all 3 spawn sites |
+| N3 | compaction floor undefined when `owner == None` | §6: `min` over live subscribers, owner hard-ceiling, no-subscriber→tip, under lock |
+| N4 | server-restart double-ingest vs the existing `replay_fence` | §5: reloaded log authoritative; worker `--resume` fenced to a `(gen,seq)` watermark |
+| N5 + nits | finalize plumbing, custom `Serialize`, `Notification`-collapse migration | §8 + §12 |
+
 ---
 
 ## 11. Open / deferred
 
-- **Worker-side `emit()` lock contention** under very high chunk rates — measure;
-  a lock-free seq with a single-drainer reorder buffer is the fallback if it bites.
+- **`emit()` lock contention** under very high chunk rates — worker-side (single
+  session, low rate; likely fine) and, more importantly, **server-side**: `emit()`
+  lengthens the `sessions`-lock critical section every pump and every
+  `forward_notifications` tail already contend. Measure; a lock-free seq with a
+  single-drainer reorder buffer is the fallback if it bites.
 - This spec implements the **full D1 / event-stream refactor** — it is *not* a
-  quick win; it lands behind CI in its own phased steps after this design is
-  re-validated. The merged quick wins 1–5 stand independently of it.
+  quick win; it lands behind CI in its own phased steps. The merged quick wins
+  1–5 stand independently of it.
+
+---
+
+## 12. Required plumbing & migration (implementation-time)
+
+The design is solid; these are the concrete blast-radius items it requires
+(surfaced by the re-validation) — not open design questions:
+
+- **Wire:** `Request::Attach` (`session_proto`) + `SessionServerClient::attach`
+  grow `acked_seq` + `client_generation` (today every attach is an unconditional
+  from-0 replay; the §6 predicate needs these).
+- **Finalize:** `finalize_agent_turn(&mut Editor)` grows `(generation, turn)`;
+  `AgentState` gains a `generation` field (it has none today); all **four**
+  finalize/inference sites route through the idempotent guard (§7) and the §9
+  single gate — server `ReplyEvent` (~`main.rs:11925`), server `TurnEnded`
+  (~`:11938`), direct pump (~`:12169`), worker settle (`acp_channel.rs:1435`).
+- **Spawn:** `spawn_with_resume_in` grows `generation`, wired at create
+  (`main.rs:374`), restore (`:280`), restart (`:601`).
+- **Migration (breaking):** collapsing `Notification::{ReplyEvent,TurnEnded,UserPrompt}`
+  + `WorkerEvent::Reply` into `AgentEvent` changes the durable `session_server.json`
+  shape. Gate it behind a schema `version` field with a one-time reader for the
+  old shape (or explicitly discard old logs). **The durable WAL (ADR-0009) must
+  carry a version tag from day one.**
