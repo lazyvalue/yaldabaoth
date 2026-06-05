@@ -3188,31 +3188,6 @@ fn truncate_lines(body: &str, max_lines: usize) -> String {
 /// the document, per spec-agent-window.md §E1. The renderer resolves it to
 /// a line index via `editor.line_for_anchor(a)`; a `None` (line consumed)
 /// falls back to EOF rendering.
-/// Perf (finding 4): O(k) equivalent of `doc.full_text().trim_end().ends_with(s)`
-/// where k = chars scanned. Walks back over the rope's trailing whitespace, then
-/// compares only the last `s.chars().count()` chars — never materializing the
-/// whole transcript as a String.
-fn document_trimmed_end_ends_with(doc: &Document, s: &str) -> bool {
-    let want = s.chars().count();
-    if want == 0 {
-        return true;
-    }
-    let rope = doc.rope();
-    let total = rope.len_chars();
-    // Find the index one past the last non-whitespace char (the trim_end point).
-    let mut end = total;
-    while end > 0 {
-        match rope.get_char(end - 1) {
-            Some(c) if c.is_whitespace() => end -= 1,
-            _ => break,
-        }
-    }
-    if want > end {
-        return false;
-    }
-    let tail = rope.slice((end - want)..end);
-    tail.chars().eq(s.chars())
-}
 
 fn anchor_for_new_tool_call(editor: &mut Editor) -> LineAnchor {
     // Perf (finding 5): O(1) tail probe instead of cloning the whole transcript
@@ -5010,6 +4985,19 @@ struct AgentState {
     /// Checked by the status strip and anywhere that needs to distinguish
     /// the two paths from within `AgentState` alone.
     server_managed: bool,
+    /// Order-independent reconciler for user-turn insertions — the single
+    /// authority that de-dupes the three sites a user turn can be announced
+    /// from (optimistic submit, server `UserPrompt`, agent `UserMessage`).
+    /// Replaces the position-dependent `document_trimmed_end_ends_with`
+    /// heuristic that double-rendered input whenever content streamed in
+    /// between the optimistic echo and its stream copy. See `agent_transcript`.
+    reconciler: sketch::agent_transcript::UserTurnReconciler,
+    /// User-turn `k`s inserted since the last `reset_for_replay` generation.
+    /// The M3 runtime tripwire asserts a `k` is never inserted twice — a
+    /// double-render reuses a `k`, so this turns a silent visual regression
+    /// into a loud, located failure. Scoped per generation (cleared on
+    /// transcript wipe) so a reconnect's `k`-restart is not a false positive.
+    user_turn_ks: std::collections::HashSet<usize>,
     /// Background polling task that drains the ACP channel into the editor
     /// every ~50ms. Held only so that dropping `AgentState` (e.g. on
     /// `back_to_doc`) cancels the task. The leading `_` mutes unused-field
@@ -5138,6 +5126,8 @@ impl AgentState {
             tasklist_open: false,
             subagents_open: false,
             server_managed: true,
+            reconciler: sketch::agent_transcript::UserTurnReconciler::new(),
+            user_turn_ks: std::collections::HashSet::new(),
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         }
@@ -5189,6 +5179,8 @@ impl AgentState {
             tasklist_open: false,
             subagents_open: false,
             server_managed: true,
+            reconciler: sketch::agent_transcript::UserTurnReconciler::new(),
+            user_turn_ks: std::collections::HashSet::new(),
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         };
@@ -5222,6 +5214,59 @@ impl AgentState {
         let k = rt.advance_user_boundary();
         self.replay_turn = rt.replay_turn;
         k
+    }
+
+    /// THE single chokepoint for inserting a user turn into the transcript.
+    /// All three announcement sites — the optimistic submit, the server
+    /// `UserPrompt` notification, and the agent's `UserMessage` echo — route
+    /// through here so de-duplication and turn-number attribution have exactly
+    /// one home instead of three drifting copies (the structural cause of the
+    /// double-render regressions). The pure [`UserTurnReconciler`] decides
+    /// insert-vs-skip by origin + content identity (order-independent),
+    /// replacing the position-dependent suffix heuristic.
+    ///
+    /// `advance_boundary` must be `true` only for the direct-channel replay
+    /// path (`!server_managed`), where there is no replayed `TurnEnded` to bump
+    /// the live counter and the [`ReplayTurns`] cursor must be stepped per user
+    /// boundary. It is `false` for every live insertion and for the
+    /// server-managed path (whose boundaries arrive as replayed `TurnEnded`),
+    /// so a live or server turn can never wrongly drive the machine into replay
+    /// mode. A *skipped* echo never advances the boundary — suppression and
+    /// attribution stay decoupled.
+    fn insert_user_turn(
+        &mut self,
+        text: &str,
+        origin: sketch::agent_transcript::UserTurnOrigin,
+        advance_boundary: bool,
+    ) {
+        use sketch::agent_transcript::UserTurnAction;
+        match self.reconciler.reconcile(origin, text, advance_boundary) {
+            UserTurnAction::Skip => {}
+            UserTurnAction::Insert { advance_boundary } => {
+                let k = if advance_boundary {
+                    self.advance_replay_user_boundary()
+                } else {
+                    self.current_turn()
+                };
+                // M3 runtime tripwire: a `k` inserted twice within one
+                // generation means the dedup failed and we are about to
+                // double-render. Panic in dev (located at the exact mutation);
+                // log + drop the duplicate in release rather than ship a double.
+                if !self.user_turn_ks.insert(k) {
+                    debug_assert!(
+                        false,
+                        "double user turn: TurnId::User({k}) inserted twice \
+                         (text={text:?}) — reconciler dedup regression"
+                    );
+                    eprintln!(
+                        "[sketch-gpui] INVARIANT: TurnId::User({k}) already present; \
+                         dropping duplicate user turn (text={text:?})"
+                    );
+                    return;
+                }
+                self.editor.freeze_as_user_turn(text, TurnId::User(k));
+            }
+        }
     }
 
     /// Auto-scroll follow decision (F4, INV-13). In Chatbox mode the user's
@@ -5305,6 +5350,13 @@ impl AgentState {
         self.turn_phase = TurnPhase::Idle;
         self.last_seen_turns = 0;
         self.replay_turn = 0;
+        // The transcript is being rebuilt from the authoritative event_log:
+        // nothing is "pending local" any more, and this starts a fresh
+        // tripwire generation (the replay re-numbers `k` from 1). This clear
+        // MUST happen-before any replayed echo is processed — guaranteed since
+        // reset runs inside the reconnect update before re-attach.
+        self.reconciler.reset();
+        self.user_turn_ks.clear();
         self.tool_calls.clear();
         self.tool_call_order.clear();
         self.tool_call_anchor_line.clear();
@@ -11305,6 +11357,8 @@ impl SketchGpuiView {
             tasklist_open: false,
             subagents_open: false,
             server_managed: false,
+            reconciler: sketch::agent_transcript::UserTurnReconciler::new(),
+            user_turn_ks: std::collections::HashSet::new(),
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: Some(pump),
         };
@@ -11724,6 +11778,9 @@ impl SketchGpuiView {
                     let routed = self.with_server_session_slot(&session_id, |slot| {
                         let claude = &mut slot.state;
                         finalize_agent_turn(&mut claude.editor);
+                        // Turn boundary: clear last-inserted so the next turn's
+                        // user echo isn't mistaken for a duplicate of this one.
+                        claude.reconciler.note_turn_progressed();
                         claude.last_seen_turns = turn_count;
                         claude.turn_phase = TurnPhase::Idle;
                     });
@@ -11731,29 +11788,17 @@ impl SketchGpuiView {
                 }
                 ServerNotification::UserPrompt { session_id, text } => {
                     let routed = self.with_server_session_slot(&session_id, |slot| {
-                        let claude = &mut slot.state;
-                        let incoming = text.trim_end_matches('\n');
-                        // Perf (finding 4): the dedupe suffix check ignores
-                        // trailing whitespace, so compare only the relevant tail
-                        // slice of the rope instead of cloning the whole
-                        // transcript via full_text(). We probe back from the last
-                        // non-whitespace char by at most `incoming` length.
-                        let already_present = {
-                            !incoming.is_empty()
-                                && document_trimmed_end_ends_with(
-                                    claude.editor.document(),
-                                    incoming,
-                                )
-                        };
-                        if already_present {
-                            return;
-                        }
-                        // Append + freeze + tag as turn k's user turn via the
-                        // shared helper (same shape as live submit_chatbox).
-                        let turn_k = claude.last_seen_turns + 1;
-                        claude
-                            .editor
-                            .freeze_as_user_turn(&text, TurnId::User(turn_k));
+                        // Route through the single chokepoint as an `Echo`: the
+                        // reconciler suppresses it when it matches our own
+                        // optimistic submit (live) or a turn already inserted by
+                        // a second source (replay), and inserts it otherwise.
+                        // Server-managed slots never advance the replay boundary
+                        // here — their boundaries arrive as replayed `TurnEnded`.
+                        slot.state.insert_user_turn(
+                            &text,
+                            sketch::agent_transcript::UserTurnOrigin::Echo,
+                            false,
+                        );
                     });
                     warn_unrouted(routed, &session_id);
                 }
@@ -12179,30 +12224,26 @@ impl SketchGpuiView {
                     claude.status = Some(msg.clone().into());
                 }
                 ReplyEvent::UserMessage(text) => {
-                    // A user-authored turn observed on the replay stream
-                    // (Finding 1 / defect B, INV-1, INV-6). On session/load
-                    // the agent re-emits the prior conversation including the
-                    // user's own prompts; freeze each as a `TurnId::User(k)`
-                    // turn so resumed transcripts reconstruct fully. A *live*
-                    // UserMessageChunk just echoes the prompt Submit already
-                    // inserted — dedupe it via the same trimmed-suffix check
-                    // the ServerNotification::UserPrompt path uses, so live
-                    // echoes are skipped while replayed turns are inserted.
-                    let incoming = text.trim_end_matches('\n');
-                    let already_present = !incoming.is_empty()
-                        && document_trimmed_end_ends_with(claude.editor.document(), incoming);
-                    if already_present {
-                        continue;
-                    }
-                    // A replayed user-message boundary opens the next turn
-                    // (Finding 3, INV-3). Advance the replay cursor *before*
-                    // tagging so this user turn and the agent chunks that
-                    // follow it share `k`: User(1),Llm(1),User(2),Llm(2)…
-                    // rather than collapsing onto a single turn.
-                    let turn_k = claude.advance_replay_user_boundary();
-                    claude
-                        .editor
-                        .freeze_as_user_turn(&text, TurnId::User(turn_k));
+                    // A user-authored turn surfaced by the agent's
+                    // `UserMessageChunk` (Finding 1 / defect B, INV-1, INV-6).
+                    // Emitted unconditionally by the worker — both live (an
+                    // echo of the prompt Submit already inserted) and on
+                    // `session/load` replay (reconstructing prior prompts). The
+                    // single chokepoint's reconciler suppresses the live echo
+                    // by content identity (order-independent — the old
+                    // suffix check double-rendered whenever a chunk streamed
+                    // first) and inserts genuine replayed turns. Only the
+                    // direct-channel replay path advances the replay boundary
+                    // (`!server_managed`): there is no replayed `TurnEnded` to
+                    // bump the live counter, so each user boundary must step
+                    // the cursor — User(1),Llm(1),User(2),Llm(2)…. A suppressed
+                    // echo never advances, so the live counter is safe.
+                    let advance = !claude.server_managed;
+                    claude.insert_user_turn(
+                        &text,
+                        sketch::agent_transcript::UserTurnOrigin::Echo,
+                        advance,
+                    );
                 }
                 ReplyEvent::ReplayComplete => {
                     // The agent finished re-emitting the prior conversation
@@ -12211,6 +12252,7 @@ impl SketchGpuiView {
                     // the right `k`, then signal the pump to finalize once —
                     // after the last replayed chunk, never mid-replay.
                     claude.finish_replay();
+                    claude.reconciler.note_turn_progressed();
                     replay_complete = true;
                 }
             }
@@ -12823,11 +12865,13 @@ impl SketchGpuiView {
             return;
         }
 
-        // Append the chatbox body at EOF, freeze it, and tag it as turn k's
-        // user turn. `last_seen_turns` counts completed turns; the next
-        // submit becomes turn k = last_seen + 1. See Editor::freeze_as_user_turn.
-        let turn_k = claude.last_seen_turns + 1;
-        claude.editor.freeze_as_user_turn(&text, TurnId::User(turn_k));
+        // Append the chatbox body at EOF, freeze it, and tag it as the live
+        // turn's user turn via the single chokepoint. `LocalSubmit` always
+        // inserts (it is a genuine new turn) and records the text so the
+        // stream echo that follows — server `UserPrompt` or agent
+        // `UserMessage`, in any order relative to streamed content — is
+        // suppressed. Never advances the replay boundary on a live submit.
+        claude.insert_user_turn(&text, sketch::agent_transcript::UserTurnOrigin::LocalSubmit, false);
 
         // Send.
         let prompt_body = text.trim_end_matches('\n').to_string();
