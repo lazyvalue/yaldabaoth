@@ -2113,6 +2113,11 @@ struct Preferences {
     /// Agent info bar placement: "top" or "bottom".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_status_position: Option<String>,
+    /// Document text-zoom factor (`Cmd-=`/`Cmd--`/`Cmd-0`). `None` means "no
+    /// saved zoom; start at 1.0." Clamped to `[MIN_TEXT_SCALE, MAX_TEXT_SCALE]`
+    /// on load so a hand-edited file can't push the body off-screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text_scale: Option<f32>,
 }
 
 fn load_preferences() -> Preferences {
@@ -6641,8 +6646,22 @@ impl SketchGpuiView {
         let clamped = scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
         if (clamped - self.text_scale).abs() > f32::EPSILON {
             self.text_scale = clamped;
+            self.save_settings();
             cx.notify();
         }
+    }
+
+    /// Snapshot the persistable UI settings (theme, agent info-bar placement,
+    /// text zoom) and write them in ONE place. Each settings mutation just calls
+    /// this instead of re-listing every field at its own `save_preferences(...)`
+    /// site — the structural cause of "added a setting, forgot to persist it at
+    /// one of N sites" drift. Fonts are not yet user-settable, so not persisted.
+    fn save_settings(&self) {
+        save_preferences(&Preferences {
+            theme: Some(self.theme.name.as_kebab().to_string()),
+            agent_status_position: Some(self.agent_status_position.as_str().to_string()),
+            text_scale: Some(self.text_scale),
+        });
     }
 
     /// Screen background pulled from the active theme. Used by every
@@ -6672,10 +6691,7 @@ impl SketchGpuiView {
         for tab in self.workspace.tabs.iter_mut() {
             re_render_layout_docs(&mut tab.layout, &self.theme);
         }
-        save_preferences(&Preferences {
-            theme: Some(name.as_kebab().to_string()),
-            agent_status_position: Some(self.agent_status_position.as_str().to_string()),
-        });
+        self.save_settings();
         cx.notify();
     }
 
@@ -8686,12 +8702,7 @@ impl SketchGpuiView {
             "theme-folio" => self.set_theme(ThemeName::Folio, cx),
             "claude-status-bar" => {
                 self.agent_status_position = self.agent_status_position.toggle();
-                save_preferences(&Preferences {
-                    theme: Some(self.theme.name.as_kebab().to_string()),
-                    agent_status_position: Some(
-                        self.agent_status_position.as_str().to_string(),
-                    ),
-                });
+                self.save_settings();
                 cx.notify();
             }
             // Window splits + focus + sizing — same logic the keyboard
@@ -16757,6 +16768,11 @@ fn main() {
                     if let Some(pos) = prefs.agent_status_position.as_deref() {
                         view.agent_status_position = AgentStatusPosition::parse(pos);
                     }
+                    // Restore the saved text zoom (clamped so a hand-edited
+                    // preferences file can't push the body off-screen).
+                    if let Some(scale) = prefs.text_scale {
+                        view.text_scale = scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
+                    }
                     // If we were launched with no explicit file arg, try to
                     // restore the saved workspace for this cwd. With an
                     // explicit arg the user wants that file, so the saved
@@ -16843,6 +16859,33 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settings persistence round-trips (theme, agent bar, text zoom) and a
+    /// preferences file written before `text_scale` existed still loads — the
+    /// `#[serde(default)]` keeps it forward-compatible (no panic, zoom = None).
+    #[test]
+    fn preferences_round_trip_with_text_scale() {
+        let prefs = Preferences {
+            theme: Some("dracula".into()),
+            agent_status_position: Some("top".into()),
+            text_scale: Some(1.21),
+        };
+        let json = serde_json::to_string(&prefs).unwrap();
+        let back: Preferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.theme.as_deref(), Some("dracula"));
+        assert_eq!(back.agent_status_position.as_deref(), Some("top"));
+        assert_eq!(back.text_scale, Some(1.21));
+
+        // Default (no zoom) is omitted from the serialized form.
+        let bare = Preferences::default();
+        assert!(!serde_json::to_string(&bare).unwrap().contains("text_scale"));
+
+        // An old file lacking the field deserializes with text_scale == None.
+        let legacy = r#"{"theme":"folio","agent_status_position":"bottom"}"#;
+        let parsed: Preferences = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.text_scale, None);
+        assert_eq!(parsed.theme.as_deref(), Some("folio"));
+    }
 
     fn s(text: &str) -> Segment {
         (text.to_string(), NStyle::default())
