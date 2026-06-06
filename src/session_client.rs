@@ -175,10 +175,17 @@ impl SessionServerClient {
             .name("session-client-reader".into())
             .spawn(move || {
                 let reader = io::BufReader::new(read_stream);
+                // Why this thread exits = why the GUI saw a disconnect. Logged
+                // below so a reconnect storm is diagnosable (the default — the
+                // `for` loop ending — is a clean server-side EOF).
+                let mut exit_reason = String::from("server closed connection (EOF)");
                 for line in reader.lines() {
                     let line = match line {
                         Ok(l) => l,
-                        Err(_) => break,
+                        Err(e) => {
+                            exit_reason = format!("socket read error: {e}");
+                            break;
+                        }
                     };
                     let frame: Frame = match serde_json::from_str(&line) {
                         Ok(f) => f,
@@ -193,6 +200,8 @@ impl SessionServerClient {
                         }
                         Frame::Notification { note } => {
                             if notification_tx.send(note).is_err() {
+                                exit_reason =
+                                    String::from("pump dropped the notification receiver");
                                 break;
                             }
                             // Wake the pump. Unbounded send never blocks; an
@@ -206,6 +215,7 @@ impl SessionServerClient {
                     }
                 }
                 connected_r.store(false, Ordering::SeqCst);
+                eprintln!("[sketch-gpui] session-client reader exiting — {exit_reason}");
                 // Socket closed / EOF: unblock anyone parked in `request`.
                 fail_all_pending(&pending_r);
             })?;

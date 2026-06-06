@@ -927,9 +927,18 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
         })
     };
 
+    let started = std::time::Instant::now();
     let mut lines = reader.lines();
 
-    while let Ok(Some(line)) = lines.next_line().await {
+    // Read loop. Captures WHY it exits so the teardown log can name the cause
+    // of a disconnect — the reconnect-storm diagnostic. Distinguishes client
+    // EOF vs socket read error vs a failed response write (client already gone).
+    let exit_reason: String = loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break "client closed connection (EOF)".to_string(),
+            Err(e) => break format!("socket read error: {e}"),
+        };
         let frame: Frame = match serde_json::from_str(&line) {
             Ok(f) => f,
             Err(e) => {
@@ -1082,9 +1091,16 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
         line.push('\n');
         let mut w = writer.lock().await;
         if w.write_all(line.as_bytes()).await.is_err() {
-            break;
+            break "response write failed (client gone)".to_string();
         }
-    }
+    };
+
+    eprintln!(
+        "[session-server] conn {conn_id} closed after {:.1}s — {exit_reason}; \
+         was attached to {} session(s)",
+        started.elapsed().as_secs_f64(),
+        subscribed.len(),
+    );
 
     // Connection closed — detach all sessions and cancel forwarders. This
     // releases ownership of any sessions this connection owned, which
@@ -1150,6 +1166,12 @@ async fn forward_notifications(
             }
             let mut w = writer.lock().await;
             if w.write_all(buf.as_bytes()).await.is_err() {
+                eprintln!(
+                    "[session-server] forwarder write failed for {} after {sent} events \
+                     (+{} this pass) — client gone",
+                    &session_id[..8.min(session_id.len())],
+                    new.len(),
+                );
                 return;
             }
             drop(w);

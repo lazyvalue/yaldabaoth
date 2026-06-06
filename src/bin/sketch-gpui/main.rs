@@ -11929,6 +11929,10 @@ impl SketchGpuiView {
                         last_reconnect = Some(now);
                         match this.update(cx, |this, _cx| this.reconnect_session_server()) {
                             Ok(Some((new_note, new_wake))) => {
+                                eprintln!(
+                                    "[sketch-gpui] reconnected to session server \
+                                     (re-attaching slots)"
+                                );
                                 note_rx = new_note;
                                 wake_rx = Some(new_wake);
                                 last_reconnect = None;
