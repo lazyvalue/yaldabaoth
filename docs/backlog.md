@@ -11,6 +11,25 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
 
 ---
 
+## Bugs
+
+- **Session-server reconnect storm** — `NEEDS-RUNTIME-REPRO`. The GUI client
+  flaps its connection to the session server in a tight loop: a single
+  `session-server.log` accumulated **489 "client reconnected" vs 5 "client
+  connected"** across runs. Symptom hit 2026-06-06 during signoff: creating a
+  new Claude session failed with `close_session(<id>) failed (connection):
+  session server disconnected` — `SessionServerClient::request()` returns that
+  error whenever the liveness flag is false, so a round-trip (close/create) that
+  lands in a "down" window fails. Suspected: ownership flapping in the
+  owner/observer model (`ManagedSession.owner`, `Promote`, `attach_with_owner_retry`
+  at main.rs:1884) and/or a disconnect during the large attach-replay (109/29/11
+  events) re-dropping the socket → reconnect → repeat. Pre-existing; NOT from the
+  Phase A/B refactors (none touch connect/reconnect/ownership). Adjacent to the
+  reconnect-handle work (ADR-0008 / item 10). Clean-room reset (clear
+  `session_server.json` + `acp_sessions.json` + stale socket) unblocks. Needs a
+  runtime repro to root-cause: log every connect/disconnect with reason + a
+  backoff/jitter on the GUI reconnect, then watch one launch.
+
 ## Top priority
 
 - **State-first architecture overhaul** — `NEEDS-DECISION`. Root-cause fix for

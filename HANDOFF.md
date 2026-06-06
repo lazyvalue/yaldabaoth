@@ -46,12 +46,12 @@ reason, and every owed runtime check. Status keys: ✅ done · ⬜ open · ⏸ d
 ## Phase B — GPUI / behavior-changing / gated (⚠️ all need human runtime check)
 | # | Item | Status | Gate |
 |---|---|---|---|
-| 5c | Doc/Edit single pooled `SharedCore` | ⬜ | D2 (ADR-0007) |
-| 8b | delete turn-end inference in all 3 pumps | ⬜ | D1 + 8a |
+| R | `reset_for_replay` delegation (each module owns its `reset()`) | ✅ | `eca7759` — `HighlightCache::reset()`; value-identical, adversarially verified |
+| 9′ | `apply_channel_state()` unification — drain `pending_prompts` + bump generation consistently across create/restore/restart | ✅ ⚠️ | `74c4f73` — restart now drains prompts (was: lost). Adversarially verified behavior-as-intended. **Owes runtime check**: prompt-during-restart reaches new channel; restart-in-Plan stays Plan |
+| 5c | Doc/Edit single pooled `SharedCore` | ⏸ HELD | D2 (ADR-0007) — 49-site rewrite of content ownership; ADR stages it (5a→5b→5c); not blind-landable. Plan mapped; do as its own focused session |
+| 8b | delete turn-end inference in all 3 pumps | ⏸ HELD | D1 + 8a. Needs worker-side `ReplyEvent::TurnEnded` emit ADDED first (8a only did the server `Notification`), and ADR-0006 mandates emit-additively→observe-agreement→delete. Observe step is a runtime job |
+| 11′ | `ChannelAttachState` enum — fold `channel`+`attach_pending` into `Attaching{prev,rx}` | ⏸ HELD | No functional benefit; refactors the **same reconnect path as the active reconnect-storm bug**. Stabilize/understand that first — verification is compromised while the path flaps |
 | 10 | reconnect `Arc<Core>` swap-in-place | ⏸ | D3 — explicit trigger-deferral (wait until you observe a stranded-handle vanish) |
-| R | `reset_for_replay` delegation (each module owns its `reset()`) | ⬜ | — |
-| 9′ | `apply_channel_state()` unification (out of A.9) — drain `pending_prompts` + bump generation consistently across create/restore/restart | ⬜ | **behavior-changing**: today `restart_session` drops prompts queued mid-restart and only bumps generation on restart. Needs runtime check (prompt-during-restart; restart-in-Plan-mode stays Plan) |
-| 11′ | `ChannelAttachState` enum (out of item-11) — fold `channel`+`attach_pending` | ⬜ | **behavior-sensitive**: dual-Option reaches a "both `Some`" re-attach transient the pump handles; a faithful enum needs an `Attaching{old_channel,rx}` variant + runtime check |
 
 ## Reactive fixes shipped (were NOT in the original §7 backlog)
 | Item | Status | Ref |

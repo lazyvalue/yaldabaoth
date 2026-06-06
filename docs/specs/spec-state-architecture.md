@@ -266,12 +266,11 @@ verifiable.
    only writes outside it are the two intentional carve-outs (`prompt()`
    append-without-broadcast; `broadcast_owner_changed` broadcast-without-log),
    both documented. The remaining `apply_channel_state()` unification (re-apply
-   permission mode, drain `pending_prompts`, bump generation on every swap)
-   is **behavior-changing** — `restart_session` does NOT drain `pending_prompts`
-   today and bumps generation only on restart, so unifying it FIXES latent bugs
-   (prompt-loss during restart, permission-mode revert). Moved to the Phase-B /
-   runtime-check track. Verify: restart in Plan mode stays Plan; prompt during
-   restart reaches the new channel.
+   permission mode, drain `pending_prompts`, bump generation on every swap) is
+   **done** (9′, `74c4f73`): all three sites route through one chokepoint and
+   `restart_session` now drains `pending_prompts` (was: lost prompts queued
+   mid-restart). Behavior-changing — ⚠️ owes a runtime check: restart in Plan
+   mode stays Plan; prompt during restart reaches the new channel.
 11. **Sum-type cleanups:** `InputSurface` enum **done**; `has_unseen_activity`
    was write-only dead code → **removed** (`15fe390`). `ChannelAttachState`
    (folding `channel`+`attach_pending`) **deferred**: those two `Option`s reach
@@ -328,9 +327,15 @@ Front-loaded by leverage and verifiability.
    - `[x]` *(reactive, off-plan)* pipelined-turn crash `50021fc` · mutex-poison `d4cce77`
 
 **GPUI / gated (Phase B — verify via the harness from item 2):**
-7. `[~]` Doc/Edit single rope (5c, gated D2) · delete turn-end inference
-   (8b, gated D1) · reconnect Arc<Core> (10, gated D3) ·
-   `reset_for_replay` delegation (R).
+7. `[x]` `reset_for_replay` delegation (R, `eca7759` — `HighlightCache::reset()`) ·
+   `[x]` `apply_channel_state` unification + restart prompt-drain fix (9′,
+   `74c4f73`, ⚠️ owes runtime check) · `[~]` Doc/Edit single rope (5c, gated D2
+   — **held**, 49-site staged rewrite, not blind-landable) · `[~]` delete
+   turn-end inference (8b, gated D1 — **held**, needs worker-side `ReplyEvent::
+   TurnEnded` emit + ADR-0006 emit-then-observe-then-delete rollout) · `[~]`
+   `ChannelAttachState` faithful enum (11′ — **held**, refactors the same
+   reconnect path as the active reconnect-storm bug; stabilize that first) ·
+   `[~]` reconnect Arc<Core> (10, gated D3 — trigger-deferred per ADR-0008).
 
 **Standing rule (the regression→prevention loop):**
 8. `[ ]` Every `fix(...)` lands with a failing-test-first; every new derived
