@@ -43,6 +43,26 @@ pub struct UndoEntry {
     lockable_through_line_before: usize,
 }
 
+/// Advance a tree-sitter `Point` by appending `text`. Columns are byte
+/// offsets within the row: a text with no newline extends the column by its
+/// byte length; a text with `k` newlines moves down `k` rows and the column
+/// becomes the byte length of the trailing segment after the last `\n`.
+fn advance_point(start: tree_sitter::Point, text: &str) -> tree_sitter::Point {
+    let newlines = text.bytes().filter(|&b| b == b'\n').count();
+    if newlines == 0 {
+        tree_sitter::Point {
+            row: start.row,
+            column: start.column + text.len(),
+        }
+    } else {
+        let trailing = text.rsplit('\n').next().unwrap_or("");
+        tree_sitter::Point {
+            row: start.row + newlines,
+            column: trailing.len(),
+        }
+    }
+}
+
 pub struct Document {
     rope: Rope,
     pub file_path: PathBuf,
@@ -55,6 +75,15 @@ pub struct Document {
     redo_stack: Vec<UndoEntry>,
     /// Pending undo group: snapshot taken at begin_undo_group
     pending_undo: Option<UndoEntry>,
+    /// One-clean-splice incremental-reparse tracking. `record_splice` computes
+    /// the tree-sitter `InputEdit` for each primitive splice (against the OLD
+    /// rope, before the mutation), and `take_pending_edit` hands it to the next
+    /// `reparse` ONLY when exactly one splice happened since the last reparse
+    /// (the typing hot path). Zero or multiple splices reset it to `None`, so
+    /// reparse falls back to a full parse — making a wrong `InputEdit` the only
+    /// possible incremental hazard, confined to `note_pending_edit`.
+    pending_edit: Option<tree_sitter::InputEdit>,
+    pending_splice_count: u32,
 }
 
 impl Document {
@@ -67,6 +96,8 @@ impl Document {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             pending_undo: None,
+            pending_edit: None,
+            pending_splice_count: 0,
         }
     }
 
@@ -93,6 +124,9 @@ impl Document {
     /// Callers must invoke this *before* mutating the rope, so the removed text
     /// can be read from the current (pre-edit) rope.
     fn record_splice(&mut self, start: usize, removed_chars: usize, inserted: &str) {
+        // Compute the incremental-reparse edit for EVERY splice (independent of
+        // undo grouping), using the OLD rope (this runs before the mutation).
+        self.note_pending_edit(start, removed_chars, inserted);
         if self.pending_undo.is_none() {
             return;
         }
@@ -112,6 +146,65 @@ impl Document {
                 inserted: inserted.to_string(),
             });
         }
+    }
+
+    /// tree-sitter `Point` (row, BYTE-column within the row) for a char index
+    /// in the CURRENT rope. tree-sitter columns are byte offsets, not chars.
+    fn char_point(&self, char_idx: usize) -> tree_sitter::Point {
+        let ci = char_idx.min(self.rope.len_chars());
+        let row = self.rope.char_to_line(ci);
+        let line_start_byte = self.rope.line_to_byte(row);
+        let byte = self.rope.char_to_byte(ci);
+        tree_sitter::Point {
+            row,
+            column: byte - line_start_byte,
+        }
+    }
+
+    /// Compute + accumulate the tree-sitter `InputEdit` for one primitive
+    /// splice. MUST be called BEFORE the rope mutates (it reads the OLD rope to
+    /// resolve the start / old-end byte+point). The new-end is the start
+    /// advanced by `inserted`. First splice since the last `take_pending_edit`
+    /// is stored; a 2nd marks the window multi-splice → `None` (full reparse).
+    fn note_pending_edit(&mut self, start: usize, removed_chars: usize, inserted: &str) {
+        let len = self.rope.len_chars();
+        let s = start.min(len);
+        let e = (start + removed_chars).min(len);
+        let start_byte = self.rope.char_to_byte(s);
+        let start_point = self.char_point(s);
+        let old_end_byte = self.rope.char_to_byte(e);
+        let old_end_point = self.char_point(e);
+        let new_end_byte = start_byte + inserted.len();
+        let new_end_point = advance_point(start_point, inserted);
+        let edit = tree_sitter::InputEdit {
+            start_byte,
+            old_end_byte,
+            new_end_byte,
+            start_position: start_point,
+            old_end_position: old_end_point,
+            new_end_position: new_end_point,
+        };
+        self.pending_splice_count += 1;
+        self.pending_edit = if self.pending_splice_count == 1 {
+            Some(edit)
+        } else {
+            None
+        };
+    }
+
+    /// Consume the pending incremental `InputEdit` for the next reparse,
+    /// resetting the per-reparse window. `Some` ONLY when exactly one clean
+    /// splice happened since the last call (the typing hot path); `None`
+    /// otherwise (zero or multiple splices → full reparse).
+    pub fn take_pending_edit(&mut self) -> Option<tree_sitter::InputEdit> {
+        let edit = if self.pending_splice_count == 1 {
+            self.pending_edit.take()
+        } else {
+            None
+        };
+        self.pending_edit = None;
+        self.pending_splice_count = 0;
+        edit
     }
 
     pub fn rope(&self) -> &Rope {
