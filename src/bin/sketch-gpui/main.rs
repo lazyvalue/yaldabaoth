@@ -2393,20 +2393,31 @@ fn restore_content(
     match kind {
         PersistedKind::Doc { path } => {
             let label: SharedString = path.display().to_string().into();
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
-            let doc = Document::from_text(text, path.clone());
-            let blocks = render_with_wiki(&doc.full_text(), theme, Some(&path));
-            WindowContent::Doc(DocState {
-                blocks,
-                file_label: label,
-                cursor_block: 0,
-                list_state: DocState::new_list_state(0),
-                list_item_count: std::cell::Cell::new(0),
-                blocks_seq: 0,
-                blocks_snapshot: RefCell::new(None),
-                last_cursor_block: std::cell::Cell::new(None),
-                source: None,
-            })
+            // 5c: restore the Doc bound to its pooled core (shared text/undo +
+            // live tracking). Fall back to a Browser if the file vanished since
+            // it was persisted (mirrors the Edit restore path).
+            match ws.open_and_retain(&path) {
+                Ok((id, core)) => {
+                    let blocks =
+                        render_with_wiki(&core.borrow().document().full_text(), theme, Some(&path));
+                    WindowContent::Doc(DocState {
+                        blocks,
+                        file_label: label,
+                        cursor_block: 0,
+                        list_state: DocState::new_list_state(0),
+                        list_item_count: std::cell::Cell::new(0),
+                        blocks_seq: 0,
+                        blocks_snapshot: RefCell::new(None),
+                        last_cursor_block: std::cell::Cell::new(None),
+                        source: Some(DocSource::new(id, core)),
+                    })
+                }
+                Err(_) => WindowContent::Browser(BrowserWindow::standalone(
+                    path.parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from(".")),
+                )),
+            }
         }
         PersistedKind::Edit { path } => {
             let label: SharedString = path.display().to_string().into();
@@ -4186,8 +4197,13 @@ impl DocState {
         };
         let path = PathBuf::from(self.file_label.as_ref());
         let blocks = render_with_wiki(&text, theme, Some(&path));
+        let n = blocks.len();
         self.set_blocks(blocks);
         if let Some(src) = self.source.as_mut() {
+            eprintln!(
+                "[5c] refresh_blocks: Doc buf={} seq {}→{} ({} blocks)",
+                src.buffer_id, src.rendered_seq, seq, n
+            );
             src.rendered_seq = seq;
         }
     }
@@ -6452,6 +6468,7 @@ impl SketchGpuiView {
             }
         };
         let label: SharedString = canon.into();
+        eprintln!("[5c] open_file → Doc binds buf={buf_id}");
         let blocks = render_with_wiki(
             &core.borrow().document().full_text(),
             &self.theme,
@@ -7273,25 +7290,31 @@ impl SketchGpuiView {
                 Err(_) => browser_fallback(),
             }
         } else {
-            // Doc panes render a disk snapshot (read-only view); no shared
-            // editor state to pool.
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(_) => return browser_fallback(),
-            };
-            let doc = Document::from_text(text, path.clone());
-            let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
-            WindowContent::Doc(DocState {
-                blocks,
-                file_label: label,
-                cursor_block: 0,
-                list_state: DocState::new_list_state(0),
-                list_item_count: std::cell::Cell::new(0),
-                blocks_seq: 0,
-                blocks_snapshot: RefCell::new(None),
-                last_cursor_block: std::cell::Cell::new(None),
-                source: None,
-            })
+            // 5c: bind the cloned Doc to the SAME pooled core (open_and_retain
+            // dedups by canonical path), so it tracks live edits from any other
+            // view of the file — the multi-home / also-show live case.
+            match self.workspace.open_and_retain(&path) {
+                Ok((id, core)) => {
+                    let blocks = render_with_wiki(
+                        &core.borrow().document().full_text(),
+                        &self.theme,
+                        Some(&path),
+                    );
+                    eprintln!("[5c] clone_for_split → Doc binds buf={id}");
+                    WindowContent::Doc(DocState {
+                        blocks,
+                        file_label: label,
+                        cursor_block: 0,
+                        list_state: DocState::new_list_state(0),
+                        list_item_count: std::cell::Cell::new(0),
+                        blocks_seq: 0,
+                        blocks_snapshot: RefCell::new(None),
+                        last_cursor_block: std::cell::Cell::new(None),
+                        source: Some(DocSource::new(id, core)),
+                    })
+                }
+                Err(_) => browser_fallback(),
+            }
         }
     }
 
@@ -8111,6 +8134,7 @@ impl SketchGpuiView {
                 ),
                 _ => return,
             };
+        let was_shared = shared.is_some();
         let (id, core) = match shared {
             Some(pair) => pair,
             None => {
@@ -8123,6 +8147,7 @@ impl SketchGpuiView {
                 }
             }
         };
+        eprintln!("[5c] enter_edit → Edit binds buf={id} (shared_from_doc={was_shared})");
         let mut edit_state = EditState::new(SharedEditor::new(id, core), label, view);
         edit_state.view = view;
         self.set_screen(WindowContent::Edit(edit_state));
@@ -8160,6 +8185,7 @@ impl SketchGpuiView {
                 // 5c: the new Doc keeps the SAME pooled core the Edit view held
                 // (shared text + undo). No stash — the core IS the live state.
                 let source = DocSource::new(edit.editor.buffer_id, edit.editor.core.clone());
+                eprintln!("[5c] back_to_doc → Doc keeps buf={}", source.buffer_id);
                 self.set_screen(WindowContent::Doc(DocState {
                     blocks,
                     file_label,
@@ -8233,21 +8259,23 @@ impl SketchGpuiView {
             eprintln!("wiki link: no file found for [[{}]]", target);
             return;
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(err) => {
-                eprintln!("wiki link: cannot read {}: {}", path.display(), err);
-                return;
-            }
-        };
         let canon = path
             .canonicalize()
             .unwrap_or_else(|_| path.clone())
             .display()
             .to_string();
         let label: SharedString = canon.into();
-        let doc = Document::from_text(text, path.clone());
-        let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
+        // 5c: bind the wiki-link target Doc to its pooled core (dedup by path),
+        // so it shares text/undo with any Edit view and live-tracks.
+        let (buf_id, core) = match self.workspace.open_and_retain(&path) {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("wiki link: cannot open {}: {err}", path.display());
+                return;
+            }
+        };
+        let blocks =
+            render_with_wiki(&core.borrow().document().full_text(), &self.theme, Some(&path));
         self.set_screen(WindowContent::Doc(DocState {
             blocks,
             file_label: label,
@@ -8257,7 +8285,7 @@ impl SketchGpuiView {
             blocks_seq: 0,
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
-            source: None,
+            source: Some(DocSource::new(buf_id, core)),
         }));
         self.doc_selection = None;
         self.save_workspace_state();
@@ -8276,11 +8304,16 @@ impl SketchGpuiView {
         // focused window without holding a mutable borrow across file I/O +
         // workspace mutation.
         enum FocusKind {
-            Doc(PathBuf, SharedString),
+            Doc(
+                Option<(workspace::FileBufferId, workspace::SharedCore)>,
+                PathBuf,
+                SharedString,
+            ),
             Edit(workspace::SharedCore, PathBuf),
         }
         let focus_kind = match self.workspace.focused_content() {
             Some(WindowContent::Doc(d)) => FocusKind::Doc(
+                d.source.as_ref().map(|s| (s.buffer_id, s.core.clone())),
                 PathBuf::from(d.file_label.as_ref()),
                 d.file_label.clone(),
             ),
@@ -8313,8 +8346,10 @@ impl SketchGpuiView {
                     e.editor.clear_selection();
                 }
             }
-            // Doc reload re-renders a fresh disk snapshot.
-            FocusKind::Doc(path, label) => {
+            // Doc reload: for a pool-bound Doc, reset the SHARED core to the
+            // disk version in place (reverts every view of the file, like the
+            // Edit path); for a legacy non-pooled Doc, render a fresh snapshot.
+            FocusKind::Doc(pooled, path, label) => {
                 let text = match std::fs::read_to_string(&path) {
                     Ok(t) => t,
                     Err(err) => {
@@ -8322,8 +8357,23 @@ impl SketchGpuiView {
                         return;
                     }
                 };
-                let doc = Document::from_text(text, path.clone());
-                let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
+                let (blocks, source) = match pooled {
+                    Some((id, core)) => {
+                        *core.borrow_mut() = EditorCore::new(text, path.clone());
+                        let blocks = render_with_wiki(
+                            &core.borrow().document().full_text(),
+                            &self.theme,
+                            Some(&path),
+                        );
+                        (blocks, Some(DocSource::new(id, core)))
+                    }
+                    None => {
+                        let doc = Document::from_text(text, path.clone());
+                        let blocks =
+                            render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
+                        (blocks, None)
+                    }
+                };
                 self.set_screen(WindowContent::Doc(DocState {
                     blocks,
                     file_label: label,
@@ -8333,7 +8383,7 @@ impl SketchGpuiView {
                     blocks_seq: 0,
                     blocks_snapshot: RefCell::new(None),
                     last_cursor_block: std::cell::Cell::new(None),
-                    source: None,
+                    source,
                 }));
             }
         }
@@ -16862,7 +16912,7 @@ fn main() {
     let theme = Theme::from_name(theme_name);
 
     // No path → launch directly into the file browser at cwd.
-    let initial_doc: Option<(Vec<RenderedBlock>, String)> = match args.get(1) {
+    let initial_doc: Option<(Vec<RenderedBlock>, String, PathBuf)> = match args.get(1) {
         Some(p) => {
             let path = PathBuf::from(p);
             let text = match std::fs::read_to_string(&path) {
@@ -16880,7 +16930,7 @@ fn main() {
             let doc = Document::from_text(text, path.clone());
             let blocks = render_with_wiki(&doc.full_text(), &theme, Some(&path));
             println!("sketch-gpui: loaded {} ({} blocks)", canon, blocks.len());
-            Some((blocks, canon))
+            Some((blocks, canon, path))
         }
         None => {
             println!("sketch-gpui: no file given, opening browser");
@@ -16923,12 +16973,26 @@ fn main() {
                     let focus_handle = cx.focus_handle();
                     focus_handle.focus(window);
                     let mut view = match initial_doc.clone() {
-                        Some((blocks, canon)) => SketchGpuiView::new_doc(
-                            blocks,
-                            theme.clone(),
-                            canon,
-                            focus_handle,
-                        ),
+                        Some((blocks, canon, path)) => {
+                            let mut v = SketchGpuiView::new_doc(
+                                blocks,
+                                theme.clone(),
+                                canon,
+                                focus_handle,
+                            );
+                            // 5c: pool-bind the startup Doc now that the
+                            // workspace (and its buffer pool) exists, so the
+                            // CLI file shares its core with any Edit view and
+                            // live-tracks.
+                            if let Ok((id, core)) = v.workspace.open_and_retain(&path) {
+                                if let Some(WindowContent::Doc(d)) =
+                                    v.workspace.focused_content_mut()
+                                {
+                                    d.source = Some(DocSource::new(id, core));
+                                }
+                            }
+                            v
+                        }
                         None => SketchGpuiView::new_browser(
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                             theme.clone(),
