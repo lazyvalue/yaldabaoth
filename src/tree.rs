@@ -1,7 +1,7 @@
 use tree_sitter::{Parser, Tree};
 
 /// Block boundary info from tree-sitter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockInfo {
     pub start_byte: usize,
     pub end_byte: usize,
@@ -25,20 +25,26 @@ impl TreeState {
         Self { parser, tree: None }
     }
 
-    pub fn parse(&mut self, source: &[u8]) {
-        // FRESH parse every time (`None`, not `self.tree.as_ref()`).
-        // Incremental reuse is only sound if `tree.edit()` recorded every
-        // change to the old tree first — and the editor never does (it
-        // reparses from `full_text()` with no diff). Feeding tree-sitter a
-        // stale tree gave it wrong byte offsets, and on some markdown edits
-        // the external scanner's `serialize` then read/wrote out of bounds →
-        // a (heap-nondeterministic) SIGSEGV while typing. A fresh parse is
-        // O(doc) but correct; markdown docs are small and the editor already
-        // reparses the whole buffer here. Reinstate incremental ONLY with
-        // proper `tree.edit()` tracking (and real edit positions — never the
-        // `Point::new(0,0)` placeholders the removed `edit()` helper used,
-        // which are wrong for multi-line edits).
-        self.tree = self.parser.parse(source, None);
+    /// Re-parse `source`. When `edit` is `Some`, reuse the previous tree
+    /// incrementally (O(change)) after recording the edit on it; when `None`,
+    /// drop the prior tree and do a full parse.
+    ///
+    /// SAFETY: incremental reuse is sound ONLY if the previous tree was told
+    /// about the change via `tree.edit()` with the CORRECT byte+`Point` ranges
+    /// first — feeding tree-sitter a stale tree gives it wrong byte offsets,
+    /// and on some markdown edits the external scanner's `serialize` then
+    /// reads/writes out of bounds → a (heap-nondeterministic) SIGSEGV. The
+    /// caller computes `edit` from a single clean splice
+    /// (`Document::take_pending_edit`); anything it can't represent exactly
+    /// passes `None` (full parse). `incremental_reparse_matches_full_parse`
+    /// fuzz-guards that the `Some` path never diverges from a full parse.
+    pub fn parse(&mut self, source: &[u8], edit: Option<tree_sitter::InputEdit>) {
+        match (edit, self.tree.as_mut()) {
+            (Some(e), Some(tree)) => tree.edit(&e),
+            // No edit info, or no prior tree → drop it and full-parse.
+            _ => self.tree = None,
+        }
+        self.tree = self.parser.parse(source, self.tree.as_ref());
     }
 
     pub fn tree(&self) -> Option<&Tree> {

@@ -13,6 +13,17 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
 
 ## Bugs
 
+- **Edit-view typing crash + latency** — `FIXED` (2026-06-06). `reparse` fed
+  tree-sitter a stale (never-`edit()`'d) tree → nondeterministic SIGSEGV
+  (`d32edf9`); then full-parse-per-keystroke was slow → proper incremental
+  reparse, fuzz-guarded, 10–20× faster (`413da19`). See worklog
+  `2026-06-06-reparse-segfault-and-incremental.md`.
+- **Reparse may be wasted work** — `READY` (small). The adversarial verifier
+  noted the tree-sitter tree might be consumed "only in tests, not GPUI
+  rendering." If true, the per-keystroke `reparse` could be made lazy/skipped
+  for an even bigger win. Quick code-read, no runtime needed. (Incremental
+  reparse already cut the cost 10–20×, so lower priority now.)
+
 - **Session-server reconnect storm** — `NEEDS-RUNTIME-REPRO`. The GUI client
   flaps its connection to the session server in a tight loop: a single
   `session-server.log` accumulated **489 "client reconnected" vs 5 "client

@@ -248,7 +248,7 @@ pub struct Editor {
 impl EditorCore {
     pub fn new(text: String, file_path: PathBuf) -> Self {
         let mut tree_state = TreeState::new();
-        tree_state.parse(text.as_bytes());
+        tree_state.parse(text.as_bytes(), None);
 
         let document = Document::from_text(text, file_path);
         Self {
@@ -701,10 +701,24 @@ impl EditorCore {
         }
     }
 
-    /// Re-parse the document with tree-sitter.
+    /// Re-parse the document with tree-sitter, incrementally when exactly one
+    /// clean splice has happened since the last reparse (the typing hot path),
+    /// else a full parse. The edit is computed in `Document::record_splice` and
+    /// consumed here via `take_pending_edit`.
     pub fn reparse(&mut self) {
+        let edit = self.document.take_pending_edit();
         let text = self.document.full_text();
-        self.tree_state.parse(text.as_bytes());
+        if std::env::var("SKETCH_PARSE_TIMING").as_deref() == Ok("1") {
+            let kind = if edit.is_some() { "incr" } else { "full" };
+            let t0 = std::time::Instant::now();
+            self.tree_state.parse(text.as_bytes(), edit);
+            let us = t0.elapsed().as_micros();
+            if us > 100 {
+                eprintln!("[parse] {kind} reparse {} bytes in {us}µs", text.len());
+            }
+        } else {
+            self.tree_state.parse(text.as_bytes(), edit);
+        }
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
@@ -2365,5 +2379,145 @@ fn f() { let x = 1; }
             core.reparse();
         }
         assert!(core.document.full_text().len() > content.len());
+    }
+
+    /// THE incremental-reparse safety guard. Drives the editor through long
+    /// random sequences of inserts / backspaces / deletes (markdown-structural
+    /// chars, newlines, and multibyte) and after EVERY edit asserts the
+    /// incrementally-maintained tree-sitter tree is byte-for-byte identical (by
+    /// full s-expression) to a fresh FULL parse of the same text. A wrong
+    /// `InputEdit` (the only incremental crash hazard) makes the incremental
+    /// tree diverge → this fails deterministically; and the thousands of edits
+    /// also exercise the scanner-serialize path that segfaulted. If this
+    /// passes, the `Some(edit)` path is sound.
+    #[test]
+    fn incremental_reparse_matches_full_parse() {
+        let mut s: u64 = 0x9E3779B97F4A7C15;
+        let mut rnd = |n: usize| -> usize {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s % n as u64) as usize
+        };
+        // Markdown-structural + punctuation + newline + multibyte.
+        let chars = [
+            'a', 'b', 'c', ' ', '\n', '#', '-', '*', '|', '`', '>', '1', '.', '(', ')', '[', ']',
+            'é', '—', '”', 'x', '\n',
+        ];
+        let seeds = [
+            "",
+            "# Heading\n\nsome text here\n",
+            "para\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nmore\n",
+            "```rust\nfn f() {}\n```\n\n- one\n- two\n",
+            "> quote\n> more\n\ntext é unicode line\n",
+        ];
+        for trial in 0..300 {
+            let init = seeds[trial % seeds.len()];
+            let mut core = EditorCore::new(init.to_string(), std::path::PathBuf::from("t.md"));
+            let mut view = EditorView::new();
+            core.reparse();
+            for step in 0..90 {
+                // Move the cursor to a random valid position so edits land in
+                // headings, tables, code fences, mid-line, line ends, etc.
+                let lc = core.document.line_count().max(1);
+                let line = rnd(lc);
+                let col = rnd(core.document.line_len_chars(line) + 1);
+                view.cursor.line = line;
+                view.cursor.col = col;
+                match rnd(7) {
+                    0 | 1 | 2 | 3 => {
+                        // Insert — the GUI wraps each keystroke in begin/end.
+                        let ch = chars[rnd(chars.len())];
+                        view.begin_insert(&mut core);
+                        view.insert_char(&mut core, ch);
+                        view.end_insert(&mut core);
+                    }
+                    4 => {
+                        view.begin_insert(&mut core);
+                        view.backspace(&mut core);
+                        view.end_insert(&mut core);
+                    }
+                    5 => {
+                        // Multi-char single-splice insert (programmatic_insert /
+                        // paste) — exercises the multi-line `advance_point` path.
+                        let frags = ["ab", "x\ny", "# H\n", "| z |\n", "`c` é", "\n\n", "-- "];
+                        let frag = frags[rnd(frags.len())];
+                        let ci = core.document.line_col_to_char(line, col);
+                        core.programmatic_insert(ci, frag);
+                        core.reparse();
+                    }
+                    _ => {
+                        view.delete_char_at_cursor(&mut core);
+                    }
+                }
+
+                // Oracle: the incremental tree must equal a fresh full parse.
+                let text = core.document.full_text();
+                let incr = core
+                    .tree_state
+                    .tree()
+                    .map(|t| t.root_node().to_sexp())
+                    .unwrap_or_default();
+                let mut fresh = crate::tree::TreeState::new();
+                fresh.parse(text.as_bytes(), None);
+                let full = fresh
+                    .tree()
+                    .map(|t| t.root_node().to_sexp())
+                    .unwrap_or_default();
+                assert_eq!(
+                    incr, full,
+                    "trial {trial} step {step}: incremental tree diverged from full parse.\n\
+                     --- TEXT ---\n{text}\n--- END ---"
+                );
+            }
+        }
+    }
+
+    /// MEASUREMENT (not a gate): show that an incremental single-char reparse
+    /// is ~constant regardless of doc size, vs the O(doc) full parse the
+    /// segfault fix had us paying per keystroke. Run with:
+    ///   cargo test --lib incremental_reparse_speed -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn incremental_reparse_speed() {
+        for &lines in &[200usize, 1000, 5000] {
+            let mut text = String::new();
+            let mut i = 0;
+            while text.lines().count() < lines {
+                i += 1;
+                match i % 6 {
+                    0 => text.push_str(&format!("# Section {i}\n\n")),
+                    3 => text.push_str("| a | b |\n|---|---|\n| 1 | 2 |\n\n"),
+                    4 => text.push_str("```\ncode line\n```\n\n"),
+                    _ => text.push_str(&format!("paragraph line {i} with words\n")),
+                }
+            }
+            let mut core = EditorCore::new(text.clone(), std::path::PathBuf::from("t.md"));
+            let mut view = EditorView::new();
+            core.reparse();
+            // Time many incremental single-char inserts (the typing hot path).
+            view.cursor.line = core.document.line_count() / 2;
+            view.cursor.col = 0;
+            const N: u32 = 200;
+            let t0 = std::time::Instant::now();
+            for _ in 0..N {
+                view.begin_insert(&mut core);
+                view.insert_char(&mut core, 'x');
+                view.end_insert(&mut core);
+            }
+            let incr_us = t0.elapsed().as_micros() as f64 / N as f64;
+            // Full parse cost for the same doc, for comparison.
+            let bytes = core.document.full_text();
+            let t1 = std::time::Instant::now();
+            for _ in 0..N {
+                let mut ts = crate::tree::TreeState::new();
+                ts.parse(bytes.as_bytes(), None);
+            }
+            let full_us = t1.elapsed().as_micros() as f64 / N as f64;
+            eprintln!(
+                "{lines:>5} lines: incremental {incr_us:>7.1}µs/keystroke   vs full parse {full_us:>8.1}µs   ({:.0}x faster)",
+                full_us / incr_us.max(0.01)
+            );
+        }
     }
 }
