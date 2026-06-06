@@ -102,6 +102,49 @@ impl ManagedSession {
             has_owner: self.owner.is_some(),
         });
     }
+
+    /// Publish a freshly-spawned `channel` as this session's live channel,
+    /// running the full attach choreography atomically under the caller's
+    /// lock. The single chokepoint for create / restore / restart (9′) so the
+    /// three can't drift:
+    /// 1. Re-apply the session's `permission_mode` (a fresh channel starts at
+    ///    its default — without this the configured mode silently reverts).
+    /// 2. Drain `pending_prompts` in arrival order onto the new channel BEFORE
+    ///    publishing it, so they're enqueued at the ACP driver before any
+    ///    future prompt races in. Doing this under the lock also closes the
+    ///    take-then-publish window where a concurrent `prompt()` could re-queue
+    ///    onto a `pending_prompts` we'd already drained.
+    /// 3. On a respawn (force-restart), bump `channel_generation` so the pump
+    ///    rebaselines its `last_turns` against the new channel's zeroed counter.
+    /// 4. Swap the channel in and `record(SessionAttached)`.
+    ///
+    /// Returns the OLD channel (if any) WITHOUT dropping it — the caller must
+    /// drop it AFTER releasing the sessions lock, because `AcpChannelClient`'s
+    /// `Drop` joins the worker thread / kills the child and must never run
+    /// while the global mutex is held.
+    #[must_use = "drop the returned old channel after releasing the lock"]
+    fn apply_channel_state(
+        &mut self,
+        mut channel: AcpChannelClient,
+        is_respawn: bool,
+    ) -> Option<AcpChannelClient> {
+        channel.set_permission_mode(self.permission_mode);
+        for text in std::mem::take(&mut self.pending_prompts) {
+            if let Err(e) = channel.send(&text) {
+                eprintln!("[session-server] failed to flush queued prompt: {e}");
+            }
+        }
+        let acp_session_id = channel.session_id();
+        if is_respawn {
+            self.channel_generation = self.channel_generation.wrapping_add(1);
+        }
+        let old = self.channel.replace(channel);
+        self.record(Notification::SessionAttached {
+            session_id: self.id.clone(),
+            acp_session_id,
+        });
+        old
+    }
 }
 
 // ── Session manager ────────────────────────────────────────────────
@@ -306,22 +349,16 @@ impl SessionManager {
                         SketchFrontend::Gpui,
                     ) {
                         Ok(client) => {
-                            let new_acp_id = client.session_id();
-                            {
+                            // Publish via the shared choreography (9′). Resume
+                            // from disk → is_respawn=false (generation stays 0).
+                            let old = {
                                 let mut sessions = manager.lock_sessions();
-                                if let Some(s) = sessions.get_mut(&session_id) {
-                                    // Re-apply the session's permission policy to
-                                    // the freshly spawned channel — a new channel
-                                    // starts at its default, so without this the
-                                    // configured mode silently reverts on resume.
-                                    client.set_permission_mode(s.permission_mode);
-                                    s.channel = Some(client);
-                                    s.record(Notification::SessionAttached {
-                                        session_id: session_id.clone(),
-                                        acp_session_id: new_acp_id,
-                                    });
+                                match sessions.get_mut(&session_id) {
+                                    Some(s) => s.apply_channel_state(client, false),
+                                    None => Some(client),
                                 }
-                            }
+                            };
+                            drop(old);
                             spawn_pump_thread(Arc::clone(&manager), session_id);
                         }
                         Err(e) => {
@@ -399,39 +436,20 @@ impl SessionManager {
                     resume_session_id,
                     SketchFrontend::Gpui,
                 ) {
-                    Ok(mut client) => {
-                        let acp_id = client.session_id();
-                        // Drain any prompts that the GUI submitted while we
-                        // were spawning. Send them in arrival order before
-                        // we publish the channel, so they're queued at the
-                        // ACP driver loop before any future prompt races in.
-                        let queued = {
+                    Ok(client) => {
+                        // Publish the channel + drain queued prompts atomically
+                        // (9′, `apply_channel_state`). Fresh spawn → is_respawn
+                        // = false, generation stays 0.
+                        let old = {
                             let mut sessions = manager.lock_sessions();
-                            sessions
-                                .get_mut(&session_id)
-                                .map(|s| std::mem::take(&mut s.pending_prompts))
-                                .unwrap_or_default()
+                            match sessions.get_mut(&session_id) {
+                                Some(s) => s.apply_channel_state(client, false),
+                                // Session closed while we were spawning — return
+                                // the orphan so it Drops after the lock releases.
+                                None => Some(client),
+                            }
                         };
-                        for text in queued {
-                            if let Err(e) = client.send(&text) {
-                                eprintln!(
-                                    "[session-server] failed to flush queued prompt: {e}"
-                                );
-                            }
-                        }
-                        {
-                            let mut sessions = manager.lock_sessions();
-                            if let Some(s) = sessions.get_mut(&session_id) {
-                                // Re-apply the session's permission policy to the
-                                // freshly spawned channel (defaults otherwise).
-                                client.set_permission_mode(s.permission_mode);
-                                s.channel = Some(client);
-                                s.record(Notification::SessionAttached {
-                                    session_id: session_id.clone(),
-                                    acp_session_id: acp_id,
-                                });
-                            }
-                        }
+                        drop(old);
                         // Start the pump thread now that the channel is live.
                         spawn_pump_thread(Arc::clone(&manager), session_id);
                     }
@@ -627,26 +645,20 @@ impl SessionManager {
                     SketchFrontend::Gpui,
                 ) {
                     Ok(client) => {
-                        let acp_id = client.session_id();
-                        // Swap under the lock so the pump never sees a None
-                        // channel; drop the old one *after* releasing the
-                        // lock (Drop joins the worker / kills the child).
+                        // Swap via the shared choreography (9′): re-apply the
+                        // permission policy, drain queued prompts (the fix —
+                        // restart previously dropped prompts queued mid-restart),
+                        // and bump generation (is_respawn=true). The pump never
+                        // sees a None channel (swap is under the lock); the OLD
+                        // channel is dropped AFTER releasing the lock — its Drop
+                        // joins the worker / kills the child and must not run
+                        // under the mutex.
                         let old = {
                             let mut sessions = manager.lock_sessions();
-                            let Some(s) = sessions.get_mut(&sid) else { return };
-                            // Re-apply the session's permission policy to the
-                            // freshly spawned channel — the restart spawns a
-                            // brand-new channel at its default mode, so without
-                            // this the configured policy silently reverts.
-                            client.set_permission_mode(s.permission_mode);
-                            let old = s.channel.take();
-                            s.channel = Some(client);
-                            s.channel_generation = s.channel_generation.wrapping_add(1);
-                            s.record(Notification::SessionAttached {
-                                session_id: sid.clone(),
-                                acp_session_id: acp_id,
-                            });
-                            old
+                            match sessions.get_mut(&sid) {
+                                Some(s) => s.apply_channel_state(client, true),
+                                None => Some(client),
+                            }
                         };
                         drop(old);
                     }
