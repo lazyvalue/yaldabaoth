@@ -138,6 +138,22 @@ impl HighlightCache {
         }
     }
 
+    /// Reset to the just-constructed state for a transcript replay (the owner
+    /// owns its own reset — ADR-0011 / item R). Value-identical to `new()` but
+    /// clears the per-line vectors in place so their allocations stay warm for
+    /// the immediately-following replay re-highlight.
+    pub fn reset(&mut self) {
+        self.lines.clear();
+        self.hashes.clear();
+        self.fence_before.clear();
+        self.last_edit_seq = 0;
+        self.primed = false;
+        self.theme_fp = None;
+        self.snapshot = None;
+        self.last_recomputed = 0;
+        self.last_was_skip = false;
+    }
+
     /// Reconcile against `lines` and return a cheap shareable snapshot for the
     /// list render closure. Only lines whose content hash or inbound fence
     /// state changed are re-highlighted; everything else is reused.

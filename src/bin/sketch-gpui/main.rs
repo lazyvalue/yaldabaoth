@@ -5629,7 +5629,7 @@ impl AgentState {
         self.view_model = AgentViewModel::new();
         self.lines_cache = std::rc::Rc::new(Vec::new());
         self.lines_cache_seq = u64::MAX;
-        self.highlight_cache = HighlightCache::new();
+        self.highlight_cache.reset();
         self.current_plan = None;
         self.focused_subagent = None;
         self.usage = None;
