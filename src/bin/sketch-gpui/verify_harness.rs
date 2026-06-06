@@ -600,7 +600,7 @@ fn seed_worksheet_line(
 ) {
     view.update(vcx, |v, _cx| {
         let claude = v.agent_mut().expect("active agent slot");
-        claude.input_mode = crate::InputMode::Worksheet;
+        claude.input_surface = crate::InputSurface::Worksheet;
         for ch in token.chars() {
             claude.editor.insert_char(ch);
         }
@@ -865,5 +865,47 @@ fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
 
         v.clear_overlay();
         assert!(!v.has_overlay(), "clear_overlay returns to None");
+    });
+}
+
+// ---- InputSurface (A.11: input_mode + chatbox:Option -> one enum) ---------
+
+/// The merged surface enforces "a chatbox exists IFF Chatbox mode" by type, and
+/// the Ctrl-Alt-Enter toggle flips between the two — destroying the box on the
+/// way to Worksheet and minting a fresh one on the way back (unchanged
+/// behavior, now unrepresentable-illegal-state).
+#[gpui::test]
+fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    // New session starts in Chatbox — a box exists.
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert!(c.input_surface.is_chatbox());
+        assert!(c.input_surface.chatbox().is_some(), "chatbox exists iff Chatbox variant");
+    });
+
+    // Toggle -> Worksheet: the box is gone (no stranded Some).
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert!(!c.input_surface.is_chatbox());
+        assert!(c.input_surface.chatbox().is_none(), "worksheet carries no chatbox");
+    });
+
+    // Toggle back -> Chatbox: a fresh box.
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    view.update(vcx, |v, _cx| {
+        assert!(v.agent_mut().unwrap().input_surface.is_chatbox());
     });
 }

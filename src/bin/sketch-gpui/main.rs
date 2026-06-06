@@ -2518,7 +2518,7 @@ struct PersistedSlot {
     id: String,
     label: String,
     active: bool,
-    mode: InputMode,
+    mode: InputModeKind,
     tasklist_open: bool,
     subagents_open: bool,
     cwd: Option<PathBuf>,
@@ -2551,7 +2551,7 @@ fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<PersistedSlot> {
             id: id.to_string(),
             label: "claude-1".into(),
             active: true,
-            mode: InputMode::Chatbox,
+            mode: InputModeKind::Chatbox,
             tasklist_open: false,
             subagents_open: false,
             cwd: None,
@@ -2580,10 +2580,10 @@ fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<PersistedSlot> {
                 .get("mode")
                 .and_then(|m| m.as_str())
                 .map(|s| match s {
-                    "worksheet" => InputMode::Worksheet,
-                    _ => InputMode::Chatbox,
+                    "worksheet" => InputModeKind::Worksheet,
+                    _ => InputModeKind::Chatbox,
                 })
-                .unwrap_or(InputMode::Chatbox);
+                .unwrap_or(InputModeKind::Chatbox);
             let tasklist_open = obj
                 .get("tasklist_open")
                 .and_then(|b| b.as_bool())
@@ -2675,9 +2675,9 @@ fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRing) {
             // Spec §35: persist input mode and sidepane state per slot.
             // Older sketch binaries reading this file ignore the unknown
             // keys (serde's standard behavior); no migration needed.
-            let mode_str = match slot.state.input_mode {
-                InputMode::Worksheet => "worksheet",
-                InputMode::Chatbox => "chatbox",
+            let mode_str = match slot.state.input_surface.mode() {
+                InputModeKind::Worksheet => "worksheet",
+                InputModeKind::Chatbox => "chatbox",
             };
             obj.insert(
                 "mode".into(),
@@ -3403,10 +3403,10 @@ fn count_turn_headers_before(tags: &[Option<TurnId>], before_line: usize) -> usi
 /// cursor is outside the transcript, so following is purely the sticky-bottom
 /// `follow_output` flag; in Worksheet mode the viewport tracks the cursor and
 /// follows only when the cursor is at EOF.
-fn should_follow_tail(input_mode: InputMode, follow_output: bool, cursor_at_eof: bool) -> bool {
+fn should_follow_tail(input_mode: InputModeKind, follow_output: bool, cursor_at_eof: bool) -> bool {
     match input_mode {
-        InputMode::Chatbox => follow_output,
-        InputMode::Worksheet => cursor_at_eof,
+        InputModeKind::Chatbox => follow_output,
+        InputModeKind::Worksheet => cursor_at_eof,
     }
 }
 
@@ -4138,8 +4138,14 @@ enum EditMode {
 /// spec-agent-window.md §4, every `AgentState` carries one of these two
 /// values; new sessions start at `Chatbox` to match today's compose-box-
 /// first feel. Toggled by `Ctrl-Alt-Enter` (§5).
+///
+/// `InputModeKind` is the **Copy discriminant** — the two-variant tag with no
+/// payload, kept for the persisted `PersistedSlot.mode` string and the
+/// `should_follow_tail` policy fn. The live state is [`InputSurface`], which
+/// owns the `Chatbox` inside its variant so "a chatbox exists iff we're in
+/// Chatbox mode" is enforced by the type rather than two hand-synced fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InputMode {
+enum InputModeKind {
     /// User input is interleaved with LLM output in the transcript editor.
     /// Frozen lines are immutable; editable lines accumulate until a Submit
     /// sweeps and freezes them all (§9–§15).
@@ -4148,6 +4154,43 @@ enum InputMode {
     /// bottom of the window. The transcript is read-only while in this
     /// mode (§16–§20).
     Chatbox,
+}
+
+/// The single live input surface of an agent window (§4–§5). Replaces the old
+/// `input_mode: InputMode` + `chatbox: Option<Chatbox>` pair: the Chatbox data
+/// lives INSIDE the `Chatbox` variant, so the illegal states (Chatbox-mode with
+/// no box, or Worksheet with a stranded box) are unrepresentable. New sessions
+/// start at `Chatbox` (compose-box-first); `Ctrl-Alt-Enter` toggles. NOT `Copy`
+/// (it owns a `Chatbox`).
+enum InputSurface {
+    Worksheet,
+    Chatbox(Chatbox),
+}
+
+impl InputSurface {
+    fn is_chatbox(&self) -> bool {
+        matches!(self, InputSurface::Chatbox(_))
+    }
+    fn chatbox(&self) -> Option<&Chatbox> {
+        match self {
+            InputSurface::Chatbox(cb) => Some(cb),
+            InputSurface::Worksheet => None,
+        }
+    }
+    fn chatbox_mut(&mut self) -> Option<&mut Chatbox> {
+        match self {
+            InputSurface::Chatbox(cb) => Some(cb),
+            InputSurface::Worksheet => None,
+        }
+    }
+    /// The Copy discriminant, for the persisted mode string and
+    /// `should_follow_tail` (which must not borrow the owned `Chatbox`).
+    fn mode(&self) -> InputModeKind {
+        match self {
+            InputSurface::Worksheet => InputModeKind::Worksheet,
+            InputSurface::Chatbox(_) => InputModeKind::Chatbox,
+        }
+    }
 }
 
 /// Tool names that the v1 sub-agent classifier treats as sub-agents.
@@ -5052,14 +5095,12 @@ struct AgentState {
     /// lines that changed between renders instead of the whole buffer every
     /// `cx.notify()`. Bypassed when `SKETCH_HL_CACHE=0`.
     highlight_cache: HighlightCache,
-    /// Which input surface the user is currently using (§4). Per the
-    /// spec, new sessions start at `Chatbox` to match today's compose-box-
-    /// first feel; the user toggles with `Ctrl-Alt-Enter` (§5).
-    input_mode: InputMode,
-    /// Standalone draft editor. `Some` iff `input_mode == Chatbox`; in
-    /// Worksheet mode this is `None` and key dispatch routes to the
-    /// transcript editor instead.
-    chatbox: Option<Chatbox>,
+    /// The active input surface (§4). The `Chatbox` draft editor lives INSIDE
+    /// the `Chatbox` variant — make-illegal-states-unrepresentable, so the old
+    /// "`chatbox` is `Some` iff `input_mode == Chatbox`" invariant (two
+    /// hand-synced fields) is now enforced by the type. New sessions start at
+    /// `Chatbox`; `Ctrl-Alt-Enter` toggles (§5).
+    input_surface: InputSurface,
     /// Last-seen full snapshot of the agent's plan. Updated on every ACP
     /// `Plan` notification (which carries a complete plan, not a delta —
     /// see spec-agent-window.md §21). Consumed by the Tasklist sidepane.
@@ -5239,8 +5280,7 @@ impl AgentState {
             view_model_fp: None,
             view_model_seq: 0,
             highlight_cache: HighlightCache::new(),
-            input_mode: InputMode::Chatbox,
-            chatbox: Some(Chatbox::new()),
+            input_surface: InputSurface::Chatbox(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
             usage: None,
@@ -5290,8 +5330,7 @@ impl AgentState {
             view_model_fp: None,
             view_model_seq: 0,
             highlight_cache: HighlightCache::new(),
-            input_mode: InputMode::Chatbox,
-            chatbox: Some(Chatbox::new()),
+            input_surface: InputSurface::Chatbox(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
             usage: None,
@@ -5468,7 +5507,7 @@ impl AgentState {
     fn follow_tail(&self) -> bool {
         let line_count = self.editor.document().line_count();
         let cursor_at_eof = self.editor.cursor().line + 1 >= line_count;
-        should_follow_tail(self.input_mode, self.follow_output.get(), cursor_at_eof)
+        should_follow_tail(self.input_surface.mode(), self.follow_output.get(), cursor_at_eof)
     }
 
     /// Reveal the tail item if we're following AND content has actually grown
@@ -6231,9 +6270,8 @@ impl SketchGpuiView {
                             session_index,
                             cx,
                         );
-                        state.input_mode = slot.mode;
-                        if slot.mode == InputMode::Worksheet {
-                            state.chatbox = None;
+                        if slot.mode == InputModeKind::Worksheet {
+                            state.input_surface = InputSurface::Worksheet;
                         }
                         state.tasklist_open = slot.tasklist_open;
                         state.subagents_open = slot.subagents_open;
@@ -6903,8 +6941,8 @@ impl SketchGpuiView {
             }
             Some(WindowContent::Agent(ring)) => {
                 let c = &mut ring.active_mut().state;
-                if c.input_mode == InputMode::Chatbox {
-                    if let Some(ref mut cb) = c.chatbox {
+                if c.input_surface.is_chatbox() {
+                    if let Some(cb) = c.input_surface.chatbox_mut() {
                         if cb.mode == EditMode::Insert {
                             for ch in text.chars() {
                                 cb.editor.insert_char(ch);
@@ -6955,8 +6993,8 @@ impl SketchGpuiView {
             Some(WindowContent::Edit(e)) => e.editor.selection_text(),
             Some(WindowContent::Agent(ring)) => {
                 let c = &ring.active().state;
-                if c.input_mode == InputMode::Chatbox {
-                    c.chatbox.as_ref().and_then(|cb| cb.editor.selection_text())
+                if c.input_surface.is_chatbox() {
+                    c.input_surface.chatbox().and_then(|cb| cb.editor.selection_text())
                 } else {
                     c.editor.selection_text()
                 }
@@ -10968,9 +11006,8 @@ impl SketchGpuiView {
                         session_index,
                         cx,
                     );
-                    state.input_mode = slot.mode;
-                    if slot.mode == InputMode::Worksheet {
-                        state.chatbox = None;
+                    if slot.mode == InputModeKind::Worksheet {
+                        state.input_surface = InputSurface::Worksheet;
                     }
                     state.tasklist_open = slot.tasklist_open;
                     state.subagents_open = slot.subagents_open;
@@ -11708,8 +11745,7 @@ impl SketchGpuiView {
             view_model_fp: None,
             view_model_seq: 0,
             highlight_cache: HighlightCache::new(),
-            input_mode: InputMode::Chatbox,
-            chatbox: Some(Chatbox::new()),
+            input_surface: InputSurface::Chatbox(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
             usage: None,
@@ -12846,15 +12882,12 @@ impl SketchGpuiView {
             Some(c) => c,
             None => return,
         };
-        match claude.input_mode {
-            InputMode::Chatbox => {
-                let text = claude
-                    .chatbox
-                    .as_ref()
-                    .map(|cb| cb.text())
-                    .unwrap_or_default();
-                claude.chatbox = None;
-                claude.input_mode = InputMode::Worksheet;
+        match &claude.input_surface {
+            // Read the draft text out (last use of `cb`) BEFORE reassigning the
+            // field, so the match's shared borrow ends and the write is clean.
+            InputSurface::Chatbox(cb) => {
+                let text = cb.text();
+                claude.input_surface = InputSurface::Worksheet;
                 if !text.is_empty() {
                     // Ensure the transcript ends with a `\n` so the
                     // appended draft starts on its own line, then drop
@@ -12881,9 +12914,8 @@ impl SketchGpuiView {
                 }
                 claude.editor.clear_selection();
             }
-            InputMode::Worksheet => {
-                claude.input_mode = InputMode::Chatbox;
-                claude.chatbox = Some(Chatbox::new());
+            InputSurface::Worksheet => {
+                claude.input_surface = InputSurface::Chatbox(Chatbox::new());
             }
         }
         cx.notify();
@@ -12902,17 +12934,18 @@ impl SketchGpuiView {
             );
             return;
         }
-        let mode = match self.agent_mut() {
+        let is_chatbox = match self.agent_mut() {
             Some(c) => {
                 // Re-enable auto-scroll when the user sends a message.
                 c.follow_output.set(true);
-                c.input_mode
+                c.input_surface.is_chatbox()
             }
             None => return,
         };
-        match mode {
-            InputMode::Worksheet => self.submit_worksheet(cx),
-            InputMode::Chatbox => self.submit_chatbox(cx),
+        if is_chatbox {
+            self.submit_chatbox(cx);
+        } else {
+            self.submit_worksheet(cx);
         }
     }
 
@@ -13204,7 +13237,7 @@ impl SketchGpuiView {
             Some(c) => c,
             None => return,
         };
-        let text = match &claude.chatbox {
+        let text = match claude.input_surface.chatbox() {
             Some(cb) => cb.text(),
             None => return,
         };
@@ -13257,7 +13290,7 @@ impl SketchGpuiView {
                 );
                 claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
                 // Reset the chatbox to empty; cursor stays inside.
-                claude.chatbox = Some(Chatbox::new());
+                claude.input_surface = InputSurface::Chatbox(Chatbox::new());
             }
         } else if let Some(claude) = self.agent_mut() {
             // Send failed: leave the chatbox text intact so the user can retry,
@@ -13327,8 +13360,7 @@ impl SketchGpuiView {
             && matches!(press.key, Key::Char('v') | Key::Char('V'))
         {
             if let Some(c) = self.agent_mut() {
-                c.chatbox = None;
-                c.input_mode = InputMode::Worksheet;
+                c.input_surface = InputSurface::Worksheet;
             }
             self.back_to_doc(cx);
             return;
@@ -13352,7 +13384,7 @@ impl SketchGpuiView {
         // chatbox doesn't exist.
         let in_chatbox = self
             .agent_mut()
-            .map(|c| c.input_mode == InputMode::Chatbox && c.chatbox.is_some())
+            .map(|c| c.input_surface.is_chatbox())
             .unwrap_or(false);
         if in_chatbox {
             let outcome = {
@@ -13361,7 +13393,7 @@ impl SketchGpuiView {
                     None => return,
                 };
                 claude.status = None;
-                let cb = claude.chatbox.as_mut().unwrap();
+                let cb = claude.input_surface.chatbox_mut().unwrap();
                 match cb.mode {
                     EditMode::Insert => {
                         Self::dispatch_insert_core(&mut cb.editor, &mut cb.mode, press);
@@ -15560,9 +15592,9 @@ impl SketchGpuiView {
                 )
         };
 
-        let in_chatbox = c.input_mode == InputMode::Chatbox && c.chatbox.is_some();
+        let in_chatbox = c.input_surface.is_chatbox();
         let mode_label = if in_chatbox {
-            match c.chatbox.as_ref().unwrap().mode {
+            match c.input_surface.chatbox().unwrap().mode {
                 EditMode::Normal => "CHATBOX",
                 EditMode::Insert => "CHATBOX INSERT",
             }
@@ -15657,7 +15689,7 @@ impl SketchGpuiView {
         // via a negative pixel margin so the caret stays visible. The clip
         // container inherits its width from the flex layout — no need to
         // know the pixel width at render time.
-        let compose_panel = if let Some(tb) = &mut c.chatbox {
+        let compose_panel = if let InputSurface::Chatbox(tb) = &mut c.input_surface {
             let compose_lines: Vec<String> = {
                 let doc = tb.editor.document();
                 (0..doc.line_count().max(1))
