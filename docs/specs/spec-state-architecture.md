@@ -235,9 +235,11 @@ verifiable.
    test `active_overlay_open_replaces_and_clears`. ⚠️ one intentional
    strictly-better divergence (rename-behind-menu no longer strands the menu) —
    owes a runtime eyeball.
-3. **`settings` module.** Add `text_scale`/font persistence; **consolidate** the
-   already-working `theme`/`agent_status_position` persistence (do *not* re-fix
-   a non-bug). Verify: round-trip unit test; flag relaunch zoom/theme check.
+3. ✅ **`settings`: persist text zoom + one `save_settings()`** (A.3). Added
+   `text_scale` persistence (restored on launch); consolidated the two
+   hand-rebuilt `save_preferences` sites into one snapshot method. Fonts not
+   persisted (no setter yet). Round-trip + forward-compat test. ⚠️ relaunch
+   zoom check owed.
 4. **`persistence` module** + one canonical cwd key + save-all-tabs (gated on
    **D5**). Verify: symlinked-cwd round-trip; two-tab save; golden JSON shape.
 5a. **`buffer_pool` extraction**, single liveness (strong_count + modified).
@@ -305,7 +307,7 @@ Front-loaded by leverage and verifiability.
 
 **Pure extractions (Phase A — each behind CI, no behavior change):**
 6. `[x]` `replay_turns` owns its fields (A.1, `6168157`) → **next:**
-   `overlay` enum (A.2 ✅ e5be921) → **next:** `settings` (A.3) → `persistence` (A.4) →
+   `overlay` enum (A.2 ✅ e5be921) → **next:** `settings` (A.3 ✅) → **next:** `persistence` (A.4) →
    `buffer_pool` (A.5a) → `DocState` auto-derived blocks (A.5b) →
    `tool_calls` (A.6) → `agent_view_model` (A.7) →
    additive `TurnEnded` (A.8a) → server fusions (A.9) → sum-type cleanups (A.11).
