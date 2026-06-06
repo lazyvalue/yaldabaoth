@@ -2753,6 +2753,60 @@ thread_local! {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ToolCallKey(sketch::acp_channel::ToolCallId);
 
+/// The live tool-call state cluster, extracted from `AgentState` so the four
+/// maps that must move together have ONE owner instead of four sibling fields
+/// (spec-state-architecture A.6: shrink the god-struct; one atomic mutator per
+/// coupled invariant). `calls`/`order`/`anchor` are registered together via
+/// [`ToolCalls::register`] so they can't drift; `subagents()` derives live from
+/// `calls` + `order` (ADR-0006 quick win #1 — no mirror).
+#[derive(Default)]
+struct ToolCalls {
+    /// Live tool calls keyed by `tool_call_id`. Updated in place as the agent
+    /// emits `ToolCallUpdate` notifications (status, incremental content).
+    calls: std::collections::HashMap<ToolCallKey, sketch::acp_channel::ToolCall>,
+    /// Display order — ids in the chronological order first announced. Drives
+    /// render order and "render after which line" via `anchor`.
+    order: Vec<ToolCallKey>,
+    /// Anchors a call to the buffer line that was last frozen when it was
+    /// announced; the renderer slots the tool block in just after that line.
+    anchor: std::collections::HashMap<ToolCallKey, LineAnchor>,
+    /// Ids the user expanded inline (default-collapsed).
+    expanded: std::collections::HashSet<String>,
+}
+
+impl ToolCalls {
+    /// Register a newly-announced tool call: append to `order` (if new) and
+    /// record its call + anchor — the three maps move together so they cannot
+    /// drift out of sync. THE single mutation chokepoint for a tool-call start.
+    fn register(
+        &mut self,
+        key: ToolCallKey,
+        call: sketch::acp_channel::ToolCall,
+        anchor: LineAnchor,
+    ) {
+        if !self.calls.contains_key(&key) {
+            self.order.push(key.clone());
+        }
+        self.anchor.insert(key.clone(), anchor);
+        self.calls.insert(key, call);
+    }
+
+    /// Toggle a tool call's inline-expanded state (keyed by raw id string).
+    fn toggle_expanded(&mut self, id: &str) {
+        if !self.expanded.remove(id) {
+            self.expanded.insert(id.to_string());
+        }
+    }
+
+    /// Clear every map at a transcript reset (`reset_for_replay`).
+    fn clear(&mut self) {
+        self.calls.clear();
+        self.order.clear();
+        self.anchor.clear();
+        self.expanded.clear();
+    }
+}
+
 impl ToolCallKey {
     /// Parse a protocol `ToolCallId` into the domain key. Cheap: clones an
     /// `Arc<str>`, no string allocation.
@@ -2867,11 +2921,7 @@ fn build_tool_block_with_weak(
                 let id = id_for_click.clone();
                 let _ = weak_view.update(app, |this, cx| {
                     if let Some(c) = this.agent_mut() {
-                        if c.expanded_tool_calls.contains(&id) {
-                            c.expanded_tool_calls.remove(&id);
-                        } else {
-                            c.expanded_tool_calls.insert(id);
-                        }
+                        c.tools.toggle_expanded(&id);
                     }
                     cx.notify();
                 });
@@ -3341,8 +3391,8 @@ fn cursor_visible_child_index(
     // EOF — they sort after `doc_line` and don't count.
     let eof_line = c.editor.document().line_count();
     let mut anchors_before: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for id in &c.tool_call_order {
-        if let Some(&anchor) = c.tool_call_anchor_line.get(id) {
+    for id in &c.tools.order {
+        if let Some(&anchor) = c.tools.anchor.get(id) {
             let line = c.editor.line_for_anchor(anchor).unwrap_or(eof_line);
             if line < doc_line {
                 anchors_before.insert(line);
@@ -5040,22 +5090,9 @@ struct AgentState {
     /// growth regardless of count delta, while still de-duping idle frames
     /// (same `edit_seq` ⇒ no re-scroll). `u64::MAX` = never scrolled.
     last_scrolled_edit_seq: u64,
-    /// Live tool calls keyed by `tool_call_id`. Updated in place as the
-    /// agent emits `ToolCallUpdate` notifications (status → in_progress →
-    /// completed/failed, content arriving incrementally, etc.).
-    tool_calls: std::collections::HashMap<ToolCallKey, sketch::acp_channel::ToolCall>,
-    /// Display order — `tool_call_id`s in the chronological order they
-    /// were first announced. Drives both rendering order and "render
-    /// after which buffer line" via [`tool_call_anchor_line`].
-    tool_call_order: Vec<ToolCallKey>,
-    /// Anchors a tool call to the buffer line that was the last frozen
-    /// line at the moment it was announced. The renderer slots the tool
-    /// block in just after that line, so tool blocks land between the
-    /// chunks that bracketed them in time.
-    tool_call_anchor_line: std::collections::HashMap<ToolCallKey, LineAnchor>,
-    /// Tool calls the user has expanded inline. Default-collapsed; click
-    /// the summary header to expand or recollapse.
-    expanded_tool_calls: std::collections::HashSet<String>,
+    /// The live tool-call state cluster (calls + order + anchors + expanded
+    /// set) — one owner instead of four sibling fields. See [`ToolCalls`].
+    tools: ToolCalls,
     /// Line ranges `(start, end)` that are rendered as structural blocks
     /// (tables, fenced code blocks) instead of line-by-line. Updated each
     /// render pass; used by `cursor_visible_child_index` for scroll math.
@@ -5165,9 +5202,9 @@ impl AgentState {
     /// carries the originating tool-call id, label, and status, all read
     /// live from the underlying `ToolCall`.
     fn subagents(&self) -> Vec<SubAgent> {
-        self.tool_call_order
+        self.tools.order
             .iter()
-            .filter_map(|id| self.tool_calls.get(id))
+            .filter_map(|id| self.tools.calls.get(id))
             .filter_map(classify_subagent)
             .collect()
     }
@@ -5184,8 +5221,8 @@ impl AgentState {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         edit_seq.hash(&mut h);
         frozen_line_count.hash(&mut h);
-        self.tool_call_order.len().hash(&mut h);
-        self.tool_call_order.last().hash(&mut h);
+        self.tools.order.len().hash(&mut h);
+        self.tools.order.last().hash(&mut h);
         // Resolved tool anchor lines (Finding 11, INV-8). The flat build
         // resolves each tool's `LineAnchor` to a current line via
         // `line_for_anchor` and groups tools by that line, so the resolved
@@ -5194,17 +5231,17 @@ impl AgentState {
         // memo key name this dependency directly instead of relying on the
         // unstated invariant "anything that moves an anchor also bumps
         // `edit_seq`". Cheap: one `line_for_anchor` per live tool call.
-        for id in &self.tool_call_order {
+        for id in &self.tools.order {
             let resolved = self
-                .tool_call_anchor_line
+                .tools.anchor
                 .get(id)
                 .and_then(|&anchor| self.editor.line_for_anchor(anchor));
             resolved.hash(&mut h);
         }
         // Expanded set: hash len + sorted contents (order-independent).
-        self.expanded_tool_calls.len().hash(&mut h);
+        self.tools.expanded.len().hash(&mut h);
         {
-            let mut ids: Vec<&String> = self.expanded_tool_calls.iter().collect();
+            let mut ids: Vec<&String> = self.tools.expanded.iter().collect();
             ids.sort_unstable();
             for id in ids {
                 id.hash(&mut h);
@@ -5266,10 +5303,7 @@ impl AgentState {
             turn_phase: TurnPhase::Idle,
             replay_turns: sketch::acp_channel::ReplayTurns::default(),
             last_scrolled_edit_seq: u64::MAX,
-            tool_calls: std::collections::HashMap::new(),
-            tool_call_order: Vec::new(),
-            tool_call_anchor_line: std::collections::HashMap::new(),
-            expanded_tool_calls: std::collections::HashSet::new(),
+            tools: ToolCalls::default(),
             block_ranges: Vec::new(),
             block_cache: std::collections::HashMap::new(),
             block_cache_frozen_count: 0,
@@ -5316,10 +5350,7 @@ impl AgentState {
             turn_phase: TurnPhase::Idle,
             replay_turns: sketch::acp_channel::ReplayTurns::default(),
             last_scrolled_edit_seq: u64::MAX,
-            tool_calls: std::collections::HashMap::new(),
-            tool_call_order: Vec::new(),
-            tool_call_anchor_line: std::collections::HashMap::new(),
-            expanded_tool_calls: std::collections::HashSet::new(),
+            tools: ToolCalls::default(),
             block_ranges: Vec::new(),
             block_cache: std::collections::HashMap::new(),
             block_cache_frozen_count: 0,
@@ -5580,10 +5611,7 @@ impl AgentState {
         // reset runs inside the reconnect update before re-attach.
         self.reconciler.reset();
         self.user_turn_ks.clear();
-        self.tool_calls.clear();
-        self.tool_call_order.clear();
-        self.tool_call_anchor_line.clear();
-        self.expanded_tool_calls.clear();
+        self.tools.clear();
         self.block_ranges.clear();
         self.block_cache.clear();
         self.block_cache_frozen_count = 0;
@@ -11731,10 +11759,7 @@ impl SketchGpuiView {
             turn_phase: TurnPhase::Idle,
             replay_turns: sketch::acp_channel::ReplayTurns::default(),
             last_scrolled_edit_seq: u64::MAX,
-            tool_calls: std::collections::HashMap::new(),
-            tool_call_order: Vec::new(),
-            tool_call_anchor_line: std::collections::HashMap::new(),
-            expanded_tool_calls: std::collections::HashSet::new(),
+            tools: ToolCalls::default(),
             block_ranges: Vec::new(),
             block_cache: std::collections::HashMap::new(),
             block_cache_frozen_count: 0,
@@ -12545,24 +12570,20 @@ impl SketchGpuiView {
                     // the boundary where a ToolCall enters apply_reply_events
                     // (Finding 7). All tool maps below are keyed on it.
                     let id = ToolCallKey::from_id(&tc.tool_call_id);
-                    claude.tool_call_anchor_line.insert(id.clone(), anchor);
                     // Tag the anchor with `Tool(k)` so the gutter shows
                     // `Tk` on tool-group anchor lines (§11).
                     claude
                         .editor
                         .metadata_mut::<TurnId>()
                         .insert(anchor, TurnId::Tool(current_turn));
-                    // Sub-agent classification (§25) is derived on demand
-                    // from `tool_call_order` + `tool_calls` — see
-                    // `AgentState::subagents()`. Nothing to push here.
-                    if !claude.tool_calls.contains_key(&id) {
-                        claude.tool_call_order.push(id.clone());
-                    }
-                    claude.tool_calls.insert(id, tc);
+                    // Register through the one chokepoint so order+calls+anchor
+                    // can't drift. Sub-agent classification (§25) is derived on
+                    // demand from `tools` — see `AgentState::subagents()`.
+                    claude.tools.register(id, tc, anchor);
                 }
                 ReplyEvent::ToolCallUpdated(upd) => {
                     let id = ToolCallKey::from_id(&upd.tool_call_id);
-                    if let Some(existing) = claude.tool_calls.get_mut(&id) {
+                    if let Some(existing) = claude.tools.calls.get_mut(&id) {
                         existing.update(upd.fields);
                         cap_tool_call_payloads(existing);
                         // No sub-agent mirror to update: `subagents()`
@@ -12580,15 +12601,12 @@ impl SketchGpuiView {
                         tc.update(upd.fields);
                         cap_tool_call_payloads(&mut tc);
                         let anchor = anchor_for_new_tool_call(&mut claude.editor);
-                        claude.tool_call_anchor_line.insert(id.clone(), anchor);
                         claude
                             .editor
                             .metadata_mut::<TurnId>()
                             .insert(anchor, TurnId::Tool(current_turn));
-                        // Sub-agent entry (if any) is derived by
-                        // `subagents()` from the maps below.
-                        claude.tool_call_order.push(id.clone());
-                        claude.tool_calls.insert(id, tc);
+                        // Sub-agent entry (if any) is derived by `subagents()`.
+                        claude.tools.register(id, tc, anchor);
                     }
                 }
                 ReplyEvent::PlanUpdated(plan) => {
@@ -12848,7 +12866,7 @@ impl SketchGpuiView {
     /// derived `subagents()` list is ordered (ADR-0006 quick win #1).
     fn focus_subagent(&mut self, key: ToolCallKey, cx: &mut Context<Self>) {
         if let Some(c) = self.agent_mut() {
-            if c.tool_calls.contains_key(&key) {
+            if c.tools.calls.contains_key(&key) {
                 c.focused_subagent = Some(key);
             }
         }
@@ -14523,7 +14541,7 @@ impl SketchGpuiView {
         // resolution, flat build and blank-collapse pass.
         //
         // Trap check: `ToolCallUpdated` mutates tool-call *content* in
-        // `c.tool_calls` without touching `tool_call_order` or `edit_seq`.
+        // `c.tools.calls` without touching `tool_call_order` or `edit_seq`.
         // That content is rendered inside the closure from `tool_calls_snap`,
         // never baked into a `FlatItem` (ToolGroup carries only ids), so it
         // is correctly EXCLUDED from this fingerprint.
@@ -14572,8 +14590,8 @@ impl SketchGpuiView {
         let eof_line = c.editor.document().line_count().saturating_sub(1);
         let mut tools_at_line: std::collections::HashMap<usize, Vec<ToolCallKey>> =
             std::collections::HashMap::new();
-        for id in &c.tool_call_order {
-            if let Some(&anchor) = c.tool_call_anchor_line.get(id) {
+        for id in &c.tools.order {
+            if let Some(&anchor) = c.tools.anchor.get(id) {
                 let line = c.editor.line_for_anchor(anchor).unwrap_or(eof_line);
                 tools_at_line.entry(line).or_default().push(id.clone());
             }
@@ -14809,8 +14827,8 @@ impl SketchGpuiView {
         // `gutter_tag_snap` and `flat_items_arc` come from the memoized
         // view-model tuple above (cached `Rc`s reused across frames when the
         // structural fingerprint is unchanged).
-        let tool_calls_snap = c.tool_calls.clone();
-        let expanded_snap = c.expanded_tool_calls.clone();
+        let tool_calls_snap = c.tools.calls.clone();
+        let expanded_snap = c.tools.expanded.clone();
         let frozen_lines_snap: Vec<(usize, usize)> =
             c.editor.frozen_lines().to_vec();
         let lockable_through_snap = c.editor.lockable_through_line();
@@ -15096,11 +15114,7 @@ impl SketchGpuiView {
                                     let id = click_id.clone();
                                     let _ = weak.update(app, |this, cx| {
                                         if let Some(c) = this.agent_mut() {
-                                            if c.expanded_tool_calls.contains(&id) {
-                                                c.expanded_tool_calls.remove(&id);
-                                            } else {
-                                                c.expanded_tool_calls.insert(id);
-                                            }
+                                            c.tools.toggle_expanded(&id);
                                         }
                                         cx.notify();
                                     });
@@ -15345,7 +15359,7 @@ impl SketchGpuiView {
 
         // Sub-agent breadcrumb (only when focused).
         if let Some(key) = c.focused_subagent.as_ref() {
-            if let Some(sa) = c.tool_calls.get(key).and_then(classify_subagent) {
+            if let Some(sa) = c.tools.calls.get(key).and_then(classify_subagent) {
                 let crumb = format!(" ⏵ {} ◂", sa.label);
                 strip = strip.child(
                     div()
@@ -17227,7 +17241,7 @@ mod tests {
     #[test]
     fn view_model_fingerprint_ignores_tool_content() {
         let mut st = AgentState::new_for_test();
-        st.tool_call_order.push(ToolCallKey::from_id(&"tool-1".into()));
+        st.tools.order.push(ToolCallKey::from_id(&"tool-1".into()));
         let before = st.view_model_fingerprint(7, 3);
 
         // Simulate a ToolCallUpdated: content changes, order/edit_seq don't.
@@ -17362,6 +17376,47 @@ mod tests {
     /// calls by that resolved line. Holding `edit_seq` FIXED across the two
     /// fingerprint calls isolates the anchor dependency from the `edit_seq`
     /// co-variation the memo previously leaned on implicitly.
+    /// A.6: `ToolCalls::register` is the one chokepoint that keeps `order`,
+    /// `calls`, and `anchor` in sync — a new id appends to order exactly once,
+    /// a re-register (the update path) never duplicates the order entry, and
+    /// `clear` empties every map together.
+    #[test]
+    fn tool_calls_register_keeps_maps_in_sync() {
+        use sketch::acp_channel::{ToolCall, ToolCallId};
+        let mut st = AgentState::new_for_test();
+        let id1: ToolCallId = "t1".into();
+        let k1 = ToolCallKey::from_id(&id1);
+
+        st.tools
+            .register(k1.clone(), ToolCall::new(id1.clone(), String::from("ls")), st.editor.anchor_for_line(0));
+        assert_eq!(st.tools.order.len(), 1);
+        assert!(st.tools.calls.contains_key(&k1) && st.tools.anchor.contains_key(&k1));
+
+        // Re-register the same id (an update arriving via register): order must
+        // NOT grow — the three maps stay coherent.
+        st.tools.register(
+            k1.clone(),
+            ToolCall::new(id1.clone(), String::from("ls -la")),
+            st.editor.anchor_for_line(0),
+        );
+        assert_eq!(st.tools.order.len(), 1, "re-register must not duplicate the order entry");
+        assert_eq!(st.tools.calls.len(), 1);
+
+        // A distinct id appends.
+        let id2: ToolCallId = "t2".into();
+        let k2 = ToolCallKey::from_id(&id2);
+        st.tools
+            .register(k2.clone(), ToolCall::new(id2, String::from("grep")), st.editor.anchor_for_line(0));
+        assert_eq!(st.tools.order.len(), 2);
+        assert!(st.tools.order.contains(&k2));
+
+        st.tools.clear();
+        assert!(
+            st.tools.order.is_empty() && st.tools.calls.is_empty() && st.tools.anchor.is_empty(),
+            "clear empties every map together"
+        );
+    }
+
     #[test]
     fn fingerprint_tracks_resolved_tool_anchor_line() {
         let mut st = AgentState::new_for_test();
@@ -17372,8 +17427,8 @@ mod tests {
         // Anchor a tool call to line 2 and register it in the build's inputs.
         let anchor = st.editor.anchor_for_line(2);
         let key = ToolCallKey::from_id(&"tool-1".into());
-        st.tool_call_order.push(key.clone());
-        st.tool_call_anchor_line.insert(key, anchor);
+        st.tools.order.push(key.clone());
+        st.tools.anchor.insert(key, anchor);
         assert_eq!(st.editor.line_for_anchor(anchor), Some(2));
 
         // Fingerprint at a FIXED edit_seq/frozen_count.
