@@ -817,3 +817,53 @@ fn agent_seam_unsuppressed_echo_during_inflight_turn_gets_distinct_k(cx: &mut Te
         "an unsuppressed echo during an in-flight turn must mint a fresh k, not reuse it"
     );
 }
+
+// ---- ActiveOverlay (A.2: 5 mutually-exclusive Options -> one enum) --------
+
+/// The "make illegal states unrepresentable" payoff: `open_overlay` REPLACES
+/// (never stacks), `clear_overlay` resets, and the type system guarantees at
+/// most one overlay variant is active — so the old "two overlays Some at once"
+/// (a menu stranded behind a rename) is no longer representable.
+#[gpui::test]
+fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
+    use crate::{ActiveOverlay, BufferSwitcher, SessionSwitcher};
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, _cx| {
+        assert!(!v.has_overlay(), "fresh view has no overlay");
+
+        v.open_overlay(ActiveOverlay::BufferSwitcher(BufferSwitcher {
+            selected: 0,
+            filter_mode: false,
+            filter_text: String::new(),
+        }));
+        assert!(v.has_overlay() && v.overlay_is_buffer());
+        assert!(v.buffer_ref().is_some());
+        assert!(
+            v.menu_ref().is_none()
+                && v.rename_ref().is_none()
+                && v.session_ref().is_none()
+                && v.workspace_picker_ref().is_none(),
+            "exactly one variant active — mutual exclusion is type-enforced"
+        );
+
+        // open REPLACES, never stacks: opening a different overlay drops the
+        // previous one (the tab-double-click-behind-menu case can't strand).
+        v.open_overlay(ActiveOverlay::SessionSwitcher(SessionSwitcher { selected: 0 }));
+        assert!(v.overlay_is_session());
+        assert!(v.buffer_ref().is_none(), "buffer overlay dropped on replace");
+
+        v.clear_overlay();
+        assert!(!v.has_overlay(), "clear_overlay returns to None");
+    });
+}

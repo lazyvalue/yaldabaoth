@@ -5826,6 +5826,35 @@ enum RenameTarget {
     AgentChangeCwd { index: usize },
 }
 
+/// The single, mutually-exclusive overlay layered over the screen body — at
+/// most one is open at a time (the spec's "make illegal states unrepresentable":
+/// the five sibling `Option<…>` fields this replaces could, in principle, all be
+/// `Some` at once, and one path did strand a `menu` behind a `rename`). `open()`
+/// **replaces** whatever was active rather than stacking; `clear()` returns to
+/// `None`. The render if-chain and key dispatch resolve the active variant in a
+/// fixed precedence (rename > buffer > session > workspace > menu).
+///
+/// NB: the `Menu` variant's inner `MenuOverlay` has its OWN field named `menu`
+/// (`Vec<MenuNode>`) — distinct from this variant; `menu_mut()` hands back the
+/// whole `&mut MenuOverlay` so `MenuState::process_key`'s disjoint two-field
+/// split-borrow (`m.state` + `&m.menu`) still type-checks. Do not add a
+/// per-field `&mut state` accessor. Non-exclusive chrome (`transient_status`
+/// toast, `splash_until`) is deliberately NOT folded in here.
+enum ActiveOverlay {
+    None,
+    Menu(MenuOverlay),
+    BufferSwitcher(BufferSwitcher),
+    SessionSwitcher(SessionSwitcher),
+    WorkspacePicker(WorkspacePicker),
+    Rename(RenameOverlay),
+}
+
+impl Default for ActiveOverlay {
+    fn default() -> Self {
+        ActiveOverlay::None
+    }
+}
+
 /// GPUI menu tree. Mirrors the TUI's `default_menu` for the navigation
 /// commands that exist in the GPUI frontend; omits TUI-only entries
 /// (search, claude-attach via socket, save-quit, …) that have no GPUI
@@ -5931,23 +5960,15 @@ struct SketchGpuiView {
     /// columns for horizontal scroll tracking.
     viewport_width_px: f32,
     focus_handle: FocusHandle,
-    /// Active TUI-style menu overlay. `Some` while the picker is open;
-    /// flipped to `None` on Esc-from-root or after a command is dispatched.
-    menu: Option<MenuOverlay>,
-    /// Buffer-list picker overlay — open while `Some`.
-    buffer_switcher: Option<BufferSwitcher>,
-    /// Claude session picker overlay — open while `Some`.
-    session_switcher: Option<SessionSwitcher>,
-    /// Workspace picker overlay for move/also-show pane — open while `Some`.
-    workspace_picker: Option<WorkspacePicker>,
+    /// The single mutually-exclusive overlay (menu / buffer-list / session /
+    /// workspace picker / rename input). At most one open at a time — see
+    /// [`ActiveOverlay`]. Was five sibling `Option<…>` fields.
+    active_overlay: ActiveOverlay,
     /// One-shot footer message (e.g. "Only documents can be shown in multiple
     /// workspaces (yet)"). Rendered as a small toast in the bottom-right;
-    /// cleared on the next overlay dismissal. Display-only.
+    /// cleared on the next overlay dismissal. Display-only. NOT part of
+    /// `active_overlay` — a toast can coexist with (and outlive) an overlay.
     transient_status: Option<SharedString>,
-    /// Single-line rename input overlay for the active claude session.
-    /// `Some` while the input box is open; cleared on Enter (commit) or
-    /// Esc (cancel).
-    rename_overlay: Option<RenameOverlay>,
     /// Tabs + n-ary split tree (spec-tabs-and-splits.md). The focused
     /// window's content is the authoritative live state for the workspace.
     workspace: workspace::Workspace<WindowContent>,
@@ -6016,12 +6037,8 @@ impl SketchGpuiView {
             text_scale: 1.0,
             viewport_width_px: 800.0,
             focus_handle,
-            menu: None,
-            buffer_switcher: None,
-            session_switcher: None,
-            workspace_picker: None,
+            active_overlay: ActiveOverlay::None,
             transient_status: None,
-            rename_overlay: None,
             workspace: workspace::Workspace::with_initial(initial),
             doc_selection: None,
             line_layouts: Rc::new(RefCell::new(HashMap::new())),
@@ -6043,12 +6060,8 @@ impl SketchGpuiView {
             text_scale: 1.0,
             viewport_width_px: 800.0,
             focus_handle,
-            menu: None,
-            buffer_switcher: None,
-            session_switcher: None,
-            workspace_picker: None,
+            active_overlay: ActiveOverlay::None,
             transient_status: None,
-            rename_overlay: None,
             workspace: workspace::Workspace::with_initial(initial),
             doc_selection: None,
             line_layouts: Rc::new(RefCell::new(HashMap::new())),
@@ -8484,19 +8497,94 @@ impl SketchGpuiView {
         self.open_menu_inner(cx);
     }
 
+    // ---- ActiveOverlay accessors (the single mutually-exclusive overlay) ----
+    //
+    // The per-variant `_ref`/`_mut` accessors return `Option<&T>`/`Option<&mut T>`
+    // so existing `match &self.X { Some(x) => .. }` / `if let Some(x) = &mut self.X`
+    // shapes survive as the smallest textual swap. They borrow the whole
+    // `active_overlay` field for the duration of the `if let`/`match`, exactly
+    // reproducing the old per-field borrow (one field, no cross-variant aliasing).
+
+    fn has_overlay(&self) -> bool {
+        !matches!(self.active_overlay, ActiveOverlay::None)
+    }
+    fn overlay_is_menu(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::Menu(_))
+    }
+    fn overlay_is_buffer(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::BufferSwitcher(_))
+    }
+    fn overlay_is_session(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::SessionSwitcher(_))
+    }
+    fn overlay_is_workspace(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::WorkspacePicker(_))
+    }
+    fn overlay_is_rename(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::Rename(_))
+    }
+
+    fn menu_ref(&self) -> Option<&MenuOverlay> {
+        if let ActiveOverlay::Menu(m) = &self.active_overlay { Some(m) } else { None }
+    }
+    /// Hands back the WHOLE `&mut MenuOverlay` (never a per-field accessor) so
+    /// `m.state.process_key(press, &m.menu)`'s disjoint two-field split-borrow
+    /// keeps type-checking.
+    fn menu_mut(&mut self) -> Option<&mut MenuOverlay> {
+        if let ActiveOverlay::Menu(m) = &mut self.active_overlay { Some(m) } else { None }
+    }
+    fn buffer_ref(&self) -> Option<&BufferSwitcher> {
+        if let ActiveOverlay::BufferSwitcher(b) = &self.active_overlay { Some(b) } else { None }
+    }
+    fn buffer_mut(&mut self) -> Option<&mut BufferSwitcher> {
+        if let ActiveOverlay::BufferSwitcher(b) = &mut self.active_overlay { Some(b) } else { None }
+    }
+    fn session_ref(&self) -> Option<&SessionSwitcher> {
+        if let ActiveOverlay::SessionSwitcher(s) = &self.active_overlay { Some(s) } else { None }
+    }
+    fn session_mut(&mut self) -> Option<&mut SessionSwitcher> {
+        if let ActiveOverlay::SessionSwitcher(s) = &mut self.active_overlay { Some(s) } else { None }
+    }
+    fn workspace_picker_ref(&self) -> Option<&WorkspacePicker> {
+        if let ActiveOverlay::WorkspacePicker(p) = &self.active_overlay { Some(p) } else { None }
+    }
+    fn workspace_picker_mut(&mut self) -> Option<&mut WorkspacePicker> {
+        if let ActiveOverlay::WorkspacePicker(p) = &mut self.active_overlay { Some(p) } else { None }
+    }
+    fn rename_ref(&self) -> Option<&RenameOverlay> {
+        if let ActiveOverlay::Rename(o) = &self.active_overlay { Some(o) } else { None }
+    }
+    fn rename_mut(&mut self) -> Option<&mut RenameOverlay> {
+        if let ActiveOverlay::Rename(o) = &mut self.active_overlay { Some(o) } else { None }
+    }
+
+    /// Open an overlay, **replacing** any currently-active one (overlays never
+    /// stack). The per-variant open guards are scoped to their OWN kind, so
+    /// re-opening the same kind is a no-op while opening a different kind
+    /// correctly supersedes.
+    fn open_overlay(&mut self, overlay: ActiveOverlay) {
+        self.active_overlay = overlay;
+    }
+    /// Dismiss the active overlay. Only ever called from inside the active
+    /// variant's own handler (each `handle_*_key` is wired solely by its own
+    /// render branch), so it can never clobber a sibling overlay.
+    fn clear_overlay(&mut self) {
+        self.active_overlay = ActiveOverlay::None;
+    }
+
     fn open_menu_inner(&mut self, cx: &mut Context<Self>) {
         // No-op if already open (defensive — the action shouldn't fire then).
-        if self.menu.is_some() {
+        if self.overlay_is_menu() {
             return;
         }
         // Opening the menu dismisses any lingering toast.
         self.transient_status = None;
         let mut state = MenuState::new();
         state.open();
-        self.menu = Some(MenuOverlay {
+        self.open_overlay(ActiveOverlay::Menu(MenuOverlay {
             state,
             menu: gpui_menu(),
-        });
+        }));
         cx.notify();
     }
 
@@ -8512,22 +8600,30 @@ impl SketchGpuiView {
         let press = keystroke_to_keypress(&ev.keystroke);
 
         if press.key == Key::Esc {
-            if let Some(m) = &mut self.menu {
-                m.state.handle_escape();
-                if !m.state.is_active() {
-                    self.menu = None;
+            // Borrow must end before `clear_overlay()` (a `&mut self` call): bind
+            // the close decision in a block that drops the `menu_mut()` borrow.
+            let close = match self.menu_mut() {
+                Some(m) => {
+                    m.state.handle_escape();
+                    !m.state.is_active()
                 }
+                None => false,
+            };
+            if close {
+                self.clear_overlay();
             }
             cx.notify();
             return;
         }
 
-        let cmd = match &mut self.menu {
+        // `m.state` (mut) + `&m.menu` (shared) are disjoint fields of one
+        // `&mut MenuOverlay`, so the split-borrow type-checks (see menu_mut doc).
+        let cmd = match self.menu_mut() {
             Some(m) => m.state.process_key(press, &m.menu),
             None => return,
         };
         if let Some(name) = cmd {
-            self.menu = None;
+            self.clear_overlay();
             self.dispatch_menu_command(&name, cx);
         }
         cx.notify();
@@ -8726,19 +8822,19 @@ impl SketchGpuiView {
     // ---- Buffer switcher ---------------------------------------------------
 
     fn open_buffer_switcher(&mut self, cx: &mut Context<Self>) {
-        if self.buffer_switcher.is_some() || self.workspace.tabs.is_empty() {
+        if self.overlay_is_buffer() || self.workspace.tabs.is_empty() {
             return;
         }
-        self.buffer_switcher = Some(BufferSwitcher {
+        self.open_overlay(ActiveOverlay::BufferSwitcher(BufferSwitcher {
             selected: self.workspace.active_tab,
             filter_mode: false,
             filter_text: String::new(),
-        });
+        }));
         cx.notify();
     }
 
     fn close_buffer_switcher(&mut self) {
-        self.buffer_switcher = None;
+        self.clear_overlay();
     }
 
     // ---- Workspace picker (move / also-show pane) -------------------------
@@ -8802,7 +8898,7 @@ impl SketchGpuiView {
         mode: WorkspacePickerMode,
         cx: &mut Context<Self>,
     ) {
-        if self.workspace_picker.is_some() {
+        if self.overlay_is_workspace() {
             return;
         }
         // A fresh picker attempt clears any prior toast.
@@ -8823,12 +8919,12 @@ impl SketchGpuiView {
         let selected = (0..self.workspace.tabs.len())
             .find(|&i| i != active)
             .unwrap_or(self.workspace.tabs.len());
-        self.workspace_picker = Some(WorkspacePicker { mode, selected });
+        self.open_overlay(ActiveOverlay::WorkspacePicker(WorkspacePicker { mode, selected }));
         cx.notify();
     }
 
     fn close_workspace_picker(&mut self) {
-        self.workspace_picker = None;
+        self.clear_overlay();
     }
 
     /// Number of selectable entries in the picker: every workspace plus the
@@ -8845,7 +8941,7 @@ impl SketchGpuiView {
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
         let count = self.workspace_picker_entry_count();
-        let selected = match &self.workspace_picker {
+        let selected = match self.workspace_picker_ref() {
             Some(p) => p.selected,
             None => return,
         };
@@ -8854,26 +8950,26 @@ impl SketchGpuiView {
                 self.close_workspace_picker();
             }
             Key::Char('j') | Key::Down => {
-                if let Some(p) = &mut self.workspace_picker {
+                if let Some(p) = self.workspace_picker_mut() {
                     if count > 0 {
                         p.selected = (p.selected + 1) % count;
                     }
                 }
             }
             Key::Char('k') | Key::Up => {
-                if let Some(p) = &mut self.workspace_picker {
+                if let Some(p) = self.workspace_picker_mut() {
                     if count > 0 {
                         p.selected = if p.selected == 0 { count - 1 } else { p.selected - 1 };
                     }
                 }
             }
             Key::Char('g') => {
-                if let Some(p) = &mut self.workspace_picker {
+                if let Some(p) = self.workspace_picker_mut() {
                     p.selected = 0;
                 }
             }
             Key::Char('G') => {
-                if let Some(p) = &mut self.workspace_picker {
+                if let Some(p) = self.workspace_picker_mut() {
                     if count > 0 {
                         p.selected = count - 1;
                     }
@@ -8890,7 +8986,7 @@ impl SketchGpuiView {
     /// Apply the picker selection. `entry` is the chosen index into the entry
     /// list (`tabs.len()` means "+ new workspace").
     fn commit_workspace_picker(&mut self, entry: usize, cx: &mut Context<Self>) {
-        let mode = match &self.workspace_picker {
+        let mode = match self.workspace_picker_ref() {
             Some(p) => p.mode,
             None => return,
         };
@@ -8999,7 +9095,7 @@ impl SketchGpuiView {
     // ---- Session switcher overlay -----------------------------------------
 
     fn open_session_switcher(&mut self, cx: &mut Context<Self>) {
-        if self.session_switcher.is_some() {
+        if self.overlay_is_session() {
             return;
         }
         // Must be on the agent screen with at least one session.
@@ -9017,14 +9113,15 @@ impl SketchGpuiView {
                 self.agent_ring().unwrap()
             }
         };
-        self.session_switcher = Some(SessionSwitcher {
-            selected: ring.active,
-        });
+        // Hoist `ring.active` to an owned local so the `ring` (&self) borrow
+        // ends before `open_overlay` takes `&mut self`.
+        let selected = ring.active;
+        self.open_overlay(ActiveOverlay::SessionSwitcher(SessionSwitcher { selected }));
         cx.notify();
     }
 
     fn close_session_switcher(&mut self) {
-        self.session_switcher = None;
+        self.clear_overlay();
     }
 
     fn handle_session_switcher_key(
@@ -9034,7 +9131,7 @@ impl SketchGpuiView {
         cx: &mut Context<Self>,
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
-        let selected = match &self.session_switcher {
+        let selected = match self.session_ref() {
             Some(ss) => ss.selected,
             None => return,
         };
@@ -9045,7 +9142,7 @@ impl SketchGpuiView {
             }
             Key::Char('j') | Key::Down => {
                 let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
-                if let Some(ss) = &mut self.session_switcher {
+                if let Some(ss) = self.session_mut() {
                     if count > 0 {
                         ss.selected = (ss.selected + 1) % count;
                     }
@@ -9053,7 +9150,7 @@ impl SketchGpuiView {
             }
             Key::Char('k') | Key::Up => {
                 let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
-                if let Some(ss) = &mut self.session_switcher {
+                if let Some(ss) = self.session_mut() {
                     if count > 0 {
                         ss.selected = if ss.selected == 0 {
                             count - 1
@@ -9064,13 +9161,13 @@ impl SketchGpuiView {
                 }
             }
             Key::Char('g') => {
-                if let Some(ss) = &mut self.session_switcher {
+                if let Some(ss) = self.session_mut() {
                     ss.selected = 0;
                 }
             }
             Key::Char('G') => {
                 let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
-                if let Some(ss) = &mut self.session_switcher {
+                if let Some(ss) = self.session_mut() {
                     if count > 0 {
                         ss.selected = count - 1;
                     }
@@ -9109,7 +9206,7 @@ impl SketchGpuiView {
                         cx.notify();
                         return;
                     }
-                    if let Some(ss) = &mut self.session_switcher {
+                    if let Some(ss) = self.session_mut() {
                         if ss.selected >= new_count {
                             ss.selected = new_count - 1;
                         }
@@ -9123,7 +9220,7 @@ impl SketchGpuiView {
     }
 
     fn render_session_switcher(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let ss = match &self.session_switcher {
+        let ss = match self.session_ref() {
             Some(ss) => ss,
             None => unreachable!(),
         };
@@ -9242,7 +9339,7 @@ impl SketchGpuiView {
     }
 
     fn render_workspace_picker(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let picker = match &self.workspace_picker {
+        let picker = match self.workspace_picker_ref() {
             Some(p) => p,
             None => unreachable!(),
         };
@@ -9375,17 +9472,21 @@ impl SketchGpuiView {
     /// if claude isn't focused (the command is gated by the menu but a
     /// stray dispatch shouldn't crash) or if an overlay is already open.
     fn open_rename_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.rename_overlay.is_some() {
+        if self.overlay_is_rename() {
             return;
         }
         let Some(ring) = self.agent_ring() else {
             return;
         };
         let slot = &ring.slots[ring.active];
-        self.rename_overlay = Some(RenameOverlay {
-            text: slot.label.clone(),
-            target: RenameTarget::AgentSlot { index: slot.index },
-        });
+        // Own the reads so the `ring`/`slot` (&self) borrow ends before
+        // `open_overlay` takes `&mut self`.
+        let text = slot.label.clone();
+        let index = slot.index;
+        self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
+            text,
+            target: RenameTarget::AgentSlot { index },
+        }));
         cx.notify();
     }
 
@@ -9394,15 +9495,15 @@ impl SketchGpuiView {
     /// cancels — the bare `claude-new` already exists for the
     /// "process cwd" case.
     fn open_new_agent_session_cwd_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.rename_overlay.is_some() {
+        if self.overlay_is_rename() {
             return;
         }
         // Don't gate by "claude is focused" — this command can transition
         // the user into the agent screen at the chosen cwd in one step.
-        self.rename_overlay = Some(RenameOverlay {
+        self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
             text: String::new(),
             target: RenameTarget::AgentNewSessionCwd,
-        });
+        }));
         cx.notify();
     }
 
@@ -9410,17 +9511,19 @@ impl SketchGpuiView {
     /// current cwd; on commit, respawn the slot at the new path
     /// (spec-agent-cwd.md §4).
     fn open_change_agent_cwd_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.rename_overlay.is_some() {
+        if self.overlay_is_rename() {
             return;
         }
         let Some(ring) = self.agent_ring() else {
             return;
         };
         let slot = &ring.slots[ring.active];
-        self.rename_overlay = Some(RenameOverlay {
-            text: slot.cwd.display().to_string(),
-            target: RenameTarget::AgentChangeCwd { index: slot.index },
-        });
+        let text = slot.cwd.display().to_string();
+        let index = slot.index;
+        self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
+            text,
+            target: RenameTarget::AgentChangeCwd { index },
+        }));
         cx.notify();
     }
 
@@ -9428,29 +9531,30 @@ impl SketchGpuiView {
     /// input pre-fills with the tab's current display label (display_name
     /// if set, else auto_name).
     fn open_rename_active_tab_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.rename_overlay.is_some() {
+        if self.overlay_is_rename() {
             return;
         }
         let idx = self.workspace.active_tab;
         let Some(tab) = self.workspace.tabs.get(idx) else {
             return;
         };
-        self.rename_overlay = Some(RenameOverlay {
-            text: tab.display_label().to_string(),
+        let text = tab.display_label().to_string();
+        self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
+            text,
             target: RenameTarget::Tab { index: idx },
-        });
+        }));
         cx.notify();
     }
 
     fn close_rename_overlay(&mut self) {
-        self.rename_overlay = None;
+        self.clear_overlay();
     }
 
     /// Apply the overlay's text to the targeted slot/tab, then close.
     /// Trims whitespace; an all-whitespace input cancels (acts like Esc) so
     /// the user can't accidentally erase the label by hammering Enter.
     fn commit_rename_overlay(&mut self, cx: &mut Context<Self>) {
-        let (target, new_label) = match &self.rename_overlay {
+        let (target, new_label) = match self.rename_ref() {
             Some(o) => (o.target, o.text.trim().to_string()),
             None => return,
         };
@@ -9538,13 +9642,13 @@ impl SketchGpuiView {
             }
             Key::Enter => self.commit_rename_overlay(cx),
             Key::Backspace => {
-                if let Some(o) = &mut self.rename_overlay {
+                if let Some(o) = self.rename_mut() {
                     o.text.pop();
                 }
                 cx.notify();
             }
             Key::Char(c) => {
-                if let Some(o) = &mut self.rename_overlay {
+                if let Some(o) = self.rename_mut() {
                     o.text.push(c);
                 }
                 cx.notify();
@@ -9555,7 +9659,7 @@ impl SketchGpuiView {
 
     /// Return the indices of buffers matching the current filter query.
     fn filtered_buffer_indices(&self) -> Vec<usize> {
-        let bs = match &self.buffer_switcher {
+        let bs = match self.buffer_ref() {
             Some(bs) => bs,
             None => return (0..self.workspace.tabs.len()).collect(),
         };
@@ -9581,7 +9685,7 @@ impl SketchGpuiView {
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
 
-        let (filter_mode, selected) = match &self.buffer_switcher {
+        let (filter_mode, selected) = match self.buffer_ref() {
             Some(bs) => (bs.filter_mode, bs.selected),
             None => return,
         };
@@ -9600,7 +9704,7 @@ impl SketchGpuiView {
                         self.close_buffer_switcher();
                         self.switch_to_buffer(idx);
                     } else if !filtered.is_empty() {
-                        if let Some(bs) = &mut self.buffer_switcher {
+                        if let Some(bs) = self.buffer_mut() {
                             bs.filter_mode = false;
                         }
                     }
@@ -9608,13 +9712,13 @@ impl SketchGpuiView {
                     return;
                 }
                 Key::Backspace => {
-                    if let Some(bs) = &mut self.buffer_switcher {
+                    if let Some(bs) = self.buffer_mut() {
                         bs.filter_text.pop();
                         bs.selected = 0;
                     }
                 }
                 Key::Char(c) => {
-                    if let Some(bs) = &mut self.buffer_switcher {
+                    if let Some(bs) = self.buffer_mut() {
                         bs.filter_text.push(c);
                         bs.selected = 0;
                     }
@@ -9631,7 +9735,7 @@ impl SketchGpuiView {
             }
             Key::Char('j') | Key::Down => {
                 let count = self.filtered_buffer_indices().len();
-                if let Some(bs) = &mut self.buffer_switcher {
+                if let Some(bs) = self.buffer_mut() {
                     if count > 0 {
                         bs.selected = (bs.selected + 1) % count;
                     }
@@ -9639,7 +9743,7 @@ impl SketchGpuiView {
             }
             Key::Char('k') | Key::Up => {
                 let count = self.filtered_buffer_indices().len();
-                if let Some(bs) = &mut self.buffer_switcher {
+                if let Some(bs) = self.buffer_mut() {
                     if count > 0 {
                         bs.selected = if bs.selected == 0 {
                             count - 1
@@ -9650,13 +9754,13 @@ impl SketchGpuiView {
                 }
             }
             Key::Char('g') => {
-                if let Some(bs) = &mut self.buffer_switcher {
+                if let Some(bs) = self.buffer_mut() {
                     bs.selected = 0;
                 }
             }
             Key::Char('G') => {
                 let count = self.filtered_buffer_indices().len();
-                if let Some(bs) = &mut self.buffer_switcher {
+                if let Some(bs) = self.buffer_mut() {
                     if count > 0 {
                         bs.selected = count - 1;
                     }
@@ -9674,7 +9778,7 @@ impl SketchGpuiView {
                 if let Some(&buf_idx) = filtered.get(selected) {
                     self.close_buffer_at(buf_idx, cx);
                     let count = self.filtered_buffer_indices().len();
-                    if let Some(bs) = &mut self.buffer_switcher {
+                    if let Some(bs) = self.buffer_mut() {
                         if bs.selected >= count && count > 0 {
                             bs.selected = count - 1;
                         }
@@ -9682,7 +9786,7 @@ impl SketchGpuiView {
                 }
             }
             Key::Char('/') => {
-                if let Some(bs) = &mut self.buffer_switcher {
+                if let Some(bs) = self.buffer_mut() {
                     bs.filter_mode = true;
                     bs.filter_text.clear();
                     bs.selected = 0;
@@ -10360,7 +10464,7 @@ impl SketchGpuiView {
     }
 
     fn render_menu_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let m = match &self.menu {
+        let m = match self.menu_ref() {
             Some(m) => m,
             None => unreachable!(),
         };
@@ -10479,7 +10583,7 @@ impl SketchGpuiView {
     /// Render the buffer-list picker as a full-window overlay, mirroring the
     /// TUI's `draw_full_buffer_list`.
     fn render_buffer_switcher(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let bs = match &self.buffer_switcher {
+        let bs = match self.buffer_ref() {
             Some(bs) => bs,
             None => unreachable!(),
         };
@@ -10636,7 +10740,7 @@ impl SketchGpuiView {
     /// a full-screen panel. Pre-filled with the current label; trailing
     /// block char serves as a cursor.
     fn render_rename_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let o = match &self.rename_overlay {
+        let o = match self.rename_ref() {
             Some(o) => o,
             None => unreachable!(),
         };
@@ -13139,7 +13243,7 @@ impl SketchGpuiView {
         let press = keystroke_to_keypress(&ev.keystroke);
 
         // Session switcher overlay intercepts all keys when open.
-        if self.session_switcher.is_some() {
+        if self.overlay_is_session() {
             self.handle_session_switcher_key(ev, _w, cx);
             return;
         }
@@ -13381,11 +13485,7 @@ impl Render for SketchGpuiView {
             return self.render_splash(cx);
         }
 
-        let has_overlay = self.menu.is_some()
-            || self.buffer_switcher.is_some()
-            || self.session_switcher.is_some()
-            || self.workspace_picker.is_some()
-            || self.rename_overlay.is_some();
+        let has_overlay = self.has_overlay();
 
         // Build the screen content. When an overlay is OPEN, focus moves up
         // to the wrapper so the screen's `SketchView`/`BrowserView` action
@@ -13476,7 +13576,7 @@ impl Render for SketchGpuiView {
         // shifted chars could shadow distinct overlay entries (e.g. `w` vs
         // `W`). The capture handler short-circuits the entire rest of the
         // pipeline.
-        if self.rename_overlay.is_some() {
+        if self.overlay_is_rename() {
             return div()
                 .track_focus(&self.focus_handle)
                 .key_context("RenameOverlayView")
@@ -13492,7 +13592,7 @@ impl Render for SketchGpuiView {
         }
 
         // Buffer switcher takes priority over menu.
-        if self.buffer_switcher.is_some() {
+        if self.overlay_is_buffer() {
             return div()
                 .track_focus(&self.focus_handle)
                 .key_context("BufferSwitcherView")
@@ -13508,7 +13608,7 @@ impl Render for SketchGpuiView {
         }
 
         // Session switcher takes priority over menu.
-        if self.session_switcher.is_some() {
+        if self.overlay_is_session() {
             return div()
                 .track_focus(&self.focus_handle)
                 .key_context("SessionSwitcherView")
@@ -13524,7 +13624,7 @@ impl Render for SketchGpuiView {
         }
 
         // Workspace picker (move / also-show pane).
-        if self.workspace_picker.is_some() {
+        if self.overlay_is_workspace() {
             return div()
                 .track_focus(&self.focus_handle)
                 .key_context("WorkspacePickerView")
