@@ -2322,4 +2322,48 @@ mod tests {
             "preexisting content\nagent says hi\n"
         );
     }
+
+    /// Smoke-exercise the reparse path that caused the crash. `reparse` used to
+    /// feed tree-sitter the previous tree for incremental reuse WITHOUT ever
+    /// calling `tree.edit()`, so the old tree's byte offsets went stale; for
+    /// markdown with external-scanner constructs (tables / fenced code /
+    /// blockquotes) that made `tree_sitter_markdown_external_scanner_serialize`
+    /// read/write out of bounds. The OOB is heap-nondeterministic, so this test
+    /// does NOT reliably segfault on the buggy code (it passed there too) — it's
+    /// a path exerciser that's guaranteed sound after the fresh-parse fix, not a
+    /// deterministic repro. The deterministic repro is the GUI (type in a file
+    /// with a table; observed SIGSEGV in `external_scanner_serialize`).
+    #[test]
+    fn reparse_survives_many_edits_without_segfault() {
+        let content = "\
+# Heading
+
+para text here
+
+- a
+- b
+
+```rust
+fn f() { let x = 1; }
+```
+
+| c1 | c2 |
+|----|----|
+| 1  | 2  |
+
+> quote line
+";
+        let mut core = EditorCore::new(content.to_string(), std::path::PathBuf::from("t.md"));
+        let mut view = EditorView::new();
+        core.reparse();
+        // Insert at the document head so EVERY edit shifts all byte offsets,
+        // maximally desyncing a stale reused tree; reparse after each char to
+        // mirror per-keystroke `end_insert`.
+        for i in 0..4000 {
+            let ch = if i % 11 == 0 { '\n' } else { 'x' };
+            view.insert_char(&mut core, ch);
+            core.reparse();
+        }
+        assert!(core.document.full_text().len() > content.len());
+    }
 }

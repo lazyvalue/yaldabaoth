@@ -1,4 +1,4 @@
-use tree_sitter::{InputEdit, Parser, Point, Tree};
+use tree_sitter::{Parser, Tree};
 
 /// Block boundary info from tree-sitter.
 #[derive(Debug, Clone)]
@@ -26,26 +26,23 @@ impl TreeState {
     }
 
     pub fn parse(&mut self, source: &[u8]) {
-        self.tree = self.parser.parse(source, self.tree.as_ref());
+        // FRESH parse every time (`None`, not `self.tree.as_ref()`).
+        // Incremental reuse is only sound if `tree.edit()` recorded every
+        // change to the old tree first — and the editor never does (it
+        // reparses from `full_text()` with no diff). Feeding tree-sitter a
+        // stale tree gave it wrong byte offsets, and on some markdown edits
+        // the external scanner's `serialize` then read/wrote out of bounds →
+        // a (heap-nondeterministic) SIGSEGV while typing. A fresh parse is
+        // O(doc) but correct; markdown docs are small and the editor already
+        // reparses the whole buffer here. Reinstate incremental ONLY with
+        // proper `tree.edit()` tracking (and real edit positions — never the
+        // `Point::new(0,0)` placeholders the removed `edit()` helper used,
+        // which are wrong for multi-line edits).
+        self.tree = self.parser.parse(source, None);
     }
 
     pub fn tree(&self) -> Option<&Tree> {
         self.tree.as_ref()
-    }
-
-    /// Notify tree-sitter of an edit before re-parsing.
-    pub fn edit(&mut self, start_byte: usize, old_end_byte: usize, new_end_byte: usize) {
-        if let Some(tree) = &mut self.tree {
-            let edit = InputEdit {
-                start_byte,
-                old_end_byte,
-                new_end_byte,
-                start_position: Point::new(0, 0),
-                old_end_position: Point::new(0, 0),
-                new_end_position: Point::new(0, 0),
-            };
-            tree.edit(&edit);
-        }
     }
 
     /// Get top-level block boundaries from the syntax tree.
