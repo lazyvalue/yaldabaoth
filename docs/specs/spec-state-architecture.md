@@ -207,9 +207,17 @@ verifiable.
   instead of "human eyeballs it" — `vcx.simulate_keystrokes(...)` now works.
 
 ### Phase A — Pure, front-loaded, low/med risk (unit-testable, no behavior change)
-1. **`replay_turns` owns its fields.** `AgentState` holds one `ReplayTurns`
-   (not loose `last_seen_turns`/`replay_turn`); delete the copy-in/out view
-   reconstruction. *(Field-ownership refactor still **open**.)*
+1. ✅ **`replay_turns` owns its fields — DONE.**
+   - ✅ **Field-ownership refactor** (`6168157`). `AgentState` now holds one
+     `ReplayTurns` (the two loose `last_seen_turns`/`replay_turn` fields are
+     gone); the reconstruct-on-read accessor + copy-back-out mutators are
+     deleted, the turn methods delegate in place, and the pump/server turn-end
+     sites read/write `replay_turns.last_seen` directly. Pure, no behavior
+     change; net −23 lines; full suite green.
+   - ✅ **Plus** the pipelined-submit crash fix (`50021fc`): non-replay inserts
+     take `max(current_turn(), next_unused_user_turn())` so a submit made while
+     the previous turn is in flight gets a distinct `k` instead of tripping the
+     M3 tripwire. ⚠️ owes a human runtime check.
    - ✅ **Worksheet submit now routes through the reconciler chokepoint**
      (`a6f2829`). Extracted `register_user_turn() -> Option<k>` (reconcile +
      `current_turn()` k-derivation + `user_turn_ks` tripwire) as the shared
@@ -292,8 +300,7 @@ Front-loaded by leverage and verifiability.
    D4 durability · D5 cwd migration · D6 metadata store + crate boundary.
 
 **Pure extractions (Phase A — each behind CI, no behavior change):**
-6. `[ ]` `replay_turns` owns its fields (A.1 field-ownership half; the
-   worksheet-routing half landed — item 3) →
+6. `[x]` `replay_turns` owns its fields (A.1, `6168157`) → **next:**
    `overlay` enum (A.2) → `settings` (A.3) → `persistence` (A.4) →
    `buffer_pool` (A.5a) → `DocState` auto-derived blocks (A.5b) →
    `tool_calls` (A.6) → `agent_view_model` (A.7) →
