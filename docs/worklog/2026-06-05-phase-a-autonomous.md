@@ -43,15 +43,36 @@ fix `50021fc`, `replay_turns` field-ownership `6168157`; plus mutex-poison
   derive blocks from its `edit_seq`" is a murky restructure (DocState holds
   rendered blocks, not the source Document) with unclear payoff. Defer.
 
-## Open / next
+- **A.11 — `InputSurface` enum** (`761dfe6`). `input_mode: InputMode` +
+  `chatbox: Option<Chatbox>` → one `input_surface: InputSurface { Worksheet,
+  Chatbox(Chatbox) }`; old `InputMode`→`InputModeKind` (Copy discriminant) kept
+  only for the persisted mode string + `should_follow_tail`. ~38 live sites
+  migrated compiler-driven; persistence format byte-identical. Workflow
+  design+review caught the missed harness site + the `ToggleAgentInputMode`
+  substring-collision trap. Test `input_surface_toggle_round_trips`.
 
-- **A.11 `InputSurface`** (input_mode + `chatbox: Option` → one enum) — clean
-  illegal-states win like A.2; next up (workflow-assisted).
-- **A.6 tool_calls**, **A.7 agent_view_model** (memoization modules), **A.8a
-  additive TurnEnded**, **A.9 server fusions** — medium pure extractions.
-- **Phase B (gated, behavior-changing, runtime-check):** D2 Doc/Edit shared rope
-  (5c), 8b delete turn-end inference. **D3 skipped** (explicitly trigger-deferred).
-- **Not quick wins:** clippy (164) + fmt (531) — dedicated passes only.
+## Stopping point (context budget) — next session starts here
+
+Completed this run: **A.1 (full), mutex-poison, A.2, A.3, A.4, A.11** — every
+high-value, headlessly-verifiable, illegal-states / persistence / robustness
+item in Phase A. `master` @ `8cc54b7`.
+
+**Remaining (deliberately NOT rushed under low context):**
+- **A.6 `tool_calls`**, **A.7 `agent_view_model`** — memoization-module
+  extractions, each ~A.2-sized blast radius. Do each in its own worktree with a
+  map→design workflow (the pattern that worked for A.2/A.11). Pure, CI-gated.
+- **A.8a additive `TurnEnded`** (emit the explicit event from the worker without
+  yet deleting inference) → **A.9 server fusions** — medium.
+- **Phase B (behavior-changing — REQUIRE human runtime check, can't verify
+  headless):** D2 Doc/Edit shared rope (5c), 8b delete turn-end inference.
+  **D3 skipped** (explicit trigger-deferral). A.5a buffer_pool belongs with D2.
+- **A.5a/A.5b** deferred (see above). **clippy (164) + fmt (531)** — dedicated
+  passes only.
+
+**Owed runtime checks (GUI not headless-drivable):** pipelined worksheet turns
+render separately · worksheet send-failure keeps lines editable · A.2
+rename-behind-menu divergence · A.3 relaunch zoom restore · A.11 chatbox/worksheet
+toggle + restore still behave.
 
 ## Runtime checks owed (GUI not headless-drivable)
 pipelined worksheet turns render separately · worksheet send-failure keeps lines
