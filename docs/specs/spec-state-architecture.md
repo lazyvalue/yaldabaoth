@@ -229,8 +229,12 @@ verifiable.
      non-vacuous negative control + a pure multi-line reconciler test. ⚠️ The
      send-first reorder is a send-FAILURE behavior change the headless harness
      can't verify — **owes a human GUI runtime check**.
-2. **`overlay`: 5 `Option`s → `ActiveOverlay` enum.** Verify: unit test on
-   open-replaces-not-stacks + clear.
+2. ✅ **`overlay`: 5 `Option`s → `ActiveOverlay` enum** (`e5be921`). One
+   `active_overlay` field + per-variant accessors + open/clear/has_overlay;
+   ~65 sites migrated; `transient_status`/`splash_until` left separate. Unit
+   test `active_overlay_open_replaces_and_clears`. ⚠️ one intentional
+   strictly-better divergence (rename-behind-menu no longer strands the menu) —
+   owes a runtime eyeball.
 3. **`settings` module.** Add `text_scale`/font persistence; **consolidate** the
    already-working `theme`/`agent_status_position` persistence (do *not* re-fix
    a non-bug). Verify: round-trip unit test; flag relaunch zoom/theme check.
@@ -301,7 +305,7 @@ Front-loaded by leverage and verifiability.
 
 **Pure extractions (Phase A — each behind CI, no behavior change):**
 6. `[x]` `replay_turns` owns its fields (A.1, `6168157`) → **next:**
-   `overlay` enum (A.2) → `settings` (A.3) → `persistence` (A.4) →
+   `overlay` enum (A.2 ✅ e5be921) → **next:** `settings` (A.3) → `persistence` (A.4) →
    `buffer_pool` (A.5a) → `DocState` auto-derived blocks (A.5b) →
    `tool_calls` (A.6) → `agent_view_model` (A.7) →
    additive `TurnEnded` (A.8a) → server fusions (A.9) → sum-type cleanups (A.11).
