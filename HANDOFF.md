@@ -38,7 +38,7 @@ reason, and every owed runtime check. Status keys: ✅ done · ⬜ open · ⏸ d
 | 5a | `buffer_pool` extraction (single liveness) | ⏸ | dead/unwired code; do **with** D2 (5c), not before |
 | 5b | `DocState.blocks` → `edit_seq` auto-derivation | ⏸ | memoization half already done (quick-win-2); rest is a murky restructure, low payoff |
 | 6 / A.6 | `tool_calls` → `ToolCalls` owner + atomic `register` | ✅ | `f10486e` |
-| 7 / A.7 | `agent_view_model` memoizer extraction → `AgentViewModel` owner | ✅ | `9253139` (6 fields moved; `memoize_view_model` stays on `AgentState` — its rebuild needs `&mut Self`; `lines_cache` kept put per the gotcha) |
+| 7 / A.7 | `agent_view_model` memoizer extraction → `AgentViewModel` owner | ✅ | `9253139` (6 fields moved; `lines_cache` kept put per the gotcha) + `1c939f0` (owner owns the decision: split `memoize_view_model` into `cached`/`store` on `AgentViewModel`, rebuild stays at the call site) |
 | 8a | emit `TurnEnded{count,generation}` **additively** | ✅ | `8cdbdd1` (added `generation` w/ `#[serde(default)]`, populated from server `channel_generation`; consumer ignores it; +2 serde back-compat tests). Direct-channel explicit emit left to 8b (behavior-changing) |
 | 9 | session-server fusions (`record()` = log+broadcast, etc.) | ✅ | `record()` already fused; only writes outside it are 2 intentional carve-outs. `apply_channel_state()` unification is **behavior-changing** (fixes restart prompt-loss + perm-mode revert) → Phase B / runtime-check track |
 | 11 | sum-type cleanups | ✅ (this slice) | `InputSurface` ✅ `761dfe6`; `has_unseen_activity` dead-code **removed** `15fe390`. `ChannelAttachState` **deferred**: `channel`+`attach_pending` reach a "both `Some`" re-attach transient (4-state, not a clean enum) |

@@ -29,6 +29,14 @@ high confidence, zero findings** for all three code commits.
   through `self.view_model.*`. Same god-struct shrink, no borrow hazard.
   `lines_cache`/`lines_cache_seq` left on `AgentState` (the name-collision
   gotcha — an identical pair lives on `EditState`).
+  - **Follow-up (`1c939f0`):** that first cut owned the *data* but not the
+    *decision* — `AgentViewModel` was a passive field-bag. Split
+    `memoize_view_model` into `cached()` + `store()` on `AgentViewModel` so the
+    owner owns the S1 decision; the rebuild runs at the call site on
+    `&mut AgentState` (between the two calls, no `view_model` borrow held),
+    sidestepping the aliasing that blocked moving the unified closure method.
+    Cost: a caller could `cached()`-then-forget-`store()` (misuse surface = 1
+    render site + the test). Test rewritten to assert the cached/store contract.
 
 - **item-11 — `has_unseen_activity` was write-only dead code**, not a
   scoping problem. Set in 5 places, read in zero (no badge/render ever consumed
