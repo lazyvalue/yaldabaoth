@@ -312,7 +312,7 @@ Front-loaded by leverage and verifiability.
    `overlay` enum (A.2 ✅ e5be921) → **next:** `settings` (A.3 ✅) → `persistence`/cwd-key (A.4 ✅) → **next:** →
    `buffer_pool` (A.5a) → `DocState` auto-derived blocks (A.5b) →
    `tool_calls` (A.6) → `agent_view_model` (A.7) →
-   additive `TurnEnded` (A.8a) → server fusions (A.9) → sum-type cleanups (A.11).
+   additive `TurnEnded` (A.8a) → server fusions (A.9) → sum-type cleanups: `InputSurface` (A.11 ✅) + remaining.
 
 **GPUI / gated (Phase B — verify via the harness from item 2):**
 7. `[~]` Doc/Edit single rope (5c, gated D2) · delete turn-end inference
