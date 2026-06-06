@@ -5022,10 +5022,12 @@ impl TurnPhase {
 /// The memoized `render_agent` view-model caches, grouped into one owner
 /// instead of six sibling fields on `AgentState` (A.7 god-struct shrink).
 /// Every field is derived from the structural inputs captured in
-/// `view_model_fp`; none are serialized (runtime-only). The S1 cache
-/// decision — `memoize_view_model` — stays on `AgentState` because its
-/// rebuild closure needs the whole state; this owner just holds the cache
-/// slots that decision reads and writes.
+/// `view_model_fp`; none are serialized (runtime-only). This owner owns the
+/// S1 cache decision via [`cached`](Self::cached) + [`store`](Self::store):
+/// the rebuild between them runs at the call site on `&mut AgentState` (it
+/// needs `tools`/`editor` and writes `block_cache`), which can't be borrowed
+/// while a method holds `&mut self` here — hence the split rather than one
+/// closure-taking `memoize`.
 #[derive(Default)]
 struct AgentViewModel {
     /// Cache of parsed RenderedBlocks keyed by `(start, end)` range.
@@ -5050,6 +5052,43 @@ struct AgentViewModel {
 impl AgentViewModel {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// Cache hit: return the memoized `Rc`s iff `fp` matches the fingerprint
+    /// the cache was built at; `None` = miss → the caller rebuilds and calls
+    /// [`store`](Self::store). The S1 cache decision is split into
+    /// `cached` + `store` (rather than one closure-taking `memoize`) so this
+    /// owner owns the decision: the rebuild runs at the call site on
+    /// `&mut AgentState` (it reads `tools`/`editor` and writes
+    /// `self.view_model.block_cache`), which cannot be borrowed while a method
+    /// holds `&mut self` on the nested `view_model`.
+    fn cached(
+        &self,
+        fp: u64,
+    ) -> Option<(std::rc::Rc<Vec<FlatItem>>, std::rc::Rc<Vec<Option<TurnId>>>)> {
+        (self.view_model_fp == Some(fp))
+            .then(|| (self.flat_items_cache.clone(), self.gutter_cache.clone()))
+    }
+
+    /// Store a freshly-rebuilt view-model, stamp the fingerprint, and bump
+    /// `view_model_seq`. Call exactly once per [`cached`](Self::cached) miss.
+    fn store(
+        &mut self,
+        fp: u64,
+        flat_items: Vec<FlatItem>,
+        gutter: Vec<Option<TurnId>>,
+    ) -> (std::rc::Rc<Vec<FlatItem>>, std::rc::Rc<Vec<Option<TurnId>>>) {
+        #[cfg(test)]
+        {
+            VIEW_MODEL_REBUILDS.with(|n| n.set(n.get() + 1));
+        }
+        let flat_rc = std::rc::Rc::new(flat_items);
+        let gutter_rc = std::rc::Rc::new(gutter);
+        self.flat_items_cache = flat_rc.clone();
+        self.gutter_cache = gutter_rc.clone();
+        self.view_model_fp = Some(fp);
+        self.view_model_seq = self.view_model_seq.wrapping_add(1);
+        (flat_rc, gutter_rc)
     }
 }
 
@@ -5265,41 +5304,6 @@ impl AgentState {
         }
         self.turn_phase.is_awaiting().hash(&mut h);
         h.finish()
-    }
-
-    /// Return the memoized view-model (flat_items + gutter), reusing the
-    /// cached `Rc`s when `fp` matches the fingerprint the cache was built
-    /// at. On a miss, runs `rebuild`, stores the result, stamps the
-    /// fingerprint, and bumps `view_model_seq`. The single source of truth
-    /// for the S1 cache decision — exercised directly by
-    /// `view_model_memoization_fast_skip`.
-    fn memoize_view_model(
-        &mut self,
-        fp: u64,
-        rebuild: impl FnOnce(&mut Self) -> (Vec<FlatItem>, Vec<Option<TurnId>>),
-    ) -> (
-        std::rc::Rc<Vec<FlatItem>>,
-        std::rc::Rc<Vec<Option<TurnId>>>,
-    ) {
-        if self.view_model.view_model_fp == Some(fp) {
-            // Fast skip: structural inputs unchanged — reuse the cache.
-            return (
-                self.view_model.flat_items_cache.clone(),
-                self.view_model.gutter_cache.clone(),
-            );
-        }
-        #[cfg(test)]
-        {
-            VIEW_MODEL_REBUILDS.with(|n| n.set(n.get() + 1));
-        }
-        let (flat_items, gutter) = rebuild(self);
-        let flat_rc = std::rc::Rc::new(flat_items);
-        let gutter_rc = std::rc::Rc::new(gutter);
-        self.view_model.flat_items_cache = flat_rc.clone();
-        self.view_model.gutter_cache = gutter_rc.clone();
-        self.view_model.view_model_fp = Some(fp);
-        self.view_model.view_model_seq = self.view_model.view_model_seq.wrapping_add(1);
-        (flat_rc, gutter_rc)
     }
 
     /// Minimal `AgentState` for unit tests. Only the fields the S1
@@ -14523,12 +14527,15 @@ impl SketchGpuiView {
         // is correctly EXCLUDED from this fingerprint.
         let view_model_fp: u64 = c.view_model_fingerprint(edit_seq, frozen_line_count);
 
-        // On a fingerprint hit `memoize_view_model` returns the cached `Rc`s
-        // without invoking the rebuild closure; on a miss it runs the closure,
-        // stores the result, stamps `view_model_fp`, and bumps `view_model_seq`.
+        // S1 cache: on a fingerprint hit `cached` returns the memoized `Rc`s
+        // and the rebuild below is skipped entirely; on a miss the rebuild runs
+        // on `&mut AgentState` (it reads `tools`/`editor` and writes
+        // `c.view_model.block_cache`) and `store` stamps the fingerprint and
+        // bumps `view_model_seq`. The decision lives on `AgentViewModel`.
         let theme_ref = &self.theme;
-        let (flat_items_arc, gutter_tag_snap) =
-            c.memoize_view_model(view_model_fp, |c| {
+        let (flat_items_arc, gutter_tag_snap) = match c.view_model.cached(view_model_fp) {
+            Some(hit) => hit,
+            None => {
 
         // Per-line gutter tag, sourced from the editor's `TurnId` metadata
         // keyed by `LineAnchor` (spec §11, §E2). Lines without a tag yet
@@ -14759,8 +14766,9 @@ impl SketchGpuiView {
             flat_items.push(FlatItem::ThinkingIndicator);
         }
 
-            (flat_items, gutter_tag_per_line)
-        });
+            c.view_model.store(view_model_fp, flat_items, gutter_tag_per_line)
+            }
+        };
 
         // Splice ListState to match new item count. When block ranges
         // are active, line count can shrink unpredictably, so always
@@ -17099,10 +17107,12 @@ mod tests {
         assert!(after.is_empty());
     }
 
-    /// S1 enforcement: an unchanged fingerprint must take the fast-skip
-    /// path — reuse the cached `Rc`s (same pointer) and run ZERO rebuilds.
-    /// A changed fingerprint must rebuild exactly once and produce fresh
-    /// `Rc`s. Models the `highlight_cache` fast-skip tests.
+    /// S1 enforcement, on the split `cached` + `store` API: an unchanged
+    /// fingerprint must hit (`cached` returns `Some` the same-pointer `Rc`s
+    /// and the caller never `store`s, so ZERO rebuilds). A changed fingerprint
+    /// must miss (`cached` returns `None`) and the following `store` produces
+    /// fresh `Rc`s. `VIEW_MODEL_REBUILDS` counts `store` calls (= misses).
+    /// Models the `highlight_cache` fast-skip tests.
     #[test]
     fn view_model_memoization_fast_skip() {
         VIEW_MODEL_REBUILDS.with(|n| n.set(0));
@@ -17111,27 +17121,29 @@ mod tests {
         // Build a fingerprint over the empty structural state.
         let fp1 = st.view_model_fingerprint(0, 0);
 
-        // First call: cold cache → one rebuild.
-        let (flat1, gut1) = st.memoize_view_model(fp1, |_c| {
-            (vec![FlatItem::Line(0)], vec![None])
-        });
+        // Cold cache: miss → rebuild at the call site, then `store`.
+        assert!(st.view_model.cached(fp1).is_none(), "cold cache must miss");
+        let (flat1, gut1) =
+            st.view_model
+                .store(fp1, vec![FlatItem::Line(0)], vec![None]);
         assert_eq!(
             VIEW_MODEL_REBUILDS.with(|n| n.get()),
             1,
-            "cold cache must rebuild once"
+            "store counts as one rebuild"
         );
         let seq_after_first = st.view_model.view_model_seq;
-        assert_eq!(seq_after_first, 1, "first rebuild bumps the seq to 1");
+        assert_eq!(seq_after_first, 1, "first store bumps the seq to 1");
 
-        // Second call, SAME fingerprint: must skip the rebuild entirely and
-        // hand back the very same `Rc`s (pointer identity), seq unchanged.
-        let (flat2, gut2) = st.memoize_view_model(fp1, |_c| {
-            panic!("rebuild closure must NOT run on a fingerprint hit");
-        });
+        // SAME fingerprint: hit → reuse the very same `Rc`s (pointer identity),
+        // no `store`, seq unchanged.
+        let (flat2, gut2) = st
+            .view_model
+            .cached(fp1)
+            .expect("same fingerprint must hit");
         assert_eq!(
             VIEW_MODEL_REBUILDS.with(|n| n.get()),
             1,
-            "fingerprint hit must not rebuild"
+            "a hit must not rebuild"
         );
         assert!(
             std::rc::Rc::ptr_eq(&flat1, &flat2),
@@ -17143,28 +17155,35 @@ mod tests {
         );
         assert_eq!(
             st.view_model.view_model_seq, seq_after_first,
-            "seq must not change on a fingerprint hit"
+            "seq must not change on a hit"
         );
 
         // Fingerprint sensitivity: a structural change (turn_phase enters
         // awaiting, which the thinking indicator depends on) yields a DIFFERENT
-        // fingerprint and forces exactly one rebuild + a fresh Rc.
+        // fingerprint → miss, and the following `store` produces a fresh `Rc`.
         st.turn_phase = TurnPhase::begin(std::time::Instant::now());
         let fp2 = st.view_model_fingerprint(0, 0);
         assert_ne!(fp1, fp2, "turn_phase awaiting must change the fingerprint");
-        let (flat3, _gut3) = st.memoize_view_model(fp2, |_c| {
-            (vec![FlatItem::ThinkingIndicator], vec![None])
-        });
+        assert!(
+            st.view_model.cached(fp2).is_none(),
+            "changed fingerprint must miss"
+        );
+        let (flat3, _gut3) =
+            st.view_model
+                .store(fp2, vec![FlatItem::ThinkingIndicator], vec![None]);
         assert_eq!(
             VIEW_MODEL_REBUILDS.with(|n| n.get()),
             2,
-            "a fingerprint miss must rebuild"
+            "a miss + store rebuilds again"
         );
         assert!(
             !std::rc::Rc::ptr_eq(&flat1, &flat3),
             "a rebuild must produce a fresh Rc"
         );
-        assert_eq!(st.view_model.view_model_seq, 2, "miss bumps the seq again");
+        assert_eq!(
+            st.view_model.view_model_seq, 2,
+            "second store bumps the seq again"
+        );
     }
 
     /// F7 (parse-don't-validate at the trust boundary): a `ToolCallKey` parsed
