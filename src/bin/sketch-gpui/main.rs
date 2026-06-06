@@ -1869,6 +1869,18 @@ fn cwd_match_key(p: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// THE canonical on-disk key for a cwd (ADR-0010 / D5). Every cwd-keyed map in
+/// our persistence files (`workspace.json`, the ACP-session file) keys through
+/// this, so a symlinked / non-normalized / `/tmp`-vs-`/private/tmp` launch dir
+/// resolves to the SAME string the entry was saved under — instead of silently
+/// missing and resurrecting the workspace/session as empty. Mirrors
+/// [`cwd_match_key`] (the resume *filter* key); this is its on-disk twin.
+/// Falls back to the raw spelling when `canonicalize` fails (deleted path), so
+/// a transient stat failure never regresses to never-matching.
+fn persist_cwd_key(cwd: &std::path::Path) -> String {
+    cwd_match_key(cwd).to_string_lossy().into_owned()
+}
+
 /// Attach to a server session, retrying an Owner attach briefly when the
 /// server still reports a previous owner.
 ///
@@ -2467,7 +2479,11 @@ fn save_persisted_workspace(cwd: &std::path::Path, ws: &workspace::Workspace<Win
         .unwrap_or_default();
     let snap = snapshot_workspace(ws);
     if let Ok(v) = serde_json::to_value(&snap) {
-        map.insert(cwd.display().to_string(), v);
+        // Drop any entry saved under the old raw spelling so the file doesn't
+        // accumulate a canonical + raw duplicate for the same dir (ADR-0010:
+        // the next save rewrites canonical — this is that rewrite).
+        map.remove(&cwd.display().to_string());
+        map.insert(persist_cwd_key(cwd), v);
     }
     if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
         let _ = std::fs::write(&path, bytes);
@@ -2481,7 +2497,11 @@ fn load_persisted_workspace(cwd: &std::path::Path) -> Option<PersistedWorkspace>
     let path = workspace_persist_path()?;
     let bytes = std::fs::read(&path).ok()?;
     let map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
-    let entry = map.get(&cwd.display().to_string())?;
+    // Canonical key first; lazy fallback to the old raw spelling for entries
+    // saved before D5 (ADR-0010 — adopt on read, next save rewrites canonical).
+    let entry = map
+        .get(&persist_cwd_key(cwd))
+        .or_else(|| map.get(&cwd.display().to_string()))?;
     serde_json::from_value(entry.clone()).ok()
 }
 
@@ -2519,8 +2539,9 @@ fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<PersistedSlot> {
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Vec::new();
     };
-    let key = cwd.to_string_lossy();
-    let Some(entry) = json.get(key.as_ref()) else {
+    // Canonical key first; lazy fallback to the old raw spelling (ADR-0010).
+    let raw = cwd.to_string_lossy();
+    let Some(entry) = json.get(&persist_cwd_key(cwd)).or_else(|| json.get(raw.as_ref())) else {
         return Vec::new();
     };
     // Legacy single-string shape: synthesize a one-slot list with the
@@ -2605,6 +2626,8 @@ fn forget_persisted_acp_sessions(cwd: &std::path::Path) {
         return;
     };
     if let Some(obj) = json.as_object_mut() {
+        // Clear both spellings so a pre-D5 raw entry can't linger (ADR-0010).
+        obj.remove(persist_cwd_key(cwd).as_str());
         obj.remove(cwd.to_string_lossy().as_ref());
     }
     if let Ok(serialized) = serde_json::to_string_pretty(&json) {
@@ -2691,10 +2714,14 @@ fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRing) {
         if entries.is_empty() {
             // Don't leave a stale list behind if nothing is persistable
             // (e.g., user closed all sessions but reboot hasn't fired yet).
+            obj.remove(persist_cwd_key(cwd).as_str());
             obj.remove(cwd.to_string_lossy().as_ref());
         } else {
+            // Clear the old raw spelling, then write under the canonical key
+            // (ADR-0010: next save rewrites canonical).
+            obj.remove(cwd.to_string_lossy().as_ref());
             obj.insert(
-                cwd.to_string_lossy().into_owned(),
+                persist_cwd_key(cwd),
                 serde_json::Value::Array(entries),
             );
         }
@@ -16859,6 +16886,38 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0010: the canonical on-disk cwd key resolves a symlinked spelling
+    /// and the real path to the SAME string (so a session saved under one is
+    /// found when launched under the other), and falls back to the raw spelling
+    /// when the path can't be canonicalized (never regresses to never-matching).
+    #[test]
+    fn persist_cwd_key_canonicalizes_symlinks() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("sketch-cwdkey-{}", std::process::id()));
+        let real = base.join("real");
+        let link = base.join("link");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&real).unwrap();
+        symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            persist_cwd_key(&link),
+            persist_cwd_key(&real),
+            "symlinked and real cwd must share one on-disk key"
+        );
+        assert_ne!(
+            persist_cwd_key(&link),
+            link.to_string_lossy(),
+            "the key must be canonicalized, not the raw symlink spelling"
+        );
+
+        // Non-existent path: canonicalize fails -> echo raw (no never-match).
+        let missing = base.join("does-not-exist");
+        assert_eq!(persist_cwd_key(&missing), missing.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// Settings persistence round-trips (theme, agent bar, text zoom) and a
     /// preferences file written before `text_scale` existed still loads — the
