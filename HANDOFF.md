@@ -1,6 +1,6 @@
 # Handoff — state-architecture overhaul (single source of truth)
 
-**Date:** 2026-06-06 · **Branch:** `master` @ `8cdbdd1` (Phase A finished) · Tree clean.
+**Date:** 2026-06-06 · **Branch:** `master` @ `0c25869` (Phase A done; Phase B R/9′/8b-stage1 landed; reparse crash+latency fixed) · Tree clean.
 Read `CLAUDE.md` + auto-memory first; this is the consolidated item list that
 spec §7, the worklogs, and the original `handover.md` only covered in pieces.
 
@@ -48,8 +48,8 @@ reason, and every owed runtime check. Status keys: ✅ done · ⬜ open · ⏸ d
 |---|---|---|---|
 | R | `reset_for_replay` delegation (each module owns its `reset()`) | ✅ | `eca7759` — `HighlightCache::reset()`; value-identical, adversarially verified |
 | 9′ | `apply_channel_state()` unification — drain `pending_prompts` + bump generation consistently across create/restore/restart | ✅ ⚠️ | `74c4f73` — restart now drains prompts (was: lost). Adversarially verified behavior-as-intended. **Owes runtime check**: prompt-during-restart reaches new channel; restart-in-Plan stays Plan |
-| 5c | Doc/Edit single pooled `SharedCore` | ⏸ HELD | D2 (ADR-0007) — 49-site rewrite of content ownership; ADR stages it (5a→5b→5c); not blind-landable. Plan mapped; do as its own focused session |
-| 8b | delete turn-end inference in all 3 pumps | 🔶 stage 1 done | **Additive emit landed** (`6eb9660`+): `ReplyEvent::TurnEnded{count}` from the worker, gated `SKETCH_EMIT_TURN_ENDED=1` (default off); GUI arm inert + logs agreement. **Deletion (stage 2) gated** on (a) running with the flag and confirming agreement on a resume + tool-only turn (runtime job, ADR-0006), (b) the reconnect-storm fix (same replay path) |
+| 5c | Doc/Edit single pooled `SharedCore` | 🔶 step 1 on branch | On `doc-edit-5c` (off master, +incremental reparse merged). **Done:** `DocState` binds a pooled `SharedCore` via `source: Option<DocSource>`; `edit_cache` retired; toggle shares the core; `refresh_blocks` re-derives Doc blocks live (read-only borrow — panic-safe); **ALL Doc-open paths pool-bound** (open_file, clone-for-split, restore, wiki-link, reload-in-place, startup). **Awaiting runtime check:** two-pane live tracking (refresh fires) + no data loss on toggle. **Step 2:** cursor-stash on Doc→Edit, save-clears-dirty-in-both, persist/restore, gc/refcount hygiene; strip the temp `[5c]` diag logs. Carries a small per-keystroke Doc-side cost (`render_with_wiki` re-parse) — separate from the Edit-side incremental reparse |
+| 8b | delete turn-end inference in all 3 pumps | 🔶 stage 1 done | **Additive emit landed** (`8b-additive`, on master): `ReplyEvent::TurnEnded{count}` from the worker, gated `SKETCH_EMIT_TURN_ENDED=1` (default off); GUI arm inert + logs agreement. **Stage 2 (delete inference) splits by risk** — investigated 2026-06-06: (i) **GUI-consumer half** — `apply_reply_events` finalizes on the explicit signal; delete the legacy direct (`gpui:12429`) + TUI (`claude.rs:326`) inferences. **Seam-test verifiable** (verify_harness drives `apply_server_batch`). Lower risk. (ii) **Server-pump half** — delete the inference at `session-server/main.rs:794`, rewire to the worker's explicit `TurnEnded`, **preserving the replay-fence (`:808-838`) + generation emit (`:856-871`)**. **NO headless coverage** (seam tests don't drive the server pump), storm-muddied resume path → needs a live **resume** runtime check; a fence mistake = transcript loss on reconnect. Do (i) anytime; do (ii) with the app + after/with the storm root-cause |
 | 11′ | `ChannelAttachState` enum — fold `channel`+`attach_pending` into `Attaching{prev,rx}` | ⏸ HELD | No functional benefit; refactors the **same reconnect path as the active reconnect-storm bug**. Stabilize/understand that first — verification is compromised while the path flaps |
 | 10 | reconnect `Arc<Core>` swap-in-place | ⏸ | D3 — explicit trigger-deferral (wait until you observe a stranded-handle vanish) |
 
@@ -58,6 +58,9 @@ reason, and every owed runtime check. Status keys: ✅ done · ⬜ open · ⏸ d
 |---|---|---|
 | Pipelined-submit turn-numbering crash (`User(2) inserted twice`) | ✅ ⚠️ | `50021fc` |
 | Session-server mutex-poison cascade | ✅ | `d4cce77` |
+| **Edit-view typing SIGSEGV** (stale-tree incremental parse) | ✅ | `d32edf9` — fresh parse; found via 5c testing |
+| **Edit-view typing latency** (full parse/keystroke after the segfault fix) | ✅ | `413da19` — proper incremental reparse, fuzz-guarded (~27k edits, sexp-equal to full parse), **10–20× faster** |
+| **Reconnect-storm diagnostics** | ✅ | `6eb9660` — every disconnect now names its cause (server EOF/read-err/write-fail; client reader exit reason). Storm itself still NEEDS-RUNTIME-REPRO (backlog → Bugs) |
 
 ## Standing / cross-cutting (from spec §7 items 4, 8 + handover §8)
 | Item | Status | Note |
@@ -89,16 +92,22 @@ borrows. Memoization is already implemented + tested, so this is **god-struct
 shrink only** — lower priority than the observability gap.
 
 ## Recommended next moves
-**Phase A is finished** (A.7/A.8a/A.9/item-11 closed — see tables above;
-adversarially verified behavior-preserving, full CI green). What's left:
-1. **The 5 runtime checks** with the app running (quick; needs you).
-2. **GUI observability** (`report_error` sink + no-silent-drop pump) — highest-
-   value untouched item; spec it first.
-3. **Phase B (5c, 8b)** together against the running app (behavior-changing) —
-   8a groundwork (`generation` on `TurnEnded`) is now in place for 8b.
-4. **Behavior-changing follow-ups surfaced this session** (9′ `apply_channel_state`
-   prompt-drain/generation fix; 11′ `ChannelAttachState` enum) — both need the
-   runtime-check track, not a pure Phase-A merge. See Phase B table.
+**Phase A is done; the pure/no-behavior-change refactors are exhausted.** Every
+remaining item is behavior-changing and runtime-gated — nothing left to grind
+solo. The keystone is the **reconnect storm**: root-causing it unblocks both 11′
+and 8b's server-pump half. Ranked:
+1. **Verify 5c live-tracking** at the app (5 min) → merge `doc-edit-5c` → step 2.
+   Closest to done; just needs your eyes. App was last built+running for this.
+2. **Reconnect-storm root cause** — fully instrumented now; trigger a repro and
+   read the labeled log (server conn-closed reason + client reader exit). Fixing
+   it unblocks 11′ AND 8b-server-half. Highest leverage.
+3. **8b stage 2** — do the GUI-consumer half anytime (seam-test verifiable); the
+   server-pump half needs a live **resume** check (see 8b row) — do it with the
+   app, after the storm.
+4. **11′** `ChannelAttachState` — after the storm is understood (same path).
+5. **GUI observability** (`report_error` sink + no-silent-drop pump) — still the
+   highest-value *untouched* feature; would make every runtime check above
+   cheaper. Spec it first.
 
 ## Working conventions (unchanged)
 Worktree per task under `.claude/worktrees/`; map→design→adversarial-verify
