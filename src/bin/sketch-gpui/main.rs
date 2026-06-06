@@ -4196,12 +4196,14 @@ impl DocState {
             None => return,
         };
         let path = PathBuf::from(self.file_label.as_ref());
+        let t0 = std::time::Instant::now();
         let blocks = render_with_wiki(&text, theme, Some(&path));
         let n = blocks.len();
+        let us = t0.elapsed().as_micros();
         self.set_blocks(blocks);
         if let Some(src) = self.source.as_mut() {
             eprintln!(
-                "[5c] refresh_blocks: Doc buf={} seq {}→{} ({} blocks)",
+                "[5c] refresh_blocks: Doc buf={} seq {}→{} ({} blocks, render_with_wiki {us}µs)",
                 src.buffer_id, src.rendered_seq, seq, n
             );
             src.rendered_seq = seq;
