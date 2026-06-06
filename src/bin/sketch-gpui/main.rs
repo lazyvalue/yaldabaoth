@@ -4940,23 +4940,22 @@ struct AgentState {
     /// Replaces the prior `(awaiting_reply, turn_started, last_event_at,
     /// stop_requested_at)` quadruple — see `TurnPhase`.
     turn_phase: TurnPhase,
-    /// Last-seen turn count. The pump compares this against the live counter
-    /// each tick — when it ticks up, the in-flight turn just ended, which is
-    /// our cue to finalize the buffer (ensure an editable line below the
-    /// frozen content) and return the phase to `Idle`.
-    last_seen_turns: usize,
-    /// Replay turn cursor (Finding 3, INV-3). On `session/load` the agent
-    /// re-emits the whole prior conversation as a single burst of
-    /// `UserMessage` / `Chunk` events with no per-turn prompt-response to
-    /// advance `last_seen_turns`. Without this the whole replayed history
-    /// collapses into one `TurnId::Llm(1)`. Instead, each replayed
-    /// `UserMessage` boundary advances this cursor so the following agent
-    /// chunks attach to the *next* `Llm(k)`: the sequence becomes
-    /// `User(1),Llm(1),User(2),Llm(2)` rather than all-1s. Zero outside a
-    /// replay; `current_turn()` prefers it when non-zero so live submit and
-    /// replay share one source of `k` (INV-3). `ReplayComplete` folds it back
-    /// into `last_seen_turns` and resets it to 0 so live turns resume cleanly.
-    replay_turn: usize,
+    /// The turn-number state machine (Findings 3 & 13, INV-3/INV-4) — the
+    /// **single owner** of `k`. Holds `last_seen` (settled live turns; the pump
+    /// compares the live counter against it each tick, and when it ticks up the
+    /// in-flight turn just ended → finalize the buffer + return the phase to
+    /// `Idle`) and `replay_turn` (the replay cursor). On `session/load` the
+    /// agent re-emits the whole prior conversation as one burst of
+    /// `UserMessage`/`Chunk` events with no per-turn prompt-response to advance
+    /// `last_seen`; without the cursor the replayed history collapses into one
+    /// `TurnId::Llm(1)`. Instead each replayed `UserMessage` boundary steps the
+    /// cursor so chunks attach to the *next* `Llm(k)` —
+    /// `User(1),Llm(1),User(2),Llm(2)` — and `current_turn()` prefers it when
+    /// non-zero so live submit and replay share one source of `k`.
+    /// `ReplayComplete` folds the cursor back into `last_seen` and zeroes it.
+    /// (Was two loose `usize` fields reconstructed into a temporary `ReplayTurns`
+    /// on every read and copied back out on every mutation — now owned directly.)
+    replay_turns: sketch::acp_channel::ReplayTurns,
     /// `edit_seq` at which the tail was last revealed by the follow-scroll
     /// (F4, INV-13). The render-time re-reveal historically fired only when
     /// the flat-item COUNT changed, so a chunk that grows the last line/block
@@ -5192,8 +5191,7 @@ impl AgentState {
             list_item_count: 0,
             status: None,
             turn_phase: TurnPhase::Idle,
-            last_seen_turns: 0,
-            replay_turn: 0,
+            replay_turns: sketch::acp_channel::ReplayTurns::default(),
             last_scrolled_edit_seq: u64::MAX,
             tool_calls: std::collections::HashMap::new(),
             tool_call_order: Vec::new(),
@@ -5244,8 +5242,7 @@ impl AgentState {
             list_item_count: 0,
             status,
             turn_phase: TurnPhase::Idle,
-            last_seen_turns: 0,
-            replay_turn: 0,
+            replay_turns: sketch::acp_channel::ReplayTurns::default(),
             last_scrolled_edit_seq: u64::MAX,
             tool_calls: std::collections::HashMap::new(),
             tool_call_order: Vec::new(),
@@ -5279,32 +5276,17 @@ impl AgentState {
         state
     }
 
-    /// View of `(last_seen_turns, replay_turn)` as the lib-crate
-    /// `ReplayTurns` state machine (Findings 3 & 13). The two fields stay on
-    /// `AgentState` (other call sites read them), but every attribution
-    /// decision routes through `ReplayTurns` so the bin can't drift from the
-    /// unit-tested rules. Mutating helpers below write the result back.
-    fn replay_turns(&self) -> sketch::acp_channel::ReplayTurns {
-        sketch::acp_channel::ReplayTurns {
-            last_seen: self.last_seen_turns,
-            replay_turn: self.replay_turn,
-        }
-    }
-
     /// Single source of the in-flight turn number `k` (Finding 3, INV-3),
     /// used by both live submit and replay so gutter tags and TurnHeaders
-    /// are identical in both regimes.
+    /// are identical in both regimes. Delegates to the owned `ReplayTurns`.
     fn current_turn(&self) -> usize {
-        self.replay_turns().current_turn()
+        self.replay_turns.current_turn()
     }
 
     /// Advance the replay cursor at a replayed user-message boundary and
     /// return the new turn `k` (Finding 3, INV-3).
     fn advance_replay_user_boundary(&mut self) -> usize {
-        let mut rt = self.replay_turns();
-        let k = rt.advance_user_boundary();
-        self.replay_turn = rt.replay_turn;
-        k
+        self.replay_turns.advance_user_boundary()
     }
 
     /// The lowest turn number not yet issued to a user turn this generation.
@@ -5500,10 +5482,7 @@ impl AgentState {
     /// Fold the replay cursor back into the live counter at end-of-replay
     /// (Finding 13, INV-4).
     fn finish_replay(&mut self) {
-        let mut rt = self.replay_turns();
-        rt.finish_replay();
-        self.last_seen_turns = rt.last_seen;
-        self.replay_turn = rt.replay_turn;
+        self.replay_turns.finish_replay();
     }
 
     /// Reset all transcript-derived state to the empty baseline so that a
@@ -5522,8 +5501,7 @@ impl AgentState {
         // watermark so the first replayed chunk re-reveals the tail (F4).
         self.last_scrolled_edit_seq = u64::MAX;
         self.turn_phase = TurnPhase::Idle;
-        self.last_seen_turns = 0;
-        self.replay_turn = 0;
+        self.replay_turns = sketch::acp_channel::ReplayTurns::default();
         // The transcript is being rebuilt from the authoritative event_log:
         // nothing is "pending local" any more, and this starts a fresh
         // tripwire generation (the replay re-numbers `k` from 1). This clear
@@ -11572,8 +11550,7 @@ impl SketchGpuiView {
             list_item_count: 0,
             status: Some("attaching to ACP agent…".into()),
             turn_phase: TurnPhase::Idle,
-            last_seen_turns: 0,
-            replay_turn: 0,
+            replay_turns: sketch::acp_channel::ReplayTurns::default(),
             last_scrolled_edit_seq: u64::MAX,
             tool_calls: std::collections::HashMap::new(),
             tool_call_order: Vec::new(),
@@ -12022,7 +11999,7 @@ impl SketchGpuiView {
                         // Turn boundary: clear last-inserted so the next turn's
                         // user echo isn't mistaken for a duplicate of this one.
                         claude.reconciler.note_turn_progressed();
-                        claude.last_seen_turns = turn_count;
+                        claude.replay_turns.last_seen = turn_count;
                         claude.turn_phase = TurnPhase::Idle;
                     });
                     warn_unrouted(routed, &session_id);
@@ -12226,7 +12203,7 @@ impl SketchGpuiView {
 
             // 3) Drain up to PUMP_EVENT_BUDGET reply events.
             let mut events: Vec<sketch::acp_channel::ReplyEvent> = Vec::new();
-            let mut current_turns = claude.last_seen_turns;
+            let mut current_turns = claude.replay_turns.last_seen;
             let mut more_pending = false;
             if let Some(client) = &claude.channel {
                 while events.len() < PUMP_EVENT_BUDGET {
@@ -12249,7 +12226,7 @@ impl SketchGpuiView {
             // marker (Finding 13, INV-4) returned by `apply_reply_events`, so
             // a transiently-empty queue between notification bursts can no
             // longer infer turn-end and finalize mid-replay.
-            let turn_ended = !more_pending && current_turns > claude.last_seen_turns;
+            let turn_ended = !more_pending && current_turns > claude.replay_turns.last_seen;
             let has_events = !events.is_empty() || turn_ended;
             if has_events {
                 let mut replay_complete = Self::apply_reply_events(claude, events);
@@ -12263,7 +12240,7 @@ impl SketchGpuiView {
                         }
                     }
                     replay_complete |= Self::apply_reply_events(claude, tail);
-                    claude.last_seen_turns = current_turns;
+                    claude.replay_turns.last_seen = current_turns;
                 }
                 if turn_ended || replay_complete {
                     finalize_agent_turn(&mut claude.editor);
@@ -12364,8 +12341,8 @@ impl SketchGpuiView {
             // event so a replayed `UserMessage` boundary mid-batch advances
             // the turn for the chunks that follow it (Finding 3, INV-3).
             // `current_turn()` is the single source of `k` (live submit and
-            // replay agree): live turns read `last_seen_turns + 1`; during
-            // replay the boundary-advanced `replay_turn` takes over.
+            // replay agree): live turns read `replay_turns.last_seen + 1`;
+            // during replay the boundary-advanced cursor takes over.
             let current_turn = claude.current_turn();
             match ev {
                 ReplyEvent::Chunk(text) => {

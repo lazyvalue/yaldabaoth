@@ -745,7 +745,7 @@ fn agent_seam_pipelined_worksheet_submits_get_distinct_turns(cx: &mut TestAppCon
 
     // Turn 1 has settled (its TurnEnded advanced last_seen to 1).
     view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().last_seen_turns = 1;
+        v.agent_mut().unwrap().replay_turns.last_seen = 1;
     });
 
     // First in-flight submit -> turn 2.
@@ -791,7 +791,7 @@ fn agent_seam_unsuppressed_echo_during_inflight_turn_gets_distinct_k(cx: &mut Te
     vcx.run_until_parked();
     install_agent_slot(&view, &mut *vcx, Some("S1"));
     view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().last_seen_turns = 1;
+        v.agent_mut().unwrap().replay_turns.last_seen = 1;
     });
 
     // Local submit -> turn 2 (in flight; last_seen still 1).
