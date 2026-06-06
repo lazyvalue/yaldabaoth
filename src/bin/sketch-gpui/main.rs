@@ -2393,20 +2393,31 @@ fn restore_content(
     match kind {
         PersistedKind::Doc { path } => {
             let label: SharedString = path.display().to_string().into();
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
-            let doc = Document::from_text(text, path.clone());
-            let blocks = render_with_wiki(&doc.full_text(), theme, Some(&path));
-            WindowContent::Doc(DocState {
-                blocks,
-                file_label: label,
-                cursor_block: 0,
-                list_state: DocState::new_list_state(0),
-                list_item_count: std::cell::Cell::new(0),
-                blocks_seq: 0,
-                blocks_snapshot: RefCell::new(None),
-                last_cursor_block: std::cell::Cell::new(None),
-                edit_cache: None,
-            })
+            // 5c: restore the Doc bound to its pooled core (shared text/undo +
+            // live tracking). Fall back to a Browser if the file vanished since
+            // it was persisted (mirrors the Edit restore path).
+            match ws.open_and_retain(&path) {
+                Ok((id, core)) => {
+                    let blocks =
+                        render_with_wiki(&core.borrow().document().full_text(), theme, Some(&path));
+                    WindowContent::Doc(DocState {
+                        blocks,
+                        file_label: label,
+                        cursor_block: 0,
+                        list_state: DocState::new_list_state(0),
+                        list_item_count: std::cell::Cell::new(0),
+                        blocks_seq: 0,
+                        blocks_snapshot: RefCell::new(None),
+                        last_cursor_block: std::cell::Cell::new(None),
+                        source: Some(DocSource::new(id, core)),
+                    })
+                }
+                Err(_) => WindowContent::Browser(BrowserWindow::standalone(
+                    path.parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from(".")),
+                )),
+            }
         }
         PersistedKind::Edit { path } => {
             let label: SharedString = path.display().to_string().into();
@@ -4102,11 +4113,51 @@ struct DocState {
     /// the list was populated (stale count) and keeping the cursor bar
     /// on-screen. `None` until the first render.
     last_cursor_block: std::cell::Cell<Option<usize>>,
-    /// Stashed editor from a prior Edit-mode session in the same file,
-    /// preserved across Ctrl-V round-trips so unsaved edits aren't lost
-    /// when previewing the rendered view. `None` for files that have
-    /// only been viewed (never edited) or that came in fresh from disk.
-    edit_cache: Option<EditState>,
+    /// The pooled, shared source this Doc renders (D2 / 5c). `Some` for
+    /// file-backed Docs — the SAME `SharedCore` an Edit view of the file
+    /// binds to, so editing in Edit shows live in Doc and undo is unified.
+    /// `None` for string-backed Docs (help/welcome) and transient
+    /// placeholders. Replaces the old `edit_cache` stash: the shared core IS
+    /// the live state, so there is nothing to shuttle across a Doc↔Edit
+    /// round-trip.
+    source: Option<DocSource>,
+}
+
+/// A file-backed Doc's handle onto its pooled `SharedCore` (5c). Held so the
+/// Doc renders the file's *live* rope (shared with any Edit view) and so the
+/// pool's `Rc`-strong-count liveness keeps the buffer alive while the Doc is
+/// open.
+struct DocSource {
+    buffer_id: workspace::FileBufferId,
+    core: workspace::SharedCore,
+    /// `Document.edit_seq()` the current `blocks` were derived at. The
+    /// per-frame `refresh_blocks` re-derives only when the core has advanced
+    /// past this — O(1) when idle, one re-parse per change (the two-pane live
+    /// path; memoized exactly like `EditState.lines_cache`).
+    rendered_seq: u64,
+}
+
+impl DocSource {
+    /// Build a source from a pooled `(buffer_id, core)`, stamping
+    /// `rendered_seq` at the core's current `edit_seq` (caller renders the
+    /// matching initial `blocks`).
+    fn new(buffer_id: workspace::FileBufferId, core: workspace::SharedCore) -> Self {
+        let rendered_seq = core.borrow().document().edit_seq();
+        Self {
+            buffer_id,
+            core,
+            rendered_seq,
+        }
+    }
+    fn full_text(&self) -> String {
+        self.core.borrow().document().full_text()
+    }
+    fn edit_seq(&self) -> u64 {
+        self.core.borrow().document().edit_seq()
+    }
+    fn is_modified(&self) -> bool {
+        self.core.borrow().document().is_modified()
+    }
 }
 
 impl DocState {
@@ -4124,6 +4175,32 @@ impl DocState {
     fn set_blocks(&mut self, blocks: Vec<RenderedBlock>) {
         self.blocks = blocks;
         self.blocks_seq = self.blocks_seq.wrapping_add(1);
+    }
+
+    /// Re-derive `blocks` from the shared core if it has advanced since the
+    /// last derivation (5c live path: an Edit view's keystroke bumps the
+    /// shared `edit_seq`, and the next frame re-renders this Doc). O(1) when
+    /// idle; one markdown parse per change. Uses a READ-ONLY borrow of the
+    /// core — never `borrow_mut` here — so a concurrent Edit mutation on the
+    /// same core cannot trigger a `RefCell` double-borrow panic. No-op for
+    /// string-backed Docs (`source == None`).
+    fn refresh_blocks(&mut self, theme: &Theme) {
+        let (seq, text) = match &self.source {
+            Some(src) => {
+                let seq = src.edit_seq();
+                if seq == src.rendered_seq {
+                    return;
+                }
+                (seq, src.full_text())
+            }
+            None => return,
+        };
+        let path = PathBuf::from(self.file_label.as_ref());
+        let blocks = render_with_wiki(&text, theme, Some(&path));
+        self.set_blocks(blocks);
+        if let Some(src) = self.source.as_mut() {
+            src.rendered_seq = seq;
+        }
     }
 
     /// O(1) pointer clone of the blocks snapshot, rebuilding it (one full
@@ -6124,7 +6201,7 @@ impl SketchGpuiView {
             blocks_seq: 0,
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
-            edit_cache: None,
+            source: None,
         });
         Self {
             theme,
@@ -6375,16 +6452,22 @@ impl SketchGpuiView {
             return true;
         }
 
-        let text = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
+        // 5c: bind the Doc to the file's pooled core (dedup by canonical path),
+        // so an Edit view of the same file — opened separately — shares the
+        // exact same rope + undo and edits show live in this Doc.
+        let (buf_id, core) = match self.workspace.open_and_retain(&path) {
+            Ok(pair) => pair,
             Err(e) => {
                 eprintln!("error: cannot read {}: {}", path.display(), e);
                 return false;
             }
         };
         let label: SharedString = canon.into();
-        let doc = Document::from_text(text, path.clone());
-        let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
+        let blocks = render_with_wiki(
+            &core.borrow().document().full_text(),
+            &self.theme,
+            Some(&path),
+        );
         let new_content = WindowContent::Doc(DocState {
             blocks,
             file_label: label,
@@ -6394,7 +6477,7 @@ impl SketchGpuiView {
             blocks_seq: 0,
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
-            edit_cache: None,
+            source: Some(DocSource::new(buf_id, core)),
         });
 
         // If the current tab is a transient Browser, replace its content
@@ -7201,25 +7284,30 @@ impl SketchGpuiView {
                 Err(_) => browser_fallback(),
             }
         } else {
-            // Doc panes render a disk snapshot (read-only view); no shared
-            // editor state to pool.
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(_) => return browser_fallback(),
-            };
-            let doc = Document::from_text(text, path.clone());
-            let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
-            WindowContent::Doc(DocState {
-                blocks,
-                file_label: label,
-                cursor_block: 0,
-                list_state: DocState::new_list_state(0),
-                list_item_count: std::cell::Cell::new(0),
-                blocks_seq: 0,
-                blocks_snapshot: RefCell::new(None),
-                last_cursor_block: std::cell::Cell::new(None),
-                edit_cache: None,
-            })
+            // 5c: bind the cloned Doc to the SAME pooled core (open_and_retain
+            // dedups by canonical path), so it tracks live edits from any other
+            // view of the file — the multi-home / also-show live case.
+            match self.workspace.open_and_retain(&path) {
+                Ok((id, core)) => {
+                    let blocks = render_with_wiki(
+                        &core.borrow().document().full_text(),
+                        &self.theme,
+                        Some(&path),
+                    );
+                    WindowContent::Doc(DocState {
+                        blocks,
+                        file_label: label,
+                        cursor_block: 0,
+                        list_state: DocState::new_list_state(0),
+                        list_item_count: std::cell::Cell::new(0),
+                        blocks_seq: 0,
+                        blocks_snapshot: RefCell::new(None),
+                        last_cursor_block: std::cell::Cell::new(None),
+                        source: Some(DocSource::new(id, core)),
+                    })
+                }
+                Err(_) => browser_fallback(),
+            }
         }
     }
 
@@ -7976,7 +8064,7 @@ impl SketchGpuiView {
             blocks_seq: 0,
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
-            edit_cache: None,
+            source: None,
         }));
         // The real doc body only renders once the splash deadline passes; clear
         // it so the harness exercises the list path immediately.
@@ -8027,35 +8115,41 @@ impl SketchGpuiView {
     /// disk. The chosen `view` is applied either way — switching from Code
     /// → WP without losing cursor/buffer state is just `cached.view = view`.
     fn enter_edit_with(&mut self, view: EditView, cx: &mut Context<Self>) {
-        // Take the cached EditState (preserving unsaved edits + cursor) without
-        // holding a mutable borrow across the pool mutation below.
-        let (cached, label): (Option<EditState>, SharedString) =
+        // 5c: bind the Edit view to the Doc's SHARED pooled core (same text +
+        // undo), so edits show live in any Doc pane of the file and there's no
+        // stash to shuttle. Snapshot the (id, core) without holding the borrow
+        // across the pool mutation below.
+        let (shared, label): (Option<(workspace::FileBufferId, workspace::SharedCore)>, SharedString) =
             match self.workspace.focused_content_mut() {
-                Some(WindowContent::Doc(d)) => (d.edit_cache.take(), d.file_label.clone()),
+                Some(WindowContent::Doc(d)) => (
+                    d.source.as_ref().map(|s| (s.buffer_id, s.core.clone())),
+                    d.file_label.clone(),
+                ),
                 _ => return,
             };
-        let mut edit_state = match cached {
-            Some(cached) => cached,
+        let (id, core) = match shared {
+            Some(pair) => pair,
             None => {
-                // Bind a fresh view to the file's pooled core (shared text +
-                // undo with any other window on the same file).
+                // Source-less Doc (string-backed, or not yet pool-bound): open
+                // the file by label and bind a fresh pooled core.
                 let path: PathBuf = label.to_string().into();
-                let (id, core) = match self.workspace.open_and_retain(&path) {
+                match self.workspace.open_and_retain(&path) {
                     Ok(pair) => pair,
                     Err(_) => return,
-                };
-                EditState::new(SharedEditor::new(id, core), label, view)
+                }
             }
         };
+        let mut edit_state = EditState::new(SharedEditor::new(id, core), label, view);
         edit_state.view = view;
         self.set_screen(WindowContent::Edit(edit_state));
         cx.notify();
     }
 
-    /// Edit → Doc round trip. Re-renders the buffer's *current* text (not the
-    /// on-disk version), so unsaved edits show up in the rendered preview.
-    /// Stashes the EditState on the new DocState so re-entering edit picks
-    /// up exactly where the user left off (cursor, mode, scroll, undo).
+    /// Edit → Doc round trip. The new Doc keeps the SAME pooled core (5c), so
+    /// it shows the buffer's *current* (unsaved) text and shares undo with any
+    /// other view of the file. No stash — the shared core IS the live state.
+    /// (Step-2 TODO: stash the EditorView cursor so re-entering Edit lands
+    /// where the user left off; today the cursor resets to the top.)
     fn back_to_doc(&mut self, cx: &mut Context<Self>) {
         let prev = self
             .workspace
@@ -8070,7 +8164,7 @@ impl SketchGpuiView {
                 blocks_seq: 0,
                 blocks_snapshot: RefCell::new(None),
                 last_cursor_block: std::cell::Cell::new(None),
-                edit_cache: None,
+                source: None,
             }),
         )
             .expect("workspace has no focused window");
@@ -8080,6 +8174,9 @@ impl SketchGpuiView {
                 let blocks =
                     render_with_wiki(&edit.editor.full_text(), &self.theme, Some(&edit_path));
                 let file_label = edit.file_label.clone();
+                // 5c: the new Doc keeps the SAME pooled core the Edit view held
+                // (shared text + undo). No stash — the core IS the live state.
+                let source = DocSource::new(edit.editor.buffer_id, edit.editor.core.clone());
                 self.set_screen(WindowContent::Doc(DocState {
                     blocks,
                     file_label,
@@ -8089,7 +8186,7 @@ impl SketchGpuiView {
                     blocks_seq: 0,
                     blocks_snapshot: RefCell::new(None),
                     last_cursor_block: std::cell::Cell::new(None),
-                    edit_cache: Some(edit),
+                    source: Some(source),
                 }));
             }
             WindowContent::Agent(ring) => {
@@ -8153,21 +8250,23 @@ impl SketchGpuiView {
             eprintln!("wiki link: no file found for [[{}]]", target);
             return;
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(err) => {
-                eprintln!("wiki link: cannot read {}: {}", path.display(), err);
-                return;
-            }
-        };
         let canon = path
             .canonicalize()
             .unwrap_or_else(|_| path.clone())
             .display()
             .to_string();
         let label: SharedString = canon.into();
-        let doc = Document::from_text(text, path.clone());
-        let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
+        // 5c: bind the wiki-link target Doc to its pooled core (dedup by path),
+        // so it shares text/undo with any Edit view and live-tracks.
+        let (buf_id, core) = match self.workspace.open_and_retain(&path) {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("wiki link: cannot open {}: {err}", path.display());
+                return;
+            }
+        };
+        let blocks =
+            render_with_wiki(&core.borrow().document().full_text(), &self.theme, Some(&path));
         self.set_screen(WindowContent::Doc(DocState {
             blocks,
             file_label: label,
@@ -8177,7 +8276,7 @@ impl SketchGpuiView {
             blocks_seq: 0,
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
-            edit_cache: None,
+            source: Some(DocSource::new(buf_id, core)),
         }));
         self.doc_selection = None;
         self.save_workspace_state();
@@ -8196,11 +8295,16 @@ impl SketchGpuiView {
         // focused window without holding a mutable borrow across file I/O +
         // workspace mutation.
         enum FocusKind {
-            Doc(PathBuf, SharedString),
+            Doc(
+                Option<(workspace::FileBufferId, workspace::SharedCore)>,
+                PathBuf,
+                SharedString,
+            ),
             Edit(workspace::SharedCore, PathBuf),
         }
         let focus_kind = match self.workspace.focused_content() {
             Some(WindowContent::Doc(d)) => FocusKind::Doc(
+                d.source.as_ref().map(|s| (s.buffer_id, s.core.clone())),
                 PathBuf::from(d.file_label.as_ref()),
                 d.file_label.clone(),
             ),
@@ -8233,8 +8337,10 @@ impl SketchGpuiView {
                     e.editor.clear_selection();
                 }
             }
-            // Doc reload re-renders a fresh disk snapshot.
-            FocusKind::Doc(path, label) => {
+            // Doc reload: for a pool-bound Doc, reset the SHARED core to the
+            // disk version in place (reverts every view of the file, like the
+            // Edit path); for a legacy non-pooled Doc, render a fresh snapshot.
+            FocusKind::Doc(pooled, path, label) => {
                 let text = match std::fs::read_to_string(&path) {
                     Ok(t) => t,
                     Err(err) => {
@@ -8242,8 +8348,23 @@ impl SketchGpuiView {
                         return;
                     }
                 };
-                let doc = Document::from_text(text, path.clone());
-                let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
+                let (blocks, source) = match pooled {
+                    Some((id, core)) => {
+                        *core.borrow_mut() = EditorCore::new(text, path.clone());
+                        let blocks = render_with_wiki(
+                            &core.borrow().document().full_text(),
+                            &self.theme,
+                            Some(&path),
+                        );
+                        (blocks, Some(DocSource::new(id, core)))
+                    }
+                    None => {
+                        let doc = Document::from_text(text, path.clone());
+                        let blocks =
+                            render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
+                        (blocks, None)
+                    }
+                };
                 self.set_screen(WindowContent::Doc(DocState {
                     blocks,
                     file_label: label,
@@ -8253,7 +8374,7 @@ impl SketchGpuiView {
                     blocks_seq: 0,
                     blocks_snapshot: RefCell::new(None),
                     last_cursor_block: std::cell::Cell::new(None),
-                    edit_cache: None,
+                    source,
                 }));
             }
         }
@@ -10958,7 +11079,7 @@ impl SketchGpuiView {
                 blocks_seq: 0,
                 blocks_snapshot: RefCell::new(None),
                 last_cursor_block: std::cell::Cell::new(None),
-                edit_cache: None,
+                source: None,
             }))
             .expect("workspace has no focused window");
 
@@ -13570,6 +13691,21 @@ impl Render for SketchGpuiView {
         }
         if self.splash_until.is_some() {
             return self.render_splash(cx);
+        }
+
+        // 5c: re-derive each Doc pane's blocks from its shared core when the
+        // rope has advanced (e.g. an Edit pane of the same file took a
+        // keystroke). `refresh_blocks` is O(1) per Doc when the core is
+        // unchanged and read-only on the core, so this is cheap and panic-safe.
+        {
+            let theme = &self.theme;
+            for tab in self.workspace.tabs.iter_mut() {
+                tab.layout.for_each_leaf_content_mut(&mut |content| {
+                    if let WindowContent::Doc(d) = content {
+                        d.refresh_blocks(theme);
+                    }
+                });
+            }
         }
 
         let has_overlay = self.has_overlay();
@@ -16552,9 +16688,9 @@ fn screen_is_modified(screen: &WindowContent) -> bool {
     match screen {
         WindowContent::Edit(e) => e.editor.is_modified(),
         WindowContent::Doc(d) => d
-            .edit_cache
+            .source
             .as_ref()
-            .map_or(false, |ec| ec.editor.is_modified()),
+            .map_or(false, |s| s.is_modified()),
         _ => false,
     }
 }
@@ -16767,7 +16903,7 @@ fn main() {
     let theme = Theme::from_name(theme_name);
 
     // No path → launch directly into the file browser at cwd.
-    let initial_doc: Option<(Vec<RenderedBlock>, String)> = match args.get(1) {
+    let initial_doc: Option<(Vec<RenderedBlock>, String, PathBuf)> = match args.get(1) {
         Some(p) => {
             let path = PathBuf::from(p);
             let text = match std::fs::read_to_string(&path) {
@@ -16785,7 +16921,7 @@ fn main() {
             let doc = Document::from_text(text, path.clone());
             let blocks = render_with_wiki(&doc.full_text(), &theme, Some(&path));
             println!("sketch-gpui: loaded {} ({} blocks)", canon, blocks.len());
-            Some((blocks, canon))
+            Some((blocks, canon, path))
         }
         None => {
             println!("sketch-gpui: no file given, opening browser");
@@ -16828,12 +16964,26 @@ fn main() {
                     let focus_handle = cx.focus_handle();
                     focus_handle.focus(window);
                     let mut view = match initial_doc.clone() {
-                        Some((blocks, canon)) => SketchGpuiView::new_doc(
-                            blocks,
-                            theme.clone(),
-                            canon,
-                            focus_handle,
-                        ),
+                        Some((blocks, canon, path)) => {
+                            let mut v = SketchGpuiView::new_doc(
+                                blocks,
+                                theme.clone(),
+                                canon,
+                                focus_handle,
+                            );
+                            // 5c: pool-bind the startup Doc now that the
+                            // workspace (and its buffer pool) exists, so the
+                            // CLI file shares its core with any Edit view and
+                            // live-tracks.
+                            if let Ok((id, core)) = v.workspace.open_and_retain(&path) {
+                                if let Some(WindowContent::Doc(d)) =
+                                    v.workspace.focused_content_mut()
+                                {
+                                    d.source = Some(DocSource::new(id, core));
+                                }
+                            }
+                            v
+                        }
                         None => SketchGpuiView::new_browser(
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                             theme.clone(),
