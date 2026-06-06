@@ -4196,16 +4196,9 @@ impl DocState {
             None => return,
         };
         let path = PathBuf::from(self.file_label.as_ref());
-        let t0 = std::time::Instant::now();
         let blocks = render_with_wiki(&text, theme, Some(&path));
-        let n = blocks.len();
-        let us = t0.elapsed().as_micros();
         self.set_blocks(blocks);
         if let Some(src) = self.source.as_mut() {
-            eprintln!(
-                "[5c] refresh_blocks: Doc buf={} seq {}→{} ({} blocks, render_with_wiki {us}µs)",
-                src.buffer_id, src.rendered_seq, seq, n
-            );
             src.rendered_seq = seq;
         }
     }
@@ -6470,7 +6463,6 @@ impl SketchGpuiView {
             }
         };
         let label: SharedString = canon.into();
-        eprintln!("[5c] open_file → Doc binds buf={buf_id}");
         let blocks = render_with_wiki(
             &core.borrow().document().full_text(),
             &self.theme,
@@ -7302,7 +7294,6 @@ impl SketchGpuiView {
                         &self.theme,
                         Some(&path),
                     );
-                    eprintln!("[5c] clone_for_split → Doc binds buf={id}");
                     WindowContent::Doc(DocState {
                         blocks,
                         file_label: label,
@@ -8136,7 +8127,6 @@ impl SketchGpuiView {
                 ),
                 _ => return,
             };
-        let was_shared = shared.is_some();
         let (id, core) = match shared {
             Some(pair) => pair,
             None => {
@@ -8149,17 +8139,17 @@ impl SketchGpuiView {
                 }
             }
         };
-        eprintln!("[5c] enter_edit → Edit binds buf={id} (shared_from_doc={was_shared})");
         let mut edit_state = EditState::new(SharedEditor::new(id, core), label, view);
         edit_state.view = view;
         self.set_screen(WindowContent::Edit(edit_state));
         cx.notify();
     }
 
-    /// Edit → Doc round trip. Re-renders the buffer's *current* text (not the
-    /// on-disk version), so unsaved edits show up in the rendered preview.
-    /// Stashes the EditState on the new DocState so re-entering edit picks
-    /// up exactly where the user left off (cursor, mode, scroll, undo).
+    /// Edit → Doc round trip. The new Doc keeps the SAME pooled core (5c), so
+    /// it shows the buffer's *current* (unsaved) text and shares undo with any
+    /// other view of the file. No stash — the shared core IS the live state.
+    /// (Step-2 TODO: stash the EditorView cursor so re-entering Edit lands
+    /// where the user left off; today the cursor resets to the top.)
     fn back_to_doc(&mut self, cx: &mut Context<Self>) {
         let prev = self
             .workspace
@@ -8187,7 +8177,6 @@ impl SketchGpuiView {
                 // 5c: the new Doc keeps the SAME pooled core the Edit view held
                 // (shared text + undo). No stash — the core IS the live state.
                 let source = DocSource::new(edit.editor.buffer_id, edit.editor.core.clone());
-                eprintln!("[5c] back_to_doc → Doc keeps buf={}", source.buffer_id);
                 self.set_screen(WindowContent::Doc(DocState {
                     blocks,
                     file_label,
