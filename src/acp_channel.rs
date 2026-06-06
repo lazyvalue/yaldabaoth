@@ -193,6 +193,22 @@ pub enum ReplyEvent {
     /// transiently-empty queue, so finalize runs once after the last replayed
     /// chunk and never mid-replay.
     ReplayComplete,
+    /// The authoritative turn boundary: emitted by the worker once the
+    /// `session/prompt` RPC resolves (right after `turns.fetch_add`) — the one
+    /// point that stands on the real boundary (ADR-0006 / D1, item 8b).
+    /// `count` is the post-increment turn count.
+    ///
+    /// **Additive rollout (this stage):** emitted only when
+    /// `SKETCH_EMIT_TURN_ENDED=1`, and consumers treat it as inert — the three
+    /// pumps still INFER turn-end ("queue empty + counter climbed") and that
+    /// inference still drives `finalize`. The consuming arm only logs whether
+    /// the explicit signal agrees with the inferred boundary, so agreement can
+    /// be confirmed on real sessions (incl. a resume + a tool-only turn) before
+    /// the inference is deleted in the final stage. No `generation` field — it's
+    /// a server-side respawn counter, stamped where it's authoritative: the
+    /// server already carries it on `Notification::TurnEnded { count, generation }`
+    /// (A.8a) when it forwards this boundary.
+    TurnEnded { count: usize },
 }
 
 /// Pure turn-attribution state machine for the replay stream (Findings 3 &
@@ -1432,7 +1448,17 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         // Bump the turn counter once the turn settles
                         // (success, cancel, or exhausted retries) — the user
                         // can send again either way.
-                        turns.fetch_add(1, Ordering::SeqCst);
+                        let count = turns.fetch_add(1, Ordering::SeqCst) + 1;
+                        // 8b additive (ADR-0006): emit the authoritative turn
+                        // boundary HERE, where the worker stands on the resolved
+                        // `session/prompt`. Gated off by default so the durable
+                        // event stream (and the in-flight reconnect/replay work)
+                        // is unperturbed; set `SKETCH_EMIT_TURN_ENDED=1` to gather
+                        // agreement data before the inference is deleted.
+                        if std::env::var("SKETCH_EMIT_TURN_ENDED").as_deref() == Ok("1") {
+                            let _ = event_tx_for_driver
+                                .send(WorkerEvent::Reply(ReplyEvent::TurnEnded { count }));
+                        }
                     }
                     acp_debug!("driver loop exiting");
                     Ok::<_, agent_client_protocol::Error>(())

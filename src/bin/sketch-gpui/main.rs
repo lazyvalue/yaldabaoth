@@ -12641,6 +12641,21 @@ impl SketchGpuiView {
                     claude.reconciler.note_turn_progressed();
                     replay_complete = true;
                 }
+                ReplyEvent::TurnEnded { count } => {
+                    // 8b additive (ADR-0006): the worker's authoritative turn
+                    // boundary. INERT this stage — the pump's "queue empty +
+                    // counter climbed" inference still drives finalize. Log
+                    // whether the explicit signal agrees with what we inferred
+                    // (last_seen), so agreement can be confirmed on real
+                    // sessions before the inference is deleted. Only reaches
+                    // here when SKETCH_EMIT_TURN_ENDED=1.
+                    eprintln!(
+                        "[sketch-gpui] explicit TurnEnded count={count}; \
+                         inferred last_seen={} (agree={})",
+                        claude.replay_turns.last_seen,
+                        count == claude.replay_turns.last_seen,
+                    );
+                }
             }
         }
         replay_complete
