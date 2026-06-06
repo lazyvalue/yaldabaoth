@@ -5678,8 +5678,6 @@ struct AgentSlot {
     index: usize,
     /// The session state. Contains editor, channel, tool calls, etc.
     state: AgentState,
-    /// True if new content has arrived since the user last viewed this session.
-    has_unseen_activity: bool,
     /// The id this slot was created from on persistence restore. The slot's
     /// persisted id stays this value even if `session/load` failed and the
     /// channel fell back to `session/new` with a different id — so the next
@@ -5748,7 +5746,6 @@ impl AgentRing {
             label,
             index,
             state,
-            has_unseen_activity: false,
             resume_id,
             cwd,
             server_session_id,
@@ -5763,7 +5760,6 @@ impl AgentRing {
             return;
         }
         self.active = (self.active + 1) % self.slots.len();
-        self.slots[self.active].has_unseen_activity = false;
     }
 
     fn prev(&mut self) {
@@ -5775,7 +5771,6 @@ impl AgentRing {
         } else {
             self.active - 1
         };
-        self.slots[self.active].has_unseen_activity = false;
     }
 
     /// Remove the active slot and return its state. Advances to the next
@@ -5791,9 +5786,6 @@ impl AgentRing {
         } else if self.active >= self.slots.len() {
             self.active = self.slots.len() - 1;
         }
-        if !self.slots.is_empty() {
-            self.slots[self.active].has_unseen_activity = false;
-        }
         Some(removed)
     }
 
@@ -5808,9 +5800,6 @@ impl AgentRing {
             self.active = self.slots.len() - 1;
         } else if self.active > idx {
             self.active -= 1;
-        }
-        if !self.slots.is_empty() {
-            self.slots[self.active].has_unseen_activity = false;
         }
         Some(removed)
     }
@@ -12311,12 +12300,12 @@ impl SketchGpuiView {
         const PUMP_EVENT_BUDGET: usize = 64;
 
         // Scoped borrow: all mutable access to the ring/slot/claude happens
-        // inside this block. Returns (has_events, more_pending, attached_with_id,
-        // is_active) so post-borrow work (persistence, activity flag) can proceed.
+        // inside this block. Returns (has_events, more_pending, attached_with_id)
+        // so post-borrow work (persistence) can proceed.
         //
         // Search ALL panes (not just the focused one) so that agent sessions
         // in unfocused split panes keep pumping events.
-        let (has_events, more_pending, attached_with_id, is_active) = {
+        let (has_events, more_pending, attached_with_id) = {
             // Find the slot across every pane in EVERY tab (not just the
             // active tab) so agent sessions in background tabs and unfocused
             // split panes keep pumping events.
@@ -12324,15 +12313,12 @@ impl SketchGpuiView {
             for tab in self.workspace.tabs.iter_mut() {
                 found = tab.layout.find_map_leaf_content_mut(&mut |content| {
                     if let WindowContent::Agent(ring) = content {
-                        let is_active_in_ring = ring.slots.get(ring.active)
-                            .map(|s| s.index == session_index)
-                            .unwrap_or(false);
                         if let Some(slot) = ring.slot_by_index_mut(session_index) {
                             // SAFETY: pointer is valid for the scoped-borrow
                             // block below — we don't structurally mutate the
                             // layout.
                             let ptr = &mut slot.state as *mut AgentState;
-                            return Some((ptr, is_active_in_ring));
+                            return Some(ptr);
                         }
                     }
                     None
@@ -12341,7 +12327,7 @@ impl SketchGpuiView {
                     break;
                 }
             }
-            let (state_ptr, is_active) = match found {
+            let state_ptr = match found {
                 Some(f) => f,
                 None => return false,
             };
@@ -12460,7 +12446,7 @@ impl SketchGpuiView {
                 }
             }
 
-            (has_events, more_pending, attached_with_id, is_active)
+            (has_events, more_pending, attached_with_id)
         };
 
         // Post-borrow: persist the whole ring snapshot so the just-attached
@@ -12470,19 +12456,6 @@ impl SketchGpuiView {
         // if its slot isn't in the ring anymore.
         if attached_with_id {
             self.save_agent_ring();
-        }
-
-        // Mark inactive sessions with unseen activity (cross-tab, cross-pane).
-        if has_events && !is_active {
-            for tab in self.workspace.tabs.iter_mut() {
-                tab.layout.for_each_leaf_content_mut(&mut |content| {
-                    if let WindowContent::Agent(ring) = content {
-                        if let Some(slot) = ring.slot_by_index_mut(session_index) {
-                            slot.has_unseen_activity = true;
-                        }
-                    }
-                });
-            }
         }
 
         if has_events {
