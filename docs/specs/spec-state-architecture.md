@@ -240,8 +240,10 @@ verifiable.
    hand-rebuilt `save_preferences` sites into one snapshot method. Fonts not
    persisted (no setter yet). Round-trip + forward-compat test. ⚠️ relaunch
    zoom check owed.
-4. **`persistence` module** + one canonical cwd key + save-all-tabs (gated on
-   **D5**). Verify: symlinked-cwd round-trip; two-tab save; golden JSON shape.
+4. ✅ **canonical cwd key (D5/ADR-0010)** + save-all-tabs (`persist_cwd_key`,
+   lazy fallback-read, all 4 on-disk sites). save-all-tabs was already done;
+   the `persistence` module FILE-extraction is deferred as organizational.
+   Symlink round-trip test.
 5a. **`buffer_pool` extraction**, single liveness (strong_count + modified).
    Verify: `gc` reaps unmodified zero-view buffers, retains modified.
 5b. **`DocState.blocks` → `edit_seq`-keyed auto-derivation** while *still* owning
@@ -307,7 +309,7 @@ Front-loaded by leverage and verifiability.
 
 **Pure extractions (Phase A — each behind CI, no behavior change):**
 6. `[x]` `replay_turns` owns its fields (A.1, `6168157`) → **next:**
-   `overlay` enum (A.2 ✅ e5be921) → **next:** `settings` (A.3 ✅) → **next:** `persistence` (A.4) →
+   `overlay` enum (A.2 ✅ e5be921) → **next:** `settings` (A.3 ✅) → `persistence`/cwd-key (A.4 ✅) → **next:** →
    `buffer_pool` (A.5a) → `DocState` auto-derived blocks (A.5b) →
    `tool_calls` (A.6) → `agent_view_model` (A.7) →
    additive `TurnEnded` (A.8a) → server fusions (A.9) → sum-type cleanups (A.11).
