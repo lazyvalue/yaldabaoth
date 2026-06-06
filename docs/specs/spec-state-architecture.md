@@ -308,11 +308,15 @@ Front-loaded by leverage and verifiability.
    D4 durability · D5 cwd migration · D6 metadata store + crate boundary.
 
 **Pure extractions (Phase A — each behind CI, no behavior change):**
-6. `[x]` `replay_turns` owns its fields (A.1, `6168157`) → **next:**
-   `overlay` enum (A.2 ✅ e5be921) → **next:** `settings` (A.3 ✅) → `persistence`/cwd-key (A.4 ✅) → **next:** →
-   `buffer_pool` (A.5a) → `DocState` auto-derived blocks (A.5b) →
-   `tool_calls` (A.6 ✅) → **next:** `agent_view_model` (A.7) →
-   additive `TurnEnded` (A.8a) → server fusions (A.9) → sum-type cleanups: `InputSurface` (A.11 ✅) + remaining.
+6. Pure extractions — status (full table in `HANDOFF.md`):
+   - `[x]` `replay_turns` (A.1, `6168157`) · `[x]` `overlay` enum (A.2, `e5be921`)
+   - `[x]` `settings`/text-zoom (A.3, `e66a54c`) · `[x]` canonical cwd key (A.4, `c46f023`)
+   - `[~]` `buffer_pool` (A.5a) — deferred: dead/unwired, do with D2 (5c)
+   - `[~]` `DocState` auto-derive (A.5b) — deferred: memo half already done
+   - `[x]` `tool_calls` → `ToolCalls` owner (A.6, `f10486e`)
+   - `[ ]` `agent_view_model` (A.7 — see HANDOFF gotcha) · `[ ]` additive `TurnEnded` (A.8a) · `[ ]` server fusions (A.9)
+   - `[x]` `InputSurface` (`761dfe6`) · `[ ]` rest of sum-type cleanups (11: `has_unseen_activity` scoping, …)
+   - `[x]` *(reactive, off-plan)* pipelined-turn crash `50021fc` · mutex-poison `d4cce77`
 
 **GPUI / gated (Phase B — verify via the harness from item 2):**
 7. `[~]` Doc/Edit single rope (5c, gated D2) · delete turn-end inference
