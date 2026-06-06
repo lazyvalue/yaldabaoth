@@ -1,6 +1,6 @@
 # Handoff — state-architecture overhaul (single source of truth)
 
-**Date:** 2026-06-06 · **Branch:** `master` @ `66990c1` · Tree clean.
+**Date:** 2026-06-06 · **Branch:** `master` @ `8cdbdd1` (Phase A finished) · Tree clean.
 Read `CLAUDE.md` + auto-memory first; this is the consolidated item list that
 spec §7, the worklogs, and the original `handover.md` only covered in pieces.
 
@@ -38,10 +38,10 @@ reason, and every owed runtime check. Status keys: ✅ done · ⬜ open · ⏸ d
 | 5a | `buffer_pool` extraction (single liveness) | ⏸ | dead/unwired code; do **with** D2 (5c), not before |
 | 5b | `DocState.blocks` → `edit_seq` auto-derivation | ⏸ | memoization half already done (quick-win-2); rest is a murky restructure, low payoff |
 | 6 / A.6 | `tool_calls` → `ToolCalls` owner + atomic `register` | ✅ | `f10486e` |
-| 7 / A.7 | `agent_view_model` memoizer extraction | ⬜ | ⚠️ gotcha below — NOT a clean compiler-driven rename |
-| 8a | emit `TurnEnded{count,generation}` **additively** (worker holds the boundary at `acp_channel.rs:1388`) | ⬜ | groundwork for 8b (D1) |
-| 9 | session-server fusions (`record()` = log+broadcast, etc.) | ⬜ | medium |
-| 11 | sum-type cleanups | partial | `InputSurface` ✅ `761dfe6`; **remaining:** `has_unseen_activity` scoping + other sum-types |
+| 7 / A.7 | `agent_view_model` memoizer extraction → `AgentViewModel` owner | ✅ | `9253139` (6 fields moved; `memoize_view_model` stays on `AgentState` — its rebuild needs `&mut Self`; `lines_cache` kept put per the gotcha) |
+| 8a | emit `TurnEnded{count,generation}` **additively** | ✅ | `8cdbdd1` (added `generation` w/ `#[serde(default)]`, populated from server `channel_generation`; consumer ignores it; +2 serde back-compat tests). Direct-channel explicit emit left to 8b (behavior-changing) |
+| 9 | session-server fusions (`record()` = log+broadcast, etc.) | ✅ | `record()` already fused; only writes outside it are 2 intentional carve-outs. `apply_channel_state()` unification is **behavior-changing** (fixes restart prompt-loss + perm-mode revert) → Phase B / runtime-check track |
+| 11 | sum-type cleanups | ✅ (this slice) | `InputSurface` ✅ `761dfe6`; `has_unseen_activity` dead-code **removed** `15fe390`. `ChannelAttachState` **deferred**: `channel`+`attach_pending` reach a "both `Some`" re-attach transient (4-state, not a clean enum) |
 
 ## Phase B — GPUI / behavior-changing / gated (⚠️ all need human runtime check)
 | # | Item | Status | Gate |
@@ -50,6 +50,8 @@ reason, and every owed runtime check. Status keys: ✅ done · ⬜ open · ⏸ d
 | 8b | delete turn-end inference in all 3 pumps | ⬜ | D1 + 8a |
 | 10 | reconnect `Arc<Core>` swap-in-place | ⏸ | D3 — explicit trigger-deferral (wait until you observe a stranded-handle vanish) |
 | R | `reset_for_replay` delegation (each module owns its `reset()`) | ⬜ | — |
+| 9′ | `apply_channel_state()` unification (out of A.9) — drain `pending_prompts` + bump generation consistently across create/restore/restart | ⬜ | **behavior-changing**: today `restart_session` drops prompts queued mid-restart and only bumps generation on restart. Needs runtime check (prompt-during-restart; restart-in-Plan-mode stays Plan) |
+| 11′ | `ChannelAttachState` enum (out of item-11) — fold `channel`+`attach_pending` | ⬜ | **behavior-sensitive**: dual-Option reaches a "both `Some`" re-attach transient the pump handles; a faithful enum needs an `Attaching{old_channel,rx}` variant + runtime check |
 
 ## Reactive fixes shipped (were NOT in the original §7 backlog)
 | Item | Status | Ref |
@@ -87,12 +89,16 @@ borrows. Memoization is already implemented + tested, so this is **god-struct
 shrink only** — lower priority than the observability gap.
 
 ## Recommended next moves
+**Phase A is finished** (A.7/A.8a/A.9/item-11 closed — see tables above;
+adversarially verified behavior-preserving, full CI green). What's left:
 1. **The 5 runtime checks** with the app running (quick; needs you).
 2. **GUI observability** (`report_error` sink + no-silent-drop pump) — highest-
    value untouched item; spec it first.
-3. **Phase B (5c, 8b)** together against the running app (behavior-changing).
-4. **A.7 / A.8a / A.9 / item-11 remainder** — fresh-context organizational/
-   groundwork passes; each its own worktree, workflow-assisted, CI-gated.
+3. **Phase B (5c, 8b)** together against the running app (behavior-changing) —
+   8a groundwork (`generation` on `TurnEnded`) is now in place for 8b.
+4. **Behavior-changing follow-ups surfaced this session** (9′ `apply_channel_state`
+   prompt-drain/generation fix; 11′ `ChannelAttachState` enum) — both need the
+   runtime-check track, not a pure Phase-A merge. See Phase B table.
 
 ## Working conventions (unchanged)
 Worktree per task under `.claude/worktrees/`; map→design→adversarial-verify

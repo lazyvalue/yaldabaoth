@@ -262,14 +262,23 @@ verifiable.
    debug-assert/log that it agrees with the existing inference for a release
    (gated on **D1**). Verify: respawn resets counter + new generation; consumer
    rebaselines.
-9. **Session-server fusions:** `record()` (log+broadcast) and
-   `spawn_channel_then_apply_state()` (re-apply permission mode, drain
-   `pending_prompts`, bump generation on every swap). Verify: restart in Plan
-   mode stays Plan; prompt during restart reaches the new channel.
-11. **Sum-type cleanups:** `InputSurface` enum; `has_unseen_activity` scoped to
-   the originating ring; cross-ring lookups by `server_session_id`; collapse the
-   1:1 `Editor` wrapper. Verify: same-index two-ring activity isolation;
-   `InputSurface` makes `(Chatbox,None)` non-constructible; TUI suite green.
+9. **Session-server fusions:** `record()` (log+broadcast) is **done** — the
+   only writes outside it are the two intentional carve-outs (`prompt()`
+   append-without-broadcast; `broadcast_owner_changed` broadcast-without-log),
+   both documented. The remaining `apply_channel_state()` unification (re-apply
+   permission mode, drain `pending_prompts`, bump generation on every swap)
+   is **behavior-changing** — `restart_session` does NOT drain `pending_prompts`
+   today and bumps generation only on restart, so unifying it FIXES latent bugs
+   (prompt-loss during restart, permission-mode revert). Moved to the Phase-B /
+   runtime-check track. Verify: restart in Plan mode stays Plan; prompt during
+   restart reaches the new channel.
+11. **Sum-type cleanups:** `InputSurface` enum **done**; `has_unseen_activity`
+   was write-only dead code → **removed** (`15fe390`). `ChannelAttachState`
+   (folding `channel`+`attach_pending`) **deferred**: those two `Option`s reach
+   a real "both `Some`" transient (re-attach while the old channel is still
+   live), so they are a 4-state space, not a clean 3-variant enum — a naive
+   collapse would change reconnect behavior. Remaining ideas: cross-ring lookups
+   by `server_session_id`; collapse the 1:1 `Editor` wrapper.
 
 ### Phase B — GPUI-view / behavior-changing / gated (verify via the harness from 0.2)
 - **5c.** `DocState` → pooled `SharedCore` (gated on **D2**). Verify: edit in an
@@ -314,8 +323,8 @@ Front-loaded by leverage and verifiability.
    - `[~]` `buffer_pool` (A.5a) — deferred: dead/unwired, do with D2 (5c)
    - `[~]` `DocState` auto-derive (A.5b) — deferred: memo half already done
    - `[x]` `tool_calls` → `ToolCalls` owner (A.6, `f10486e`)
-   - `[ ]` `agent_view_model` (A.7 — see HANDOFF gotcha) · `[ ]` additive `TurnEnded` (A.8a) · `[ ]` server fusions (A.9)
-   - `[x]` `InputSurface` (`761dfe6`) · `[ ]` rest of sum-type cleanups (11: `has_unseen_activity` scoping, …)
+   - `[x]` `agent_view_model` → `AgentViewModel` owner (A.7, `9253139`) · `[x]` additive `TurnEnded{generation}` (A.8a, `8cdbdd1`) · `[x]` server fusions (A.9 — `record()` already fused; rest is behavior-changing, see below)
+   - `[x]` `InputSurface` (`761dfe6`) · `[x]` `has_unseen_activity` dead-code removed (11, `15fe390`); `ChannelAttachState` enum deferred (dual-Option is 4-state, not a clean sum-type — see HANDOFF)
    - `[x]` *(reactive, off-plan)* pipelined-turn crash `50021fc` · mutex-poison `d4cce77`
 
 **GPUI / gated (Phase B — verify via the harness from item 2):**
