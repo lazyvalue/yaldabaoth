@@ -173,6 +173,16 @@ pub enum Notification {
     TurnEnded {
         session_id: ServerSessionId,
         turn_count: usize,
+        /// The channel generation this boundary was produced on (bumps on
+        /// every force-restart / reconnect, server-side `channel_generation`).
+        /// Carried additively (A.8a) so a later pass (8b) can delete the
+        /// turn-end *inference* in the pumps and instead trust this explicit
+        /// signal, using `generation` to reject a replayed boundary from a
+        /// channel that has since been superseded. `#[serde(default)]` keeps
+        /// old persisted `event_log`s (written before this field existed)
+        /// deserializable — they replay with `generation == 0`.
+        #[serde(default)]
+        generation: u64,
     },
 
     /// The user submitted a prompt. Logged so re-attaching GUIs can
@@ -253,4 +263,47 @@ pub fn pid_file_path() -> PathBuf {
 /// across restarts. Lives in the cache dir alongside other sketch state.
 pub fn session_server_persist_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("sketch").join("session_server.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A.8a back-compat: an `event_log` written before `generation` existed
+    /// has no `generation` key. `#[serde(default)]` MUST let it deserialize
+    /// (to `generation == 0`) so old persisted transcripts still replay.
+    #[test]
+    fn turn_ended_deserializes_without_generation() {
+        let old = r#"{"type":"turn_ended","session_id":"s1","turn_count":3}"#;
+        let note: Notification = serde_json::from_str(old).expect("old log must deserialize");
+        match note {
+            Notification::TurnEnded {
+                session_id,
+                turn_count,
+                generation,
+            } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(turn_count, 3);
+                assert_eq!(generation, 0, "missing generation defaults to 0");
+            }
+            other => panic!("expected TurnEnded, got {other:?}"),
+        }
+    }
+
+    /// New logs carry `generation` and it survives a round-trip.
+    #[test]
+    fn turn_ended_round_trips_generation() {
+        let note = Notification::TurnEnded {
+            session_id: "s1".to_string(),
+            turn_count: 7,
+            generation: 4,
+        };
+        let json = serde_json::to_string(&note).unwrap();
+        assert!(json.contains("\"generation\":4"));
+        let back: Notification = serde_json::from_str(&json).unwrap();
+        match back {
+            Notification::TurnEnded { generation, .. } => assert_eq!(generation, 4),
+            other => panic!("expected TurnEnded, got {other:?}"),
+        }
+    }
 }

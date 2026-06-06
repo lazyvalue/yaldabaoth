@@ -855,6 +855,7 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                     session.record(Notification::TurnEnded {
                         session_id: session_id.clone(),
                         turn_count: current_turns,
+                        generation: session.channel_generation,
                     });
                 }
 

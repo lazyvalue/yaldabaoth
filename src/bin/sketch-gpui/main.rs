@@ -12183,7 +12183,11 @@ impl SketchGpuiView {
                     }
                     warn_unrouted(routed, &session_id);
                 }
-                ServerNotification::TurnEnded { session_id, turn_count } => {
+                // `generation` is carried additively (A.8a) but not yet
+                // consumed here — the GUI still trusts this explicit boundary
+                // by `turn_count`. 8b will bind `generation` to reject a
+                // boundary replayed from a superseded channel.
+                ServerNotification::TurnEnded { session_id, turn_count, generation: _ } => {
                     let routed = self.with_server_session_slot(&session_id, |slot| {
                         let claude = &mut slot.state;
                         finalize_agent_turn(&mut claude.editor);
