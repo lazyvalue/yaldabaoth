@@ -408,6 +408,21 @@ impl SessionServerClient {
         }
     }
 
+    /// Fetch a diagnostic snapshot of the server's live session state
+    /// (ownership, subscriber counts, channel generation). Read-only.
+    pub fn admin_status(&self) -> io::Result<AdminSnapshot> {
+        match self.request(Request::AdminStatus)? {
+            Response::Ok {
+                data: ResponseData::AdminStatus { snapshot },
+            } => Ok(snapshot),
+            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected response",
+            )),
+        }
+    }
+
     pub fn create_session(
         &self,
         cwd: PathBuf,

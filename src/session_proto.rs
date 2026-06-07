@@ -114,6 +114,12 @@ pub enum Request {
         session_id: ServerSessionId,
         label: String,
     },
+
+    /// Diagnostic snapshot of every managed session's live server-side state
+    /// (ownership, subscribers, channel generation, etc.). Additive,
+    /// read-only — no breaking changes to existing verbs.
+    #[serde(rename = "admin_status")]
+    AdminStatus,
 }
 
 // ── Server → GUI responses ─────────────────────────────────────────
@@ -138,6 +144,8 @@ pub enum ResponseData {
     Session { session: SessionInfo },
     #[serde(rename = "ack")]
     Ack,
+    #[serde(rename = "admin_status")]
+    AdminStatus { snapshot: AdminSnapshot },
 }
 
 /// Metadata about a managed session.
@@ -153,6 +161,33 @@ pub struct SessionInfo {
     /// Whether some connection currently owns (can drive) this session.
     /// A candidate GUI uses this to decide whether it can `Promote`.
     pub has_owner: bool,
+}
+
+/// Diagnostic snapshot of the server's live session state (response to
+/// [`Request::AdminStatus`]). Read-only; for observability/debugging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminSnapshot {
+    pub session_count: usize,
+    pub sessions: Vec<AdminSessionInfo>,
+}
+
+/// Per-session live server-side state, richer than [`SessionInfo`] — exposes
+/// internals (owner conn id, subscriber/receiver count, channel generation)
+/// useful for diagnosing reconnect/ownership issues.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminSessionInfo {
+    pub session_id: ServerSessionId,
+    pub label: String,
+    /// Agent subprocess live (channel is Some).
+    pub connected: bool,
+    pub has_owner: bool,
+    pub owner_conn_id: Option<u64>,
+    pub turns: usize,
+    pub event_log_len: usize,
+    /// Active broadcast receivers = attached connections (owner + observers).
+    pub subscriber_count: usize,
+    pub channel_generation: u64,
+    pub permission_mode: PermissionMode,
 }
 
 // ── Server → GUI notifications (no response expected) ──────────────
