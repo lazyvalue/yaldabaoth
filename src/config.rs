@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::acp_channel::{PermissionMode, DEFAULT_PERMISSION_MODE};
 use crate::command::CommandRegistry;
 use crate::keys::{self, KeyPress};
 use crate::menu::MenuNode;
@@ -32,6 +33,10 @@ pub struct MenuConfig {
 pub struct Config {
     pub max_line_width: usize,
     pub theme: ThemeName,
+    /// The permission mode new agent sessions start in. Overrides the
+    /// hard-coded [`DEFAULT_PERMISSION_MODE`] when set via the
+    /// `default-permission-mode` config node.
+    pub default_permission_mode: PermissionMode,
     pub keybinds: Option<KeybindConfig>,
     pub menu: Option<MenuConfig>,
 }
@@ -41,6 +46,7 @@ impl Default for Config {
         Self {
             max_line_width: 80,
             theme: ThemeName::default(),
+            default_permission_mode: DEFAULT_PERMISSION_MODE,
             keybinds: None,
             menu: None,
         }
@@ -96,6 +102,15 @@ impl Config {
         {
             config.theme = ThemeName::parse(val).ok_or_else(|| ConfigError {
                 message: format!("unknown theme \"{}\"", val),
+            })?;
+        }
+
+        // Default permission mode for new agent sessions.
+        if let Some(node) = doc.get("default-permission-mode")
+            && let Some(val) = node.get(0).and_then(|v| v.as_string())
+        {
+            config.default_permission_mode = PermissionMode::parse(val).ok_or_else(|| ConfigError {
+                message: format!("unknown permission mode \"{}\"", val),
             })?;
         }
 

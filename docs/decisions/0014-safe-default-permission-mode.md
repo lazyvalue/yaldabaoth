@@ -91,3 +91,46 @@ theater (that peer can read the handshake). The load-bearing control is the
 `server_socket_is_owner_only` (socket mode is `0600`). Unit tests in
 `acp_channel.rs`: the default denies `Execute`/`Delete`; explicit `Yolo` allows
 `Execute`.
+
+
+## Addendum (2026-06-07): default reverted to Yolo, now config-driven
+
+The safe default proved too annoying in day-to-day use without an inline-approval
+UI: a brand-new session silently declined every gated tool, so the common case
+(start a session, ask the agent to do work) required cycling the mode first
+every single time. Pending the approval UI, the creation default is now
+**`Yolo`** (auto-approve gated tools).
+
+What changed:
+
+- `DEFAULT_PERMISSION_MODE` is now `PermissionMode::Yolo` — the hard-coded
+  fallback when nothing overrides it.
+- The default is now **user-configurable** via a top-level `default-permission-mode`
+  node in `config.kdl` (e.g. `default-permission-mode "auto-edit"`), parsed by
+  `PermissionMode::parse` and surfaced on `Config::default_permission_mode`. The
+  session server loads the config once at startup and threads it into
+  `SessionManager`, so new sessions honour the configured default with the
+  hard-coded constant as the ultimate fallback.
+
+What is retained from the original decision:
+
+- The **0600 owner-only socket** still gates who can reach the session-driving
+  surface — auto-approve changes *what the owner's own sessions do*, not *who can
+  drive them*.
+- **Owner-gated escalation** is unchanged: only the session owner can change a
+  session's permission mode.
+- The **safe modes** (`ask-each` / `auto-edit` / `read-only`) remain available
+  and are the **recommended default once an inline-approval UI exists** — at
+  which point `ask-each` (prompt the user inline) should become the shipped
+  default again. The original decision text above stands as the rationale for
+  that target end state.
+
+Verification update: `tests/session_resilience_test.rs` now pins the no-config
+default as `Yolo` (`new_session_defaults_to_safe_permission_mode`,
+`non_owner_cannot_change_permission_mode`, `admin_status_reports_live_sessions`);
+the owner-gate and `server_socket_is_owner_only` (0600) assertions are unchanged.
+`tests/config_test.rs` pins config parsing of `default-permission-mode`
+(valid → parsed, invalid → error, absent → `Yolo`). `acp_channel.rs` unit tests
+pin `DEFAULT_PERMISSION_MODE == Yolo`, that the safe modes still decline
+`Execute`/`Delete`, and that `PermissionMode::parse` round-trips every
+`short_label()`.

@@ -20,9 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
-use sketch::acp_channel::{
-    AcpChannelClient, PermissionMode, SketchFrontend, DEFAULT_PERMISSION_MODE,
-};
+use sketch::acp_channel::{AcpChannelClient, PermissionMode, SketchFrontend};
 use sketch::session_proto::*;
 
 mod launchd;
@@ -217,6 +215,10 @@ struct SessionManager {
     /// GUI so closures/renames done in one panel or one GUI instance propagate
     /// everywhere and the session lists stay consistent without polling.
     events: broadcast::Sender<Notification>,
+    /// The permission mode new sessions start in. Loaded once from the config
+    /// file at startup (`default-permission-mode`), falling back to the
+    /// hard-coded [`DEFAULT_PERMISSION_MODE`] when no config is present.
+    default_permission_mode: PermissionMode,
 }
 
 /// Open a fresh durable WAL for a session, or `None` (degrade to in-memory) if
@@ -242,11 +244,12 @@ fn open_session_wal(
 }
 
 impl SessionManager {
-    fn new() -> Self {
+    fn new(default_permission_mode: PermissionMode) -> Self {
         let (events, _) = broadcast::channel(1024);
         Self {
             sessions: Mutex::new(HashMap::new()),
             events,
+            default_permission_mode,
         }
     }
 
@@ -437,7 +440,9 @@ impl SessionManager {
     ) -> SessionInfo {
         let id = uuid::Uuid::new_v4().to_string();
         let (event_tx, _) = broadcast::channel(16384);
-        let permission_mode = DEFAULT_PERMISSION_MODE;
+        // Config-driven default (loaded at startup), with the hard-coded
+        // DEFAULT_PERMISSION_MODE as the ultimate fallback.
+        let permission_mode = self.default_permission_mode;
 
         // Open the durable WAL up front and write its header, so even a crash
         // immediately after create can recover the session's identity. Degrade
@@ -1376,7 +1381,19 @@ async fn main() -> io::Result<()> {
 
     tracing::info!("listening on {}", socket_path.display());
 
-    let manager = Arc::new(SessionManager::new());
+    // Load the config once at startup to pick up the user's default permission
+    // mode. Config::load() is a plain lib fn (no GUI deps) and returns the
+    // Default config when no file is present, so this is safe in the headless
+    // server. Any parse error degrades to the hard-coded default rather than
+    // refusing to start.
+    let config = sketch::config::Config::load().unwrap_or_default();
+    let default_permission_mode = config.default_permission_mode;
+    tracing::info!(
+        default_permission_mode = config.default_permission_mode.short_label(),
+        "loaded config"
+    );
+
+    let manager = Arc::new(SessionManager::new(default_permission_mode));
 
     // Restore sessions from a prior run, if any.
     manager.restore_from_disk();
@@ -1445,6 +1462,7 @@ async fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sketch::acp_channel::DEFAULT_PERMISSION_MODE;
 
     /// The cascade guard: once any holder panics while holding the sessions
     /// lock the std `Mutex` is poisoned, and a plain `.lock().unwrap()` at every
@@ -1452,7 +1470,7 @@ mod tests {
     /// `lock_sessions()` must recover the guard so the server keeps serving.
     #[test]
     fn lock_sessions_recovers_from_a_poisoned_mutex() {
-        let mgr = SessionManager::new();
+        let mgr = SessionManager::new(DEFAULT_PERMISSION_MODE);
 
         // Poison the mutex: panic while holding the raw lock (caught so the test
         // process survives — the panic message on stderr is expected noise).

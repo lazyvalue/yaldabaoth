@@ -1,3 +1,4 @@
+use sketch::acp_channel::{PermissionMode, DEFAULT_PERMISSION_MODE};
 use sketch::config::Config;
 use sketch::keybind::KeybindManager;
 use sketch::keys::{Key, KeyPress, Modifiers};
@@ -144,6 +145,29 @@ fn test_unknown_theme_fails() {
         theme "nonexistent"
     "#);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_default_permission_mode_parses() {
+    let config = parse_config(r#"
+        default-permission-mode "auto-edit"
+    "#);
+    assert_eq!(config.default_permission_mode, PermissionMode::AutoEdit);
+}
+
+#[test]
+fn test_unknown_permission_mode_fails() {
+    let result = Config::load_from_str(r#"
+        default-permission-mode "nonsense"
+    "#);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_default_permission_mode_absent_yields_default() {
+    let config = parse_config("");
+    assert_eq!(config.default_permission_mode, DEFAULT_PERMISSION_MODE);
+    assert_eq!(config.default_permission_mode, PermissionMode::Yolo);
 }
 
 #[test]

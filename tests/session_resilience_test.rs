@@ -61,6 +61,11 @@ impl TestServer {
             // fine: the session is created and persists regardless; we are
             // testing the socket/attach/reconnect layer, not the agent.
             .env("SKETCH_ACP_AGENT", "/usr/bin/true")
+            // Hermetic: force the no-config path so default-mode assertions
+            // see the built-in default (Yolo), not whatever ~/.config/sketch/
+            // config.kdl the dev box happens to have. config_path() returns
+            // this nonexistent path → Config::default().
+            .env("SKETCH_CONFIG", "/nonexistent/sketch-test-config.kdl")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(logfile))
@@ -337,11 +342,14 @@ fn second_server_does_not_steal_socket() {
     );
 }
 
-/// Security default at the wire level: a freshly created session must come back
-/// in the SAFE permission mode (AskEachTime), proving the server no longer
-/// hands out Yolo by default. Then the owner explicitly escalates to Yolo and
-/// that change must be reflected in the session's reported mode — pinning the
-/// "safe by default, user-escalated" contract end to end.
+/// Default-mode contract at the wire level: with no config file present (tests
+/// run without SKETCH_CONFIG), a freshly created session comes back in the
+/// no-config default mode, which is now `Yolo` (the default was reverted from
+/// the safe modes pending an inline-approval UI; see ADR-0014 addendum). The
+/// owner can then explicitly change the mode and that change must be reflected
+/// in the session's reported mode — pinning the owner-driven mode contract end
+/// to end. (Mode changes remain owner-gated; see
+/// `non_owner_cannot_change_permission_mode`.)
 #[test]
 fn new_session_defaults_to_safe_permission_mode() {
     let _g = serial_lock();
@@ -354,30 +362,30 @@ fn new_session_defaults_to_safe_permission_mode() {
         .expect("create_session");
     assert_eq!(
         info.permission_mode,
-        PermissionMode::AskEachTime,
-        "new session must start in the safe default mode, not Yolo; log:\n{}",
+        PermissionMode::Yolo,
+        "new session must start in the no-config default mode (Yolo); log:\n{}",
         server.read_log()
     );
 
-    // Escalation is an explicit owner action. Attach as Owner first (the server
-    // only honours mode changes from the owner), then flip to Yolo.
+    // A mode change is an owner action. Attach as Owner first (the server only
+    // honours mode changes from the owner), then flip to a safe mode.
     client
         .attach(&info.session_id, AttachMode::Owner)
         .expect("attach owner");
     client
-        .set_permission_mode(&info.session_id, PermissionMode::Yolo)
-        .expect("set_permission_mode Yolo");
+        .set_permission_mode(&info.session_id, PermissionMode::ReadOnly)
+        .expect("set_permission_mode ReadOnly");
 
     // The new mode must be reflected in the session metadata.
-    let sessions = client.list_sessions().expect("list after escalate");
+    let sessions = client.list_sessions().expect("list after change");
     let s = sessions
         .iter()
         .find(|s| s.session_id == info.session_id)
-        .expect("session present after escalate");
+        .expect("session present after change");
     assert_eq!(
         s.permission_mode,
-        PermissionMode::Yolo,
-        "explicit escalation to Yolo not reflected; log:\n{}",
+        PermissionMode::ReadOnly,
+        "explicit owner mode change not reflected; log:\n{}",
         server.read_log()
     );
 }
@@ -416,12 +424,13 @@ fn non_owner_cannot_change_permission_mode() {
         .create_session(std::env::temp_dir(), "perms-gate".into(), None)
         .expect("create_session");
 
-    // No Owner attach → not the owner → escalation must be rejected, and the
-    // mode must stay at the safe default.
-    let res = client.set_permission_mode(&info.session_id, PermissionMode::Yolo);
+    // No Owner attach → not the owner → the mode change must be rejected, and
+    // the mode must stay at the no-config default (Yolo). Aim at a *different*
+    // mode so the rejection is observable rather than a no-op.
+    let res = client.set_permission_mode(&info.session_id, PermissionMode::ReadOnly);
     assert!(
         res.is_err(),
-        "non-owner was allowed to escalate permission mode; log:\n{}",
+        "non-owner was allowed to change permission mode; log:\n{}",
         server.read_log()
     );
     let sessions = client.list_sessions().expect("list");
@@ -431,8 +440,8 @@ fn non_owner_cannot_change_permission_mode() {
         .expect("session present");
     assert_eq!(
         s.permission_mode,
-        PermissionMode::AskEachTime,
-        "rejected escalation must leave the safe default intact; log:\n{}",
+        PermissionMode::Yolo,
+        "rejected change must leave the no-config default intact; log:\n{}",
         server.read_log()
     );
 }
@@ -489,8 +498,8 @@ fn admin_status_reports_live_sessions() {
             });
         assert_eq!(
             entry.permission_mode,
-            PermissionMode::AskEachTime,
-            "snapshot must report the safe default permission mode; log:\n{}",
+            PermissionMode::Yolo,
+            "snapshot must report the no-config default permission mode (Yolo); log:\n{}",
             server.read_log()
         );
         // A freshly-created session (agent is /usr/bin/true → no events) has an

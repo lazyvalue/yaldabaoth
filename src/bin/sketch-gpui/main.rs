@@ -5278,6 +5278,17 @@ struct AgentState {
     /// `plan` / `learn`, etc.). Distinct from the permission mode on
     /// `AcpChannelClient`. Surfaced by the Status Strip.
     agent_mode: Option<sketch::acp_channel::SessionModeId>,
+    /// The session's permission mode, as session state sourced from the
+    /// server. In session-server mode the agent/channel live in the server
+    /// (not the GUI), so `channel` is `None` and the live `AcpChannelClient`
+    /// permission flag is unreachable from here — the authoritative value
+    /// arrives on `SessionInfo.permission_mode` and is mirrored into this
+    /// field whenever a slot learns its `SessionInfo`. Rendered by the Status
+    /// Strip badge and cycled by `cycle_claude_permission_mode`. Initialized
+    /// to `DEFAULT_PERMISSION_MODE` and overwritten the moment the server
+    /// reports the real value. For the legacy direct-spawn path the channel is
+    /// still the live authority; this field is kept in sync alongside it.
+    permission_mode: sketch::acp_channel::PermissionMode,
     /// Last-seen usage snapshot (tokens used/total, cost). Populated only
     /// when the upstream `unstable_session_usage` feature is on; otherwise
     /// stays `None` and the Status Strip omits these fields per §30.
@@ -5412,6 +5423,7 @@ impl AgentState {
             input_surface: InputSurface::Chatbox(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
+            permission_mode: sketch::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
             tasklist_open: false,
@@ -5454,6 +5466,7 @@ impl AgentState {
             input_surface: InputSurface::Chatbox(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
+            permission_mode: sketch::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
             tasklist_open: false,
@@ -5723,6 +5736,9 @@ struct AttachedSlot {
     acp_id: Option<String>,
     /// Footer status string ("reconnected …").
     status: String,
+    /// Server-reported permission mode for this session, mirrored into
+    /// `AgentState.permission_mode` when the slot binds.
+    permission_mode: sketch::acp_channel::PermissionMode,
 }
 
 /// Outcome of the background session-server round-trips kicked off by
@@ -5735,6 +5751,8 @@ enum OpenResolution {
     Created {
         sid: String,
         acp_id: Option<String>,
+        /// Server-reported permission mode for the freshly created session.
+        permission_mode: sketch::acp_channel::PermissionMode,
     },
     /// The list or create round-trip failed; surface it on the placeholder.
     Failed(String),
@@ -6046,6 +6064,8 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("x", "close session", "claude-close"),
                 MenuNode::entry("r", "rename session", "claude-rename"),
                 MenuNode::entry("w", "toggle worksheet/chatbox (Ctrl-Alt-Enter)", "agent-input-toggle"),
+                MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
+                MenuNode::entry("g", "rebuild & restart gui", "dev-restart-gui"),
                 MenuNode::separator(),
                 MenuNode::label("Build loop"),
                 MenuNode::entry("p", "promote: build & launch candidate", "dev-build-candidate"),
@@ -6734,6 +6754,87 @@ impl SketchGpuiView {
                             ),
                             Err(e) => {
                                 this.set_agent_status(&format!("candidate spawn failed: {e}"), cx)
+                            }
+                        }
+                    }
+                    None => this.set_agent_status("cannot locate current executable", cx),
+                },
+                Ok(out) => {
+                    // Surface the tail of stderr so the failure is actionable.
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
+                    let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
+                    this.set_agent_status(&format!("build failed: {tail}"), cx);
+                }
+                Err(e) => this.set_agent_status(&format!("build error: {e}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Dev hot-restart: rebuild `sketch-gpui` and replace THIS instance with a
+    /// fresh NORMAL one. Distinct from `build_and_launch_candidate`: that spawns
+    /// a read-only candidate (SKETCH_CANDIDATE=1) that co-attaches and waits for
+    /// the user to hand off; this is a full self-restart — build, spawn a fresh
+    /// normal instance (no SKETCH_CANDIDATE), then quit so the new process
+    /// reclaims ownership of every server-managed session via the proven
+    /// GUI-restart / `attach_with_owner_retry` path. The session server (and its
+    /// live agent sessions) is left running, so agents survive the bounce.
+    ///
+    /// NEEDS-RUNTIME: GPUI can't be driven headlessly, so this is compile-
+    /// verified only — the actual rebuild/relaunch/owner-reclaim must be
+    /// checked by a human.
+    fn dev_rebuild_restart_gui(&mut self, cx: &mut Context<Self>) {
+        self.set_agent_status("rebuilding gui: cargo build --bin sketch-gpui…", cx);
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR").to_string();
+        let exe = std::env::current_exe().ok();
+        let args: Vec<String> = std::env::args().skip(1).collect();
+
+        cx.spawn(async move |this, cx| {
+            // Run the (slow, blocking) build on a background thread.
+            let built = cx
+                .background_executor()
+                .spawn(async move {
+                    std::process::Command::new("cargo")
+                        .args(["build", "--bin", "sketch-gpui"])
+                        .current_dir(&manifest_dir)
+                        .output()
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| match built {
+                Ok(out) if out.status.success() => match exe {
+                    Some(exe) => {
+                        // Fresh NORMAL instance: same args, NO SKETCH_CANDIDATE —
+                        // this is an ordinary relaunch, not a read-only candidate.
+                        // Command inherits the full parent env, so we must
+                        // explicitly REMOVE the candidate marker (if this very
+                        // process was itself launched as a candidate) — otherwise
+                        // the "fresh normal instance" would inherit and come up
+                        // read-only.
+                        let mut cmd = std::process::Command::new(exe);
+                        cmd.args(&args);
+                        cmd.env_remove("SKETCH_CANDIDATE");
+                        cmd.stdin(std::process::Stdio::null());
+                        cmd.stdout(std::process::Stdio::null());
+                        // stderr inherited so post-restart logs reach the dev
+                        // terminal (unlike reboot_into_claude's fully-detached
+                        // stdio).
+                        cmd.stderr(std::process::Stdio::inherit());
+                        match cmd.spawn() {
+                            Ok(_) => {
+                                this.set_agent_status(
+                                    "rebuilt — relaunching gui, this window will close",
+                                    cx,
+                                );
+                                // Quit promptly: the new instance's
+                                // attach_with_owner_retry handles the teardown
+                                // race, so we don't need to linger.
+                                cx.quit();
+                            }
+                            Err(e) => {
+                                this.set_agent_status(&format!("relaunch spawn failed: {e}"), cx)
                             }
                         }
                     }
@@ -8891,6 +8992,7 @@ impl SketchGpuiView {
             "claude-new-here" => self.open_new_agent_session_cwd_overlay(cx),
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
             "dev-build-candidate" => self.build_and_launch_candidate(cx),
+            "dev-restart-gui" => self.dev_rebuild_restart_gui(cx),
             "dev-take-over" => self.candidate_take_over(cx),
             "rail-files" => self.toggle_file_browser_rail_impl(cx),
             "rail-outline" => self.toggle_outline_rail_impl(cx),
@@ -11239,6 +11341,7 @@ impl SketchGpuiView {
                             Ok(info) => OpenResolution::Created {
                                 sid: info.session_id,
                                 acp_id: info.acp_session_id,
+                                permission_mode: info.permission_mode,
                             },
                             Err(e) => OpenResolution::Failed(format!("create failed: {e}")),
                         }
@@ -11264,6 +11367,7 @@ impl SketchGpuiView {
                                 } else {
                                     "reconnecting (agent spawning…)".to_string()
                                 },
+                                permission_mode: info.permission_mode,
                             })
                             .collect();
                         OpenResolution::Attached(attached)
@@ -11319,10 +11423,11 @@ impl SketchGpuiView {
                     Self::append_system_notice(&mut ring.slots[pos].state, &m);
                     ring.slots[pos].state.status = Some(m.into());
                 }
-                OpenResolution::Created { sid, acp_id } => {
+                OpenResolution::Created { sid, acp_id, permission_mode } => {
                     let slot = &mut ring.slots[pos];
                     slot.server_session_id = Some(sid.clone());
                     slot.resume_id = acp_id;
+                    slot.state.permission_mode = permission_mode;
                     slot.state.status =
                         Some("attaching to ACP agent via session server…".into());
                     bound_sids_c.borrow_mut().push(sid);
@@ -11335,12 +11440,14 @@ impl SketchGpuiView {
                         slot.label = first.label;
                         slot.server_session_id = Some(first.sid.clone());
                         slot.resume_id = first.acp_id;
+                        slot.state.permission_mode = first.permission_mode;
                         slot.state.status = Some(first.status.into());
                         bound_sids_c.borrow_mut().push(first.sid);
                     }
                     // Remaining sessions get their own slots in the same ring.
                     for a in iter {
-                        let state = AgentState::new_server_managed(Some(a.status.into()));
+                        let mut state = AgentState::new_server_managed(Some(a.status.into()));
+                        state.permission_mode = a.permission_mode;
                         ring.push(a.label, state, a.acp_id, proc_cwd.clone(), Some(a.sid.clone()));
                         bound_sids_c.borrow_mut().push(a.sid);
                     }
@@ -11454,9 +11561,17 @@ impl SketchGpuiView {
         let (label, session_index) = match self.agent_ring() {
             Some(r) => (format!("claude-{}", r.next_index + 1), r.next_index),
             None => {
-                // Not on the Agent screen yet — bootstrap it (which creates
-                // a fresh session as part of setup), then we're done.
-                self.open_agent_inner(cx);
+                // Not on the Agent screen yet — bootstrap it AND create a
+                // brand-new session. We deliberately do NOT route through
+                // `open_agent_inner` here: its server path runs
+                // `spawn_open_agent_server`, which `list_sessions` and
+                // re-attaches an existing per-cwd session instead of creating
+                // a fresh one. That made the very first "new session" resume
+                // the prior session and only the *second* invocation create
+                // fresh (the bug). `bootstrap_fresh_agent_session` mirrors the
+                // screen setup but always creates (server path) / always
+                // spawns fresh (direct path).
+                self.bootstrap_fresh_agent_session(cwd, cx);
                 return;
             }
         };
@@ -11502,6 +11617,72 @@ impl SketchGpuiView {
         cx.notify();
     }
 
+    /// Bootstrap the Agent screen from a non-Agent screen AND create a
+    /// brand-new session — never re-attach an existing per-cwd one. This is
+    /// the always-fresh counterpart to `open_agent_inner`: `open_agent_inner`
+    /// resolves the cwd against the server's existing sessions and resumes a
+    /// match (the "open the agent panel" semantics), whereas the "new session"
+    /// command must always start a fresh conversation. The screen-stash /
+    /// placeholder / server-pump setup is identical to `open_agent_inner`'s
+    /// server path; the only difference is it calls `spawn_create_agent_session`
+    /// (create-only) instead of `spawn_open_agent_server` (list + resolve +
+    /// attach). The direct-spawn path builds a fresh `create_agent_session`
+    /// with no `resume_id`.
+    fn bootstrap_fresh_agent_session(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
+        // Stash the current screen so back_to_doc can restore it (mirrors
+        // open_agent_inner).
+        let prior = self
+            .workspace
+            .replace_focused_content(WindowContent::Doc(DocState {
+                blocks: Vec::new(),
+                file_label: SharedString::new_static(""),
+                cursor_block: 0,
+                list_state: DocState::new_list_state(0),
+                list_item_count: std::cell::Cell::new(0),
+                blocks_seq: 0,
+                blocks_snapshot: RefCell::new(None),
+                last_cursor_block: std::cell::Cell::new(None),
+                source: None,
+            }))
+            .expect("workspace has no focused window");
+
+        let mut ring = AgentRing::new(Some(Box::new(prior)));
+        let slot_cwd = cwd.unwrap_or_else(process_cwd);
+        let label = "claude-1".to_string();
+
+        if self.session_server.is_some() {
+            // Server path: placeholder + create-only round-trip (NO resolve /
+            // reattach — that is the whole point of "fresh").
+            let placeholder = AgentState::new_server_managed(Some(
+                "connecting to session server…".into(),
+            ));
+            let open_token = alloc_open_token();
+            ring.push(label.clone(), placeholder, None, slot_cwd.clone(), None);
+            let server_pump = self.start_server_pump(cx);
+            if let Some(slot) = ring.slots.first_mut() {
+                slot.state._pump = Some(server_pump);
+                slot.pending_open_token = Some(open_token);
+            }
+            self.set_screen(WindowContent::Agent(ring));
+            if let Some(c) = self.agent_mut() {
+                c.editor.begin_insert();
+            }
+            cx.notify();
+            self.spawn_create_agent_session(open_token, label, slot_cwd, cx);
+        } else {
+            // Direct-spawn path: a fresh session has no resume_id.
+            let session_index = ring.next_index;
+            let state = self.create_agent_session(None, slot_cwd.clone(), session_index, cx);
+            ring.push(label, state, None, slot_cwd, None);
+            self.set_screen(WindowContent::Agent(ring));
+            if let Some(c) = self.agent_mut() {
+                c.editor.begin_insert();
+            }
+            self.save_agent_ring();
+            cx.notify();
+        }
+    }
+
     /// Background half of `new_agent_session`'s session-server path (S4).
     /// Issues the `create_session` + `attach` round-trips off the paint thread
     /// and fills the "connecting…" placeholder (by `placeholder_index`) when
@@ -11528,6 +11709,7 @@ impl SketchGpuiView {
                         Ok(info) => OpenResolution::Created {
                             sid: info.session_id,
                             acp_id: info.acp_session_id,
+                            permission_mode: info.permission_mode,
                         },
                         Err(e) => OpenResolution::Failed(format!("create failed: {e}")),
                     }
@@ -11886,6 +12068,7 @@ impl SketchGpuiView {
             input_surface: InputSurface::Chatbox(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
+            permission_mode: sketch::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
             tasklist_open: false,
@@ -12815,25 +12998,71 @@ impl SketchGpuiView {
     /// yolo → read-only). Surfaces the new mode in the claude footer so
     /// the user sees the change without having to find it in the header.
     fn cycle_claude_permission_mode(&mut self, cx: &mut Context<Self>) {
-        let Some(claude) = self.agent_mut() else {
-            return;
-        };
-        let new_mode = match &claude.channel {
-            Some(ch) => {
-                let next = ch.permission_mode().next();
-                ch.set_permission_mode(next);
-                Some(next)
+        // Read what we need WITHOUT holding a long borrow of `self`. The
+        // borrow checker forbids holding `self.agent_mut()` (borrows `self`)
+        // while also touching `self.session_server` (also borrows `self`), so
+        // we snapshot the current mode + whether a local channel exists first,
+        // then drop the borrow before talking to the server.
+        let snapshot = self
+            .agent_ring()
+            .and_then(|r| r.slots.get(r.active))
+            .map(|s| (s.state.permission_mode, s.state.channel.is_some()));
+        let (current, has_channel) = match snapshot {
+            Some(v) => v,
+            None => {
+                if let Some(c) = self.agent_mut() {
+                    c.status = Some("permission mode: no session".into());
+                }
+                cx.notify();
+                return;
             }
-            None => None,
         };
-        match new_mode {
-            Some(m) => {
-                let msg = format!("permission mode → {}", m.short_label());
+        let next = current.next();
+        let sid = self.active_server_session_id();
+
+        let server_result: Option<std::io::Result<()>> = match (&sid, self.session_server.as_ref()) {
+            (Some(sid), Some(server)) => Some(server.set_permission_mode(sid, next)),
+            _ => None,
+        };
+
+        if let Some(result) = server_result {
+            // Server-backed session: the authoritative mode lives in the
+            // server. The change was pushed over the wire above (the
+            // `session_server` borrow has now ended), so it's safe to
+            // re-borrow `self` mutably to mirror the result into the
+            // session-state field for the badge.
+            match result {
+                Ok(()) => {
+                    if let Some(claude) = self.agent_mut() {
+                        claude.permission_mode = next;
+                        let msg = format!("permission mode → {}", next.short_label());
+                        Self::append_system_notice(claude, &msg);
+                        claude.status = Some(msg.into());
+                    }
+                }
+                Err(e) => {
+                    if let Some(claude) = self.agent_mut() {
+                        claude.status =
+                            Some(format!("permission mode change failed: {e}").into());
+                    }
+                }
+            }
+        } else if has_channel {
+            // Legacy direct-spawn fallback: the live channel is the authority.
+            // Flip it AND keep the session-state mirror in sync.
+            if let Some(claude) = self.agent_mut() {
+                if let Some(ch) = &claude.channel {
+                    ch.set_permission_mode(next);
+                }
+                claude.permission_mode = next;
+                let msg = format!("permission mode → {}", next.short_label());
                 Self::append_system_notice(claude, &msg);
                 claude.status = Some(msg.into());
             }
-            None => {
-                claude.status = Some("permission mode: no agent attached".into());
+        } else {
+            // Neither a server session nor a local channel — nothing to drive.
+            if let Some(claude) = self.agent_mut() {
+                claude.status = Some("permission mode: no session".into());
             }
         }
         cx.notify();
@@ -15537,15 +15766,32 @@ impl SketchGpuiView {
             );
         }
 
-        // Permission mode.
-        if let Some(ch) = &c.channel {
-            let mode_str = ch.permission_mode().short_label();
-            strip = strip.child(
-                div()
-                    .pr_2()
-                    .text_color(strip_dim)
-                    .child(SharedString::from(mode_str.to_string())),
-            );
+        // Permission mode — made prominent so the danger level of the
+        // current mode reads at a glance. Yolo (auto-approve everything,
+        // the no-config default) gets the warm/danger accent + bold; the
+        // restricted modes render dim. Stays at native chrome size (no
+        // text_scale). Cycle it with `<space> c m`.
+        //
+        // Sourced from session state (`c.permission_mode`), NOT the local
+        // `channel`: in session-server mode the agent/channel live in the
+        // server and `c.channel` is `None`, so gating on it hid the badge
+        // for every server-backed session. The session always has a mode
+        // (mirrored from `SessionInfo.permission_mode`), so always render.
+        {
+            let mode = c.permission_mode;
+            let mode_str = mode.short_label();
+            let is_yolo = matches!(mode, sketch::acp_channel::PermissionMode::Yolo);
+            let glyph = if is_yolo { "⚡" } else { "🔒" };
+            let badge = div()
+                .pr_2()
+                .text_color(if is_yolo { strip_warm } else { strip_dim })
+                .child(SharedString::from(format!("{glyph} perm: {mode_str}")));
+            let badge = if is_yolo {
+                badge.font_weight(FontWeight::BOLD)
+            } else {
+                badge.font_weight(FontWeight::NORMAL)
+            };
+            strip = strip.child(badge);
         }
 
         // Context-window usage + cost (when the unstable feature is on
