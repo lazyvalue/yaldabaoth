@@ -69,6 +69,13 @@ see worklog `2026-06-07-session-server-hardening.md`.
   Server-binary `eprintln`→`tracing` (stderr, ANSI off, `RUST_LOG`/env-filter);
   additive `admin_status` returns `AdminSnapshot` (session/owner/subscriber/log
   state). Behavior-preserving; transcript test is the log-grep regression guard.
+- **Headless start-work verb** — `READY` (decided, ADR-0015). "Run with no GUI"
+  now includes *starting* work, not just finishing it. Build an admin/CLI path to
+  enqueue a prompt to an unowned session (e.g. `sketch-session-server prompt <sid>
+  <text>` subcommand and/or an `admin_prompt` socket verb), reusing the
+  pending-prompt queue + WAL durability. Needs a short follow-up spec first
+  (verb/CLI shape, lease-interaction rules, durability ordering) — see ADR-0015.
+  Headlessly testable via the stub agent.
 - **Slow-subscriber disconnect** — `DEFERRED (refined)`. The shared-log forwarder
   already defuses the original "slow subscriber pins unbounded growth" worry
   (subscribers re-derive their tail from the shared `event_log`; no per-subscriber
