@@ -14,16 +14,138 @@ use std::collections::HashMap;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, watch};
 
-use sketch::acp_channel::{AcpChannelClient, PermissionMode, SketchFrontend};
+use sketch::acp_channel::{AcpChannelClient, PermissionMode, SketchFrontend, TransportHandle};
 use sketch::session_proto::*;
 
 mod launchd;
+
+// ── Actor command inlet ────────────────────────────────────────────
+//
+// All session-state mutation flows through this single inlet, drained by the
+// single-writer `run_manager` actor task that OWNS the HashMap (no Mutex).
+// `sid` = ServerSessionId. Oneshot replies are used where the caller needs a
+// consistent read/ack; pump-sourced commands carry no reply.
+//
+// `generation` on the pump-sourced commands (Record/TurnCount/AgentDisconnected)
+// is the fence (Blocker B): the actor ignores any whose generation !=
+// session.channel_generation.
+enum Command {
+    // ── External (connection-handler sourced; each carries a oneshot) ──
+    Create {
+        cwd: PathBuf,
+        label: String,
+        resume_session_id: Option<String>,
+        reply: tokio::sync::oneshot::Sender<SessionInfo>,
+    },
+    Attach {
+        sid: ServerSessionId,
+        mode: AttachMode,
+        conn_id: u64,
+        reply: tokio::sync::oneshot::Sender<
+            Result<
+                (
+                    watch::Receiver<bool>,
+                    watch::Receiver<Arc<Vec<Notification>>>,
+                    usize,
+                ),
+                String,
+            >,
+        >,
+    },
+    Detach {
+        sid: ServerSessionId,
+        conn_id: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Promote {
+        sid: ServerSessionId,
+        conn_id: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Prompt {
+        sid: ServerSessionId,
+        text: String,
+        conn_id: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Cancel {
+        sid: ServerSessionId,
+        conn_id: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Close {
+        sid: ServerSessionId,
+        conn_id: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Restart {
+        sid: ServerSessionId,
+        conn_id: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Rename {
+        sid: ServerSessionId,
+        label: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    SetPermissionMode {
+        sid: ServerSessionId,
+        mode: PermissionMode,
+        conn_id: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    ListSessions {
+        reply: tokio::sync::oneshot::Sender<Vec<SessionInfo>>,
+    },
+    AdminQuery {
+        reply: tokio::sync::oneshot::Sender<AdminSnapshot>,
+    },
+    SessionCount {
+        reply: tokio::sync::oneshot::Sender<usize>,
+    },
+
+    // ── Spawn-worker sourced (channel (re)spawn completed) ──
+    // The freshly-spawned client's `handle` (Send surface) is installed in the
+    // map; the OWNING pump thread is spawned by the worker AFTER the actor
+    // replies the committed generation. The actor never receives or drops the
+    // client. `is_respawn` bumps generation (and gen_watch) so the old pump
+    // self-terminates and drops its client off-actor (Blocker A).
+    PublishChannel {
+        sid: ServerSessionId,
+        handle: TransportHandle,
+        is_respawn: bool,
+        // On success: (committed generation, gen_watch subscription, replay
+        // fence) — everything the OWNING pump needs to drive + self-terminate.
+        // `None` if the session was closed while spawning.
+        reply: tokio::sync::oneshot::Sender<Option<(u64, watch::Receiver<u64>, usize)>>,
+    },
+    SpawnFailed {
+        sid: ServerSessionId,
+        reason: String,
+    },
+
+    // ── Pump-thread sourced (fire-and-forget; generation-fenced) ──
+    Record {
+        sid: ServerSessionId,
+        generation: u64,
+        event: sketch::acp_channel::ReplyEvent,
+    },
+    TurnCount {
+        sid: ServerSessionId,
+        generation: u64,
+        turns: usize,
+    },
+    AgentDisconnected {
+        sid: ServerSessionId,
+        generation: u64,
+    },
+}
 
 /// CLI: with no subcommand the binary runs the server (the default the GUI
 /// auto-launches); subcommands manage launchd supervision.
@@ -52,17 +174,32 @@ struct ManagedSession {
     id: ServerSessionId,
     label: String,
     cwd: PathBuf,
-    /// The live ACP channel. `None` while the subprocess is being spawned.
-    channel: Option<AcpChannelClient>,
-    /// Bumped every time `channel` is replaced (force-restart). The pump
-    /// thread watches this and resets its `last_turns` baseline so the fresh
-    /// channel's turn counter (which restarts at 0) is tracked correctly.
+    /// The live ACP transport surface — the Send sub-handles of the
+    /// `AcpChannelClient` whose `reply_rx` is owned by the pump thread. `None`
+    /// while the subprocess is being spawned. The actor never holds the client
+    /// itself (so its blocking `Drop` never runs on the actor task).
+    channel: Option<TransportHandle>,
+    /// Bumped every time `channel` is replaced (force-restart). The apply
+    /// handlers fence stale pump messages on this (Blocker B, CP5), and the
+    /// `gen_watch` mirror lets the old pump self-terminate (Blocker A).
     channel_generation: u64,
+    /// Mirrors `channel_generation` so each pump thread can observe a restart
+    /// (generation bump) and self-terminate + drop its owned client off the
+    /// actor task (Blocker A).
+    gen_watch: watch::Sender<u64>,
     turns: usize,
     permission_mode: PermissionMode,
-    /// Broadcast sender — attached GUI connections subscribe here. Any number
-    /// of connections (one owner + N observers) may subscribe concurrently.
-    event_tx: broadcast::Sender<Notification>,
+    /// Per-session transcript log channel. Holds the latest snapshot of
+    /// `event_log` (as a cloned `Arc`); every `record`/`log_only` sends the
+    /// updated snapshot via `send_replace`. The forwarder tails `[sent..]` of
+    /// the latest snapshot lock-free — watch coalescing self-heals exactly like
+    /// the old broadcast `Lagged` path.
+    log_tx: watch::Sender<Arc<Vec<Notification>>>,
+    /// Per-session ownership control channel. Holds the current
+    /// `owner.is_some()`. The forwarder selects on this and synthesizes a single
+    /// `OwnerChanged` control note on change — replaces the broadcast-as-wake
+    /// path for ownership state.
+    owner_tx: watch::Sender<bool>,
     /// Connection id of the current owner — the only connection allowed to
     /// drive the session (prompt / set permission / close). `None` when no
     /// owner is attached, in which case an observer may `Promote` to claim it.
@@ -116,18 +253,21 @@ impl ManagedSession {
     /// deliberately NOT routed through here: it is transient connection state,
     /// not transcript, and must never land in `event_log`.
     fn record(&mut self, note: Notification) {
-        Arc::make_mut(&mut self.event_log).push(note.clone());
         self.wal_append(&note);
-        let _ = self.event_tx.send(note);
+        Arc::make_mut(&mut self.event_log).push(note);
+        let _ = self.log_tx.send_replace(Arc::clone(&self.event_log));
     }
 
-    /// Append a transcript event to `event_log` durably WITHOUT broadcasting.
-    /// Used for the user's own prompt, which the live GUI already rendered
-    /// locally (so it must be logged for replay but not re-broadcast). The
-    /// broadcast path goes through [`record`].
+    /// Append a transcript event to `event_log` + WAL and fire the watch wake.
+    /// Used for the user's own prompt: the live GUI already rendered it locally,
+    /// and its transcript reconciler dedups the prompt it then sees replayed via
+    /// the log tail (the watch delivers every event_log entry, same as the old
+    /// broadcast tail did). Distinguished from [`record`] only in intent — both
+    /// now publish through the per-session `log_tx` watch.
     fn log_only(&mut self, note: Notification) {
-        Arc::make_mut(&mut self.event_log).push(note.clone());
         self.wal_append(&note);
+        Arc::make_mut(&mut self.event_log).push(note);
+        let _ = self.log_tx.send_replace(Arc::clone(&self.event_log));
     }
 
     /// Append `note` to the durable WAL. `fsync`s at turn boundaries
@@ -155,70 +295,113 @@ impl ManagedSession {
     /// to `event_log` — ownership is transient connection state, not part of
     /// the conversation transcript a late observer needs to replay.
     fn broadcast_owner_changed(&self) {
-        let _ = self.event_tx.send(Notification::OwnerChanged {
-            session_id: self.id.clone(),
-            has_owner: self.owner.is_some(),
-        });
+        let _ = self.owner_tx.send_replace(self.owner.is_some());
     }
 
-    /// Publish a freshly-spawned `channel` as this session's live channel,
-    /// running the full attach choreography atomically under the caller's
-    /// lock. The single chokepoint for create / restore / restart (9′) so the
-    /// three can't drift:
+    /// Publish a freshly-spawned channel's `TransportHandle` as this session's
+    /// live transport, running the full attach choreography atomically under the
+    /// caller's lock. The single chokepoint for create / restore / restart (9′)
+    /// so the three can't drift:
     /// 1. Re-apply the session's `permission_mode` (a fresh channel starts at
     ///    its default — without this the configured mode silently reverts).
-    /// 2. Drain `pending_prompts` in arrival order onto the new channel BEFORE
+    /// 2. Drain `pending_prompts` in arrival order onto the new transport BEFORE
     ///    publishing it, so they're enqueued at the ACP driver before any
     ///    future prompt races in. Doing this under the lock also closes the
     ///    take-then-publish window where a concurrent `prompt()` could re-queue
     ///    onto a `pending_prompts` we'd already drained.
-    /// 3. On a respawn (force-restart), bump `channel_generation` so the pump
-    ///    rebaselines its `last_turns` against the new channel's zeroed counter.
-    /// 4. Swap the channel in and `record(SessionAttached)`.
+    /// 3. On a respawn (force-restart), bump `channel_generation` AND the
+    ///    `gen_watch` mirror so (a) the apply handlers fence the old pump's
+    ///    in-flight messages (Blocker B, CP5) and (b) the OLD pump thread
+    ///    observes the bump and self-terminates + drops its owned client off the
+    ///    actor task (Blocker A).
+    /// 4. Swap the handle in and `record(SessionAttached)`.
     ///
-    /// Returns the OLD channel (if any) WITHOUT dropping it — the caller must
-    /// drop it AFTER releasing the sessions lock, because `AcpChannelClient`'s
-    /// `Drop` joins the worker thread / kills the child and must never run
-    /// while the global mutex is held.
-    #[must_use = "drop the returned old channel after releasing the lock"]
-    fn apply_channel_state(
-        &mut self,
-        mut channel: AcpChannelClient,
-        is_respawn: bool,
-    ) -> Option<AcpChannelClient> {
-        channel.set_permission_mode(self.permission_mode);
+    /// Unlike the old client-owning version this returns nothing: the actor only
+    /// ever holds the cheap Send `TransportHandle`; the owning `AcpChannelClient`
+    /// (and its blocking `Drop`) lives on the pump's OS thread.
+    fn apply_channel_state(&mut self, mut handle: TransportHandle, is_respawn: bool) {
+        handle.set_permission_mode(self.permission_mode);
         for text in std::mem::take(&mut self.pending_prompts) {
-            if let Err(e) = channel.send(&text) {
+            if let Err(e) = handle.send(&text) {
                 tracing::error!(error = %e, "failed to flush queued prompt");
             }
         }
-        let acp_session_id = channel.session_id();
+        let acp_session_id = handle.session_id();
         if is_respawn {
             self.channel_generation = self.channel_generation.wrapping_add(1);
+            let _ = self.gen_watch.send_replace(self.channel_generation);
         }
-        let old = self.channel.replace(channel);
+        handle.generation = self.channel_generation;
+        self.channel = Some(handle);
         self.record(Notification::SessionAttached {
             session_id: self.id.clone(),
             acp_session_id,
         });
-        old
     }
 }
 
 // ── Session manager ────────────────────────────────────────────────
 
-struct SessionManager {
-    sessions: Mutex<HashMap<ServerSessionId, ManagedSession>>,
+/// Build a fresh `ManagedSession` for a brand-new session.
+fn new_managed_session(
+    id: ServerSessionId,
+    label: String,
+    cwd: PathBuf,
+    permission_mode: PermissionMode,
+    wal: Option<sketch::session_wal::SessionWal>,
+) -> ManagedSession {
+    let event_log = Arc::new(Vec::new());
+    let (log_tx, _) = watch::channel(Arc::clone(&event_log));
+    let (owner_tx, _) = watch::channel(false);
+    let (gen_watch, _) = watch::channel(0u64);
+    ManagedSession {
+        id,
+        label,
+        cwd,
+        channel: None,
+        channel_generation: 0,
+        gen_watch,
+        turns: 0,
+        permission_mode,
+        log_tx,
+        owner_tx,
+        owner: None,
+        pending_prompts: Vec::new(),
+        event_log,
+        replay_fence: 0,
+        wal,
+    }
+}
+
+/// A pending ACP resume job produced by WAL recovery — the seed map plus the
+/// data each resume worker needs to re-spawn its subprocess.
+struct ResumeJob {
+    session_id: ServerSessionId,
+    cwd: PathBuf,
+    acp_session_id: String,
+}
+
+/// The single-writer actor state: it OWNS the sessions map (no Mutex). Mutated
+/// only on the `run_manager` task, one command at a time.
+struct Manager {
+    sessions: HashMap<ServerSessionId, ManagedSession>,
     /// Manager-level broadcast for session-list changes (create/close/rename).
-    /// Distinct from each session's `event_tx`: those carry one session's
-    /// transcript to its subscribers, whereas this reaches **every** connected
-    /// GUI so closures/renames done in one panel or one GUI instance propagate
-    /// everywhere and the session lists stay consistent without polling.
     events: broadcast::Sender<Notification>,
-    /// The permission mode new sessions start in. Loaded once from the config
-    /// file at startup (`default-permission-mode`), falling back to the
-    /// hard-coded [`DEFAULT_PERMISSION_MODE`] when no config is present.
     default_permission_mode: PermissionMode,
+    /// The inlet sender — cloned into spawn workers so they can post back
+    /// `PublishChannel` / `SpawnFailed` without touching the map directly.
+    cmd_tx: mpsc::UnboundedSender<Command>,
+}
+
+/// The public handle the connection handlers hold. All mutation goes through
+/// `cmd_tx`; the single-writer `run_manager` actor owns the sessions map. The
+/// handle keeps only the inlet sender and the manager-level (session-list)
+/// broadcast — there is no shared map and no lock.
+struct SessionManager {
+    /// Manager-level broadcast for session-list changes (create/close/rename).
+    events: broadcast::Sender<Notification>,
+    /// The actor command inlet — every request becomes a Command sent here.
+    cmd_tx: mpsc::UnboundedSender<Command>,
 }
 
 /// Open a fresh durable WAL for a session, or `None` (degrade to in-memory) if
@@ -244,247 +427,489 @@ fn open_session_wal(
 }
 
 impl SessionManager {
-    fn new(default_permission_mode: PermissionMode) -> Self {
+    fn new_with_inlet(
+        default_permission_mode: PermissionMode,
+    ) -> (Self, mpsc::UnboundedReceiver<Command>, PermissionMode) {
         let (events, _) = broadcast::channel(1024);
-        Self {
-            sessions: Mutex::new(HashMap::new()),
-            events,
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        (
+            Self { events, cmd_tx },
+            cmd_rx,
             default_permission_mode,
-        }
+        )
     }
 
-    /// THE single accessor for the shared sessions map — poison-tolerant.
-    ///
-    /// If any thread panics *while holding* the lock, a plain `.lock().unwrap()`
-    /// at every other site would then panic too, so one stray panic cascades
-    /// into "every session is dead" (the failure mode this centralization
-    /// closes). The guarded data is a plain `HashMap` mutated by short,
-    /// non-compound critical sections — there is no half-applied multi-step
-    /// invariant that a mid-mutation panic could leave torn — so recovering the
-    /// guard via `into_inner()` keeps the surviving sessions serving instead of
-    /// taking the whole server down. The recovery is surfaced (once per poison
-    /// observation) rather than swallowed, so the originating panic stays
-    /// visible. Every `sessions` access MUST go through here.
-    fn lock_sessions(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<ServerSessionId, ManagedSession>> {
-        self.sessions.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!(
-                "sessions mutex was poisoned by a prior panic; \
-                 recovering the guard to keep other sessions alive"
-            );
-            poisoned.into_inner()
-        })
-    }
-
-    /// Subscribe to manager-level session-list notifications. Each connection
-    /// calls this once and forwards everything it receives to its GUI.
+    /// Subscribe to manager-level session-list notifications.
     fn subscribe_events(&self) -> broadcast::Receiver<Notification> {
         self.events.subscribe()
     }
 
-    /// Recover sessions from their durable WALs (ADR-0009) and re-spawn their
-    /// ACP subprocesses. Called once at startup before accepting connections.
-    /// Replaces the old clean-shutdown-only JSON snapshot: the WAL is written
-    /// continuously, so recovery survives a CRASH, not just a graceful exit.
-    /// Idempotent — unlike the old delete-on-restore hack, the WAL files are
-    /// kept (a session's WAL is removed only when it is explicitly closed), so a
-    /// crash mid-recovery just replays again next boot.
-    fn restore_from_disk(self: &Arc<Self>) {
-        let Some(dir) = session_wal_dir() else {
-            return;
-        };
-        let recovered = sketch::session_wal::recover_all(&dir);
-        for rs in recovered {
-            let sid = rs.server_session_id.clone();
-            // Without an acp_session_id we can't --resume the agent; the
-            // transcript is preserved but the session is inert. Drop it (and its
-            // WAL) rather than leaving a zombie that can never make progress.
-            let Some(acp_session_id) = rs.acp_session_id.clone() else {
-                tracing::warn!(
-                    session_id = %&sid[..8.min(sid.len())],
-                    "discarding recovered session: no acp_session_id to resume"
-                );
-                let _ = std::fs::remove_file(&rs.path);
-                continue;
-            };
+    // ── Async request wrappers (oneshot round-trip to the actor) ──
 
-            let (event_tx, _) = broadcast::channel(16384);
-            // Re-open the WAL in append mode so the restored session keeps
-            // logging to the same file. If reopen fails, degrade to
-            // in-memory-only (still better than dropping the session).
-            let wal = match sketch::session_wal::SessionWal::reopen(rs.path.clone()) {
-                Ok(w) => Some(w),
+    async fn send_create(
+        &self,
+        cwd: PathBuf,
+        label: String,
+        resume_session_id: Option<String>,
+    ) -> SessionInfo {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::Create {
+            cwd,
+            label,
+            resume_session_id,
+            reply,
+        });
+        rx.await.expect("actor dropped a Create reply")
+    }
+
+    async fn send_attach(
+        &self,
+        sid: &str,
+        mode: AttachMode,
+        conn_id: u64,
+    ) -> Result<
+        (
+            watch::Receiver<bool>,
+            watch::Receiver<Arc<Vec<Notification>>>,
+            usize,
+        ),
+        String,
+    > {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::Attach {
+            sid: sid.to_string(),
+            mode,
+            conn_id,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
+    async fn send_detach(&self, sid: &str, conn_id: u64) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::Detach {
+            sid: sid.to_string(),
+            conn_id,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
+    async fn send_promote(&self, sid: &str, conn_id: u64) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::Promote {
+            sid: sid.to_string(),
+            conn_id,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
+    async fn send_prompt(&self, sid: &str, text: &str, conn_id: u64) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::Prompt {
+            sid: sid.to_string(),
+            text: text.to_string(),
+            conn_id,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
+    async fn send_cancel(&self, sid: &str, conn_id: u64) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::Cancel {
+            sid: sid.to_string(),
+            conn_id,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
+    async fn send_close(&self, sid: &str, conn_id: u64) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::Close {
+            sid: sid.to_string(),
+            conn_id,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
+    async fn send_restart(&self, sid: &str, conn_id: u64) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::Restart {
+            sid: sid.to_string(),
+            conn_id,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
+    async fn send_rename(&self, sid: &str, label: String) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::Rename {
+            sid: sid.to_string(),
+            label,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
+    async fn send_set_permission_mode(
+        &self,
+        sid: &str,
+        mode: PermissionMode,
+        conn_id: u64,
+    ) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::SetPermissionMode {
+            sid: sid.to_string(),
+            mode,
+            conn_id,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
+    async fn send_list_sessions(&self) -> Vec<SessionInfo> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::ListSessions { reply });
+        rx.await.unwrap_or_default()
+    }
+
+    async fn send_admin_status(&self) -> AdminSnapshot {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::AdminQuery { reply });
+        rx.await.unwrap_or(AdminSnapshot {
+            session_count: 0,
+            sessions: Vec::new(),
+        })
+    }
+
+    async fn send_session_count(&self) -> usize {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::SessionCount { reply });
+        rx.await.unwrap_or(0)
+    }
+}
+
+/// Recover sessions from their durable WALs (ADR-0009). Returns the SEED map
+/// (moved into `run_manager` before the actor starts) plus the resume jobs whose
+/// workers re-spawn the ACP subprocesses (each posting `PublishChannel` back
+/// into the actor). Runs once at startup before accepting connections.
+fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<ResumeJob>) {
+    let mut sessions = HashMap::new();
+    let mut jobs = Vec::new();
+    let Some(dir) = session_wal_dir() else {
+        return (sessions, jobs);
+    };
+    let recovered = sketch::session_wal::recover_all(&dir);
+    for rs in recovered {
+        let sid = rs.server_session_id.clone();
+        let Some(acp_session_id) = rs.acp_session_id.clone() else {
+            tracing::warn!(
+                session_id = %&sid[..8.min(sid.len())],
+                "discarding recovered session: no acp_session_id to resume"
+            );
+            let _ = std::fs::remove_file(&rs.path);
+            continue;
+        };
+
+        let wal = match sketch::session_wal::SessionWal::reopen(rs.path.clone()) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                tracing::error!(
+                    session_id = %&sid[..8.min(sid.len())],
+                    error = %e,
+                    "WAL reopen failed"
+                );
+                None
+            }
+        };
+
+        let event_log = Arc::new(rs.event_log);
+        // Seed the watch with the recovered log so the first tail sees history.
+        let (log_tx, _) = watch::channel(Arc::clone(&event_log));
+        let (owner_tx, _) = watch::channel(false);
+        let (gen_watch, _) = watch::channel(0u64);
+        let session = ManagedSession {
+            id: sid.clone(),
+            label: rs.label.clone(),
+            cwd: rs.cwd.clone(),
+            channel: None,
+            channel_generation: 0,
+            gen_watch,
+            turns: rs.turns,
+            permission_mode: rs.permission_mode,
+            log_tx,
+            owner_tx,
+            owner: None,
+            pending_prompts: Vec::new(),
+            event_log,
+            replay_fence: rs.turns,
+            wal,
+        };
+
+        tracing::info!(
+            session_id = %&sid[..8.min(sid.len())],
+            events = session.event_log.len(),
+            turns = rs.turns,
+            acp_session_id = %&acp_session_id[..8.min(acp_session_id.len())],
+            "recovering session"
+        );
+
+        sessions.insert(sid.clone(), session);
+        jobs.push(ResumeJob {
+            session_id: sid,
+            cwd: rs.cwd,
+            acp_session_id,
+        });
+    }
+    (sessions, jobs)
+}
+
+/// Spawn the OS thread that re-spawns a recovered session's ACP subprocess with
+/// `--resume`, then publishes the transport via the actor inlet.
+fn spawn_resume_worker(cmd_tx: mpsc::UnboundedSender<Command>, job: ResumeJob) {
+    let ResumeJob {
+        session_id,
+        cwd,
+        acp_session_id,
+    } = job;
+    std::thread::Builder::new()
+        .name(format!("acp-resume-{}", &session_id[..8.min(session_id.len())]))
+        .spawn(move || {
+            // SAFETY: dedicated spawn thread; see create worker.
+            unsafe {
+                std::env::set_var("SKETCH_SESSION_MANAGED", "1");
+            }
+            let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
+            match AcpChannelClient::spawn_with_resume_in(
+                &cmd,
+                Some(cwd),
+                Some(acp_session_id),
+                SketchFrontend::Gpui,
+            ) {
+                Ok(client) => {
+                    // Resume from disk → is_respawn=false (generation stays 0).
+                    publish_channel(&cmd_tx, &session_id, client, false);
+                }
                 Err(e) => {
                     tracing::error!(
-                        session_id = %&sid[..8.min(sid.len())],
+                        session_id = %&session_id[..8.min(session_id.len())],
                         error = %e,
-                        "WAL reopen failed"
+                        "failed to resume session"
                     );
-                    None
+                    let _ = cmd_tx.send(Command::SpawnFailed {
+                        sid: session_id,
+                        reason: format!("resume failed: {e}"),
+                    });
                 }
-            };
+            }
+        })
+        .ok();
+}
 
-            let session = ManagedSession {
-                id: sid.clone(),
-                label: rs.label.clone(),
-                cwd: rs.cwd.clone(),
-                channel: None,
-                channel_generation: 0,
-                turns: rs.turns,
-                permission_mode: rs.permission_mode,
-                event_tx: event_tx.clone(),
-                owner: None,
-                pending_prompts: Vec::new(),
-                event_log: Arc::new(rs.event_log),
-                replay_fence: rs.turns,
-                wal,
-            };
+// ── Manager actor task ─────────────────────────────────────────────
 
-            tracing::info!(
-                session_id = %&sid[..8.min(sid.len())],
-                events = session.event_log.len(),
-                turns = rs.turns,
-                acp_session_id = %&acp_session_id[..8.min(acp_session_id.len())],
-                "recovering session"
-            );
+/// The single-writer actor: owns the sessions map and drains the inlet, one
+/// command at a time. Replaces the old mutex-guarded map + per-method locking.
+async fn run_manager(
+    mut rx: mpsc::UnboundedReceiver<Command>,
+    sessions: HashMap<ServerSessionId, ManagedSession>,
+    events: broadcast::Sender<Notification>,
+    default_permission_mode: PermissionMode,
+    cmd_tx: mpsc::UnboundedSender<Command>,
+) {
+    let mut mgr = Manager {
+        sessions,
+        events,
+        default_permission_mode,
+        cmd_tx,
+    };
+    while let Some(cmd) = rx.recv().await {
+        mgr.apply(cmd);
+    }
+}
 
-            self.lock_sessions().insert(sid.clone(), session);
-
-            // Re-spawn the ACP subprocess with --resume.
-            let manager = Arc::clone(self);
-            let session_id = sid.clone();
-            let cwd = rs.cwd.clone();
-            std::thread::Builder::new()
-                .name(format!("acp-resume-{}", &session_id[..8.min(session_id.len())]))
-                .spawn(move || {
-                    unsafe {
-                        std::env::set_var("SKETCH_SESSION_MANAGED", "1");
+impl Manager {
+    fn apply(&mut self, cmd: Command) {
+        match cmd {
+            Command::Create {
+                cwd,
+                label,
+                resume_session_id,
+                reply,
+            } => {
+                let info = self.do_create(cwd, label, resume_session_id);
+                let _ = reply.send(info);
+            }
+            Command::Attach {
+                sid,
+                mode,
+                conn_id,
+                reply,
+            } => {
+                let _ = reply.send(self.do_attach(&sid, mode, conn_id));
+            }
+            Command::Detach { sid, conn_id, reply } => {
+                let _ = reply.send(self.do_detach(&sid, conn_id));
+            }
+            Command::Promote { sid, conn_id, reply } => {
+                let _ = reply.send(self.do_promote(&sid, conn_id));
+            }
+            Command::Prompt {
+                sid,
+                text,
+                conn_id,
+                reply,
+            } => {
+                let _ = reply.send(self.do_prompt(&sid, &text, conn_id));
+            }
+            Command::Cancel { sid, conn_id, reply } => {
+                let _ = reply.send(self.do_cancel(&sid, conn_id));
+            }
+            Command::Close { sid, conn_id, reply } => {
+                let _ = reply.send(self.do_close(&sid, conn_id));
+            }
+            Command::Restart { sid, conn_id, reply } => {
+                let _ = reply.send(self.do_restart(&sid, conn_id));
+            }
+            Command::Rename { sid, label, reply } => {
+                let _ = reply.send(self.do_rename(&sid, label));
+            }
+            Command::SetPermissionMode {
+                sid,
+                mode,
+                conn_id,
+                reply,
+            } => {
+                let _ = reply.send(self.do_set_permission_mode(&sid, mode, conn_id));
+            }
+            Command::ListSessions { reply } => {
+                let _ = reply.send(self.sessions.values().map(|s| s.info()).collect());
+            }
+            Command::AdminQuery { reply } => {
+                let _ = reply.send(self.do_admin_status());
+            }
+            Command::SessionCount { reply } => {
+                let _ = reply.send(self.sessions.len());
+            }
+            Command::PublishChannel {
+                sid,
+                handle,
+                is_respawn,
+                reply,
+            } => {
+                let published = match self.sessions.get_mut(&sid) {
+                    Some(s) => {
+                        s.apply_channel_state(handle, is_respawn);
+                        Some((
+                            s.channel_generation,
+                            s.gen_watch.subscribe(),
+                            s.replay_fence,
+                        ))
                     }
-                    let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
-                    match AcpChannelClient::spawn_with_resume_in(
-                        &cmd,
-                        Some(cwd),
-                        Some(acp_session_id),
-                        SketchFrontend::Gpui,
-                    ) {
-                        Ok(client) => {
-                            // Publish via the shared choreography (9′). Resume
-                            // from disk → is_respawn=false (generation stays 0).
-                            let old = {
-                                let mut sessions = manager.lock_sessions();
-                                match sessions.get_mut(&session_id) {
-                                    Some(s) => s.apply_channel_state(client, false),
-                                    None => Some(client),
-                                }
-                            };
-                            drop(old);
-                            spawn_pump_thread(Arc::clone(&manager), session_id);
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                session_id = %&session_id[..8.min(session_id.len())],
-                                error = %e,
-                                "failed to resume session"
-                            );
-                            let mut sessions = manager.lock_sessions();
-                            if let Some(s) = sessions.get_mut(&session_id) {
-                                s.record(Notification::SessionDetached {
-                                    session_id: session_id.clone(),
-                                    reason: format!("resume failed: {e}"),
-                                });
-                            }
-                        }
-                    }
-                })
-                .ok();
+                    None => None,
+                };
+                let _ = reply.send(published);
+            }
+            Command::SpawnFailed { sid, reason } => {
+                if let Some(s) = self.sessions.get_mut(&sid) {
+                    s.record(Notification::SessionDetached {
+                        session_id: sid.clone(),
+                        reason,
+                    });
+                }
+            }
+            Command::Record {
+                sid,
+                generation,
+                event,
+            } => {
+                let Some(s) = self.sessions.get_mut(&sid) else {
+                    return;
+                };
+                if generation != s.channel_generation {
+                    return; // stale reader (superseded by a restart)
+                }
+                s.record(Notification::ReplyEvent {
+                    session_id: sid.clone(),
+                    event,
+                });
+            }
+            Command::TurnCount {
+                sid,
+                generation,
+                turns,
+            } => {
+                let Some(s) = self.sessions.get_mut(&sid) else {
+                    return;
+                };
+                if generation != s.channel_generation {
+                    return; // stale reader (superseded by a restart)
+                }
+                // A `turns <= replay_fence` signal is the pump telling us replay
+                // is complete: clear the fence, no TurnEnded for a replay turn.
+                if s.replay_fence > 0 && turns <= s.replay_fence {
+                    s.replay_fence = 0;
+                    return;
+                }
+                s.turns = turns;
+                let channel_generation = s.channel_generation;
+                s.record(Notification::TurnEnded {
+                    session_id: sid.clone(),
+                    turn_count: turns,
+                    generation: channel_generation,
+                });
+            }
+            Command::AgentDisconnected { sid, generation } => {
+                let Some(s) = self.sessions.get_mut(&sid) else {
+                    return;
+                };
+                if generation != s.channel_generation {
+                    return; // stale reader (superseded by a restart)
+                }
+                s.record(Notification::SessionDetached {
+                    session_id: sid.clone(),
+                    reason: "agent disconnected".into(),
+                });
+                s.channel = None;
+            }
         }
     }
 
-    fn list_sessions(&self) -> Vec<SessionInfo> {
-        let sessions = self.lock_sessions();
-        sessions.values().map(|s| s.info()).collect()
-    }
-
-    /// Diagnostic snapshot of every managed session's live server-side state.
-    /// Read-only — exposes internals (owner conn id, broadcast receiver count,
-    /// channel generation) for observability without affecting any session.
-    fn admin_status(&self) -> AdminSnapshot {
-        let sessions = self.lock_sessions();
-        let infos = sessions
-            .values()
-            .map(|s| AdminSessionInfo {
-                session_id: s.id.clone(),
-                label: s.label.clone(),
-                connected: s.channel.is_some(),
-                has_owner: s.owner.is_some(),
-                owner_conn_id: s.owner,
-                turns: s.turns,
-                event_log_len: s.event_log.len(),
-                subscriber_count: s.event_tx.receiver_count(),
-                channel_generation: s.channel_generation,
-                permission_mode: s.permission_mode,
-            })
-            .collect();
-        AdminSnapshot {
-            session_count: sessions.len(),
-            sessions: infos,
-        }
-    }
-
-    fn create_session(
-        self: &Arc<Self>,
+    fn do_create(
+        &mut self,
         cwd: PathBuf,
         label: String,
         resume_session_id: Option<String>,
     ) -> SessionInfo {
         let id = uuid::Uuid::new_v4().to_string();
-        let (event_tx, _) = broadcast::channel(16384);
-        // Config-driven default (loaded at startup), with the hard-coded
-        // DEFAULT_PERMISSION_MODE as the ultimate fallback.
         let permission_mode = self.default_permission_mode;
-
-        // Open the durable WAL up front and write its header, so even a crash
-        // immediately after create can recover the session's identity. Degrade
-        // to in-memory-only if it can't be opened.
+        // Open the durable WAL up front so even a crash immediately after create
+        // can recover the session's identity.
         let wal = open_session_wal(&id, &label, &cwd, permission_mode);
-
-        let session = ManagedSession {
-            id: id.clone(),
-            label,
-            cwd: cwd.clone(),
-            channel: None,
-            channel_generation: 0,
-            turns: 0,
-            permission_mode,
-            event_tx: event_tx.clone(),
-            owner: None,
-            pending_prompts: Vec::new(),
-            event_log: Arc::new(Vec::new()),
-            replay_fence: 0,
-            wal,
-        };
+        let session = new_managed_session(id.clone(), label, cwd.clone(), permission_mode, wal);
 
         let info = session.info();
-        self.lock_sessions().insert(id.clone(), session);
+        self.sessions.insert(id.clone(), session);
         let _ = self.events.send(Notification::SessionCreated {
             session: info.clone(),
         });
 
-        // Spawn the ACP agent on a background thread (blocking handshake).
-        let manager = Arc::clone(self);
+        // Spawn the ACP agent on a background thread (blocking handshake), which
+        // posts `PublishChannel` back into the actor when ready.
+        let cmd_tx = self.cmd_tx.clone();
         let session_id = id.clone();
         std::thread::Builder::new()
             .name(format!("acp-spawn-{}", &id[..8]))
             .spawn(move || {
-                // Tell the agent subprocess it's running under the session
-                // server (not a direct GUI spawn). Agents can check
-                // `SKETCH_SESSION_MANAGED=1` to branch on client/server mode.
-                // Safe to set process-wide: every agent this server spawns
-                // is server-managed by definition.
-                // SAFETY: this runs on a dedicated spawn thread; the session
-                // server is single-purpose and no other thread reads this var.
-                unsafe { std::env::set_var("SKETCH_SESSION_MANAGED", "1"); }
+                // SAFETY: dedicated spawn thread; single-purpose server.
+                unsafe {
+                    std::env::set_var("SKETCH_SESSION_MANAGED", "1");
+                }
                 let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
                 match AcpChannelClient::spawn_with_resume_in(
                     &cmd,
@@ -493,30 +918,14 @@ impl SessionManager {
                     SketchFrontend::Gpui,
                 ) {
                     Ok(client) => {
-                        // Publish the channel + drain queued prompts atomically
-                        // (9′, `apply_channel_state`). Fresh spawn → is_respawn
-                        // = false, generation stays 0.
-                        let old = {
-                            let mut sessions = manager.lock_sessions();
-                            match sessions.get_mut(&session_id) {
-                                Some(s) => s.apply_channel_state(client, false),
-                                // Session closed while we were spawning — return
-                                // the orphan so it Drops after the lock releases.
-                                None => Some(client),
-                            }
-                        };
-                        drop(old);
-                        // Start the pump thread now that the channel is live.
-                        spawn_pump_thread(Arc::clone(&manager), session_id);
+                        // Fresh spawn → is_respawn = false, generation stays 0.
+                        publish_channel(&cmd_tx, &session_id, client, false);
                     }
                     Err(e) => {
-                        let mut sessions = manager.lock_sessions();
-                        if let Some(s) = sessions.get_mut(&session_id) {
-                            s.record(Notification::SessionDetached {
-                                session_id: session_id.clone(),
-                                reason: format!("spawn failed: {e}"),
-                            });
-                        }
+                        let _ = cmd_tx.send(Command::SpawnFailed {
+                            sid: session_id,
+                            reason: format!("spawn failed: {e}"),
+                        });
                     }
                 }
             })
@@ -525,52 +934,48 @@ impl SessionManager {
         info
     }
 
-    fn close_session(&self, session_id: &str, conn_id: u64) -> Result<(), String> {
-        let removed = {
-            let mut sessions = self.lock_sessions();
-            match sessions.get(session_id) {
-                Some(s) if s.owner == Some(conn_id) => {
-                    // Dropping ManagedSession drops AcpChannelClient → kills subprocess.
-                    let session = sessions.remove(session_id);
-                    // Explicit close = intentional end of life: delete the
-                    // durable WAL so this session is NOT recovered on the next
-                    // start. (Crash/disconnect leave the WAL; only an explicit
-                    // close removes it.)
-                    if let Some(wal) = session.and_then(|s| s.wal) {
-                        wal.remove();
-                    }
-                    true
+    fn do_close(&mut self, session_id: &str, conn_id: u64) -> Result<(), String> {
+        match self.sessions.get(session_id) {
+            Some(s) if s.owner == Some(conn_id) => {
+                // Removing the session drops its TransportHandle (prompt_tx
+                // clone). The owning pump observes the close (inlet still open
+                // but no map entry → its generation check / disconnect breaks it)
+                // and drops its client off-actor. Bump gen_watch so any owning
+                // pump wakes immediately to self-terminate.
+                let session = self.sessions.remove(session_id);
+                if let Some(s) = &session {
+                    let _ = s.gen_watch.send_replace(s.channel_generation.wrapping_add(1));
                 }
-                Some(_) => return Err("only the session owner can close the session".into()),
-                None => return Err(format!("no such session: {session_id}")),
+                // Explicit close = intentional end of life: delete the durable
+                // WAL so this session is NOT recovered on the next start.
+                if let Some(wal) = session.and_then(|s| s.wal) {
+                    wal.remove();
+                }
+                let _ = self.events.send(Notification::SessionClosed {
+                    session_id: session_id.to_string(),
+                });
+                Ok(())
             }
-        };
-        if removed {
-            // Tell every connection to drop this session from its list — the
-            // owner that closed it *and* any observer panels / other GUIs.
-            let _ = self.events.send(Notification::SessionClosed {
-                session_id: session_id.to_string(),
-            });
+            Some(_) => Err("only the session owner can close the session".into()),
+            None => Err(format!("no such session: {session_id}")),
         }
-        Ok(())
     }
 
-    /// Attach a connection to a session. `Owner` mode requires the session
-    /// to have no current owner (or already be owned by this connection);
-    /// `Observer` mode always succeeds and never touches ownership. Returns
-    /// the live broadcast receiver plus the current event-log length (the
-    /// forwarder re-derives the actual transcript by tailing `event_log` from
-    /// index 0, so the bytes never need to leave the lock — only the count, for
-    /// the attach log line). Subscribing while holding the lock keeps the
-    /// replay/live-subscription seam gap-free.
-    fn attach(
-        &self,
+    fn do_attach(
+        &mut self,
         session_id: &str,
         mode: AttachMode,
         conn_id: u64,
-    ) -> Result<(broadcast::Receiver<Notification>, usize), String> {
-        let mut sessions = self.lock_sessions();
-        let session = sessions
+    ) -> Result<
+        (
+            watch::Receiver<bool>,
+            watch::Receiver<Arc<Vec<Notification>>>,
+            usize,
+        ),
+        String,
+    > {
+        let session = self
+            .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
         if mode == AttachMode::Owner {
@@ -587,15 +992,15 @@ impl SessionManager {
                 }
             }
         }
-        let rx = session.event_tx.subscribe();
+        let owner_rx = session.owner_tx.subscribe();
+        let log_rx = session.log_tx.subscribe();
         let log_len = session.event_log.len();
-        Ok((rx, log_len))
+        Ok((owner_rx, log_rx, log_len))
     }
 
-    /// An observer claims ownership of a currently-unowned session.
-    fn promote(&self, session_id: &str, conn_id: u64) -> Result<(), String> {
-        let mut sessions = self.lock_sessions();
-        let session = sessions
+    fn do_promote(&mut self, session_id: &str, conn_id: u64) -> Result<(), String> {
+        let session = self
+            .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
         match session.owner {
@@ -609,12 +1014,9 @@ impl SessionManager {
         }
     }
 
-    /// Detach a connection. If it was the owner, ownership is released and an
-    /// `OwnerChanged` is broadcast so observers can promote. Observer detach
-    /// is a no-op on ownership (the dropped receiver cleans itself up).
-    fn detach(&self, session_id: &str, conn_id: u64) -> Result<(), String> {
-        let mut sessions = self.lock_sessions();
-        let session = sessions
+    fn do_detach(&mut self, session_id: &str, conn_id: u64) -> Result<(), String> {
+        let session = self
+            .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
         if session.owner == Some(conn_id) {
@@ -624,32 +1026,23 @@ impl SessionManager {
         Ok(())
     }
 
-    fn prompt(&self, session_id: &str, text: &str, conn_id: u64) -> Result<(), String> {
-        let mut sessions = self.lock_sessions();
-        let session = sessions
+    fn do_prompt(&mut self, session_id: &str, text: &str, conn_id: u64) -> Result<(), String> {
+        let session = self
+            .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
         if session.owner != Some(conn_id) {
             return Err("only the session owner can send prompts".into());
         }
-
         // Log the user's prompt so re-attaching GUIs can replay it (and so it
         // survives a crash — UserPrompt is a turn boundary that fsyncs). Only
-        // appended to event_log + WAL, not broadcast — the live GUI already
-        // inserted the text locally in submit_chatbox before calling prompt().
-        // Broadcasting would duplicate it.
+        // appended to event_log + WAL, not broadcast.
         session.log_only(Notification::UserPrompt {
             session_id: session_id.to_string(),
             text: text.to_string(),
         });
-
-        // If the ACP subprocess is still spawning, queue the prompt; the
-        // create-session worker drains `pending_prompts` and forwards them
-        // as soon as the channel is live. Otherwise send straight through.
-        match session.channel.as_mut() {
-            Some(channel) => channel
-                .send(text)
-                .map_err(|e| format!("send failed: {e}")),
+        match session.channel.as_ref() {
+            Some(channel) => channel.send(text).map_err(|e| format!("send failed: {e}")),
             None => {
                 session.pending_prompts.push(text.to_string());
                 Ok(())
@@ -657,12 +1050,9 @@ impl SessionManager {
         }
     }
 
-    /// Interrupt the in-flight turn. Owner-only, like `prompt`. Best-effort:
-    /// if the ACP subprocess is still spawning (no channel yet) there is
-    /// nothing in flight to cancel, so it's a no-op.
-    fn cancel(&self, session_id: &str, conn_id: u64) -> Result<(), String> {
-        let mut sessions = self.lock_sessions();
-        let session = sessions
+    fn do_cancel(&mut self, session_id: &str, conn_id: u64) -> Result<(), String> {
+        let session = self
+            .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
         if session.owner != Some(conn_id) {
@@ -674,17 +1064,10 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Hard recovery: kill the agent subprocess and respawn it, resuming the
-    /// same ACP session so prior context survives. The escalation when a
-    /// graceful `cancel` won't unstick a turn wedged on a hung upstream
-    /// request. The new channel is spawned off-thread (blocking handshake)
-    /// and swapped in atomically once ready, so the pump never observes a
-    /// gap and the old (wedged) subprocess stays up until the replacement is
-    /// live. Owner-only.
-    fn restart_session(self: &Arc<Self>, session_id: &str, conn_id: u64) -> Result<(), String> {
+    fn do_restart(&mut self, session_id: &str, conn_id: u64) -> Result<(), String> {
         let (cwd, resume_id) = {
-            let sessions = self.lock_sessions();
-            let session = sessions
+            let session = self
+                .sessions
                 .get(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
             if session.owner != Some(conn_id) {
@@ -694,13 +1077,15 @@ impl SessionManager {
             (session.cwd.clone(), resume)
         };
 
-        let manager = Arc::clone(self);
+        let cmd_tx = self.cmd_tx.clone();
         let sid = session_id.to_string();
         std::thread::Builder::new()
             .name(format!("acp-restart-{}", &sid[..8.min(sid.len())]))
             .spawn(move || {
-                // SAFETY: dedicated spawn thread; see create_session.
-                unsafe { std::env::set_var("SKETCH_SESSION_MANAGED", "1"); }
+                // SAFETY: dedicated spawn thread; see do_create.
+                unsafe {
+                    std::env::set_var("SKETCH_SESSION_MANAGED", "1");
+                }
                 let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
                 match AcpChannelClient::spawn_with_resume_in(
                     &cmd,
@@ -709,31 +1094,15 @@ impl SessionManager {
                     SketchFrontend::Gpui,
                 ) {
                     Ok(client) => {
-                        // Swap via the shared choreography (9′): re-apply the
-                        // permission policy, drain queued prompts (the fix —
-                        // restart previously dropped prompts queued mid-restart),
-                        // and bump generation (is_respawn=true). The pump never
-                        // sees a None channel (swap is under the lock); the OLD
-                        // channel is dropped AFTER releasing the lock — its Drop
-                        // joins the worker / kills the child and must not run
-                        // under the mutex.
-                        let old = {
-                            let mut sessions = manager.lock_sessions();
-                            match sessions.get_mut(&sid) {
-                                Some(s) => s.apply_channel_state(client, true),
-                                None => Some(client),
-                            }
-                        };
-                        drop(old);
+                        // is_respawn=true bumps generation + gen_watch so the OLD
+                        // pump self-terminates and drops its client off-actor.
+                        publish_channel(&cmd_tx, &sid, client, true);
                     }
                     Err(e) => {
-                        let mut sessions = manager.lock_sessions();
-                        if let Some(s) = sessions.get_mut(&sid) {
-                            s.record(Notification::SessionDetached {
-                                session_id: sid.clone(),
-                                reason: format!("restart failed: {e}"),
-                            });
-                        }
+                        let _ = cmd_tx.send(Command::SpawnFailed {
+                            sid,
+                            reason: format!("restart failed: {e}"),
+                        });
                     }
                 }
             })
@@ -741,15 +1110,14 @@ impl SessionManager {
         Ok(())
     }
 
-    fn rename_session(&self, session_id: &str, label: String) -> Result<(), String> {
+    fn do_rename(&mut self, session_id: &str, label: String) -> Result<(), String> {
         {
-            let mut sessions = self.lock_sessions();
-            let session = sessions
+            let session = self
+                .sessions
                 .get_mut(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
             session.label = label.clone();
         }
-        // Propagate the new label to every panel and every GUI instance.
         let _ = self.events.send(Notification::SessionRenamed {
             session_id: session_id.to_string(),
             label,
@@ -757,14 +1125,14 @@ impl SessionManager {
         Ok(())
     }
 
-    fn set_permission_mode(
-        &self,
+    fn do_set_permission_mode(
+        &mut self,
         session_id: &str,
         mode: PermissionMode,
         conn_id: u64,
     ) -> Result<(), String> {
-        let mut sessions = self.lock_sessions();
-        let session = sessions
+        let session = self
+            .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
         if session.owner != Some(conn_id) {
@@ -776,73 +1144,153 @@ impl SessionManager {
         }
         Ok(())
     }
+
+    fn do_admin_status(&self) -> AdminSnapshot {
+        let infos = self
+            .sessions
+            .values()
+            .map(|s| AdminSessionInfo {
+                session_id: s.id.clone(),
+                label: s.label.clone(),
+                connected: s.channel.is_some(),
+                has_owner: s.owner.is_some(),
+                owner_conn_id: s.owner,
+                turns: s.turns,
+                event_log_len: s.event_log.len(),
+                subscriber_count: s.log_tx.receiver_count(),
+                channel_generation: s.channel_generation,
+                permission_mode: s.permission_mode,
+            })
+            .collect();
+        AdminSnapshot {
+            session_count: self.sessions.len(),
+            sessions: infos,
+        }
+    }
 }
 
 // ── Session pump task ──────────────────────────────────────────────
 
-/// Background thread that drains `ReplyEvent`s from an `AcpChannelClient`
-/// and broadcasts them as `Notification`s to attached GUIs.
+/// Publish a freshly-spawned `AcpChannelClient` as a session's live transport,
+/// from a (blocking) spawn worker thread:
 ///
-/// Runs on a dedicated OS thread (not a tokio task) because
-/// `AcpChannelClient` contains `std::sync::mpsc::Receiver` which isn't
-/// `Sync`, and holding a `std::sync::Mutex` guard across `.try_recv()`
-/// is fine on a real thread but problematic across `.await` points.
-fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) {
+/// 1. Derive its [`TransportHandle`] (the Send surface the actor stores).
+/// 2. Send `PublishChannel` into the actor inlet and BLOCK on the oneshot reply.
+///    The actor installs the handle via `apply_channel_state` (drains queued
+///    prompts, re-applies permission mode, bumps generation + `gen_watch` on
+///    respawn) and replies with (committed generation, gen_watch subscription,
+///    replay fence). The actor never holds the client.
+/// 3. Spawn the OWNING pump thread with the client moved into it, stamped with
+///    that generation and wired to the gen_watch + fence.
+///
+/// On `is_respawn`, the generation bump wakes any OLD pump (via `gen_watch`) so
+/// it self-terminates and drops its own client off the actor task (Blocker A).
+/// If the session was closed mid-spawn, the client is dropped here on the
+/// worker's OWN thread (its blocking Drop never runs on the actor).
+fn publish_channel(
+    cmd_tx: &mpsc::UnboundedSender<Command>,
+    session_id: &ServerSessionId,
+    client: AcpChannelClient,
+    is_respawn: bool,
+) {
+    let handle = client.handle();
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    if cmd_tx
+        .send(Command::PublishChannel {
+            sid: session_id.clone(),
+            handle,
+            is_respawn,
+            reply,
+        })
+        .is_err()
+    {
+        drop(client); // actor gone — drop the client on this worker thread.
+        return;
+    }
+    // Blocking recv on this OS worker thread — never on the actor task.
+    match rx.blocking_recv() {
+        Ok(Some((generation, gen_rx, replay_fence))) => {
+            spawn_pump_thread(
+                cmd_tx.clone(),
+                session_id.clone(),
+                client,
+                generation,
+                gen_rx,
+                replay_fence,
+            );
+        }
+        Ok(None) | Err(_) => {
+            // Session closed while spawning (or actor gone) — drop the client
+            // here, on this worker thread (its Drop joins the worker / kills the
+            // child; must never run on the actor task).
+            drop(client);
+        }
+    }
+}
+
+/// Background thread that OWNS an `AcpChannelClient`, drains its `ReplyEvent`s,
+/// and forwards them to the actor inlet as generation-stamped `Command`s.
+///
+/// Runs on a dedicated OS thread (not a tokio task) because `AcpChannelClient`
+/// contains a `std::sync::mpsc::Receiver` which isn't `Sync`. The pump is the
+/// SOLE owner of the client: it drops it (running the blocking `Drop`) on its
+/// OWN thread when it observes a generation bump (restart) or a closed inlet
+/// (close) — never on the actor (Blocker A).
+fn spawn_pump_thread(
+    cmd_tx: mpsc::UnboundedSender<Command>,
+    session_id: ServerSessionId,
+    client: AcpChannelClient,
+    my_generation: u64,
+    gen_rx: watch::Receiver<u64>,
+    initial_replay_fence: usize,
+) {
     std::thread::Builder::new()
-        .name(format!("pump-{}", &session_id[..8]))
+        .name(format!("pump-{}", &session_id[..8.min(session_id.len())]))
         .spawn(move || {
+            // Per-session generation watch: a restart (generation bump) wakes us
+            // to self-terminate + drop the client off the actor task.
+            let gen_rx = gen_rx;
+
             let mut last_turns: usize = 0;
-            let mut synced_gen: u64 = 0;
-            // Drain-then-sleep: only park the thread when a full cycle
-            // produced no work, so the first token of a turn isn't held
-            // for a fixed tick. When a cycle drains events (or more remain
-            // queued past our budget) we loop immediately. Mirrors the GUI
-            // pump's `more_pending` fast-loop.
+            // Local mirror of the session's replay fence. Suppression decisions
+            // stay pump-side (cycle granularity); the actor only sees Records
+            // that should be logged.
+            let mut replay_fence: usize = initial_replay_fence;
+
             const PUMP_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(16);
 
             loop {
-                let mut sessions = manager.lock_sessions();
-                let Some(session) = sessions.get_mut(&session_id) else {
-                    return; // Session was closed.
-                };
-                // A force-restart swapped in a fresh channel whose turn
-                // counter restarts at 0 — rebaseline so we don't wait for it
-                // to climb past the old channel's count before firing
-                // turn-end again.
-                if session.channel_generation != synced_gen {
-                    synced_gen = session.channel_generation;
-                    last_turns = 0;
+                // A newer generation means a restart (or close) superseded us —
+                // break and drop the client off the actor task.
+                if *gen_rx.borrow() > my_generation {
+                    break;
                 }
-                let Some(channel) = &session.channel else {
-                    drop(sessions);
-                    std::thread::sleep(PUMP_IDLE_SLEEP); // Not yet spawned — idle.
-                    continue;
-                };
+                // Inlet closed (manager gone) — terminate.
+                if cmd_tx.is_closed() {
+                    break;
+                }
 
-                // Check liveness.
-                if !channel.is_connected() {
-                    session.record(Notification::SessionDetached {
-                        session_id: session_id.clone(),
-                        reason: "agent disconnected".into(),
+                // Liveness.
+                if !client.is_connected() {
+                    let _ = cmd_tx.send(Command::AgentDisconnected {
+                        sid: session_id.clone(),
+                        generation: my_generation,
                     });
-                    session.channel = None;
-                    return;
+                    break;
                 }
 
-                // Drain events up to a budget. If we hit the budget and
-                // more events are pending, defer turn-end detection to a
-                // later cycle so we don't fire it before all of this turn's
-                // chunks have been broadcast.
+                // Drain events up to a budget. If we hit the budget and more
+                // events are pending, defer turn-end detection to a later cycle.
                 const PUMP_EVENT_BUDGET: usize = 64;
                 let mut events = Vec::new();
                 while events.len() < PUMP_EVENT_BUDGET {
-                    match channel.try_recv() {
+                    match client.try_recv() {
                         Some(ev) => events.push(ev),
                         None => break,
                     }
                 }
                 let more_pending = events.len() == PUMP_EVENT_BUDGET
-                    && match channel.try_recv() {
+                    && match client.try_recv() {
                         Some(ev) => {
                             events.push(ev);
                             true
@@ -850,107 +1298,91 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                         None => false,
                     };
 
-                let current_turns = channel.turn_count();
-                // Turn ended when (a) the queue is fully drained for this
-                // cycle and (b) the ACP driver loop has bumped the turn
-                // counter past what we last reported. Mirrors the direct
-                // path in sketch-gpui's per-session pump.
+                let current_turns = client.turn_count();
                 let turn_ended = !more_pending && current_turns > last_turns;
 
-                // If the turn ended, drain any tail events that landed between
-                // our budget drain and the `turn_count()` read *now*, while the
-                // `&session.channel` borrow is still free. Collecting here ends
-                // that borrow before the `session.record` calls below (which
-                // need `&mut session`); the tail is recorded after the budget
-                // events and before TurnEnded, preserving log order.
                 let tail_events: Vec<sketch::acp_channel::ReplyEvent> = if turn_ended {
-                    std::iter::from_fn(|| channel.try_recv()).collect()
+                    std::iter::from_fn(|| client.try_recv()).collect()
                 } else {
                     Vec::new()
                 };
 
                 // ── Replay fence: suppress duplicate events ──────────
-                // When a session is restored from disk, the persisted
-                // event_log already contains all events up to
-                // `replay_fence` turns. The freshly-spawned ACP agent
-                // replays those same turns as new ReplyEvents. We drain
-                // them (so the channel doesn't back up) but skip logging
-                // and broadcasting until the agent moves past the fence.
-                let fence = session.replay_fence;
-                if fence > 0 && current_turns <= fence {
-                    // Still replaying — discard events silently.
+                // A restored/resumed session replays prior turns. Drain them
+                // (so the channel doesn't back up) but emit no Records until the
+                // agent moves past the fence. The fence-clear is signalled to
+                // the actor via a TurnCount whose `turns <= replay_fence`.
+                if replay_fence > 0 && current_turns <= replay_fence {
                     let drained = !events.is_empty();
                     if turn_ended {
                         last_turns = current_turns;
-                        if current_turns == fence {
-                            // Replay complete — clear the fence so
-                            // subsequent turns log normally.
-                            session.replay_fence = 0;
+                        if current_turns == replay_fence {
+                            // Replay complete — tell the actor to clear the
+                            // session's fence (no TurnEnded for a replay turn).
+                            let _ = cmd_tx.send(Command::TurnCount {
+                                sid: session_id.clone(),
+                                generation: my_generation,
+                                turns: current_turns,
+                            });
+                            replay_fence = 0;
                             tracing::info!(
-                                session_id = %&session_id[..8],
+                                session_id = %&session_id[..8.min(session_id.len())],
                                 turn = current_turns,
                                 "replay fence cleared"
                             );
                         }
                     }
-                    drop(sessions);
-                    // Drained discarded replay events this cycle (or more are
-                    // queued past the budget) → loop immediately; otherwise idle.
                     if !drained && !more_pending {
                         std::thread::sleep(PUMP_IDLE_SLEEP);
                     }
                     continue;
                 }
 
-                // Did this cycle produce any work? Drives drain-then-sleep.
                 let drained_events = !events.is_empty();
 
-                // Broadcast events first.
+                // Forward events first (in order).
                 for ev in events {
                     if std::env::var("SKETCH_CHUNKLOG").is_ok() {
                         if let sketch::acp_channel::ReplyEvent::Chunk(t) = &ev {
-                            // info! so the SKETCH_CHUNKLOG env gate alone re-enables
-                            // it (the default env-filter is "info"); otherwise this
-                            // dev trace would silently also require RUST_LOG=debug.
                             tracing::info!("[chunklog srv] {t:?}");
                         }
                     }
-                    session.record(Notification::ReplyEvent {
-                        session_id: session_id.clone(),
+                    let _ = cmd_tx.send(Command::Record {
+                        sid: session_id.clone(),
+                        generation: my_generation,
                         event: ev,
                     });
                 }
 
                 if turn_ended {
-                    // Tail events were drained above (while the channel borrow
-                    // was free); record them before TurnEnded closes the turn.
+                    // Tail events recorded after budget events, before TurnEnded.
                     for ev in tail_events {
-                        session.record(Notification::ReplyEvent {
-                            session_id: session_id.clone(),
+                        let _ = cmd_tx.send(Command::Record {
+                            sid: session_id.clone(),
+                            generation: my_generation,
                             event: ev,
                         });
                     }
                     last_turns = current_turns;
-                    session.turns = current_turns;
-                    session.record(Notification::TurnEnded {
-                        session_id: session_id.clone(),
-                        turn_count: current_turns,
-                        generation: session.channel_generation,
+                    let _ = cmd_tx.send(Command::TurnCount {
+                        sid: session_id.clone(),
+                        generation: my_generation,
+                        turns: current_turns,
                     });
                 }
 
-                drop(sessions);
-
-                // Sleep ONLY when this cycle was fully idle: no events drained,
-                // no more queued past the budget, and no turn-end fired. When we
-                // did real work, loop immediately — more may already be queued.
                 if !drained_events && !more_pending && !turn_ended {
                     std::thread::sleep(PUMP_IDLE_SLEEP);
                 }
             }
+
+            // Drop the client on THIS thread (blocking Drop: kills child +
+            // joins worker). Never runs on the actor task (Blocker A).
+            drop(client);
         })
         .ok();
 }
+
 
 // ── Connection handler ─────────────────────────────────────────────
 
@@ -1025,7 +1457,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
             },
 
             Request::ListSessions => {
-                let sessions = manager.list_sessions();
+                let sessions = manager.send_list_sessions().await;
                 Response::Ok {
                     data: ResponseData::Sessions { sessions },
                 }
@@ -1036,15 +1468,15 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 label,
                 resume_session_id,
             } => {
-                let info = manager.create_session(cwd, label, resume_session_id);
+                let info = manager.send_create(cwd, label, resume_session_id).await;
                 Response::Ok {
                     data: ResponseData::Session { session: info },
                 }
             }
 
             Request::Attach { session_id, mode } => {
-                match manager.attach(&session_id, mode, conn_id) {
-                    Ok((rx, replay_len)) => {
+                match manager.send_attach(&session_id, mode, conn_id).await {
+                    Ok((owner_rx, log_rx, replay_len)) => {
                         // No explicit replay write here anymore: the forwarder
                         // tails `event_log` from index 0, so it streams the
                         // full history and then live events over one ordered,
@@ -1061,7 +1493,8 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                             Arc::clone(&manager),
                             session_id.clone(),
                             w,
-                            rx,
+                            owner_rx,
+                            log_rx,
                         ));
                         subscribed.insert(session_id, handle);
                         Response::Ok {
@@ -1076,7 +1509,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 if let Some(handle) = subscribed.remove(&session_id) {
                     handle.abort();
                 }
-                match manager.detach(&session_id, conn_id) {
+                match manager.send_detach(&session_id, conn_id).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },
@@ -1085,7 +1518,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
             }
 
             Request::Promote { session_id } => {
-                match manager.promote(&session_id, conn_id) {
+                match manager.send_promote(&session_id, conn_id).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },
@@ -1094,7 +1527,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
             }
 
             Request::Prompt { session_id, text } => {
-                match manager.prompt(&session_id, &text, conn_id) {
+                match manager.send_prompt(&session_id, &text, conn_id).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },
@@ -1103,7 +1536,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
             }
 
             Request::Cancel { session_id } => {
-                match manager.cancel(&session_id, conn_id) {
+                match manager.send_cancel(&session_id, conn_id).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },
@@ -1112,7 +1545,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
             }
 
             Request::RestartSession { session_id } => {
-                match manager.restart_session(&session_id, conn_id) {
+                match manager.send_restart(&session_id, conn_id).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },
@@ -1121,7 +1554,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
             }
 
             Request::SetPermissionMode { session_id, mode } => {
-                match manager.set_permission_mode(&session_id, mode, conn_id) {
+                match manager.send_set_permission_mode(&session_id, mode, conn_id).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },
@@ -1133,7 +1566,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 if let Some(handle) = subscribed.remove(&session_id) {
                     handle.abort();
                 }
-                match manager.close_session(&session_id, conn_id) {
+                match manager.send_close(&session_id, conn_id).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },
@@ -1142,7 +1575,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
             }
 
             Request::RenameSession { session_id, label } => {
-                match manager.rename_session(&session_id, label) {
+                match manager.send_rename(&session_id, label).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },
@@ -1152,7 +1585,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
 
             Request::AdminStatus => Response::Ok {
                 data: ResponseData::AdminStatus {
-                    snapshot: manager.admin_status(),
+                    snapshot: manager.send_admin_status().await,
                 },
             },
         };
@@ -1182,17 +1615,9 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
     // broadcasts OwnerChanged so an observing candidate GUI can promote.
     for (sid, handle) in &subscribed {
         handle.abort();
-        let _ = manager.detach(sid, conn_id);
+        let _ = manager.send_detach(sid, conn_id).await;
     }
     manager_events.abort();
-}
-
-/// True for notifications that are recorded in `event_log` (the durable
-/// transcript). `OwnerChanged` is the lone exception — it's transient
-/// connection state, broadcast-only, and must be forwarded directly since
-/// the log-tailing path below will never carry it.
-fn is_logged(note: &Notification) -> bool {
-    !matches!(note, Notification::OwnerChanged { .. })
 }
 
 /// Forward a session's notifications to one GUI connection's writer.
@@ -1207,108 +1632,119 @@ fn is_logged(note: &Notification) -> bool {
 /// subsumes the attach-time replay, so history and live stream share one
 /// ordered path with no replay/live seam.
 async fn forward_notifications(
-    manager: Arc<SessionManager>,
+    _manager: Arc<SessionManager>,
     session_id: ServerSessionId,
     writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    mut rx: broadcast::Receiver<Notification>,
+    mut owner_rx: watch::Receiver<bool>,
+    mut log_rx: watch::Receiver<Arc<Vec<Notification>>>,
 ) {
     // Number of `event_log` entries already written to this client.
     let mut sent = 0usize;
 
-    loop {
-        // 1. Tail: flush any logged events appended since we last sent.
-        //    Snapshot under the lock, then release it before awaiting the
-        //    socket write (never hold a std Mutex across `.await`).
-        let new: Vec<Notification> = {
-            let sessions = manager.lock_sessions();
-            match sessions.get(&session_id) {
-                Some(s) if s.event_log.len() > sent => s.event_log[sent..].to_vec(),
-                Some(_) => Vec::new(),
-                None => return, // session gone
-            }
-        };
-        if !new.is_empty() {
-            // Serialize the whole tail snapshot into one buffer and issue a
-            // single write — same bytes/order, far fewer syscalls under
-            // streaming. (Failed serializations are skipped, as before.)
-            let mut buf = String::new();
-            for note in &new {
-                let frame = Frame::Notification { note: note.clone() };
-                if let Ok(line) = serde_json::to_string(&frame) {
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
-            }
-            let mut w = writer.lock().await;
-            if w.write_all(buf.as_bytes()).await.is_err() {
-                tracing::warn!(
-                    session_id = %&session_id[..8.min(session_id.len())],
-                    sent,
-                    this_pass = new.len(),
-                    "forwarder write failed — client gone"
-                );
+    // First pass: `watch::Sender::subscribe()` marks the current value as
+    // already-seen, so the initial transcript replay IS the first tail. Mark
+    // the current snapshot seen with `borrow_and_update()` and tail it from
+    // index 0 to subsume attach replay (no separate replay path).
+    {
+        let snapshot = log_rx.borrow_and_update().clone();
+        if snapshot.len() > sent {
+            if !flush_tail(&writer, &session_id, &snapshot[sent..]).await {
                 return;
             }
-            drop(w);
-            sent += new.len();
+            sent = snapshot.len();
         }
+    }
 
-        // 2. Wait for a wake.
-        match rx.recv().await {
-            Ok(note) => {
-                // Transient, never-logged notifications (OwnerChanged) must be
-                // forwarded straight through — the tail above can't see them.
-                // Logged notifications are ignored here; the next loop's tail
-                // delivers them exactly once, in log order.
-                if !is_logged(&note) {
-                    let frame = Frame::Notification { note };
-                    if let Ok(mut line) = serde_json::to_string(&frame) {
-                        line.push('\n');
-                        let mut w = writer.lock().await;
-                        if w.write_all(line.as_bytes()).await.is_err() {
-                            return;
+    // Once the control (OwnerChanged) channel closes, stop selecting on it so
+    // a closed broadcast doesn't busy-loop; keep serving the transcript log.
+    let mut owner_open = true;
+
+    loop {
+        tokio::select! {
+            // Transcript log channel: a new snapshot was published. Tail the
+            // latest snapshot lock-free from the cloned `Arc` — no manager lock
+            // in the hot path. Coalesced wakes self-heal: we always tail
+            // [sent..] of whatever the latest snapshot is.
+            changed = log_rx.changed() => {
+                match changed {
+                    Ok(()) => {
+                        let snapshot = log_rx.borrow_and_update().clone();
+                        if snapshot.len() > sent {
+                            if !flush_tail(&writer, &session_id, &snapshot[sent..]).await {
+                                return;
+                            }
+                            sent = snapshot.len();
                         }
                     }
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                // Harmless now: the wake was dropped but the data lives in
-                // event_log, which the next tail pass recovers in full.
-                tracing::warn!(
-                    lagged = n,
-                    "subscriber lagged — recovering missed events from event_log"
-                );
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                // Producer gone (session closing). One final tail to flush any
-                // trailing logged events, then exit.
-                let tail: Vec<Notification> = {
-                    let sessions = manager.lock_sessions();
-                    match sessions.get(&session_id) {
-                        Some(s) if s.event_log.len() > sent => {
-                            s.event_log[sent..].to_vec()
+                    Err(_) => {
+                        // Sender dropped (session closing). One final tail of
+                        // the last snapshot, then exit.
+                        let snapshot = log_rx.borrow().clone();
+                        if snapshot.len() > sent {
+                            let _ = flush_tail(&writer, &session_id, &snapshot[sent..]).await;
                         }
-                        _ => Vec::new(),
-                    }
-                };
-                if !tail.is_empty() {
-                    let mut buf = String::new();
-                    for note in &tail {
-                        let frame = Frame::Notification { note: note.clone() };
-                        if let Ok(line) = serde_json::to_string(&frame) {
-                            buf.push_str(&line);
-                            buf.push('\n');
-                        }
-                    }
-                    let mut w = writer.lock().await;
-                    if w.write_all(buf.as_bytes()).await.is_err() {
                         return;
                     }
                 }
-                return;
+            }
+
+            // Control channel: ownership state (watch<bool>). On change,
+            // synthesize a single `OwnerChanged` control note and forward it —
+            // the only control note, never logged.
+            changed = owner_rx.changed(), if owner_open => {
+                match changed {
+                    Ok(()) => {
+                        let has_owner = *owner_rx.borrow_and_update();
+                        let frame = Frame::Notification {
+                            note: Notification::OwnerChanged {
+                                session_id: session_id.clone(),
+                                has_owner,
+                            },
+                        };
+                        if let Ok(mut line) = serde_json::to_string(&frame) {
+                            line.push('\n');
+                            let mut w = writer.lock().await;
+                            if w.write_all(line.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Control channel closed: keep serving the transcript
+                        // log channel until IT closes.
+                        owner_open = false;
+                    }
+                }
             }
         }
     }
+}
+
+/// Serialize and write a tail slice of notifications in one buffered write.
+/// Returns `false` if the write failed (client gone).
+async fn flush_tail(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    session_id: &str,
+    tail: &[Notification],
+) -> bool {
+    let mut buf = String::new();
+    for note in tail {
+        let frame = Frame::Notification { note: note.clone() };
+        if let Ok(line) = serde_json::to_string(&frame) {
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+    }
+    let mut w = writer.lock().await;
+    if w.write_all(buf.as_bytes()).await.is_err() {
+        tracing::warn!(
+            session_id = %&session_id[..8.min(session_id.len())],
+            this_pass = tail.len(),
+            "forwarder write failed — client gone"
+        );
+        return false;
+    }
+    true
 }
 
 // ── Main ─────────────────────────────────────────���─────────────────
@@ -1393,10 +1829,31 @@ async fn main() -> io::Result<()> {
         "loaded config"
     );
 
-    let manager = Arc::new(SessionManager::new(default_permission_mode));
+    let (mgr, cmd_rx, default_permission_mode) =
+        SessionManager::new_with_inlet(default_permission_mode);
+    let manager = Arc::new(mgr);
 
-    // Restore sessions from a prior run, if any.
-    manager.restore_from_disk();
+    // Recover sessions from a prior run BEFORE the actor starts (recovery must
+    // precede the accept loop). The seed map is moved into the actor; the resume
+    // jobs spawn workers that re-spawn ACP subprocesses and post `PublishChannel`
+    // back into the actor once it's running.
+    let (seed_sessions, resume_jobs) = restore_seed_from_disk();
+
+    // Spawn the single-writer manager actor: it OWNS the sessions map and drains
+    // the inlet (external requests, spawn-worker publishes, pump-sourced records)
+    // one command at a time.
+    tokio::spawn(run_manager(
+        cmd_rx,
+        seed_sessions,
+        manager.events.clone(),
+        default_permission_mode,
+        manager.cmd_tx.clone(),
+    ));
+
+    // Now the actor is running, kick off the resume workers.
+    for job in resume_jobs {
+        spawn_resume_worker(manager.cmd_tx.clone(), job);
+    }
 
     // Handle graceful shutdown — persist sessions before exiting.
     // Listen for both SIGINT (Ctrl-C) and SIGTERM (kill / process manager).
@@ -1441,7 +1898,7 @@ async fn main() -> io::Result<()> {
         // so a "reconnect" surfaces here as conn_id > 1 and/or pre-existing
         // sessions — the session count is what tells you the client rejoined
         // live state rather than starting cold.
-        let active_sessions = manager.lock_sessions().len();
+        let active_sessions = manager.send_session_count().await;
         if conn_id == 1 {
             tracing::info!(
                 conn_id,
@@ -1456,39 +1913,5 @@ async fn main() -> io::Result<()> {
             );
         }
         tokio::spawn(handle_connection(stream, mgr, conn_id));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sketch::acp_channel::DEFAULT_PERMISSION_MODE;
-
-    /// The cascade guard: once any holder panics while holding the sessions
-    /// lock the std `Mutex` is poisoned, and a plain `.lock().unwrap()` at every
-    /// other site would then panic too — one stray panic killing every session.
-    /// `lock_sessions()` must recover the guard so the server keeps serving.
-    #[test]
-    fn lock_sessions_recovers_from_a_poisoned_mutex() {
-        let mgr = SessionManager::new(DEFAULT_PERMISSION_MODE);
-
-        // Poison the mutex: panic while holding the raw lock (caught so the test
-        // process survives — the panic message on stderr is expected noise).
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = mgr.sessions.lock().unwrap();
-            panic!("boom while holding the sessions lock");
-        }));
-        assert!(res.is_err(), "the critical section must have panicked");
-        assert!(mgr.sessions.is_poisoned(), "the mutex must now be poisoned");
-
-        // A plain `.lock().unwrap()` here would cascade-panic; the helper must
-        // hand back a usable, intact map instead (no torn state — the panic
-        // happened before any insert).
-        let guard = mgr.lock_sessions();
-        assert!(guard.is_empty(), "recovered map is intact");
-        drop(guard);
-
-        // Recovery is durable, not one-shot: subsequent accesses keep working.
-        assert!(mgr.lock_sessions().is_empty(), "server keeps serving after poison");
     }
 }
