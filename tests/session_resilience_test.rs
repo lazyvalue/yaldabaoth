@@ -27,8 +27,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use sketch::acp_channel::PermissionMode;
 use sketch::session_client::SessionServerClient;
-use sketch::session_proto::{socket_path, AttachMode};
+use sketch::session_proto::{socket_path, AdminSnapshot, AttachMode};
 
 /// A running server instance bound to a private socket, with its stderr
 /// captured to a file we can scan for connect/disconnect lines.
@@ -332,6 +333,198 @@ fn second_server_does_not_steal_socket() {
     assert!(
         sessions.iter().any(|s| s.session_id == sid),
         "original session lost — socket was stolen; log:\n{}",
+        server.read_log()
+    );
+}
+
+/// Security default at the wire level: a freshly created session must come back
+/// in the SAFE permission mode (AskEachTime), proving the server no longer
+/// hands out Yolo by default. Then the owner explicitly escalates to Yolo and
+/// that change must be reflected in the session's reported mode — pinning the
+/// "safe by default, user-escalated" contract end to end.
+#[test]
+fn new_session_defaults_to_safe_permission_mode() {
+    let _g = serial_lock();
+    let server = TestServer::start();
+    server.activate_env();
+
+    let client = SessionServerClient::connect().expect("connect");
+    let info = client
+        .create_session(std::env::temp_dir(), "perms".into(), None)
+        .expect("create_session");
+    assert_eq!(
+        info.permission_mode,
+        PermissionMode::AskEachTime,
+        "new session must start in the safe default mode, not Yolo; log:\n{}",
+        server.read_log()
+    );
+
+    // Escalation is an explicit owner action. Attach as Owner first (the server
+    // only honours mode changes from the owner), then flip to Yolo.
+    client
+        .attach(&info.session_id, AttachMode::Owner)
+        .expect("attach owner");
+    client
+        .set_permission_mode(&info.session_id, PermissionMode::Yolo)
+        .expect("set_permission_mode Yolo");
+
+    // The new mode must be reflected in the session metadata.
+    let sessions = client.list_sessions().expect("list after escalate");
+    let s = sessions
+        .iter()
+        .find(|s| s.session_id == info.session_id)
+        .expect("session present after escalate");
+    assert_eq!(
+        s.permission_mode,
+        PermissionMode::Yolo,
+        "explicit escalation to Yolo not reflected; log:\n{}",
+        server.read_log()
+    );
+}
+
+/// The 0600 contract, pinned (not just code-read): the server socket must be
+/// owner-only the moment it is connectable, so no other local user can reach
+/// the session-driving surface. Asserts the actual on-disk mode bits.
+#[test]
+fn server_socket_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let _g = serial_lock();
+    let server = TestServer::start();
+    let mode = std::fs::metadata(&server.socket)
+        .expect("stat socket")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "session-server socket must be 0600 (owner-only), got {mode:o}; log:\n{}",
+        server.read_log()
+    );
+}
+
+/// The escalation gate is owner-only: a connection that does NOT own the
+/// session cannot flip its permission mode. Pins the other half of the
+/// "safe by default, only the owner escalates" contract.
+#[test]
+fn non_owner_cannot_change_permission_mode() {
+    let _g = serial_lock();
+    let server = TestServer::start();
+    server.activate_env();
+
+    let client = SessionServerClient::connect().expect("connect");
+    let info = client
+        .create_session(std::env::temp_dir(), "perms-gate".into(), None)
+        .expect("create_session");
+
+    // No Owner attach → not the owner → escalation must be rejected, and the
+    // mode must stay at the safe default.
+    let res = client.set_permission_mode(&info.session_id, PermissionMode::Yolo);
+    assert!(
+        res.is_err(),
+        "non-owner was allowed to escalate permission mode; log:\n{}",
+        server.read_log()
+    );
+    let sessions = client.list_sessions().expect("list");
+    let s = sessions
+        .iter()
+        .find(|s| s.session_id == info.session_id)
+        .expect("session present");
+    assert_eq!(
+        s.permission_mode,
+        PermissionMode::AskEachTime,
+        "rejected escalation must leave the safe default intact; log:\n{}",
+        server.read_log()
+    );
+}
+
+/// The diagnostic `admin_status` verb: a read-only snapshot of every managed
+/// session's live server-side state. Asserts the snapshot is empty before any
+/// session exists, tracks created sessions (with the safe default permission
+/// mode), and reflects ownership + subscriber count once an Owner attaches.
+#[test]
+fn admin_status_reports_live_sessions() {
+    let _g = serial_lock();
+    let server = TestServer::start();
+    server.activate_env();
+
+    let client = SessionServerClient::connect().expect("connect");
+
+    // Empty to start.
+    let snap: AdminSnapshot = client.admin_status().expect("admin_status (empty)");
+    assert_eq!(
+        snap.session_count, 0,
+        "fresh server must report zero sessions; log:\n{}",
+        server.read_log()
+    );
+    assert!(snap.sessions.is_empty(), "sessions vec must be empty too");
+
+    // Create two sessions.
+    let s1 = client
+        .create_session(std::env::temp_dir(), "admin-a".into(), None)
+        .expect("create_session a");
+    let s2 = client
+        .create_session(std::env::temp_dir(), "admin-b".into(), None)
+        .expect("create_session b");
+
+    let snap = client.admin_status().expect("admin_status (two)");
+    assert_eq!(
+        snap.session_count, 2,
+        "both sessions must appear in the snapshot; log:\n{}",
+        server.read_log()
+    );
+    assert_eq!(snap.sessions.len(), 2);
+
+    // Each created session is present with the safe default permission mode and
+    // a present (>= 0) event-log length field.
+    for sid in [&s1.session_id, &s2.session_id] {
+        let entry = snap
+            .sessions
+            .iter()
+            .find(|e| &e.session_id == sid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "created session {sid} missing from snapshot; log:\n{}",
+                    server.read_log()
+                )
+            });
+        assert_eq!(
+            entry.permission_mode,
+            PermissionMode::AskEachTime,
+            "snapshot must report the safe default permission mode; log:\n{}",
+            server.read_log()
+        );
+        // A freshly-created session (agent is /usr/bin/true → no events) has an
+        // empty transcript; the snapshot must report that, not a stale/garbage len.
+        assert_eq!(
+            entry.event_log_len, 0,
+            "fresh session should have an empty event log; log:\n{}",
+            server.read_log()
+        );
+    }
+
+    // Attach as Owner to one session, then re-snapshot: that entry must report
+    // ownership and at least one active broadcast subscriber.
+    client
+        .attach(&s1.session_id, AttachMode::Owner)
+        .expect("attach owner");
+    // Give the server a beat to register the subscriber/forwarder.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let snap = client.admin_status().expect("admin_status (after attach)");
+    let owned = snap
+        .sessions
+        .iter()
+        .find(|e| e.session_id == s1.session_id)
+        .expect("owned session present after attach");
+    assert!(
+        owned.has_owner,
+        "owned session must report has_owner == true; log:\n{}",
+        server.read_log()
+    );
+    assert!(
+        owned.subscriber_count >= 1,
+        "owned session must report >= 1 subscriber after Owner attach, got {}; log:\n{}",
+        owned.subscriber_count,
         server.read_log()
     );
 }

@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +20,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
-use sketch::acp_channel::{AcpChannelClient, PermissionMode, SketchFrontend};
+use sketch::acp_channel::{
+    AcpChannelClient, PermissionMode, SketchFrontend, DEFAULT_PERMISSION_MODE,
+};
 use sketch::session_proto::*;
 
 mod launchd;
@@ -141,9 +144,10 @@ impl ManagedSession {
                 Notification::UserPrompt { .. } | Notification::TurnEnded { .. }
             );
             if let Err(e) = wal.append(note, boundary) {
-                eprintln!(
-                    "[session-server] WAL append failed for {}: {e}",
-                    &self.id[..8.min(self.id.len())]
+                tracing::error!(
+                    session_id = %&self.id[..8.min(self.id.len())],
+                    error = %e,
+                    "WAL append failed"
                 );
             }
         }
@@ -187,7 +191,7 @@ impl ManagedSession {
         channel.set_permission_mode(self.permission_mode);
         for text in std::mem::take(&mut self.pending_prompts) {
             if let Err(e) = channel.send(&text) {
-                eprintln!("[session-server] failed to flush queued prompt: {e}");
+                tracing::error!(error = %e, "failed to flush queued prompt");
             }
         }
         let acp_session_id = channel.session_id();
@@ -227,9 +231,10 @@ fn open_session_wal(
     match sketch::session_wal::SessionWal::create(&dir, id, label, cwd, permission_mode) {
         Ok(w) => Some(w),
         Err(e) => {
-            eprintln!(
-                "[session-server] WAL create failed for {} (in-memory only): {e}",
-                &id[..8.min(id.len())]
+            tracing::error!(
+                session_id = %&id[..8.min(id.len())],
+                error = %e,
+                "WAL create failed (in-memory only)"
             );
             None
         }
@@ -261,9 +266,9 @@ impl SessionManager {
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<ServerSessionId, ManagedSession>> {
         self.sessions.lock().unwrap_or_else(|poisoned| {
-            eprintln!(
-                "[session-server] WARNING: sessions mutex was poisoned by a prior \
-                 panic; recovering the guard to keep other sessions alive"
+            tracing::warn!(
+                "sessions mutex was poisoned by a prior panic; \
+                 recovering the guard to keep other sessions alive"
             );
             poisoned.into_inner()
         })
@@ -293,9 +298,9 @@ impl SessionManager {
             // transcript is preserved but the session is inert. Drop it (and its
             // WAL) rather than leaving a zombie that can never make progress.
             let Some(acp_session_id) = rs.acp_session_id.clone() else {
-                eprintln!(
-                    "[session-server] discarding recovered {}: no acp_session_id to resume",
-                    &sid[..8.min(sid.len())],
+                tracing::warn!(
+                    session_id = %&sid[..8.min(sid.len())],
+                    "discarding recovered session: no acp_session_id to resume"
                 );
                 let _ = std::fs::remove_file(&rs.path);
                 continue;
@@ -308,7 +313,11 @@ impl SessionManager {
             let wal = match sketch::session_wal::SessionWal::reopen(rs.path.clone()) {
                 Ok(w) => Some(w),
                 Err(e) => {
-                    eprintln!("[session-server] WAL reopen failed for {}: {e}", &sid[..8.min(sid.len())]);
+                    tracing::error!(
+                        session_id = %&sid[..8.min(sid.len())],
+                        error = %e,
+                        "WAL reopen failed"
+                    );
                     None
                 }
             };
@@ -329,12 +338,12 @@ impl SessionManager {
                 wal,
             };
 
-            eprintln!(
-                "[session-server] recovering session {} ({} events, {} turns, acp {})",
-                &sid[..8.min(sid.len())],
-                session.event_log.len(),
-                rs.turns,
-                &acp_session_id[..8.min(acp_session_id.len())],
+            tracing::info!(
+                session_id = %&sid[..8.min(sid.len())],
+                events = session.event_log.len(),
+                turns = rs.turns,
+                acp_session_id = %&acp_session_id[..8.min(acp_session_id.len())],
+                "recovering session"
             );
 
             self.lock_sessions().insert(sid.clone(), session);
@@ -370,9 +379,10 @@ impl SessionManager {
                             spawn_pump_thread(Arc::clone(&manager), session_id);
                         }
                         Err(e) => {
-                            eprintln!(
-                                "[session-server] failed to resume session {}: {e}",
-                                &session_id[..8.min(session_id.len())],
+                            tracing::error!(
+                                session_id = %&session_id[..8.min(session_id.len())],
+                                error = %e,
+                                "failed to resume session"
                             );
                             let mut sessions = manager.lock_sessions();
                             if let Some(s) = sessions.get_mut(&session_id) {
@@ -393,6 +403,32 @@ impl SessionManager {
         sessions.values().map(|s| s.info()).collect()
     }
 
+    /// Diagnostic snapshot of every managed session's live server-side state.
+    /// Read-only — exposes internals (owner conn id, broadcast receiver count,
+    /// channel generation) for observability without affecting any session.
+    fn admin_status(&self) -> AdminSnapshot {
+        let sessions = self.lock_sessions();
+        let infos = sessions
+            .values()
+            .map(|s| AdminSessionInfo {
+                session_id: s.id.clone(),
+                label: s.label.clone(),
+                connected: s.channel.is_some(),
+                has_owner: s.owner.is_some(),
+                owner_conn_id: s.owner,
+                turns: s.turns,
+                event_log_len: s.event_log.len(),
+                subscriber_count: s.event_tx.receiver_count(),
+                channel_generation: s.channel_generation,
+                permission_mode: s.permission_mode,
+            })
+            .collect();
+        AdminSnapshot {
+            session_count: sessions.len(),
+            sessions: infos,
+        }
+    }
+
     fn create_session(
         self: &Arc<Self>,
         cwd: PathBuf,
@@ -401,7 +437,7 @@ impl SessionManager {
     ) -> SessionInfo {
         let id = uuid::Uuid::new_v4().to_string();
         let (event_tx, _) = broadcast::channel(16384);
-        let permission_mode = PermissionMode::Yolo;
+        let permission_mode = DEFAULT_PERMISSION_MODE;
 
         // Open the durable WAL up front and write its header, so even a crash
         // immediately after create can recover the session's identity. Degrade
@@ -845,9 +881,10 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                             // Replay complete — clear the fence so
                             // subsequent turns log normally.
                             session.replay_fence = 0;
-                            eprintln!(
-                                "[session-server] replay fence cleared for {} at turn {}",
-                                &session_id[..8], current_turns,
+                            tracing::info!(
+                                session_id = %&session_id[..8],
+                                turn = current_turns,
+                                "replay fence cleared"
                             );
                         }
                     }
@@ -867,7 +904,10 @@ fn spawn_pump_thread(manager: Arc<SessionManager>, session_id: ServerSessionId) 
                 for ev in events {
                     if std::env::var("SKETCH_CHUNKLOG").is_ok() {
                         if let sketch::acp_channel::ReplyEvent::Chunk(t) = &ev {
-                            eprintln!("[chunklog srv] {t:?}");
+                            // info! so the SKETCH_CHUNKLOG env gate alone re-enables
+                            // it (the default env-filter is "info"); otherwise this
+                            // dev trace would silently also require RUST_LOG=debug.
+                            tracing::info!("[chunklog srv] {t:?}");
                         }
                     }
                     session.record(Notification::ReplyEvent {
@@ -965,7 +1005,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
         let frame: Frame = match serde_json::from_str(&line) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[session-server] bad frame: {e}");
+                tracing::error!(error = %e, "bad frame");
                 continue;
             }
         };
@@ -1006,10 +1046,10 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                         // gap-free path. (We still receive the log length from
                         // attach for the count log; the contents are re-derived
                         // by the forwarder.)
-                        eprintln!(
-                            "[session-server] attach {}: forwarder will replay {} logged events",
-                            &session_id[..8],
+                        tracing::info!(
+                            session_id = %&session_id[..8],
                             replay_len,
+                            "attach: forwarder will replay logged events"
                         );
                         let w = Arc::clone(&writer);
                         let handle = tokio::spawn(forward_notifications(
@@ -1104,6 +1144,12 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                     Err(e) => Response::Error { message: e },
                 }
             }
+
+            Request::AdminStatus => Response::Ok {
+                data: ResponseData::AdminStatus {
+                    snapshot: manager.admin_status(),
+                },
+            },
         };
 
         let resp_frame = Frame::Response {
@@ -1118,9 +1164,10 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
         }
     };
 
-    eprintln!(
-        "[session-server] conn {conn_id} closed after {:.1}s — {exit_reason}; \
-         was attached to {} session(s)",
+    tracing::info!(
+        conn_id,
+        attached = subscribed.len(),
+        "conn {conn_id} closed after {:.1}s — {exit_reason}; was attached to {} session(s)",
         started.elapsed().as_secs_f64(),
         subscribed.len(),
     );
@@ -1189,11 +1236,11 @@ async fn forward_notifications(
             }
             let mut w = writer.lock().await;
             if w.write_all(buf.as_bytes()).await.is_err() {
-                eprintln!(
-                    "[session-server] forwarder write failed for {} after {sent} events \
-                     (+{} this pass) — client gone",
-                    &session_id[..8.min(session_id.len())],
-                    new.len(),
+                tracing::warn!(
+                    session_id = %&session_id[..8.min(session_id.len())],
+                    sent,
+                    this_pass = new.len(),
+                    "forwarder write failed — client gone"
                 );
                 return;
             }
@@ -1222,9 +1269,9 @@ async fn forward_notifications(
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 // Harmless now: the wake was dropped but the data lives in
                 // event_log, which the next tail pass recovers in full.
-                eprintln!(
-                    "[session-server] subscriber lagged by {n} wakes — \
-                     recovering missed events from event_log"
+                tracing::warn!(
+                    lagged = n,
+                    "subscriber lagged — recovering missed events from event_log"
                 );
             }
             Err(broadcast::error::RecvError::Closed) => {
@@ -1263,6 +1310,19 @@ async fn forward_notifications(
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    // Structured logging FIRST, before any other work. Route to STDERR (the
+    // launchd/test harness captures the server's stderr to a log file and greps
+    // it), with ANSI colors off so the log file stays clean grep-able text.
+    // Defaults to "info" when RUST_LOG is unset.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     use clap::Parser;
     // Subcommands manage launchd supervision and exit; no subcommand = run the
     // server (the default path the GUI auto-launches).
@@ -1287,8 +1347,8 @@ async fn main() -> io::Result<()> {
     // prior crash left it behind), so we clear it and take over.
     if socket_path.exists() {
         if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-            eprintln!(
-                "[sketch-session-server] another server already listening on {} — exiting",
+            tracing::warn!(
+                "another server already listening on {} — exiting",
                 socket_path.display()
             );
             return Ok(());
@@ -1296,15 +1356,25 @@ async fn main() -> io::Result<()> {
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    let listener = UnixListener::bind(&socket_path)?;
+    // Owner-only socket: nobody else on the box can connect to (and drive)
+    // our agent sessions. The mode must be tight from the instant the inode
+    // exists — `bind()` starts queueing `connect()`s immediately, so a
+    // chmod-after-bind leaves a TOCTOU window where a same-host attacker can
+    // slip into the backlog. Clamp the umask around the bind so the socket is
+    // created 0600 atomically; the explicit set_permissions is a belt-and-
+    // suspenders assertion (and covers any platform that ignores umask on
+    // socket inodes). We are single-threaded here (pre-accept-loop), so the
+    // process-global umask flip is safe to restore right after.
+    let prev_umask = unsafe { libc::umask(0o177) };
+    let bind_result = UnixListener::bind(&socket_path);
+    unsafe { libc::umask(prev_umask) };
+    let listener = bind_result?;
+    let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
 
     // Write PID file.
     let _ = std::fs::write(&pid_path, std::process::id().to_string());
 
-    eprintln!(
-        "[sketch-session-server] listening on {}",
-        socket_path.display()
-    );
+    tracing::info!("listening on {}", socket_path.display());
 
     let manager = Arc::new(SessionManager::new());
 
@@ -1337,7 +1407,7 @@ async fn main() -> io::Result<()> {
         // (and a crash). Just clean up the socket + pid so the next start is
         // tidy; the WAL dir is intentionally left for recovery.
         let _ = &mgr_shutdown;
-        eprintln!("[sketch-session-server] shutting down (WALs are durable)");
+        tracing::info!("shutting down (WALs are durable)");
         let _ = std::fs::remove_file(&socket_path_cleanup);
         let _ = std::fs::remove_file(&pid_path_cleanup);
         std::process::exit(0);
@@ -1355,10 +1425,19 @@ async fn main() -> io::Result<()> {
         // sessions — the session count is what tells you the client rejoined
         // live state rather than starting cold.
         let active_sessions = manager.lock_sessions().len();
-        eprintln!(
-            "[session-server] client {} (conn {conn_id}); {active_sessions} active session(s)",
-            if conn_id == 1 { "connected" } else { "reconnected" },
-        );
+        if conn_id == 1 {
+            tracing::info!(
+                conn_id,
+                active_sessions,
+                "client connected (conn {conn_id}); {active_sessions} active session(s)"
+            );
+        } else {
+            tracing::info!(
+                conn_id,
+                active_sessions,
+                "client reconnected (conn {conn_id}); {active_sessions} active session(s)"
+            );
+        }
         tokio::spawn(handle_connection(stream, mgr, conn_id));
     }
 }
