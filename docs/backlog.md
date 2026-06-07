@@ -52,46 +52,44 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
   broadcast lag — that path was already self-healing; the real cause was the
   missing shutdown.
 
-## Session-server hardening (branch `session-hardening`, off `master`)
+## Session-server hardening + actor extraction (all MERGED to `master`)
 
-Phase-7 of `spec-session-server-actor.md`. All on the **`session-hardening`**
-branch (`bd796d4`, `1e2c881`), **unmerged + unpushed**. Headlessly verified;
-see worklog `2026-06-07-session-server-hardening.md`.
+Phase-3 + phase-7 of `spec-session-server-actor.md`. All landed on `master`
+(`bd796d4`,`1e2c881`,`03e8d10`,`23747a0`,`a70ef74`); branches deleted. Headlessly
+verified via the resilience+transcript harness. Worklogs:
+`2026-06-07-session-server-hardening.md`, `2026-06-07-actor-extraction-and-perm-ux.md`.
 
-- **Safe-default permission mode + `0600` socket** — `DONE on branch` /
-  `NEEDS-RUNTIME` for GUI UX (2026-06-07, ADR-0014). New sessions default to
-  `AskEachTime` (not `Yolo`); `DEFAULT_PERMISSION_MODE` is the single revert point.
-  Owner-gated escalation. Socket forced `0600` via `umask` around `bind()`
-  (TOCTOU-free). **Runtime check owed:** with no inline-approval UI yet, a fresh
-  GUI session declines tools until the user cycles the mode — confirm this is
-  acceptable / add a chrome hint, or flip the constant.
-- **Structured tracing + `admin_status` verb** — `DONE on branch` (2026-06-07).
-  Server-binary `eprintln`→`tracing` (stderr, ANSI off, `RUST_LOG`/env-filter);
-  additive `admin_status` returns `AdminSnapshot` (session/owner/subscriber/log
-  state). Behavior-preserving; transcript test is the log-grep regression guard.
-- **Headless start-work verb** — `READY` (decided, ADR-0015). "Run with no GUI"
-  now includes *starting* work, not just finishing it. Build an admin/CLI path to
-  enqueue a prompt to an unowned session (e.g. `sketch-session-server prompt <sid>
-  <text>` subcommand and/or an `admin_prompt` socket verb), reusing the
-  pending-prompt queue + WAL durability. Needs a short follow-up spec first
-  (verb/CLI shape, lease-interaction rules, durability ordering) — see ADR-0015.
-  Headlessly testable via the stub agent.
-- **Slow-subscriber disconnect** — `DEFERRED (refined)`. The shared-log forwarder
-  already defuses the original "slow subscriber pins unbounded growth" worry
-  (subscribers re-derive their tail from the shared `event_log`; no per-subscriber
-  queue; `Lagged` is graceful). Residual is a minor liveness issue only: a
-  forwarder parked on a permanently-dead socket. Low-risk fix = a bounded
-  write-timeout reaper, but it touches the load-bearing forwarder and its GUI
-  reconnect-after-forced-disconnect can't be runtime-verified headlessly. Do
-  supervised. (Distinct from the deferred event_log *compaction* item below, which
-  is the actual unbounded-memory concern.)
-- **Actor extraction (phase 3, ADR-0012)** — `READY` (large). Scoped: 21 lock
-  sites, 8 mutated `ManagedSession` fields, crux is the per-session pump
-  sync↔async bridge (non-`Sync` `std::sync::mpsc::Receiver` → forward `Record`
-  into the actor inlet). Mechanical but pervasive (~1–2 wk); kills the shared-mutex
-  race class + poison-tolerant lock. Independent of the two `DONE` items above.
-- **Merge decision** — `NEEDS-DECISION`. Fold `session-hardening` to `master`?
-  Tracing + admin_status are foldable now; the permission change is `NEEDS-RUNTIME`.
+- **Permission default + `0600` socket** — `DONE` (ADR-0014 + addendum). Now
+  **Yolo, config-driven** (`default-permission-mode` in config.kdl; server loads
+  config in `create_session`); `DEFAULT_PERMISSION_MODE` is the no-config
+  fallback. Socket `0600` (TOCTOU-closed via `umask`-around-`bind`). Owner-gated
+  escalation. Runtime-confirmed by user.
+- **Permission mode visible + cyclable in the server model** — `DONE` /
+  runtime-confirmed. `AgentState.permission_mode` from `SessionInfo`; status-strip
+  badge always renders; `<space> c m` cycles via the `SetPermissionMode` wire verb.
+- **Structured tracing + `admin_status` verb** — `DONE`. Runtime-confirmed.
+- **Actor extraction (phase 3, ADR-0012)** — `DONE` (`23747a0`). `Mutex<HashMap>`
+  → single `run_manager` task (mpsc `Command` + oneshot); lock-free watch-based
+  forwarder; pump owns the channel + forwards generation-stamped Commands.
+  Behavior-preserving (conn_id ownership kept, no wire change); harness green 5×,
+  test files unchanged, two adversarial reviews SOLID. Kills the shared-mutex race
+  class + poison-tolerant lock.
+- **Slow-subscriber disconnect** — `DONE` (`a70ef74`). All server→client writes
+  bounded by a timeout (60s default; `SKETCH_SLOW_SUB_TIMEOUT_MS`); stuck peer
+  dropped → reconnects + replays; owner never gapped.
+- **Headless start-work verb** — `READY` (decided, ADR-0015). Admin/CLI path to
+  enqueue a prompt to an unowned session, reusing the pending-prompt queue + WAL.
+  Needs a short spec first (verb/CLI shape, lease interaction, durability order).
+- **Lease ownership + cursor reconnect (phases 4–5)** — `READY`, now unblocked by
+  the actor (conn_id ownership isolated behind the Command inlet; generation
+  fencing is a stepping stone). Needs the event-stream `seq` work.
+- **GUI stale-session robustness** — `READY` (GUI, NEEDS-RUNTIME). When the GUI's
+  persisted session list outlives the server's, attach failures read as "new
+  sessions failing" (hit 2026-06-07; worked around via clean-room reset). GUI
+  should drop/ignore unknown session ids on startup instead of churning.
+- **In-app rebuild + reconnect-badge** — `NEEDS-RUNTIME`. `dev_rebuild_restart_gui`
+  (`<space> c g`) and the permission badge after a sid-only reconnect (shows
+  default until re-synced) need a human runtime check.
   Split the branch if you want the first two ahead of the permission sign-off.
 
 ## Top priority
