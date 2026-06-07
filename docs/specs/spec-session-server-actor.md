@@ -376,9 +376,10 @@ requires the GPUI app to verify the server-side change.
 2. **Durable WAL (D4):** implement ADR-0009 (`snapshot + tail` recovery, versioned
    WAL). Verify: kill -9 mid-turn, recover, assert the completed turn survives.
 3. **Actor extraction:** move the `Mutex<HashMap>` behind a single Manager task +
-   `Command` inlet, mechanically, preserving today's `conn_id` ownership. Verify:
-   existing resilience + transcript-replay harness unchanged; delete poison-
-   tolerant lock access and the `.lock().unwrap()` vector.
+   `Command` inlet, mechanically, preserving today's `conn_id` ownership.
+   **Hand-rolled `tokio::mpsc` + `oneshot`, no actor framework** (ADR-0012).
+   Verify: existing resilience + transcript-replay harness unchanged; delete
+   poison-tolerant lock access and the `.lock().unwrap()` vector.
 4. **Lease ownership:** replace `owner: conn_id` with `Lease{client_id,expiry}` +
    heartbeat; retire `attach_with_owner_retry`/observer-fallback. Verify: a
    headless "client_id reconnect" reclaims its lease with zero retries; a second
