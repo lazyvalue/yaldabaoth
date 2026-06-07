@@ -1412,8 +1412,26 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                         if let Ok(mut line) = serde_json::to_string(&frame) {
                             line.push('\n');
                             let mut w = w.lock().await;
-                            if w.write_all(line.as_bytes()).await.is_err() {
-                                return;
+                            // Same slow-subscriber reaping as the per-session
+                            // forwarder: a peer that never drains this fd would
+                            // otherwise park this task forever once its kernel
+                            // send buffer fills under session-list churn.
+                            match tokio::time::timeout(
+                                slow_sub_write_timeout(),
+                                w.write_all(line.as_bytes()),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => return, // client gone
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "slow subscriber: session-list write stalled \
+                                         >{}ms — disconnecting",
+                                        slow_sub_write_timeout().as_millis()
+                                    );
+                                    return;
+                                }
                             }
                         }
                     }
@@ -1597,8 +1615,12 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
         let mut line = serde_json::to_string(&resp_frame).unwrap();
         line.push('\n');
         let mut w = writer.lock().await;
-        if w.write_all(line.as_bytes()).await.is_err() {
-            break "response write failed (client gone)".to_string();
+        // Bound the reply write too: a client that issued a request but stopped
+        // draining its socket must not park this read loop forever.
+        match tokio::time::timeout(slow_sub_write_timeout(), w.write_all(line.as_bytes())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => break "response write failed (client gone)".to_string(),
+            Err(_) => break "response write stalled (slow client)".to_string(),
         }
     };
 
@@ -1703,9 +1725,19 @@ async fn forward_notifications(
                         };
                         if let Ok(mut line) = serde_json::to_string(&frame) {
                             line.push('\n');
+                            let dur = slow_sub_write_timeout();
                             let mut w = writer.lock().await;
-                            if w.write_all(line.as_bytes()).await.is_err() {
-                                return;
+                            match tokio::time::timeout(dur, w.write_all(line.as_bytes())).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => return,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        session_id = %&session_id[..8.min(session_id.len())],
+                                        "slow subscriber: OwnerChanged write stalled >{}ms — disconnecting",
+                                        dur.as_millis()
+                                    );
+                                    return;
+                                }
                             }
                         }
                     }
@@ -1720,8 +1752,35 @@ async fn forward_notifications(
     }
 }
 
+/// Per-write timeout for forwarder socket writes. A subscriber whose socket
+/// stops draining (dead/stuck peer) would otherwise make `write_all` block
+/// indefinitely, parking the forwarder task + its fd forever. We bound every
+/// forwarder write by this duration; on elapse we drop the subscriber (its
+/// write half closes → the client sees EOF and cleanly reconnects, replaying
+/// from the watch snapshot, so no events are lost).
+///
+/// Default is GENEROUS (60s) so a healthy slow-but-progressing client is never
+/// falsely reaped. Override via `SKETCH_SLOW_SUB_TIMEOUT_MS` (u64 ms); `0` or
+/// unset → the 60s default.
+fn slow_sub_write_timeout() -> std::time::Duration {
+    // Resolved once per process (env can't change mid-run) so the hot
+    // streaming write path doesn't lock + parse the env on every write.
+    static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        const DEFAULT_MS: u64 = 60_000;
+        let ms = std::env::var("SKETCH_SLOW_SUB_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .unwrap_or(DEFAULT_MS);
+        std::time::Duration::from_millis(ms)
+    })
+}
+
 /// Serialize and write a tail slice of notifications in one buffered write.
-/// Returns `false` if the write failed (client gone).
+/// Returns `false` if the write failed (client gone) or stalled past the
+/// slow-subscriber timeout (non-draining peer), in which case the caller drops
+/// the forwarder.
 async fn flush_tail(
     writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     session_id: &str,
@@ -1735,16 +1794,30 @@ async fn flush_tail(
             buf.push('\n');
         }
     }
+    let dur = slow_sub_write_timeout();
     let mut w = writer.lock().await;
-    if w.write_all(buf.as_bytes()).await.is_err() {
-        tracing::warn!(
-            session_id = %&session_id[..8.min(session_id.len())],
-            this_pass = tail.len(),
-            "forwarder write failed — client gone"
-        );
-        return false;
+    match tokio::time::timeout(dur, w.write_all(buf.as_bytes())).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => {
+            // Socket error — client gone.
+            tracing::warn!(
+                session_id = %&session_id[..8.min(session_id.len())],
+                this_pass = tail.len(),
+                "forwarder write failed — client gone"
+            );
+            false
+        }
+        Err(_) => {
+            // Elapsed — the peer's socket buffer is full and not draining.
+            tracing::warn!(
+                session_id = %&session_id[..8.min(session_id.len())],
+                this_pass = tail.len(),
+                "slow subscriber: write stalled >{}ms — disconnecting",
+                dur.as_millis()
+            );
+            false
+        }
     }
-    true
 }
 
 // ── Main ─────────────────────────────────────────���─────────────────
