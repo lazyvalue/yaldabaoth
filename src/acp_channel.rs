@@ -708,6 +708,93 @@ impl AcpChannelClient {
     pub fn try_recv(&self) -> Option<ReplyEvent> {
         self.reply_rx.try_recv().ok()
     }
+
+    /// Derive a [`TransportHandle`] — the `Send` (+`Sync`) subset of this
+    /// client's surface — by cloning the sub-handles that don't include the
+    /// `!Sync` `reply_rx`. The reply receiver stays owned by the pump thread
+    /// that owns the whole client; the actor stores only this handle in its map
+    /// and never touches (or drops) the client itself.
+    ///
+    /// `generation` defaults to 0; the publishing worker/actor stamps the real
+    /// generation onto the handle before installing it.
+    pub fn handle(&self) -> TransportHandle {
+        TransportHandle {
+            prompt_tx: self.prompt_tx.clone(),
+            cancel_tx: self.cancel_tx.clone(),
+            connected: Arc::clone(&self.connected),
+            turns: Arc::clone(&self.turns),
+            permission_mode: Arc::clone(&self.permission_mode),
+            session_id: Arc::clone(&self.session_id),
+            generation: 0,
+        }
+    }
+}
+
+/// The `Send` (+`Sync`) transport surface the session-server actor stores in
+/// its map. Built by [`AcpChannelClient::handle`] by cloning the client's Send
+/// sub-fields — it NEVER holds the `!Sync` `reply_rx`, which stays owned by the
+/// pump thread. This lets the single-writer actor task drive prompt/cancel/
+/// permission/liveness/turn-count reads without ever holding (or dropping) an
+/// `AcpChannelClient` (whose `Drop` joins an OS thread).
+pub struct TransportHandle {
+    /// Outbound prompts (Clone+Send). `send`-equivalent of `AcpChannelClient`.
+    pub prompt_tx: std_mpsc::Sender<String>,
+    /// Cancel signal (Clone+Send).
+    pub cancel_tx: futures::channel::mpsc::UnboundedSender<()>,
+    /// Liveness flag, shared with the worker.
+    pub connected: Arc<AtomicBool>,
+    /// Completed-turn count, shared with the worker.
+    pub turns: Arc<AtomicUsize>,
+    /// Current permission policy, shared with the worker.
+    pub permission_mode: Arc<AtomicU8>,
+    /// Live ACP session id, populated by the worker after `session/new`/`load`.
+    pub session_id: Arc<std::sync::Mutex<Option<String>>>,
+    /// The generation this transport was published at (stamped by the actor on
+    /// install). Lets liveness/diagnostics correlate a handle with its pump.
+    pub generation: u64,
+}
+
+impl TransportHandle {
+    /// Enqueue a prompt onto the owning pump's client. Mirrors
+    /// [`AcpChannelClient::send`]: fails (and marks disconnected) if the worker
+    /// channel is closed.
+    pub fn send(&self, prompt: &str) -> io::Result<()> {
+        if !self.is_connected() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "ACP agent gone (worker exited) — re-attach to recover",
+            ));
+        }
+        self.prompt_tx.send(prompt.to_string()).map_err(|_| {
+            self.connected.store(false, Ordering::SeqCst);
+            io::Error::new(io::ErrorKind::BrokenPipe, "ACP worker channel closed")
+        })
+    }
+
+    /// Request cancellation of the in-flight turn. Best-effort.
+    pub fn cancel(&self) {
+        let _ = self.cancel_tx.unbounded_send(());
+    }
+
+    /// Set the live permission policy (read by the worker on gated tool calls).
+    pub fn set_permission_mode(&self, mode: PermissionMode) {
+        self.permission_mode.store(mode as u8, Ordering::SeqCst);
+    }
+
+    /// Worker liveness flag.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+
+    /// Completed-turn count.
+    pub fn turn_count(&self) -> usize {
+        self.turns.load(Ordering::SeqCst)
+    }
+
+    /// Live ACP session id (populated by the worker after handshake).
+    pub fn session_id(&self) -> Option<String> {
+        self.session_id.lock().ok().and_then(|g| g.clone())
+    }
 }
 
 impl Drop for AcpChannelClient {
