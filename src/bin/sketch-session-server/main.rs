@@ -19,8 +19,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
-use serde::{Deserialize, Serialize};
-
 use sketch::acp_channel::{AcpChannelClient, PermissionMode, SketchFrontend};
 use sketch::session_proto::*;
 
@@ -51,7 +49,7 @@ struct ManagedSession {
     /// Every notification ever broadcast for this session, so a
     /// re-attaching GUI can replay the full transcript.
     ///
-    /// Wrapped in `Arc` so `attach`/`save_to_disk` clone a *pointer* under the
+    /// Wrapped in `Arc` so `attach` clones a *pointer* under the
     /// global lock, not the whole (unbounded) `Vec`. Pushes go through
     /// `Arc::make_mut`, which is a cheap in-place mutation whenever the only
     /// reference is this field (the common case — snapshots are short-lived and
@@ -63,6 +61,11 @@ struct ManagedSession {
     /// agent moves past the fence (a genuinely new turn), normal logging
     /// resumes. Zero for fresh (non-restored) sessions.
     replay_fence: usize,
+    /// Durable write-ahead log for this session (ADR-0009). Every logged event
+    /// is appended here so a crash (not just a clean shutdown) preserves the
+    /// transcript. `None` only if the WAL couldn't be opened (we degrade to
+    /// in-memory-only rather than refusing to run).
+    wal: Option<sketch::session_wal::SessionWal>,
 }
 
 impl ManagedSession {
@@ -90,7 +93,37 @@ impl ManagedSession {
     /// not transcript, and must never land in `event_log`.
     fn record(&mut self, note: Notification) {
         Arc::make_mut(&mut self.event_log).push(note.clone());
+        self.wal_append(&note);
         let _ = self.event_tx.send(note);
+    }
+
+    /// Append a transcript event to `event_log` durably WITHOUT broadcasting.
+    /// Used for the user's own prompt, which the live GUI already rendered
+    /// locally (so it must be logged for replay but not re-broadcast). The
+    /// broadcast path goes through [`record`].
+    fn log_only(&mut self, note: Notification) {
+        Arc::make_mut(&mut self.event_log).push(note.clone());
+        self.wal_append(&note);
+    }
+
+    /// Append `note` to the durable WAL. `fsync`s at turn boundaries
+    /// (`UserPrompt` / `TurnEnded`) so a completed turn or a sent prompt is
+    /// never lost on power loss, but not per streamed chunk (ADR-0009). A WAL
+    /// error is logged, never fatal — the in-memory `event_log` still holds the
+    /// event for live subscribers.
+    fn wal_append(&mut self, note: &Notification) {
+        if let Some(wal) = self.wal.as_mut() {
+            let boundary = matches!(
+                note,
+                Notification::UserPrompt { .. } | Notification::TurnEnded { .. }
+            );
+            if let Err(e) = wal.append(note, boundary) {
+                eprintln!(
+                    "[session-server] WAL append failed for {}: {e}",
+                    &self.id[..8.min(self.id.len())]
+                );
+            }
+        }
     }
 
     /// Broadcast an `OwnerChanged` to all attached connections. Not appended
@@ -159,17 +192,25 @@ struct SessionManager {
     events: broadcast::Sender<Notification>,
 }
 
-/// Serializable snapshot of a single session, saved to disk so the server
-/// can restore sessions across restarts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedSession {
-    server_session_id: String,
-    acp_session_id: Option<String>,
-    label: String,
-    cwd: PathBuf,
-    turns: usize,
+/// Open a fresh durable WAL for a session, or `None` (degrade to in-memory) if
+/// no WAL dir is resolvable or the file can't be created — logged, never fatal.
+fn open_session_wal(
+    id: &str,
+    label: &str,
+    cwd: &std::path::Path,
     permission_mode: PermissionMode,
-    event_log: Vec<Notification>,
+) -> Option<sketch::session_wal::SessionWal> {
+    let dir = session_wal_dir()?;
+    match sketch::session_wal::SessionWal::create(&dir, id, label, cwd, permission_mode) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!(
+                "[session-server] WAL create failed for {} (in-memory only): {e}",
+                &id[..8.min(id.len())]
+            );
+            None
+        }
+    }
 }
 
 impl SessionManager {
@@ -211,132 +252,76 @@ impl SessionManager {
         self.events.subscribe()
     }
 
-    /// Snapshot all sessions to disk so they survive a server restart.
-    fn save_to_disk(&self) {
-        let Some(path) = session_server_persist_path() else {
-            return;
-        };
-        // Snapshot lightweight metadata + an `Arc` *pointer* to each session's
-        // event_log under the lock, then release it. The expensive deep copy of
-        // each log into the owned `PersistedSession.event_log` happens off-lock,
-        // so a large/unbounded transcript no longer stalls every other session
-        // for the duration of the clone+serialize.
-        struct Snap {
-            server_session_id: String,
-            acp_session_id: Option<String>,
-            label: String,
-            cwd: PathBuf,
-            turns: usize,
-            permission_mode: PermissionMode,
-            event_log: Arc<Vec<Notification>>,
-        }
-        let snaps: Vec<Snap> = {
-            let sessions = self.lock_sessions();
-            sessions
-                .values()
-                .map(|s| Snap {
-                    server_session_id: s.id.clone(),
-                    acp_session_id: s.channel.as_ref().and_then(|c| c.session_id()),
-                    label: s.label.clone(),
-                    cwd: s.cwd.clone(),
-                    turns: s.turns,
-                    permission_mode: s.permission_mode,
-                    event_log: Arc::clone(&s.event_log),
-                })
-                .collect()
-        };
-        let persisted: Vec<PersistedSession> = snaps
-            .into_iter()
-            .map(|s| PersistedSession {
-                server_session_id: s.server_session_id,
-                acp_session_id: s.acp_session_id,
-                label: s.label,
-                cwd: s.cwd,
-                turns: s.turns,
-                permission_mode: s.permission_mode,
-                event_log: (*s.event_log).clone(),
-            })
-            .collect();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match serde_json::to_string_pretty(&persisted) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    eprintln!("[session-server] failed to persist sessions: {e}");
-                }
-            }
-            Err(e) => {
-                eprintln!("[session-server] failed to serialize sessions: {e}");
-            }
-        }
-    }
-
-    /// Load persisted sessions from disk and re-spawn their ACP subprocesses.
-    /// Called once at startup before accepting connections.
+    /// Recover sessions from their durable WALs (ADR-0009) and re-spawn their
+    /// ACP subprocesses. Called once at startup before accepting connections.
+    /// Replaces the old clean-shutdown-only JSON snapshot: the WAL is written
+    /// continuously, so recovery survives a CRASH, not just a graceful exit.
+    /// Idempotent — unlike the old delete-on-restore hack, the WAL files are
+    /// kept (a session's WAL is removed only when it is explicitly closed), so a
+    /// crash mid-recovery just replays again next boot.
     fn restore_from_disk(self: &Arc<Self>) {
-        let Some(path) = session_server_persist_path() else {
+        let Some(dir) = session_wal_dir() else {
             return;
         };
-        let data = match std::fs::read_to_string(&path) {
-            Ok(d) => d,
-            Err(_) => return, // No persist file — first run.
-        };
-        let persisted: Vec<PersistedSession> = match serde_json::from_str(&data) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[session-server] failed to parse persisted sessions: {e}");
-                return;
-            }
-        };
-
-        // Clear the file immediately — if we crash mid-restore, stale entries
-        // won't re-spawn on the next boot.
-        let _ = std::fs::remove_file(&path);
-
-        for ps in persisted {
-            // Only restore sessions that had an ACP session id — without one,
-            // there's nothing to --resume.
-            let Some(acp_session_id) = ps.acp_session_id.clone() else {
+        let recovered = sketch::session_wal::recover_all(&dir);
+        for rs in recovered {
+            let sid = rs.server_session_id.clone();
+            // Without an acp_session_id we can't --resume the agent; the
+            // transcript is preserved but the session is inert. Drop it (and its
+            // WAL) rather than leaving a zombie that can never make progress.
+            let Some(acp_session_id) = rs.acp_session_id.clone() else {
                 eprintln!(
-                    "[session-server] skipping restore of {}: no acp_session_id",
-                    &ps.server_session_id[..8],
+                    "[session-server] discarding recovered {}: no acp_session_id to resume",
+                    &sid[..8.min(sid.len())],
                 );
+                let _ = std::fs::remove_file(&rs.path);
                 continue;
             };
 
             let (event_tx, _) = broadcast::channel(16384);
+            // Re-open the WAL in append mode so the restored session keeps
+            // logging to the same file. If reopen fails, degrade to
+            // in-memory-only (still better than dropping the session).
+            let wal = match sketch::session_wal::SessionWal::reopen(rs.path.clone()) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    eprintln!("[session-server] WAL reopen failed for {}: {e}", &sid[..8.min(sid.len())]);
+                    None
+                }
+            };
 
             let session = ManagedSession {
-                id: ps.server_session_id.clone(),
-                label: ps.label.clone(),
-                cwd: ps.cwd.clone(),
+                id: sid.clone(),
+                label: rs.label.clone(),
+                cwd: rs.cwd.clone(),
                 channel: None,
                 channel_generation: 0,
-                turns: ps.turns,
-                permission_mode: ps.permission_mode,
+                turns: rs.turns,
+                permission_mode: rs.permission_mode,
                 event_tx: event_tx.clone(),
                 owner: None,
                 pending_prompts: Vec::new(),
-                event_log: Arc::new(ps.event_log),
-                replay_fence: ps.turns,
+                event_log: Arc::new(rs.event_log),
+                replay_fence: rs.turns,
+                wal,
             };
 
             eprintln!(
-                "[session-server] restoring session {} (acp {})",
-                &ps.server_session_id[..8],
+                "[session-server] recovering session {} ({} events, {} turns, acp {})",
+                &sid[..8.min(sid.len())],
+                session.event_log.len(),
+                rs.turns,
                 &acp_session_id[..8.min(acp_session_id.len())],
             );
 
-            self.lock_sessions()
-                .insert(ps.server_session_id.clone(), session);
+            self.lock_sessions().insert(sid.clone(), session);
 
             // Re-spawn the ACP subprocess with --resume.
             let manager = Arc::clone(self);
-            let session_id = ps.server_session_id.clone();
-            let cwd = ps.cwd.clone();
+            let session_id = sid.clone();
+            let cwd = rs.cwd.clone();
             std::thread::Builder::new()
-                .name(format!("acp-resume-{}", &session_id[..8]))
+                .name(format!("acp-resume-{}", &session_id[..8.min(session_id.len())]))
                 .spawn(move || {
                     unsafe {
                         std::env::set_var("SKETCH_SESSION_MANAGED", "1");
@@ -364,7 +349,7 @@ impl SessionManager {
                         Err(e) => {
                             eprintln!(
                                 "[session-server] failed to resume session {}: {e}",
-                                &session_id[..8],
+                                &session_id[..8.min(session_id.len())],
                             );
                             let mut sessions = manager.lock_sessions();
                             if let Some(s) = sessions.get_mut(&session_id) {
@@ -393,6 +378,12 @@ impl SessionManager {
     ) -> SessionInfo {
         let id = uuid::Uuid::new_v4().to_string();
         let (event_tx, _) = broadcast::channel(16384);
+        let permission_mode = PermissionMode::Yolo;
+
+        // Open the durable WAL up front and write its header, so even a crash
+        // immediately after create can recover the session's identity. Degrade
+        // to in-memory-only if it can't be opened.
+        let wal = open_session_wal(&id, &label, &cwd, permission_mode);
 
         let session = ManagedSession {
             id: id.clone(),
@@ -401,12 +392,13 @@ impl SessionManager {
             channel: None,
             channel_generation: 0,
             turns: 0,
-            permission_mode: PermissionMode::Yolo,
+            permission_mode,
             event_tx: event_tx.clone(),
             owner: None,
             pending_prompts: Vec::new(),
             event_log: Arc::new(Vec::new()),
             replay_fence: 0,
+            wal,
         };
 
         let info = session.info();
@@ -475,7 +467,14 @@ impl SessionManager {
             match sessions.get(session_id) {
                 Some(s) if s.owner == Some(conn_id) => {
                     // Dropping ManagedSession drops AcpChannelClient → kills subprocess.
-                    sessions.remove(session_id);
+                    let session = sessions.remove(session_id);
+                    // Explicit close = intentional end of life: delete the
+                    // durable WAL so this session is NOT recovered on the next
+                    // start. (Crash/disconnect leave the WAL; only an explicit
+                    // close removes it.)
+                    if let Some(wal) = session.and_then(|s| s.wal) {
+                        wal.remove();
+                    }
                     true
                 }
                 Some(_) => return Err("only the session owner can close the session".into()),
@@ -570,11 +569,12 @@ impl SessionManager {
             return Err("only the session owner can send prompts".into());
         }
 
-        // Log the user's prompt so re-attaching GUIs can replay it.
-        // Only appended to event_log (not broadcast) — the live GUI
-        // already inserted the text locally in submit_chatbox before
-        // calling prompt(). Broadcasting would duplicate it.
-        Arc::make_mut(&mut session.event_log).push(Notification::UserPrompt {
+        // Log the user's prompt so re-attaching GUIs can replay it (and so it
+        // survives a crash — UserPrompt is a turn boundary that fsyncs). Only
+        // appended to event_log + WAL, not broadcast — the live GUI already
+        // inserted the text locally in submit_chatbox before calling prompt().
+        // Broadcasting would duplicate it.
+        session.log_only(Notification::UserPrompt {
             session_id: session_id.to_string(),
             text: text.to_string(),
         });
@@ -1298,8 +1298,12 @@ async fn main() -> io::Result<()> {
         {
             ctrl_c.await.ok();
         }
-        eprintln!("[sketch-session-server] shutting down — persisting sessions");
-        mgr_shutdown.save_to_disk();
+        // No explicit persist needed: each session's durable WAL is written
+        // continuously (ADR-0009), so sessions already survive this shutdown
+        // (and a crash). Just clean up the socket + pid so the next start is
+        // tidy; the WAL dir is intentionally left for recovery.
+        let _ = &mgr_shutdown;
+        eprintln!("[sketch-session-server] shutting down (WALs are durable)");
         let _ = std::fs::remove_file(&socket_path_cleanup);
         let _ = std::fs::remove_file(&pid_path_cleanup);
         std::process::exit(0);

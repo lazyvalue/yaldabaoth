@@ -18,6 +18,7 @@ pub mod parse;
 pub mod render;
 pub mod session_client;
 pub mod session_proto;
+pub mod session_wal;
 pub mod style;
 pub mod theme;
 pub mod tree;

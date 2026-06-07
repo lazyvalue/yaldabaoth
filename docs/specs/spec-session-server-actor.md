@@ -143,11 +143,15 @@ removes the shared-mutable substrate underneath them.
   sync↔async bridge in `session_client.rs` and `acp_channel.rs` is where these
   "cleanup deferred to process exit" traps breed; eliminating it removes the class.
 
-### Durability & recovery (ACTIVE per ADR-0009)
-- The actor's state is reconstructable from `latest snapshot + WAL tail` after any
-  crash cause, not just clean shutdown. Guarantee (per ADR-0009): never lose a
+### Durability & recovery (SHIPPED — `session_wal.rs`; snapshot/compaction deferred)
+- ✅ The session state is reconstructable from the durable WAL after any crash
+  cause, not just clean shutdown. Guarantee (per ADR-0009): never lose a
   completed turn or a sent prompt; worst case is an in-flight stream tail
   truncating on power loss. The WAL carries a schema `version` from day one.
+  Shipped as a per-session append-only NDJSON log (not yet snapshot+tail —
+  compaction is deferred per ADR-0009); recovery replays the full log and
+  tolerates a torn final line. Verified by `session_recovered_after_server_crash`
+  (SIGKILL → restart → full transcript recovers).
 - **fsync is in-actor at turn boundaries, not delegated (resolves the durability-
   vs-await-free tension).** Per-event `Record` does a buffered `write()` only — a
   *process* crash loses nothing (the OS flushes), so this stays await-free. The
@@ -373,8 +377,13 @@ requires the GPUI app to verify the server-side change.
 
 1. **Lifetime hygiene (SHIPPED, `81ae216`):** socket `shutdown` on drop;
    single-instance guard; socket-scoped pid/state paths; the resilience harness.
-2. **Durable WAL (D4):** implement ADR-0009 (`snapshot + tail` recovery, versioned
-   WAL). Verify: kill -9 mid-turn, recover, assert the completed turn survives.
+2. **Durable WAL (D4):** ✅ SHIPPED (`session_wal.rs`). Per-session append-only
+   NDJSON WAL: write-immediately (process-crash safe) + fsync at turn boundaries
+   (power-loss safe), versioned header, recovery by full-log replay (torn final
+   line tolerated), agent re-adoption via `session/load`; replaces the
+   clean-shutdown-only JSON snapshot. Verified: `session_recovered_after_server_crash`
+   SIGKILLs the server and asserts the completed turn's transcript recovers.
+   **snapshot+tail compaction deferred** (ADR-0009) until it measurably matters.
 3. **Actor extraction:** move the `Mutex<HashMap>` behind a single Manager task +
    `Command` inlet, mechanically, preserving today's `conn_id` ownership.
    **Hand-rolled `tokio::mpsc` + `oneshot`, no actor framework** (ADR-0012).

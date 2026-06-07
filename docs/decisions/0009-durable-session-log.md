@@ -1,8 +1,9 @@
 # ADR-0009: Durable per-session event-log subsystem (D4)
 
-**Status:** Accepted
+**Status:** Accepted — **IMPLEMENTED 2026-06-07** (`src/session_wal.rs`), except
+the deferred snapshot/compaction (still a plain append-only log replayed in full).
 **Date:** 2026-06-05
-**Related:** ADR-0006 (the stream), spec-event-stream.md (durable instance), spec-state-architecture.md (D4)
+**Related:** ADR-0006 (the stream), spec-event-stream.md (durable instance), spec-state-architecture.md (D4), spec-session-server-actor.md § Durability (the implementing spec)
 
 ## Context
 
