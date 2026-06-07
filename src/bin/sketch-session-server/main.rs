@@ -1243,8 +1243,22 @@ async fn main() -> io::Result<()> {
     let socket_path = socket_path();
     let pid_path = pid_file_path();
 
-    // Clean up stale socket.
+    // Single-instance guard. If a server is ALREADY listening on this socket,
+    // exit cleanly instead of removing the socket and re-binding — which would
+    // silently steal it from the live server and orphan every session that
+    // server is running. The client auto-launches a server on any failed
+    // connect, so spurious concurrent launches genuinely happen; this makes
+    // them harmless (the loser exits, the client's connect-retry finds the
+    // winner). A socket file that exists but is NOT connectable is stale (a
+    // prior crash left it behind), so we clear it and take over.
     if socket_path.exists() {
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            eprintln!(
+                "[sketch-session-server] another server already listening on {} — exiting",
+                socket_path.display()
+            );
+            return Ok(());
+        }
         let _ = std::fs::remove_file(&socket_path);
     }
 

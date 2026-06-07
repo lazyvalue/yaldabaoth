@@ -11912,6 +11912,7 @@ impl SketchGpuiView {
     /// the on-screen transcript cleanly instead of duplicating it.
     fn reconnect_session_server(
         &mut self,
+        cx: &mut Context<Self>,
     ) -> Option<(
         std::sync::mpsc::Receiver<ServerNotification>,
         futures::channel::mpsc::UnboundedReceiver<()>,
@@ -11942,25 +11943,19 @@ impl SketchGpuiView {
             });
         }
 
-        let mode = if self.is_candidate {
-            AttachMode::Observer
-        } else {
-            AttachMode::Owner
-        };
-        if let Some(server) = self.session_server.as_ref() {
-            for sid in &sids {
-                if let Err(e) = server.attach(sid, mode) {
-                    eprintln!(
-                        "[sketch-gpui] re-attach after reconnect failed for {}: {e}",
-                        &sid[..sid.len().min(8)],
-                    );
-                }
-            }
+        // Re-attach off the paint thread, with the same Owner-reclaim retry the
+        // open path uses. The PREVIOUS connection's server-side teardown races
+        // this fresh one: the new socket can re-attach before the server has
+        // processed the old socket's close and released ownership, so a bare
+        // attach momentarily loses to a not-yet-cleared owner ("another GUI
+        // already owns this session"). `spawn_attach_sessions` retries past
+        // that window and reconciles per-slot status. (Doing blocking attach
+        // round-trips inline here, as before, also froze rendering.)
+        let n = sids.len();
+        if !sids.is_empty() {
+            self.spawn_attach_sessions(sids, cx);
         }
-        eprintln!(
-            "[sketch-gpui] session-server reconnected; re-attached {} session(s)",
-            sids.len(),
-        );
+        eprintln!("[sketch-gpui] session-server reconnected; re-attaching {n} session(s)");
         Some((note_rx, wake_rx))
     }
 
@@ -12048,7 +12043,7 @@ impl SketchGpuiView {
                         .map_or(true, |t| now.duration_since(t) >= reconnect_backoff);
                     if due {
                         last_reconnect = Some(now);
-                        match this.update(cx, |this, _cx| this.reconnect_session_server()) {
+                        match this.update(cx, |this, cx| this.reconnect_session_server(cx)) {
                             Ok(Some((new_note, new_wake))) => {
                                 eprintln!(
                                     "[sketch-gpui] reconnected to session server \
