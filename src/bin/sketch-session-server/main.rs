@@ -22,6 +22,29 @@ use tokio::sync::broadcast;
 use sketch::acp_channel::{AcpChannelClient, PermissionMode, SketchFrontend};
 use sketch::session_proto::*;
 
+mod launchd;
+
+/// CLI: with no subcommand the binary runs the server (the default the GUI
+/// auto-launches); subcommands manage launchd supervision.
+#[derive(clap::Parser)]
+#[command(name = "sketch-session-server", about = "Sketch ACP session-server daemon")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Subcmd>,
+}
+
+#[derive(clap::Subcommand)]
+enum Subcmd {
+    /// Install + load the launchd LaunchAgent: the server starts at login and
+    /// is restarted automatically if it crashes (so agent sessions run with no
+    /// GUI present). Hands off any running server losslessly via its WAL.
+    Install,
+    /// Unload + remove the launchd LaunchAgent.
+    Uninstall,
+    /// Show whether the LaunchAgent is installed/loaded and the socket is live.
+    Status,
+}
+
 // ── Managed session ────────────────────────────────────────────────
 
 struct ManagedSession {
@@ -1240,6 +1263,17 @@ async fn forward_notifications(
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    use clap::Parser;
+    // Subcommands manage launchd supervision and exit; no subcommand = run the
+    // server (the default path the GUI auto-launches).
+    if let Some(command) = Cli::parse().command {
+        return match command {
+            Subcmd::Install => launchd::install(),
+            Subcmd::Uninstall => launchd::uninstall(),
+            Subcmd::Status => launchd::status(),
+        };
+    }
+
     let socket_path = socket_path();
     let pid_path = pid_file_path();
 

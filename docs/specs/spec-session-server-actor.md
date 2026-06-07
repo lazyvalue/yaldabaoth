@@ -168,12 +168,17 @@ removes the shared-mutable substrate underneath them.
   replay to the persisted `(generation, seq)` watermark (spec-event-stream §5), so
   the reloaded log is authoritative and the two replays can't fight.
 
-### Single-instance by construction (SHIPPED guard → DRAFT target)
-- SHIPPED (`81ae216`): a TOCTOU-windowed guard — a second server probes the
-  socket and exits if a live one answers.
-- DRAFT target: OS-level exclusivity — **launchd socket activation** on macOS
-  (the kernel owns the socket; exactly one server by construction) or a `flock`ed
-  lockfile — so single-instance is a property, not a check with a race window.
+### Supervision & single-instance (SHIPPED — launchd LaunchAgent; ADR-0013)
+- SHIPPED (`81ae216`): a socket-probe guard — a second server exits if a live one
+  answers (covers GUI/manual duplicates).
+- SHIPPED (launchd): `sketch-session-server install` writes a per-user
+  **LaunchAgent** (`RunAtLoad` + `KeepAlive{SuccessfulExit=false}`) so the server
+  starts at login and is **restarted on crash** — the always-present host for
+  headless agents. `install` hands off any running server via SIGTERM, lossless
+  because sessions recover from their WALs (ADR-0009). launchd (one job) +
+  the guard give single-instance. See ADR-0013 for why NOT socket activation
+  (lazy start contradicts always-present) and why launchd over flock.
+- Deferred: socket activation / flock are unnecessary given the above.
 
 ### Authorization & safe defaults (DRAFT — hardening)
 - **The primary control is the permission mode, not socket auth.** Today any
@@ -397,11 +402,15 @@ requires the GPUI app to verify the server-side change.
    Verify: large-transcript reconnect re-streams only the tail, not from 0.
 6. **`AgentTransport` seam:** extract the trait + in-process fake; migrate most
    harness tests off subprocess spawning.
-7. **Hardening:** safe-default permission mode + `0600` socket assertion (the
-   real control; capability token only if a lower-trust local component later
-   needs socket access); bounded queues + slow-subscriber disconnect (per-
-   backlog, not subscriber-count); OS-level single-instance (launchd/flock);
-   structured `tracing` + `admin_status`.
+7. **Hardening:**
+   - ✅ SHIPPED — **launchd supervision** (`install`/`uninstall`/`status`;
+     LaunchAgent with `RunAtLoad` + `KeepAlive{SuccessfulExit=false}`; ADR-0013):
+     start-at-login + restart-on-crash, the always-present host for headless
+     agents. Single-instance via launchd + the socket guard.
+   - Still open: safe-default permission mode + `0600` socket assertion (the real
+     authz control; capability token only if a lower-trust local component later
+     needs socket access); bounded queues + slow-subscriber disconnect (per-
+     backlog, not subscriber-count); structured `tracing` + `admin_status`.
 8. **GUI projection (client corollary):** unidirectional `events → reducer → view`;
    retire `reset_for_replay` choreography. Verify: human runtime check (GPUI not
    headless-drivable) — the one phase that needs it.
