@@ -56,3 +56,11 @@ required-features = []
 [[bin]]
 name = "sketch-session-server"
 path = "src/bin/sketch-session-server/main.rs"
+
+# Test-support stub ACP agent. Speaks the agent side of the Agent Client
+# Protocol over stdio (NDJSON) just enough to satisfy sketch's client, so the
+# headless session-server harness can drive a real transcript without a live
+# Claude agent. Integration tests find it via env!("CARGO_BIN_EXE_sketch-acp-stub").
+[[bin]]
+name = "sketch-acp-stub"
+path = "src/bin/sketch-acp-stub.rs"
