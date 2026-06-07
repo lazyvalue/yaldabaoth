@@ -274,6 +274,17 @@ pub fn session_server_persist_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("sketch").join("session_server.json"))
 }
 
+/// Directory holding the durable per-session write-ahead logs (ADR-0009). Like
+/// [`session_server_persist_path`], it follows `SKETCH_SESSION_SOCKET` so test
+/// and alternate instances never share durable state; otherwise it lives in the
+/// cache dir alongside other sketch state. `None` only if no cache dir exists.
+pub fn session_wal_dir() -> Option<PathBuf> {
+    if std::env::var_os("SKETCH_SESSION_SOCKET").is_some() {
+        return Some(socket_path().with_extension("wal"));
+    }
+    dirs::cache_dir().map(|d| d.join("sketch").join("wal"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

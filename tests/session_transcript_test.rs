@@ -51,10 +51,17 @@ impl TestServer {
         let log = dir.join(format!("sketch-txtest-{pid}-{n}.log"));
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(&log);
-        // Also clear any persisted state file colocated with the socket so a
-        // prior run can't restore stale sessions into this fresh server.
+        // Clear any durable state colocated with this socket so a prior run
+        // can't restore stale sessions into this fresh server.
         let _ = std::fs::remove_file(socket.with_extension("state.json"));
+        let _ = std::fs::remove_dir_all(socket.with_extension("wal"));
+        Self::spawn_on(socket, log, knobs)
+    }
 
+    /// Spawn a server process bound to `socket`, stderr → `log`, agents =
+    /// `sketch-acp-stub`, with the given env knobs. Does NOT clear durable
+    /// state — callers that want a fresh start clear it first.
+    fn spawn_on(socket: PathBuf, log: PathBuf, knobs: &[(&str, &str)]) -> TestServer {
         let logfile = std::fs::File::create(&log).expect("create server log");
         let server_bin = env!("CARGO_BIN_EXE_sketch-session-server");
         let stub_bin = env!("CARGO_BIN_EXE_sketch-acp-stub");
@@ -74,6 +81,22 @@ impl TestServer {
         let server = TestServer { child, socket, log };
         server.wait_for_socket();
         server
+    }
+
+    /// SIGKILL the server and reap it, **leaving the socket + WAL on disk** so a
+    /// successor can recover — simulates a hard crash (no graceful shutdown).
+    fn crash(&mut self) {
+        let _ = self.child.kill(); // std Child::kill = SIGKILL on Unix
+        let _ = self.child.wait();
+    }
+
+    /// Start a fresh server process on the SAME socket + WAL dir (call after
+    /// `crash`). The new server's single-instance guard sees the stale,
+    /// unconnectable socket, clears it, and recovers sessions from the WAL.
+    fn respawn(&self, knobs: &[(&str, &str)]) -> TestServer {
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let log = self.log.with_extension(format!("respawn-{n}.log"));
+        Self::spawn_on(self.socket.clone(), log, knobs)
     }
 
     fn wait_for_socket(&self) {
@@ -109,6 +132,11 @@ impl Drop for TestServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.socket);
+        // Clean up durable state so repeated runs don't accumulate. (For a
+        // crash/respawn pair both TestServers share these paths; double-remove
+        // is harmless.)
+        let _ = std::fs::remove_file(self.socket.with_extension("state.json"));
+        let _ = std::fs::remove_dir_all(self.socket.with_extension("wal"));
     }
 }
 
@@ -510,5 +538,104 @@ fn turn_completes_with_no_subscriber_attached() {
         "the turn must have ENDED while unattended (no TurnEnded in the durable log); \
          replay={replay:#?}\nlog:\n{}",
         server.read_log()
+    );
+}
+
+/// 5. CRASH RECOVERY (ADR-0009). The decisive "agents run with no GUI" test:
+///    a turn completes, the server is SIGKILL'd with NO graceful shutdown (the
+///    old clean-shutdown-only JSON snapshot would lose everything here), a fresh
+///    server starts on the same socket + WAL dir, and the session plus its full
+///    transcript must be recovered from the durable write-ahead log.
+#[test]
+fn session_recovered_after_server_crash() {
+    let _g = serial_lock();
+    const CHUNKS: usize = 6;
+    let mut server = TestServer::start_with_env(&[("STUB_CHUNKS", "6")]);
+    server.activate_env();
+
+    let sid = {
+        let client = SessionServerClient::connect().expect("connect");
+        let info = client
+            .create_session(std::env::temp_dir(), "crashtest".into(), None)
+            .expect("create_session");
+        client
+            .attach(&info.session_id, AttachMode::Owner)
+            .expect("attach");
+        client
+            .prompt(&info.session_id, "survive a crash")
+            .expect("prompt");
+        // Wait for the turn to fully complete — TurnEnded is a WAL fsync
+        // boundary, so after this the transcript is durably on disk.
+        let notes = drain_until(&client, Duration::from_secs(15), |n| {
+            n.iter().any(|note| {
+                matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == info.session_id)
+            })
+        });
+        assert_eq!(
+            count_agent_chunks(&notes),
+            CHUNKS,
+            "turn must complete before the crash; log:\n{}",
+            server.read_log()
+        );
+        info.session_id
+    };
+
+    // HARD CRASH — SIGKILL, no graceful shutdown, no chance to persist.
+    server.crash();
+
+    // Fresh server on the SAME socket + WAL dir. Its single-instance guard
+    // clears the stale socket and recovery replays the WAL.
+    let server2 = server.respawn(&[("STUB_CHUNKS", "6")]);
+
+    // The recovered session must reappear (recovery runs at startup before the
+    // accept loop, but be tolerant of scheduling).
+    let client2 = SessionServerClient::connect().expect("connect after crash");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut present = false;
+    while Instant::now() < deadline {
+        if let Ok(sessions) = client2.list_sessions() {
+            if sessions.iter().any(|s| s.session_id == sid) {
+                present = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        present,
+        "session was not recovered from the WAL after a hard crash; log:\n{}",
+        server2.read_log()
+    );
+
+    // Attach and confirm the FULL pre-crash transcript replays from the WAL.
+    client2
+        .attach_owner_with_retry(&sid)
+        .expect("re-attach recovered session");
+    let replay = drain_until(&client2, Duration::from_secs(10), |n| {
+        count_agent_chunks(n) >= CHUNKS
+            && n.iter().any(|note| {
+                matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == sid)
+            })
+    });
+    assert_eq!(
+        count_agent_chunks(&replay),
+        CHUNKS,
+        "WAL must recover all {CHUNKS} agent chunks after a hard crash, got {}; log:\n{}",
+        count_agent_chunks(&replay),
+        server2.read_log()
+    );
+    assert!(
+        replay.iter().any(|n| matches!(
+            n,
+            Notification::UserPrompt { text, .. } if text == "survive a crash"
+        )),
+        "the user's prompt must survive the crash; replay={replay:#?}"
+    );
+    assert!(
+        replay.iter().any(|n| matches!(
+            n,
+            Notification::TurnEnded { session_id, .. } if *session_id == sid
+        )),
+        "the completed turn boundary must survive the crash"
     );
 }

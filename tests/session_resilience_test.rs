@@ -124,6 +124,10 @@ impl Drop for TestServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.socket);
+        // Clean up durable state (WAL dir + any state file) colocated with the
+        // socket so repeated runs don't accumulate.
+        let _ = std::fs::remove_file(self.socket.with_extension("state.json"));
+        let _ = std::fs::remove_dir_all(self.socket.with_extension("wal"));
         // Leave the log on disk for post-mortem if a test failed; temp dir is
         // cleaned by the OS. (Removing here would hide failures.)
     }
