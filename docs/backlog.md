@@ -24,22 +24,33 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
   for an even bigger win. Quick code-read, no runtime needed. (Incremental
   reparse already cut the cost 10–20×, so lower priority now.)
 
-- **Session-server reconnect storm** — `NEEDS-RUNTIME-REPRO`. The GUI client
-  flaps its connection to the session server in a tight loop: a single
-  `session-server.log` accumulated **489 "client reconnected" vs 5 "client
-  connected"** across runs. Symptom hit 2026-06-06 during signoff: creating a
-  new Claude session failed with `close_session(<id>) failed (connection):
-  session server disconnected` — `SessionServerClient::request()` returns that
-  error whenever the liveness flag is false, so a round-trip (close/create) that
-  lands in a "down" window fails. Suspected: ownership flapping in the
-  owner/observer model (`ManagedSession.owner`, `Promote`, `attach_with_owner_retry`
-  at main.rs:1884) and/or a disconnect during the large attach-replay (109/29/11
-  events) re-dropping the socket → reconnect → repeat. Pre-existing; NOT from the
-  Phase A/B refactors (none touch connect/reconnect/ownership). Adjacent to the
-  reconnect-handle work (ADR-0008 / item 10). Clean-room reset (clear
-  `session_server.json` + `acp_sessions.json` + stale socket) unblocks. Needs a
-  runtime repro to root-cause: log every connect/disconnect with reason + a
-  backoff/jitter on the GUI reconnect, then watch one launch.
+- **Session-server reconnect storm** — `ROOT-CAUSED + FIXED on branch
+  session-resilience` (2026-06-07); `NEEDS-RUNTIME` for the GUI reconnect path.
+  **Root cause:** `SessionServerClient` had no socket shutdown on drop. Its
+  reader thread is detached and blocks forever on `lines()`, so dropping the
+  client (notably `reconnect()`'s `*self = fresh`) leaked the thread AND kept
+  the socket fd open — the **server never saw the disconnect, so it never
+  released session ownership**. Every in-place `reconnect()` orphaned a zombie
+  owner; the next re-attach was rejected with "another GUI already owns this
+  session", and the connection only truly closed at process exit. That is the
+  489-reconnects / few-closes pattern and the `close/create … disconnected`
+  round-trip failures. **Fix (4 files):** (1) `Drop` now `shutdown(Both)`s the
+  socket so the reader unblocks and the server releases ownership at once;
+  (2) reconnect re-attach moved off the paint thread via the existing
+  `spawn_attach_sessions` (Owner-reclaim retry) instead of raw inline blocking
+  attaches that also froze rendering; (3) `attach_owner_with_retry` added to the
+  client lib for the residual teardown-vs-reattach race; (4) single-instance
+  guard — a 2nd server on a live socket exits instead of stealing it and
+  orphaning sessions; (5) `pid_file_path`/persist path now follow
+  `SKETCH_SESSION_SOCKET` (enables isolated instances + the guard). **Verified:**
+  new headless harness `tests/session_resilience_test.rs` drives the REAL server
+  binary (no agent needed) — reproduces the storm without the fix; with it, 30
+  sequential restarts + in-place reconnect + duplicate-server guard all pass,
+  every connection closes (no zombies). **Still owed:** human runtime check that
+  the GPUI app reconnects seamlessly after the server reader thread sees EOF
+  (GPUI can't be driven headlessly). Was suspected to be the attach-replay
+  broadcast lag — that path was already self-healing; the real cause was the
+  missing shutdown.
 
 ## Top priority
 

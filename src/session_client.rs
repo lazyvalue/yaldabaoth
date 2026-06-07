@@ -46,6 +46,15 @@ pub struct SessionServerClient {
     _writer: Option<JoinHandle<()>>,
     /// Pending response channels, keyed by request id.
     pending: Arc<Mutex<std::collections::HashMap<u64, std_mpsc::Sender<Response>>>>,
+    /// A clone of the socket retained solely so [`Drop`] can `shutdown` it.
+    /// The reader thread blocks on `lines()` and is detached (not joined), so
+    /// without an explicit shutdown the socket fd stays open after this struct
+    /// drops — the reader parks forever and, critically, the SERVER never sees
+    /// the disconnect, so it never releases the session ownership this
+    /// connection held. That zombie connection per `reconnect()` was the root
+    /// of the reconnect storm. Shutting the socket down on drop makes the read
+    /// return EOF (reader exits) and the server observe the close at once.
+    shutdown_handle: UnixStream,
 }
 
 /// Drop every pending response channel, unblocking any thread parked in
@@ -164,8 +173,11 @@ impl SessionServerClient {
         let (request_tx, request_rx) =
             std_mpsc::channel::<(Frame, Option<std_mpsc::Sender<Response>>)>();
 
-        // Clone the stream for reading.
+        // Clone the stream for reading, and retain one more clone purely so
+        // `Drop` can `shutdown` the socket (the reader thread owns its clone
+        // but is detached and blocked, so it can't close on demand).
         let read_stream = stream.try_clone()?;
+        let shutdown_handle = stream.try_clone()?;
         let write_stream = stream;
 
         // Reader thread: reads NDJSON lines, routes responses and notifications.
@@ -260,6 +272,7 @@ impl SessionServerClient {
             _reader: Some(reader),
             _writer: Some(writer),
             pending,
+            shutdown_handle,
         })
     }
 
@@ -431,6 +444,49 @@ impl SessionServerClient {
         }
     }
 
+    /// Attach as `Owner`, tolerating the brief window after a *previous*
+    /// connection of ours dropped but before the server has finished tearing
+    /// it down and releasing ownership. That window is real on an in-place
+    /// [`reconnect`](Self::reconnect): the new socket can re-attach before the
+    /// server has processed the old socket's EOF, so a bare [`attach`] races
+    /// and is rejected with "another GUI already owns this session".
+    ///
+    /// Retries on *ownership contention only* (any other error is fatal and
+    /// returned at once) for a bounded window, then falls back to an `Observer`
+    /// attach so the transcript still replays. Returns `Ok(true)` if we became
+    /// owner, `Ok(false)` if we fell back to observer (a genuinely live peer
+    /// still owns it). Mirrors the open-path retry but lives here so the
+    /// reconnect path and tests share one implementation.
+    pub fn attach_owner_with_retry(&self, session_id: &str) -> io::Result<bool> {
+        // ~1s total (20 × 50ms). The clean-shutdown → server-detach window is
+        // sub-millisecond once the socket is closed (see `Drop`), so this
+        // almost always succeeds on the first or second try; the budget only
+        // covers scheduling jitter under load.
+        let mut last = String::new();
+        for _ in 0..20 {
+            match self.attach(session_id, AttachMode::Owner) {
+                Ok(()) => return Ok(true),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("already own") {
+                        return Err(e);
+                    }
+                    last = msg;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        // Still owned after the window: a real peer holds it. Observe instead
+        // so we at least receive the replay + live stream.
+        self.attach(session_id, AttachMode::Observer).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("{last}; observer fallback failed: {e}"),
+            )
+        })?;
+        Ok(false)
+    }
+
     /// Claim ownership of a session this connection is observing. Succeeds
     /// only once the previous owner has disconnected (server reports the
     /// session as ownerless). Used by a candidate GUI to take over.
@@ -526,6 +582,16 @@ impl SessionServerClient {
 
 impl Drop for SessionServerClient {
     fn drop(&mut self) {
+        // Shut the socket down FIRST. The reader thread is detached and blocked
+        // on `lines()`; only closing the socket makes that read return EOF so
+        // the thread exits instead of leaking. Critically, it also makes the
+        // SERVER observe the disconnect immediately and release any session
+        // ownership this connection held — without it the server kept the
+        // connection (and its ownership) alive until the whole process exited,
+        // so every in-place `reconnect()` orphaned a zombie owner and the next
+        // re-attach was rejected with "another GUI already owns this session".
+        // That was the reconnect storm. Errors mean it's already closed.
+        let _ = self.shutdown_handle.shutdown(std::net::Shutdown::Both);
         // Unblock any parked request and let the writer thread observe the
         // dropped `request_tx` so it exits cleanly.
         self.connected.store(false, Ordering::SeqCst);

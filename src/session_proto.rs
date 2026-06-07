@@ -253,15 +253,24 @@ pub fn socket_path() -> PathBuf {
         .unwrap_or_else(|_| default_socket_path())
 }
 
-/// PID file path — colocated with the socket.
+/// PID file path — colocated with the socket. Derived from [`socket_path`] by
+/// swapping the extension, so it honors `SKETCH_SESSION_SOCKET`: a server on a
+/// custom socket gets its own PID file (and thus its own single-instance
+/// guard) rather than sharing the default one. For the default socket this
+/// resolves to `/tmp/sketch-session-$USER.pid`, unchanged.
 pub fn pid_file_path() -> PathBuf {
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-    PathBuf::from(format!("/tmp/sketch-session-{user}.pid"))
+    socket_path().with_extension("pid")
 }
 
 /// Path to the JSON file where the session server persists session metadata
-/// across restarts. Lives in the cache dir alongside other sketch state.
+/// across restarts. When the socket is overridden (tests, alternate
+/// instances) the state file lives next to that socket so instances never
+/// share persistence; otherwise it lives in the cache dir alongside other
+/// sketch state (the default, unchanged).
 pub fn session_server_persist_path() -> Option<PathBuf> {
+    if std::env::var_os("SKETCH_SESSION_SOCKET").is_some() {
+        return Some(socket_path().with_extension("state.json"));
+    }
     dirs::cache_dir().map(|d| d.join("sketch").join("session_server.json"))
 }
 
