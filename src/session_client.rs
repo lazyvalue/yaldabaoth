@@ -46,15 +46,6 @@ pub struct SessionServerClient {
     _writer: Option<JoinHandle<()>>,
     /// Pending response channels, keyed by request id.
     pending: Arc<Mutex<std::collections::HashMap<u64, std_mpsc::Sender<Response>>>>,
-    /// A clone of the socket retained solely so [`Drop`] can `shutdown` it.
-    /// The reader thread blocks on `lines()` and is detached (not joined), so
-    /// without an explicit shutdown the socket fd stays open after this struct
-    /// drops — the reader parks forever and, critically, the SERVER never sees
-    /// the disconnect, so it never releases the session ownership this
-    /// connection held. That zombie connection per `reconnect()` was the root
-    /// of the reconnect storm. Shutting the socket down on drop makes the read
-    /// return EOF (reader exits) and the server observe the close at once.
-    shutdown_handle: UnixStream,
 }
 
 /// Drop every pending response channel, unblocking any thread parked in
@@ -173,11 +164,11 @@ impl SessionServerClient {
         let (request_tx, request_rx) =
             std_mpsc::channel::<(Frame, Option<std_mpsc::Sender<Response>>)>();
 
-        // Clone the stream for reading, and retain one more clone purely so
-        // `Drop` can `shutdown` the socket (the reader thread owns its clone
-        // but is detached and blocked, so it can't close on demand).
+        // Clone the stream for reading. The writer keeps `write_stream` and is
+        // responsible for shutting the whole socket down once the request
+        // channel closes — AFTER it has flushed every queued frame — which in
+        // turn unblocks this detached reader (its blocking read returns EOF).
         let read_stream = stream.try_clone()?;
-        let shutdown_handle = stream.try_clone()?;
         let write_stream = stream;
 
         // Reader thread: reads NDJSON lines, routes responses and notifications.
@@ -258,8 +249,17 @@ impl SessionServerClient {
                         break;
                     }
                 }
-                // Writer exiting (send error or request_tx dropped): unblock
-                // any in-flight blocking request so it fails fast.
+                // The request channel closed (client dropped / reconnecting) or
+                // a write failed: every queued frame above has been flushed.
+                // NOW shut the socket down — this unblocks the detached reader
+                // (its blocking read returns EOF) AND makes the server observe
+                // the disconnect and release session ownership. Doing it here,
+                // *after* the drain, is what lets a fire-and-forget prompt sent
+                // just before drop still reach the server (shutting down in
+                // `Drop` instead raced this flush and silently dropped it).
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                // Writer exiting: unblock any in-flight blocking request so it
+                // fails fast.
                 fail_all_pending(&pending_w);
             })?;
 
@@ -272,7 +272,6 @@ impl SessionServerClient {
             _reader: Some(reader),
             _writer: Some(writer),
             pending,
-            shutdown_handle,
         })
     }
 
@@ -582,18 +581,18 @@ impl SessionServerClient {
 
 impl Drop for SessionServerClient {
     fn drop(&mut self) {
-        // Shut the socket down FIRST. The reader thread is detached and blocked
-        // on `lines()`; only closing the socket makes that read return EOF so
-        // the thread exits instead of leaking. Critically, it also makes the
-        // SERVER observe the disconnect immediately and release any session
-        // ownership this connection held — without it the server kept the
-        // connection (and its ownership) alive until the whole process exited,
-        // so every in-place `reconnect()` orphaned a zombie owner and the next
-        // re-attach was rejected with "another GUI already owns this session".
-        // That was the reconnect storm. Errors mean it's already closed.
-        let _ = self.shutdown_handle.shutdown(std::net::Shutdown::Both);
-        // Unblock any parked request and let the writer thread observe the
-        // dropped `request_tx` so it exits cleanly.
+        // Dropping `self` drops `request_tx` (once this body returns and the
+        // fields fall), which ends the writer thread's recv loop. The writer
+        // then FLUSHES every queued frame — including a fire-and-forget prompt
+        // sent right before drop/reconnect — and only THEN shuts the socket
+        // down (see `from_stream`), which unblocks the detached reader and lets
+        // the server see the disconnect. Shutting the socket down *here* would
+        // race that flush and silently drop the last prompt, so we don't.
+        //
+        // The writer only exits once ALL `request_tx` clones are gone; a
+        // `SessionServerHandle` holds one, but handles are short-lived
+        // (created per off-thread request, never stored), so the connection
+        // tears down promptly. We just unblock parked requests and mark dead.
         self.connected.store(false, Ordering::SeqCst);
         fail_all_pending(&self.pending);
     }

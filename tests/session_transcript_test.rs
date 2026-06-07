@@ -440,3 +440,75 @@ fn mid_turn_reconnect_no_corruption() {
         server.read_log()
     );
 }
+
+/// 4. The literal feature: an agent turn RUNS TO COMPLETION with NO GUI attached.
+///    The owner prompts and immediately leaves; for the entire turn there are
+///    zero connections to the server. The turn must still complete and the full
+///    transcript must be durable, so a GUI that attaches later sees the finished
+///    work. This is "agents keep running when no GUI is attached," proven end to
+///    end (not just "the session record survives a restart").
+#[test]
+fn turn_completes_with_no_subscriber_attached() {
+    let _g = serial_lock();
+    const CHUNKS: usize = 30;
+    // ~20ms/chunk → ~600ms turn. We wait far longer than that with NOBODY
+    // connected, so completion provably happens with no subscriber.
+    let server = TestServer::start_with_env(&[("STUB_CHUNKS", "30"), ("STUB_DELAY_MS", "20")]);
+    server.activate_env();
+
+    let sid = {
+        let client = SessionServerClient::connect().expect("connect owner");
+        let info = client
+            .create_session(std::env::temp_dir(), "headless".into(), None)
+            .expect("create_session");
+        client
+            .attach(&info.session_id, AttachMode::Owner)
+            .expect("attach owner");
+        // Send the prompt, then leave IMMEDIATELY — before the turn can finish.
+        // `prompt` is a round-trip, so on return the agent already has the work.
+        client.prompt(&info.session_id, "run with nobody watching").expect("prompt");
+        info.session_id
+        // client dropped here → the GUI is gone. From now until the attach far
+        // below, there are ZERO connections to the server.
+    };
+
+    // No GUI attached. Wait comfortably past the turn duration (~600ms) so the
+    // turn must complete with no subscriber. The per-session pump drains the
+    // agent and appends to event_log regardless of attach state.
+    std::thread::sleep(Duration::from_secs(3));
+
+    // A GUI shows up only now. It must see the COMPLETED turn — every chunk plus
+    // the turn boundary — replayed from the durable log.
+    let gui = SessionServerClient::connect().expect("late connect");
+    let sessions = gui.list_sessions().expect("list");
+    assert!(
+        sessions.iter().any(|s| s.session_id == sid),
+        "session vanished while no GUI was attached; log:\n{}",
+        server.read_log()
+    );
+    gui.attach(&sid, AttachMode::Owner).expect("attach after the fact");
+
+    let replay = drain_until(&gui, Duration::from_secs(10), |n| {
+        count_agent_chunks(n) >= CHUNKS
+            && n.iter().any(|note| {
+                matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == sid)
+            })
+    });
+    let chunks = count_agent_chunks(&replay);
+    assert_eq!(
+        chunks, CHUNKS,
+        "turn must complete with no GUI attached: expected {CHUNKS} chunks in the durable log, \
+         got {chunks}; replay={replay:#?}\nlog:\n{}",
+        server.read_log()
+    );
+    assert!(
+        replay.iter().any(|n| matches!(
+            n,
+            Notification::TurnEnded { session_id, turn_count, .. }
+                if *session_id == sid && *turn_count >= 1
+        )),
+        "the turn must have ENDED while unattended (no TurnEnded in the durable log); \
+         replay={replay:#?}\nlog:\n{}",
+        server.read_log()
+    );
+}
