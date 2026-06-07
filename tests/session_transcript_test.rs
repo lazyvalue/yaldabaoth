@@ -639,3 +639,113 @@ fn session_recovered_after_server_crash() {
         "the completed turn boundary must survive the crash"
     );
 }
+
+/// 6. SLOW-SUBSCRIBER DISCONNECT (phase-7 liveness hardening). A subscriber
+///    whose socket stops draining must NOT be able to park its forwarder task +
+///    fd forever. The forwarder bounds every socket write by
+///    `SKETCH_SLOW_SUB_TIMEOUT_MS`; when a non-draining peer's OS send buffer
+///    fills, the write stalls past the timeout and the server drops that
+///    subscriber — while the healthy OWNER is completely unaffected.
+///
+///    Setup: a LARGE burst (STUB_CHUNKS=2000 × a long STUB_CHUNK_TEXT) so the
+///    forwarder must push enough bytes to overflow a non-draining socket's
+///    kernel send buffer. The owner is a normal client (reads continuously).
+///    The stuck subscriber is a RAW `UnixStream` that attaches as Observer and
+///    then NEVER reads. With the timeout dropped to 500ms the test is fast.
+#[test]
+fn slow_subscriber_is_disconnected_owner_unaffected() {
+    use std::io::Write as _;
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    let _g = serial_lock();
+    const CHUNKS: usize = 2000;
+    // A long per-chunk text: 2000 chunks × ~200 chars each is ~400KB+ of frames,
+    // comfortably more than a default socket send buffer, so a non-draining peer
+    // fills up and the forwarder's write_all blocks → trips the 500ms timeout.
+    let long_text = "x".repeat(200);
+    let server = TestServer::start_with_env(&[
+        ("STUB_CHUNKS", "2000"),
+        ("STUB_CHUNK_TEXT", &long_text),
+        ("SKETCH_SLOW_SUB_TIMEOUT_MS", "500"),
+    ]);
+    server.activate_env();
+
+    // Owner: a normal client that reads continuously.
+    let owner = SessionServerClient::connect().expect("connect owner");
+    let info = owner
+        .create_session(std::env::temp_dir(), "slow-sub".into(), None)
+        .expect("create_session");
+    owner
+        .attach(&info.session_id, AttachMode::Owner)
+        .expect("attach owner");
+
+    // Stuck subscriber: a RAW UnixStream that attaches as Observer over the wire
+    // (mirroring `Request::Attach` / `Frame::Request`), then NEVER reads. Its
+    // forwarder's writes will pile up in the kernel send buffer until full.
+    let mut stuck = StdUnixStream::connect(&server.socket).expect("raw connect");
+    let attach_frame = format!(
+        "{{\"kind\":\"request\",\"id\":1,\"req\":{{\"method\":\"attach\",\"session_id\":{sid},\"mode\":\"observer\"}}}}\n",
+        sid = serde_json::to_string(&info.session_id).unwrap()
+    );
+    stuck
+        .write_all(attach_frame.as_bytes())
+        .expect("send raw attach");
+    stuck.flush().expect("flush raw attach");
+    // Deliberately do NOT read from `stuck` from here on.
+
+    // Drive a turn. The stub streams the big burst → the stuck observer's send
+    // buffer fills → its forwarder write times out at 500ms → server drops it.
+    owner.prompt(&info.session_id, "flood the slow subscriber").expect("prompt");
+
+    // (a) The stuck subscriber is reaped: the server logs the slow-subscriber
+    // warning. Bounded wait — the timeout is 500ms; allow generous slack for the
+    // burst to fill the buffer and the write to stall.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_warning = false;
+    while Instant::now() < deadline {
+        if server.read_log().contains("slow subscriber: write stalled") {
+            saw_warning = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        saw_warning,
+        "expected the server to log a 'slow subscriber: write stalled' disconnect for the \
+         non-draining observer; the buffer-fill never tripped the {timeout}ms write timeout.\n\
+         If this is flaky, the kernel send buffer may be larger than the burst — increase \
+         STUB_CHUNKS / STUB_CHUNK_TEXT length.\nlog:\n{log}",
+        timeout = 500,
+        log = server.read_log()
+    );
+
+    // (b) The OWNER is unaffected: it still receives every chunk and the turn
+    // completes normally (TurnEnded). The slow subscriber's reaping must not gap
+    // or stall the healthy owner.
+    let notes = drain_until(&owner, Duration::from_secs(30), |n| {
+        count_agent_chunks(n) >= CHUNKS
+            && n.iter().any(|note| {
+                matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == info.session_id)
+            })
+    });
+    let got = count_agent_chunks(&notes);
+    assert_eq!(
+        got, CHUNKS,
+        "owner must receive ALL {CHUNKS} chunks even while a slow subscriber is reaped, got {got}\nlog:\n{}",
+        server.read_log()
+    );
+    assert!(
+        notes.iter().any(|n| matches!(
+            n,
+            Notification::TurnEnded { session_id, turn_count, .. }
+                if *session_id == info.session_id && *turn_count >= 1
+        )),
+        "owner's turn must complete normally despite the slow-subscriber disconnect; \
+         notes={notes:#?}\nlog:\n{}",
+        server.read_log()
+    );
+
+    // Keep the stuck stream alive until the very end so it stays connected for
+    // the whole turn (drop closes it; we want the timeout, not a clean EOF).
+    drop(stuck);
+}
