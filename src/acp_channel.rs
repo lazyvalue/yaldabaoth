@@ -324,6 +324,12 @@ impl PermissionMode {
     }
 }
 
+/// The permission mode a session starts in. Safe by default: tool calls are
+/// NOT auto-approved (AskEachTime declines today and will prompt the user once
+/// the inline approval UI lands). Escalation to Yolo is an explicit user action
+/// (the mode-cycle keybind). Flipping this constant changes the default everywhere.
+pub const DEFAULT_PERMISSION_MODE: PermissionMode = PermissionMode::AskEachTime;
+
 /// Decide whether `kind` is allowed under `mode`. Centralised so both
 /// sides of the worker boundary use identical logic.
 fn allow_tool_kind(mode: PermissionMode, kind: ToolKind) -> bool {
@@ -535,11 +541,12 @@ impl AcpChannelClient {
         let session_id: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(None));
         let session_id_for_worker = session_id.clone();
-        // Default to Yolo so the agent can run its full edit→build→test
-        // loop without being silently cut off at the Bash boundary. The
-        // mode toggle (`<space> k m`) cycles to ReadOnly / AutoEdit when
-        // the user wants tighter limits per session.
-        let permission_mode = Arc::new(AtomicU8::new(PermissionMode::Yolo as u8));
+        // Start safe: sessions begin in DEFAULT_PERMISSION_MODE (AskEachTime),
+        // which does NOT auto-approve gated tools (Edit/Write/Move/Delete/
+        // Execute/Fetch). The user explicitly escalates with the mode toggle
+        // (`<space> k m`) — e.g. to Yolo — when they want the agent to run its
+        // full edit→build→test loop without prompts.
+        let permission_mode = Arc::new(AtomicU8::new(DEFAULT_PERMISSION_MODE as u8));
         let permission_mode_for_worker = permission_mode.clone();
 
         // Wake channel: the worker pushes `()` every time it forwards a
@@ -1495,6 +1502,26 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::process::Stdio;
+
+    /// The shipped default must be safe: a fresh session never auto-approves
+    /// gated tools. This pins the security contract — flipping
+    /// DEFAULT_PERMISSION_MODE to anything that allows Execute/Delete will
+    /// break this test.
+    #[test]
+    fn default_permission_mode_is_safe() {
+        // Shell execution is NOT auto-approved by default.
+        assert!(!allow_tool_kind(DEFAULT_PERMISSION_MODE, ToolKind::Execute));
+        // Destructive deletes are NOT auto-approved by default.
+        assert!(!allow_tool_kind(DEFAULT_PERMISSION_MODE, ToolKind::Delete));
+    }
+
+    /// The escalation contract: explicit Yolo DOES allow shell execution.
+    /// Together with the test above this proves the user must opt in to the
+    /// permissive behaviour rather than getting it for free.
+    #[test]
+    fn explicit_yolo_allows_execute() {
+        assert!(allow_tool_kind(PermissionMode::Yolo, ToolKind::Execute));
+    }
 
     /// Build a tiny Python script that pretends to be an ACP agent: it
     /// answers `initialize` and `session/new`, then for each `session/prompt`

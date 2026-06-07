@@ -5572,6 +5572,7 @@ dependencies = [
  "gpui",
  "insta",
  "kdl",
+ "libc",
  "pretty_assertions",
  "pulldown-cmark",
  "ratatui",

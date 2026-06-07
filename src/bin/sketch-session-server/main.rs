@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +20,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
-use sketch::acp_channel::{AcpChannelClient, PermissionMode, SketchFrontend};
+use sketch::acp_channel::{
+    AcpChannelClient, PermissionMode, SketchFrontend, DEFAULT_PERMISSION_MODE,
+};
 use sketch::session_proto::*;
 
 mod launchd;
@@ -401,7 +404,7 @@ impl SessionManager {
     ) -> SessionInfo {
         let id = uuid::Uuid::new_v4().to_string();
         let (event_tx, _) = broadcast::channel(16384);
-        let permission_mode = PermissionMode::Yolo;
+        let permission_mode = DEFAULT_PERMISSION_MODE;
 
         // Open the durable WAL up front and write its header, so even a crash
         // immediately after create can recover the session's identity. Degrade
@@ -1296,7 +1299,20 @@ async fn main() -> io::Result<()> {
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    let listener = UnixListener::bind(&socket_path)?;
+    // Owner-only socket: nobody else on the box can connect to (and drive)
+    // our agent sessions. The mode must be tight from the instant the inode
+    // exists — `bind()` starts queueing `connect()`s immediately, so a
+    // chmod-after-bind leaves a TOCTOU window where a same-host attacker can
+    // slip into the backlog. Clamp the umask around the bind so the socket is
+    // created 0600 atomically; the explicit set_permissions is a belt-and-
+    // suspenders assertion (and covers any platform that ignores umask on
+    // socket inodes). We are single-threaded here (pre-accept-loop), so the
+    // process-global umask flip is safe to restore right after.
+    let prev_umask = unsafe { libc::umask(0o177) };
+    let bind_result = UnixListener::bind(&socket_path);
+    unsafe { libc::umask(prev_umask) };
+    let listener = bind_result?;
+    let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
 
     // Write PID file.
     let _ = std::fs::write(&pid_path, std::process::id().to_string());
