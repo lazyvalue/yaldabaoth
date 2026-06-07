@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Dev iteration loop for sketch (server + GUI model).
+# Dev iteration loop for sketch — rebuild + restart BOTH gui and server.
 #
 # Builds the latest binaries, stops any persistent session server (so the
 # rebuild actually takes effect instead of the GUI reconnecting to the OLD
@@ -8,12 +8,17 @@
 # GUI. The GUI auto-spawns a fresh DETACHED session server on launch; killing
 # the old one here is what forces your new server binary to be used.
 #
+# Use this when you've changed the SERVER (session-server, WAL, ACP channel,
+# permission logic) and need the new server binary live. It DROPS all live
+# agent sessions — the server is killed and its socket cleared. If you only
+# touched the GUI and want to keep agents alive, use ./dev-gui.sh instead.
+#
 #   Server logs -> ~/Library/Caches/sketch/session-server.log  (detached daemon)
 #   GUI logs    -> this terminal
 #
 # Quit the GUI and re-run this script to iterate. Pass a file to open it:
-#   ./dev.sh            # opens the browser
-#   ./dev.sh notes.md   # opens a file
+#   ./dev-all.sh            # opens the browser
+#   ./dev-all.sh notes.md   # opens a file
 #
 set -euo pipefail
 cd "$(dirname "$0")"

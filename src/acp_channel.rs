@@ -314,6 +314,19 @@ impl PermissionMode {
         }
     }
 
+    /// Parse a mode from a config string. Accepts the `short_label()` forms
+    /// plus a few friendly aliases; case-insensitive. Returns `None` for
+    /// anything unrecognised so the caller can surface a config error.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "readonly" | "read-only" => Some(Self::ReadOnly),
+            "autoedit" | "auto-edit" => Some(Self::AutoEdit),
+            "askeachtime" | "ask-each-time" | "ask-each" | "ask" => Some(Self::AskEachTime),
+            "yolo" => Some(Self::Yolo),
+            _ => None,
+        }
+    }
+
     fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::AutoEdit,
@@ -324,11 +337,17 @@ impl PermissionMode {
     }
 }
 
-/// The permission mode a session starts in. Safe by default: tool calls are
-/// NOT auto-approved (AskEachTime declines today and will prompt the user once
-/// the inline approval UI lands). Escalation to Yolo is an explicit user action
-/// (the mode-cycle keybind). Flipping this constant changes the default everywhere.
-pub const DEFAULT_PERMISSION_MODE: PermissionMode = PermissionMode::AskEachTime;
+/// The permission mode a session starts in when nothing overrides it. The
+/// default is now `Yolo` (auto-approve every gated tool) — the safe modes
+/// proved too annoying without an inline-approval UI. This is config-overridable
+/// via `default-permission-mode` in the config file; the safe modes
+/// (read-only / auto-edit / ask-each) remain available and become the
+/// recommended default once an inline-approval UI lands. The 0600 owner-only
+/// socket still gates other local users from reaching the session surface, so
+/// auto-approve here does not widen who can drive the agent — only what the
+/// owner's own sessions do by default. Flipping this constant changes the
+/// hard-coded fallback everywhere; the config node is the user-facing knob.
+pub const DEFAULT_PERMISSION_MODE: PermissionMode = PermissionMode::Yolo;
 
 /// Decide whether `kind` is allowed under `mode`. Centralised so both
 /// sides of the worker boundary use identical logic.
@@ -541,11 +560,14 @@ impl AcpChannelClient {
         let session_id: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(None));
         let session_id_for_worker = session_id.clone();
-        // Start safe: sessions begin in DEFAULT_PERMISSION_MODE (AskEachTime),
-        // which does NOT auto-approve gated tools (Edit/Write/Move/Delete/
-        // Execute/Fetch). The user explicitly escalates with the mode toggle
-        // (`<space> k m`) — e.g. to Yolo — when they want the agent to run its
-        // full edit→build→test loop without prompts.
+        // Sessions begin in DEFAULT_PERMISSION_MODE (now Yolo — auto-approve,
+        // so the agent runs its full edit→build→test loop without prompts).
+        // The effective default is config-driven on the server side
+        // (`default-permission-mode` in config.kdl); this constant is the
+        // no-config fallback. The user de-escalates to a safe mode
+        // (read-only / auto-edit / ask-each) with the mode toggle
+        // (`<space> c m`). The 0600 socket remains the gate against other
+        // local users.
         let permission_mode = Arc::new(AtomicU8::new(DEFAULT_PERMISSION_MODE as u8));
         let permission_mode_for_worker = permission_mode.clone();
 
@@ -1503,24 +1525,56 @@ mod tests {
     use std::io::Write;
     use std::process::Stdio;
 
-    /// The shipped default must be safe: a fresh session never auto-approves
-    /// gated tools. This pins the security contract — flipping
-    /// DEFAULT_PERMISSION_MODE to anything that allows Execute/Delete will
-    /// break this test.
-    #[test]
-    fn default_permission_mode_is_safe() {
-        // Shell execution is NOT auto-approved by default.
-        assert!(!allow_tool_kind(DEFAULT_PERMISSION_MODE, ToolKind::Execute));
-        // Destructive deletes are NOT auto-approved by default.
-        assert!(!allow_tool_kind(DEFAULT_PERMISSION_MODE, ToolKind::Delete));
-    }
-
     /// The escalation contract: explicit Yolo DOES allow shell execution.
-    /// Together with the test above this proves the user must opt in to the
-    /// permissive behaviour rather than getting it for free.
+    /// The default is now Yolo (config-overridable), so this also pins the
+    /// no-config default behaviour: gated tools auto-approve out of the box.
     #[test]
     fn explicit_yolo_allows_execute() {
         assert!(allow_tool_kind(PermissionMode::Yolo, ToolKind::Execute));
+    }
+
+    /// The current default is Yolo (auto-approve), config-overridable. The
+    /// 0600 owner-only socket — not the permission mode — is what gates who can
+    /// drive the agent; the safe modes stay available for users who want them.
+    #[test]
+    fn default_permission_mode_is_yolo() {
+        assert_eq!(DEFAULT_PERMISSION_MODE, PermissionMode::Yolo);
+        assert!(allow_tool_kind(DEFAULT_PERMISSION_MODE, ToolKind::Execute));
+        assert!(allow_tool_kind(DEFAULT_PERMISSION_MODE, ToolKind::Delete));
+    }
+
+    /// The safe modes remain available and never auto-approve dangerous tools,
+    /// so a user who opts back into them gets the original protective behaviour.
+    #[test]
+    fn safe_modes_still_decline_dangerous_tools() {
+        for mode in [PermissionMode::ReadOnly, PermissionMode::AskEachTime] {
+            assert!(!allow_tool_kind(mode, ToolKind::Execute));
+            assert!(!allow_tool_kind(mode, ToolKind::Delete));
+        }
+        // AutoEdit allows edits but still declines shell/delete.
+        assert!(!allow_tool_kind(PermissionMode::AutoEdit, ToolKind::Execute));
+        assert!(!allow_tool_kind(PermissionMode::AutoEdit, ToolKind::Delete));
+    }
+
+    /// `parse` round-trips every `short_label()` value and rejects garbage, so
+    /// the config knob and the chrome label can never drift apart silently.
+    #[test]
+    fn parse_round_trips_short_labels_and_rejects_garbage() {
+        for mode in [
+            PermissionMode::ReadOnly,
+            PermissionMode::AutoEdit,
+            PermissionMode::AskEachTime,
+            PermissionMode::Yolo,
+        ] {
+            assert_eq!(
+                PermissionMode::parse(mode.short_label()),
+                Some(mode),
+                "short_label {:?} must parse back to itself",
+                mode.short_label()
+            );
+        }
+        assert_eq!(PermissionMode::parse("nonsense"), None);
+        assert_eq!(PermissionMode::parse(""), None);
     }
 
     /// Build a tiny Python script that pretends to be an ACP agent: it
