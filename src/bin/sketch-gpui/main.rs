@@ -1850,6 +1850,54 @@ fn acp_session_persist_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("sketch").join("acp_sessions.json"))
 }
 
+/// Path to the one-line UUID file holding this GUI install's STABLE client id
+/// (spec phase 4). Sibling to `acp_session_persist_path` under
+/// `~/.cache/sketch/`. Chosen over `config.kdl` (this is an implementation
+/// detail, not user-facing) and `preferences.json` (no JSON restructure; `rm`
+/// to reset).
+fn client_id_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("sketch").join("client_id"))
+}
+
+/// Load (or first-time generate) this GUI's stable `client_id`. The lease model
+/// keys ownership on this id so a restart/reconnect resumes with zero
+/// contention.
+///
+/// A per-process `SKETCH_CLIENT_ID` override WINS, so a blue-green *candidate*
+/// (launched with a fresh per-process UUID) is a DISTINCT client from the
+/// original — it lands as Observer while the original's lease is live, then
+/// Promotes under its own id. This is load-bearing: if the candidate read the
+/// on-disk id it would impersonate the original and steal the lease.
+///
+/// Production (no env) reads/creates the persistent file, so a normal restart
+/// resumes the lease.
+fn load_or_create_client_id() -> String {
+    if let Ok(env_id) = std::env::var("SKETCH_CLIENT_ID") {
+        let t = env_id.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    if let Some(path) = client_id_path() {
+        if let Ok(id) = std::fs::read_to_string(&path) {
+            let t = id.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        if let Some(p) = path.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        let _ = std::fs::write(&path, &id);
+        id
+    } else {
+        // No cache dir: ephemeral per-process id (rare; lease still works within
+        // this process's lifetime, just doesn't survive a restart).
+        uuid::Uuid::new_v4().to_string()
+    }
+}
+
 /// Sketch's process cwd, with a safe fallback. Used both as the default
 /// per-session cwd for new agent slots (spec-agent-cwd.md §1) and as the
 /// top-level key in `acp_sessions.json` / `workspace.json`.
@@ -1881,59 +1929,37 @@ fn persist_cwd_key(cwd: &std::path::Path) -> String {
     cwd_match_key(cwd).to_string_lossy().into_owned()
 }
 
-/// Attach to a server session, retrying an Owner attach briefly when the
-/// server still reports a previous owner.
+/// Attach to a server session and learn our role in ONE deterministic round
+/// trip (spec phase 4 — replaces the old `attach_owner_with_retry` race).
 ///
-/// The session server is persistent and outlives the GUI, so on app reboot the
-/// pre-reboot connection's `detach` — which releases ownership when its socket
-/// closes — can be processed by the server *after* the freshly-launched process
-/// issues its attach. A one-shot Owner attach then loses that race and returns
-/// "another GUI already owns this session"; the old code swallowed the error
-/// and bound the slot anyway, leaving a session that received no events and
-/// whose prompts the server silently rejected (`prompt` is fire-and-forget, so
-/// the rejection never surfaced) — the "resume never responds" bug.
+/// The lease keys on this GUI's STABLE `client_id` (already set on the client),
+/// so a returning instance presents the SAME id as any lingering lease and the
+/// server's same-`client_id` branch RESUMES on the first attempt — regardless
+/// of whether the prior socket's EOF has been processed, and regardless of
+/// expiry (live → renew, expired → re-grant). There is nothing to wait out, so
+/// the 8×300ms retry + "already own" error-string sniffing is gone.
 ///
-/// Retrying for a bounded window lets the stale owner clear. If the window
-/// expires still-owned (a genuinely live peer, or a wedged connection), fall
-/// back to an Observer attach so the replay/live stream is at least received,
-/// and report `Ok(false)` so the caller can surface "not the owner". Errors
-/// other than ownership contention are returned immediately.
+/// Returns `Ok(true)` when this attach was granted drive rights (the lease) and
+/// `Ok(false)` when it downgraded to Observer (a different live client holds the
+/// lease, or `want_owner` is false). The role comes straight from the response's
+/// `driver` flag, never from an inferred error.
 ///
-/// Runs on the background executor (never the paint thread), so the bounded
-/// `sleep` between tries is safe.
-fn attach_with_owner_retry(
+/// Still runs on the background executor (never the paint thread).
+///
+/// Named `attach_for_role` (not `_with_retry`): there is no retry loop anymore —
+/// it is a single deterministic attach whose Owner/Observer outcome the caller
+/// records onto the slot's `is_driver`.
+fn attach_for_role(
     handle: &sketch::session_client::SessionServerHandle,
     sid: &str,
     want_owner: bool,
 ) -> Result<bool, String> {
-    if !want_owner {
-        return handle
-            .attach(sid, AttachMode::Observer)
-            .map(|_| false)
-            .map_err(|e| e.to_string());
-    }
-    let mut last_err = String::new();
-    // ~2.4s total (8 × 300ms) — comfortably longer than the socket-close →
-    // detach window on a clean reboot, short enough not to stall the open.
-    for _ in 0..8 {
-        match handle.attach(sid, AttachMode::Owner) {
-            Ok(()) => return Ok(true),
-            Err(e) => {
-                last_err = e.to_string();
-                // Only ownership contention is transient; anything else is fatal.
-                if !last_err.contains("already own") {
-                    return Err(last_err);
-                }
-                std::thread::sleep(Duration::from_millis(300));
-            }
-        }
-    }
-    // Still owned after the window: subscribe as an observer so the transcript
-    // still replays, and tell the caller we are not the owner.
-    match handle.attach(sid, AttachMode::Observer) {
-        Ok(()) => Ok(false),
-        Err(e) => Err(format!("{last_err}; observer fallback failed: {e}")),
-    }
+    let mode = if want_owner {
+        AttachMode::Owner
+    } else {
+        AttachMode::Observer
+    };
+    handle.attach(sid, mode).map_err(|e| e.to_string())
 }
 
 /// Whether this process was launched as a build-loop candidate.
@@ -1954,6 +1980,11 @@ fn connect_session_server() -> Option<SessionServerClient> {
     }
     match SessionServerClient::connect() {
         Ok(client) => {
+            // Install the stable lease identity (phase 4) right after connect so
+            // every attach / heartbeat / gated action carries it. Survives
+            // in-place reconnect (the client re-applies it onto the rebuilt
+            // struct) AND app restart (persisted to ~/.cache/sketch/client_id).
+            client.set_client_id(load_or_create_client_id());
             eprintln!("[sketch-gpui] connected to session server");
             Some(client)
         }
@@ -5844,6 +5875,15 @@ struct AgentSlot {
     /// When using the session server, this is the server-assigned session id.
     /// `None` when using direct AcpChannelClient spawning.
     server_session_id: Option<String>,
+    /// Whether THIS window currently holds the lease (drives) this session,
+    /// from the `driver` flag in the attach response (phase 4). `true` only
+    /// while we are the live Owner; an attach that downgraded us to Observer
+    /// (a different live client holds the lease) leaves this `false`. The
+    /// lease heartbeat beats ONLY driver slots, and an observer never
+    /// poll-acquires Owner on a heartbeat error — it waits for an explicit
+    /// `LeaseChanged{None}` promote. Reset to `false` on (re)bind; set to the
+    /// attach outcome by `spawn_attach_sessions`.
+    is_driver: bool,
     /// Set while an async server open/create round-trip for this slot is in
     /// flight; the resolution binds back to this slot by matching the token
     /// across the whole workspace. Globally unique (see `alloc_open_token`) so
@@ -5901,6 +5941,10 @@ impl AgentRing {
             resume_id,
             cwd,
             server_session_id,
+            // Role is unknown until the attach response lands; default to
+            // non-driver so a freshly-pushed slot never beats before
+            // spawn_attach_sessions records the real outcome.
+            is_driver: false,
             pending_open_token: None,
         });
         self.active = self.slots.len() - 1;
@@ -6245,9 +6289,10 @@ struct SketchGpuiView {
     /// `build_and_launch_candidate` / `candidate_take_over`.
     is_candidate: bool,
     /// For a candidate: whether the mirrored sessions have been released by
-    /// the original owner (i.e. an `OwnerChanged{has_owner:false}` arrived),
-    /// meaning take-over will now succeed. Drives the banner color. Purely a
-    /// display hint — `candidate_take_over` re-checks authoritatively.
+    /// the original holder (i.e. a `LeaseChanged{lease:None}` arrived, or the
+    /// lease is now held by our own client_id), meaning take-over will now
+    /// succeed. Drives the banner color. Purely a display hint —
+    /// `candidate_take_over` re-checks authoritatively.
     candidate_promote_ready: bool,
     /// Splash screen shown at startup. `Some(deadline)` while visible;
     /// `None` after dismissal (auto-timeout or keypress).
@@ -6255,6 +6300,16 @@ struct SketchGpuiView {
     /// Shared syntect highlighter for code block syntax coloring in Edit Mode
     /// and the agent transcript pane. Loaded once at startup.
     syntect_hl: sketch::highlight::Highlighter,
+    /// The lease-heartbeat beater (spec phase 4). A SINGLETON tied to this
+    /// view's lifetime: spawned at most once (on the first `start_server_pump`
+    /// that finds this `None`) and self-gates per-tick on `slot.is_driver`, so
+    /// one beater covers every driven session in this window for the window's
+    /// life. Subsequent `start_server_pump` calls (re-opening the Claude
+    /// screen) find this `Some` and DON'T spawn another — fixing the leak where
+    /// each open spawned a fresh detached beater, so a lease-loss event fanned
+    /// out into K redundant Owner re-attaches. Dropped (and thus cancelled)
+    /// with the view.
+    _lease_heartbeat: Option<Task<()>>,
 }
 
 impl SketchGpuiView {
@@ -6294,6 +6349,7 @@ impl SketchGpuiView {
             candidate_promote_ready: false,
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
             syntect_hl: sketch::highlight::Highlighter::new(),
+            _lease_heartbeat: None,
         }
     }
 
@@ -6317,6 +6373,7 @@ impl SketchGpuiView {
             candidate_promote_ready: false,
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
             syntect_hl: sketch::highlight::Highlighter::new(),
+            _lease_heartbeat: None,
         }
     }
 
@@ -6797,6 +6854,14 @@ impl SketchGpuiView {
                         let mut cmd = std::process::Command::new(exe);
                         cmd.args(&args);
                         cmd.env("SKETCH_CANDIDATE", "1");
+                        // Phase-4 blue-green: give the candidate a DISTINCT
+                        // per-launch client_id so it is a different lease client
+                        // from the original. It lands as Observer while the
+                        // original's lease is live, then Promotes under this
+                        // fresh id once the original cleanly exits. (If it read
+                        // the on-disk id it would impersonate the original and
+                        // steal the lease.)
+                        cmd.env("SKETCH_CLIENT_ID", uuid::Uuid::new_v4().to_string());
                         cmd.stdin(std::process::Stdio::null());
                         cmd.stdout(std::process::Stdio::null());
                         cmd.stderr(std::process::Stdio::inherit());
@@ -6830,9 +6895,11 @@ impl SketchGpuiView {
     /// a read-only candidate (SKETCH_CANDIDATE=1) that co-attaches and waits for
     /// the user to hand off; this is a full self-restart — build, spawn a fresh
     /// normal instance (no SKETCH_CANDIDATE), then quit so the new process
-    /// reclaims ownership of every server-managed session via the proven
-    /// GUI-restart / `attach_with_owner_retry` path. The session server (and its
-    /// live agent sessions) is left running, so agents survive the bounce.
+    /// reclaims ownership of every server-managed session via the deterministic
+    /// same-`client_id` `attach_for_role` path (the new instance presents the
+    /// SAME stable client_id, so the server resumes its lease on the first
+    /// attach). The session server (and its live agent sessions) is left
+    /// running, so agents survive the bounce.
     ///
     /// NEEDS-RUNTIME: GPUI can't be driven headlessly, so this is compile-
     /// verified only — the actual rebuild/relaunch/owner-reclaim must be
@@ -6881,9 +6948,9 @@ impl SketchGpuiView {
                                     "rebuilt — relaunching gui, this window will close",
                                     cx,
                                 );
-                                // Quit promptly: the new instance's
-                                // attach_with_owner_retry handles the teardown
-                                // race, so we don't need to linger.
+                                // Quit promptly: the new instance's deterministic
+                                // same-client_id attach_for_role reclaim handles
+                                // the teardown race, so we don't need to linger.
                                 cx.quit();
                             }
                             Err(e) => {
@@ -6942,6 +7009,16 @@ impl SketchGpuiView {
         if failures.is_empty() {
             self.is_candidate = false;
             self.candidate_promote_ready = false;
+            // We now hold the lease on every promoted session. Mark each slot a
+            // driver so the (already-running, unconditionally-spawned) lease
+            // heartbeat begins beating them on its next tick — without this the
+            // freshly-promoted owner would hold the lease but never heartbeat
+            // it, and the server would sweep it ~15s later (owner-gap bug).
+            for sid in &sids {
+                self.for_each_server_session_slot(sid, |slot| {
+                    slot.is_driver = true;
+                });
+            }
             self.set_agent_status(
                 &format!("took over {} session(s) — you now own them", sids.len()),
                 cx,
@@ -11541,7 +11618,7 @@ impl SketchGpuiView {
                 .spawn(async move {
                     sids.into_iter()
                         .map(|sid| {
-                            let r = attach_with_owner_retry(&handle, &sid, want_owner);
+                            let r = attach_for_role(&handle, &sid, want_owner);
                             (sid, r)
                         })
                         .collect()
@@ -11554,15 +11631,26 @@ impl SketchGpuiView {
                 // launch (see below). Transient failures keep today's behavior.
                 let mut dead_sids: Vec<String> = Vec::new();
                 for (sid, r) in results {
-                    let status: Option<SharedString> = match r {
-                        // Owner (or observer-by-design): leave the optimistic
+                    // Per-slot outcome: the status string to surface (if any) and
+                    // whether THIS window now drives the session. `is_driver` is
+                    // the attach response's `driver` flag — the single source of
+                    // truth the lease heartbeat (beat only drivers) and the
+                    // no-poll-acquire rule (observers don't re-attach Owner on a
+                    // heartbeat error) both read.
+                    let (status, is_driver): (Option<SharedString>, bool) = match r {
+                        // Granted drive rights (Owner): leave the optimistic
                         // "reconnecting…"/"attaching…" status to be overwritten
                         // by the first real event / SessionAttached notice.
-                        Ok(true) => None,
-                        Ok(false) if want_owner => {
-                            Some("read-only — another window owns this session".into())
-                        }
-                        Ok(false) => None,
+                        Ok(true) => (None, true),
+                        // Downgraded to Observer despite wanting Owner: a
+                        // different live client holds the lease. Surface
+                        // read-only and DO NOT drive.
+                        Ok(false) if want_owner => (
+                            Some("read-only — another window owns this session".into()),
+                            false,
+                        ),
+                        // Observer by design (candidate / explicit observe).
+                        Ok(false) => (None, false),
                         Err(e) => {
                             eprintln!(
                                 "[sketch-gpui] attach failed for {}: {e}",
@@ -11577,17 +11665,21 @@ impl SketchGpuiView {
                             // reconnect, so keep the status and the slot.
                             if is_session_gone_error(&e) {
                                 dead_sids.push(sid.clone());
-                                None
+                                (None, false)
                             } else {
-                                Some("attach failed — session may be unavailable".into())
+                                (
+                                    Some("attach failed — session may be unavailable".into()),
+                                    false,
+                                )
                             }
                         }
                     };
-                    if let Some(s) = status {
-                        this.for_each_server_session_slot(&sid, |slot| {
-                            slot.state.status = Some(s.clone());
-                        });
-                    }
+                    this.for_each_server_session_slot(&sid, |slot| {
+                        slot.is_driver = is_driver;
+                        if let Some(s) = status.clone() {
+                            slot.state.status = Some(s);
+                        }
+                    });
                 }
                 // Drop dead slots via the same path the server's SessionClosed
                 // broadcast uses: `reconcile_session_closed` finds the slot in
@@ -12245,7 +12337,117 @@ impl SketchGpuiView {
     /// notifications from `SessionServerClient::try_recv()` and routes
     /// them to the correct `AgentSlot` by `server_session_id`. Runs as a
     /// single GPUI background task per view (not per-slot).
-    fn start_server_pump(&self, cx: &mut Context<Self>) -> Task<()> {
+    /// Long-lived lease-heartbeat driver (spec phase 4). Every
+    /// `HEARTBEAT_INTERVAL` it collects the server sessions THIS GUI currently
+    /// drives (a candidate/observer drives none) and sends `Heartbeat` for each
+    /// so the server pushes the lease expiry forward. On a Heartbeat `Err`
+    /// (lease lost — expired and re-taken, or demoted) it re-attaches that sid
+    /// (resumes-or-observes), which also refreshes the slot's role. The task
+    /// self-cancels when the client disconnects or the view is dropped.
+    ///
+    /// SINGLETON per view: the beater is stored in `self._lease_heartbeat` and
+    /// spawned at most ONCE for the window's lifetime. `start_server_pump` runs
+    /// at every "open a fresh Claude screen" site, but only the first call (the
+    /// one that finds the field `None`) spawns a beater; later calls are
+    /// no-ops. One beater is correct and sufficient because the loop depends on
+    /// NO per-open state — it self-gates per-tick on `slot.is_driver` and so
+    /// covers every driven session this window has, including ones opened after
+    /// it started. (A non-singleton, detached-per-call design would leave K
+    /// concurrent beaters after K opens, and a single lease-loss would fan out
+    /// into K redundant same-client_id Owner re-attaches.) Cancelled when the
+    /// view (and thus the stored `Task`) is dropped.
+    fn start_lease_heartbeat(&mut self, cx: &mut Context<Self>) {
+        // Singleton guard: a beater already rides this window's lifetime, so the
+        // 2nd+ `start_server_pump` call (re-opening the Claude screen) must not
+        // spawn another. The existing beater already covers any newly-opened
+        // driven session via its per-tick `is_driver` rescan.
+        if self._lease_heartbeat.is_some() {
+            return;
+        }
+        // Spawned UNCONDITIONALLY (no `is_candidate` early-return). The loop
+        // self-gates per-iteration: each tick it collects ONLY the sessions
+        // this window actually drives (`slot.is_driver`). A candidate drives
+        // nothing, so it simply beats no one until it promotes — and once
+        // `candidate_take_over` flips `is_driver=true` on its slots, the very
+        // next tick begins beating them automatically, with no need to restart
+        // the beater. This closes the owner-gap-after-promote race where a
+        // freshly-promoted owner held the lease but never heartbeat it.
+        const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+        let beater = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(HEARTBEAT_INTERVAL).await;
+
+                // Collect the handle + the sids this GUI DRIVES this tick. Only
+                // driver slots (`is_driver`) are beaten: a window downgraded to
+                // Observer at attach must never beat (its heartbeat would hit
+                // the server's non-holder branch and churn re-attaches). Bail if
+                // there's no server (view dropped / server disabled).
+                let collected = this.update(cx, |this, _cx| {
+                    let handle = this.session_server.as_ref().map(|s| s.handle());
+                    let mut sids: Vec<String> = Vec::new();
+                    for tab in this.workspace.tabs.iter_mut() {
+                        tab.layout.for_each_leaf_content_mut(&mut |content| {
+                            if let WindowContent::Agent(ring) = content {
+                                for slot in ring.slots.iter() {
+                                    if !slot.is_driver {
+                                        continue;
+                                    }
+                                    if let Some(sid) = slot.server_session_id.clone() {
+                                        sids.push(sid);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    (handle, sids)
+                });
+                let (handle, sids) = match collected {
+                    Ok((Some(handle), sids)) if !sids.is_empty() => (handle, sids),
+                    Ok(_) => continue,    // no server or nothing to beat
+                    Err(_) => break,      // view dropped: stop the beater
+                };
+                if !handle.is_connected() {
+                    continue; // pump's reconnect path will re-attach
+                }
+
+                // Beat each driven session off the paint thread. Collect the
+                // ones whose lease was lost so we can re-attach them.
+                let lost: Vec<String> = cx
+                    .background_executor()
+                    .spawn(async move {
+                        sids.into_iter()
+                            .filter(|sid| handle.heartbeat(sid).is_err())
+                            .collect()
+                    })
+                    .await;
+
+                if !lost.is_empty() {
+                    // Only GENUINE drivers reach this branch (the collect above
+                    // beats `is_driver` slots exclusively), so a lost sid was a
+                    // real owner whose own lease lapsed — re-attaching as Owner
+                    // is a same-client_id DETERMINISTIC reclaim, not a poll-
+                    // acquire steal: the server grants it only if the lease is
+                    // free or already ours. A window downgraded to Observer at
+                    // attach never beats, so it can never reach here and never
+                    // re-attaches Owner from a heartbeat error; it regains
+                    // ownership only via an explicit LeaseChanged{None} promote.
+                    // spawn_attach_sessions re-stamps `is_driver` from the new
+                    // outcome, so if the reclaim downgrades us we stop beating.
+                    let _ = this.update(cx, |this, cx| {
+                        this.spawn_attach_sessions(lost, cx);
+                    });
+                }
+            }
+        });
+        // Store the singleton beater on the view so it lives for the window's
+        // lifetime and is cancelled (dropped) with the view.
+        self._lease_heartbeat = Some(beater);
+    }
+
+    fn start_server_pump(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        // Phase 4: a single lease-heartbeat beater rides alongside the pump so a
+        // live owner's lease never falsely expires.
+        self.start_lease_heartbeat(cx);
         cx.spawn(async move |this, cx| {
             use futures::stream::StreamExt;
             use futures::FutureExt;
@@ -12518,6 +12720,11 @@ impl SketchGpuiView {
         cx: &mut Context<Self>,
     ) -> bool {
         let is_candidate = self.is_candidate;
+        // This GUI's stable lease client_id, for the LeaseChanged check below
+        // (released == unleased OR held by us). Captured up front so the
+        // per-note loop doesn't re-borrow `session_server`.
+        let my_client_id: Option<String> =
+            self.session_server.as_ref().map(|s| s.client_id());
         let mut ready_change: Option<bool> = None;
 
         let warn_unrouted = |routed: bool, sid: &str| {
@@ -12638,14 +12845,20 @@ impl SketchGpuiView {
                     });
                     warn_unrouted(routed, &session_id);
                 }
-                ServerNotification::OwnerChanged { session_id, has_owner } => {
+                ServerNotification::LeaseChanged { session_id, lease } => {
                     if is_candidate {
-                        ready_change = Some(!has_owner);
+                        // Released == unleased (None) OR (defensively) already
+                        // held by our OWN client_id. Either way a Promote will
+                        // succeed, so the candidate may take over.
+                        let released = lease
+                            .as_ref()
+                            .map_or(true, |l| Some(&l.client_id) == my_client_id.as_ref());
+                        ready_change = Some(released);
                         self.with_server_session_slot(&session_id, |slot| {
-                            let msg = if has_owner {
-                                "mirroring (original active) — read-only"
-                            } else {
+                            let msg = if released {
                                 "original released — menu → claude → take over"
+                            } else {
+                                "mirroring (original active) — read-only"
                             };
                             Self::append_system_notice(&mut slot.state, msg);
                             slot.state.status = Some(msg.into());

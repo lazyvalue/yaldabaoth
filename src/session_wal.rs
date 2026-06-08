@@ -60,7 +60,12 @@ enum WalRecord {
     Event(Notification),
 }
 
-const WAL_VERSION: u32 = 1;
+/// On-disk WAL format version. Bumped 1→2 for the phase-4 lease migration: the
+/// `OwnerChanged → LeaseChanged` wire rename is a breaking schema change, so it
+/// rides this one-time version bump. `recover_one` discards any header whose
+/// version != `WAL_VERSION` (no converter — locked decision), so pre-v2 logs
+/// are dropped and those sessions resume empty (re-load from the agent).
+const WAL_VERSION: u32 = 2;
 
 /// A live write handle to one session's WAL file. The session server's
 /// `ManagedSession` owns exactly one of these and is its only writer.
@@ -215,12 +220,26 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
         };
         match rec {
             WalRecord::Header {
+                version,
                 server_session_id,
                 label,
                 cwd,
                 permission_mode,
-                ..
             } => {
+                // Phase-4 version gate: a header from a prior schema (v1) is
+                // discarded wholesale — the session resumes empty and re-loads
+                // from the live agent on the next attach (locked decision: no
+                // converter). The header is always the FIRST record, so this
+                // fires before any (potentially `owner_changed`) Event line is
+                // parsed, so a stale log never reaches serde Event parsing.
+                if version != WAL_VERSION {
+                    eprintln!(
+                        "[session-wal] discarding pre-v{WAL_VERSION} WAL {} (version {version}, \
+                         lease migration); session resumes empty",
+                        path.display()
+                    );
+                    return Ok(None);
+                }
                 header = Some((server_session_id, label, cwd, permission_mode));
             }
             WalRecord::Event(note) => event_log.push(note),
@@ -371,6 +390,52 @@ mod tests {
         }
         let recovered = recover_all(&dir);
         assert_eq!(recovered[0].event_log.len(), 2);
+    }
+
+    #[test]
+    fn v1_wal_is_discarded_on_read() {
+        // Hand-write a pre-v2 (version:1) log with a header + a couple events,
+        // including the retired `owner_changed` control line. The v2 reader must
+        // discard the whole file (Ok(None)) and not crash.
+        let dir = tmp_dir("v1discard");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = wal_path(&dir, "old1");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"t":"header","version":1,"server_session_id":"old1","label":"l","cwd":"/tmp","permission_mode":"yolo"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"t":"event","type":"owner_changed","session_id":"old1","has_owner":true}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"t":"event","type":"user_prompt","session_id":"old1","text":"hi"}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let one = recover_one(&path).expect("recover_one must not error on a v1 log");
+        assert!(one.is_none(), "v1 log must be discarded (Ok(None))");
+        assert!(
+            recover_all(&dir).is_empty(),
+            "discarded v1 session must be absent from recovery"
+        );
+
+        // A fresh v2 create→append→recover round-trip still works afterward.
+        {
+            let mut wal =
+                SessionWal::create(&dir, "new2", "l", Path::new("/tmp"), PermissionMode::Yolo)
+                    .unwrap();
+            wal.append(&attached("acp-v2"), false).unwrap();
+            wal.append(&turn_ended(1), true).unwrap();
+        }
+        let recovered = recover_all(&dir);
+        assert_eq!(recovered.len(), 1, "v2 session must recover normally");
+        assert_eq!(recovered[0].server_session_id, "new2");
     }
 
     #[test]
