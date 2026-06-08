@@ -2623,6 +2623,18 @@ fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<PersistedSlot> {
         .collect()
 }
 
+/// Classify an attach error string as the PERMANENT "session is gone" case.
+/// The session-server actor returns `no such session: <id>` for a lookup miss
+/// (every `.ok_or_else(|| format!("no such session: {session_id}"))` site in
+/// `sketch-session-server/main.rs`). That means the persisted id outlived the
+/// server's WAL — the slot can never reattach and must be dropped, not retried.
+/// Matched case-insensitively via `.contains` so wrapping/prefixing (e.g. the
+/// io::Error round-trip) can't hide it. Transient errors ("disconnected",
+/// write/read failures) deliberately do NOT match.
+fn is_session_gone_error(e: &str) -> bool {
+    e.to_ascii_lowercase().contains("no such session")
+}
+
 /// Forget the saved ACP session list for `cwd`. Used by `claude-clear` so
 /// the next attach hits `session/new` instead of resuming the cleared
 /// sessions.
@@ -2640,6 +2652,47 @@ fn forget_persisted_acp_sessions(cwd: &std::path::Path) {
         // Clear both spellings so a pre-D5 raw entry can't linger (ADR-0010).
         obj.remove(persist_cwd_key(cwd).as_str());
         obj.remove(cwd.to_string_lossy().as_ref());
+    }
+    if let Ok(serialized) = serde_json::to_string_pretty(&json) {
+        let _ = std::fs::write(&path, serialized);
+    }
+}
+
+/// Remove specific session ids from the persisted ACP-session file, across
+/// EVERY cwd key (the file is `{ cwd_key: [ {id, ...}, ... ] }`). Used when an
+/// attach reports a session the server no longer has: re-saving the live rings
+/// can't be relied on to drop the id (a single-slot ring that empties no longer
+/// holds an Agent ring to re-save, and a stale id in a non-active tab is never
+/// walked), so we scrub by id here. A cwd whose array becomes empty has its key
+/// removed. Best-effort.
+fn forget_persisted_acp_session_ids(ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let Some(path) = acp_session_persist_path() else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return;
+    };
+    let dead: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
+    if let Some(obj) = json.as_object_mut() {
+        for v in obj.values_mut() {
+            if let Some(arr) = v.as_array_mut() {
+                arr.retain(|entry| {
+                    entry
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(|id| !dead.contains(id))
+                        .unwrap_or(true)
+                });
+            }
+        }
+        // Drop now-empty cwd arrays so the file doesn't accumulate dead keys.
+        obj.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
     }
     if let Ok(serialized) = serde_json::to_string_pretty(&json) {
         let _ = std::fs::write(&path, serialized);
@@ -11495,6 +11548,11 @@ impl SketchGpuiView {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                // Sids whose attach failed with a PERMANENT "session is gone"
+                // error. These are dropped after the status pass so the dead
+                // slot neither lingers as a broken tab nor gets retried next
+                // launch (see below). Transient failures keep today's behavior.
+                let mut dead_sids: Vec<String> = Vec::new();
                 for (sid, r) in results {
                     let status: Option<SharedString> = match r {
                         // Owner (or observer-by-design): leave the optimistic
@@ -11510,7 +11568,19 @@ impl SketchGpuiView {
                                 "[sketch-gpui] attach failed for {}: {e}",
                                 &sid[..sid.len().min(8)]
                             );
-                            Some("attach failed — session may be unavailable".into())
+                            // The server answers `no such session: <id>` for a
+                            // lookup miss (sketch-session-server actor) — the
+                            // persisted id outlived the server's WAL. That's
+                            // PERMANENT: drop the dead slot rather than churn a
+                            // broken one. Anything else (disconnected, write/
+                            // read failure) is TRANSIENT and may recover on
+                            // reconnect, so keep the status and the slot.
+                            if is_session_gone_error(&e) {
+                                dead_sids.push(sid.clone());
+                                None
+                            } else {
+                                Some("attach failed — session may be unavailable".into())
+                            }
                         }
                     };
                     if let Some(s) = status {
@@ -11518,6 +11588,35 @@ impl SketchGpuiView {
                             slot.state.status = Some(s.clone());
                         });
                     }
+                }
+                // Drop dead slots via the same path the server's SessionClosed
+                // broadcast uses: `reconcile_session_closed` finds the slot in
+                // any tab/pane, removes it with `close_at` (which fixes the
+                // ring's active index and never panics on the last slot), and
+                // restores the underlying screen if the ring empties — so no
+                // panel is ever left holding an empty ring. After removal,
+                // re-save every pane's ring (keyed by the process cwd, exactly
+                // like close_active_agent_session) so the stale id doesn't
+                // return on the next launch.
+                let mut dropped_any = false;
+                for sid in &dead_sids {
+                    if this.reconcile_session_closed(sid) {
+                        dropped_any = true;
+                    }
+                }
+                if dropped_any {
+                    this.save_agent_ring();
+                }
+                // Authoritatively scrub the dead ids from the persisted file by
+                // id (across every cwd key). `save_agent_ring` alone misses the
+                // cases that matter most here: a single-slot ring that empties
+                // (the pane no longer holds an Agent ring, so the re-save never
+                // touches that cwd) and a stale session in a non-active tab
+                // (save_agent_ring only walks the active tab). Without this the
+                // dead id would be resumed again on the next launch — the exact
+                // churn this fix targets.
+                if !dead_sids.is_empty() {
+                    forget_persisted_acp_session_ids(&dead_sids);
                 }
                 cx.notify();
             });
