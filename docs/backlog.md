@@ -126,17 +126,35 @@ verified via the resilience+transcript harness. Worklogs:
   Behavior-preserving → foldable after build-check. Overlaps
   `tests/session_resilience_test.rs` with phase 4 at integrate (kept additive).
   Unblocks the phase-8 eventlog reducer/forwarder headless tests.
-- **GUI projection + full eventlog end-to-end (phase 8)** — `READY` / launching
-  (4+6 merged to master). Decision: **go end-to-end** (2026-06-08). Consumer side: unidirectional
-  `events → reducer → view`, retire `reset_for_replay`. Necessarily drags in the
-  **eventlog producer-side**: collapse `Notification::{ReplyEvent,TurnEnded,
-  UserPrompt}` + `WorkerEvent::Reply` into one `AgentEvent` (spec-event-stream),
-  emit chokepoint, generation-on-`ChannelOpened`, forward-verbatim; WAL bumps 2→3
-  (discard). Plus **ringbuffer compaction**: bound the in-memory `event_log`, wire
-  its base to `log_base` (§6 epoch predicate) in cursor-reconnect's `seq` space,
-  surface trims as `CompactedSummary` markers (not silent drops); on-disk WAL stays
-  append-only. Sequenced AFTER phase 4 (wire/WAL conflict) + phase 6 (uses the
-  transport fake). The one phase needing a human GPUI runtime check.
+- **GUI projection + full eventlog end-to-end (phase 8)** — `NEEDS-RUNTIME`
+  (headless-complete, branch `phase8-eventlog`, **uncommitted**, 2026-06-08).
+  Producer collapse `Notification::{ReplyEvent,TurnEnded,UserPrompt}` +
+  `WorkerEvent::Reply` → one `AgentEvent` (`src/agent_event.rs`, byte-preserving
+  `Unknown{tag,raw}`); emit chokepoint (worker stamps gen/turn, server `record()`
+  assigns durable seq); generation-on-`ChannelOpened`; WAL 2→3 **discard**;
+  **ringbuffer compaction** (`log_base` logical offset, §6 epoch predicate wired
+  into phase-5 cursor seq-space, `CompactedSummary` trim marker, on-disk WAL
+  append-only); GUI **total reducer** over `AgentEventKind` + idempotent finalize,
+  **additive** per §9 (old inference kept behind a gate — deleting it is a
+  post-soak follow-up). **Verification:** workflow `wf_73656668-97f` (build + all
+  suites green: new `event_log`/`agent_event_stream`/`agent_reducer_*`/ringbuffer
+  tests) → adversarial review `BLOCKING` (live forwarder gapped the owner across a
+  trim; marker prepend shifted seq +1; finalize ledger keyed 0-vs-1-based so dedup
+  never fired) → **fixed** (log_base-aware live forwarder + owner hard-ceiling;
+  prepend decrements `log_base`; aligned finalize keys) with fail-before/pass-after
+  tests → re-review `SOLID`, found a MAJOR (no high-water bound → an App-Napped
+  owner pins in-memory growth) → **fixed** (spec §6 disconnect-before-gap:
+  `enforce_high_water` evicts the slowest forwarder — owner included, lease-safe —
+  before the trim) → eviction race self-checked clean (immutable `LogSnapshot` +
+  evicted-check-first). Final: build clean, **full `--features test-support` suite
+  green**. **Owed before merge:** (1) stage-C GUI reducer render-leg runtime check
+  (GPUI not headless-drivable) — resume-then-live-prompt renders correctly, the §9
+  gate-flip (`ReplayEnd` → authoritative) behaves; (2) App-Nap-paused-owner
+  high-water eviction → clean reconnect + lease reclaim in the live app; (3) the
+  merge is the **v2→v3 WAL cutover** (discards v2 sessions — do at a quiet moment).
+  **Deferred follow-ups:** delete the §9 gated old-inference after real-session
+  soak; latent `event.seq` vs `seq_of` divergence (only bites when phase-5 cursor
+  is wired client-side — commented).
 - **GUI stale-session robustness** — `DONE` (`b0f1eb2`) / NEEDS-RUNTIME. GUI drops
   the slot + scrubs the persisted id (by id, across all cwd keys) on a permanent
   `no such session` attach error; transient errors keep the recoverable status.
