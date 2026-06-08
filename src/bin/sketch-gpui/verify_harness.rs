@@ -1364,7 +1364,9 @@ fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContex
     });
 }
 
-/// LIVE-TURN-AFTER-REPLAY (the phase-8 runtime "stuck thinking" bug).
+/// LIVE-TURN-AFTER-REPLAY (the phase-8 runtime "stuck thinking" bug),
+/// SUBMIT-AFTER-REPLAY ordering — the user types only once replay has fully
+/// completed and the phase has already returned to Idle.
 ///
 /// Reproduces the real symptom at the fold level: resume a server-managed
 /// session (a daemon restart / re-attach replays the full `event_log` at
@@ -1377,9 +1379,19 @@ fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContex
 /// disk-recovered log is at gen 0):
 ///   replay: legacy ReplyEvent chunk for turn 0  (gate still closed)
 ///           forwarded Agent TurnEnded{Completed, turn 0}  (flips the gate)
-///           forwarded Agent TurnEnded{ReplayEnd}
+///           forwarded Agent TurnEnded{ReplayEnd}  (no live turn in flight → Idle)
 ///   live:   forwarded Agent Chunk{Message, turn 1}
 ///           forwarded Agent TurnEnded{Completed, turn 1}
+///
+/// The key the bug turns on: the server stamps the `ReplayEnd` envelope `turn`
+/// with the current settled count, and `finish_replay` folds the replay cursor
+/// into `last_seen`, so `last_seen` ends up EQUAL to the upcoming live turn's
+/// `completed_turn` index (1). The buggy `ReplayEnded` arm keyed the per-turn
+/// ledger on `last_seen`, pre-occupying `(0, 1)` — the LIVE turn's key. To
+/// faithfully reproduce that aliasing the replay cursor must be driven up to the
+/// live index BEFORE `ReplayEnd` (the legacy replay path leaves it there); a
+/// `replay_turn` left at 0 folds `last_seen` to 0 and never collides, which is
+/// why an under-driven version of this test passed even against the bug.
 ///
 /// Asserts the live turn (a) folds its message content into the transcript and
 /// (b) FINALIZES — `turn_phase` returns to `Idle` (not stuck "thinking") and the
@@ -1404,9 +1416,24 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
                     event: ReplyEvent::Chunk("replayed turn-0 prose".into()),
                 },
                 agent_note("S1", 0, 0, 0, K::TurnEnded { outcome: TurnOutcome::Completed }),
-                // End of the replayed prefix.
-                agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::ReplayEnd }),
             ],
+            cx,
+        );
+    });
+
+    // Drive the replay cursor up to the live turn's index, the way the legacy
+    // replay path leaves it just before `ReplayEnd` (a replayed user boundary
+    // seeds replay_turn = last_seen + 1 = 1). Without this `finish_replay` folds
+    // `last_seen` to 0 and the bug's aliasing never occurs.
+    view.update(vcx, |v, _cx| {
+        v.agent_mut().unwrap().replay_turns.replay_turn = 1;
+    });
+
+    // End of the replayed prefix. `finish_replay` now folds `last_seen` → 1,
+    // which aliases the upcoming live turn's `completed_turn` (1).
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::ReplayEnd })],
             cx,
         );
     });
@@ -1420,6 +1447,16 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
         assert!(
             matches!(c.turn_phase, crate::TurnPhase::Idle),
             "after replay (no live turn in flight) the phase is Idle, not thinking"
+        );
+        assert_eq!(
+            c.replay_turns.last_seen, 1,
+            "finish_replay folded the cursor to the live turn's index (the aliasing \
+             precondition the bug needs)"
+        );
+        assert!(
+            !c.finalized.contains(&(0, 1)),
+            "ReplayEnd must NOT pre-occupy the live turn's (0, 1) key; ledger={:?}",
+            c.finalized
         );
     });
 
@@ -1471,42 +1508,70 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
     });
 }
 
-/// LIVE-TURN-AFTER-REPLAY, finalize-ledger COLLISION variant (suspect b).
+/// LIVE-TURN-AFTER-REPLAY across a MULTI-TURN replayed prefix (two replayed
+/// turns, then a live turn). Confirms the aliasing holds at a higher turn index
+/// and that the replayed turn boundaries' OWN ledger keys stay distinct from
+/// both the ReplayEnd settle and the live turn's finalize.
 ///
-/// The replayed `TurnEnded{Completed}` boundaries are applied by the reducer
-/// even before the gate flips (the `is_boundary` observe path), so each one
-/// inserts `(generation, turn)` into the finalize ledger. If the live turn after
-/// replay is ever stamped with a `turn` that a replayed boundary ALREADY
-/// finalized, `finalize_agent_turn_idem` no-ops on the collision and the live
-/// `turn_phase` is never flipped back to Idle → STUCK THINKING.
+/// Replay turns 0 and 1 each finalize their own boundary keys `(0, 0)`/`(0, 1)`.
+/// `finish_replay` folds the cursor to 2 — which aliases the upcoming live
+/// turn's `completed_turn` (settled count 3 → 2). The buggy `ReplayEnded` arm
+/// keyed the per-turn ledger on that folded `last_seen` (2), pre-occupying the
+/// LIVE turn's `(0, 2)` key so its `TurnEnded` no-op'd and `turn_phase` never
+/// returned to Idle → STUCK THINKING.
 ///
-/// This pins the exact key alignment: replay finalizes turn 0; the live turn
-/// MUST be stamped turn >= 1 so it gets its own ledger entry and finalizes.
+/// As with the single-turn case, the replay cursor must be driven up to the live
+/// index before `ReplayEnd` — an under-driven cursor folds `last_seen` low and
+/// never collides, so the test would pass even against the bug.
 #[gpui::test]
-fn agent_reducer_live_turn_after_replay_no_ledger_collision(cx: &mut TestAppContext) {
+fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppContext) {
     use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
 
     let (view, vcx) = boot_with_bound_slot(cx, "S1");
 
-    // Replay: a single completed turn 0, then ReplayEnd. The reducer finalizes
-    // (0, 0) for the replayed boundary and flips the gate.
+    // Replay two completed turns (0 and 1). Each is applied via the boundary
+    // observe-path and finalizes its OWN key; the first flips the gate.
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
             vec![
                 agent_note("S1", 0, 0, 0, K::TurnEnded { outcome: TurnOutcome::Completed }),
-                agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::ReplayEnd }),
+                agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
             ],
+            cx,
+        );
+    });
+
+    // Drive the replay cursor to the upcoming live turn's index (2), the way the
+    // legacy replay path leaves it after two replayed user boundaries.
+    view.update(vcx, |v, _cx| {
+        v.agent_mut().unwrap().replay_turns.replay_turn = 2;
+    });
+
+    // ReplayEnd: `finish_replay` folds `last_seen` → 2, aliasing the live turn.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 0, 2, 2, K::TurnEnded { outcome: TurnOutcome::ReplayEnd })],
             cx,
         );
     });
 
     view.update(vcx, |v, _cx| {
         let c = v.agent_mut().unwrap();
-        assert!(c.finalized.contains(&(0, 0)), "replayed turn 0 finalized");
         assert!(c.agent_stream_authoritative, "gate flipped after replay");
+        assert!(c.finalized.contains(&(0, 0)), "replayed turn 0 finalized its own key");
+        assert!(c.finalized.contains(&(0, 1)), "replayed turn 1 finalized its own key");
+        assert_eq!(
+            c.replay_turns.last_seen, 2,
+            "finish_replay folded the cursor to the live turn's index"
+        );
+        assert!(
+            !c.finalized.contains(&(0, 2)),
+            "ReplayEnd must NOT pre-occupy the live turn's (0, 2) key; ledger={:?}",
+            c.finalized
+        );
     });
 
-    // Live turn: begin (thinking), stream content, end. Stamped turn 1.
+    // Live turn 2: begin (thinking), stream content, end. Stamped turn 2.
     view.update(vcx, |v, _cx| {
         v.agent_mut().unwrap().turn_phase =
             crate::TurnPhase::begin(std::time::Instant::now());
@@ -1517,11 +1582,11 @@ fn agent_reducer_live_turn_after_replay_no_ledger_collision(cx: &mut TestAppCont
                 agent_note(
                     "S1",
                     0,
-                    1,
                     2,
+                    3,
                     K::Chunk { text: "LIVE-PROSE".into(), role: ChunkRole::Message },
                 ),
-                agent_note("S1", 0, 1, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+                agent_note("S1", 0, 2, 4, K::TurnEnded { outcome: TurnOutcome::Completed }),
             ],
             cx,
         );
@@ -1529,14 +1594,17 @@ fn agent_reducer_live_turn_after_replay_no_ledger_collision(cx: &mut TestAppCont
 
     view.update(vcx, |v, _cx| {
         let c = v.agent_mut().unwrap();
+        let text = c.editor.document().full_text();
+        assert!(text.contains("LIVE-PROSE"), "live content folded; transcript:\n{text}");
         assert!(
             matches!(c.turn_phase, crate::TurnPhase::Idle),
-            "live turn after replay must finalize (Idle), not stay thinking; phase={:?}",
+            "live turn after multi-turn replay must finalize (Idle), not stay thinking; \
+             phase={:?}",
             c.turn_phase
         );
         assert!(
-            c.finalized.contains(&(0, 1)),
-            "live turn 1 finalized its own ledger key; ledger={:?}",
+            c.finalized.contains(&(0, 2)),
+            "live turn 2 finalized its own ledger key; ledger={:?}",
             c.finalized
         );
     });
