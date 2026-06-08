@@ -838,3 +838,155 @@ fn slow_subscriber_is_disconnected_owner_unaffected() {
     // the whole turn (drop closes it; we want the timeout, not a clean EOF).
     drop(stuck);
 }
+
+/// Is this a TRANSCRIPT note — i.e. an `event_log` entry the forwarder tails —
+/// as opposed to a per-connection control note (`OwnerChanged`) synthesized by
+/// the forwarder and never stored in the log? Used to compare what a cursor
+/// reconnect streams against the durable log's tail.
+fn is_transcript_note(n: &Notification) -> bool {
+    !matches!(n, Notification::OwnerChanged { .. })
+}
+
+/// 7. CURSOR-BASED INCREMENTAL RECONNECT (spec phase 5, additive).
+///
+///    A reconnecting client that supplies a cursor `(generation, index)` must
+///    receive ONLY the transcript tail after `index` — not the full replay from
+///    0. A client that supplies NO cursor (today's every-client behavior, incl.
+///    the GUI) still gets the full replay. A stale-generation cursor falls back
+///    to full replay too. All proven against one real server + stub turn.
+#[test]
+fn cursor_reconnect_streams_only_tail() {
+    let _g = serial_lock();
+    const CHUNKS: usize = 8;
+    let server = TestServer::start_with_env(&[("STUB_CHUNKS", &CHUNKS.to_string())]);
+    server.activate_env();
+
+    // Owner drives one turn so the session has a known, non-trivial event_log.
+    let owner = SessionServerClient::connect().expect("connect owner");
+    let info = owner
+        .create_session(std::env::temp_dir(), "cursor".into(), None)
+        .expect("create_session");
+    owner
+        .attach(&info.session_id, AttachMode::Owner)
+        .expect("attach owner");
+    owner.prompt(&info.session_id, "hello cursor").expect("prompt");
+
+    let _ = drain_until(&owner, Duration::from_secs(15), |n| {
+        n.iter().any(|note| {
+            matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == info.session_id)
+        })
+    });
+
+    // M = the authoritative durable transcript length, and generation must be 0
+    // for a fresh, never-force-restarted session.
+    let snap = owner.admin_status().expect("admin_status");
+    let s = snap
+        .sessions
+        .iter()
+        .find(|s| s.session_id == info.session_id)
+        .expect("session in admin snapshot");
+    let m = s.event_log_len;
+    assert_eq!(
+        s.channel_generation, 0,
+        "a fresh session's channel_generation must be 0; snapshot={snap:#?}"
+    );
+    assert!(
+        m >= 4,
+        "expected a non-trivial event_log (SessionAttached + UserPrompt + {CHUNKS} chunks + \
+         TurnEnded), got len {m}; log:\n{}",
+        server.read_log()
+    );
+
+    // CONTROL: a full-replay observer (cursor None) receives all M transcript
+    // notes. We also use its transcript as ground truth for the log's contents,
+    // so we can assert the cursor tail is an exact suffix.
+    let full = SessionServerClient::connect().expect("connect full-replay observer");
+    full.attach(&info.session_id, AttachMode::Observer)
+        .expect("attach full observer");
+    let full_notes = drain_until(&full, Duration::from_secs(10), |n| {
+        n.iter()
+            .filter(|x| is_transcript_note(x))
+            .filter(|x| matches!(x, Notification::TurnEnded { .. }))
+            .count()
+            >= 1
+    });
+    let full_transcript: Vec<Notification> = full_notes
+        .into_iter()
+        .filter(is_transcript_note)
+        .collect();
+    assert_eq!(
+        full_transcript.len(),
+        m,
+        "cursor None (full replay) must deliver all {m} transcript notes, got {}; \
+         transcript={full_transcript:#?}\nlog:\n{}",
+        full_transcript.len(),
+        server.read_log()
+    );
+
+    // INCREMENTAL: a second observer attaches WITH cursor (0, K) for K in
+    // (0, M). It must receive ONLY the tail [K..] — exactly M-K notes — and that
+    // tail must equal the suffix of the full replay starting at K.
+    let k = m / 2;
+    assert!(k > 0 && k < m, "K={k} must be strictly inside (0, {m})");
+    let tail = SessionServerClient::connect().expect("connect tail observer");
+    tail.attach_with_cursor(&info.session_id, AttachMode::Observer, Some((0, k as u64)))
+        .expect("attach tail observer with cursor");
+    // Drain until we've seen the turn boundary (the last logged note for this
+    // turn), then filter to transcript notes.
+    let tail_notes = drain_until(&tail, Duration::from_secs(10), |n| {
+        n.iter()
+            .filter(|x| is_transcript_note(x))
+            .filter(|x| matches!(x, Notification::TurnEnded { .. }))
+            .count()
+            >= 1
+    });
+    let tail_transcript: Vec<Notification> = tail_notes
+        .into_iter()
+        .filter(is_transcript_note)
+        .collect();
+    assert_eq!(
+        tail_transcript.len(),
+        m - k,
+        "cursor (0, {k}) must stream ONLY the {} tail notes, got {}; tail={tail_transcript:#?}\nlog:\n{}",
+        m - k,
+        tail_transcript.len(),
+        server.read_log()
+    );
+    // The tail must be the exact suffix full[K..] — first tail note == log[K],
+    // no first K notes replayed.
+    let expected_tail = &full_transcript[k..];
+    for (i, (got, want)) in tail_transcript.iter().zip(expected_tail.iter()).enumerate() {
+        assert_eq!(
+            serde_json::to_string(got).unwrap(),
+            serde_json::to_string(want).unwrap(),
+            "tail note {i} must match event_log[{}] (the suffix after the cursor)",
+            k + i
+        );
+    }
+
+    // EDGE: a stale-generation cursor (999, 0) must FALL BACK to full replay —
+    // the safe behavior for an epoch mismatch (force-restart / server restart).
+    let stale = SessionServerClient::connect().expect("connect stale-cursor observer");
+    stale
+        .attach_with_cursor(&info.session_id, AttachMode::Observer, Some((999, 0)))
+        .expect("attach stale-cursor observer");
+    let stale_notes = drain_until(&stale, Duration::from_secs(10), |n| {
+        n.iter()
+            .filter(|x| is_transcript_note(x))
+            .filter(|x| matches!(x, Notification::TurnEnded { .. }))
+            .count()
+            >= 1
+    });
+    let stale_transcript: Vec<Notification> = stale_notes
+        .into_iter()
+        .filter(is_transcript_note)
+        .collect();
+    assert_eq!(
+        stale_transcript.len(),
+        m,
+        "a generation-mismatch cursor (999, 0) must fall back to FULL replay ({m} notes), got {}; \
+         transcript={stale_transcript:#?}\nlog:\n{}",
+        stale_transcript.len(),
+        server.read_log()
+    );
+}
