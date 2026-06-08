@@ -147,9 +147,21 @@ verified via the resilience+transcript harness. Worklogs:
   `enforce_high_water` evicts the slowest forwarder — owner included, lease-safe —
   before the trim) → eviction race self-checked clean (immutable `LogSnapshot` +
   evicted-check-first). Final: build clean, **full `--features test-support` suite
-  green**. **Owed before merge:** (1) stage-C GUI reducer render-leg runtime check
-  (GPUI not headless-drivable) — resume-then-live-prompt renders correctly, the §9
-  gate-flip (`ReplayEnd` → authoritative) behaves; (2) App-Nap-paused-owner
+  green**. **Runtime check (2026-06-08, isolated v3 sandbox):** replay idempotency
+  passed (a daemon-bounce full replay caused NO visible re-render — the reducer
+  refolded identical state); WAL v3 reload + re-adopt clean. **Found + FIXED a real
+  §9 bug:** a live prompt AFTER a resume stuck in "thinking" forever — `ReplayEnd`'s
+  server-stamped envelope `turn` (`self.turns`) aliases the next live turn's
+  finalize key (`completed_turn = turns-1`), so routing `ReplayEnd` through the
+  per-turn idempotency ledger pre-occupied the live turn's `(gen,turn)` slot →
+  live `TurnEnded` no-op'd finalize → `turn_phase` never returned to `Idle`. Fix
+  (`e19b9d7`): `ReplayEnd` is a replay-PREFIX marker, routed through a one-shot
+  `replay_prefix_finalized` (re-armed on `reset_for_replay`), never taking a
+  per-turn slot. Reproduced + fixed headlessly (verify_harness), independently
+  re-reviewed `SOLID` (multi-resume re-arm + no-other-aliasing-pair + no §9
+  regression confirmed). **Owed before merge:** (1) one-shot GPUI paint confirm —
+  the now-`Idle` spinner visibly clears on screen (fold/`turn_phase` proven correct
+  headlessly; only the paint is unverifiable without a GPUI run); (2) App-Nap-paused-owner
   high-water eviction → clean reconnect + lease reclaim in the live app; (3) the
   merge is the **v2→v3 WAL cutover** (discards v2 sessions — do at a quiet moment).
   **Deferred follow-ups:** delete the §9 gated old-inference after real-session
