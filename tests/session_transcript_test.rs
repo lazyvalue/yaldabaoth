@@ -541,6 +541,95 @@ fn turn_completes_with_no_subscriber_attached() {
     );
 }
 
+/// 4b. HEADLESS START-WORK (ADR-0015). A non-GUI caller enqueues a prompt to an
+///     EXISTING session it does NOT own, via the ungated `admin_prompt` path,
+///     and the agent runs the turn to completion with no owner ever attached.
+///     This proves the owner-gate-free enqueue actually drives the agent — the
+///     literal "start work headlessly" feature, distinct from "finish a turn the
+///     owner started" (test #4).
+#[test]
+fn admin_prompt_drives_turn_without_owner() {
+    let _g = serial_lock();
+    const CHUNKS: usize = 4;
+    let server = TestServer::start_with_env(&[("STUB_CHUNKS", &CHUNKS.to_string())]);
+    server.activate_env();
+
+    // Create the session but do NOT attach as owner — it stays unowned.
+    let client = SessionServerClient::connect().expect("connect");
+    let info = client
+        .create_session(std::env::temp_dir(), "headless-start".into(), None)
+        .expect("create_session");
+
+    // Sanity: nobody owns it (admin_status reports owner=None).
+    let snap = client.admin_status().expect("admin_status");
+    let s = snap
+        .sessions
+        .iter()
+        .find(|s| s.session_id == info.session_id)
+        .expect("session in admin snapshot");
+    assert!(
+        !s.has_owner && s.owner_conn_id.is_none(),
+        "precondition: session must be UNOWNED before the headless prompt; snapshot={snap:#?}"
+    );
+
+    // The ungated enqueue. A normal `prompt` here would be rejected ("only the
+    // session owner can send prompts") because this client never attached as
+    // owner — `admin_prompt` skips that gate.
+    client
+        .admin_prompt(&info.session_id, "hello")
+        .expect("admin_prompt drives an unowned session");
+
+    // Prove the turn actually ran: attach a FRESH observer (read-only, takes no
+    // ownership) and drain the replayed durable transcript for the user prompt
+    // we enqueued plus the agent reply and the turn boundary.
+    let observer = SessionServerClient::connect().expect("connect observer");
+    observer
+        .attach(&info.session_id, AttachMode::Observer)
+        .expect("attach observer");
+    let notes = drain_until(&observer, Duration::from_secs(15), |n| {
+        n.iter().any(|note| {
+            matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == info.session_id)
+        })
+    });
+
+    assert!(
+        notes.iter().any(|n| matches!(
+            n,
+            Notification::UserPrompt { text, .. } if text == "hello"
+        )),
+        "the headless-enqueued user prompt must be in the durable transcript; notes={notes:#?}\nlog:\n{}",
+        server.read_log()
+    );
+    let chunks = count_agent_chunks(&notes);
+    assert_eq!(
+        chunks, CHUNKS,
+        "the agent must have streamed its reply ({CHUNKS} chunks) for the headless prompt, got {chunks}; \
+         notes={notes:#?}\nlog:\n{}",
+        server.read_log()
+    );
+    assert!(
+        notes.iter().any(|n| matches!(
+            n,
+            Notification::TurnEnded { session_id, turn_count, .. }
+                if *session_id == info.session_id && *turn_count >= 1
+        )),
+        "the headless prompt must have driven a turn to completion (turns >= 1); notes={notes:#?}\nlog:\n{}",
+        server.read_log()
+    );
+
+    // Cross-check the actor's own turn count too (independent of the replay).
+    let snap2 = client.admin_status().expect("admin_status after turn");
+    let s2 = snap2
+        .sessions
+        .iter()
+        .find(|s| s.session_id == info.session_id)
+        .expect("session still present");
+    assert!(
+        s2.turns >= 1,
+        "server-side turn count must be >= 1 after the headless prompt drove a turn; snapshot={snap2:#?}"
+    );
+}
+
 /// 5. CRASH RECOVERY (ADR-0009). The decisive "agents run with no GUI" test:
 ///    a turn completes, the server is SIGKILL'd with NO graceful shutdown (the
 ///    old clean-shutdown-only JSON snapshot would lose everything here), a fresh

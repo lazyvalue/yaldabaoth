@@ -120,6 +120,19 @@ pub enum Request {
     /// read-only — no breaking changes to existing verbs.
     #[serde(rename = "admin_status")]
     AdminStatus,
+
+    /// Headless "start-work" verb (ADR-0015): enqueue a prompt to an EXISTING
+    /// session WITHOUT owning it. Unlike `Prompt` there is no owner gate — a
+    /// non-GUI caller (CLI / cron / automation) can drive a turn on an unowned
+    /// session and the agent runs it to completion with no GUI attached. It
+    /// does NOT take a lease: the prompt is appended to the session's input
+    /// queue (same WAL-durable path as `Prompt`) and the server drives the turn
+    /// regardless of which connection sent it.
+    #[serde(rename = "admin_prompt")]
+    AdminPrompt {
+        session_id: ServerSessionId,
+        text: String,
+    },
 }
 
 // ── Server → GUI responses ─────────────────────────────────────────
