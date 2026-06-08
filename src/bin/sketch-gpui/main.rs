@@ -4153,9 +4153,16 @@ enum AgentEventEffect {
     /// A live/terminal turn boundary (spec §5). The caller finalizes
     /// `(generation, turn)` idempotently and flips the phase to `Idle`.
     TurnEnded { generation: u64, turn: usize },
-    /// End of the replayed history prefix (old `ReplayComplete`). The caller
-    /// finalizes once, flipping the phase to `Idle` only if no live turn is in
-    /// flight.
+    /// End of the replayed history prefix (old `ReplayComplete`). This is a
+    /// replay-prefix MARKER, not a turn completion: it must NOT occupy a
+    /// `(generation, turn)` slot in the per-turn finalize ledger, because the
+    /// server stamps the `ReplayEnd` envelope `turn` with the CURRENT settled
+    /// count `self.turns` — the SAME index the next live turn's `completed_turn`
+    /// carries — so keying the turn ledger here would pre-occupy the upcoming
+    /// live turn's entry and wedge its finalize (the stuck-thinking-after-resume
+    /// bug). The caller instead settles the replay buffer through a DEDICATED
+    /// idempotency (`finalize_replay_prefix`) and flips the phase to `Idle` only
+    /// if no live turn is in flight.
     ReplayEnded,
 }
 
@@ -5445,6 +5452,14 @@ struct AgentState {
     /// exactly once — no double trailing newline, no double phase flip.
     /// Cleared by `reset_for_replay` (a fresh generation re-numbers turns).
     finalized: std::collections::HashSet<(u64, usize)>,
+    /// Dedicated idempotency for the `ReplayEnd` replay-prefix marker, decoupled
+    /// from the per-turn `finalized` ledger above. The `ReplayEnd` envelope
+    /// `turn` collides with the next live turn's `completed_turn` (both = the
+    /// server's settled count at emit time), so keying `ReplayEnd` into the turn
+    /// ledger would steal the live turn's finalize slot and wedge it
+    /// ("thinking" forever after resume). This flag settles the replayed prefix
+    /// exactly once without consuming a turn key. Reset by `reset_for_replay`.
+    replay_prefix_finalized: bool,
     /// Set once this session has observed a real forwarded `TurnEnded` in the
     /// canonical `AgentEvent` stream (the per-session `has_forwarded_turn_ended
     /// _in_stream` gate, spec §9). While `false` the legacy inference is the
@@ -5558,6 +5573,7 @@ impl AgentState {
             user_turn_ks: std::collections::HashSet::new(),
             generation: 0,
             finalized: std::collections::HashSet::new(),
+            replay_prefix_finalized: false,
             agent_stream_authoritative: false,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
@@ -5604,6 +5620,7 @@ impl AgentState {
             user_turn_ks: std::collections::HashSet::new(),
             generation: 0,
             finalized: std::collections::HashSet::new(),
+            replay_prefix_finalized: false,
             agent_stream_authoritative: false,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
@@ -5845,6 +5862,24 @@ impl AgentState {
         true
     }
 
+    /// Settle the replayed history prefix exactly once on `ReplayEnd`, WITHOUT
+    /// consuming a per-turn `(generation, turn)` ledger slot. The `ReplayEnd`
+    /// marker is not a turn boundary and its envelope `turn` aliases the next
+    /// live turn's index, so it must NOT route through `finalize_agent_turn_idem`
+    /// (that would pre-occupy the live turn's key and wedge its finalize). Like
+    /// the turn ledger this applies the buffer-idempotent newline guard; the
+    /// boolean exists only to keep the phase flip a one-shot. Returns whether
+    /// this call actually settled (the first `ReplayEnd` of this generation), so
+    /// the caller can gate the phase flip on it. Reset by `reset_for_replay`.
+    fn finalize_replay_prefix(&mut self) -> bool {
+        if self.replay_prefix_finalized {
+            return false;
+        }
+        self.replay_prefix_finalized = true;
+        finalize_agent_turn(&mut self.editor);
+        true
+    }
+
     /// Reset all transcript-derived state to the empty baseline so that a
     /// server re-attach — which replays the session's full `event_log` — can
     /// rebuild the transcript from scratch without duplicating what's already
@@ -5879,6 +5914,7 @@ impl AgentState {
         // reconnect must fall back to inference until the new channel forwards
         // its first `TurnEnded`.
         self.finalized.clear();
+        self.replay_prefix_finalized = false;
         self.agent_stream_authoritative = false;
         self.tools.clear();
         self.block_ranges.clear();
@@ -12351,6 +12387,7 @@ impl SketchGpuiView {
             user_turn_ks: std::collections::HashSet::new(),
             generation: 0,
             finalized: std::collections::HashSet::new(),
+            replay_prefix_finalized: false,
             agent_stream_authoritative: false,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: Some(pump),
@@ -13627,8 +13664,11 @@ impl SketchGpuiView {
                 match outcome {
                     TurnOutcome::ReplayEnd => {
                         // Old `ReplayComplete`: fold the replay cursor back into
-                        // the live counter. Finalize only if no live turn is in
-                        // flight (the caller gates the phase flip).
+                        // the live counter. The marker is NOT a turn boundary —
+                        // its finalize is settled by the caller through a
+                        // dedicated replay-prefix idempotency, NOT the per-turn
+                        // `(generation, turn)` ledger (whose key it would share
+                        // with the next live turn → stuck-thinking after resume).
                         claude.finish_replay();
                         AgentEventEffect::ReplayEnded
                     }
@@ -13696,12 +13736,17 @@ impl SketchGpuiView {
                 }
             }
             AgentEventEffect::ReplayEnded => {
-                // Replay end finalizes once; flip to Idle only if no live turn
-                // is in flight (a live submit during replay keeps `Awaiting`).
-                let gen_ = claude.generation;
-                let turn = claude.replay_turns.last_seen;
-                let finalized = claude.finalize_agent_turn_idem(gen_, turn);
-                if finalized && !claude.turn_phase.is_awaiting() {
+                // Replay end settles the replayed prefix exactly once through a
+                // DEDICATED idempotency that does NOT touch the per-turn
+                // `(generation, turn)` ledger: the server stamps the `ReplayEnd`
+                // envelope `turn` with the current settled count, which is the
+                // SAME index the next live turn's `completed_turn` carries, so
+                // keying the turn ledger here would pre-occupy that live turn's
+                // entry and make its `TurnEnded` a no-op → "thinking" forever.
+                // Flip to Idle only if no live turn is in flight (a live submit
+                // during/after replay keeps `Awaiting`).
+                let settled = claude.finalize_replay_prefix();
+                if settled && !claude.turn_phase.is_awaiting() {
                     claude.turn_phase = TurnPhase::Idle;
                 }
             }

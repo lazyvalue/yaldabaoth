@@ -1363,3 +1363,279 @@ fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContex
         );
     });
 }
+
+/// LIVE-TURN-AFTER-REPLAY (the phase-8 runtime "stuck thinking" bug).
+///
+/// Reproduces the real symptom at the fold level: resume a server-managed
+/// session (a daemon restart / re-attach replays the full `event_log` at
+/// generation 0), then send a fresh LIVE prompt. The replayed stream ends with
+/// `TurnOutcome::ReplayEnd`, which flips `agent_stream_authoritative = true`
+/// (the §9 gate) so the legacy `ReplyEvent` path goes inert and the live turn is
+/// supposed to drive entirely through the `AgentEvent` reducer.
+///
+/// The flow modelled (all at generation 0 — a re-attach does NOT respawn, and a
+/// disk-recovered log is at gen 0):
+///   replay: legacy ReplyEvent chunk for turn 0  (gate still closed)
+///           forwarded Agent TurnEnded{Completed, turn 0}  (flips the gate)
+///           forwarded Agent TurnEnded{ReplayEnd}
+///   live:   forwarded Agent Chunk{Message, turn 1}
+///           forwarded Agent TurnEnded{Completed, turn 1}
+///
+/// Asserts the live turn (a) folds its message content into the transcript and
+/// (b) FINALIZES — `turn_phase` returns to `Idle` (not stuck "thinking") and the
+/// live `(generation, turn)` lands in the finalize ledger exactly once.
+#[gpui::test]
+fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
+    use sketch::acp_channel::ReplyEvent;
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use sketch::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // ── REPLAY burst (generation 0) ────────────────────────────────────────
+    // Replayed turn 0: the legacy ReplyEvent stream drives the chunk (gate is
+    // still closed), and the forwarded Agent TurnEnded{Completed, turn 0} marks
+    // the boundary — that first forwarded boundary FLIPS the §9 gate.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ServerNotification::ReplyEvent {
+                    session_id: "S1".into(),
+                    event: ReplyEvent::Chunk("replayed turn-0 prose".into()),
+                },
+                agent_note("S1", 0, 0, 0, K::TurnEnded { outcome: TurnOutcome::Completed }),
+                // End of the replayed prefix.
+                agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::ReplayEnd }),
+            ],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert!(
+            c.agent_stream_authoritative,
+            "the forwarded TurnEnded must flip the §9 gate after replay"
+        );
+        assert!(
+            matches!(c.turn_phase, crate::TurnPhase::Idle),
+            "after replay (no live turn in flight) the phase is Idle, not thinking"
+        );
+    });
+
+    // ── LIVE turn after replay ─────────────────────────────────────────────
+    // The user submits a fresh prompt: the turn begins (thinking indicator on),
+    // then the live content + boundary stream through the now-authoritative
+    // reducer. envelope turn == 1 (settled count 2 -> completed_turn 1).
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
+    });
+
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note(
+                    "S1",
+                    0,
+                    1,
+                    2,
+                    K::Chunk { text: "LIVE-AFTER-REPLAY".into(), role: ChunkRole::Message },
+                ),
+                agent_note("S1", 0, 1, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            ],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        let text = c.editor.document().full_text();
+        assert!(
+            text.contains("LIVE-AFTER-REPLAY"),
+            "the live turn's message content must fold into the transcript; \
+             transcript:\n{text}"
+        );
+        assert!(
+            matches!(c.turn_phase, crate::TurnPhase::Idle),
+            "BUG: the live turn must FINALIZE — turn_phase back to Idle, not stuck \
+             'thinking'; phase={:?}",
+            c.turn_phase
+        );
+        assert!(
+            c.finalized.contains(&(0, 1)),
+            "the live (generation 0, turn 1) boundary must finalize exactly once; \
+             ledger={:?}",
+            c.finalized
+        );
+    });
+}
+
+/// LIVE-TURN-AFTER-REPLAY, finalize-ledger COLLISION variant (suspect b).
+///
+/// The replayed `TurnEnded{Completed}` boundaries are applied by the reducer
+/// even before the gate flips (the `is_boundary` observe path), so each one
+/// inserts `(generation, turn)` into the finalize ledger. If the live turn after
+/// replay is ever stamped with a `turn` that a replayed boundary ALREADY
+/// finalized, `finalize_agent_turn_idem` no-ops on the collision and the live
+/// `turn_phase` is never flipped back to Idle → STUCK THINKING.
+///
+/// This pins the exact key alignment: replay finalizes turn 0; the live turn
+/// MUST be stamped turn >= 1 so it gets its own ledger entry and finalizes.
+#[gpui::test]
+fn agent_reducer_live_turn_after_replay_no_ledger_collision(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Replay: a single completed turn 0, then ReplayEnd. The reducer finalizes
+    // (0, 0) for the replayed boundary and flips the gate.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note("S1", 0, 0, 0, K::TurnEnded { outcome: TurnOutcome::Completed }),
+                agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::ReplayEnd }),
+            ],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert!(c.finalized.contains(&(0, 0)), "replayed turn 0 finalized");
+        assert!(c.agent_stream_authoritative, "gate flipped after replay");
+    });
+
+    // Live turn: begin (thinking), stream content, end. Stamped turn 1.
+    view.update(vcx, |v, _cx| {
+        v.agent_mut().unwrap().turn_phase =
+            crate::TurnPhase::begin(std::time::Instant::now());
+    });
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note(
+                    "S1",
+                    0,
+                    1,
+                    2,
+                    K::Chunk { text: "LIVE-PROSE".into(), role: ChunkRole::Message },
+                ),
+                agent_note("S1", 0, 1, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            ],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert!(
+            matches!(c.turn_phase, crate::TurnPhase::Idle),
+            "live turn after replay must finalize (Idle), not stay thinking; phase={:?}",
+            c.turn_phase
+        );
+        assert!(
+            c.finalized.contains(&(0, 1)),
+            "live turn 1 finalized its own ledger key; ledger={:?}",
+            c.finalized
+        );
+    });
+}
+
+/// LIVE-TURN-AFTER-REPLAY — the STUCK-THINKING root cause (suspect b, ReplayEnd
+/// finalize pre-occupies the live turn's ledger key).
+///
+/// Models the real ordering where the user submits the live prompt while replay
+/// is still finishing (or the `ReplayEnd` marker simply trails the live submit):
+///
+///   1. replayed turn 0 boundary  -> finalizes (0, 0), last_seen = 0
+///   2. USER SUBMITS  -> turn_phase = Awaiting (thinking); next live turn is 1
+///   3. ReplayEnd (envelope turn 1)  -> `settle` finalizes (gen, replay_turns
+///      .last_seen). After `finish_replay`, last_seen has been folded to the
+///      replay cursor, which is the SAME index the live turn will carry.
+///   4. live Chunk (turn 1)  -> folds content
+///   5. live TurnEnded{Completed, turn 1}  -> `settle` finalizes (gen, 1)
+///
+/// BUG: step 3 finalizes the live turn's key (gen, 1) ahead of step 5, so step 5
+/// is an idempotent no-op and never flips `turn_phase` back to Idle — the live
+/// turn renders its content but the "thinking" indicator never clears.
+///
+/// FAILS before the fix (turn_phase stuck Awaiting); PASSES after (ReplayEnd
+/// finalizes its OWN envelope turn, leaving the live turn's key free).
+#[gpui::test]
+fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Step 1: replayed turn 0 completes. Note last_seen advances to 0.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 0, 0, 0, K::TurnEnded { outcome: TurnOutcome::Completed })],
+            cx,
+        );
+    });
+
+    // Step 2: the user submits a live prompt mid-resume → turn begins (thinking).
+    // Drive `replay_turns` so the replay cursor lands on the live turn index, the
+    // way the legacy replay path leaves it just before `ReplayEnd` (a replayed
+    // user boundary seeds replay_turn = last_seen + 1 = 1).
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        c.replay_turns.replay_turn = 1; // pending replayed boundary for turn 1
+        c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
+    });
+
+    // Step 3: ReplayEnd arrives (envelope turn 1). A live turn is in flight, so it
+    // must NOT flip to Idle — and it must NOT finalize the live turn's key.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::ReplayEnd })],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert!(
+            c.turn_phase.is_awaiting(),
+            "ReplayEnd with a live turn in flight must keep the phase Awaiting"
+        );
+        assert!(
+            !c.finalized.contains(&(0, 1)),
+            "BUG: ReplayEnd must NOT finalize the live turn's (0, 1) key ahead of the \
+             live TurnEnded — that pre-occupies the ledger and wedges the live finalize; \
+             ledger={:?}",
+            c.finalized
+        );
+    });
+
+    // Step 4 + 5: the live turn streams its content and ends (envelope turn 1).
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note(
+                    "S1",
+                    0,
+                    1,
+                    2,
+                    K::Chunk { text: "LIVE-MID-RESUME".into(), role: ChunkRole::Message },
+                ),
+                agent_note("S1", 0, 1, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            ],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        let text = c.editor.document().full_text();
+        assert!(text.contains("LIVE-MID-RESUME"), "live content folded; transcript:\n{text}");
+        assert!(
+            matches!(c.turn_phase, crate::TurnPhase::Idle),
+            "STUCK-THINKING BUG: the live turn after replay must finalize (Idle), not stay \
+             Awaiting forever; phase={:?}",
+            c.turn_phase
+        );
+    });
+}
