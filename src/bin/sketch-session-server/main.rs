@@ -22,7 +22,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 
-use sketch::acp_channel::{AcpChannelClient, PermissionMode, SketchFrontend, TransportHandle};
+use sketch::acp_channel::{
+    AgentSpawner, AgentTransport, PermissionMode, RealAgentSpawner, SketchFrontend, TransportHandle,
+};
 use sketch::session_proto::*;
 
 mod launchd;
@@ -500,6 +502,11 @@ struct Manager {
     /// The inlet sender — cloned into spawn workers so they can post back
     /// `PublishChannel` / `SpawnFailed` without touching the map directly.
     cmd_tx: mpsc::UnboundedSender<Command>,
+    /// The agent-transport factory (Phase 6 seam). Cloned into every (off-actor)
+    /// spawn thread; the shipping binary installs [`RealAgentSpawner`], a test
+    /// substitutes a `FakeAgentSpawner`. The actor itself never spawns — it only
+    /// hands this `Arc` to the spawn workers.
+    spawner: Arc<dyn AgentSpawner>,
 }
 
 /// The public handle the connection handlers hold. All mutation goes through
@@ -804,7 +811,11 @@ fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<Re
 
 /// Spawn the OS thread that re-spawns a recovered session's ACP subprocess with
 /// `--resume`, then publishes the transport via the actor inlet.
-fn spawn_resume_worker(cmd_tx: mpsc::UnboundedSender<Command>, job: ResumeJob) {
+fn spawn_resume_worker(
+    cmd_tx: mpsc::UnboundedSender<Command>,
+    job: ResumeJob,
+    spawner: Arc<dyn AgentSpawner>,
+) {
     let ResumeJob {
         session_id,
         cwd,
@@ -818,7 +829,7 @@ fn spawn_resume_worker(cmd_tx: mpsc::UnboundedSender<Command>, job: ResumeJob) {
                 std::env::set_var("SKETCH_SESSION_MANAGED", "1");
             }
             let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
-            match AcpChannelClient::spawn_with_resume_in(
+            match spawner.spawn(
                 &cmd,
                 Some(cwd),
                 Some(acp_session_id),
@@ -854,12 +865,14 @@ async fn run_manager(
     events: broadcast::Sender<Notification>,
     default_permission_mode: PermissionMode,
     cmd_tx: mpsc::UnboundedSender<Command>,
+    spawner: Arc<dyn AgentSpawner>,
 ) {
     let mut mgr = Manager {
         sessions,
         events,
         default_permission_mode,
         cmd_tx,
+        spawner,
     };
     // Phase 4: the loop also drives a periodic lease sweep. The sweep is a
     // PROACTIVE side-effect only (lazy expiry in every gate/attach already
@@ -1067,6 +1080,7 @@ impl Manager {
         // Spawn the ACP agent on a background thread (blocking handshake), which
         // posts `PublishChannel` back into the actor when ready.
         let cmd_tx = self.cmd_tx.clone();
+        let spawner = Arc::clone(&self.spawner);
         let session_id = id.clone();
         std::thread::Builder::new()
             .name(format!("acp-spawn-{}", &id[..8]))
@@ -1076,7 +1090,7 @@ impl Manager {
                     std::env::set_var("SKETCH_SESSION_MANAGED", "1");
                 }
                 let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
-                match AcpChannelClient::spawn_with_resume_in(
+                match spawner.spawn(
                     &cmd,
                     Some(cwd),
                     resume_session_id,
@@ -1363,6 +1377,7 @@ impl Manager {
         };
 
         let cmd_tx = self.cmd_tx.clone();
+        let spawner = Arc::clone(&self.spawner);
         let sid = session_id.to_string();
         std::thread::Builder::new()
             .name(format!("acp-restart-{}", &sid[..8.min(sid.len())]))
@@ -1372,7 +1387,7 @@ impl Manager {
                     std::env::set_var("SKETCH_SESSION_MANAGED", "1");
                 }
                 let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
-                match AcpChannelClient::spawn_with_resume_in(
+                match spawner.spawn(
                     &cmd,
                     Some(cwd),
                     resume_id,
@@ -1510,7 +1525,7 @@ fn holds_lease(session: &ManagedSession, client_id: &str, now: Instant) -> bool 
 fn publish_channel(
     cmd_tx: &mpsc::UnboundedSender<Command>,
     session_id: &ServerSessionId,
-    client: AcpChannelClient,
+    client: Box<dyn AgentTransport>,
     is_respawn: bool,
 ) {
     let handle = client.handle();
@@ -1559,7 +1574,7 @@ fn publish_channel(
 fn spawn_pump_thread(
     cmd_tx: mpsc::UnboundedSender<Command>,
     session_id: ServerSessionId,
-    client: AcpChannelClient,
+    client: Box<dyn AgentTransport>,
     my_generation: u64,
     gen_rx: watch::Receiver<u64>,
     initial_replay_fence: usize,
@@ -2329,17 +2344,23 @@ async fn main() -> io::Result<()> {
     // Spawn the single-writer manager actor: it OWNS the sessions map and drains
     // the inlet (external requests, spawn-worker publishes, pump-sourced records)
     // one command at a time.
+    // The shipping binary always uses the real subprocess-spawning transport.
+    // The seam (Arc<dyn AgentSpawner>) exists so headless tests can substitute an
+    // in-process fake; production behaviour is unchanged.
+    let spawner: Arc<dyn AgentSpawner> = Arc::new(RealAgentSpawner);
+
     tokio::spawn(run_manager(
         cmd_rx,
         seed_sessions,
         manager.events.clone(),
         default_permission_mode,
         manager.cmd_tx.clone(),
+        Arc::clone(&spawner),
     ));
 
     // Now the actor is running, kick off the resume workers.
     for job in resume_jobs {
-        spawn_resume_worker(manager.cmd_tx.clone(), job);
+        spawn_resume_worker(manager.cmd_tx.clone(), job, Arc::clone(&spawner));
     }
 
     // Handle graceful shutdown — persist sessions before exiting.

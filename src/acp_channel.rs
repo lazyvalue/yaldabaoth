@@ -369,6 +369,269 @@ fn allow_tool_kind(mode: PermissionMode, kind: ToolKind) -> bool {
 /// package is republished under that name.
 pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-code-acp", "claude-agent-acp"];
 
+/// Constructor seam for an [`AgentTransport`] (Phase 6, spec-session-server-actor
+/// §Rollout). The pump thread never builds the client — the session-server's
+/// three spawn workers (create / restart / resume) do. Abstracting *spawning*
+/// behind this object-safe factory lets a test inject an in-process fake without
+/// touching the `SKETCH_ACP_AGENT` env or forking the real binary, while the
+/// production path stays byte-for-byte identical via [`RealAgentSpawner`].
+///
+/// `Send + Sync` so it can live behind an `Arc<dyn AgentSpawner>` shared by the
+/// actor and cloned into each (off-actor) spawn thread.
+pub trait AgentSpawner: Send + Sync {
+    /// Spawn (or resume) an agent and complete its blocking handshake, returning
+    /// the owning transport. Mirrors [`AcpChannelClient::spawn_with_resume_in`]:
+    /// `command` empty ⇒ default fallback chain; `resume` `Some` ⇒ `session/load`.
+    /// Runs on a dedicated OS spawn thread (the handshake blocks), never the actor.
+    fn spawn(
+        &self,
+        command: &str,
+        cwd: Option<PathBuf>,
+        resume: Option<String>,
+        frontend: SketchFrontend,
+    ) -> io::Result<Box<dyn AgentTransport>>;
+}
+
+/// Production [`AgentSpawner`]: forwards to [`AcpChannelClient::spawn_with_resume_in`]
+/// and boxes the resulting real client. Zero behaviour change — this is the only
+/// spawner the shipping binary installs.
+pub struct RealAgentSpawner;
+
+impl AgentSpawner for RealAgentSpawner {
+    fn spawn(
+        &self,
+        command: &str,
+        cwd: Option<PathBuf>,
+        resume: Option<String>,
+        frontend: SketchFrontend,
+    ) -> io::Result<Box<dyn AgentTransport>> {
+        AcpChannelClient::spawn_with_resume_in(command, cwd, resume, frontend)
+            .map(|c| Box::new(c) as Box<dyn AgentTransport>)
+    }
+}
+
+// ── In-process fake transport (Phase 6 test substrate) ─────────────────────
+//
+// Gated on `test-support` so it ships in test builds only. The fake reproduces
+// the worker's framing/ordering using the SAME channel + atomic types the real
+// client holds (`std::sync::mpsc::Receiver<ReplyEvent>` + the four shared
+// atomics), so the pump's `try_recv()` / `turn_count()` / `is_connected()` reads
+// see identical semantics. The ONLY thing it skips is the subprocess /
+// JSON-RPC serialization — `ReplyEvent` is already the post-deserialize currency
+// the pump consumes, so the fake injects at exactly the layer where real and
+// fake are indistinguishable to the pump. It therefore proves reducer /
+// forwarder / pump logic — NOT wire framing (which the real-agent transcript
+// tests still cover).
+#[cfg(any(test, feature = "test-support"))]
+mod fake {
+    use super::*;
+    use futures::channel::mpsc as f_mpsc;
+
+    /// In-process [`AgentTransport`] standing in for [`AcpChannelClient`]: no OS
+    /// process, no ACP protocol — events arrive on a plain `std::sync::mpsc`
+    /// channel a test scenario drives via [`FakeAgentControls`].
+    pub struct FakeTransport {
+        reply_rx: std_mpsc::Receiver<ReplyEvent>,
+        connected: Arc<AtomicBool>,
+        turns: Arc<AtomicUsize>,
+        permission_mode: Arc<AtomicU8>,
+        session_id: Arc<std::sync::Mutex<Option<String>>>,
+        prompt_tx: std_mpsc::Sender<String>,
+        cancel_tx: f_mpsc::UnboundedSender<()>,
+    }
+
+    /// Drive-side controls for a [`FakeTransport`]: push events, advance the turn
+    /// counter, flip liveness, and observe outbound prompts/cancels. Holds clones
+    /// of the same atomics + the sender end of the reply channel, mirroring how a
+    /// real agent's notification handler feeds the pump.
+    pub struct FakeAgentControls {
+        reply_tx: std_mpsc::Sender<ReplyEvent>,
+        connected: Arc<AtomicBool>,
+        turns: Arc<AtomicUsize>,
+        permission_mode: Arc<AtomicU8>,
+        session_id: Arc<std::sync::Mutex<Option<String>>>,
+        /// Receiver for prompts the transport side enqueues — lets a scenario
+        /// assert a prompt arrived (e.g. admin_prompt) before auto-emitting a turn.
+        pub prompt_rx: std_mpsc::Receiver<String>,
+        /// Receiver for cancel signals.
+        pub cancel_rx: f_mpsc::UnboundedReceiver<()>,
+    }
+
+    impl FakeTransport {
+        /// Build a fake transport paired with its drive-side controls. The
+        /// session id is pre-populated (mirroring how the real worker fills it
+        /// after `session/new`) so `handle().session_id()` and restart's
+        /// resume-id computation behave like the real path.
+        pub fn new() -> (FakeTransport, FakeAgentControls) {
+            Self::with_session_id("fake-sess-0001")
+        }
+
+        /// Like [`new`] but with a caller-chosen synthetic session id.
+        pub fn with_session_id(sid: &str) -> (FakeTransport, FakeAgentControls) {
+            let (reply_tx, reply_rx) = std_mpsc::channel::<ReplyEvent>();
+            let (prompt_tx, prompt_rx) = std_mpsc::channel::<String>();
+            let (cancel_tx, cancel_rx) = f_mpsc::unbounded::<()>();
+            let connected = Arc::new(AtomicBool::new(true));
+            let turns = Arc::new(AtomicUsize::new(0));
+            let permission_mode = Arc::new(AtomicU8::new(DEFAULT_PERMISSION_MODE as u8));
+            let session_id =
+                Arc::new(std::sync::Mutex::new(Some(sid.to_string())));
+
+            let transport = FakeTransport {
+                reply_rx,
+                connected: Arc::clone(&connected),
+                turns: Arc::clone(&turns),
+                permission_mode: Arc::clone(&permission_mode),
+                session_id: Arc::clone(&session_id),
+                prompt_tx,
+                cancel_tx,
+            };
+            let controls = FakeAgentControls {
+                reply_tx,
+                connected,
+                turns,
+                permission_mode,
+                session_id,
+                prompt_rx,
+                cancel_rx,
+            };
+            (transport, controls)
+        }
+    }
+
+    impl AgentTransport for FakeTransport {
+        fn try_recv(&self) -> Option<ReplyEvent> {
+            self.reply_rx.try_recv().ok()
+        }
+        fn is_connected(&self) -> bool {
+            self.connected.load(Ordering::SeqCst)
+        }
+        fn turn_count(&self) -> usize {
+            self.turns.load(Ordering::SeqCst)
+        }
+        fn handle(&self) -> TransportHandle {
+            TransportHandle {
+                prompt_tx: self.prompt_tx.clone(),
+                cancel_tx: self.cancel_tx.clone(),
+                connected: Arc::clone(&self.connected),
+                turns: Arc::clone(&self.turns),
+                permission_mode: Arc::clone(&self.permission_mode),
+                session_id: Arc::clone(&self.session_id),
+                generation: 0,
+            }
+        }
+        fn session_id(&self) -> Option<String> {
+            self.session_id.lock().ok().and_then(|g| g.clone())
+        }
+    }
+
+    impl FakeAgentControls {
+        /// Push one reply event onto the transport's inbound stream. FIFO order is
+        /// preserved exactly as the real notification-handler → pump path does.
+        pub fn push(&self, event: ReplyEvent) {
+            let _ = self.reply_tx.send(event);
+        }
+
+        /// Push a streamed text chunk (convenience for `push(ReplyEvent::Chunk)`).
+        pub fn push_chunk(&self, text: &str) {
+            self.push(ReplyEvent::Chunk(text.to_string()));
+        }
+
+        /// Mirror the real DEFAULT worker turn boundary: bump the turn counter
+        /// ONLY. The default worker does NOT push `ReplyEvent::TurnEnded` into the
+        /// reply stream — that variant is gated behind `SKETCH_EMIT_TURN_ENDED=1`
+        /// and is inert by default; the pump detects the boundary purely via
+        /// `turn_count() > last_turns`. Emitting a TurnEnded here would make a
+        /// fake-driven turn produce an extra eventlog record the production path
+        /// never emits (false confidence for reducer/forwarder tests). Use
+        /// [`emit_turn_ended_event`](Self::emit_turn_ended_event) to exercise the
+        /// opt-in `SKETCH_EMIT_TURN_ENDED=1` mode.
+        pub fn complete_turn(&self) {
+            self.turns.fetch_add(1, Ordering::SeqCst);
+        }
+
+        /// Opt-in: reproduce the `SKETCH_EMIT_TURN_ENDED=1` worker mode — bump the
+        /// turn counter AND push a `TurnEnded{count}` event into the reply stream.
+        /// Only for scenarios deliberately exercising that gated path; the default
+        /// boundary is [`complete_turn`](Self::complete_turn) (counter-only).
+        pub fn emit_turn_ended_event(&self) {
+            let count = self.turns.fetch_add(1, Ordering::SeqCst) + 1;
+            self.push(ReplyEvent::TurnEnded { count });
+        }
+
+        /// Flip liveness false (worker EOF/exit) to drive the `AgentDisconnected`
+        /// path the pump emits when `is_connected()` goes false.
+        pub fn disconnect(&self) {
+            self.connected.store(false, Ordering::SeqCst);
+        }
+
+        /// Read the current permission policy the actor pushed via the handle.
+        pub fn permission_mode(&self) -> PermissionMode {
+            PermissionMode::from_u8(self.permission_mode.load(Ordering::SeqCst))
+        }
+
+        /// Overwrite the synthetic session id (e.g. to simulate a resume landing
+        /// on a different id).
+        pub fn set_session_id(&self, sid: Option<String>) {
+            if let Ok(mut g) = self.session_id.lock() {
+                *g = sid;
+            }
+        }
+
+        /// Non-blocking pull of the next prompt the transport enqueued, if any.
+        pub fn try_recv_prompt(&self) -> Option<String> {
+            self.prompt_rx.try_recv().ok()
+        }
+    }
+
+    /// A pluggable [`AgentSpawner`] whose `spawn` returns a pre-built
+    /// [`FakeTransport`] (no subprocess). The factory closure is invoked per
+    /// spawn so a scenario can hand out a fresh fake (and capture its controls)
+    /// or fail on demand to exercise the `SpawnFailed` branch.
+    pub struct FakeAgentSpawner {
+        #[allow(clippy::type_complexity)]
+        factory: std::sync::Mutex<
+            Box<dyn FnMut(&str, Option<PathBuf>, Option<String>) -> io::Result<Box<dyn AgentTransport>>
+                + Send>,
+        >,
+    }
+
+    impl FakeAgentSpawner {
+        /// Build a spawner from a factory closure. The closure receives the same
+        /// (command, cwd, resume) the real spawner would and returns either a
+        /// boxed transport or an `io::Error` (to drive `SpawnFailed`).
+        pub fn new<F>(factory: F) -> Self
+        where
+            F: FnMut(&str, Option<PathBuf>, Option<String>) -> io::Result<Box<dyn AgentTransport>>
+                + Send
+                + 'static,
+        {
+            Self {
+                factory: std::sync::Mutex::new(Box::new(factory)),
+            }
+        }
+    }
+
+    impl AgentSpawner for FakeAgentSpawner {
+        fn spawn(
+            &self,
+            command: &str,
+            cwd: Option<PathBuf>,
+            resume: Option<String>,
+            _frontend: SketchFrontend,
+        ) -> io::Result<Box<dyn AgentTransport>> {
+            let mut f = self
+                .factory
+                .lock()
+                .map_err(|_| io::Error::other("fake spawner poisoned"))?;
+            f(command, cwd, resume)
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub use fake::{FakeAgentControls, FakeAgentSpawner, FakeTransport};
+
 /// A live ACP connection to a locally-spawned agent subprocess.
 ///
 /// API mirrors `claude_channel::ChannelClient` so that `app.rs` can drive
@@ -727,6 +990,65 @@ impl AcpChannelClient {
             session_id: Arc::clone(&self.session_id),
             generation: 0,
         }
+    }
+}
+
+/// The pump-thread-facing surface of an agent connection (Phase 6,
+/// spec-session-server-actor §Rollout). This is *exactly* the set of touchpoints
+/// the session-server's pump thread uses against the spawned client today, made
+/// object-safe so the pump can own a `Box<dyn AgentTransport>` and a test can
+/// substitute an in-process fake for the subprocess-backed [`AcpChannelClient`].
+///
+/// Deliberately minimal:
+/// - `try_recv` / `is_connected` / `turn_count` / `session_id` are the loop's
+///   reads; `handle` derives the actor-facing [`TransportHandle`].
+/// - `send` / `cancel` / `set_permission_mode` are NOT here — those are reached
+///   through `TransportHandle` (the actor side); `take_wake_receiver` is GUI-only.
+/// - No `async` (the pump drains synchronously) and no `Self`-returning methods,
+///   so the trait stays object-safe.
+/// - No explicit `shutdown`: teardown is `Drop` (blocking — kill child, join
+///   worker). The pump's final `drop(client)` works unchanged whether the boxed
+///   concrete type is the real client or a fake.
+///
+/// `Send` (the pump moves the box onto its OS thread) but intentionally NOT
+/// `Sync`: it preserves today's invariant that only the cloned [`TransportHandle`]
+/// is `Sync`, while the receiver-owning object stays single-owner on the pump.
+pub trait AgentTransport: Send {
+    /// Pull one queued reply event if any are pending. Non-blocking; the pump
+    /// drains this in a budgeted loop. Identical semantics to
+    /// [`AcpChannelClient::try_recv`].
+    fn try_recv(&self) -> Option<ReplyEvent>;
+    /// Worker liveness. The pump emits `AgentDisconnected` when this flips false.
+    fn is_connected(&self) -> bool;
+    /// Completed-turn count, compared against the pump's `last_turns` to detect a
+    /// turn boundary.
+    fn turn_count(&self) -> usize;
+    /// Derive the `Send + Sync` actor-facing [`TransportHandle`].
+    fn handle(&self) -> TransportHandle;
+    /// Live ACP session id (used at restart to compute the resume id).
+    fn session_id(&self) -> Option<String>;
+}
+
+/// Pure forwarding impl: every method already exists verbatim on the inherent
+/// `impl AcpChannelClient`, so the trait is a thin facade over the same object
+/// with zero behaviour change. The blocking `Drop for AcpChannelClient`
+/// (swap-out prompt_tx, join worker) satisfies the block-on-Drop/kill-child
+/// contract automatically — the concrete type is what's boxed.
+impl AgentTransport for AcpChannelClient {
+    fn try_recv(&self) -> Option<ReplyEvent> {
+        AcpChannelClient::try_recv(self)
+    }
+    fn is_connected(&self) -> bool {
+        AcpChannelClient::is_connected(self)
+    }
+    fn turn_count(&self) -> usize {
+        AcpChannelClient::turn_count(self)
+    }
+    fn handle(&self) -> TransportHandle {
+        AcpChannelClient::handle(self)
+    }
+    fn session_id(&self) -> Option<String> {
+        AcpChannelClient::session_id(self)
     }
 }
 

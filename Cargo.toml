@@ -37,6 +37,14 @@ gpui = "0.2"
 # unconditional so `match ev` arms stay exhaustive regardless.
 unstable_session_usage = ["agent-client-protocol/unstable_session_usage"]
 
+# Phase 6 (spec-session-server-actor §Rollout): exposes the in-process
+# `FakeTransport` / `FakeAgentControls` / `FakeAgentSpawner` test substrate in
+# `acp_channel`. The fake injects at the `ReplyEvent` layer (the post-deserialize
+# currency the pump consumes), so a harness can exercise the pump / reducer /
+# forwarder without spawning a real ACP subprocess. Off by default; integration
+# tests opt in via `required-features`.
+test-support = []
+
 [dev-dependencies]
 pretty_assertions = "1"
 insta = "1"
@@ -67,3 +75,11 @@ path = "src/bin/sketch-session-server/main.rs"
 [[bin]]
 name = "sketch-acp-stub"
 path = "src/bin/sketch-acp-stub.rs"
+
+# Phase 6: in-process AgentTransport-fake tests. Gated on `test-support` so the
+# fake substrate (FakeTransport / FakeAgentControls / FakeAgentSpawner) is
+# compiled in. Run with `cargo test --features test-support`.
+[[test]]
+name = "agent_transport_fake_test"
+path = "tests/agent_transport_fake_test.rs"
+required-features = ["test-support"]
