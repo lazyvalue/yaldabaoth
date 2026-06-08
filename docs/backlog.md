@@ -88,11 +88,55 @@ verified via the resilience+transcript harness. Worklogs:
   `cursor_reconnect_streams_only_tail`. **GUI cursor-wiring is NEEDS-RUNTIME** (have
   the GUI send its last cursor on reconnect; the transcript reconciler must be
   checked under tail-only streams — GPUI not headless-drivable).
-- **Lease ownership (phase 4)** — `READY`, DEFERRED (do supervised). Replace
-  `owner: conn_id` with `Lease{client_id, expires_at}` + heartbeat. The
-  `OwnerChanged→LeaseChanged` rename is a BREAKING wire+WAL change needing lockstep
-  GUI updates — must not land unattended; ride the spec-event-stream §12 migration.
-  Independent of the (now-done) cursor work.
+- **Lease ownership (phase 4)** — `DONE` — runtime-verified, merging to master
+  (branch `phase4-lease` → `ba12d5d`, 2026-06-08). `owner: conn_id` → `Lease{
+  client_id, expires_at: Instant}` + 5s client heartbeat / 15s TTL; dual-clock
+  (actor owns monotonic `Instant`, wire carries display-only millis); stable
+  per-install `client_id` (`~/.cache/sketch/client_id`, `SKETCH_CLIENT_ID` override
+  for blue-green candidates); `attach_owner_with_retry`→`attach_for_role`
+  (deterministic same-`client_id` reclaim, retry/observer-fallback retired); wire
+  `OwnerChanged→LeaseChanged`; WAL 1→2 with **discard** of v1. STAGED, not bundled
+  with the eventlog collapse. **Verification:** workflow `wf_c45c440b-aac` (build +
+  15/8 headless) → race review found 2 BLOCKING client races (owner-gap after
+  promote; observer heartbeat steal/churn) → fixed (unconditional beater +
+  per-tick `is_driver` self-gate; `is_driver` persisted on `AgentSlot`) → indep.
+  re-review `MINOR`, both closed, found a leaked-beater → fixed (singleton
+  `_lease_heartbeat` Task). Final: build clean, **17 + 8 headless pass**. **Runtime-verified
+  (2026-06-08):** clean v2 daemon spawn + live v1-WAL discard; heartbeats accepted
+  (no `bad frame`); idle-then-prompt holds the lease (no false expiry); `:promote`
+  self-hosting handoff textbook (candidate observer-attach → original close →
+  candidate promote → drives past >15s — the bug-1 owner-gap fix, confirmed in-app
+  via daemon log + user drive). **Known limitation (App Nap):** two windows of the
+  *same* install on one Mac — the backgrounded owner's heartbeat (collect step on
+  GPUI's foreground executor) is throttled by macOS App Nap, so its lease lapses
+  (~15s) and ownership follows focus. Fails safe (no double-drive / corruption).
+  Acceptable per user — the self-hosting / blue-green loop is the real case and
+  works; same-machine multi-window is the edge. Follow-up only if that matters
+  (heartbeat off an App-Nap-immune timer / disable App Nap / longer TTL).
+- **`AgentTransport` seam (phase 6)** — `DONE` / merging to master (branch
+  `phase6-transport` → `b0375e9` + `1f80296`, 2026-06-08). `AgentTransport` trait
+  (object-safe, sync, pump-facing) + `AgentSpawner` factory + `RealAgentSpawner`;
+  `FakeTransport`/`FakeAgentControls`/`FakeAgentSpawner` in-process fake (gated
+  `feature = "test-support"`); new `tests/agent_transport_fake_test.rs`. Real
+  subprocess path byte-identical; crash/WAL/socket/back-pressure tests kept
+  subprocess-backed. Workflow `wf_6ead8955-d04` → review `MINOR` (fake's
+  `complete_turn` wrongly emitted a `TurnEnded` record the default worker doesn't)
+  → fixed: `complete_turn` is counter-only, opt-in `emit_turn_ended_event` covers
+  `SKETCH_EMIT_TURN_ENDED=1`. Build + full suite + 8/8 fake tests green.
+  Behavior-preserving → foldable after build-check. Overlaps
+  `tests/session_resilience_test.rs` with phase 4 at integrate (kept additive).
+  Unblocks the phase-8 eventlog reducer/forwarder headless tests.
+- **GUI projection + full eventlog end-to-end (phase 8)** — `READY` / launching
+  (4+6 merged to master). Decision: **go end-to-end** (2026-06-08). Consumer side: unidirectional
+  `events → reducer → view`, retire `reset_for_replay`. Necessarily drags in the
+  **eventlog producer-side**: collapse `Notification::{ReplyEvent,TurnEnded,
+  UserPrompt}` + `WorkerEvent::Reply` into one `AgentEvent` (spec-event-stream),
+  emit chokepoint, generation-on-`ChannelOpened`, forward-verbatim; WAL bumps 2→3
+  (discard). Plus **ringbuffer compaction**: bound the in-memory `event_log`, wire
+  its base to `log_base` (§6 epoch predicate) in cursor-reconnect's `seq` space,
+  surface trims as `CompactedSummary` markers (not silent drops); on-disk WAL stays
+  append-only. Sequenced AFTER phase 4 (wire/WAL conflict) + phase 6 (uses the
+  transport fake). The one phase needing a human GPUI runtime check.
 - **GUI stale-session robustness** — `DONE` (`b0f1eb2`) / NEEDS-RUNTIME. GUI drops
   the slot + scrubs the persisted id (by id, across all cwd keys) on a permanent
   `no such session` attach error; transient errors keep the recoverable status.
