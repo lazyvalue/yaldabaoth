@@ -47,6 +47,12 @@ enum Command {
         sid: ServerSessionId,
         mode: AttachMode,
         conn_id: u64,
+        /// Optional reconnect cursor `(generation, index)`. Resolved by
+        /// `do_attach` against the session's `channel_generation` +
+        /// `event_log.len()` into the forwarder's initial `sent` value (the
+        /// `usize` in the reply): the tail starts there. `None` / stale /
+        /// out-of-range ⇒ `0` ⇒ full replay (unchanged behavior).
+        cursor: Option<(u64, u64)>,
         reply: tokio::sync::oneshot::Sender<
             Result<
                 (
@@ -485,6 +491,7 @@ impl SessionManager {
         sid: &str,
         mode: AttachMode,
         conn_id: u64,
+        cursor: Option<(u64, u64)>,
     ) -> Result<
         (
             watch::Receiver<bool>,
@@ -498,6 +505,7 @@ impl SessionManager {
             sid: sid.to_string(),
             mode,
             conn_id,
+            cursor,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
@@ -778,9 +786,10 @@ impl Manager {
                 sid,
                 mode,
                 conn_id,
+                cursor,
                 reply,
             } => {
-                let _ = reply.send(self.do_attach(&sid, mode, conn_id));
+                let _ = reply.send(self.do_attach(&sid, mode, conn_id, cursor));
             }
             Command::Detach { sid, conn_id, reply } => {
                 let _ = reply.send(self.do_detach(&sid, conn_id));
@@ -1003,6 +1012,7 @@ impl Manager {
         session_id: &str,
         mode: AttachMode,
         conn_id: u64,
+        cursor: Option<(u64, u64)>,
     ) -> Result<
         (
             watch::Receiver<bool>,
@@ -1032,7 +1042,33 @@ impl Manager {
         let owner_rx = session.owner_tx.subscribe();
         let log_rx = session.log_tx.subscribe();
         let log_len = session.event_log.len();
-        Ok((owner_rx, log_rx, log_len))
+
+        // Resolve the reconnect cursor into the forwarder's initial `sent`.
+        //
+        // Incremental tail ONLY when the cursor's generation matches the
+        // session's current `channel_generation` AND its index is within the
+        // current log. Falls back to `0` ⇒ full replay (exactly today's
+        // behavior) for any of:
+        //   - no cursor (every client today);
+        //   - generation mismatch — a *force-restart* bumped the epoch, so the
+        //     client's pre-restart cursor is stale;
+        //   - index past the log — WAL compaction-past-cursor or a bogus client.
+        // NOTE on server restart: WAL recovery resets `channel_generation` to 0
+        // AND restores the full durable log as a faithful append-ordered prefix.
+        // So a never-force-restarted client's (gen 0, idx) cursor MATCHES the
+        // restored gen 0 and correctly tails the restored log — [0..idx] is
+        // exactly what it already saw, [idx..] the right suffix. If un-fsynced
+        // mid-turn chunks were lost on crash, idx > log_len trips the
+        // full-replay fallback. Safe either way; behavior-preserving.
+        let initial_sent = match cursor {
+            Some((cursor_gen, idx))
+                if cursor_gen == session.channel_generation && (idx as usize) <= log_len =>
+            {
+                idx as usize
+            }
+            _ => 0,
+        };
+        Ok((owner_rx, log_rx, initial_sent))
     }
 
     fn do_promote(&mut self, session_id: &str, conn_id: u64) -> Result<(), String> {
@@ -1545,19 +1581,25 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 }
             }
 
-            Request::Attach { session_id, mode } => {
-                match manager.send_attach(&session_id, mode, conn_id).await {
-                    Ok((owner_rx, log_rx, replay_len)) => {
-                        // No explicit replay write here anymore: the forwarder
-                        // tails `event_log` from index 0, so it streams the
-                        // full history and then live events over one ordered,
-                        // gap-free path. (We still receive the log length from
-                        // attach for the count log; the contents are re-derived
-                        // by the forwarder.)
+            Request::Attach {
+                session_id,
+                mode,
+                cursor,
+            } => {
+                match manager.send_attach(&session_id, mode, conn_id, cursor).await {
+                    Ok((owner_rx, log_rx, initial_sent)) => {
+                        // `initial_sent` is the actor-resolved tail start (see
+                        // `do_attach`): 0 for a full replay (no/stale cursor —
+                        // the forwarder tails `event_log` from index 0, the
+                        // unchanged behavior), or the cursor index for an
+                        // incremental reconnect that streams only `[idx..]`.
+                        // Either way history + live events flow over one
+                        // ordered, gap-free path.
                         tracing::info!(
                             session_id = %&session_id[..8],
-                            replay_len,
-                            "attach: forwarder will replay logged events"
+                            initial_sent,
+                            cursor = ?cursor,
+                            "attach: forwarder tail start resolved"
                         );
                         let w = Arc::clone(&writer);
                         let handle = tokio::spawn(forward_notifications(
@@ -1566,6 +1608,7 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                             w,
                             owner_rx,
                             log_rx,
+                            initial_sent,
                         ));
                         subscribed.insert(session_id, handle);
                         Response::Ok {
@@ -1721,14 +1764,21 @@ async fn forward_notifications(
     writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     mut owner_rx: watch::Receiver<bool>,
     mut log_rx: watch::Receiver<Arc<Vec<Notification>>>,
+    initial_sent: usize,
 ) {
-    // Number of `event_log` entries already written to this client.
-    let mut sent = 0usize;
+    // Number of `event_log` entries already written to this client. Starts at
+    // the actor-resolved `initial_sent`: `0` for a full replay (no/stale
+    // cursor — unchanged behavior), or the reconnect cursor index so the first
+    // tail pass streams only `[initial_sent..]` (incremental reconnect, spec
+    // phase 5). Everything below (tail loop, owner watch, slow-subscriber
+    // timeout) is identical regardless.
+    let mut sent = initial_sent;
 
     // First pass: `watch::Sender::subscribe()` marks the current value as
     // already-seen, so the initial transcript replay IS the first tail. Mark
     // the current snapshot seen with `borrow_and_update()` and tail it from
-    // index 0 to subsume attach replay (no separate replay path).
+    // `sent` (the cursor index, or 0 for full replay) to subsume attach replay
+    // (no separate replay path).
     {
         let snapshot = log_rx.borrow_and_update().clone();
         if snapshot.len() > sent {

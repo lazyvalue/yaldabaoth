@@ -459,10 +459,32 @@ impl SessionServerClient {
     /// Attach to a session as `Owner` (can drive) or `Observer` (read-only
     /// mirror). The server replays the full event log before the Ack, so the
     /// pump picks up the entire transcript on its first drain cycle.
+    ///
+    /// This is the unchanged, full-replay path: it delegates to
+    /// [`attach_with_cursor`](Self::attach_with_cursor) with `None`, so every
+    /// existing caller (the GUI included) keeps today's behavior exactly.
     pub fn attach(&self, session_id: &str, mode: AttachMode) -> io::Result<()> {
+        self.attach_with_cursor(session_id, mode, None)
+    }
+
+    /// Attach with an optional cursor for incremental reconnect (spec phase 5).
+    ///
+    /// When `cursor` is `Some((generation, index))` and it matches the
+    /// session's current channel generation with an in-range index, the server
+    /// streams only the transcript tail after `index` instead of the full log.
+    /// `None` (or a stale/out-of-range cursor) yields the full replay — the
+    /// same behavior as [`attach`](Self::attach). Additive: callers that don't
+    /// track a cursor simply use `attach`.
+    pub fn attach_with_cursor(
+        &self,
+        session_id: &str,
+        mode: AttachMode,
+        cursor: Option<(u64, u64)>,
+    ) -> io::Result<()> {
         match self.request(Request::Attach {
             session_id: session_id.to_string(),
             mode,
+            cursor,
         })? {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
@@ -725,9 +747,11 @@ impl SessionServerHandle {
     }
 
     pub fn attach(&self, session_id: &str, mode: AttachMode) -> io::Result<()> {
+        // Handles never track a cursor: always full replay (cursor = None).
         match self.request(Request::Attach {
             session_id: session_id.to_string(),
             mode,
+            cursor: None,
         })? {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),

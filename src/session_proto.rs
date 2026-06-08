@@ -70,6 +70,21 @@ pub enum Request {
         session_id: ServerSessionId,
         /// Owner (drives the session) or Observer (read-only mirror).
         mode: AttachMode,
+        /// Cursor-based incremental reconnect (spec phase 5): the client's
+        /// last-seen transcript position as `(generation, index)`, where
+        /// `index` is the number of `event_log` entries already received on
+        /// channel `generation`. When the cursor's generation matches the
+        /// session's current `channel_generation` and the index is in range,
+        /// the server streams ONLY the tail `[index..]` rather than the full
+        /// log. Otherwise (None, generation mismatch, or out-of-range index)
+        /// it falls back to today's behavior: a full replay from index 0.
+        ///
+        /// `#[serde(default)]` is what makes this purely additive — every
+        /// existing client (incl. the GUI) and every pre-cursor persisted
+        /// message deserializes with `cursor == None`, i.e. unchanged full
+        /// replay.
+        #[serde(default)]
+        cursor: Option<(u64, u64)>,
     },
 
     #[serde(rename = "detach")]
