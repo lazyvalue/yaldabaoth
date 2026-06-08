@@ -71,6 +71,17 @@ impl SessionServerClient {
         Self::from_stream(stream)
     }
 
+    /// Connect to an ALREADY-RUNNING server only — never auto-launch one.
+    /// Used by non-GUI CLI callers (e.g. the headless `prompt` subcommand,
+    /// ADR-0015) that want to drive an existing server's existing session, not
+    /// spin up a throwaway daemon. Fails fast with `ConnectionRefused` if no
+    /// server is listening so the caller can tell the user to start one.
+    pub fn connect_existing() -> io::Result<Self> {
+        let path = socket_path();
+        let stream = UnixStream::connect(&path)?;
+        Self::from_stream(stream)
+    }
+
     fn connect_or_launch(path: &std::path::Path) -> io::Result<UnixStream> {
         // Try connecting first.
         match UnixStream::connect(path) {
@@ -531,6 +542,22 @@ impl SessionServerClient {
             session_id: session_id.to_string(),
             text: text.to_string(),
         })
+    }
+
+    /// Headless "start-work" enqueue (ADR-0015): enqueue a prompt to an
+    /// EXISTING session this caller does NOT own, and have the agent run the
+    /// turn to completion with no GUI attached. Unlike [`prompt`] there is no
+    /// owner gate. This is a round-trip (waits for Ack/Error) so a non-GUI
+    /// caller (the CLI `prompt` subcommand, cron, automation) gets a definitive
+    /// success/failure — it has no notification stream to infer delivery from.
+    pub fn admin_prompt(&self, session_id: &str, text: &str) -> io::Result<()> {
+        match self.request(Request::AdminPrompt {
+            session_id: session_id.to_string(),
+            text: text.to_string(),
+        })? {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+        }
     }
 
     /// Interrupt the in-flight turn for `session_id`. Fire-and-forget,

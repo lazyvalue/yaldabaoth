@@ -74,6 +74,14 @@ enum Command {
         conn_id: u64,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Headless "start-work" enqueue (ADR-0015): same as `Prompt` but with NO
+    /// owner gate. The handler calls `enqueue_prompt` directly, so a non-GUI
+    /// caller can drive a turn on a session it does not own.
+    AdminPrompt {
+        session_id: ServerSessionId,
+        text: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     Cancel {
         sid: ServerSessionId,
         conn_id: u64,
@@ -166,6 +174,16 @@ enum Subcmd {
     Uninstall,
     /// Show whether the LaunchAgent is installed/loaded and the socket is live.
     Status,
+    /// Enqueue a prompt to an existing session with no GUI attached (headless
+    /// start-work). Connects to the already-running server and drives a turn on
+    /// a session this CLI does not own (ADR-0015); the agent runs it to
+    /// completion with no GUI ever attaching.
+    Prompt {
+        /// The id of the existing session to enqueue the prompt to.
+        session_id: String,
+        /// The prompt text to send to the agent.
+        text: String,
+    },
 }
 
 // ── Managed session ────────────────────────────────────────────────
@@ -516,6 +534,17 @@ impl SessionManager {
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
+    /// Headless ungated enqueue (ADR-0015). No `conn_id` / owner check.
+    async fn send_admin_prompt(&self, sid: &str, text: &str) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::AdminPrompt {
+            session_id: sid.to_string(),
+            text: text.to_string(),
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
     async fn send_cancel(&self, sid: &str, conn_id: u64) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Cancel {
@@ -766,6 +795,14 @@ impl Manager {
                 reply,
             } => {
                 let _ = reply.send(self.do_prompt(&sid, &text, conn_id));
+            }
+            Command::AdminPrompt {
+                session_id,
+                text,
+                reply,
+            } => {
+                // Ungated: enqueue directly, no owner check (ADR-0015).
+                let _ = reply.send(self.enqueue_prompt(&session_id, &text));
             }
             Command::Cancel { sid, conn_id, reply } => {
                 let _ = reply.send(self.do_cancel(&sid, conn_id));
@@ -1027,13 +1064,29 @@ impl Manager {
     }
 
     fn do_prompt(&mut self, session_id: &str, text: &str, conn_id: u64) -> Result<(), String> {
+        {
+            let session = self
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| format!("no such session: {session_id}"))?;
+            if session.owner != Some(conn_id) {
+                return Err("only the session owner can send prompts".into());
+            }
+        }
+        self.enqueue_prompt(session_id, text)
+    }
+
+    /// Owner-gate-free core of the prompt path: log the user's prompt durably,
+    /// then hand it to the live channel (or queue it if the agent is still
+    /// spawning). Used by both the owner-gated [`do_prompt`] and the ungated
+    /// headless [`Command::AdminPrompt`] path (ADR-0015). The ONLY difference
+    /// between the two is the owner check; everything that makes a prompt
+    /// durable + drives the turn lives here.
+    fn enqueue_prompt(&mut self, session_id: &str, text: &str) -> Result<(), String> {
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if session.owner != Some(conn_id) {
-            return Err("only the session owner can send prompts".into());
-        }
         // Log the user's prompt so re-attaching GUIs can replay it (and so it
         // survives a crash — UserPrompt is a turn boundary that fsyncs). Only
         // appended to event_log + WAL, not broadcast.
@@ -1553,6 +1606,15 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 }
             }
 
+            Request::AdminPrompt { session_id, text } => {
+                match manager.send_admin_prompt(&session_id, &text).await {
+                    Ok(()) => Response::Ok {
+                        data: ResponseData::Ack,
+                    },
+                    Err(e) => Response::Error { message: e },
+                }
+            }
+
             Request::Cancel { session_id } => {
                 match manager.send_cancel(&session_id, conn_id).await {
                     Ok(()) => Response::Ok {
@@ -1845,6 +1907,32 @@ async fn main() -> io::Result<()> {
             Subcmd::Install => launchd::install(),
             Subcmd::Uninstall => launchd::uninstall(),
             Subcmd::Status => launchd::status(),
+            Subcmd::Prompt { session_id, text } => {
+                // Headless start-work (ADR-0015). Connect to an ALREADY-RUNNING
+                // server (never auto-launch a throwaway daemon — a CLI prompt
+                // targets a session in a live server), then enqueue via the
+                // ungated admin path. Print ok/error and exit.
+                let client = match sketch::session_client::SessionServerClient::connect_existing() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!(
+                            "error: could not connect to a running session server ({e}). \
+                             Start one with `sketch-session-server` (or `sketch-session-server install`)."
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                match client.admin_prompt(&session_id, &text) {
+                    Ok(()) => {
+                        println!("ok");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
         };
     }
 
