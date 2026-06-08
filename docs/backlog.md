@@ -77,20 +77,30 @@ verified via the resilience+transcript harness. Worklogs:
 - **Slow-subscriber disconnect** — `DONE` (`a70ef74`). All server→client writes
   bounded by a timeout (60s default; `SKETCH_SLOW_SUB_TIMEOUT_MS`); stuck peer
   dropped → reconnects + replays; owner never gapped.
-- **Headless start-work verb** — `READY` (decided, ADR-0015). Admin/CLI path to
-  enqueue a prompt to an unowned session, reusing the pending-prompt queue + WAL.
-  Needs a short spec first (verb/CLI shape, lease interaction, durability order).
-- **Lease ownership + cursor reconnect (phases 4–5)** — `READY`, now unblocked by
-  the actor (conn_id ownership isolated behind the Command inlet; generation
-  fencing is a stepping stone). Needs the event-stream `seq` work.
-- **GUI stale-session robustness** — `READY` (GUI, NEEDS-RUNTIME). When the GUI's
-  persisted session list outlives the server's, attach failures read as "new
-  sessions failing" (hit 2026-06-07; worked around via clean-room reset). GUI
-  should drop/ignore unknown session ids on startup instead of churning.
+- **Headless start-work verb** — `DONE` (`f3585b0`, ADR-0015). `Request::AdminPrompt`
+  + `sketch-session-server prompt <sid> <text>` CLI + `SessionServerClient::
+  {admin_prompt,connect_existing}`; ungated `enqueue_prompt` core shared with the
+  owner-gated `do_prompt`. Headless prompt takes no lease; WAL-durable; runs under
+  the session's stored permission mode. Test: `admin_prompt_drives_turn_without_owner`.
+- **Cursor reconnect (phase 5, additive)** — `DONE` (`a3650a4`). Optional
+  `cursor:(generation,index)` on `Request::Attach`; forwarder tails `[index..]` on
+  generation-match+in-range, else full replay (additive; GUI untouched). Test:
+  `cursor_reconnect_streams_only_tail`. **GUI cursor-wiring is NEEDS-RUNTIME** (have
+  the GUI send its last cursor on reconnect; the transcript reconciler must be
+  checked under tail-only streams — GPUI not headless-drivable).
+- **Lease ownership (phase 4)** — `READY`, DEFERRED (do supervised). Replace
+  `owner: conn_id` with `Lease{client_id, expires_at}` + heartbeat. The
+  `OwnerChanged→LeaseChanged` rename is a BREAKING wire+WAL change needing lockstep
+  GUI updates — must not land unattended; ride the spec-event-stream §12 migration.
+  Independent of the (now-done) cursor work.
+- **GUI stale-session robustness** — `DONE` (`b0f1eb2`) / NEEDS-RUNTIME. GUI drops
+  the slot + scrubs the persisted id (by id, across all cwd keys) on a permanent
+  `no such session` attach error; transient errors keep the recoverable status.
+  Compile-verified; runtime check owed (silent drop, no recur next launch,
+  transient survives, last-slot restores underlying, multi-tab/pane).
 - **In-app rebuild + reconnect-badge** — `NEEDS-RUNTIME`. `dev_rebuild_restart_gui`
   (`<space> c g`) and the permission badge after a sid-only reconnect (shows
   default until re-synced) need a human runtime check.
-  Split the branch if you want the first two ahead of the permission sign-off.
 
 ## Top priority
 
