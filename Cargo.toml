@@ -83,3 +83,8 @@ path = "src/bin/sketch-acp-stub.rs"
 name = "agent_transport_fake_test"
 path = "tests/agent_transport_fake_test.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "agent_event_stream_test"
+path = "tests/agent_event_stream_test.rs"
+required-features = ["test-support"]

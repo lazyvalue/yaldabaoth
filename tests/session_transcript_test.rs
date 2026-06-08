@@ -850,6 +850,204 @@ fn slow_subscriber_is_disconnected_owner_unaffected() {
     drop(stuck);
 }
 
+/// 6b. HIGH-WATER BACKLOG BOUND (spec §6, MAJOR — disconnect-before-gap).
+///
+///     The owner hard-ceiling (`floor = min(sent_seq)` over live forwarders,
+///     never compact past it) means a slow/PAUSED forwarder — concretely a
+///     backgrounded GUI under macOS App Nap that stops draining its socket —
+///     pins `min(sent_seq)`, blocks the trim, and grows the in-memory `event_log`
+///     `Vec`. The 60s slow-sub write timeout is the only other reaper, so a
+///     reader that pauses can pin growth for up to 60s (or unbounded if it drains
+///     just enough to keep resetting the write timer). Spec §6 requires a
+///     subscriber past the high-water backlog threshold to be DISCONNECTED
+///     (forced clean from-0 reconnect) and thereby dropped from the `min`, so the
+///     trim resumes — high-water disconnect fires BEFORE any gap-marker.
+///
+///     Setup mirrors the slow-subscriber test but isolates the HIGH-WATER reaper
+///     from the WRITE-TIMEOUT reaper: the write timeout is set HUGE (60s) so it
+///     can NEVER fire within the test, leaving the high-water disconnect as the
+///     ONLY mechanism that can reap the wedged consumer. A tiny CAP (16) and a
+///     low HIGH_WATER (= cap×2 = 32) make a long turn (CHUNKS=600) blow past the
+///     bound quickly. A healthy draining owner drives the turn; a raw observer
+///     attaches and then NEVER reads, pinning the floor.
+///
+///     Assertions:
+///       (1) the wedged observer is DISCONNECTED — the server logs the
+///           "high-water disconnect" warning AND the raw stream sees EOF;
+///       (2) the in-memory log is BOUNDED — `event_log_len` settles far below the
+///           full CHUNKS transcript (near the cap), and `log_base` advanced past
+///           HIGH_WATER, proving the trim RESUMED after the disconnect.
+///
+///     FAIL-BEFORE (without the high-water bound): the wedged observer is never
+///     disconnected (the 60s write timeout can't fire in-test), so the floor
+///     stays pinned at the wedged observer's `sent_seq ≈ 0`, the trim never
+///     advances `log_base`, and `event_log_len` grows to the full transcript.
+#[test]
+fn slow_owner_past_high_water_is_disconnected_log_bounded() {
+    use std::io::Read as _;
+    use std::io::Write as _;
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    let _g = serial_lock();
+    const CHUNKS: usize = 600;
+    const CAP: usize = 16;
+    // HIGH_WATER must be (a) comfortably ABOVE any transient lag a HEALTHY
+    // draining owner exhibits (so the owner is never falsely reaped), and (b)
+    // well BELOW the full transcript (~2×CHUNKS events, since each chunk is
+    // logged twice — legacy ReplyEvent + additive Agent) so a WEDGED consumer
+    // pinned near seq 0 crosses it long before the turn ends. 150 sits in that
+    // window for CHUNKS=600 (full ≈ 1200).
+    const HIGH_WATER: usize = 150;
+    // A modest per-chunk text so the wedged observer's send buffer fills (pinning
+    // the floor).
+    let chunk_text = "y".repeat(64);
+    let server = TestServer::start_with_env(&[
+        ("STUB_CHUNKS", &CHUNKS.to_string()),
+        ("STUB_CHUNK_TEXT", &chunk_text),
+        // Pace the stream so the HEALTHY owner's reader keeps up and its forwarder
+        // never lags past HIGH_WATER (only the never-draining wedged observer
+        // does). Fast enough that the whole turn still finishes promptly.
+        ("STUB_DELAY_MS", "3"),
+        ("SKETCH_EVENT_LOG_CAP", &CAP.to_string()),
+        ("SKETCH_EVENT_LOG_HIGH_WATER", &HIGH_WATER.to_string()),
+        // HUGE write timeout: the high-water disconnect must be the ONLY reaper.
+        ("SKETCH_SLOW_SUB_TIMEOUT_MS", "60000"),
+    ]);
+    server.activate_env();
+
+    // Healthy owner: a normal client that reads continuously and drives the turn.
+    let owner = connect_as("gui-highwater");
+    let info = owner
+        .create_session(std::env::temp_dir(), "high-water".into(), None)
+        .expect("create_session");
+    owner
+        .attach(&info.session_id, AttachMode::Owner)
+        .expect("attach owner");
+
+    // Wedged observer: a RAW UnixStream that attaches as Observer over the wire,
+    // then NEVER reads. Its forwarder's writes pile up in the kernel send buffer
+    // and its `sent_seq` stays pinned near 0, holding the trim floor down.
+    let mut wedged = StdUnixStream::connect(&server.socket).expect("raw connect");
+    let attach_frame = format!(
+        "{{\"kind\":\"request\",\"id\":1,\"req\":{{\"method\":\"attach\",\"session_id\":{sid},\"mode\":\"observer\"}}}}\n",
+        sid = serde_json::to_string(&info.session_id).unwrap()
+    );
+    wedged
+        .write_all(attach_frame.as_bytes())
+        .expect("send raw attach");
+    wedged.flush().expect("flush raw attach");
+    // Deliberately do NOT read from `wedged` from here on (paused-reader sim).
+
+    // Drive a long turn. The stub streams 600 chunks; the wedged observer's send
+    // buffer fills and pins the floor; the backlog crosses HIGH_WATER → the
+    // server force-disconnects the wedged observer and the trim resumes.
+    owner
+        .prompt(&info.session_id, "flood past the high-water mark")
+        .expect("prompt");
+
+    // (1a) The server logs a high-water disconnect for the wedged observer —
+    // and NOT a write-timeout disconnect (the 60s timeout can't fire in-test).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_high_water = false;
+    while Instant::now() < deadline {
+        let log = server.read_log();
+        if log.contains("high-water disconnect") {
+            saw_high_water = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let log = server.read_log();
+    assert!(
+        saw_high_water,
+        "expected a 'high-water disconnect' for the wedged observer (CAP={CAP}, \
+         HIGH_WATER={HIGH_WATER}, CHUNKS={CHUNKS}); the high-water bound never fired.\nlog:\n{log}"
+    );
+    assert!(
+        !log.contains("write stalled"),
+        "the high-water disconnect — NOT the 60s write timeout — must reap the wedged \
+         observer; the write-timeout path fired unexpectedly.\nlog:\n{log}"
+    );
+
+    // (1b) The wedged observer's connection is closed: a read returns EOF (0
+    // bytes) or an error once the server drops the forwarder and closes the
+    // write half. (Its OS buffer may hold queued frames we never read; we read
+    // until EOF/error, bounded.)
+    wedged
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set read timeout");
+    let mut buf = [0u8; 4096];
+    let mut saw_eof = false;
+    let eof_deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < eof_deadline {
+        match wedged.read(&mut buf) {
+            Ok(0) => {
+                saw_eof = true;
+                break;
+            }
+            Ok(_) => continue, // drain queued frames until EOF
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(_) => {
+                saw_eof = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_eof,
+        "the wedged observer's connection must be CLOSED by the high-water disconnect \
+         (read should hit EOF), but it stayed open.\nlog:\n{}",
+        server.read_log()
+    );
+
+    // (2) The in-memory log is BOUNDED. Probe via admin_status from a FRESH
+    // client (decoupled from the owner's liveness). Poll until the trim has
+    // RESUMED — `log_base` advanced past HIGH_WATER, which it could NOT have done
+    // had the wedged observer kept pinning the floor near seq 0. Throughout, the
+    // resident `Vec` must stay BOUNDED: far below the full transcript (~2×CHUNKS
+    // entries — each chunk is logged twice), settling near the high-water + cap
+    // window. A wedged consumer pinning unbounded growth is the bug under test.
+    let admin = connect_as("admin-probe");
+    let bound = HIGH_WATER + CAP + 8;
+    let probe_deadline = Instant::now() + Duration::from_secs(60);
+    let mut resumed = false;
+    let mut last = None;
+    while Instant::now() < probe_deadline {
+        let snap = admin.admin_status().expect("admin_status");
+        if let Some(s) = snap.sessions.iter().find(|s| s.session_id == info.session_id) {
+            // The in-memory Vec must NEVER blow past the bound — assert on every
+            // poll so a transient overshoot is caught, not just the final state.
+            assert!(
+                s.event_log_len <= bound,
+                "in-memory event_log must stay BOUNDED (≤ {bound}) while a wedged consumer \
+                 is reaped — got {} (full transcript ≈ {}); admin={s:#?}\nlog:\n{}",
+                s.event_log_len,
+                2 * CHUNKS,
+                server.read_log()
+            );
+            last = Some((s.log_base, s.event_log_len));
+            if s.log_base as usize > HIGH_WATER {
+                resumed = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        resumed,
+        "the trim must RESUME after the high-water disconnect — log_base should advance \
+         past HIGH_WATER ({HIGH_WATER}); last observed (log_base, event_log_len)={last:?}\nlog:\n{}",
+        server.read_log()
+    );
+
+    drop(wedged);
+}
+
 /// Is this a TRANSCRIPT note — i.e. an `event_log` entry the forwarder tails —
 /// as opposed to a per-connection control note (`LeaseChanged`) synthesized by
 /// the forwarder and never stored in the log? Used to compare what a cursor
@@ -999,5 +1197,377 @@ fn cursor_reconnect_streams_only_tail() {
          transcript={stale_transcript:#?}\nlog:\n{}",
         stale_transcript.len(),
         server.read_log()
+    );
+}
+
+/// Is this note the Stage B ringbuffer-trim marker (a `CompactedSummary`)?
+fn is_compacted_summary(n: &Notification) -> bool {
+    matches!(
+        n,
+        Notification::Agent { event }
+            if matches!(
+                event.kind,
+                sketch::agent_event::AgentEventKind::CompactedSummary { .. }
+            )
+    )
+}
+
+/// 8. RINGBUFFER COMPACTION (spec-event-stream §6, phase-8 Stage B).
+///
+///    With a TINY in-memory `event_log` cap and a turn of many chunks, the
+///    server trims the front of the in-memory log and advances `log_base`. Two
+///    guarantees, end-to-end against a real server + stub turn:
+///
+///    (a) The trim is SURFACED, not silent: a full-replay (from-base) observer
+///        receives a `CompactedSummary` marker as its FIRST transcript note, and
+///        the resident log stays bounded near the cap (NOT the full chunk count).
+///        `admin_status` reports a non-zero `log_base`.
+///
+///    (b) A client whose acked `seq` fell BELOW `log_base` (it was trimmed past)
+///        gets a clean from-base rebuild — it sees the `CompactedSummary` marker
+///        too, never a silent gap (spec §6 fast-disconnect-before-gap).
+#[test]
+fn ringbuffer_compaction_trims_and_surfaces_marker() {
+    let _g = serial_lock();
+    // A turn of CHUNKS chunks. CAP is well below the total transcript length
+    // (SessionAttached + ChannelOpened + UserPrompt + CHUNKS chunks + TurnEnded),
+    // so the front MUST be trimmed mid-stream.
+    const CHUNKS: usize = 40;
+    const CAP: usize = 8;
+    // STUB_DELAY_MS paces the stream so the LIVE owner's forwarder keeps up with
+    // production. This matters since the owner hard-ceiling (Bug 1b): the trim
+    // floor is `min(live forwarder sent_seq)`, so a trim can never drop below the
+    // owner's forwarded position. With an un-paced burst the owner's socket would
+    // lag the in-memory log and the floor would (correctly) BLOCK trimming until
+    // it catches up — the spec §6 "never gap the owner" guarantee, but it would
+    // let the resident `Vec` grow past the cap mid-burst. Pacing keeps the owner
+    // at the tip so the floor tracks the tip and the log stays bounded near the
+    // cap while STILL never gapping the owner. (The high-water disconnect that
+    // bounds a genuinely-wedged owner is a separate spec §6 follow-up.)
+    let server = TestServer::start_with_env(&[
+        ("STUB_CHUNKS", &CHUNKS.to_string()),
+        ("STUB_DELAY_MS", "2"),
+        ("SKETCH_EVENT_LOG_CAP", &CAP.to_string()),
+    ]);
+    server.activate_env();
+
+    let owner = connect_as("gui-compact");
+    let info = owner
+        .create_session(std::env::temp_dir(), "compact".into(), None)
+        .expect("create_session");
+    owner
+        .attach(&info.session_id, AttachMode::Owner)
+        .expect("attach owner");
+    owner.prompt(&info.session_id, "stream a lot").expect("prompt");
+
+    // Drain the owner CONTINUOUSLY so its forwarder progress keeps advancing
+    // (the floor follows it to the tip), letting trims keep the log bounded.
+    let _ = drain_until(&owner, Duration::from_secs(20), |n| {
+        n.iter().any(|note| {
+            matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == info.session_id)
+        })
+    });
+
+    // (a) The in-memory log is bounded near the cap, and log_base advanced.
+    let snap = owner.admin_status().expect("admin_status");
+    let s = snap
+        .sessions
+        .iter()
+        .find(|s| s.session_id == info.session_id)
+        .expect("session in admin snapshot");
+    assert!(
+        s.log_base > 0,
+        "a trim must have advanced log_base above 0; admin={s:#?}\nlog:\n{}",
+        server.read_log()
+    );
+    // Resident length is bounded near the cap. NOTE (Bug 1b owner hard-ceiling):
+    // the bound is the low-water `target` PLUS a bounded tail of entries that
+    // were in-flight to the live owner when the final push happened — the trim
+    // floor can't drop below the owner's not-yet-forwarded position, so the last
+    // handful of streamed entries settle above the cap rather than being trimmed
+    // out from under the owner. That tail is small and bounded (it clears on the
+    // next push once the owner forwards them), so the log stays a SMALL MULTIPLE
+    // of the cap, never the full transcript. The load-bearing guarantee is the
+    // second assertion: compaction happened, so the resident log is far below the
+    // full ~2*CHUNKS-entry transcript.
+    assert!(
+        s.event_log_len <= CAP * 3,
+        "in-memory log must stay bounded near the cap (owner-ceiling tail included), \
+         got {} (cap {CAP}); admin={s:#?}\nlog:\n{}",
+        s.event_log_len,
+        server.read_log()
+    );
+    assert!(
+        s.event_log_len < CHUNKS,
+        "in-memory log must be far below the {CHUNKS}-chunk transcript (compaction \
+         must have happened), got {}; admin={s:#?}",
+        s.event_log_len
+    );
+
+    // (a, cont.) A from-base observer (cursor None) sees the CompactedSummary
+    // marker as its FIRST transcript note — the trim is surfaced, not silent.
+    let from_base = SessionServerClient::connect().expect("connect from-base observer");
+    from_base
+        .attach(&info.session_id, AttachMode::Observer)
+        .expect("attach from-base observer");
+    let notes = drain_until(&from_base, Duration::from_secs(10), |n| {
+        n.iter().filter(|x| is_transcript_note(x)).count() >= 1
+    });
+    let transcript: Vec<Notification> = notes.into_iter().filter(is_transcript_note).collect();
+    assert!(
+        is_compacted_summary(&transcript[0]),
+        "a from-base rebuild must begin with the CompactedSummary trim marker, got {:#?}\nlog:\n{}",
+        transcript[0],
+        server.read_log()
+    );
+
+    // (b) A client whose acked_seq fell BELOW log_base must get a from-base
+    // rebuild (sees the marker), NOT a gap. Cursor (gen 0, seq 1) is below the
+    // advanced base.
+    assert_eq!(
+        s.channel_generation, 0,
+        "fresh session generation must be 0; admin={s:#?}"
+    );
+    let stale_seq = 1u64;
+    assert!(
+        stale_seq < s.log_base,
+        "test precondition: acked_seq {stale_seq} must be below log_base {}",
+        s.log_base
+    );
+    let fell_off = SessionServerClient::connect().expect("connect fell-off observer");
+    fell_off
+        .attach_with_cursor(
+            &info.session_id,
+            AttachMode::Observer,
+            Some((0, stale_seq)),
+        )
+        .expect("attach fell-off observer");
+    let fo_notes = drain_until(&fell_off, Duration::from_secs(10), |n| {
+        n.iter().filter(|x| is_transcript_note(x)).count() >= 1
+    });
+    let fo_transcript: Vec<Notification> =
+        fo_notes.into_iter().filter(is_transcript_note).collect();
+    assert!(
+        is_compacted_summary(&fo_transcript[0]),
+        "a cursor below log_base must fall back to a from-base rebuild (marker first), \
+         got {:#?}\nlog:\n{}",
+        fo_transcript[0],
+        server.read_log()
+    );
+}
+
+/// 9. CURSOR RECONNECT STILL TAILS WHEN IN-RANGE (spec §6 back-compat).
+///
+///    Even after compaction has advanced `log_base`, a cursor whose acked `seq`
+///    is at/above `log_base` (still resident) must stream ONLY the tail
+///    `[acked_seq..]` — NOT a full from-base rebuild. This proves the
+///    `seq ↔ Vec-offset` translation via `log_base` keeps phase-5 incremental
+///    reconnect working through a trim (the load-bearing interaction).
+#[test]
+fn cursor_reconnect_tails_after_compaction_when_in_range() {
+    let _g = serial_lock();
+    const CHUNKS: usize = 40;
+    const CAP: usize = 8;
+    // Pace the stream so the live owner's forwarder keeps up and the owner
+    // hard-ceiling floor (Bug 1b) tracks the tip — see the note in
+    // `ringbuffer_compaction_trims_and_surfaces_marker`. Without pacing a fast
+    // burst would (correctly) block trimming below the lagging owner and
+    // `log_base` might not advance, voiding this test's compaction precondition.
+    let server = TestServer::start_with_env(&[
+        ("STUB_CHUNKS", &CHUNKS.to_string()),
+        ("STUB_DELAY_MS", "2"),
+        ("SKETCH_EVENT_LOG_CAP", &CAP.to_string()),
+    ]);
+    server.activate_env();
+
+    let owner = connect_as("gui-compact-tail");
+    let info = owner
+        .create_session(std::env::temp_dir(), "compact-tail".into(), None)
+        .expect("create_session");
+    owner
+        .attach(&info.session_id, AttachMode::Owner)
+        .expect("attach owner");
+    owner.prompt(&info.session_id, "stream a lot").expect("prompt");
+    let _ = drain_until(&owner, Duration::from_secs(20), |n| {
+        n.iter().any(|note| {
+            matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == info.session_id)
+        })
+    });
+
+    let snap = owner.admin_status().expect("admin_status");
+    let s = snap
+        .sessions
+        .iter()
+        .find(|s| s.session_id == info.session_id)
+        .expect("session in admin snapshot");
+    let base = s.log_base;
+    let len = s.event_log_len as u64;
+    let tip = base + len; // exclusive logical tip
+    assert!(base > 0, "compaction must have advanced log_base; admin={s:#?}");
+
+    // CONTROL: a from-base observer's transcript IS the resident log, in order —
+    // ground truth for the suffix comparison.
+    let full = SessionServerClient::connect().expect("connect full observer");
+    full.attach(&info.session_id, AttachMode::Observer)
+        .expect("attach full observer");
+    let full_notes = drain_until(&full, Duration::from_secs(10), |n| {
+        n.iter().filter(|x| is_transcript_note(x)).count() >= len as usize
+    });
+    let full_transcript: Vec<Notification> =
+        full_notes.into_iter().filter(is_transcript_note).collect();
+    assert_eq!(
+        full_transcript.len(),
+        len as usize,
+        "from-base observer must receive exactly the {len} resident notes; \
+         got {}\nlog:\n{}",
+        full_transcript.len(),
+        server.read_log()
+    );
+
+    // INCREMENTAL: a cursor at a resident seq K in (base, tip) must stream ONLY
+    // the tail [K..] — exactly (tip - K) notes — and that tail must equal the
+    // resident-log suffix at Vec offset (K - base).
+    let k = base + (tip - base) / 2; // strictly inside the resident range
+    assert!(k > base && k < tip, "K={k} must be inside (base {base}, tip {tip})");
+    let tail = SessionServerClient::connect().expect("connect tail observer");
+    tail.attach_with_cursor(&info.session_id, AttachMode::Observer, Some((0, k)))
+        .expect("attach tail observer with cursor");
+    let expected_tail_len = (tip - k) as usize;
+    let tail_notes = drain_until(&tail, Duration::from_secs(10), |n| {
+        n.iter().filter(|x| is_transcript_note(x)).count() >= expected_tail_len
+    });
+    let tail_transcript: Vec<Notification> =
+        tail_notes.into_iter().filter(is_transcript_note).collect();
+    assert_eq!(
+        tail_transcript.len(),
+        expected_tail_len,
+        "cursor (0, {k}) must stream ONLY the {expected_tail_len} tail notes (NOT a from-base \
+         rebuild of {len}), got {}; tail={tail_transcript:#?}\nlog:\n{}",
+        tail_transcript.len(),
+        server.read_log()
+    );
+    // The tail must equal the resident suffix at Vec offset (K - base).
+    let off = (k - base) as usize;
+    let expected = &full_transcript[off..];
+    for (i, (got, want)) in tail_transcript.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            serde_json::to_string(got).unwrap(),
+            serde_json::to_string(want).unwrap(),
+            "tail note {i} must equal resident log[{}] (suffix after the cursor seq)",
+            off + i
+        );
+    }
+}
+
+/// Extract the 0-based chunk index `i` from a stub chunk's text (`"chunk {i}"`).
+/// Matches ONLY the legacy `ReplyEvent::Chunk` (the GUI-driving variant counted
+/// by `count_agent_chunks`) — during the additive rollout each chunk is ALSO
+/// recorded as an `Agent { Chunk }`, so matching both would double every index.
+/// `None` for non-chunk notes or chunks that don't match the stub format.
+fn stub_chunk_index(n: &Notification) -> Option<usize> {
+    let text = match n {
+        Notification::ReplyEvent {
+            event: sketch::acp_channel::ReplyEvent::Chunk(t),
+            ..
+        } => t.as_str(),
+        _ => return None,
+    };
+    text.strip_prefix("chunk ")?.trim().parse::<usize>().ok()
+}
+
+/// 10. LIVE OWNER STREAMING ACROSS A TRIM (Bug 1, spec §6 owner hard-ceiling).
+///
+///     This is the bug the prior tests MISSED: they attached observers AFTER a
+///     trim, so the corruption window — a LIVE forwarder whose `sent` position is
+///     invalidated by a front-trim that shortens the published `Vec` — never
+///     opened. Here an owner attaches BEFORE the turn and streams a long turn
+///     whose event count crosses `SKETCH_EVENT_LOG_CAP`, so a trim fires
+///     mid-stream while the owner is live.
+///
+///     Two guarantees:
+///       (a) The owner receives EVERY chunk exactly once, in order — no gap, no
+///           dup. Before Bug 1a's fix, the forwarder tracked `sent` as a raw
+///           `Vec` index; a front-trim made `snapshot.len() > sent` go false
+///           (stall), then a re-slice at a stale offset gapped/duped the stream.
+///       (b) The trim NEVER drops below the owner's forwarded position (Bug 1b's
+///           owner hard-ceiling): the durable log stays AHEAD of the cap while the
+///           live owner is mid-stream, because the floor = min(live sent_seq)
+///           protects everything the owner hasn't yet been sent.
+///
+///     `STUB_DELAY_MS` paces the stream so the owner forwards incrementally
+///     across several trims rather than after the whole turn is already logged.
+#[test]
+fn live_owner_streams_across_trim_no_gap_or_dup() {
+    let _g = serial_lock();
+    const CHUNKS: usize = 300;
+    const CAP: usize = 16;
+    let server = TestServer::start_with_env(&[
+        ("STUB_CHUNKS", &CHUNKS.to_string()),
+        ("STUB_DELAY_MS", "2"),
+        ("SKETCH_EVENT_LOG_CAP", &CAP.to_string()),
+    ]);
+    server.activate_env();
+
+    // Owner attaches BEFORE prompting — it is a LIVE forwarder for the whole
+    // turn, so the mid-stream trim hits its live `sent` position.
+    let owner = connect_as("gui-live-trim");
+    let info = owner
+        .create_session(std::env::temp_dir(), "live-trim".into(), None)
+        .expect("create_session");
+    owner
+        .attach(&info.session_id, AttachMode::Owner)
+        .expect("attach owner before turn");
+    owner.prompt(&info.session_id, "stream a lot").expect("prompt");
+
+    // Collect everything the live owner receives until the turn ends.
+    let notes = drain_until(&owner, Duration::from_secs(60), |n| {
+        n.iter().any(|note| {
+            matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == info.session_id)
+        })
+    });
+
+    // A trim MUST have fired mid-stream (proves the corruption window opened).
+    let snap = owner.admin_status().expect("admin_status");
+    let s = snap
+        .sessions
+        .iter()
+        .find(|s| s.session_id == info.session_id)
+        .expect("session in admin snapshot");
+    assert!(
+        s.log_base > 0,
+        "test precondition: a trim must have advanced log_base mid-stream (CAP={CAP}, \
+         CHUNKS={CHUNKS}); admin={s:#?}\nlog:\n{}",
+        server.read_log()
+    );
+
+    // (a) Every chunk index 0..CHUNKS arrives EXACTLY ONCE, IN ORDER. The live
+    // owner is the one stream that must never gap/dup across a trim.
+    let indices: Vec<usize> = notes.iter().filter_map(stub_chunk_index).collect();
+    assert_eq!(
+        indices,
+        (0..CHUNKS).collect::<Vec<_>>(),
+        "live owner must receive every chunk exactly once, in order, across the trim \
+         (no gap/dup); got {} chunks (deduped {}), log_base={}\nlog:\n{}",
+        indices.len(),
+        {
+            let mut u = indices.clone();
+            u.sort_unstable();
+            u.dedup();
+            u.len()
+        },
+        s.log_base,
+        server.read_log()
+    );
+
+    // (b) The owner hard-ceiling held: the durable in-memory log was NOT allowed
+    // to compact past the live owner's position while it was mid-stream. By the
+    // time the turn ends the owner has caught up, so the log has now settled near
+    // the cap; the load-bearing assertion is (a) — that the owner saw everything
+    // despite the floor protecting it during the stream.
+    assert!(
+        s.event_log_len <= CAP + 1,
+        "after the owner caught up the log should settle near the cap ({CAP}+marker), \
+         got {}; admin={s:#?}",
+        s.event_log_len
     );
 }

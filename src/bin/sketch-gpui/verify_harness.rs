@@ -909,3 +909,457 @@ fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
         assert!(v.agent_mut().unwrap().input_surface.is_chatbox());
     });
 }
+
+// ---- Phase 8 Stage C: AgentEvent TOTAL reducer (NEEDS-RUNTIME) ------------
+//
+// These drive the canonical `AgentEvent` stream through the REAL
+// `apply_server_batch` -> `apply_agent_event` -> `settle_agent_effect` path on a
+// headless view. They cover the spec §7 reducer contract (total match, explicit
+// Unknown / CompactedSummary arms), the §4 generation rebaseline rule, and the
+// §7/H5 idempotent finalize. The events→reducer→VIEW (render) leg is NOT
+// covered (GPUI is not headlessly verifiable end-to-end) — see the worklog's
+// NEEDS-RUNTIME list.
+
+/// Build a `Notification::Agent` for session `sid` with the given envelope+kind.
+#[cfg(test)]
+fn agent_note(
+    sid: &str,
+    generation: u64,
+    turn: u64,
+    seq: u64,
+    kind: sketch::agent_event::AgentEventKind,
+) -> sketch::session_proto::Notification {
+    sketch::session_proto::Notification::Agent {
+        event: sketch::agent_event::AgentEvent::new(sid.into(), generation, turn, seq, kind),
+    }
+}
+
+/// A boot + one bound server-managed slot, ready to feed batches. Returns the
+/// borrowed `VisualTestContext` (lifetime tied to `cx`, like the inline tests).
+#[cfg(test)]
+fn boot_with_bound_slot<'a>(
+    cx: &'a mut TestAppContext,
+    sid: &str,
+) -> (gpui::Entity<SketchGpuiView>, &'a mut gpui::VisualTestContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, vcx, Some(sid));
+    (view, vcx)
+}
+
+/// The end-to-end Stage C reducer: a synthetic AgentEvent sequence drives the
+/// transcript via the TOTAL reducer once the §9 gate flips on the first
+/// forwarded `TurnEnded`. Asserts (a) the gate stays closed until a boundary so
+/// the first turn's chunks are NOT double-applied (legacy stream owns them — but
+/// here no legacy stream runs, so they're simply absent until the gate flips on
+/// the next turn), (b) once authoritative, chunks land tagged by the FORWARDED
+/// `event.turn`, (c) finalize ran (phase Idle) after `TurnEnded`.
+#[gpui::test]
+fn agent_reducer_drives_transcript_after_gate_flips(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Turn 1: ChannelOpened (rebaselines to gen 1), a chunk, then a TurnEnded.
+    // The chunk arrives BEFORE the gate flips, so the reducer must NOT apply it
+    // (the legacy stream would, but there's none here). The TurnEnded flips the
+    // gate and finalizes turn 1.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
+            agent_note(
+                "S1",
+                1,
+                1,
+                1,
+                K::Chunk { text: "pre-gate chunk".into(), role: ChunkRole::Message },
+            ),
+            agent_note("S1", 1, 1, 2, K::TurnEnded { outcome: TurnOutcome::Completed }),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert_eq!(c.generation, 1, "ChannelOpened rebaselined to gen 1");
+        assert!(
+            c.agent_stream_authoritative,
+            "the forwarded TurnEnded must flip the per-session gate"
+        );
+        assert!(
+            !c.editor.document().full_text().contains("pre-gate chunk"),
+            "a pre-gate chunk must NOT be applied by the reducer (legacy stream owns it)"
+        );
+        assert!(
+            matches!(c.turn_phase, crate::TurnPhase::Idle),
+            "TurnEnded finalized turn 1 (phase Idle)"
+        );
+        assert!(
+            c.finalized.contains(&(1, 1)),
+            "the (generation, turn) ledger records the finalized boundary"
+        );
+    });
+
+    // Turn 2: now authoritative — chunks land, tagged by event.turn==2.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            agent_note(
+                "S1",
+                1,
+                2,
+                3,
+                K::Chunk { text: "live turn-2 prose".into(), role: ChunkRole::Message },
+            ),
+            agent_note("S1", 1, 2, 4, K::TurnEnded { outcome: TurnOutcome::Completed }),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        let text = c.editor.document().full_text();
+        assert!(
+            text.contains("live turn-2 prose"),
+            "post-gate chunk must be applied by the reducer; transcript:\n{text}"
+        );
+        // The chunk's line is tagged Llm(2) — sourced from the FORWARDED turn,
+        // not current_turn() inference. Resolve anchors first (immutable), then
+        // read the metadata view.
+        let anchors: Vec<_> = (0..c.editor.document().line_count())
+            .filter_map(|line| c.editor.anchor_for_line_opt(line))
+            .collect();
+        let meta = c.editor.metadata::<crate::TurnId>();
+        let tagged_turn_2 = anchors
+            .iter()
+            .any(|a| matches!(meta.get(*a), Some(crate::TurnId::Llm(2))));
+        assert!(tagged_turn_2, "the turn-2 chunk must be tagged Llm(2) from event.turn");
+        assert!(c.finalized.contains(&(1, 2)), "turn 2 finalized once");
+    });
+}
+
+/// §7/H5 idempotent finalize: delivering `TurnEnded` for the SAME
+/// `(generation, turn)` twice finalizes once — no double trailing newline,
+/// single phase flip. (Models the dual-stream duplicate: a forwarded boundary
+/// plus a lingering inference during additive rollout.)
+#[gpui::test]
+fn agent_reducer_finalize_is_idempotent_on_generation_turn(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Flip the gate + stream a chunk WITHOUT a trailing newline.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
+            agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                1,
+                2,
+                2,
+                K::Chunk { text: "no newline here".into(), role: ChunkRole::Message },
+            ),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    // First TurnEnded for (1,2): finalizes, adds the trailing newline.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 1, 2, 3, K::TurnEnded { outcome: TurnOutcome::Completed })],
+            cx,
+        );
+    });
+    let after_first = active_transcript_text(&view, vcx);
+
+    // SECOND TurnEnded for the SAME (1,2): must be a no-op on the buffer.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 1, 2, 4, K::TurnEnded { outcome: TurnOutcome::Completed })],
+            cx,
+        );
+    });
+    let after_second = active_transcript_text(&view, vcx);
+
+    assert_eq!(
+        after_first, after_second,
+        "a duplicate TurnEnded for the same (generation, turn) must NOT mutate the buffer"
+    );
+    assert_eq!(
+        after_second.matches("no newline here").count(),
+        1,
+        "the chunk text appears exactly once"
+    );
+    // Exactly one trailing newline (the finalize added one; the dup added none).
+    assert!(after_second.ends_with('\n'));
+    assert!(
+        !after_second.ends_with("\n\n"),
+        "idempotent finalize must not append a second trailing newline"
+    );
+}
+
+/// §4 generation rebaseline: a strictly-newer generation wipes the transcript
+/// FIRST, then adopts the new generation; a stray OLDER-generation event after
+/// the bump is ignored.
+#[gpui::test]
+fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Gen 1: authoritative, with content on screen.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
+            agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                1,
+                2,
+                2,
+                K::Chunk { text: "GEN1-CONTENT".into(), role: ChunkRole::Message },
+            ),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+    assert!(active_transcript_text(&view, vcx).contains("GEN1-CONTENT"));
+
+    // Gen 2 ChannelOpened: must reset_for_replay (wipe GEN1-CONTENT) and adopt
+    // gen 2. The gate resets too (a fresh channel), so the gen-2 chunk before
+    // the gen-2 boundary is NOT applied — matching the §9 first-turn rule.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            agent_note("S1", 2, 1, 0, K::ChannelOpened { resumed: true }),
+            agent_note("S1", 2, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                2,
+                2,
+                2,
+                K::Chunk { text: "GEN2-CONTENT".into(), role: ChunkRole::Message },
+            ),
+            agent_note("S1", 2, 2, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert_eq!(c.generation, 2, "adopted the newer generation");
+        let text = c.editor.document().full_text();
+        assert!(
+            !text.contains("GEN1-CONTENT"),
+            "the newer generation must wipe the old transcript; got:\n{text}"
+        );
+        assert!(text.contains("GEN2-CONTENT"), "gen-2 content rebuilt");
+    });
+
+    // A stray OLDER-generation (gen 1) event after the bump is ignored.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note(
+                "S1",
+                1,
+                9,
+                99,
+                K::Chunk { text: "STRAY-OLD-GEN".into(), role: ChunkRole::Message },
+            )],
+            cx,
+        );
+    });
+    assert!(
+        !active_transcript_text(&view, vcx).contains("STRAY-OLD-GEN"),
+        "an event from a superseded (older) generation must be ignored"
+    );
+}
+
+/// §7/§8 explicit Unknown + CompactedSummary arms: Unknown renders nothing (but
+/// is not an error), CompactedSummary inserts a deterministic placeholder.
+#[gpui::test]
+fn agent_reducer_unknown_and_compacted_summary_arms(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, TurnOutcome};
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Flip the gate so the reducer drives, then feed CompactedSummary + Unknown.
+    view.update(vcx, |v, cx| {
+        let unknown = K::Unknown {
+            tag: "speculative_decode".into(),
+            raw: serde_json::json!({"kind":"speculative_decode","tokens":128}),
+        };
+        let batch = vec![
+            agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
+            agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                1,
+                2,
+                2,
+                K::CompactedSummary { through_turn: 5, summary: "earlier work".into() },
+            ),
+            agent_note("S1", 1, 2, 3, unknown),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    let text = active_transcript_text(&view, vcx);
+    assert!(
+        text.contains("history compacted through turn 5"),
+        "CompactedSummary must surface a deterministic placeholder; got:\n{text}"
+    );
+    assert!(text.contains("earlier work"), "the summary text is included");
+    assert!(
+        !text.contains("speculative_decode"),
+        "an Unknown event must render nothing (no broken block)"
+    );
+}
+
+/// §9 no-double-apply guard: with BOTH the legacy `ReplyEvent` stream and the
+/// canonical `Agent` stream carrying the same turn-2 chunk, the gate routes the
+/// chunk through exactly ONE driver — it must appear EXACTLY ONCE.
+#[gpui::test]
+fn agent_reducer_no_double_apply_across_streams(cx: &mut TestAppContext) {
+    use sketch::acp_channel::ReplyEvent;
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use sketch::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Turn 1 boundary flips the gate -> the Agent stream becomes authoritative.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
+                agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            ],
+            cx,
+        );
+    });
+
+    // Turn 2: the SAME chunk arrives on BOTH streams in one batch. The legacy
+    // ReplyEvent arm is now inert (gate is set), the Agent arm applies it once.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            ServerNotification::ReplyEvent {
+                session_id: "S1".into(),
+                event: ReplyEvent::Chunk("DEDUP-ME".into()),
+            },
+            agent_note(
+                "S1",
+                1,
+                2,
+                2,
+                K::Chunk { text: "DEDUP-ME".into(), role: ChunkRole::Message },
+            ),
+            agent_note("S1", 1, 2, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    let text = active_transcript_text(&view, vcx);
+    assert_eq!(
+        text.matches("DEDUP-ME").count(),
+        1,
+        "the chunk must apply from exactly one stream; transcript:\n{text}"
+    );
+}
+
+/// Bug 3: the forwarded `Agent { TurnEnded }` boundary and the legacy
+/// `ServerNotification::TurnEnded` for the SAME (generation, turn) must collapse
+/// to ONE ledger entry, so finalize fires EXACTLY ONCE.
+///
+/// The bug: the legacy arm keyed the idempotent ledger with `turn_count` (1-based
+/// SETTLED count), while the Agent reducer arm keys with the envelope's 0-based
+/// `turn` (the server sets `completed_turn = turns - 1`). So the two streams
+/// inserted DISTINCT keys — `(gen, turns-1)` and `(gen, turns)` — and BOTH
+/// finalized, defeating the §7/§9 exactly-once backstop. It was benign only
+/// because `finalize_agent_turn` happens to be buffer-idempotent; the ledger
+/// itself is the ground truth, so this test asserts on the ledger directly.
+///
+/// FAILS before the fix (ledger holds both `(1,1)` and `(1,2)` → two finalizes);
+/// PASSES after (the legacy arm converts `turn_count - 1`, so both collapse to
+/// `(1,1)` and the second finalize is a no-op).
+#[gpui::test]
+fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, TurnOutcome};
+    use sketch::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Rebaseline to generation 1 so both streams share the same generation key.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 1, 0, 0, K::ChannelOpened { resumed: false })],
+            cx,
+        );
+    });
+
+    // The FORWARDED boundary for turn 1: envelope `turn` is 0-based, so the
+    // server emits `turn = 1` for the SECOND completed turn (settled count 2).
+    // It finalizes the ledger key (generation 1, turn 1).
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed })],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert!(
+            c.finalized.contains(&(1, 1)),
+            "forwarded TurnEnded must finalize the 0-based (generation 1, turn 1) key; \
+             ledger={:?}",
+            c.finalized
+        );
+    });
+
+    // The LEGACY boundary for the SAME turn: `turn_count` is the 1-based settled
+    // count, so it is 2 for the turn whose 0-based index is 1. With the fix the
+    // legacy arm converts `turn_count - 1 == 1`, hitting the SAME ledger key, so
+    // the second finalize is a no-op. With the BUG it would key `(1, 2)` — a
+    // DISTINCT entry — and finalize a second time.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::TurnEnded {
+                session_id: "S1".into(),
+                turn_count: 2,
+                generation: 1,
+            }],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        // The forwarded and legacy boundaries collapsed to a SINGLE ledger entry.
+        assert!(
+            c.finalized.contains(&(1, 1)),
+            "the shared 0-based key must be present; ledger={:?}",
+            c.finalized
+        );
+        assert!(
+            !c.finalized.contains(&(1, 2)),
+            "BUG 3: the legacy boundary must NOT key a DISTINCT 1-based entry — that \
+             would finalize a second time for the same turn; ledger={:?}",
+            c.finalized
+        );
+        // Exactly one ledger entry for this (generation, turn) boundary: the two
+        // streams deduped to one finalize.
+        let entries_for_turn = c.finalized.iter().filter(|(g, _)| *g == 1).count();
+        assert_eq!(
+            entries_for_turn, 1,
+            "the forwarded + legacy TurnEnded for one (generation, turn) must collapse to \
+             ONE ledger entry (exactly-once finalize); ledger={:?}",
+            c.finalized
+        );
+    });
+}
