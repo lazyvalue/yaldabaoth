@@ -15,15 +15,75 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch};
+use tokio::time::Instant;
 
 use sketch::acp_channel::{AcpChannelClient, PermissionMode, SketchFrontend, TransportHandle};
 use sketch::session_proto::*;
 
 mod launchd;
+
+// ── Lease (write-ownership) constants ──────────────────────────────
+//
+// A lease grants drive rights to a stable `client_id`. Expiry is driven by a
+// monotonic `tokio::time::Instant` (immune to wall-clock steps); the wire
+// `Lease.expires_at_unix_ms` is a display-only SystemTime stamp computed at
+// emit time. The client beats `Heartbeat` every `HEARTBEAT_INTERVAL`; three
+// missed beats (~`LEASE_TTL`) free a crashed owner so a candidate can promote,
+// while two dropped beats / a GC pause tolerate a live owner.
+
+/// How long a lease stays valid without a renewing heartbeat. Overridable for
+/// tests via `SKETCH_LEASE_TTL_MS`.
+fn lease_ttl() -> Duration {
+    static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        std::env::var("SKETCH_LEASE_TTL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_secs(15))
+    })
+}
+
+/// Actor idle-sweep cadence: how often the run_manager loop proactively clears
+/// expired leases and emits `LeaseChanged{None}` so an idle observing candidate
+/// learns a crashed owner's lease freed (lazy eval already gates who-may-act).
+const LEASE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Actor-local lease state. Holds a MONOTONIC `Instant` for expiry math (never
+/// the wire millis). The wire [`Lease`] is built from this via SystemTime only
+/// at broadcast time, for display.
+struct LeaseState {
+    client_id: String,
+    expires_at: Instant,
+}
+
+impl LeaseState {
+    /// Whether this lease is held by `client_id` and not yet expired at `now`.
+    fn is_live_for(&self, client_id: &str, now: Instant) -> bool {
+        self.client_id == client_id && self.expires_at > now
+    }
+}
+
+/// Build the wire [`Lease`] (display-only millis) from an actor-local
+/// [`LeaseState`] (monotonic Instant). The expiry millis is derived by adding
+/// the Instant's remaining duration to the current wall clock.
+fn lease_to_wire(state: &LeaseState, now: Instant) -> Lease {
+    let remaining = state.expires_at.saturating_duration_since(now);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    Lease {
+        client_id: state.client_id.clone(),
+        expires_at_unix_ms: now_ms.saturating_add(remaining.as_millis() as u64),
+    }
+}
 
 // ── Actor command inlet ────────────────────────────────────────────
 //
@@ -46,19 +106,23 @@ enum Command {
     Attach {
         sid: ServerSessionId,
         mode: AttachMode,
-        conn_id: u64,
+        /// Stable client identity (phase 4). Used to acquire/resume the lease;
+        /// replaces the old per-connection `conn_id` ownership key.
+        client_id: String,
         /// Optional reconnect cursor `(generation, index)`. Resolved by
         /// `do_attach` against the session's `channel_generation` +
         /// `event_log.len()` into the forwarder's initial `sent` value (the
         /// `usize` in the reply): the tail starts there. `None` / stale /
         /// out-of-range ⇒ `0` ⇒ full replay (unchanged behavior).
         cursor: Option<(u64, u64)>,
+        // On success: (lease watch, log watch, initial tail index, granted_drive).
         reply: tokio::sync::oneshot::Sender<
             Result<
                 (
-                    watch::Receiver<bool>,
+                    watch::Receiver<Option<Lease>>,
                     watch::Receiver<Arc<Vec<Notification>>>,
                     usize,
+                    bool,
                 ),
                 String,
             >,
@@ -66,18 +130,25 @@ enum Command {
     },
     Detach {
         sid: ServerSessionId,
-        conn_id: u64,
+        client_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Renew a held lease (phase 4). No `event_log` side effect; renews the
+    /// expiry in place. Errors if the caller no longer holds the lease.
+    Heartbeat {
+        sid: ServerSessionId,
+        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Promote {
         sid: ServerSessionId,
-        conn_id: u64,
+        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Prompt {
         sid: ServerSessionId,
         text: String,
-        conn_id: u64,
+        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     /// Headless "start-work" enqueue (ADR-0015): same as `Prompt` but with NO
@@ -90,17 +161,17 @@ enum Command {
     },
     Cancel {
         sid: ServerSessionId,
-        conn_id: u64,
+        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Close {
         sid: ServerSessionId,
-        conn_id: u64,
+        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Restart {
         sid: ServerSessionId,
-        conn_id: u64,
+        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Rename {
@@ -111,7 +182,7 @@ enum Command {
     SetPermissionMode {
         sid: ServerSessionId,
         mode: PermissionMode,
-        conn_id: u64,
+        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     ListSessions {
@@ -219,15 +290,19 @@ struct ManagedSession {
     /// the latest snapshot lock-free — watch coalescing self-heals exactly like
     /// the old broadcast `Lagged` path.
     log_tx: watch::Sender<Arc<Vec<Notification>>>,
-    /// Per-session ownership control channel. Holds the current
-    /// `owner.is_some()`. The forwarder selects on this and synthesizes a single
-    /// `OwnerChanged` control note on change — replaces the broadcast-as-wake
-    /// path for ownership state.
-    owner_tx: watch::Sender<bool>,
-    /// Connection id of the current owner — the only connection allowed to
-    /// drive the session (prompt / set permission / close). `None` when no
-    /// owner is attached, in which case an observer may `Promote` to claim it.
-    owner: Option<u64>,
+    /// Per-session lease control channel (phase 4). Holds the current wire
+    /// [`Lease`] (or `None`). The forwarder selects on this and emits a single
+    /// `LeaseChanged` control note on holder change — replaces the old
+    /// `owner_tx: watch<bool>` ownership path. Carries the wire form so the
+    /// forwarder does zero conversion.
+    lease_tx: watch::Sender<Option<Lease>>,
+    /// The current write-ownership lease (phase 4) — the stable `client_id`
+    /// allowed to drive the session (prompt / cancel / restart / set permission
+    /// / close) plus its monotonic expiry. `None` when unleased, in which case
+    /// an observer may `Promote` to claim it. Replaces the old `owner: conn_id`.
+    /// In-memory only: never persisted (a crash stops all heartbeats, so every
+    /// lease is dead by construction on restart).
+    lease: Option<LeaseState>,
     /// Prompts that arrived before the ACP subprocess finished spawning.
     /// Drained in submission order once `channel` becomes `Some`.
     pending_prompts: Vec<String>,
@@ -263,8 +338,15 @@ impl ManagedSession {
             turns: self.turns,
             connected: self.channel.as_ref().is_some_and(|c| c.is_connected()),
             permission_mode: self.permission_mode,
-            has_owner: self.owner.is_some(),
+            // Lazy expiry: a held-but-expired lease reports as no owner.
+            has_owner: self.is_leased(Instant::now()),
         }
+    }
+
+    /// Whether a non-expired lease is currently held (lazy expiry: an expired
+    /// lease counts as unleased even before a sweep clears it).
+    fn is_leased(&self, now: Instant) -> bool {
+        matches!(&self.lease, Some(l) if l.expires_at > now)
     }
 
     /// Record that an event happened: append it to the durable `event_log`
@@ -273,8 +355,8 @@ impl ManagedSession {
     /// site routes through here so the two writes can never skew (one appended
     /// without waking subscribers, or one broadcast without being logged).
     ///
-    /// The `OwnerChanged` broadcast-only path (`broadcast_owner_changed`) is
-    /// deliberately NOT routed through here: it is transient connection state,
+    /// The `LeaseChanged` broadcast-only path (`broadcast_lease_changed`) is
+    /// deliberately NOT routed through here: it is transient lease state,
     /// not transcript, and must never land in `event_log`.
     fn record(&mut self, note: Notification) {
         self.wal_append(&note);
@@ -315,11 +397,14 @@ impl ManagedSession {
         }
     }
 
-    /// Broadcast an `OwnerChanged` to all attached connections. Not appended
-    /// to `event_log` — ownership is transient connection state, not part of
-    /// the conversation transcript a late observer needs to replay.
-    fn broadcast_owner_changed(&self) {
-        let _ = self.owner_tx.send_replace(self.owner.is_some());
+    /// Broadcast a `LeaseChanged` to all attached connections by publishing the
+    /// current lease (as the wire [`Lease`]) on the lease watch. Not appended to
+    /// `event_log` — lease state is transient, not transcript. Call ONLY on a
+    /// holder change (acquire / release / promote / sweep), never on a pure
+    /// heartbeat renew, so each transition fires exactly one notification.
+    fn broadcast_lease_changed(&self, now: Instant) {
+        let wire = self.lease.as_ref().map(|l| lease_to_wire(l, now));
+        let _ = self.lease_tx.send_replace(wire);
     }
 
     /// Publish a freshly-spawned channel's `TransportHandle` as this session's
@@ -376,7 +461,7 @@ fn new_managed_session(
 ) -> ManagedSession {
     let event_log = Arc::new(Vec::new());
     let (log_tx, _) = watch::channel(Arc::clone(&event_log));
-    let (owner_tx, _) = watch::channel(false);
+    let (lease_tx, _) = watch::channel(None);
     let (gen_watch, _) = watch::channel(0u64);
     ManagedSession {
         id,
@@ -388,8 +473,8 @@ fn new_managed_session(
         turns: 0,
         permission_mode,
         log_tx,
-        owner_tx,
-        owner: None,
+        lease_tx,
+        lease: None,
         pending_prompts: Vec::new(),
         event_log,
         replay_fence: 0,
@@ -490,13 +575,14 @@ impl SessionManager {
         &self,
         sid: &str,
         mode: AttachMode,
-        conn_id: u64,
+        client_id: String,
         cursor: Option<(u64, u64)>,
     ) -> Result<
         (
-            watch::Receiver<bool>,
+            watch::Receiver<Option<Lease>>,
             watch::Receiver<Arc<Vec<Notification>>>,
             usize,
+            bool,
         ),
         String,
     > {
@@ -504,39 +590,49 @@ impl SessionManager {
         let _ = self.cmd_tx.send(Command::Attach {
             sid: sid.to_string(),
             mode,
-            conn_id,
+            client_id,
             cursor,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
-    async fn send_detach(&self, sid: &str, conn_id: u64) -> Result<(), String> {
+    async fn send_detach(&self, sid: &str, client_id: String) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Detach {
             sid: sid.to_string(),
-            conn_id,
+            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
-    async fn send_promote(&self, sid: &str, conn_id: u64) -> Result<(), String> {
+    async fn send_heartbeat(&self, sid: &str, client_id: String) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::Heartbeat {
+            sid: sid.to_string(),
+            client_id,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
+    async fn send_promote(&self, sid: &str, client_id: String) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Promote {
             sid: sid.to_string(),
-            conn_id,
+            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
-    async fn send_prompt(&self, sid: &str, text: &str, conn_id: u64) -> Result<(), String> {
+    async fn send_prompt(&self, sid: &str, text: &str, client_id: String) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Prompt {
             sid: sid.to_string(),
             text: text.to_string(),
-            conn_id,
+            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
@@ -553,31 +649,31 @@ impl SessionManager {
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
-    async fn send_cancel(&self, sid: &str, conn_id: u64) -> Result<(), String> {
+    async fn send_cancel(&self, sid: &str, client_id: String) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Cancel {
             sid: sid.to_string(),
-            conn_id,
+            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
-    async fn send_close(&self, sid: &str, conn_id: u64) -> Result<(), String> {
+    async fn send_close(&self, sid: &str, client_id: String) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Close {
             sid: sid.to_string(),
-            conn_id,
+            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
-    async fn send_restart(&self, sid: &str, conn_id: u64) -> Result<(), String> {
+    async fn send_restart(&self, sid: &str, client_id: String) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Restart {
             sid: sid.to_string(),
-            conn_id,
+            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
@@ -597,13 +693,13 @@ impl SessionManager {
         &self,
         sid: &str,
         mode: PermissionMode,
-        conn_id: u64,
+        client_id: String,
     ) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::SetPermissionMode {
             sid: sid.to_string(),
             mode,
-            conn_id,
+            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
@@ -668,7 +764,7 @@ fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<Re
         let event_log = Arc::new(rs.event_log);
         // Seed the watch with the recovered log so the first tail sees history.
         let (log_tx, _) = watch::channel(Arc::clone(&event_log));
-        let (owner_tx, _) = watch::channel(false);
+        let (lease_tx, _) = watch::channel(None);
         let (gen_watch, _) = watch::channel(0u64);
         let session = ManagedSession {
             id: sid.clone(),
@@ -680,8 +776,8 @@ fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<Re
             turns: rs.turns,
             permission_mode: rs.permission_mode,
             log_tx,
-            owner_tx,
-            owner: None,
+            lease_tx,
+            lease: None,
             pending_prompts: Vec::new(),
             event_log,
             replay_fence: rs.turns,
@@ -765,8 +861,28 @@ async fn run_manager(
         default_permission_mode,
         cmd_tx,
     };
-    while let Some(cmd) = rx.recv().await {
-        mgr.apply(cmd);
+    // Phase 4: the loop also drives a periodic lease sweep. The sweep is a
+    // PROACTIVE side-effect only (lazy expiry in every gate/attach already
+    // governs who-may-act); its job is to emit `LeaseChanged{None}` within
+    // ~`LEASE_SWEEP_INTERVAL` so an idle observing candidate learns a crashed
+    // owner's lease freed. Keeping it INSIDE this select preserves the
+    // single-writer invariant (ADR-0012): `apply`/`sweep` are the only mutators
+    // and they never run concurrently. (Do NOT spawn a second task touching the
+    // map.)
+    let mut sweep = tokio::time::interval(LEASE_SWEEP_INTERVAL);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            maybe_cmd = rx.recv() => {
+                match maybe_cmd {
+                    Some(cmd) => mgr.apply(cmd),
+                    None => break, // inlet closed: shutdown
+                }
+            }
+            _ = sweep.tick() => {
+                mgr.sweep_expired_leases();
+            }
+        }
     }
 }
 
@@ -785,25 +901,28 @@ impl Manager {
             Command::Attach {
                 sid,
                 mode,
-                conn_id,
+                client_id,
                 cursor,
                 reply,
             } => {
-                let _ = reply.send(self.do_attach(&sid, mode, conn_id, cursor));
+                let _ = reply.send(self.do_attach(&sid, mode, &client_id, cursor));
             }
-            Command::Detach { sid, conn_id, reply } => {
-                let _ = reply.send(self.do_detach(&sid, conn_id));
+            Command::Detach { sid, client_id, reply } => {
+                let _ = reply.send(self.do_detach(&sid, &client_id));
             }
-            Command::Promote { sid, conn_id, reply } => {
-                let _ = reply.send(self.do_promote(&sid, conn_id));
+            Command::Heartbeat { sid, client_id, reply } => {
+                let _ = reply.send(self.do_heartbeat(&sid, &client_id));
+            }
+            Command::Promote { sid, client_id, reply } => {
+                let _ = reply.send(self.do_promote(&sid, &client_id));
             }
             Command::Prompt {
                 sid,
                 text,
-                conn_id,
+                client_id,
                 reply,
             } => {
-                let _ = reply.send(self.do_prompt(&sid, &text, conn_id));
+                let _ = reply.send(self.do_prompt(&sid, &text, &client_id));
             }
             Command::AdminPrompt {
                 session_id,
@@ -813,14 +932,14 @@ impl Manager {
                 // Ungated: enqueue directly, no owner check (ADR-0015).
                 let _ = reply.send(self.enqueue_prompt(&session_id, &text));
             }
-            Command::Cancel { sid, conn_id, reply } => {
-                let _ = reply.send(self.do_cancel(&sid, conn_id));
+            Command::Cancel { sid, client_id, reply } => {
+                let _ = reply.send(self.do_cancel(&sid, &client_id));
             }
-            Command::Close { sid, conn_id, reply } => {
-                let _ = reply.send(self.do_close(&sid, conn_id));
+            Command::Close { sid, client_id, reply } => {
+                let _ = reply.send(self.do_close(&sid, &client_id));
             }
-            Command::Restart { sid, conn_id, reply } => {
-                let _ = reply.send(self.do_restart(&sid, conn_id));
+            Command::Restart { sid, client_id, reply } => {
+                let _ = reply.send(self.do_restart(&sid, &client_id));
             }
             Command::Rename { sid, label, reply } => {
                 let _ = reply.send(self.do_rename(&sid, label));
@@ -828,10 +947,10 @@ impl Manager {
             Command::SetPermissionMode {
                 sid,
                 mode,
-                conn_id,
+                client_id,
                 reply,
             } => {
-                let _ = reply.send(self.do_set_permission_mode(&sid, mode, conn_id));
+                let _ = reply.send(self.do_set_permission_mode(&sid, mode, &client_id));
             }
             Command::ListSessions { reply } => {
                 let _ = reply.send(self.sessions.values().map(|s| s.info()).collect());
@@ -980,9 +1099,10 @@ impl Manager {
         info
     }
 
-    fn do_close(&mut self, session_id: &str, conn_id: u64) -> Result<(), String> {
+    fn do_close(&mut self, session_id: &str, client_id: &str) -> Result<(), String> {
+        let now = Instant::now();
         match self.sessions.get(session_id) {
-            Some(s) if s.owner == Some(conn_id) => {
+            Some(s) if holds_lease(s, client_id, now) => {
                 // Removing the session drops its TransportHandle (prompt_tx
                 // clone). The owning pump observes the close (inlet still open
                 // but no map entry → its generation check / disconnect breaks it)
@@ -1002,7 +1122,7 @@ impl Manager {
                 });
                 Ok(())
             }
-            Some(_) => Err("only the session owner can close the session".into()),
+            Some(_) => Err("only the lease holder can close the session".into()),
             None => Err(format!("no such session: {session_id}")),
         }
     }
@@ -1011,35 +1131,60 @@ impl Manager {
         &mut self,
         session_id: &str,
         mode: AttachMode,
-        conn_id: u64,
+        client_id: &str,
         cursor: Option<(u64, u64)>,
     ) -> Result<
         (
-            watch::Receiver<bool>,
+            watch::Receiver<Option<Lease>>,
             watch::Receiver<Arc<Vec<Notification>>>,
             usize,
+            bool,
         ),
         String,
     > {
+        let now = Instant::now();
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if mode == AttachMode::Owner {
-            match session.owner {
-                Some(existing) if existing != conn_id => {
-                    return Err("another GUI already owns this session".into());
-                }
-                _ => {
-                    let was_unowned = session.owner.is_none();
-                    session.owner = Some(conn_id);
-                    if was_unowned {
-                        session.broadcast_owner_changed();
-                    }
+
+        // Lease acquire/resume (phase 4). Deterministic — no retry, no error on
+        // contention. Owner mode with a NON-empty client_id may take the lease:
+        //   - free (None)                       -> first-claim
+        //   - same client_id (live OR expired)  -> RESUME (renew / re-grant)
+        //   - different LIVE client_id          -> silent downgrade to Observer
+        // An empty client_id (headless / pre-phase-4) never acquires a lease.
+        // Observer mode never touches the lease. The whole decision is one
+        // synchronous critical section on the single-writer actor: read, the
+        // Instant comparison, and the write share `now` with no await between —
+        // the actor IS the mutual exclusion (no TOCTOU, first-claim-wins).
+        let mut granted_drive = false;
+        if mode == AttachMode::Owner && !client_id.is_empty() {
+            let acquire = match &session.lease {
+                None => true,                                            // free
+                Some(l) if l.client_id == client_id => true,            // same id -> resume
+                Some(l) if l.expires_at <= now => true,                 // prior holder expired
+                Some(_) => false,                                       // different live id
+            };
+            if acquire {
+                let changed_holder =
+                    session.lease.as_ref().map(|l| l.client_id.as_str()) != Some(client_id);
+                session.lease = Some(LeaseState {
+                    client_id: client_id.to_string(),
+                    expires_at: now + lease_ttl(),
+                });
+                granted_drive = true;
+                // Only broadcast on holder CHANGE (never a pure same-id renew),
+                // so each transition fires exactly one LeaseChanged.
+                if changed_holder {
+                    session.broadcast_lease_changed(now);
                 }
             }
+            // else: silent downgrade to Observer. Attach still Ok with full
+            // replay; granted_drive stays false.
         }
-        let owner_rx = session.owner_tx.subscribe();
+
+        let lease_rx = session.lease_tx.subscribe();
         let log_rx = session.log_tx.subscribe();
         let log_len = session.event_log.len();
 
@@ -1068,45 +1213,94 @@ impl Manager {
             }
             _ => 0,
         };
-        Ok((owner_rx, log_rx, initial_sent))
+        Ok((lease_rx, log_rx, initial_sent, granted_drive))
     }
 
-    fn do_promote(&mut self, session_id: &str, conn_id: u64) -> Result<(), String> {
+    /// Renew a held lease (phase 4). Same-`client_id` live → push expiry (no
+    /// LeaseChanged, holder unchanged); same-`client_id` but expired/free →
+    /// lazy re-grant; otherwise the caller no longer holds the lease → Err so
+    /// the GUI re-attaches (resumes-or-observes).
+    fn do_heartbeat(&mut self, session_id: &str, client_id: &str) -> Result<(), String> {
+        let now = Instant::now();
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        match session.owner {
-            None => {
-                session.owner = Some(conn_id);
-                session.broadcast_owner_changed();
+        match &session.lease {
+            Some(l) if l.client_id == client_id => {
+                // Live OR expired but same id: renew/re-grant in place. The
+                // holder is unchanged (a lazy re-grant of an expired-but-same
+                // lease is still the same holder), so NO LeaseChanged is emitted.
+                session.lease = Some(LeaseState {
+                    client_id: client_id.to_string(),
+                    expires_at: now + lease_ttl(),
+                });
                 Ok(())
             }
-            Some(existing) if existing == conn_id => Ok(()),
-            Some(_) => Err("session is still owned by another GUI".into()),
+            _ => Err("lease lost".into()),
         }
     }
 
-    fn do_detach(&mut self, session_id: &str, conn_id: u64) -> Result<(), String> {
+    fn do_promote(&mut self, session_id: &str, client_id: &str) -> Result<(), String> {
+        if client_id.is_empty() {
+            return Err("promote requires a client identity".into());
+        }
+        let now = Instant::now();
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if session.owner == Some(conn_id) {
-            session.owner = None;
-            session.broadcast_owner_changed();
+        // Claim if free, expired, or already ours (idempotent). A different
+        // LIVE holder blocks promote (blue-green invariant: a candidate may
+        // only take over once the original releases / its lease lapses).
+        let claim = match &session.lease {
+            None => true,
+            Some(l) if l.client_id == client_id => true,
+            Some(l) if l.expires_at <= now => true,
+            Some(_) => false,
+        };
+        if claim {
+            let changed_holder =
+                session.lease.as_ref().map(|l| l.client_id.as_str()) != Some(client_id);
+            session.lease = Some(LeaseState {
+                client_id: client_id.to_string(),
+                expires_at: now + lease_ttl(),
+            });
+            if changed_holder {
+                session.broadcast_lease_changed(now);
+            }
+            Ok(())
+        } else {
+            Err("session still leased by another GUI".into())
+        }
+    }
+
+    fn do_detach(&mut self, session_id: &str, client_id: &str) -> Result<(), String> {
+        let now = Instant::now();
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("no such session: {session_id}"))?;
+        // EXPLICIT detach = clean handoff: release the lease immediately so a
+        // deliberate blue-green handoff doesn't wait the full TTL. (Socket-EOF
+        // detach does NOT clear the lease — see `detach_on_disconnect`.) Only
+        // the holder may release.
+        if matches!(&session.lease, Some(l) if l.client_id == client_id) {
+            session.lease = None;
+            session.broadcast_lease_changed(now);
         }
         Ok(())
     }
 
-    fn do_prompt(&mut self, session_id: &str, text: &str, conn_id: u64) -> Result<(), String> {
+    fn do_prompt(&mut self, session_id: &str, text: &str, client_id: &str) -> Result<(), String> {
         {
+            let now = Instant::now();
             let session = self
                 .sessions
                 .get(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
-            if session.owner != Some(conn_id) {
-                return Err("only the session owner can send prompts".into());
+            if !holds_lease(session, client_id, now) {
+                return Err("only the lease holder can send prompts".into());
             }
         }
         self.enqueue_prompt(session_id, text)
@@ -1139,13 +1333,14 @@ impl Manager {
         }
     }
 
-    fn do_cancel(&mut self, session_id: &str, conn_id: u64) -> Result<(), String> {
+    fn do_cancel(&mut self, session_id: &str, client_id: &str) -> Result<(), String> {
+        let now = Instant::now();
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if session.owner != Some(conn_id) {
-            return Err("only the session owner can cancel".into());
+        if !holds_lease(session, client_id, now) {
+            return Err("only the lease holder can cancel".into());
         }
         if let Some(channel) = session.channel.as_ref() {
             channel.cancel();
@@ -1153,14 +1348,15 @@ impl Manager {
         Ok(())
     }
 
-    fn do_restart(&mut self, session_id: &str, conn_id: u64) -> Result<(), String> {
+    fn do_restart(&mut self, session_id: &str, client_id: &str) -> Result<(), String> {
         let (cwd, resume_id) = {
+            let now = Instant::now();
             let session = self
                 .sessions
                 .get(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
-            if session.owner != Some(conn_id) {
-                return Err("only the session owner can restart".into());
+            if !holds_lease(session, client_id, now) {
+                return Err("only the lease holder can restart".into());
             }
             let resume = session.channel.as_ref().and_then(|c| c.session_id());
             (session.cwd.clone(), resume)
@@ -1218,14 +1414,15 @@ impl Manager {
         &mut self,
         session_id: &str,
         mode: PermissionMode,
-        conn_id: u64,
+        client_id: &str,
     ) -> Result<(), String> {
+        let now = Instant::now();
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if session.owner != Some(conn_id) {
-            return Err("only the session owner can change permission mode".into());
+        if !holds_lease(session, client_id, now) {
+            return Err("only the lease holder can change permission mode".into());
         }
         session.permission_mode = mode;
         if let Some(channel) = &session.channel {
@@ -1235,6 +1432,7 @@ impl Manager {
     }
 
     fn do_admin_status(&self) -> AdminSnapshot {
+        let now = Instant::now();
         let infos = self
             .sessions
             .values()
@@ -1242,8 +1440,14 @@ impl Manager {
                 session_id: s.id.clone(),
                 label: s.label.clone(),
                 connected: s.channel.is_some(),
-                has_owner: s.owner.is_some(),
-                owner_conn_id: s.owner,
+                has_owner: s.is_leased(now),
+                // Only report a LIVE lease as the holder; a held-but-expired
+                // lease reads as unleased (lazy expiry), matching has_owner.
+                lease_holder: s
+                    .lease
+                    .as_ref()
+                    .filter(|l| l.expires_at > now)
+                    .map(|l| lease_to_wire(l, now)),
                 turns: s.turns,
                 event_log_len: s.event_log.len(),
                 subscriber_count: s.log_tx.receiver_count(),
@@ -1256,6 +1460,33 @@ impl Manager {
             sessions: infos,
         }
     }
+
+    /// Periodic sweep (phase 4): clear every expired lease and emit
+    /// `LeaseChanged{None}` so an idle observing candidate learns a crashed
+    /// owner's lease freed within ~`LEASE_SWEEP_INTERVAL`. This is a PROACTIVE
+    /// side-effect only — lazy expiry in the gates already governs who-may-act,
+    /// so correctness does not depend on this running on time. Stays on the
+    /// single-writer actor task (called from the run_manager select), so it
+    /// never races `apply` (ADR-0012).
+    fn sweep_expired_leases(&mut self) {
+        let now = Instant::now();
+        for s in self.sessions.values_mut() {
+            if matches!(&s.lease, Some(l) if l.expires_at <= now) {
+                s.lease = None;
+                s.broadcast_lease_changed(now);
+            }
+        }
+    }
+}
+
+/// Whether `session` is currently leased to `client_id` and that lease has not
+/// expired at `now`. The single gate predicate applied identically at every
+/// write verb (prompt / cancel / restart / set-permission / close). An empty
+/// `client_id` never holds a lease. Lazy expiry: an expired lease fails the
+/// gate even before a sweep clears it.
+fn holds_lease(session: &ManagedSession, client_id: &str, now: Instant) -> bool {
+    !client_id.is_empty()
+        && matches!(&session.lease, Some(l) if l.is_live_for(client_id, now))
 }
 
 // ── Session pump task ──────────────────────────────────────────────
@@ -1584,10 +1815,14 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
             Request::Attach {
                 session_id,
                 mode,
+                client_id,
                 cursor,
             } => {
-                match manager.send_attach(&session_id, mode, conn_id, cursor).await {
-                    Ok((owner_rx, log_rx, initial_sent)) => {
+                match manager
+                    .send_attach(&session_id, mode, client_id, cursor)
+                    .await
+                {
+                    Ok((lease_rx, log_rx, initial_sent, granted_drive)) => {
                         // `initial_sent` is the actor-resolved tail start (see
                         // `do_attach`): 0 for a full replay (no/stale cursor —
                         // the forwarder tails `event_log` from index 0, the
@@ -1606,24 +1841,34 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                             Arc::clone(&manager),
                             session_id.clone(),
                             w,
-                            owner_rx,
+                            lease_rx,
                             log_rx,
                             initial_sent,
                         ));
                         subscribed.insert(session_id, handle);
+                        // Phase 4: tell the client its role explicitly so it
+                        // never has to infer ownership from an error string.
                         Response::Ok {
-                            data: ResponseData::Ack,
+                            data: ResponseData::Attached {
+                                driver: granted_drive,
+                            },
                         }
                     }
                     Err(e) => Response::Error { message: e },
                 }
             }
 
-            Request::Detach { session_id } => {
+            Request::Detach {
+                session_id,
+                client_id,
+            } => {
                 if let Some(handle) = subscribed.remove(&session_id) {
                     handle.abort();
                 }
-                match manager.send_detach(&session_id, conn_id).await {
+                // Explicit Detach with the holder's client_id releases the lease
+                // immediately (clean handoff). An empty id just tears down the
+                // forwarder without touching the lease.
+                match manager.send_detach(&session_id, client_id).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },
@@ -1631,23 +1876,36 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 }
             }
 
-            Request::Promote { session_id } => {
-                match manager.send_promote(&session_id, conn_id).await {
-                    Ok(()) => Response::Ok {
-                        data: ResponseData::Ack,
-                    },
-                    Err(e) => Response::Error { message: e },
-                }
-            }
+            Request::Heartbeat {
+                session_id,
+                client_id,
+            } => match manager.send_heartbeat(&session_id, client_id).await {
+                Ok(()) => Response::Ok {
+                    data: ResponseData::Ack,
+                },
+                Err(e) => Response::Error { message: e },
+            },
 
-            Request::Prompt { session_id, text } => {
-                match manager.send_prompt(&session_id, &text, conn_id).await {
-                    Ok(()) => Response::Ok {
-                        data: ResponseData::Ack,
-                    },
-                    Err(e) => Response::Error { message: e },
-                }
-            }
+            Request::Promote {
+                session_id,
+                client_id,
+            } => match manager.send_promote(&session_id, client_id).await {
+                Ok(()) => Response::Ok {
+                    data: ResponseData::Ack,
+                },
+                Err(e) => Response::Error { message: e },
+            },
+
+            Request::Prompt {
+                session_id,
+                text,
+                client_id,
+            } => match manager.send_prompt(&session_id, &text, client_id).await {
+                Ok(()) => Response::Ok {
+                    data: ResponseData::Ack,
+                },
+                Err(e) => Response::Error { message: e },
+            },
 
             Request::AdminPrompt { session_id, text } => {
                 match manager.send_admin_prompt(&session_id, &text).await {
@@ -1658,38 +1916,48 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 }
             }
 
-            Request::Cancel { session_id } => {
-                match manager.send_cancel(&session_id, conn_id).await {
-                    Ok(()) => Response::Ok {
-                        data: ResponseData::Ack,
-                    },
-                    Err(e) => Response::Error { message: e },
-                }
-            }
+            Request::Cancel {
+                session_id,
+                client_id,
+            } => match manager.send_cancel(&session_id, client_id).await {
+                Ok(()) => Response::Ok {
+                    data: ResponseData::Ack,
+                },
+                Err(e) => Response::Error { message: e },
+            },
 
-            Request::RestartSession { session_id } => {
-                match manager.send_restart(&session_id, conn_id).await {
-                    Ok(()) => Response::Ok {
-                        data: ResponseData::Ack,
-                    },
-                    Err(e) => Response::Error { message: e },
-                }
-            }
+            Request::RestartSession {
+                session_id,
+                client_id,
+            } => match manager.send_restart(&session_id, client_id).await {
+                Ok(()) => Response::Ok {
+                    data: ResponseData::Ack,
+                },
+                Err(e) => Response::Error { message: e },
+            },
 
-            Request::SetPermissionMode { session_id, mode } => {
-                match manager.send_set_permission_mode(&session_id, mode, conn_id).await {
-                    Ok(()) => Response::Ok {
-                        data: ResponseData::Ack,
-                    },
-                    Err(e) => Response::Error { message: e },
-                }
-            }
+            Request::SetPermissionMode {
+                session_id,
+                mode,
+                client_id,
+            } => match manager
+                .send_set_permission_mode(&session_id, mode, client_id)
+                .await
+            {
+                Ok(()) => Response::Ok {
+                    data: ResponseData::Ack,
+                },
+                Err(e) => Response::Error { message: e },
+            },
 
-            Request::CloseSession { session_id } => {
+            Request::CloseSession {
+                session_id,
+                client_id,
+            } => {
                 if let Some(handle) = subscribed.remove(&session_id) {
                     handle.abort();
                 }
-                match manager.send_close(&session_id, conn_id).await {
+                match manager.send_close(&session_id, client_id).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },
@@ -1737,12 +2005,19 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
         subscribed.len(),
     );
 
-    // Connection closed — detach all sessions and cancel forwarders. This
-    // releases ownership of any sessions this connection owned, which
-    // broadcasts OwnerChanged so an observing candidate GUI can promote.
+    // Connection closed (socket EOF) — tear down the forwarders, but do NOT
+    // release any lease. Under the phase-4 lease model the lease keys on the
+    // STABLE client_id, not this ephemeral connection, and EOF deliberately
+    // "starts the clock": the lease is left to expire on its TTL so a fast
+    // same-client_id reconnect resumes with zero contention (the race the old
+    // attach_owner_with_retry masked). A *clean* handoff uses an explicit
+    // Request::Detach carrying the holder's client_id (do_detach releases now);
+    // a crash/close frees the lease only when the TTL lapses (then the sweep
+    // broadcasts LeaseChanged{None} so a candidate can promote). Passing the
+    // empty client_id here makes send_detach a lease no-op.
     for (sid, handle) in &subscribed {
         handle.abort();
-        let _ = manager.send_detach(sid, conn_id).await;
+        let _ = manager.send_detach(sid, String::new()).await;
     }
     manager_events.abort();
 }
@@ -1762,7 +2037,7 @@ async fn forward_notifications(
     _manager: Arc<SessionManager>,
     session_id: ServerSessionId,
     writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    mut owner_rx: watch::Receiver<bool>,
+    mut lease_rx: watch::Receiver<Option<Lease>>,
     mut log_rx: watch::Receiver<Arc<Vec<Notification>>>,
     initial_sent: usize,
 ) {
@@ -1789,9 +2064,9 @@ async fn forward_notifications(
         }
     }
 
-    // Once the control (OwnerChanged) channel closes, stop selecting on it so
+    // Once the control (LeaseChanged) channel closes, stop selecting on it so
     // a closed broadcast doesn't busy-loop; keep serving the transcript log.
-    let mut owner_open = true;
+    let mut lease_open = true;
 
     loop {
         tokio::select! {
@@ -1822,17 +2097,18 @@ async fn forward_notifications(
                 }
             }
 
-            // Control channel: ownership state (watch<bool>). On change,
-            // synthesize a single `OwnerChanged` control note and forward it —
-            // the only control note, never logged.
-            changed = owner_rx.changed(), if owner_open => {
+            // Control channel: lease state (watch<Option<Lease>>). On change,
+            // synthesize a single `LeaseChanged` control note and forward it —
+            // the only control note, never logged. The watch already holds the
+            // WIRE Lease form, so no conversion happens here.
+            changed = lease_rx.changed(), if lease_open => {
                 match changed {
                     Ok(()) => {
-                        let has_owner = *owner_rx.borrow_and_update();
+                        let lease = lease_rx.borrow_and_update().clone();
                         let frame = Frame::Notification {
-                            note: Notification::OwnerChanged {
+                            note: Notification::LeaseChanged {
                                 session_id: session_id.clone(),
-                                has_owner,
+                                lease,
                             },
                         };
                         if let Ok(mut line) = serde_json::to_string(&frame) {
@@ -1845,7 +2121,7 @@ async fn forward_notifications(
                                 Err(_) => {
                                     tracing::warn!(
                                         session_id = %&session_id[..8.min(session_id.len())],
-                                        "slow subscriber: OwnerChanged write stalled >{}ms — disconnecting",
+                                        "slow subscriber: LeaseChanged write stalled >{}ms — disconnecting",
                                         dur.as_millis()
                                     );
                                     return;
@@ -1856,7 +2132,7 @@ async fn forward_notifications(
                     Err(_) => {
                         // Control channel closed: keep serving the transcript
                         // log channel until IT closes.
-                        owner_open = false;
+                        lease_open = false;
                     }
                 }
             }

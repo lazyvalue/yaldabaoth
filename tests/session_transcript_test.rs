@@ -147,6 +147,15 @@ fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Connect a client carrying a stable lease `client_id` (phase 4). A client
+/// that wants drive rights (Owner attach + prompt) MUST present one. Owner
+/// clients across a "GUI restart" reuse the SAME id so the lease resumes.
+fn connect_as(client_id: &str) -> SessionServerClient {
+    let c = SessionServerClient::connect().expect("connect");
+    c.set_client_id(client_id.to_string());
+    c
+}
+
 /// Count `ReplyEvent(Chunk)` notifications carrying agent text in a drained
 /// batch. This is the per-turn transcript payload the stub produces.
 fn count_agent_chunks(notes: &[Notification]) -> usize {
@@ -207,7 +216,7 @@ fn prompt_turn_round_trip() {
     let server = TestServer::start_with_env(&[("STUB_CHUNKS", "5")]);
     server.activate_env();
 
-    let client = SessionServerClient::connect().expect("connect");
+    let client = connect_as("gui-rt");
     let info = client
         .create_session(std::env::temp_dir(), "round-trip".into(), None)
         .expect("create_session");
@@ -282,7 +291,7 @@ fn large_replay_reconnect() {
     server.activate_env();
 
     let sid = {
-        let client = SessionServerClient::connect().expect("connect #1");
+        let client = connect_as("gui-large");
         let info = client
             .create_session(std::env::temp_dir(), "large".into(), None)
             .expect("create_session");
@@ -315,13 +324,13 @@ fn large_replay_reconnect() {
 
     // GUI #2: fresh client re-attaches. The server replays the full event_log
     // (all 800 chunks + the user prompt + the turn boundary) on attach.
-    let client2 = SessionServerClient::connect().expect("connect #2");
+    let client2 = connect_as("gui-large");
     let became_owner = client2
-        .attach_owner_with_retry(&sid)
+        .attach(&sid, AttachMode::Owner)
         .expect("re-attach after restart");
     assert!(
         became_owner,
-        "fresh attach should reclaim ownership (previous owner released on drop)\nlog:\n{}",
+        "fresh same-id attach should resume the lease on the first try\nlog:\n{}",
         server.read_log()
     );
 
@@ -381,7 +390,7 @@ fn mid_turn_reconnect_no_corruption() {
     server.activate_env();
 
     let sid = {
-        let client = SessionServerClient::connect().expect("connect #1");
+        let client = connect_as("gui-midturn");
         let info = client
             .create_session(std::env::temp_dir(), "midturn".into(), None)
             .expect("create_session");
@@ -408,9 +417,9 @@ fn mid_turn_reconnect_no_corruption() {
 
     // Fresh client re-attaches while the turn may still be streaming on the
     // server. The server keeps pumping the agent regardless of attach state.
-    let client2 = SessionServerClient::connect().expect("connect #2");
+    let client2 = connect_as("gui-midturn");
     client2
-        .attach_owner_with_retry(&sid)
+        .attach(&sid, AttachMode::Owner)
         .expect("re-attach mid-turn");
 
     // The forwarder tails event_log from index 0 on attach, so this fresh
@@ -485,7 +494,7 @@ fn turn_completes_with_no_subscriber_attached() {
     server.activate_env();
 
     let sid = {
-        let client = SessionServerClient::connect().expect("connect owner");
+        let client = connect_as("gui-headless");
         let info = client
             .create_session(std::env::temp_dir(), "headless".into(), None)
             .expect("create_session");
@@ -507,7 +516,7 @@ fn turn_completes_with_no_subscriber_attached() {
 
     // A GUI shows up only now. It must see the COMPLETED turn — every chunk plus
     // the turn boundary — replayed from the durable log.
-    let gui = SessionServerClient::connect().expect("late connect");
+    let gui = connect_as("gui-headless");
     let sessions = gui.list_sessions().expect("list");
     assert!(
         sessions.iter().any(|s| s.session_id == sid),
@@ -560,7 +569,7 @@ fn admin_prompt_drives_turn_without_owner() {
         .create_session(std::env::temp_dir(), "headless-start".into(), None)
         .expect("create_session");
 
-    // Sanity: nobody owns it (admin_status reports owner=None).
+    // Sanity: nobody holds the lease (admin_status reports lease_holder=None).
     let snap = client.admin_status().expect("admin_status");
     let s = snap
         .sessions
@@ -568,8 +577,8 @@ fn admin_prompt_drives_turn_without_owner() {
         .find(|s| s.session_id == info.session_id)
         .expect("session in admin snapshot");
     assert!(
-        !s.has_owner && s.owner_conn_id.is_none(),
-        "precondition: session must be UNOWNED before the headless prompt; snapshot={snap:#?}"
+        !s.has_owner && s.lease_holder.is_none(),
+        "precondition: session must be UNLEASED before the headless prompt; snapshot={snap:#?}"
     );
 
     // The ungated enqueue. A normal `prompt` here would be rejected ("only the
@@ -643,7 +652,7 @@ fn session_recovered_after_server_crash() {
     server.activate_env();
 
     let sid = {
-        let client = SessionServerClient::connect().expect("connect");
+        let client = connect_as("gui-crash");
         let info = client
             .create_session(std::env::temp_dir(), "crashtest".into(), None)
             .expect("create_session");
@@ -678,7 +687,7 @@ fn session_recovered_after_server_crash() {
 
     // The recovered session must reappear (recovery runs at startup before the
     // accept loop, but be tolerant of scheduling).
-    let client2 = SessionServerClient::connect().expect("connect after crash");
+    let client2 = connect_as("gui-crash");
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut present = false;
     while Instant::now() < deadline {
@@ -697,8 +706,10 @@ fn session_recovered_after_server_crash() {
     );
 
     // Attach and confirm the FULL pre-crash transcript replays from the WAL.
+    // After a crash every lease is dead (no heartbeats reached the dead server),
+    // so this same-id Owner attach first-claims a free lease.
     client2
-        .attach_owner_with_retry(&sid)
+        .attach(&sid, AttachMode::Owner)
         .expect("re-attach recovered session");
     let replay = drain_until(&client2, Duration::from_secs(10), |n| {
         count_agent_chunks(n) >= CHUNKS
@@ -760,7 +771,7 @@ fn slow_subscriber_is_disconnected_owner_unaffected() {
     server.activate_env();
 
     // Owner: a normal client that reads continuously.
-    let owner = SessionServerClient::connect().expect("connect owner");
+    let owner = connect_as("gui-slowsub");
     let info = owner
         .create_session(std::env::temp_dir(), "slow-sub".into(), None)
         .expect("create_session");
@@ -840,11 +851,11 @@ fn slow_subscriber_is_disconnected_owner_unaffected() {
 }
 
 /// Is this a TRANSCRIPT note — i.e. an `event_log` entry the forwarder tails —
-/// as opposed to a per-connection control note (`OwnerChanged`) synthesized by
+/// as opposed to a per-connection control note (`LeaseChanged`) synthesized by
 /// the forwarder and never stored in the log? Used to compare what a cursor
 /// reconnect streams against the durable log's tail.
 fn is_transcript_note(n: &Notification) -> bool {
-    !matches!(n, Notification::OwnerChanged { .. })
+    !matches!(n, Notification::LeaseChanged { .. })
 }
 
 /// 7. CURSOR-BASED INCREMENTAL RECONNECT (spec phase 5, additive).
@@ -862,7 +873,7 @@ fn cursor_reconnect_streams_only_tail() {
     server.activate_env();
 
     // Owner drives one turn so the session has a known, non-trivial event_log.
-    let owner = SessionServerClient::connect().expect("connect owner");
+    let owner = connect_as("gui-cursor");
     let info = owner
         .create_session(std::env::temp_dir(), "cursor".into(), None)
         .expect("create_session");

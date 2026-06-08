@@ -46,6 +46,15 @@ pub struct SessionServerClient {
     _writer: Option<JoinHandle<()>>,
     /// Pending response channels, keyed by request id.
     pending: Arc<Mutex<std::collections::HashMap<u64, std_mpsc::Sender<Response>>>>,
+    /// Stable client identity (spec phase 4). Set once via
+    /// [`set_client_id`](Self::set_client_id) right after connect and shared
+    /// (cloned) into every [`SessionServerHandle`], so `attach` / `heartbeat`
+    /// read it without every call site threading it through. Empty until set
+    /// (and for headless callers, who take no lease). Survives an in-place
+    /// [`reconnect`](Self::reconnect) because it's re-applied onto the rebuilt
+    /// struct — that identity stability is what makes lease resume contention-
+    /// free across socket reconnect AND app restart.
+    client_id: Arc<Mutex<String>>,
 }
 
 /// Drop every pending response channel, unblocking any thread parked in
@@ -283,7 +292,23 @@ impl SessionServerClient {
             _reader: Some(reader),
             _writer: Some(writer),
             pending,
+            client_id: Arc::new(Mutex::new(String::new())),
         })
+    }
+
+    /// Install the stable client identity (spec phase 4). Call once right after
+    /// [`connect`](Self::connect) (the GUI loads/creates it from
+    /// `~/.cache/sketch/client_id`). Threaded into every `attach`/`heartbeat`
+    /// request and shared with handles so the lease keys on a stable id.
+    pub fn set_client_id(&self, id: String) {
+        if let Ok(mut g) = self.client_id.lock() {
+            *g = id;
+        }
+    }
+
+    /// The current stable client identity (empty until [`set_client_id`]).
+    pub fn client_id(&self) -> String {
+        self.client_id.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Re-establish the connection in place after a disconnect. Rebuilds the
@@ -305,11 +330,18 @@ impl SessionServerClient {
         let path = socket_path();
         let stream = Self::connect_or_launch(&path)?;
         let fresh = Self::from_stream(stream)?;
+        // Preserve the STABLE client identity across the reconnect: the rebuilt
+        // `fresh` starts with an empty client_id, but the lease model depends on
+        // the same id presenting after a socket drop so the server resumes the
+        // lease with zero contention. Carry it forward before the wholesale
+        // replace below.
+        let prior_client_id = self.client_id();
         // Replace our internals wholesale. Assigning `*self` drops the old
         // value (its threads have already exited — that's why we're
         // reconnecting — and its `pending` map was drained on disconnect), and
         // moves `fresh` in without running its destructor.
         *self = fresh;
+        self.set_client_id(prior_client_id);
         let note_rx = self
             .notification_rx
             .take()
@@ -403,6 +435,7 @@ impl SessionServerClient {
             connected: Arc::clone(&self.connected),
             next_id: Arc::clone(&self.next_id),
             pending: Arc::clone(&self.pending),
+            client_id: Arc::clone(&self.client_id),
         }
     }
 
@@ -456,14 +489,21 @@ impl SessionServerClient {
         }
     }
 
-    /// Attach to a session as `Owner` (can drive) or `Observer` (read-only
-    /// mirror). The server replays the full event log before the Ack, so the
-    /// pump picks up the entire transcript on its first drain cycle.
+    /// Attach to a session as `Owner` (acquires/resumes the lease) or
+    /// `Observer` (read-only mirror). The server replays the full event log
+    /// before the response, so the pump picks up the entire transcript on its
+    /// first drain cycle.
+    ///
+    /// Returns `Ok(true)` when this attach was granted the lease (drive rights)
+    /// and `Ok(false)` when it silently downgraded to Observer because a
+    /// different live `client_id` holds the lease. This is the deterministic
+    /// replacement for the retired `attach_owner_with_retry`: a same-`client_id`
+    /// Owner attach always resumes on the FIRST try (no retry, no "already own"
+    /// error string), so the role comes straight from the response.
     ///
     /// This is the unchanged, full-replay path: it delegates to
-    /// [`attach_with_cursor`](Self::attach_with_cursor) with `None`, so every
-    /// existing caller (the GUI included) keeps today's behavior exactly.
-    pub fn attach(&self, session_id: &str, mode: AttachMode) -> io::Result<()> {
+    /// [`attach_with_cursor`](Self::attach_with_cursor) with `None`.
+    pub fn attach(&self, session_id: &str, mode: AttachMode) -> io::Result<bool> {
         self.attach_with_cursor(session_id, mode, None)
     }
 
@@ -473,82 +513,67 @@ impl SessionServerClient {
     /// session's current channel generation with an in-range index, the server
     /// streams only the transcript tail after `index` instead of the full log.
     /// `None` (or a stale/out-of-range cursor) yields the full replay — the
-    /// same behavior as [`attach`](Self::attach). Additive: callers that don't
-    /// track a cursor simply use `attach`.
+    /// same behavior as [`attach`](Self::attach). Injects the stable
+    /// `client_id` (phase 4) so the server can acquire/resume the lease.
+    /// Returns the granted-drive flag (see [`attach`]).
     pub fn attach_with_cursor(
         &self,
         session_id: &str,
         mode: AttachMode,
         cursor: Option<(u64, u64)>,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         match self.request(Request::Attach {
             session_id: session_id.to_string(),
             mode,
+            client_id: self.client_id(),
             cursor,
+        })? {
+            // Phase-4 reply: carries the driver flag explicitly.
+            Response::Ok {
+                data: ResponseData::Attached { driver },
+            } => Ok(driver),
+            // Tolerate a plain Ack (e.g. a server that pre-dates the Attached
+            // variant): an Owner-mode Ack means we drove, Observer means not.
+            Response::Ok { .. } => Ok(mode == AttachMode::Owner),
+            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+        }
+    }
+
+    /// Renew the lease on a session this client drives (spec phase 4). The GUI
+    /// beats this every `HEARTBEAT_INTERVAL`; a successful beat pushes the lease
+    /// expiry forward. An `Err` means the lease was lost (expired and re-taken,
+    /// or never held), and the caller should re-attach (resumes-or-observes).
+    pub fn heartbeat(&self, session_id: &str) -> io::Result<()> {
+        match self.request(Request::Heartbeat {
+            session_id: session_id.to_string(),
+            client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
         }
     }
 
-    /// Attach as `Owner`, tolerating the brief window after a *previous*
-    /// connection of ours dropped but before the server has finished tearing
-    /// it down and releasing ownership. That window is real on an in-place
-    /// [`reconnect`](Self::reconnect): the new socket can re-attach before the
-    /// server has processed the old socket's EOF, so a bare [`attach`] races
-    /// and is rejected with "another GUI already owns this session".
-    ///
-    /// Retries on *ownership contention only* (any other error is fatal and
-    /// returned at once) for a bounded window, then falls back to an `Observer`
-    /// attach so the transcript still replays. Returns `Ok(true)` if we became
-    /// owner, `Ok(false)` if we fell back to observer (a genuinely live peer
-    /// still owns it). Mirrors the open-path retry but lives here so the
-    /// reconnect path and tests share one implementation.
-    pub fn attach_owner_with_retry(&self, session_id: &str) -> io::Result<bool> {
-        // ~1s total (20 × 50ms). The clean-shutdown → server-detach window is
-        // sub-millisecond once the socket is closed (see `Drop`), so this
-        // almost always succeeds on the first or second try; the budget only
-        // covers scheduling jitter under load.
-        let mut last = String::new();
-        for _ in 0..20 {
-            match self.attach(session_id, AttachMode::Owner) {
-                Ok(()) => return Ok(true),
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.contains("already own") {
-                        return Err(e);
-                    }
-                    last = msg;
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-        }
-        // Still owned after the window: a real peer holds it. Observe instead
-        // so we at least receive the replay + live stream.
-        self.attach(session_id, AttachMode::Observer).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("{last}; observer fallback failed: {e}"),
-            )
-        })?;
-        Ok(false)
-    }
-
-    /// Claim ownership of a session this connection is observing. Succeeds
-    /// only once the previous owner has disconnected (server reports the
-    /// session as ownerless). Used by a candidate GUI to take over.
+    /// Claim the lease on a session this connection is observing. Succeeds only
+    /// once the previous holder has cleanly detached or its lease expired
+    /// (server reports the session as unleased). Used by a candidate GUI to take
+    /// over. Carries the stable `client_id` so the new lease records this GUI.
     pub fn promote(&self, session_id: &str) -> io::Result<()> {
         match self.request(Request::Promote {
             session_id: session_id.to_string(),
+            client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
         }
     }
 
+    /// Clean detach (phase 4): carries `client_id` so the server releases the
+    /// lease immediately on a deliberate handoff (vs. a socket EOF, which leaves
+    /// the lease to its TTL).
     pub fn detach(&self, session_id: &str) -> io::Result<()> {
         match self.request(Request::Detach {
             session_id: session_id.to_string(),
+            client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
@@ -563,6 +588,7 @@ impl SessionServerClient {
         self.request_fire(Request::Prompt {
             session_id: session_id.to_string(),
             text: text.to_string(),
+            client_id: self.client_id(),
         })
     }
 
@@ -588,6 +614,7 @@ impl SessionServerClient {
     pub fn cancel(&self, session_id: &str) -> io::Result<()> {
         self.request_fire(Request::Cancel {
             session_id: session_id.to_string(),
+            client_id: self.client_id(),
         })
     }
 
@@ -597,6 +624,7 @@ impl SessionServerClient {
     pub fn restart_session(&self, session_id: &str) -> io::Result<()> {
         self.request_fire(Request::RestartSession {
             session_id: session_id.to_string(),
+            client_id: self.client_id(),
         })
     }
 
@@ -608,6 +636,7 @@ impl SessionServerClient {
         match self.request(Request::SetPermissionMode {
             session_id: session_id.to_string(),
             mode,
+            client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
@@ -624,6 +653,7 @@ impl SessionServerClient {
     pub fn close_session(&self, session_id: &str) -> io::Result<()> {
         match self.request(Request::CloseSession {
             session_id: session_id.to_string(),
+            client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
@@ -675,11 +705,18 @@ pub struct SessionServerHandle {
     connected: Arc<AtomicBool>,
     next_id: Arc<AtomicU64>,
     pending: Arc<Mutex<std::collections::HashMap<u64, std_mpsc::Sender<Response>>>>,
+    /// Shared (cloned `Arc`) with the owning client so off-thread attach /
+    /// heartbeat present the SAME stable client_id the client set.
+    client_id: Arc<Mutex<String>>,
 }
 
 impl SessionServerHandle {
-    fn is_connected(&self) -> bool {
+    pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    fn client_id(&self) -> String {
+        self.client_id.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Blocking request/response — identical semantics to
@@ -746,21 +783,43 @@ impl SessionServerHandle {
         }
     }
 
-    pub fn attach(&self, session_id: &str, mode: AttachMode) -> io::Result<()> {
-        // Handles never track a cursor: always full replay (cursor = None).
+    /// Attach off-thread (phase 4). Returns the granted-drive flag — `Ok(true)`
+    /// when the lease was acquired/resumed, `Ok(false)` on silent downgrade to
+    /// Observer. Handles never track a cursor: always full replay (cursor =
+    /// None). Sends the shared stable `client_id` so the lease keys correctly.
+    pub fn attach(&self, session_id: &str, mode: AttachMode) -> io::Result<bool> {
         match self.request(Request::Attach {
             session_id: session_id.to_string(),
             mode,
+            client_id: self.client_id(),
             cursor: None,
+        })? {
+            Response::Ok {
+                data: ResponseData::Attached { driver },
+            } => Ok(driver),
+            Response::Ok { .. } => Ok(mode == AttachMode::Owner),
+            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+        }
+    }
+
+    /// Renew the lease off-thread (phase 4). `Err` ⇒ lease lost ⇒ caller
+    /// re-attaches.
+    pub fn heartbeat(&self, session_id: &str) -> io::Result<()> {
+        match self.request(Request::Heartbeat {
+            session_id: session_id.to_string(),
+            client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
         }
     }
 
+    /// Clean detach off-thread (phase 4): carries `client_id` so the server can
+    /// release the lease immediately on a deliberate handoff.
     pub fn detach(&self, session_id: &str) -> io::Result<()> {
         match self.request(Request::Detach {
             session_id: session_id.to_string(),
+            client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
@@ -770,6 +829,7 @@ impl SessionServerHandle {
     pub fn close_session(&self, session_id: &str) -> io::Result<()> {
         match self.request(Request::CloseSession {
             session_id: session_id.to_string(),
+            client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
