@@ -13,6 +13,31 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
 
 ## Bugs
 
+- **Resume hang (replay fence never cleared)** — `FIXED` (2026-06-09,
+  `9112188` on master). After a server restart, a recovered session's pump
+  fence waited for the channel turn counter to reach the restored count — but
+  the counter restarts at 0 every spawn and `092c218` removed the post-load
+  bump, so the fence never cleared and EVERY post-resume event (replay, marker,
+  live turns) was silently discarded: prompts looked hung while the agent
+  worked invisibly (a queued "integrate" actually ran + folded a branch to
+  master unseen). Fix: marker-based fence (`src/replay_fence.rs`), worker emits
+  `ReplayComplete` on every resume attempt incl. fallbacks, pump reports
+  session-absolute TurnCounts (`turn_base +`), restart-with-resume arms the
+  fence (kills the restart double-record). Regression test:
+  `recovered_session_is_drivable_after_resume` (red pre-fix, green post-fix).
+  Residual hazard noted in code: a timed-out `session/load`'s late replay
+  notifications can record as live events (bounded duplication, not a wedge).
+- **Leaked `claude-code-acp` adapter processes** — `READY`. ~70 idle adapter
+  processes observed (2026-06-09) dating back 2 weeks, surviving their parent
+  sketch/server exits. Something on the teardown path (GUI direct-spawn drops?
+  server crash-kills?) doesn't kill the child. Inventory: `pgrep -fl
+  claude-code-acp`. Needs a teardown audit + maybe a startup reaper.
+- **Reconnect bursts at GUI launch** — `READY` (mild). ~25 conns
+  opened+closed within ~1s on each GUI start (server log 2026-06-09 05:47,
+  19:06). Self-terminating — the 2026-06-07 zombie-owner fix holds (every conn
+  closes) — but the client side shouldn't need 25 connection attempts to come
+  up. Likely a per-slot/per-probe connect fan-out; cheap log-driven repro.
+
 - **Edit-view typing crash + latency** — `FIXED` (2026-06-06). `reparse` fed
   tree-sitter a stale (never-`edit()`'d) tree → nondeterministic SIGSEGV
   (`d32edf9`); then full-parse-per-keystroke was slow → proper incremental
