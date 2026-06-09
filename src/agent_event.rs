@@ -40,8 +40,19 @@
 //! `Deserialize`: an unknown `kind` lands in [`AgentEventKind::Unknown`]
 //! preserving the whole object, and on the way out it is re-emitted under its
 //! ORIGINAL `kind` tag (NOT `{"kind":"unknown"}`).
+//!
+//! The `Deserialize` reads the kind object as an ORDERED, duplicate-preserving
+//! entry list (a map visitor) rather than via `serde_json::Value`. This is
+//! load-bearing for BACKWARD compat: tool-call payloads (`ToolCall` /
+//! `ToolCallUpdate`) carry their own `kind` (the ACP tool category), and a
+//! legacy build serialized that FLAT next to the event tag, so old WAL records
+//! hold TWO `kind` keys. `Value` collapses duplicates to the last, which would
+//! destroy the event tag and drop the event as `Unknown`; the ordered read keeps
+//! the first `kind` as the tag and the second as the tool kind. New records nest
+//! the tool payload under `tool_call`/`tool_call_update` (no collision); the
+//! reader accepts BOTH shapes, so every record ever written round-trips.
 
-use serde::de::{self, MapAccess, Visitor};
+use serde::de::{MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -70,9 +81,10 @@ pub struct AgentEvent {
     /// MINOR (6) — FRAGILITY UNDER NON-SELF-DESCRIBING FORMATS: `#[serde(flatten)]`
     /// makes serde buffer the whole struct into an internal `Content` map and
     /// re-deserialize fields from it; combined with the custom `AgentEventKind`
-    /// `Deserialize` (which round-trips through `serde_json::Value`, see below),
-    /// the envelope's `u64` fields (`generation`/`turn`/`seq`) are decoded from
-    /// that intermediate, not directly from the wire. This is sound for
+    /// `Deserialize` (an ordered map read whose per-field values are buffered as
+    /// `serde_json::Value`, see below), the envelope's `u64` fields
+    /// (`generation`/`turn`/`seq`) are decoded from that intermediate, not
+    /// directly from the wire. This is sound for
     /// SELF-DESCRIBING formats (JSON — our only wire/WAL format today) because the
     /// buffered value carries its own number type. It is NOT robust for a
     /// non-self-describing format (bincode/postcard/MessagePack-in-compact-mode),
@@ -350,21 +362,103 @@ impl<'de> Deserialize<'de> for AgentEventKind {
     where
         D: Deserializer<'de>,
     {
-        // Buffer into a Value first so an unknown tag preserves its bytes.
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let tag = value
-            .get("kind")
-            .and_then(|k| k.as_str())
-            .ok_or_else(|| de::Error::custom("AgentEventKind missing string `kind`"))?
-            .to_string();
-
-        // Try the known mirror. If serde rejects the tag (unknown variant) OR
-        // the payload doesn't fit, fall into Unknown preserving the bytes.
-        match serde_json::from_value::<KnownKind>(value.clone()) {
-            Ok(known) => Ok(AgentEventKind::from_known(known)),
-            Err(_) => Ok(AgentEventKind::Unknown { tag, raw: value }),
-        }
+        // Read the kind object as an ORDERED entry list, preserving duplicate
+        // keys — we must NOT route through `serde_json::Value` here. Legacy flat
+        // tool-call records (written before tool payloads were nested) carry TWO
+        // `kind` keys: the event tag, then the ACP tool's own kind. `Value`
+        // collapses duplicates to the LAST, which destroys the event tag and
+        // misparses the whole event as `Unknown` (dropping it). An ordered read
+        // keeps both, so both the new nested shape and every legacy flat record
+        // round-trip. (`flatten` on `AgentEvent` preserves the duplicate entries
+        // in its buffer, so this visitor sees them even via the envelope.)
+        deserializer.deserialize_map(AgentEventKindVisitor)
     }
+}
+
+struct AgentEventKindVisitor;
+
+impl<'de> Visitor<'de> for AgentEventKindVisitor {
+    type Value = AgentEventKind;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("an AgentEventKind object carrying a `kind` tag")
+    }
+
+    fn visit_map<A>(self, mut access: A) -> Result<AgentEventKind, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
+        while let Some((k, v)) = access.next_entry::<String, serde_json::Value>()? {
+            entries.push((k, v));
+        }
+        Ok(agent_event_kind_from_entries(entries))
+    }
+}
+
+/// Build an `AgentEventKind` from the ordered (duplicate-preserving) entries of
+/// the kind object. Handles every on-wire shape this vocabulary has produced:
+///   - NEW nested tool calls — payload under `tool_call` / `tool_call_update`.
+///   - LEGACY flat tool calls — tool fields beside the event tag, possibly with
+///     a SECOND `kind` (the ACP tool category) recovered by dropping ONLY the
+///     first `kind` (the event tag).
+///   - all other kinds — the derive mirror (`KnownKind`), or byte-preserving
+///     `Unknown` for a tag this build doesn't recognize (forward-compat, §8).
+fn agent_event_kind_from_entries(entries: Vec<(String, serde_json::Value)>) -> AgentEventKind {
+    // Event tag = the FIRST `kind` entry (ordered read keeps it even when a
+    // legacy flat record also carries the tool's own `kind` later).
+    let tag = entries
+        .iter()
+        .find(|(k, _)| k == "kind")
+        .and_then(|(_, v)| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    match tag.as_str() {
+        "tool_call_started" => {
+            if let Some(tc) = tool_payload::<ToolCall>(&entries, "tool_call") {
+                return AgentEventKind::ToolCallStarted(tc);
+            }
+        }
+        "tool_call_updated" => {
+            if let Some(u) = tool_payload::<ToolCallUpdate>(&entries, "tool_call_update") {
+                return AgentEventKind::ToolCallUpdated(u);
+            }
+        }
+        _ => {}
+    }
+
+    // Non-tool kinds never carry a colliding `kind`, so a deduped map is
+    // faithful; reuse it for the known-mirror parse and the `Unknown` raw.
+    let value = serde_json::Value::Object(entries.into_iter().collect());
+    match serde_json::from_value::<KnownKind>(value.clone()) {
+        Ok(known) => AgentEventKind::from_known(known),
+        Err(_) => AgentEventKind::Unknown { tag, raw: value },
+    }
+}
+
+/// Reconstruct a tool-call payload of type `T` from the ordered entries.
+/// New nested shape: the sub-object under `nested_key`. Legacy flat shape: every
+/// field EXCEPT the first `kind` (the event tag); a later `kind` (the tool's own
+/// category) survives, so default- and explicit-kind legacy records both
+/// recover. Returns `None` if neither shape parses (caller falls back).
+fn tool_payload<T: serde::de::DeserializeOwned>(
+    entries: &[(String, serde_json::Value)],
+    nested_key: &str,
+) -> Option<T> {
+    if let Some((_, v)) = entries.iter().find(|(k, _)| k == nested_key) {
+        return serde_json::from_value::<T>(v.clone()).ok();
+    }
+    let mut map = serde_json::Map::new();
+    let mut dropped_tag = false;
+    for (k, v) in entries {
+        if k == "kind" && !dropped_tag {
+            dropped_tag = true; // drop ONLY the event tag; keep a later tool kind
+            continue;
+        }
+        map.insert(k.clone(), v.clone());
+    }
+    serde_json::from_value::<T>(serde_json::Value::Object(map)).ok()
 }
 
 // A standalone Visitor isn't needed (we delegate through Value), but keep the
@@ -518,6 +612,110 @@ mod tests {
             other => panic!("expected ToolCallStarted, got {other:?}"),
         }
         assert_eq!(back, e, "tool-call event must round-trip");
+    }
+
+    /// Backward-compat: a LEGACY FLAT tool-call record (the broken on-disk shape
+    /// with a DUPLICATE `kind` — event tag THEN the ACP tool kind) must still be
+    /// recovered, not dropped as `Unknown`. This is a verbatim record shape from
+    /// a real pre-fix WAL (toolName "Glob" → kind "search"). The ordered reader
+    /// keeps the first `kind` as the tag and the second as the tool's kind.
+    #[test]
+    fn legacy_flat_tool_call_started_with_dup_kind_recovers() {
+        let wire = r#"{"session_id":"479446f2","generation":0,"turn":0,"seq":5,"kind":"tool_call_started","toolCallId":"toolu_01EfFgJpFRVft5yZGvzzX6bm","title":"Find","kind":"search","rawInput":{},"_meta":{"claudeCode":{"toolName":"Glob"}}}"#;
+        let back: AgentEvent = serde_json::from_str(wire).unwrap();
+        match &back.kind {
+            AgentEventKind::ToolCallStarted(tc) => {
+                assert_eq!(tc.kind, crate::acp_channel::ToolKind::Search);
+                assert_eq!(tc.title, "Find");
+            }
+            other => panic!("legacy flat dup-kind must recover, got {other:?}"),
+        }
+        // Envelope still decodes around the recovered kind.
+        assert_eq!(back.seq, 5);
+        assert_eq!(back.turn, 0);
+    }
+
+    /// Backward-compat: a legacy FLAT `tool_call_updated` (no nested key, no tool
+    /// kind on this one) recovers to `ToolCallUpdated`, not `Unknown`.
+    #[test]
+    fn legacy_flat_tool_call_updated_recovers() {
+        let wire = r#"{"session_id":"s1","generation":0,"turn":0,"seq":7,"kind":"tool_call_updated","toolCallId":"toolu_x","status":"completed"}"#;
+        let back: AgentEvent = serde_json::from_str(wire).unwrap();
+        assert!(
+            matches!(back.kind, AgentEventKind::ToolCallUpdated(_)),
+            "legacy flat tool_call_updated must recover, got {:?}",
+            back.kind
+        );
+    }
+
+    /// New nested tool-call records (post-fix shape) round-trip through the
+    /// ordered reader exactly as the legacy ones do.
+    #[test]
+    fn nested_tool_call_round_trips_through_ordered_reader() {
+        let tc: ToolCall =
+            serde_json::from_str(r#"{"toolCallId":"t9","title":"Run","kind":"execute"}"#).unwrap();
+        let e = ev(AgentEventKind::ToolCallStarted(tc));
+        let wire = serde_json::to_string(&e).unwrap();
+        assert!(wire.contains(r#""tool_call":{"#), "writes nested: {wire}");
+        let back: AgentEvent = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, e);
+    }
+
+    /// 100%-certainty check against the user's REAL WAL(s): every record tagged
+    /// as a tool call must recover (never land in `Unknown`). Opt-in (reads
+    /// `~/.sketch/wal`) so CI / other machines skip it; run with
+    /// `SKETCH_WAL_RECOVER_CHECK=1 cargo test`.
+    #[test]
+    fn real_wal_tool_calls_all_recover_when_present() {
+        if std::env::var("SKETCH_WAL_RECOVER_CHECK").as_deref() != Ok("1") {
+            return;
+        }
+        let Some(home) = dirs::home_dir() else { return };
+        let wal_dir = home.join(".sketch").join("wal");
+        let Ok(entries) = std::fs::read_dir(&wal_dir) else {
+            return;
+        };
+        let mut checked = 0usize;
+        let mut dropped = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("log") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in content.lines() {
+                // Tool-call records carry the tag textually (legacy lines have a
+                // DUPLICATE `kind`, so a Value-based check would miss them).
+                if !(line.contains(r#""kind":"tool_call_started""#)
+                    || line.contains(r#""kind":"tool_call_updated""#))
+                {
+                    continue;
+                }
+                // The WAL line wraps the event: {"t":..,"type":..,"event":<OBJ>}.
+                // Parse <OBJ> from the RAW bytes (NOT via serde_json::Value,
+                // which would collapse the duplicate `kind` and defeat the test).
+                // "event" is the last key, so <OBJ> runs to the final `}`.
+                let marker = "\"event\":";
+                let Some(pos) = line.find(marker) else {
+                    continue;
+                };
+                let obj = line[pos + marker.len()..].trim_end();
+                let obj = obj.strip_suffix('}').unwrap_or(obj); // drop wrapper close
+                checked += 1;
+                match serde_json::from_str::<AgentEvent>(obj) {
+                    Ok(ev) if matches!(ev.kind, AgentEventKind::Unknown { .. }) => dropped += 1,
+                    Ok(_) => {}
+                    Err(_) => dropped += 1,
+                }
+            }
+        }
+        assert_eq!(
+            dropped, 0,
+            "all {checked} real tool-call WAL records must recover; {dropped} still dropped"
+        );
+        eprintln!("[wal-recover-check] {checked} tool-call records, all recovered");
     }
 
     /// The load-bearing spec §8 guarantee: an older decoder lands an unknown
