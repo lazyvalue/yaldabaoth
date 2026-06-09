@@ -1778,19 +1778,6 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             }
                         };
                         if loaded {
-                            // session/load synthesises a whole prior conversation
-                            // via session/update notifications, then returns *after*
-                            // the last one — it never fires a session/prompt
-                            // response. Emit an explicit end-of-replay marker
-                            // (Finding 13, INV-4) instead of bumping the turn
-                            // counter and letting the App infer turn-end from a
-                            // transiently-empty queue. Ordered strictly after the
-                            // replay burst (all handler events and this one share
-                            // `event_tx`), it tells the App to finalize exactly once
-                            // — ensuring an editable line below the frozen content —
-                            // and never mid-replay.
-                            let _ = event_tx_for_driver
-                                .send(WorkerEvent::Reply(ReplyEvent::ReplayComplete));
                             SessionId::new(id.clone())
                         } else {
                             match connection
@@ -1826,6 +1813,35 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             }
                         }
                     };
+                    // === End-of-replay marker — emitted on EVERY spawn that
+                    //     ATTEMPTED a resume, regardless of outcome.
+                    //
+                    // session/load synthesises the whole prior conversation via
+                    // session/update notifications, then returns *after* the
+                    // last one — it never fires a session/prompt response. The
+                    // marker (Finding 13, INV-4) replaces the old post-load
+                    // turn-counter bump: it tells the App to finalize the
+                    // replayed prefix exactly once, and never mid-replay. On
+                    // the load-ok path the replay burst shares `event_tx` with
+                    // this send, so the marker orders strictly after the last
+                    // replayed event and strictly before any live one.
+                    //
+                    // It MUST also fire on the fallback paths (load error /
+                    // load timeout / agent without loadSession → session/new):
+                    // a consumer that already holds the history — the session-
+                    // server's recovered event_log — arms a replay fence and
+                    // discards everything before this marker. If the marker
+                    // only fired on success, a fallback would leave that fence
+                    // up forever and every subsequent live event would be
+                    // silently discarded (the resume-hang bug, take two). A
+                    // timed-out load's abandoned request may still trickle
+                    // late replay notifications in AFTER the marker; those
+                    // then record as live events — a known, bounded
+                    // duplication hazard, strictly better than the wedge.
+                    if resume_session_id.is_some() {
+                        let _ = event_tx_for_driver
+                            .send(WorkerEvent::Reply(ReplyEvent::ReplayComplete));
+                    }
                     acp_debug!("session ready: {session_id:?}");
                     if let Ok(mut slot) = session_id_slot.lock() {
                         *slot = Some(session_id.0.to_string());

@@ -286,10 +286,19 @@ enum Command {
         sid: ServerSessionId,
         handle: TransportHandle,
         is_respawn: bool,
+        /// The spawn attempted `session/load` (it had a resume id) — arms the
+        /// replay fence and is recorded as `ChannelOpened { resumed }`.
+        resumed: bool,
         // On success: (committed generation, gen_watch subscription, replay
-        // fence) — everything the OWNING pump needs to drive + self-terminate.
-        // `None` if the session was closed while spawning.
-        reply: tokio::sync::oneshot::Sender<Option<(u64, watch::Receiver<u64>, usize)>>,
+        // fence, turn base) — everything the OWNING pump needs to drive +
+        // self-terminate. `turn base` is the session's settled turn count at
+        // publish: the channel's own counter restarts at 0 every spawn, so the
+        // pump reports TurnCounts as `base + channel count` to keep the
+        // durable numbering monotonic. `None` if the session was closed while
+        // spawning.
+        // type alias would hurt readability here more than help
+        #[allow(clippy::type_complexity)]
+        reply: tokio::sync::oneshot::Sender<Option<(u64, watch::Receiver<u64>, usize, usize)>>,
     },
     SpawnFailed {
         sid: ServerSessionId,
@@ -306,6 +315,13 @@ enum Command {
         sid: ServerSessionId,
         generation: u64,
         turns: usize,
+    },
+    /// The pump observed the worker's end-of-replay marker on a resumed
+    /// channel and dropped its fence; clear the actor's copy so a later
+    /// `PublishChannel` doesn't seed a new pump with a stale fence.
+    ReplayDone {
+        sid: ServerSessionId,
+        generation: u64,
     },
     AgentDisconnected {
         sid: ServerSessionId,
@@ -411,11 +427,14 @@ struct ManagedSession {
     /// offset so a trim never re-aliases a client's acked `seq`. The on-disk WAL
     /// stays append-only / unbounded.
     event_log: sketch::event_log::EventLog,
-    /// Persisted turn count at restore time. The pump thread suppresses
-    /// logging while the ACP agent's turn counter is ≤ this value, since
-    /// those events are replays of turns already in `event_log`. Once the
-    /// agent moves past the fence (a genuinely new turn), normal logging
-    /// resumes. Zero for fresh (non-restored) sessions.
+    /// Replay-fence arm state, re-derived at every channel publish
+    /// (`apply_channel_state`): nonzero (the settled turn count) when the
+    /// channel was spawned with a resume id AND `event_log` already holds the
+    /// history `session/load` will re-emit. The pump suppresses Records while
+    /// its (marker-based, see `sketch::replay_fence`) fence is up and sends
+    /// `ReplayDone` when the worker's end-of-replay marker clears it; this
+    /// field is the actor's mirror so a later publish never seeds a pump with
+    /// a stale fence. Zero for fresh sessions and non-resumed channels.
     replay_fence: usize,
     /// Durable write-ahead log for this session (ADR-0009). Every logged event
     /// is appended here so a crash (not just a clean shutdown) preserves the
@@ -741,7 +760,18 @@ impl ManagedSession {
     /// Unlike the old client-owning version this returns nothing: the actor only
     /// ever holds the cheap Send `TransportHandle`; the owning `AcpChannelClient`
     /// (and its blocking `Drop`) lives on the pump's OS thread.
-    fn apply_channel_state(&mut self, mut handle: TransportHandle, is_respawn: bool) {
+    /// `resumed` = the spawn ATTEMPTED `session/load` (it had a resume id), so
+    /// the worker will emit an end-of-replay marker after its handshake. That
+    /// is the only condition under which the replay fence may be armed: an
+    /// unarmed channel never emits the marker, and a fence with no marker
+    /// coming never clears — discarding every live event forever (the
+    /// resume-hang bug).
+    fn apply_channel_state(
+        &mut self,
+        mut handle: TransportHandle,
+        is_respawn: bool,
+        resumed: bool,
+    ) {
         handle.set_permission_mode(self.permission_mode);
         for text in std::mem::take(&mut self.pending_prompts) {
             if let Err(e) = handle.send(&text) {
@@ -775,6 +805,16 @@ impl ManagedSession {
         }
         handle.generation = self.channel_generation;
         self.channel = Some(handle);
+        // Arm (or disarm) the replay fence for THIS channel. A resumed channel
+        // re-emits `self.turns` turns of history that are already in
+        // `event_log` — the pump suppresses them until the worker's
+        // end-of-replay marker (`ReplayComplete`). `self.turns == 0` (a fresh
+        // session adopting an existing ACP session via create-with-resume)
+        // leaves the fence down: the log is empty, so the replay is exactly
+        // the content we WANT recorded. A non-resumed channel emits no
+        // marker, so any stale fence from a prior channel MUST be cleared
+        // here or it would discard the new channel's live events forever.
+        self.replay_fence = if resumed { self.turns } else { 0 };
         // ADDITIVE (spec §4/§9): emit `ChannelOpened` as the FIRST event of this
         // (re)spawned channel, BEFORE `SessionAttached`. `resumed` is true when
         // we are reconnecting to an existing ACP session id (the respawn /
@@ -790,9 +830,11 @@ impl ManagedSession {
         // assume these envelopes are worker-sourced: the worker-sourced emission
         // (§4 "emit before the load RPC") is a later-phase move; today the SERVER
         // stamps the generation + seq 0 at this site.
-        self.record_agent(sketch::agent_event::channel_opened_kind(
-            acp_session_id.is_some(),
-        ));
+        // `resumed` here is the real resume-attempted flag — NOT
+        // `acp_session_id.is_some()`, which is true for every successful
+        // handshake (session/new also yields an id) and so mislabeled fresh
+        // channels as resumed.
+        self.record_agent(sketch::agent_event::channel_opened_kind(resumed));
         self.record(Notification::SessionAttached {
             session_id: self.id.clone(),
             acp_session_id,
@@ -1219,7 +1261,7 @@ fn spawn_resume_worker(
                     // gen 0, so the second is an idempotent no-op (its
                     // `reset_for_replay` would just rebuild the same prefix). Noted
                     // so a future reader doesn't treat the duplicate as a bug.
-                    publish_channel(&cmd_tx, &session_id, client, false);
+                    publish_channel(&cmd_tx, &session_id, client, false, true);
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1384,15 +1426,17 @@ impl Manager {
                 sid,
                 handle,
                 is_respawn,
+                resumed,
                 reply,
             } => {
                 let published = match self.sessions.get_mut(&sid) {
                     Some(s) => {
-                        s.apply_channel_state(handle, is_respawn);
+                        s.apply_channel_state(handle, is_respawn, resumed);
                         Some((
                             s.channel_generation,
                             s.gen_watch.subscribe(),
                             s.replay_fence,
+                            s.turns,
                         ))
                     }
                     None => None,
@@ -1450,12 +1494,12 @@ impl Manager {
                 if generation != s.channel_generation {
                     return; // stale reader (superseded by a restart)
                 }
-                // A `turns <= replay_fence` signal is the pump telling us replay
-                // is complete: clear the fence, no TurnEnded for a replay turn.
-                if s.replay_fence > 0 && turns <= s.replay_fence {
-                    s.replay_fence = 0;
-                    return;
-                }
+                // The pump's `turns` is already session-absolute (its
+                // `turn_base` + the channel-local live count), and replay
+                // never produces a TurnCount (the fence clears on the
+                // end-of-replay marker via `ReplayDone`, not on a turn
+                // number) — so every TurnCount that lands here is a real,
+                // completed live turn.
                 s.turns = turns;
                 let channel_generation = s.channel_generation;
                 // ADDITIVE (spec §9): record the canonical AgentEvent TurnEnded
@@ -1485,6 +1529,15 @@ impl Manager {
                     turn_count: turns,
                     generation: channel_generation,
                 });
+            }
+            Command::ReplayDone { sid, generation } => {
+                let Some(s) = self.sessions.get_mut(&sid) else {
+                    return;
+                };
+                if generation != s.channel_generation {
+                    return; // stale reader (superseded by a restart)
+                }
+                s.replay_fence = 0;
             }
             Command::AgentDisconnected { sid, generation } => {
                 let Some(s) = self.sessions.get_mut(&sid) else {
@@ -1534,10 +1587,14 @@ impl Manager {
                     std::env::set_var("SKETCH_SESSION_MANAGED", "1");
                 }
                 let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
+                let resumed = resume_session_id.is_some();
                 match spawner.spawn(&cmd, Some(cwd), resume_session_id, SketchFrontend::Gpui) {
                     Ok(client) => {
                         // Fresh spawn → is_respawn = false, generation stays 0.
-                        publish_channel(&cmd_tx, &session_id, client, false);
+                        // `resumed` (create-with-resume) arms nothing here —
+                        // the session's turns are 0, so the fence stays down
+                        // and the adopted history records into the empty log.
+                        publish_channel(&cmd_tx, &session_id, client, false, resumed);
                     }
                     Err(e) => {
                         let _ = cmd_tx.send(Command::SpawnFailed {
@@ -1850,11 +1907,15 @@ impl Manager {
                     std::env::set_var("SKETCH_SESSION_MANAGED", "1");
                 }
                 let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
+                let resumed = resume_id.is_some();
                 match spawner.spawn(&cmd, Some(cwd), resume_id, SketchFrontend::Gpui) {
                     Ok(client) => {
                         // is_respawn=true bumps generation + gen_watch so the OLD
                         // pump self-terminates and drops its client off-actor.
-                        publish_channel(&cmd_tx, &sid, client, true);
+                        // A restart-with-resume replays history already in the
+                        // log → arm the fence (suppress until the marker) so a
+                        // force-restart doesn't double-record the transcript.
+                        publish_channel(&cmd_tx, &sid, client, true, resumed);
                     }
                     Err(e) => {
                         let _ = cmd_tx.send(Command::SpawnFailed {
@@ -1985,6 +2046,7 @@ fn publish_channel(
     session_id: &ServerSessionId,
     client: Box<dyn AgentTransport>,
     is_respawn: bool,
+    resumed: bool,
 ) {
     let handle = client.handle();
     let (reply, rx) = tokio::sync::oneshot::channel();
@@ -1993,6 +2055,7 @@ fn publish_channel(
             sid: session_id.clone(),
             handle,
             is_respawn,
+            resumed,
             reply,
         })
         .is_err()
@@ -2002,7 +2065,7 @@ fn publish_channel(
     }
     // Blocking recv on this OS worker thread — never on the actor task.
     match rx.blocking_recv() {
-        Ok(Some((generation, gen_rx, replay_fence))) => {
+        Ok(Some((generation, gen_rx, replay_fence, turn_base))) => {
             spawn_pump_thread(
                 cmd_tx.clone(),
                 session_id.clone(),
@@ -2010,6 +2073,7 @@ fn publish_channel(
                 generation,
                 gen_rx,
                 replay_fence,
+                turn_base,
             );
         }
         Ok(None) | Err(_) => {
@@ -2036,6 +2100,7 @@ fn spawn_pump_thread(
     my_generation: u64,
     gen_rx: watch::Receiver<u64>,
     initial_replay_fence: usize,
+    turn_base: usize,
 ) {
     std::thread::Builder::new()
         .name(format!("pump-{}", &session_id[..8.min(session_id.len())]))
@@ -2045,10 +2110,11 @@ fn spawn_pump_thread(
             let gen_rx = gen_rx;
 
             let mut last_turns: usize = 0;
-            // Local mirror of the session's replay fence. Suppression decisions
-            // stay pump-side (cycle granularity); the actor only sees Records
-            // that should be logged.
-            let mut replay_fence: usize = initial_replay_fence;
+            // Marker-based replay fence (see `sketch::replay_fence`). The
+            // suppression decision stays pump-side (cycle granularity); the
+            // actor only sees Records that should be logged, plus one
+            // `ReplayDone` when the fence drops.
+            let mut fence = sketch::replay_fence::ReplayFence::new(initial_replay_fence > 0);
 
             const PUMP_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(16);
 
@@ -2094,41 +2160,75 @@ fn spawn_pump_thread(
                 let current_turns = client.turn_count();
                 let turn_ended = !more_pending && current_turns > last_turns;
 
-                let tail_events: Vec<sketch::acp_channel::ReplyEvent> = if turn_ended {
+                let mut tail_events: Vec<sketch::acp_channel::ReplyEvent> = if turn_ended {
                     std::iter::from_fn(|| client.try_recv()).collect()
                 } else {
                     Vec::new()
                 };
 
-                // ── Replay fence: suppress duplicate events ──────────
-                // A restored/resumed session replays prior turns. Drain them
-                // (so the channel doesn't back up) but emit no Records until the
-                // agent moves past the fence. The fence-clear is signalled to
-                // the actor via a TurnCount whose `turns <= replay_fence`.
-                if replay_fence > 0 && current_turns <= replay_fence {
-                    let drained = !events.is_empty();
-                    if turn_ended {
-                        last_turns = current_turns;
-                        if current_turns == replay_fence {
-                            // Replay complete — tell the actor to clear the
-                            // session's fence (no TurnEnded for a replay turn).
-                            let _ = cmd_tx.send(Command::TurnCount {
+                // ── Replay fence: suppress the resume's duplicate history ──
+                // A restored/resumed session replays prior turns that are
+                // already in `event_log`. Drain them (so the channel doesn't
+                // back up) but emit no Records until the worker's
+                // end-of-replay marker (`ReplayComplete`), which orders
+                // strictly after the replay burst and strictly before any
+                // live event.
+                //
+                // The fence MUST key on the marker, not on `turn_count()`:
+                // the channel's counter restarts at 0 every spawn and never
+                // moves during replay (092c218 replaced the post-load bump
+                // with the marker), so a turn-count fence never cleared —
+                // every post-resume event, replayed AND live, was silently
+                // discarded while the agent kept working invisibly (the
+                // "resume hangs" bug).
+                if fence.is_up() {
+                    // Fold any turn-end tail into the batch first so a marker
+                    // landing in the tail can't be dropped with it.
+                    events.append(&mut tail_events);
+                    use sketch::replay_fence::FenceAction;
+                    match fence.on_batch(&events, turn_ended) {
+                        None => unreachable!("fence.is_up() checked above"),
+                        Some(FenceAction::ClearAtMarker { marker_index }) => {
+                            // Replayed duplicates precede the marker; the
+                            // marker itself is recorded (the actor maps it to
+                            // the durable ReplayEnd the GUI finalizes on) and
+                            // everything after it is live.
+                            let _ = cmd_tx.send(Command::ReplayDone {
                                 sid: session_id.clone(),
                                 generation: my_generation,
-                                turns: current_turns,
                             });
-                            replay_fence = 0;
                             tracing::info!(
                                 session_id = %&session_id[..8.min(session_id.len())],
-                                turn = current_turns,
-                                "replay fence cleared"
+                                discarded = marker_index,
+                                "replay fence cleared (end-of-replay marker)"
+                            );
+                            events.drain(..marker_index);
+                        }
+                        Some(FenceAction::ForceClear) => {
+                            // A live turn completed with the fence still up:
+                            // the marker was lost (it is emitted on every
+                            // resume attempt, so this is a defensive valve,
+                            // not an expected path). Unwedge and record what
+                            // remains — the turn's earlier chunks were
+                            // already discarded.
+                            let _ = cmd_tx.send(Command::ReplayDone {
+                                sid: session_id.clone(),
+                                generation: my_generation,
+                            });
+                            tracing::warn!(
+                                session_id = %&session_id[..8.min(session_id.len())],
+                                "replay fence force-cleared by live turn end \
+                                 (missing end-of-replay marker)"
                             );
                         }
+                        Some(FenceAction::Discard) => {
+                            let drained = !events.is_empty();
+                            if !drained && !more_pending {
+                                std::thread::sleep(PUMP_IDLE_SLEEP);
+                            }
+                            continue;
+                        }
                     }
-                    if !drained && !more_pending {
-                        std::thread::sleep(PUMP_IDLE_SLEEP);
-                    }
-                    continue;
                 }
 
                 let drained_events = !events.is_empty();
@@ -2157,10 +2257,16 @@ fn spawn_pump_thread(
                         });
                     }
                     last_turns = current_turns;
+                    // Report session-absolute turns: the channel's counter
+                    // restarts at 0 on every spawn, so a resumed session's
+                    // first live turn is `turn_base + 1` (continuing the
+                    // durable numbering), never 1 — the actor's `s.turns`
+                    // must not regress (envelope `turn` stamps and the WAL's
+                    // `max(turn) + 1` recovery both depend on it).
                     let _ = cmd_tx.send(Command::TurnCount {
                         sid: session_id.clone(),
                         generation: my_generation,
-                        turns: current_turns,
+                        turns: turn_base + current_turns,
                     });
                 }
 

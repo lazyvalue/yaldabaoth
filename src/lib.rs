@@ -19,6 +19,7 @@ pub mod menu;
 pub mod parse;
 pub mod paths;
 pub mod render;
+pub mod replay_fence;
 pub mod session_client;
 pub mod session_proto;
 pub mod session_wal;

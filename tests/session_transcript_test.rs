@@ -752,6 +752,150 @@ fn session_recovered_after_server_crash() {
     );
 }
 
+/// 5b. RESUME LIVENESS — the "resume hangs" regression. Recovery alone (test 5)
+///     is not enough: the recovered session must remain DRIVABLE. After a crash
+///     + respawn the server re-spawns the agent with a resume id; the agent
+///     replays the prior history (which the recovered event_log already holds)
+///     and the pump's replay fence must discard exactly that burst — then let
+///     everything after the worker's end-of-replay marker through.
+///
+///     The bug this pins down: the fence used to wait for the channel's turn
+///     counter to reach the restored turn count, but the counter restarts at 0
+///     on every spawn and only moves on LIVE turns (092c218 replaced the
+///     post-load bump with the `ReplayComplete` marker), so the fence never
+///     cleared and every post-resume event was silently discarded — prompts
+///     looked hung forever while the agent worked invisibly (and in yolo mode,
+///     invisibly was not hypothetically).
+#[test]
+fn recovered_session_is_drivable_after_resume() {
+    let _g = serial_lock();
+    const CHUNKS: usize = 4;
+    // STUB_REPLAY_USER makes the stub's session/load re-emit the user's prior
+    // prompt before its agent chunks — a realistic replay burst the fence must
+    // swallow whole.
+    let knobs: &[(&str, &str)] = &[
+        ("STUB_CHUNKS", "4"),
+        ("STUB_REPLAY_USER", "pre-crash prompt"),
+    ];
+    let mut server = TestServer::start_with_env(knobs);
+    server.activate_env();
+
+    // One completed turn before the crash, so recovery restores turns=1 and
+    // arms the replay fence.
+    let sid = {
+        let client = connect_as("gui-resume");
+        let info = client
+            .create_session(std::env::temp_dir(), "resumetest".into(), None)
+            .expect("create_session");
+        client
+            .attach(&info.session_id, AttachMode::Owner)
+            .expect("attach");
+        client
+            .prompt(&info.session_id, "pre-crash prompt")
+            .expect("prompt");
+        let notes = drain_until(&client, Duration::from_secs(15), |n| {
+            n.iter().any(|note| {
+                matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == info.session_id)
+            })
+        });
+        assert_eq!(
+            count_agent_chunks(&notes),
+            CHUNKS,
+            "turn must complete before the crash; log:\n{}",
+            server.read_log()
+        );
+        info.session_id
+    };
+
+    server.crash();
+    let server2 = server.respawn(knobs);
+
+    // Wait for recovery, then attach. The attach tail replays the recovered
+    // WAL; the resume's end-of-replay marker is recorded strictly after it
+    // (the pump records the marker when it clears the fence), so seeing the
+    // marker means the resume settled AND everything before it was delivered.
+    let client2 = connect_as("gui-resume");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(sessions) = client2.list_sessions()
+            && sessions.iter().any(|s| s.session_id == sid)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    client2
+        .attach(&sid, AttachMode::Owner)
+        .expect("re-attach recovered session");
+    let replay = drain_until(&client2, Duration::from_secs(15), |n| {
+        n.iter().any(|note| {
+            matches!(
+                note,
+                Notification::ReplyEvent {
+                    event: sketch::acp_channel::ReplyEvent::ReplayComplete,
+                    ..
+                }
+            )
+        })
+    });
+    assert_eq!(
+        count_agent_chunks(&replay),
+        CHUNKS,
+        "the attach tail must hold exactly the recovered transcript — more \
+         means the fence leaked the resume's replay burst into the log \
+         (double-record), fewer means recovery lost chunks; log:\n{}",
+        server2.read_log()
+    );
+    // The stub's replayed user echo (ReplyEvent::UserMessage) is pre-marker
+    // replay and must have been discarded by the fence; the durable
+    // UserPrompt record is the only copy of the user's prompt.
+    assert!(
+        !replay.iter().any(|n| matches!(
+            n,
+            Notification::ReplyEvent {
+                event: sketch::acp_channel::ReplyEvent::UserMessage(_),
+                ..
+            }
+        )),
+        "the resume's replayed user echo leaked past the fence; replay={replay:#?}"
+    );
+
+    // THE REGRESSION: drive a NEW turn on the recovered session. Pre-fix, the
+    // wedged fence discarded the agent's entire response and this drain came
+    // back empty (the user-visible "resume hangs").
+    client2
+        .prompt(&sid, "post-resume prompt")
+        .expect("prompt recovered session");
+    let live = drain_until(&client2, Duration::from_secs(15), |n| {
+        n.iter().any(
+            |note| matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == sid),
+        )
+    });
+    assert_eq!(
+        count_agent_chunks(&live),
+        CHUNKS,
+        "the post-resume turn's chunks must reach the client — a recovered \
+         session must stay drivable; log:\n{}",
+        server2.read_log()
+    );
+    // Turn numbering continues from the restored count: the channel's own
+    // counter restarted at 0, so without the pump's turn_base offset this
+    // would regress to 1 (and the WAL's max(turn)+1 recovery would corrupt).
+    assert!(
+        live.iter().any(|n| matches!(
+            n,
+            Notification::TurnEnded { session_id, turn_count, .. }
+                if *session_id == sid && *turn_count == 2
+        )),
+        "post-resume TurnEnded must carry turn_count=2 (continuing the \
+         restored count of 1), got: {:#?}\nlog:\n{}",
+        live.iter()
+            .filter(|n| matches!(n, Notification::TurnEnded { .. }))
+            .collect::<Vec<_>>(),
+        server2.read_log()
+    );
+}
+
 /// 6. SLOW-SUBSCRIBER DISCONNECT (phase-7 liveness hardening). A subscriber
 ///    whose socket stops draining must NOT be able to park its forwarder task +
 ///    fd forever. The forwarder bounds every socket write by
