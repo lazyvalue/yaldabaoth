@@ -367,6 +367,19 @@ fn allow_tool_kind(mode: PermissionMode, kind: ToolKind) -> bool {
 /// package is republished under that name.
 pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-code-acp", "claude-agent-acp"];
 
+/// How long to wait for `session/load` (resume) before giving up and spawning a
+/// fresh `session/new`. `session/load` returns only AFTER the agent re-emits the
+/// session's ENTIRE prior conversation as `session/update` notifications, so a
+/// big session (verified: ~700 replayed events) legitimately takes a while —
+/// the timeout must be generous enough to let such a replay COMPLETE so the
+/// resumed context is kept, and only fire on a TRUE hang (observed: a stale id
+/// left the adapter stuck in `session/load` for 20+ min). 5 minutes comfortably
+/// clears even a very large progressing replay while still bounding a real hang
+/// to one bounded wait per (re)spawn. (An idle/progress-based timeout would be
+/// tighter, but the load future is opaque here; a generous total bound is the
+/// safe, simple choice that never falsely discards a recoverable session.)
+const SESSION_LOAD_TIMEOUT_SECS: u64 = 300;
+
 /// Constructor seam for an [`AgentTransport`] (Phase 6, spec-session-server-actor
 /// §Rollout). The pump thread never builds the client — the session-server's
 /// three spawn workers (create / restart / resume) do. Abstracting *spawning*
@@ -1729,44 +1742,70 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             cwd.clone(),
                         )
                         .meta(claude_code_meta());
-                        match connection.send_request(load_req).block_task().await {
-                            Ok(_resp) => {
+                        // A stale / GC'd / otherwise unloadable resume id can make
+                        // the agent HANG in `session/load` — it never errors and
+                        // never returns, so the existing error-fallback below never
+                        // fires and the session is left permanently channel-less
+                        // (every prompt queues with no agent to drive it; observed
+                        // as a recovered session whose adapter sat in session/load
+                        // for 20+ minutes → "no response from claude"). Bound the
+                        // load: on TIMEOUT or error, fall back to a fresh
+                        // session/new so the session is always drivable. The
+                        // transcript is preserved (durable WAL); only the agent's
+                        // resumed context is lost — identical to the error path.
+                        let load_fut = connection.send_request(load_req).block_task();
+                        let loaded = match tokio::time::timeout(
+                            std::time::Duration::from_secs(SESSION_LOAD_TIMEOUT_SECS),
+                            load_fut,
+                        )
+                        .await
+                        {
+                            Ok(Ok(_resp)) => {
                                 acp_debug!("session/load ok: {id}");
-                                // session/load synthesises a whole prior
-                                // conversation via session/update
-                                // notifications, then returns this response
-                                // *after* the last one — it never fires a
-                                // session/prompt response. Emit an explicit
-                                // end-of-replay marker (Finding 13, INV-4)
-                                // instead of bumping the turn counter and
-                                // letting the App infer turn-end from a
-                                // transiently-empty queue. Ordered strictly
-                                // after the replay burst (all handler events
-                                // and this one share `event_tx`), it tells the
-                                // App to finalize exactly once — ensuring an
-                                // editable line below the frozen content —
-                                // and never mid-replay.
-                                let _ = event_tx_for_driver
-                                    .send(WorkerEvent::Reply(ReplyEvent::ReplayComplete));
-                                SessionId::new(id.clone())
+                                true
                             }
-                            Err(e) => {
-                                acp_debug!("session/load failed ({e}); falling back to session/new");
-                                match connection
-                                    .send_request(
-                                        NewSessionRequest::new(cwd.clone())
-                                            .meta(claude_code_meta()),
-                                    )
-                                    .block_task()
-                                    .await
-                                {
-                                    Ok(r) => r.session_id,
-                                    Err(e2) => {
-                                        let _ = ready_tx.send(Err(io::Error::other(format!(
-                                            "ACP new session failed (after load fallback): {e2}"
-                                        ))));
-                                        return Err(e2);
-                                    }
+                            Ok(Err(e)) => {
+                                acp_debug!(
+                                    "session/load failed ({e}); falling back to session/new"
+                                );
+                                false
+                            }
+                            Err(_elapsed) => {
+                                acp_debug!(
+                                    "session/load timed out after {SESSION_LOAD_TIMEOUT_SECS}s; falling back to session/new"
+                                );
+                                false
+                            }
+                        };
+                        if loaded {
+                            // session/load synthesises a whole prior conversation
+                            // via session/update notifications, then returns *after*
+                            // the last one — it never fires a session/prompt
+                            // response. Emit an explicit end-of-replay marker
+                            // (Finding 13, INV-4) instead of bumping the turn
+                            // counter and letting the App infer turn-end from a
+                            // transiently-empty queue. Ordered strictly after the
+                            // replay burst (all handler events and this one share
+                            // `event_tx`), it tells the App to finalize exactly once
+                            // — ensuring an editable line below the frozen content —
+                            // and never mid-replay.
+                            let _ = event_tx_for_driver
+                                .send(WorkerEvent::Reply(ReplyEvent::ReplayComplete));
+                            SessionId::new(id.clone())
+                        } else {
+                            match connection
+                                .send_request(
+                                    NewSessionRequest::new(cwd.clone()).meta(claude_code_meta()),
+                                )
+                                .block_task()
+                                .await
+                            {
+                                Ok(r) => r.session_id,
+                                Err(e2) => {
+                                    let _ = ready_tx.send(Err(io::Error::other(format!(
+                                        "ACP new session failed (after load fallback): {e2}"
+                                    ))));
+                                    return Err(e2);
                                 }
                             }
                         }
