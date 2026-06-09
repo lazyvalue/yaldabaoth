@@ -8487,10 +8487,19 @@ impl SketchGpuiView {
         cx: &mut Context<Self>,
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
-        let Some(b) = self.browser_mut() else { return };
-        if !b.fb.filter_mode {
+        let filter_mode = match self.browser_mut() {
+            Some(b) => b.fb.filter_mode,
+            None => return,
+        };
+        if !filter_mode {
+            // Not filtering — bare `m`/`'` starts a mark chord so browser
+            // panes can be marked/jumped like any other pane.
+            if self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
+                cx.stop_propagation();
+            }
             return;
         }
+        let Some(b) = self.browser_mut() else { return };
         match press.key {
             Key::Esc => {
                 b.fb.clear_filter();
@@ -15553,6 +15562,27 @@ impl SketchGpuiView {
             .agent_mut()
             .map(|c| c.input_surface.is_chatbox())
             .unwrap_or(false);
+
+        // Bare `m`/`'` in NORMAL mode starts a mark chord — agent panes are
+        // markable/jumpable like any other pane. Insert mode is untouched so
+        // typing `m`/`'` into the chatbox/worksheet still works.
+        let in_normal = if in_chatbox {
+            self.agent_mut()
+                .and_then(|c| {
+                    c.input_surface
+                        .chatbox_mut()
+                        .map(|cb| cb.mode == EditMode::Normal)
+                })
+                .unwrap_or(false)
+        } else {
+            self.agent_mut()
+                .map(|c| c.mode == EditMode::Normal)
+                .unwrap_or(false)
+        };
+        if in_normal && self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
+            return;
+        }
+
         if in_chatbox {
             let outcome = {
                 let claude = match self.agent_mut() {
