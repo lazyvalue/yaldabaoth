@@ -14094,6 +14094,34 @@ impl SketchGpuiView {
                 ServerNotification::SessionRenamed { session_id, label } => {
                     self.reconcile_session_renamed(&session_id, &label);
                 }
+                ServerNotification::PromptRejected {
+                    session_id,
+                    reason,
+                    text,
+                } => {
+                    // The server refused the prompt (another window holds the
+                    // lease). The optimistic echo is already frozen in the
+                    // transcript, so without this notice the message would
+                    // LOOK sent while the agent never received it. Say so in
+                    // the transcript + status line, and put the text back in
+                    // the chatbox (only if the user hasn't typed something
+                    // new) so a resubmit is one keypress.
+                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                        let msg = format!("✗ message NOT delivered: {reason}");
+                        Self::append_system_notice(&mut slot.state, &msg);
+                        slot.state.status = Some(msg.into());
+                        if let Some(cb) = slot.state.input_surface.chatbox_mut()
+                            && cb.text().trim().is_empty()
+                        {
+                            let mut fresh = Chatbox::new();
+                            for ch in text.chars() {
+                                fresh.editor.insert_char(ch);
+                            }
+                            *cb = fresh;
+                        }
+                    });
+                    warn_unrouted(routed, &session_id);
+                }
             }
         }
         // Single follow-scroll per session that streamed this batch, instead of

@@ -417,6 +417,24 @@ pub enum Notification {
         session_id: ServerSessionId,
         label: String,
     },
+
+    /// The server REFUSED a prompt (lease not held). Sent only to the
+    /// connection that issued the prompt — transient, never recorded.
+    ///
+    /// Exists because the GUI's `prompt()` is deliberately fire-and-forget
+    /// (a round-trip would park the paint thread), so the `Response::Error`
+    /// for the request has no waiter and is dropped by the reader. Without
+    /// this notification a rejected prompt was COMPLETELY invisible: the GUI
+    /// had already rendered the optimistic echo, so the message looked sent
+    /// while the server had silently discarded it.
+    #[serde(rename = "prompt_rejected")]
+    PromptRejected {
+        session_id: ServerSessionId,
+        reason: String,
+        /// The rejected prompt text, so the GUI can offer it back (restore
+        /// into the chatbox) instead of making the user retype it.
+        text: String,
+    },
 }
 
 // ── Socket path helpers ────────────────────────────────────────────

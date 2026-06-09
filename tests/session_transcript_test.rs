@@ -485,6 +485,201 @@ fn mid_turn_reconnect_no_corruption() {
     );
 }
 
+/// 3b. MID-TURN PROMPT QUEUEING. A prompt sent while a turn is still streaming
+///     must not be dropped: the channel driver is serial (one session/prompt in
+///     flight; later prompts wait in an unbounded queue), so prompt B runs as
+///     the next turn after A completes. Pins the server+channel half of the
+///     "messages I send mid-turn are dropped" report — if this passes, a drop
+///     is client-side (GUI gating / lease rejection invisible to the user).
+#[test]
+fn midturn_prompt_queues_and_runs_next_turn() {
+    let _g = serial_lock();
+    const CHUNKS: usize = 40;
+    // 25ms/chunk → ~1s turn: a wide window to land a second prompt mid-stream.
+    let server = TestServer::start_with_env(&[("STUB_CHUNKS", "40"), ("STUB_DELAY_MS", "25")]);
+    server.activate_env();
+
+    let client = connect_as("gui-midturn-queue");
+    let info = client
+        .create_session(std::env::temp_dir(), "midturn-queue".into(), None)
+        .expect("create_session");
+    let sid = info.session_id.clone();
+    client
+        .attach(&sid, AttachMode::Owner)
+        .expect("attach owner");
+
+    client.prompt(&sid, "turn A").expect("prompt A");
+    // Wait until turn A is verifiably mid-stream (some chunks, not all).
+    let partial = drain_until(&client, Duration::from_secs(10), |n| {
+        count_agent_chunks(n) >= 3
+    });
+    let saw = count_agent_chunks(&partial);
+    assert!(
+        (3..CHUNKS).contains(&saw),
+        "prompt B must land mid-turn (saw {saw} of {CHUNKS} chunks); increase STUB_DELAY_MS\nlog:\n{}",
+        server.read_log()
+    );
+
+    // The mid-turn send under test.
+    client.prompt(&sid, "turn B").expect("prompt B mid-turn");
+
+    // Both turns must complete: drain to TurnEnded(2).
+    let rest = drain_until(&client, Duration::from_secs(30), |n| {
+        n.iter().any(|note| {
+            matches!(note, Notification::TurnEnded { session_id, turn_count, .. }
+                if *session_id == sid && *turn_count >= 2)
+        })
+    });
+    assert!(
+        rest.iter().any(|n| matches!(
+            n,
+            Notification::TurnEnded { session_id, turn_count, .. }
+                if *session_id == sid && *turn_count == 2
+        )),
+        "turn B (sent mid-turn) must run as the next turn — a mid-turn prompt \
+         must never be dropped; got TurnEndeds: {:#?}\nlog:\n{}",
+        rest.iter()
+            .filter(|n| matches!(n, Notification::TurnEnded { .. }))
+            .collect::<Vec<_>>(),
+        server.read_log()
+    );
+    // Turn B's payload arrived too: A's remaining chunks + B's full set.
+    let total_after = count_agent_chunks(&rest);
+    assert_eq!(
+        saw + total_after,
+        2 * CHUNKS,
+        "expected the rest of A plus all of B ({} chunks), got {total_after} after {saw} partial\nlog:\n{}",
+        2 * CHUNKS - saw,
+        server.read_log()
+    );
+    // And the durable log holds BOTH user prompts.
+    for want in ["turn A", "turn B"] {
+        assert!(
+            partial.iter().chain(rest.iter()).any(|n| matches!(
+                n,
+                Notification::UserPrompt { text, .. } if text == want
+            )),
+            "user prompt {want:?} missing from the stream\nlog:\n{}",
+            server.read_log()
+        );
+    }
+}
+
+/// 3c. ACTION-AS-LIVENESS: a prompt from the lease holder whose lease has
+///     EXPIRED (no heartbeats — e.g. an App-Napped window) must re-grant the
+///     lease and deliver, not be refused. Pre-fix, `do_prompt` used the strict
+///     `holds_lease` gate, so the first post-wake prompt raced the 5s
+///     heartbeat reclaim and lost — silently, because `prompt()` is
+///     fire-and-forget (the other half of the "messages sent mid-turn are
+///     dropped" report).
+#[test]
+fn prompt_from_expired_same_client_regrants_lease_and_delivers() {
+    let _g = serial_lock();
+    // 300ms TTL so the lease verifiably lapses between turns; the sweep
+    // (5s cadence) may or may not have cleared it to None — the gate must
+    // handle both (expired-same-id renew AND free-claim).
+    let server =
+        TestServer::start_with_env(&[("STUB_CHUNKS", "3"), ("SKETCH_LEASE_TTL_MS", "300")]);
+    server.activate_env();
+
+    let client = connect_as("gui-napped");
+    let info = client
+        .create_session(std::env::temp_dir(), "naptest".into(), None)
+        .expect("create_session");
+    let sid = info.session_id.clone();
+    client
+        .attach(&sid, AttachMode::Owner)
+        .expect("attach owner");
+
+    client.prompt(&sid, "turn 1").expect("prompt 1");
+    drain_until(&client, Duration::from_secs(15), |n| {
+        n.iter().any(
+            |note| matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == sid),
+        )
+    });
+
+    // Let the lease lapse with NO heartbeat (the napped-window simulation).
+    std::thread::sleep(Duration::from_millis(700));
+
+    // The post-wake prompt itself must reclaim the lease and drive a turn.
+    client.prompt(&sid, "turn 2 after nap").expect("prompt 2");
+    let after = drain_until(&client, Duration::from_secs(15), |n| {
+        n.iter().any(|note| {
+            matches!(note, Notification::TurnEnded { session_id, turn_count, .. }
+                if *session_id == sid && *turn_count >= 2)
+        })
+    });
+    assert!(
+        after.iter().any(|n| matches!(
+            n,
+            Notification::TurnEnded { session_id, turn_count, .. }
+                if *session_id == sid && *turn_count == 2
+        )),
+        "a prompt from the same client with a lapsed lease must re-grant and \
+         deliver (action-as-liveness), not be silently refused; log:\n{}",
+        server.read_log()
+    );
+}
+
+/// 3d. REJECTED PROMPTS ARE VISIBLE: a prompt refused because ANOTHER window
+///     holds a live lease must come back as a `PromptRejected` notification on
+///     the submitter's own stream (carrying the text so the GUI can restore
+///     it). `prompt()` is fire-and-forget, so without this the rejection had
+///     no observable effect anywhere.
+#[test]
+fn rejected_prompt_surfaces_prompt_rejected_notification() {
+    let _g = serial_lock();
+    let server = TestServer::start_with_env(&[("STUB_CHUNKS", "2")]);
+    server.activate_env();
+
+    // A: the live lease holder (default 15s TTL — stays live for the test).
+    let owner = connect_as("gui-owner");
+    let info = owner
+        .create_session(std::env::temp_dir(), "rejecttest".into(), None)
+        .expect("create_session");
+    let sid = info.session_id.clone();
+    owner.attach(&sid, AttachMode::Owner).expect("attach owner");
+
+    // B: different client_id; Owner attach silently downgrades to observer
+    // while A's lease is live.
+    let interloper = connect_as("gui-interloper");
+    interloper
+        .attach(&sid, AttachMode::Owner)
+        .expect("attach interloper");
+
+    interloper
+        .prompt(&sid, "should be refused")
+        .expect("prompt write");
+    let notes = drain_until(&interloper, Duration::from_secs(10), |n| {
+        n.iter().any(|note| {
+            matches!(note, Notification::PromptRejected { session_id, .. } if *session_id == sid)
+        })
+    });
+    let rejected = notes.iter().find_map(|n| match n {
+        Notification::PromptRejected {
+            session_id,
+            reason,
+            text,
+        } if *session_id == sid => Some((reason.clone(), text.clone())),
+        _ => None,
+    });
+    let (reason, text) = rejected.unwrap_or_else(|| {
+        panic!(
+            "a refused prompt must surface PromptRejected on the submitter's stream; \
+             got: {notes:#?}\nlog:\n{}",
+            server.read_log()
+        )
+    });
+    assert!(
+        reason.contains("lease"),
+        "rejection reason should name the lease: {reason}"
+    );
+    assert_eq!(
+        text, "should be refused",
+        "the rejected text rides the notification so the GUI can restore it"
+    );
+}
+
 /// 4. The literal feature: an agent turn RUNS TO COMPLETION with NO GUI attached.
 ///    The owner prompts and immediately leaves; for the entire turn there are
 ///    zero connections to the server. The turn must still complete and the full

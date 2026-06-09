@@ -1674,29 +1674,10 @@ impl Manager {
         // Instant comparison, and the write share `now` with no await between —
         // the actor IS the mutual exclusion (no TOCTOU, first-claim-wins).
         let mut granted_drive = false;
-        if mode == AttachMode::Owner && !client_id.is_empty() {
-            let acquire = match &session.lease {
-                None => true,                                // free
-                Some(l) if l.client_id == client_id => true, // same id -> resume
-                Some(l) if l.expires_at <= now => true,      // prior holder expired
-                Some(_) => false,                            // different live id
-            };
-            if acquire {
-                let changed_holder =
-                    session.lease.as_ref().map(|l| l.client_id.as_str()) != Some(client_id);
-                session.lease = Some(LeaseState {
-                    client_id: client_id.to_string(),
-                    expires_at: now + lease_ttl(),
-                });
-                granted_drive = true;
-                // Only broadcast on holder CHANGE (never a pure same-id renew),
-                // so each transition fires exactly one LeaseChanged.
-                if changed_holder {
-                    session.broadcast_lease_changed(now);
-                }
-            }
-            // else: silent downgrade to Observer. Attach still Ok with full
-            // replay; granted_drive stays false.
+        if mode == AttachMode::Owner {
+            granted_drive = acquire_or_renew_lease(session, client_id, now);
+            // On refusal: silent downgrade to Observer. Attach still Ok with
+            // full replay; granted_drive stays false.
         }
 
         let lease_rx = session.lease_tx.subscribe();
@@ -1823,10 +1804,10 @@ impl Manager {
             let now = Instant::now();
             let session = self
                 .sessions
-                .get(session_id)
+                .get_mut(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
-            if !holds_lease(session, client_id, now) {
-                return Err("only the lease holder can send prompts".into());
+            if !acquire_or_renew_lease(session, client_id, now) {
+                return Err("another window holds this session's lease".into());
             }
         }
         self.enqueue_prompt(session_id, text)
@@ -1873,8 +1854,8 @@ impl Manager {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if !holds_lease(session, client_id, now) {
-            return Err("only the lease holder can cancel".into());
+        if !acquire_or_renew_lease(session, client_id, now) {
+            return Err("another window holds this session's lease; cancel refused".into());
         }
         if let Some(channel) = session.channel.as_ref() {
             channel.cancel();
@@ -1887,10 +1868,10 @@ impl Manager {
             let now = Instant::now();
             let session = self
                 .sessions
-                .get(session_id)
+                .get_mut(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
-            if !holds_lease(session, client_id, now) {
-                return Err("only the lease holder can restart".into());
+            if !acquire_or_renew_lease(session, client_id, now) {
+                return Err("another window holds this session's lease; restart refused".into());
             }
             let resume = session.channel.as_ref().and_then(|c| c.session_id());
             (session.cwd.clone(), resume)
@@ -1955,8 +1936,8 @@ impl Manager {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if !holds_lease(session, client_id, now) {
-            return Err("only the lease holder can change permission mode".into());
+        if !acquire_or_renew_lease(session, client_id, now) {
+            return Err("another window holds this session's lease; mode change refused".into());
         }
         session.permission_mode = mode;
         if let Some(channel) = &session.channel {
@@ -2021,6 +2002,51 @@ impl Manager {
 /// gate even before a sweep clears it.
 fn holds_lease(session: &ManagedSession, client_id: &str, now: Instant) -> bool {
     !client_id.is_empty() && matches!(&session.lease, Some(l) if l.is_live_for(client_id, now))
+}
+
+/// Deterministic lease acquire-or-renew, shared by Owner attach and the
+/// user-action gates (prompt / cancel / permission-mode / restart):
+///
+///   - free (`None`)                       → first-claim
+///   - same `client_id` (live OR expired)  → resume (renew in place)
+///   - different EXPIRED `client_id`       → claim (holder is gone)
+///   - different LIVE `client_id`          → refuse
+///
+/// A user action is at least as good a liveness proof as a heartbeat
+/// ("ownership follows action", the same way attach makes ownership follow
+/// focus). The strict [`holds_lease`] gate made an App-Napped owner's first
+/// post-wake action race the 5s heartbeat reclaim: the lease had expired (and
+/// usually been swept to `None`), so the action was refused — silently, for
+/// fire-and-forget requests like prompt. That was the "messages sent mid-turn
+/// are dropped" bug; with this gate the action itself reclaims the lease.
+///
+/// On success renews the TTL; broadcasts `LeaseChanged` ONLY on a holder
+/// change (never a pure same-id renew), so each transition fires exactly one
+/// notification. An empty `client_id` always refuses (headless callers hold
+/// no lease — they use the ungated admin paths). Runs on the single-writer
+/// actor, so read + decide + write share `now` with no await between.
+fn acquire_or_renew_lease(session: &mut ManagedSession, client_id: &str, now: Instant) -> bool {
+    if client_id.is_empty() {
+        return false;
+    }
+    let acquire = match &session.lease {
+        None => true,                                // free
+        Some(l) if l.client_id == client_id => true, // same id -> resume
+        Some(l) if l.expires_at <= now => true,      // prior holder expired
+        Some(_) => false,                            // different live id
+    };
+    if acquire {
+        let changed_holder =
+            session.lease.as_ref().map(|l| l.client_id.as_str()) != Some(client_id);
+        session.lease = Some(LeaseState {
+            client_id: client_id.to_string(),
+            expires_at: now + lease_ttl(),
+        });
+        if changed_holder {
+            session.broadcast_lease_changed(now);
+        }
+    }
+    acquire
 }
 
 // ── Session pump task ──────────────────────────────────────────────
@@ -2484,7 +2510,32 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 Ok(()) => Response::Ok {
                     data: ResponseData::Ack,
                 },
-                Err(e) => Response::Error { message: e },
+                Err(e) => {
+                    // The client's `prompt()` is fire-and-forget, so this
+                    // `Response::Error` has no waiter — without more, a
+                    // refused prompt is INVISIBLE while the GUI renders its
+                    // optimistic echo. Surface the rejection on this
+                    // connection's notification stream (transient, never
+                    // recorded — same channel discipline as LeaseChanged) so
+                    // the GUI can tell the user and offer the text back.
+                    tracing::warn!(
+                        session_id = %&session_id[..8.min(session_id.len())],
+                        reason = %e,
+                        "prompt rejected — notifying submitter"
+                    );
+                    let frame = Frame::Notification {
+                        note: Notification::PromptRejected {
+                            session_id: session_id.clone(),
+                            reason: e.clone(),
+                            text,
+                        },
+                    };
+                    if let Ok(mut line) = serde_json::to_string(&frame) {
+                        line.push('\n');
+                        let _ = writer.lock().await.write_all(line.as_bytes()).await;
+                    }
+                    Response::Error { message: e }
+                }
             },
 
             Request::AdminPrompt { session_id, text } => {
