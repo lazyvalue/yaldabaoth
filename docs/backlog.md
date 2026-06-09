@@ -179,18 +179,41 @@ verified via the resilience+transcript harness. Worklogs:
 
 ## Top priority
 
-- **State-first architecture overhaul** — `NEEDS-DECISION`. Root-cause fix for
-  the constant-regression class (30% of state is hand-synced caches/copies). Full
-  state→owner map (162 items), 20-module state-first decomposition, 6 gating
-  decisions (ADRs), and a phased, individually-verifiable migration plan in
-  `docs/specs/spec-state-architecture.md` (+ Appendix A inventory). Immediate
-  items: CI gate (done), keymap-extraction → headless action smokes, worksheet
-  double-render fix. Blocked on D1–D6 for Phase B.
+- **State-first architecture overhaul** — `PHASE-A-DONE / PHASE-B-GATED`
+  (updated 2026-06-08). Root-cause fix for the constant-regression class (30% of
+  state is hand-synced caches/copies). Full state→owner map (162 items),
+  20-module state-first decomposition, 6 gating decisions, and a phased plan in
+  `docs/specs/spec-state-architecture.md` (+ Appendix A inventory).
+  - **Phase A (pure extractions) — essentially complete.** Landed: `replay_turns`
+    field-ownership (`6168157`), `overlay` 5-Options→`ActiveOverlay` enum
+    (`e5be921`), `settings`/text-zoom persist (`e66a54c`), canonical cwd key
+    (`c46f023`), `tool_calls`→owner (`f10486e`), `agent_view_model`→owner
+    (`9253139`), additive `TurnEnded{generation}` (`8cdbdd1`), server `record()`
+    fusion + `apply_channel_state` unify (`74c4f73`), `InputSurface` enum
+    (`761dfe6`), dead-code removal (`15fe390`), `reset_for_replay` delegation
+    (`eca7759`). Deferred-on-purpose: `buffer_pool` (5a, folded into D2) and
+    `DocState` auto-derive (5b, memo half already done).
+  - **Decisions D1–D6 — written.** ADRs 0006–0011 cover them (0007 doc/edit rope
+    = D2, 0008 reconnect semantics = D3, 0009 durability = D4, 0010 cwd = D5,
+    0006/0011 turn-end + crate boundary ≈ D1/D6). No longer a blocker on the user.
+  - **Stop-the-bleeding — done:** CI gate ✅, keymap extraction + headless action
+    smokes ✅, worksheet double-render ✅, `clippy -D warnings` + `fmt --check`
+    quality CI gate ✅ (2026-06-08).
+  - **Phase B (behavior-changing, GPUI-runtime-gated) — HELD, by design.** Not
+    blocked on a decision; blocked on the **verification harness** (GPUI can't be
+    driven headlessly) and on stabilizing the active reconnect path. Remaining:
+    `5c` Doc/Edit single pooled rope (49-site staged rewrite, ADR-0007);
+    `8b` delete turn-end inference in the pumps (needs the worker to actually emit
+    `ReplyEvent::TurnEnded` first — the default worker still doesn't, see
+    `acp_channel.rs:541`; partly superseded by the phase-8 `AgentEvent` stream);
+    `10` reconnect `Arc<Core>` swap (trigger-deferred per ADR-0008);
+    `ChannelAttachState` faithful enum (refactors the live reconnect-storm path —
+    stabilize that first).
 
-- **CI gate** — `READY`. Minimal `build --bins + test` on push/PR
-  (`.github/workflows/ci.yml`), merging via the `arch-overhaul` branch. Turns the
-  human from the only oracle into the fallback. Next: `clippy -D warnings` +
-  `fmt --check` once the 8 existing warnings clear.
+- **CI gate** — `DONE` (2026-06-08). Minimal `build --bins + test` on push/PR
+  (`.github/workflows/ci.yml`) landed; the `quality` job (`clippy -D warnings` +
+  `fmt --all --check`) is now enabled too — the whole tree is clippy-clean and
+  fmt-clean. Turns the human from the only oracle into the fallback.
 
 - **Verification harness** — `READY`. Highest leverage: agents can't drive the
   GPUI app, so everything is human-verified. Build a headless/scripted render +

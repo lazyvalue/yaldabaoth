@@ -155,37 +155,39 @@ most* — the 9 `duplicated-copy` hazards — and their resolution:
 
 ---
 
-## 5. Decisions required (write these ADRs first)
+## 5. Decisions required (write these ADRs first) — ✅ ALL RESOLVED
 
-The overhaul has six forks that are **product/architecture decisions, not
+The overhaul had six forks that are **product/architecture decisions, not
 mechanical** — a migration step whose target behavior is an open question is not
-yet executable. Each becomes a short ADR in `docs/decisions/` before its gated
-step runs.
+yet executable. Each became a short ADR in `docs/decisions/` before its gated
+step runs. **As of 2026-06-08 all six are written** (see the ADR pointer on each
+below); they are no longer a blocker on the user. What remains gated is the
+*execution* of the behavior-changing steps, which is held on the verification
+harness (GPUI can't be driven headlessly), not on any open decision.
 
-- **D1 — Turn-end signal.** Replace the "queue-empty + counter-climbed"
-  inference (re-run in 3 pumps) with an explicit `AcpChannelClient::TurnEnded`
-  event? Or is the inference load-bearing for tool-only turns / compaction?
+- **D1 — Turn-end signal.** ✅ **Resolved (ADR-0006, agent-event-stream).**
+  Replace the "queue-empty + counter-climbed" inference (re-run in 3 pumps) with
+  an explicit turn-end event. Resolution: the phase-8 `AgentEvent` stream carries
+  the explicit `TurnEnded` signal; the additive `TurnEnded{generation}` emit
+  (8a) landed (`8cdbdd1`). The inference is still in place pending the emit-then-
+  observe-then-delete rollout (8b) — held on runtime soak, not on the decision.
   *Gates step 8b.*
-- **D2 — Doc/Edit single rope.** Binding Doc and Edit views of one file to one
-  `SharedCore` makes the Doc view track live edits from a concurrent Edit
-  window. Is that desired, or must Doc be a frozen snapshot until reload?
-  *Gates step 5c.*
-- **D3 — Reconnect handle semantics.** Swap-in-place keeps old
-  `SessionServerHandle`s valid but lets a handle silently target a new server.
-  Desired, or should stale handles fail loudly? *Gates step 10.*
-- **D4 — Server durability.** Add periodic atomic checkpoints + `event_log`
-  compaction/bounding now (turns the forwarder cursor into a logical offset), or
-  defer? *Affects whether `sent`/`replay_fence` stay absolute indices.*
-- **D5 — cwd migration.** Canonicalizing the cwd key orphans existing on-disk
-  entries written under the un-canonicalized key. One-time re-key migration, or
-  is dropping stale entries acceptable? *Gates step 4.*
-- **D6 — Editor metadata store + agent-slice crate boundary.** (a) Collapse the
-  type-erased `LineMetadataStore` to a concrete `line_turn` map, or keep it
-  typed-multi-field for a near-term second metadata type (per-line
-  comments/diagnostics)? (b) Do the pure agent slices (`replay_turns`,
-  `reconciler`, `tool_calls`, `agent_view_model`, `follow_tail`,
-  `highlight_cache`) live in a lib crate (testable without GPUI, reusable by the
-  TUI) or stay in the bin? **Decide before steps 6/7.**
+- **D2 — Doc/Edit single rope.** ✅ **Resolved (ADR-0007, doc-edit-shared-rope).**
+  Binding Doc and Edit views of one file to one `SharedCore` so the Doc view
+  tracks live edits from a concurrent Edit window — decided yes. *Gates step 5c
+  (49-site staged rewrite, held on the harness).*
+- **D3 — Reconnect handle semantics.** ✅ **Resolved (ADR-0008,
+  reconnect-handle-semantics).** Swap-in-place keeps old `SessionServerHandle`s
+  valid; ADR-0008 settles the trigger-deferred semantics. *Gates step 10.*
+- **D4 — Server durability.** ✅ **Resolved (ADR-0009, durable-session-log; +
+  ADR-0016 ringbuffer compaction, ADR-0017 WAL-discard migration).** Durability
+  + compaction landed via the phase-8 eventlog work (logical `log_base` offset).
+- **D5 — cwd migration.** ✅ **Resolved (ADR-0010, canonical-cwd-key).** Drop
+  stale un-canonicalized entries (lazy fallback-read); step 4 landed (`c46f023`).
+- **D6 — Editor metadata store + agent-slice crate boundary.** ✅ **Resolved
+  (ADR-0011, pure-slices-to-lib).** (a) Keep the metadata store typed-multi-field.
+  (b) The pure agent slices land as lib-testable modules. Steps 6/7 done
+  (`f10486e`, `9253139`).
 
 ---
 
@@ -308,12 +310,16 @@ Front-loaded by leverage and verifiability.
    Closed the "single chokepoint with two doors": `register_user_turn` core +
    `commit_worksheet_turn`. (The `replay_turns` field-ownership refactor — the
    other half of A.1 — remains; see item 6.) ⚠️ owes a human runtime check.
-4. `[ ]` Turn on `clippy -D warnings` + `fmt --check` in CI once the 8 existing
-   warnings are cleared (uncomment the staged `quality` job).
+4. `[x]` **DONE (2026-06-08).** `clippy -D warnings` + `fmt --all --check` now
+   gate every push/PR (the `quality` job in `ci.yml` is enabled). The whole tree
+   is clippy-clean and fmt-clean.
 
 **Decisions (write ADRs — unblock Phase B):**
-5. `[~]` D1 turn-end signal · D2 Doc/Edit rope · D3 reconnect semantics ·
-   D4 durability · D5 cwd migration · D6 metadata store + crate boundary.
+5. `[x]` **ALL RESOLVED (2026-06-08).** D1 turn-end signal (ADR-0006) · D2
+   Doc/Edit rope (ADR-0007) · D3 reconnect semantics (ADR-0008) · D4 durability
+   (ADR-0009 + 0016 + 0017) · D5 cwd migration (ADR-0010) · D6 metadata store +
+   crate boundary (ADR-0011). Phase B is now gated on the verification harness,
+   not on any open decision.
 
 **Pure extractions (Phase A — each behind CI, no behavior change):**
 6. Pure extractions — status (full table in `HANDOFF.md`):
