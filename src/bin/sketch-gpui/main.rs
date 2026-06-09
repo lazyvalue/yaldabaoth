@@ -1528,10 +1528,7 @@ fn re_render_layout_docs(layout: &mut workspace::Layout<WindowContent>, theme: &
         workspace::Layout::Empty => {}
         workspace::Layout::Leaf(win) => {
             if let WindowContent::Doc(d) = &mut win.content {
-                let path = PathBuf::from(d.file_label.as_ref());
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let doc = Document::from_text(text, path.clone());
-                d.set_blocks(render_with_wiki(&doc.full_text(), theme, Some(&path)));
+                re_render_one_doc(d, theme);
             }
             // Browser's underlying-stashed content is also restyled if it
             // happens to be a Doc — otherwise reverting via Esc lands on
@@ -1540,16 +1537,38 @@ fn re_render_layout_docs(layout: &mut workspace::Layout<WindowContent>, theme: &
                 && let Some(under) = b.underlying.as_deref_mut()
                 && let WindowContent::Doc(d) = under
             {
-                let path = PathBuf::from(d.file_label.as_ref());
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let doc = Document::from_text(text, path.clone());
-                d.set_blocks(render_with_wiki(&doc.full_text(), theme, Some(&path)));
+                re_render_one_doc(d, theme);
             }
         }
         workspace::Layout::Split { children, .. } => {
             for (_, child) in children.iter_mut() {
                 re_render_layout_docs(child, theme);
             }
+        }
+    }
+}
+
+/// Re-render one Doc's blocks under a new theme. For a pool-bound Doc (5c) the
+/// authority is the *live shared core*, not the file on disk — reading disk
+/// here would silently revert unsaved edits made through a sibling Edit view
+/// (and, because `rendered_seq` wouldn't advance, the per-frame `refresh_blocks`
+/// would not correct it). So source from the live core when present, stamping
+/// `rendered_seq` so the live path stays coherent. Only string-backed Docs
+/// (`source == None`: help/welcome/legacy) fall back to a disk read.
+fn re_render_one_doc(d: &mut DocState, theme: &Theme) {
+    let path = PathBuf::from(d.file_label.as_ref());
+    match d.source.as_ref() {
+        Some(src) => {
+            let seq = src.edit_seq();
+            let text = src.full_text();
+            d.set_blocks(render_with_wiki(&text, theme, Some(&path)));
+            if let Some(src) = d.source.as_mut() {
+                src.rendered_seq = seq;
+            }
+        }
+        None => {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            d.set_blocks(render_with_wiki(&text, theme, Some(&path)));
         }
     }
 }
@@ -18176,6 +18195,71 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 5c / ADR-0007: a theme switch re-renders Doc blocks via `re_render_one_doc`.
+    /// For a pool-bound Doc the authority is the LIVE shared core (unsaved edits
+    /// from a sibling Edit view), not the file on disk. The old code read disk
+    /// here — silently reverting unsaved edits, and (because `rendered_seq` would
+    /// not advance) the per-frame `refresh_blocks` would not self-correct. This
+    /// pins the fix: re-render reflects the live core and stamps `rendered_seq`.
+    #[test]
+    fn re_render_one_doc_sources_live_core_not_disk() {
+        let dir = std::env::temp_dir().join(format!("sketch_rerender_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.md");
+        // Disk holds a single paragraph → exactly one rendered block.
+        std::fs::write(&path, "disk only\n").unwrap();
+
+        let mut ws: workspace::Workspace<WindowContent> = workspace::Workspace::new();
+        let (id, core) = ws.open_and_retain(&path).unwrap();
+
+        // A pool-bound Doc, rendered at the disk content (rendered_seq stamped at
+        // the pristine core).
+        let mut doc = DocState {
+            blocks: render_with_wiki("disk only\n", &Theme::default(), Some(&path)),
+            file_label: path.display().to_string().into(),
+            cursor_block: 0,
+            list_state: DocState::new_list_state(0),
+            list_item_count: std::cell::Cell::new(0),
+            blocks_seq: 0,
+            blocks_snapshot: RefCell::new(None),
+            last_cursor_block: std::cell::Cell::new(None),
+            source: Some(DocSource::new(id, core.clone())),
+        };
+        assert_eq!(doc.blocks.len(), 1, "disk content is one block");
+
+        // Simulate an unsaved edit through a sibling view: append two more
+        // paragraphs that exist ONLY in the live core, never on disk.
+        {
+            let mut c = core.borrow_mut();
+            let d = c.document_mut();
+            let n = d.full_text().chars().count();
+            d.insert_str_at_char(n, "\n\npara two\n\npara three\n");
+        }
+        let live_seq = core.borrow().document().edit_seq();
+        let live_blocks = render_with_wiki(
+            &core.borrow().document().full_text(),
+            &Theme::default(),
+            Some(&path),
+        )
+        .len();
+        assert!(live_blocks >= 3, "live core now has multiple blocks");
+
+        // Theme switch path. Must reflect the LIVE core (≥3 blocks), not disk (1).
+        re_render_one_doc(&mut doc, &Theme::default());
+        assert_eq!(
+            doc.blocks.len(),
+            live_blocks,
+            "re-render must source the live core, not disk"
+        );
+        assert_eq!(
+            doc.source.as_ref().unwrap().rendered_seq,
+            live_seq,
+            "rendered_seq must advance to the live edit_seq so refresh_blocks stays coherent"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// ADR-0010: the canonical on-disk cwd key resolves a symlinked spelling
     /// and the real path to the SAME string (so a session saved under one is

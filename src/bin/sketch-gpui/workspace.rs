@@ -6,8 +6,9 @@
 //! editors live in a pooled `FileBuffer` and may be referenced by multiple
 //! windows simultaneously (shared edits across splits).
 //!
-//! Scope note: the types live here, but wiring them into the live `App` is
-//! staged in follow-up commits — this file establishes the shapes.
+//! Scope note: the file-buffer pool is wired into the live `App` as of 5c
+//! (`open_and_retain` dedup-by-canonical-path + `gc_buffers` strong-count
+//! liveness back every file-backed Doc/Edit view, so splits share a rope).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -341,7 +342,8 @@ impl<C> Tab<C> {
 /// A pooled file-backed editor. One `FileBuffer` per canonical path; refcount
 /// tracks the number of `EditorView`s in the workspace currently bound to it.
 pub struct FileBuffer {
-    // buffer pool intentionally unwired — see ADR-0005 / backlog ff-buffer-pool
+    // unused accessor variant — pool liveness goes through open_and_retain /
+    // buffer_core / gc_buffers (5c). Kept for API symmetry. See ADR-0005/0007.
     #[allow(dead_code)]
     pub id: FileBufferId,
     pub canonical_path: PathBuf,
@@ -349,7 +351,8 @@ pub struct FileBuffer {
     /// that binds to this buffer so edits + undo are shared while the pool
     /// retains its own handle for lookups, modified-checks, and save.
     pub core: SharedCore,
-    // buffer pool intentionally unwired — see ADR-0005 / backlog ff-buffer-pool
+    // unused accessor variant — pool liveness goes through open_and_retain /
+    // buffer_core / gc_buffers (5c). Kept for API symmetry. See ADR-0005/0007.
     #[allow(dead_code)]
     pub file_label: String,
     /// Active EditorViews referencing this core.
@@ -552,13 +555,15 @@ impl<C> Workspace<C> {
         Ok(id)
     }
 
-    // buffer pool intentionally unwired — see ADR-0005 / backlog ff-buffer-pool
+    // unused accessor variant — pool liveness goes through open_and_retain /
+    // buffer_core / gc_buffers (5c). Kept for API symmetry. See ADR-0005/0007.
     #[allow(dead_code)]
     pub fn buffer(&self, id: FileBufferId) -> Option<&FileBuffer> {
         self.file_buffers.get(&id)
     }
 
-    // buffer pool intentionally unwired — see ADR-0005 / backlog ff-buffer-pool
+    // unused accessor variant — pool liveness goes through open_and_retain /
+    // buffer_core / gc_buffers (5c). Kept for API symmetry. See ADR-0005/0007.
     #[allow(dead_code)]
     pub fn buffer_mut(&mut self, id: FileBufferId) -> Option<&mut FileBuffer> {
         self.file_buffers.get_mut(&id)
@@ -617,7 +622,8 @@ impl<C> Workspace<C> {
     /// Decrement the refcount. Drops the buffer from the pool when refcount
     /// hits 0 AND it has no unsaved changes; dirty buffers stay pooled for
     /// recovery via `:buffers` (Behavior 21).
-    // buffer pool intentionally unwired — see ADR-0005 / backlog ff-buffer-pool
+    // unused accessor variant — pool liveness goes through open_and_retain /
+    // buffer_core / gc_buffers (5c). Kept for API symmetry. See ADR-0005/0007.
     #[allow(dead_code)]
     pub fn buffer_release(&mut self, id: FileBufferId) {
         let drop = if let Some(b) = self.file_buffers.get_mut(&id) {
@@ -1068,6 +1074,61 @@ mod tests {
             id,
             content: TestContent(c),
         })
+    }
+
+    // 5c / ADR-0007: two views of the same file share ONE pooled core, so an
+    // edit in one is live in the other and undo is unified. This pins the
+    // structural contract (`open_and_retain` dedups by canonical path) that the
+    // GUI's Doc/Edit panes and splits rely on; it is the headlessly-verifiable
+    // half of the "Doc tracks live Edit edits" behavior (the per-frame
+    // re-render itself needs a GPUI runtime).
+    #[test]
+    fn pool_dedups_by_path_so_two_views_share_one_core() {
+        let dir = std::env::temp_dir().join(format!(
+            "sketch_pool_share_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shared.md");
+        std::fs::write(&path, "hello\n").unwrap();
+
+        let mut ws: Workspace<TestContent> = Workspace::new();
+        let (id1, core1) = ws.open_and_retain(&path).unwrap();
+        let (id2, core2) = ws.open_and_retain(&path).unwrap();
+
+        // Dedup by canonical path: one buffer, two handles onto the SAME core.
+        assert_eq!(id1, id2, "same path must map to one pooled buffer");
+        assert!(
+            Rc::ptr_eq(&core1, &core2),
+            "both views must share one EditorCore"
+        );
+
+        // An edit through one handle is immediately visible through the other.
+        {
+            let mut c = core1.borrow_mut();
+            let doc = c.document_mut();
+            doc.begin_undo_group(0, 0, &[], 0);
+            doc.insert_str(0, 0, "X");
+            doc.end_undo_group(0, 1);
+        }
+        assert!(
+            core2.borrow().document().full_text().starts_with("Xhello"),
+            "edit via core1 must be live in core2 (shared rope)"
+        );
+
+        // Undo is unified: undoing through the OTHER handle reverts the first's
+        // edit — one history per file, not per view.
+        {
+            let mut c = core2.borrow_mut();
+            c.document_mut().undo(&[], 0);
+        }
+        assert!(
+            core1.borrow().document().full_text().starts_with("hello"),
+            "undo via core2 must revert the edit made via core1 (unified undo)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -201,14 +201,27 @@ verified via the resilience+transcript harness. Worklogs:
     quality CI gate ✅ (2026-06-08).
   - **Phase B (behavior-changing, GPUI-runtime-gated) — HELD, by design.** Not
     blocked on a decision; blocked on the **verification harness** (GPUI can't be
-    driven headlessly) and on stabilizing the active reconnect path. Remaining:
-    `5c` Doc/Edit single pooled rope (49-site staged rewrite, ADR-0007);
-    `8b` delete turn-end inference in the pumps (needs the worker to actually emit
-    `ReplyEvent::TurnEnded` first — the default worker still doesn't, see
-    `acp_channel.rs:541`; partly superseded by the phase-8 `AgentEvent` stream);
-    `10` reconnect `Arc<Core>` swap (trigger-deferred per ADR-0008);
-    `ChannelAttachState` faithful enum (refactors the live reconnect-storm path —
-    stabilize that first).
+    driven headlessly) and on stabilizing the active reconnect path. Status
+    (updated 2026-06-08):
+    - `5c` Doc/Edit single pooled rope — ✅ **LANDED**. The foundation was already
+      live (`DocState.source`/`DocSource`/`SharedEditor`/`open_and_retain` dedup +
+      `refresh_blocks`); open/split/restore bind the pooled core, so Doc+Edit and
+      splits share a rope with unified undo. Final fix: theme-switch re-render
+      (`re_render_one_doc`) sources the live core instead of disk (was silently
+      reverting unsaved edits). Headless tests added (pool sharing + unified undo
+      + live-core re-render). ⚠️ cross-pane *paint* owes a GPUI eyeball.
+    - `8b` delete turn-end inference — ⏸️ **architectural goal already met by the
+      phase-8 `AgentEvent` stream** (sourced-once + total reducer + exactly-once
+      ledger; agreement pinned by `agent_stream_agrees_*`). The remaining legacy-
+      inference deletion is the content-application cutover (double-render risk the
+      §9 gate prevents) and would inject `TurnEnded` into the durable WAL — runtime
+      +soak-gated, **held by design**, not by an open decision.
+    - `10` reconnect — ✅ **decided ADR-0008 scope DONE** (re-attach failures
+      surfaced via `spawn_attach_sessions`). The `Arc<Core>` swap-in-place is an
+      explicit **ADR-0008 deferral** (HIGH risk, rare path, trigger not fired) —
+      a recorded non-goal, not unfinished work.
+    - `ChannelAttachState` faithful enum — still held (refactors the live
+      reconnect path; stabilize that first).
 
 - **CI gate** — `DONE` (2026-06-08). Minimal `build --bins + test` on push/PR
   (`.github/workflows/ci.yml`) landed; the `quality` job (`clippy -D warnings` +
@@ -230,9 +243,12 @@ user**; the rest is `NEEDS-RUNTIME`. Follow-ups below are off `integration`,
 
 ## Follow-ups (branches off `integration`)
 
-- **`ff-buffer-pool`** — `IN-FLIGHT`. Wire the dead buffer pool into the live app
-  so docs are shared by reference across views (fixes workspaces "also-show"
-  sharing unsaved edits). See ADR-0005. Behavior-changing → human review.
+- **`ff-buffer-pool`** — `DONE` (folded into 5c, 2026-06-08). The buffer pool is
+  wired into the live app: `open_and_retain` dedups by canonical path and
+  `gc_buffers` (strong-count liveness) backs every file-backed view, so docs are
+  shared by reference across views (Doc/Edit/splits of one file share a rope +
+  unified undo). See ADR-0005 / ADR-0007 and spec §6 step 5c. ⚠️ cross-pane paint
+  owes a GPUI runtime eyeball.
 - **`ff-ui-threading`** — `DONE` (`c7b138f`). Move `open_agent`/`attach`/`close`
   socket round-trips off the paint thread (tachyon S4); open is now instant.
   Removes the last ~30s freeze path. Behavior-changing → **runtime review before fold**.

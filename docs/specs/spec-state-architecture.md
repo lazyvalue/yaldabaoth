@@ -282,14 +282,40 @@ verifiable.
    by `server_session_id`; collapse the 1:1 `Editor` wrapper.
 
 ### Phase B — GPUI-view / behavior-changing / gated (verify via the harness from 0.2)
-- **5c.** `DocState` → pooled `SharedCore` (gated on **D2**). Verify: edit in an
-  Edit window reflects in the Doc view; harness round-trip.
+- **5c.** `DocState` → pooled `SharedCore` (gated on **D2**). ✅ **LANDED**
+  (2026-06-08). The foundation was already live (`DocState.source`, `DocSource`,
+  `SharedEditor`, `open_and_retain` dedup-by-path, `refresh_blocks` per-frame
+  re-derive on `edit_seq`); open/split/restore all bind to the pooled core, so
+  Doc + Edit (and splits) of one file share a rope with unified undo. Final fix
+  this pass: `re_render_layout_docs` (theme switch) read from **disk**, silently
+  reverting unsaved shared-core edits and not self-correcting (since
+  `rendered_seq` didn't advance) — now sources the live core via the new
+  `re_render_one_doc`. Headless tests: `pool_dedups_by_path_so_two_views_share_one_core`
+  (shared rope + unified undo) and `re_render_one_doc_sources_live_core_not_disk`.
+  ⚠️ The per-frame cross-pane *paint* (two simultaneous panes visibly updating)
+  is the one piece needing a GPUI runtime eyeball.
 - **8b.** Delete the turn-end inference in all 3 pumps (gated on **D1** + the 8a
-  agreement holding).
+  agreement holding). ⏸️ **Architectural goal ACHIEVED by phase-8** (the canonical
+  `AgentEvent` stream is sourced once at the worker boundary via `TurnCount`,
+  forwarded verbatim, and folded by the total reducer with a `(generation,turn)`
+  exactly-once ledger; agreement pinned by `agent_stream_agrees_*` tests). The
+  remaining *deletion* of the legacy inference is the **content-application
+  cutover** (before the §9 gate flips, first-turn chunks still come from the
+  ReplyEvent path) — the exact double-render risk the gate prevents, deferred to
+  post-real-session soak. Making the worker emit unconditionally would also
+  inject `TurnEnded` into the durable `event_log`/WAL (server records every
+  reply) and perturb the freshly-stabilized replay/cursor/compaction path. NOT
+  safely completable headlessly; **held by design**, not by an open decision.
 - **10.** `agent_transport` reconnect swaps a shared `Arc<Core>` in place; bundle
   take-once + reattach + wipe into one method; join old threads before swap
-  (gated on **D3**). Verify: pre-reconnect handle routes post-reconnect; exactly
-  one transcript wipe.
+  (gated on **D3**). ✅ **Decided scope DONE; swap-in-place deferred per ADR-0008.**
+  The decided D3 work — surface reconnect re-attach failures as a visible slot
+  error instead of permanent "reconnecting…" — is in the tree:
+  `reconnect_session_server` routes re-attach through `spawn_attach_sessions`
+  (off paint thread, Owner-reclaim retry), which surfaces read-only / "attach
+  failed" / dead-slot outcomes per slot. The `Arc<Core>` swap-in-place is
+  **explicitly deferred (HIGH risk, rare path, trigger not fired)** by ADR-0008;
+  it is a recorded non-goal, not unfinished work.
 - **R.** `reset_for_replay` delegation refactor (principle 7) — lands after the
   sub-modules it delegates to exist (after 1, 6, 7); decide the `agent_mode`
   reset question here.
@@ -325,8 +351,10 @@ Front-loaded by leverage and verifiability.
 6. Pure extractions — status (full table in `HANDOFF.md`):
    - `[x]` `replay_turns` (A.1, `6168157`) · `[x]` `overlay` enum (A.2, `e5be921`)
    - `[x]` `settings`/text-zoom (A.3, `e66a54c`) · `[x]` canonical cwd key (A.4, `c46f023`)
-   - `[~]` `buffer_pool` (A.5a) — deferred: dead/unwired, do with D2 (5c)
-   - `[~]` `DocState` auto-derive (A.5b) — deferred: memo half already done
+   - `[x]` `buffer_pool` (A.5a) — **wired** (landed with 5c): `open_and_retain`
+     dedup-by-path + `gc_buffers` strong-count liveness back every file-backed view.
+   - `[x]` `DocState` auto-derive (A.5b) — `refresh_blocks` re-derives blocks from
+     the shared core keyed on `edit_seq` (`rendered_seq`); no manual invalidation.
    - `[x]` `tool_calls` → `ToolCalls` owner (A.6, `f10486e`)
    - `[x]` `agent_view_model` → `AgentViewModel` owner (A.7, `9253139`) · `[x]` additive `TurnEnded{generation}` (A.8a, `8cdbdd1`) · `[x]` server fusions (A.9 — `record()` already fused; rest is behavior-changing, see below)
    - `[x]` `InputSurface` (`761dfe6`) · `[x]` `has_unseen_activity` dead-code removed (11, `15fe390`); `ChannelAttachState` enum deferred (dual-Option is 4-state, not a clean sum-type — see HANDOFF)
@@ -335,13 +363,20 @@ Front-loaded by leverage and verifiability.
 **GPUI / gated (Phase B — verify via the harness from item 2):**
 7. `[x]` `reset_for_replay` delegation (R, `eca7759` — `HighlightCache::reset()`) ·
    `[x]` `apply_channel_state` unification + restart prompt-drain fix (9′,
-   `74c4f73`, ⚠️ owes runtime check) · `[~]` Doc/Edit single rope (5c, gated D2
-   — **held**, 49-site staged rewrite, not blind-landable) · `[~]` delete
-   turn-end inference (8b, gated D1 — **held**, needs worker-side `ReplyEvent::
-   TurnEnded` emit + ADR-0006 emit-then-observe-then-delete rollout) · `[~]`
-   `ChannelAttachState` faithful enum (11′ — **held**, refactors the same
+   `74c4f73`, ⚠️ owes runtime check) · `[x]` **Doc/Edit single rope (5c) LANDED
+   (2026-06-08)** — foundation was live; the remaining fix made theme-switch
+   re-render source the live shared core instead of disk (`re_render_one_doc`),
+   with headless tests for pooled sharing + unified undo + live-core re-render
+   (⚠️ cross-pane *paint* owes a GPUI eyeball) · `[~]` delete turn-end inference
+   (8b) — **architectural goal met by phase-8 AgentEvent stream; the remaining
+   legacy-inference deletion is the content-application cutover, runtime+soak-
+   gated (would also perturb the durable WAL); held by design, not by decision**
+   · `[~]` `ChannelAttachState` faithful enum (11′ — **held**, refactors the same
    reconnect path as the active reconnect-storm bug; stabilize that first) ·
-   `[~]` reconnect Arc<Core> (10, gated D3 — trigger-deferred per ADR-0008).
+   `[x]` **reconnect failure-surfacing (10) decided scope DONE** — re-attach
+   routes through `spawn_attach_sessions` (read-only / failed / dead-slot
+   surfaced); the `Arc<Core>` swap-in-place stays **deferred per ADR-0008**
+   (HIGH risk, rare path, trigger not fired — a recorded non-goal).
 
 **Standing rule (the regression→prevention loop):**
 8. `[ ]` Every `fix(...)` lands with a failing-test-first; every new derived
