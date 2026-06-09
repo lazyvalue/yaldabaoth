@@ -1456,6 +1456,31 @@ fn expand_wiki_links_in_block(block: &mut RenderedBlock, theme: &Theme) {
     }
 }
 
+/// Does this block contain any link (hyperlink span or expanded wiki link)?
+/// Used by the Doc local menu's `navigate → next link` (spec-menu-scopes.md).
+fn block_contains_link(block: &RenderedBlock) -> bool {
+    fn line_has_link(line: &StyledLine) -> bool {
+        line.spans.iter().any(|s| s.link.is_some())
+    }
+    match block {
+        RenderedBlock::Heading { content, .. } => line_has_link(content),
+        RenderedBlock::Paragraph { lines } | RenderedBlock::CodeBlock { lines, .. } => {
+            lines.iter().any(line_has_link)
+        }
+        RenderedBlock::BlockQuote { blocks } => blocks.iter().any(block_contains_link),
+        RenderedBlock::List { items, .. } => items
+            .iter()
+            .any(|item| item.content.iter().any(block_contains_link)),
+        RenderedBlock::Table { headers, rows, .. } => {
+            headers.iter().any(line_has_link)
+                || rows.iter().any(|row| row.iter().any(line_has_link))
+        }
+        RenderedBlock::HorizontalRule => false,
+        // An image is itself a navigable target (it carries a URL).
+        RenderedBlock::Image { .. } => true,
+    }
+}
+
 fn expand_wiki_links_in_line(line: &mut StyledLine, theme: &Theme) {
     let mut new_spans: Vec<StyledSpan> = Vec::with_capacity(line.spans.len());
     for span in line.spans.drain(..) {
@@ -6515,11 +6540,22 @@ fn doc_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("o", "outline", "rail-outline"),
         MenuNode::separator(),
         MenuNode::submenu(
+            "n",
+            "navigate",
+            vec![
+                MenuNode::entry("l", "next link", "nav-links"),
+                MenuNode::entry("h", "next heading", "nav-headings"),
+                MenuNode::entry("i", "next list", "nav-list-items"),
+                MenuNode::entry("c", "next code block", "nav-code-blocks"),
+            ],
+        ),
+        MenuNode::submenu(
             "g",
             "goto",
             vec![
                 MenuNode::entry("g", "top", "doc-goto-top"),
                 MenuNode::entry("e", "bottom", "doc-goto-bottom"),
+                MenuNode::entry("h", "next heading", "goto-heading"),
             ],
         ),
     ]
@@ -6556,6 +6592,7 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::separator(),
         MenuNode::entry("w", "toggle worksheet/chatbox", "agent-input-toggle"),
         MenuNode::entry("s", "send buffer", "claude-send"),
+        MenuNode::entry("S", "send selection", "claude-send-selection"),
         MenuNode::entry("d", "detach", "claude-detach"),
         MenuNode::entry("a", "attach", "claude-attach"),
         MenuNode::separator(),
@@ -6568,6 +6605,9 @@ fn browser_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("s", "cycle sort", "browser-sort"),
         MenuNode::entry(".", "toggle hidden files", "browser-hidden"),
         MenuNode::entry("-", "go up", "browser-up"),
+        MenuNode::separator(),
+        MenuNode::entry("w", "open in new workspace", "browser-open-workspace"),
+        MenuNode::entry("v", "open in split", "browser-open-split"),
     ]
 }
 
@@ -6955,6 +6995,41 @@ impl SketchGpuiView {
 
     /// Open `path` as a doc. If it's already in a tab, switch to that tab.
     /// Otherwise push a new tab containing the doc. Returns false on read error.
+    /// Build a Doc `WindowContent` for `path`, bound to the shared buffer
+    /// pool (5c: dedup by canonical path so Edit views of the same file
+    /// share the exact same rope + undo and edits show live in this Doc).
+    /// `None` if the file can't be read.
+    fn make_doc_content(&mut self, path: &std::path::Path) -> Option<WindowContent> {
+        let canon = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
+            .to_string();
+        let (buf_id, core) = match self.workspace.open_and_retain(path) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("error: cannot read {}: {}", path.display(), e);
+                return None;
+            }
+        };
+        let blocks = render_with_wiki(
+            &core.borrow().document().full_text(),
+            &self.theme,
+            Some(path),
+        );
+        Some(WindowContent::Doc(DocState {
+            blocks,
+            file_label: canon.into(),
+            cursor_block: 0,
+            list_state: DocState::new_list_state(0),
+            list_item_count: std::cell::Cell::new(0),
+            blocks_seq: 0,
+            blocks_snapshot: RefCell::new(None),
+            last_cursor_block: std::cell::Cell::new(None),
+            source: Some(DocSource::new(buf_id, core)),
+        }))
+    }
+
     fn open_file(&mut self, path: PathBuf) -> bool {
         let canon = path
             .canonicalize()
@@ -6970,33 +7045,9 @@ impl SketchGpuiView {
             return true;
         }
 
-        // 5c: bind the Doc to the file's pooled core (dedup by canonical path),
-        // so an Edit view of the same file — opened separately — shares the
-        // exact same rope + undo and edits show live in this Doc.
-        let (buf_id, core) = match self.workspace.open_and_retain(&path) {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("error: cannot read {}: {}", path.display(), e);
-                return false;
-            }
+        let Some(new_content) = self.make_doc_content(&path) else {
+            return false;
         };
-        let label: SharedString = canon.into();
-        let blocks = render_with_wiki(
-            &core.borrow().document().full_text(),
-            &self.theme,
-            Some(&path),
-        );
-        let new_content = WindowContent::Doc(DocState {
-            blocks,
-            file_label: label,
-            cursor_block: 0,
-            list_state: DocState::new_list_state(0),
-            list_item_count: std::cell::Cell::new(0),
-            blocks_seq: 0,
-            blocks_snapshot: RefCell::new(None),
-            last_cursor_block: std::cell::Cell::new(None),
-            source: Some(DocSource::new(buf_id, core)),
-        });
 
         // If the current tab is a transient Browser, replace its content
         // (matches today's "browser disappears when you pick a file"). For
@@ -7128,6 +7179,38 @@ impl SketchGpuiView {
             cx.notify();
         }
     }
+    /// Move the doc cursor to the next block (wrapping past EOF) matching
+    /// `pred`. Local-menu `navigate`/`goto` commands (spec-menu-scopes.md).
+    fn doc_jump_next_matching(
+        &mut self,
+        label: &str,
+        pred: fn(&RenderedBlock) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        let target = match self.doc_mut() {
+            Some(d) if !d.blocks.is_empty() => {
+                let n = d.blocks.len();
+                let start = d.cursor_block.min(n - 1);
+                (1..=n)
+                    .map(|off| (start + off) % n)
+                    .find(|&i| pred(&d.blocks[i]))
+            }
+            _ => return,
+        };
+        match target {
+            Some(idx) => {
+                if let Some(d) = self.doc_mut() {
+                    d.cursor_block = idx;
+                    d.reveal_block(idx);
+                }
+            }
+            None => {
+                self.transient_status = Some(format!("no {label} in document").into());
+            }
+        }
+        cx.notify();
+    }
+
     fn open_browser(&mut self, _: &OpenBrowser, _w: &mut Window, cx: &mut Context<Self>) {
         self.open_browser_inner(cx);
     }
@@ -10328,6 +10411,69 @@ impl SketchGpuiView {
                 }
             }
             "wp-toggle" => self.toggle_edit_view(cx),
+            "nav-headings" | "goto-heading" => self.doc_jump_next_matching(
+                "heading",
+                |b| matches!(b, RenderedBlock::Heading { .. }),
+                cx,
+            ),
+            "nav-list-items" => {
+                self.doc_jump_next_matching("list", |b| matches!(b, RenderedBlock::List { .. }), cx)
+            }
+            "nav-code-blocks" => self.doc_jump_next_matching(
+                "code block",
+                |b| matches!(b, RenderedBlock::CodeBlock { .. }),
+                cx,
+            ),
+            "nav-links" => self.doc_jump_next_matching("link", block_contains_link, cx),
+            "claude-send-selection" => {
+                if matches!(
+                    self.workspace.focused_content(),
+                    Some(WindowContent::Agent(_))
+                ) {
+                    self.send_agent_selection(cx);
+                }
+            }
+            "browser-open-workspace" => {
+                let sel = self
+                    .browser_mut()
+                    .and_then(|b| b.fb.selected_entry().map(|e| (e.path.clone(), e.is_dir)));
+                match sel {
+                    Some((path, false)) => {
+                        if let Some(content) = self.make_doc_content(&path) {
+                            self.workspace.push_initial_tab(content);
+                            self.save_workspace_state();
+                            cx.notify();
+                        }
+                    }
+                    Some((_, true)) => {
+                        self.transient_status = Some("select a file, not a directory".into());
+                        cx.notify();
+                    }
+                    None => {}
+                }
+            }
+            "browser-open-split" => {
+                let sel = self
+                    .browser_mut()
+                    .and_then(|b| b.fb.selected_entry().map(|e| (e.path.clone(), e.is_dir)));
+                match sel {
+                    Some((path, false)) => {
+                        if let Some(content) = self.make_doc_content(&path) {
+                            let _ = self
+                                .workspace
+                                .split_focused(workspace::SplitDir::V, content);
+                            self.workspace.retile_active();
+                            self.save_workspace_state();
+                            cx.notify();
+                        }
+                    }
+                    Some((_, true)) => {
+                        self.transient_status = Some("select a file, not a directory".into());
+                        cx.notify();
+                    }
+                    None => {}
+                }
+            }
             "browser-sort" => {
                 if let Some(b) = self.browser_mut() {
                     b.fb.cycle_sort();
@@ -15686,6 +15832,77 @@ impl SketchGpuiView {
             // Send failed: leave the chatbox text intact so the user can retry,
             // and surface it instead of dropping the message into the void.
             claude.status = Some("send failed — reconnecting; press ⏎ to retry".into());
+        }
+        cx.notify();
+    }
+
+    /// Send the transcript editor's current selection as a prompt
+    /// (Agent local menu `S`, spec-menu-scopes.md). Mirrors `submit_chatbox`'s
+    /// send-first-then-echo order, but takes the text from the worksheet
+    /// selection and leaves the input surface untouched.
+    fn send_agent_selection(&mut self, cx: &mut Context<Self>) {
+        if self.is_candidate {
+            self.set_agent_status(
+                "read-only mirror — close the original window, then menu → claude → take over",
+                cx,
+            );
+            return;
+        }
+        let server_sid = self.active_server_session_id();
+
+        let text = match self.agent_mut().and_then(|c| c.editor.selection_text()) {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => {
+                if let Some(c) = self.agent_mut() {
+                    c.status = Some("no selection to send".into());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let no_channel = self
+            .agent_mut()
+            .map(|c| c.channel.is_none())
+            .unwrap_or(true);
+        if no_channel && server_sid.is_none() {
+            if let Some(c) = self.agent_mut() {
+                c.status = Some("no channel attached".into());
+            }
+            cx.notify();
+            return;
+        }
+
+        let prompt_body = text.trim_end_matches('\n').to_string();
+        let sent = if let Some(sid) = &server_sid {
+            self.session_server
+                .as_ref()
+                .and_then(|s| s.prompt(sid, &prompt_body).ok())
+                .is_some()
+        } else if let Some(claude) = self.agent_mut() {
+            if let Some(channel) = claude.channel.as_mut() {
+                channel.send(&prompt_body).is_ok()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if sent {
+            if let Some(claude) = self.agent_mut() {
+                claude.follow_output.set(true);
+                // Optimistic echo, same as a chatbox submit — LocalSubmit
+                // records the text so the stream echo is suppressed.
+                claude.insert_user_turn(
+                    &text,
+                    sketch::agent_transcript::UserTurnOrigin::LocalSubmit,
+                    false,
+                );
+                claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
+                claude.editor.clear_selection();
+            }
+        } else if let Some(claude) = self.agent_mut() {
+            claude.status = Some("send failed — selection not sent".into());
         }
         cx.notify();
     }
