@@ -13756,14 +13756,12 @@ impl SketchGpuiView {
                 // understand. Render NOTHING (so an old decoder doesn't show a
                 // broken block) but emit one diagnostic — the bytes still
                 // round-trip verbatim through the durable WAL for a newer node.
-                eprintln!(
-                    "[sketch-gpui] agent-stream: ignoring unknown event kind {tag:?} \
-                     (sid={} gen={} turn={} seq={})",
-                    &event.session_id[..event.session_id.len().min(8)],
-                    event.generation,
-                    event.turn,
-                    event.seq,
-                );
+                // Deduped per distinct tag (the comment said "one diagnostic"
+                // but it fired per-event): a resumed pre-fix session can hold
+                // hundreds of legacy tool-call records that pre-date the
+                // tool-kind/event-tag collision fix, which would otherwise flood
+                // the log. One line per kind keeps real forward-compat signal.
+                Self::log_unknown_agent_event_once(tag, event);
                 AgentEventEffect::None
             }
         }
@@ -13775,6 +13773,30 @@ impl SketchGpuiView {
     /// when a finalize actually happened. This is the SINGLE place the
     /// `AgentEvent` reducer's finalize lands, so the dual-stream duplicate
     /// `TurnEnded` (forwarded event + lingering inference) finalizes once.
+    /// Log an unrecognized AgentEvent kind at most ONCE per distinct tag for the
+    /// process lifetime. A forward-compat `Unknown` is worth a single note, not a
+    /// per-event flood — a resumed pre-fix session can replay hundreds of legacy
+    /// records (e.g. tool calls written before the tool-kind/event-tag collision
+    /// fix). The reducer runs on the GPUI foreground thread, so a thread-local
+    /// set needs no lock.
+    fn log_unknown_agent_event_once(tag: &str, event: &sketch::agent_event::AgentEvent) {
+        thread_local! {
+            static SEEN: RefCell<std::collections::HashSet<String>> =
+                RefCell::new(std::collections::HashSet::new());
+        }
+        let first = SEEN.with(|s| s.borrow_mut().insert(tag.to_string()));
+        if first {
+            eprintln!(
+                "[sketch-gpui] agent-stream: ignoring unknown event kind {tag:?} \
+                 (further ones suppressed; sid={} gen={} turn={} seq={})",
+                &event.session_id[..event.session_id.len().min(8)],
+                event.generation,
+                event.turn,
+                event.seq,
+            );
+        }
+    }
+
     fn settle_agent_effect(claude: &mut AgentState, effect: AgentEventEffect) {
         match effect {
             AgentEventEffect::None => {}

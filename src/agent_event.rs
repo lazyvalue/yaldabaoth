@@ -209,8 +209,21 @@ enum KnownKind {
         text: String,
         role: ChunkRole,
     },
-    ToolCallStarted(ToolCall),
-    ToolCallUpdated(ToolCallUpdate),
+    // Nest the payload under a named key instead of letting the newtype variant
+    // FLATTEN it: both `ToolCall` and `ToolCallUpdate` carry their own `kind`
+    // (the ACP tool category — read/execute/think/search/…), which flattened
+    // would collide with this enum's `#[serde(tag = "kind")]` and emit a
+    // DUPLICATE `kind` key. serde_json keeps the LAST on read-back, so the
+    // variant tag ("tool_call_started") loses to the tool kind ("read") and the
+    // event is misparsed as `Unknown` and silently dropped by the reducer.
+    // Nesting keeps the tool kind safely under `tool_call`/`tool_call_update`.
+    // (Same collision the `Notice`/`level` rename below avoids.)
+    ToolCallStarted {
+        tool_call: ToolCall,
+    },
+    ToolCallUpdated {
+        tool_call_update: ToolCallUpdate,
+    },
     PlanUpdated(Plan),
     ModeChanged(SessionModeId),
     UsageUpdated(UsageSnapshot),
@@ -244,8 +257,12 @@ impl AgentEventKind {
                 text: text.clone(),
                 role: *role,
             },
-            AgentEventKind::ToolCallStarted(tc) => KnownKind::ToolCallStarted(tc.clone()),
-            AgentEventKind::ToolCallUpdated(u) => KnownKind::ToolCallUpdated(u.clone()),
+            AgentEventKind::ToolCallStarted(tc) => KnownKind::ToolCallStarted {
+                tool_call: tc.clone(),
+            },
+            AgentEventKind::ToolCallUpdated(u) => KnownKind::ToolCallUpdated {
+                tool_call_update: u.clone(),
+            },
             AgentEventKind::PlanUpdated(p) => KnownKind::PlanUpdated(p.clone()),
             AgentEventKind::ModeChanged(m) => KnownKind::ModeChanged(m.clone()),
             AgentEventKind::UsageUpdated(s) => KnownKind::UsageUpdated(s.clone()),
@@ -272,8 +289,10 @@ impl AgentEventKind {
         match k {
             KnownKind::ChannelOpened { resumed } => AgentEventKind::ChannelOpened { resumed },
             KnownKind::Chunk { text, role } => AgentEventKind::Chunk { text, role },
-            KnownKind::ToolCallStarted(tc) => AgentEventKind::ToolCallStarted(tc),
-            KnownKind::ToolCallUpdated(u) => AgentEventKind::ToolCallUpdated(u),
+            KnownKind::ToolCallStarted { tool_call } => AgentEventKind::ToolCallStarted(tool_call),
+            KnownKind::ToolCallUpdated { tool_call_update } => {
+                AgentEventKind::ToolCallUpdated(tool_call_update)
+            }
             KnownKind::PlanUpdated(p) => AgentEventKind::PlanUpdated(p),
             KnownKind::ModeChanged(m) => AgentEventKind::ModeChanged(m),
             KnownKind::UsageUpdated(s) => AgentEventKind::UsageUpdated(s),
@@ -464,6 +483,41 @@ mod tests {
             let back: AgentEvent = serde_json::from_str(&json).unwrap();
             assert_eq!(back, e, "outcome {outcome:?} must round-trip");
         }
+    }
+
+    /// Regression: a tool call carries its OWN `kind` (the ACP tool category —
+    /// read/execute/think/…). Flattening the newtype variant emitted that next
+    /// to the event's `#[serde(tag = "kind")]`, producing a DUPLICATE `kind`;
+    /// serde_json keeps the last on read-back, so the variant tag lost to the
+    /// tool kind and EVERY tool call deserialized as `Unknown` and was dropped
+    /// by the reducer (resume/replay + the authoritative live AgentEvent stream).
+    /// Nesting under `tool_call` fixes it: one event tag, tool kind preserved.
+    #[test]
+    fn tool_call_kind_does_not_collide_with_event_tag() {
+        let tc: ToolCall =
+            serde_json::from_str(r#"{"toolCallId":"t1","title":"Read File","kind":"read"}"#)
+                .unwrap();
+        let e = ev(AgentEventKind::ToolCallStarted(tc));
+        let json = serde_json::to_string(&e).unwrap();
+
+        // Exactly ONE top-level event tag, and it's the variant (not the tool
+        // kind) — i.e. no duplicate `kind` key.
+        assert_eq!(
+            json.matches(r#""kind":"tool_call_started""#).count(),
+            1,
+            "event tag present exactly once: {json}"
+        );
+
+        // Round-trips back to ToolCallStarted (NOT Unknown), tool kind intact.
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        match &back.kind {
+            AgentEventKind::ToolCallStarted(tc) => {
+                assert_eq!(tc.kind, crate::acp_channel::ToolKind::Read);
+                assert_eq!(tc.title, "Read File");
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+        assert_eq!(back, e, "tool-call event must round-trip");
     }
 
     /// The load-bearing spec §8 guarantee: an older decoder lands an unknown
