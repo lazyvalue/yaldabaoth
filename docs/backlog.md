@@ -13,6 +13,34 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
 
 ## Bugs
 
+- **Mid-turn message drops (lease gate + invisible rejection)** — `FIXED`
+  (2026-06-09, `b7bdcde` on master); `NEEDS-RUNTIME` for the GUI
+  PromptRejected surfacing (notice + chatbox restore — headless tests cover
+  the server half only). Root cause was two-part: `prompt()` is
+  fire-and-forget so a server rejection had no waiter (the optimistic echo
+  made it look sent), and `do_prompt` demanded a LIVE lease — an App-Napped
+  window's lease lapses during a long turn, so the first post-wake message
+  raced the 5s heartbeat reclaim and silently lost. Fix:
+  `acquire_or_renew_lease` (action-as-liveness, shared with Owner attach) on
+  prompt/cancel/mode/restart + `Notification::PromptRejected` to the
+  submitter with the text restored into the chatbox. Tests 3b/3c/3d in
+  `session_transcript_test.rs` (red on old gate, green now).
+- **Agent chatbox typing lag while a turn streams** — `READY`, mechanism
+  hypothesized, needs SKETCH_PERF confirmation. Transcript render caches
+  (lines/extract, highlight, S1 view-model flat build) all key on the
+  transcript editor's `edit_seq` — chatbox keystrokes don't bump it, but
+  EVERY STREAMED CHUNK does, forcing a full S1 flat rebuild
+  (gutter-tag scan + tools_at_line + blank-collapse, O(whole transcript))
+  per chunk. With post-fence-fix transcripts now actually huge after resume
+  (≈4.8k events), chunk floods saturate the paint thread and concurrent
+  keystrokes queue behind it ("typing slightly slow to appear" — reported
+  while an agent turn was streaming). Suspects ranked by an audit pass:
+  S1 rebuild per chunk (primary); tag-bar `all_tags()` walk + per-leaf
+  `mark_for_window()` scan (new in 09e266b, minor). Confirm with
+  `SKETCH_PERF=1` (consolidated render_agent trace on stderr), then fix
+  direction: make the flat build incremental per appended lines, or batch
+  chunk application per frame. Audit map in session notes 2026-06-09.
+
 - **Resume hang (replay fence never cleared)** — `FIXED` (2026-06-09,
   `9112188` on master). After a server restart, a recovered session's pump
   fence waited for the channel turn counter to reach the restored count — but
