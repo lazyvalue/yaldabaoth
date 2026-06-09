@@ -368,12 +368,17 @@ fn allow_tool_kind(mode: PermissionMode, kind: ToolKind) -> bool {
 pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-code-acp", "claude-agent-acp"];
 
 /// How long to wait for `session/load` (resume) before giving up and spawning a
-/// fresh `session/new`. Generous enough that a large but progressing replay
-/// completes (a session re-emits its whole prior conversation before the load
-/// response), short enough that a stale/unloadable id doesn't hang the session
-/// forever. A true hang costs this once per (re)spawn; a healthy resume returns
-/// well under it.
-const SESSION_LOAD_TIMEOUT_SECS: u64 = 90;
+/// fresh `session/new`. `session/load` returns only AFTER the agent re-emits the
+/// session's ENTIRE prior conversation as `session/update` notifications, so a
+/// big session (verified: ~700 replayed events) legitimately takes a while —
+/// the timeout must be generous enough to let such a replay COMPLETE so the
+/// resumed context is kept, and only fire on a TRUE hang (observed: a stale id
+/// left the adapter stuck in `session/load` for 20+ min). 5 minutes comfortably
+/// clears even a very large progressing replay while still bounding a real hang
+/// to one bounded wait per (re)spawn. (An idle/progress-based timeout would be
+/// tighter, but the load future is opaque here; a generous total bound is the
+/// safe, simple choice that never falsely discards a recoverable session.)
+const SESSION_LOAD_TIMEOUT_SECS: u64 = 300;
 
 /// Constructor seam for an [`AgentTransport`] (Phase 6, spec-session-server-actor
 /// §Rollout). The pump thread never builds the client — the session-server's
