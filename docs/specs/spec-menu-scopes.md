@@ -457,3 +457,14 @@ to `gpui_menu()` in `main.rs`.
 ## Revision history
 
 - 2026-06-06 — Initial draft.
+- 2026-06-09 — v1 (Phase 1) implemented in `sketch-gpui`: `.` local leader
+  with per-content menus (Behaviors 1–4, 6–10), scope-aware headers, stale
+  dismissal, disabled global entries. Global menu kept intact (Phase 2
+  cleanup not done). Browser `.` rebound from toggle-hidden to local
+  leader; toggle-hidden is now `. .`.
+- 2026-06-09 — Full local-menu command set landed: doc `navigate` submenu
+  (`nav-links`/`nav-headings`/`nav-list-items`/`nav-code-blocks` = jump to
+  next block of kind, wrapping) + `goto-heading`; `claude-send-selection`
+  (sends the transcript selection as a prompt, input surface untouched);
+  `browser-open-workspace` / `browser-open-split` (selected file → Doc in a
+  new tab / vertical split; directories rejected with a toast).
