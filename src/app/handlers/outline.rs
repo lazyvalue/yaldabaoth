@@ -11,7 +11,12 @@ pub(crate) struct OutlineEntry {
 }
 
 impl App {
-    pub(crate) fn handle_outline_key(&mut self, key: KeyPress, _viewport_height: usize, _content_width: usize) {
+    pub(crate) fn handle_outline_key(
+        &mut self,
+        key: KeyPress,
+        _viewport_height: usize,
+        _content_width: usize,
+    ) {
         if self.outline_filter_mode {
             match key.key {
                 Key::Esc => {
@@ -53,8 +58,7 @@ impl App {
         match key.key {
             Key::Esc | Key::Char('q') => {
                 // Restore saved scroll position
-                self.buffers[self.active_buffer].viewport.scroll_offset =
-                    self.outline_saved_scroll;
+                self.buffers[self.active_buffer].viewport.scroll_offset = self.outline_saved_scroll;
                 self.mode = AppMode::Normal;
             }
             Key::Char('j') | Key::Down => {
@@ -155,20 +159,21 @@ impl App {
         let all = self.outline_entries();
 
         // Apply hierarchy filter via stack
-        let scoped: Vec<OutlineEntry> = if let Some(&(parent_level, parent_y)) = self.outline_stack.last() {
-            let child_level = parent_level + 1;
-            // Show headings at child_level that come after parent_y
-            // and before the next heading at parent_level or above
-            all.into_iter()
-                .skip_while(|e| e.y_offset <= parent_y)
-                .take_while(|e| e.level > parent_level)
-                .filter(|e| e.level == child_level)
-                .collect()
-        } else {
-            // Show top-level: find the minimum heading level and show only those
-            let min_level = all.iter().map(|e| e.level).min().unwrap_or(1);
-            all.into_iter().filter(|e| e.level == min_level).collect()
-        };
+        let scoped: Vec<OutlineEntry> =
+            if let Some(&(parent_level, parent_y)) = self.outline_stack.last() {
+                let child_level = parent_level + 1;
+                // Show headings at child_level that come after parent_y
+                // and before the next heading at parent_level or above
+                all.into_iter()
+                    .skip_while(|e| e.y_offset <= parent_y)
+                    .take_while(|e| e.level > parent_level)
+                    .filter(|e| e.level == child_level)
+                    .collect()
+            } else {
+                // Show top-level: find the minimum heading level and show only those
+                let min_level = all.iter().map(|e| e.level).min().unwrap_or(1);
+                all.into_iter().filter(|e| e.level == min_level).collect()
+            };
 
         // Apply text filter
         if self.outline_filter_text.is_empty() {
@@ -188,10 +193,13 @@ impl App {
             return None;
         }
         let all = self.outline_entries();
-        let parts: Vec<String> = self.outline_stack
+        let parts: Vec<String> = self
+            .outline_stack
             .iter()
             .filter_map(|(_, y)| {
-                all.iter().find(|e| e.y_offset == *y).map(|e| e.title.clone())
+                all.iter()
+                    .find(|e| e.y_offset == *y)
+                    .map(|e| e.title.clone())
             })
             .collect();
         if parts.is_empty() {

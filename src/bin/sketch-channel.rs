@@ -151,7 +151,10 @@ without --setup, it speaks JSON-RPC on stdio.",
 fn main() -> io::Result<()> {
     // Simple flag handling — no clap to keep the binary small.
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--setup" || a == "--help" || a == "-h") {
+    if args
+        .iter()
+        .any(|a| a == "--setup" || a == "--help" || a == "-h")
+    {
         print_setup_help();
         return Ok(());
     }
@@ -216,10 +219,7 @@ fn main() -> io::Result<()> {
                             {
                                 let mut guard = active_client.lock().unwrap();
                                 if let Some((old_id, old)) = guard.take() {
-                                    log(&format!(
-                                        "displacing previous client #{}",
-                                        old_id
-                                    ));
+                                    log(&format!("displacing previous client #{}", old_id));
                                     let _ = old.shutdown(std::net::Shutdown::Both);
                                 }
                                 match stream.try_clone() {
@@ -232,16 +232,11 @@ fn main() -> io::Result<()> {
                             }
                             let stdout_tx2 = stdout_tx.clone();
                             let active_client2 = active_client.clone();
-                            let _ = thread::Builder::new()
-                                .name("sketch-reader".into())
-                                .spawn(move || {
-                                    handle_sketch_client(
-                                        stream,
-                                        id,
-                                        stdout_tx2,
-                                        active_client2,
-                                    );
-                                });
+                            let _ = thread::Builder::new().name("sketch-reader".into()).spawn(
+                                move || {
+                                    handle_sketch_client(stream, id, stdout_tx2, active_client2);
+                                },
+                            );
                         }
                         Err(e) => {
                             log(&format!("accept error: {}", e));
@@ -292,10 +287,7 @@ fn handle_sketch_client(
     let read_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
-            log(&format!(
-                "[#{}] clone for read side failed: {}",
-                my_id, e
-            ));
+            log(&format!("[#{}] clone for read side failed: {}", my_id, e));
             return;
         }
     };
@@ -380,11 +372,7 @@ fn filter_meta(meta: Option<&Value>) -> Value {
     Value::Object(out)
 }
 
-fn handle_mcp_message(
-    msg: &Value,
-    stdout_tx: &mpsc::Sender<String>,
-    active_client: &ActiveClient,
-) {
+fn handle_mcp_message(msg: &Value, stdout_tx: &mpsc::Sender<String>, active_client: &ActiveClient) {
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let id = msg.get("id").cloned();
 
@@ -511,7 +499,11 @@ fn forward_reply_to_sketch(active_client: &ActiveClient, text: &str) -> bool {
     let mut guard = active_client.lock().unwrap();
     match guard.as_mut() {
         Some((id, s)) => {
-            log(&format!("forwarding reply to client #{} ({} bytes)", id, buf.len()));
+            log(&format!(
+                "forwarding reply to client #{} ({} bytes)",
+                id,
+                buf.len()
+            ));
             if s.write_all(&buf).is_ok() && s.flush().is_ok() {
                 return true;
             }

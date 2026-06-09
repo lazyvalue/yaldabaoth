@@ -1,4 +1,4 @@
-use sketch::keys::{format_key_sequence, parse_key_sequence, Key, Modifiers};
+use sketch::keys::{Key, Modifiers, format_key_sequence, parse_key_sequence};
 
 #[test]
 fn test_parse_single_char() {
@@ -95,7 +95,10 @@ fn test_parse_home_end_page() {
     assert_eq!(parse_key_sequence("home").unwrap()[0].key, Key::Home);
     assert_eq!(parse_key_sequence("end").unwrap()[0].key, Key::End);
     assert_eq!(parse_key_sequence("pageup").unwrap()[0].key, Key::PageUp);
-    assert_eq!(parse_key_sequence("pagedown").unwrap()[0].key, Key::PageDown);
+    assert_eq!(
+        parse_key_sequence("pagedown").unwrap()[0].key,
+        Key::PageDown
+    );
 }
 
 #[test]
@@ -152,7 +155,7 @@ fn test_parse_error_trailing_modifier() {
 #[test]
 fn test_parse_error_unknown_modifier() {
     let err = parse_key_sequence("super-k").unwrap_err();
-    assert!(err.reason.len() > 0);
+    assert!(!err.reason.is_empty());
 }
 
 #[test]
@@ -191,10 +194,15 @@ fn test_format_named_key() {
 // Crossterm adapter sanity check — at least one path through the From impl.
 #[test]
 fn test_from_crossterm_keyevent() {
-    use crossterm::event::{KeyCode as CtKeyCode, KeyEvent as CtKeyEvent, KeyModifiers as CtKeyModifiers};
+    use crossterm::event::{
+        KeyCode as CtKeyCode, KeyEvent as CtKeyEvent, KeyModifiers as CtKeyModifiers,
+    };
     use sketch::keys::KeyPress;
 
-    let press = KeyPress::from(CtKeyEvent::new(CtKeyCode::Char('d'), CtKeyModifiers::CONTROL));
+    let press = KeyPress::from(CtKeyEvent::new(
+        CtKeyCode::Char('d'),
+        CtKeyModifiers::CONTROL,
+    ));
     assert_eq!(press.key, Key::Char('d'));
     assert_eq!(press.modifiers, Modifiers::CONTROL);
 

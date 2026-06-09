@@ -151,7 +151,10 @@ impl Default for EventLog {
 impl EventLog {
     /// A fresh, empty log with `log_base == 0`.
     pub fn new() -> Self {
-        Self { entries: Arc::new(Vec::new()), log_base: 0 }
+        Self {
+            entries: Arc::new(Vec::new()),
+            log_base: 0,
+        }
     }
 
     /// Reconstruct from a recovered transcript (WAL replay). `log_base` is the
@@ -160,7 +163,10 @@ impl EventLog {
     /// normal case. (The on-disk WAL is never trimmed, so recovery always starts
     /// from the true base.)
     pub fn from_recovered(entries: Vec<Notification>, log_base: u64) -> Self {
-        Self { entries: Arc::new(entries), log_base }
+        Self {
+            entries: Arc::new(entries),
+            log_base,
+        }
     }
 
     /// The shared snapshot pointer to publish on the forwarder watch.
@@ -299,16 +305,17 @@ impl EventLog {
         }
 
         // Highest turn among the dropped entries (for the marker's through_turn).
-        let through_turn = self.entries[..dropped]
-            .iter()
-            .filter_map(note_turn)
-            .max();
+        let through_turn = self.entries[..dropped].iter().filter_map(note_turn).max();
 
         let v = Arc::make_mut(&mut self.entries);
         v.drain(..dropped);
         self.log_base += dropped as u64;
 
-        Some(TrimResult { dropped, new_base: self.log_base, through_turn })
+        Some(TrimResult {
+            dropped,
+            new_base: self.log_base,
+            through_turn,
+        })
     }
 
     /// Resolve a reconnect cursor `(cursor_gen, acked_seq)` against this log
@@ -321,11 +328,7 @@ impl EventLog {
     ///   the slow-subscriber gap case; a clean from-base rebuild, never a gap).
     /// - `acked_seq > tip_seq` → `FromBase` (bogus / lost-unfsynced-tail).
     /// - else → `Tail { vec_index: acked_seq - log_base }`.
-    pub fn resolve_cursor(
-        &self,
-        cursor: Option<(u64, u64)>,
-        current_gen: u64,
-    ) -> CursorResolution {
+    pub fn resolve_cursor(&self, cursor: Option<(u64, u64)>, current_gen: u64) -> CursorResolution {
         let Some((cursor_gen, acked_seq)) = cursor else {
             return CursorResolution::FromBase;
         };
@@ -335,7 +338,9 @@ impl EventLog {
         if acked_seq < self.log_base || acked_seq > self.tip_seq() {
             return CursorResolution::FromBase;
         }
-        CursorResolution::Tail { vec_index: (acked_seq - self.log_base) as usize }
+        CursorResolution::Tail {
+            vec_index: (acked_seq - self.log_base) as usize,
+        }
     }
 }
 
@@ -363,7 +368,10 @@ mod tests {
                 g,
                 turn,
                 seq,
-                AgentEventKind::Chunk { text: text.into(), role: ChunkRole::Message },
+                AgentEventKind::Chunk {
+                    text: text.into(),
+                    role: ChunkRole::Message,
+                },
             ),
         }
     }
@@ -375,7 +383,9 @@ mod tests {
                 g,
                 turn,
                 seq,
-                AgentEventKind::TurnEnded { outcome: TurnOutcome::Completed },
+                AgentEventKind::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
             ),
         }
     }
@@ -387,7 +397,10 @@ mod tests {
                 g,
                 0,
                 seq,
-                AgentEventKind::CompactedSummary { through_turn: 0, summary: "compacted".into() },
+                AgentEventKind::CompactedSummary {
+                    through_turn: 0,
+                    summary: "compacted".into(),
+                },
             ),
         }
     }
@@ -465,7 +478,10 @@ mod tests {
         let mut log = EventLog::new();
         for i in 0..5 {
             let seq = log.push(chunk("s", 0, 0, i, &format!("c{i}")));
-            assert_eq!(seq, i, "push returns the assigned seq == Vec index pre-trim");
+            assert_eq!(
+                seq, i,
+                "push returns the assigned seq == Vec index pre-trim"
+            );
         }
         assert_eq!(log.log_base(), 0);
         assert_eq!(log.len(), 5);
@@ -528,9 +544,15 @@ mod tests {
             CursorResolution::Tail { vec_index: 4 }
         );
         // Past tip → FromBase (bogus / lost tail).
-        assert_eq!(log.resolve_cursor(Some((0, 11)), 0), CursorResolution::FromBase);
+        assert_eq!(
+            log.resolve_cursor(Some((0, 11)), 0),
+            CursorResolution::FromBase
+        );
         // Generation mismatch → FromBase.
-        assert_eq!(log.resolve_cursor(Some((1, 8)), 0), CursorResolution::FromBase);
+        assert_eq!(
+            log.resolve_cursor(Some((1, 8)), 0),
+            CursorResolution::FromBase
+        );
         // No cursor → FromBase.
         assert_eq!(log.resolve_cursor(None, 0), CursorResolution::FromBase);
     }
@@ -546,7 +568,9 @@ mod tests {
         for idx in 0..=6u64 {
             assert_eq!(
                 log.resolve_cursor(Some((0, idx)), 0),
-                CursorResolution::Tail { vec_index: idx as usize },
+                CursorResolution::Tail {
+                    vec_index: idx as usize
+                },
                 "pre-trim, acked_seq == Vec index (phase-5 steady state)"
             );
         }
@@ -562,7 +586,10 @@ mod tests {
         // Want to trim to cap 2 (drop 8), but the owner has only acked through
         // seq 3 — so we may drop at most seqs [0,3), i.e. 3 entries.
         let trim = log.trim(2, 2, 3).expect("some trim under the floor");
-        assert_eq!(trim.dropped, 3, "floor caps the drop at the owner's acked_seq");
+        assert_eq!(
+            trim.dropped, 3,
+            "floor caps the drop at the owner's acked_seq"
+        );
         assert_eq!(log.log_base(), 3);
         assert_eq!(log.len(), 7);
         // The owner's seq 3 is still resident (Vec index 0).
@@ -609,8 +636,13 @@ mod tests {
             log.push(chunk("s", 0, 0, i, "x"));
         }
         // cap 10 high-water, target 6 low-water. len 12 > 10 → drop to 6.
-        let trim = log.trim(10, 6, u64::MAX).expect("over high-water must trim");
-        assert_eq!(trim.dropped, 6, "trim down to the low-water target, not the cap");
+        let trim = log
+            .trim(10, 6, u64::MAX)
+            .expect("over high-water must trim");
+        assert_eq!(
+            trim.dropped, 6,
+            "trim down to the low-water target, not the cap"
+        );
         assert_eq!(log.len(), 6);
         assert_eq!(log.log_base(), 6);
         // Now resident len 6 == target. The next several pushes (up to the cap)
@@ -626,6 +658,9 @@ mod tests {
         }
         // The 11th resident entry crosses the cap again.
         log.push(chunk("s", 0, 0, 16, "x")); // len 11 > cap 10
-        assert!(log.trim(10, 6, u64::MAX).is_some(), "crossing cap again trims");
+        assert!(
+            log.trim(10, 6, u64::MAX).is_some(),
+            "crossing cap again trims"
+        );
     }
 }

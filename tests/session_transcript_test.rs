@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use sketch::session_client::SessionServerClient;
-use sketch::session_proto::{socket_path, AttachMode, Notification};
+use sketch::session_proto::{AttachMode, Notification, socket_path};
 
 /// A running server bound to a private socket, pointed at the stub ACP agent.
 /// Per-test env knobs (`STUB_CHUNKS`, `STUB_DELAY_MS`, …) shape the transcript
@@ -176,11 +176,7 @@ fn count_agent_chunks(notes: &[Notification]) -> usize {
 /// Drain notifications from `client` until `done(&collected)` returns true or
 /// the deadline passes. Returns everything collected. Uses the non-blocking
 /// `try_recv` with a short sleep — bounded wait, no fixed total sleep.
-fn drain_until<F>(
-    client: &SessionServerClient,
-    timeout: Duration,
-    mut done: F,
-) -> Vec<Notification>
+fn drain_until<F>(client: &SessionServerClient, timeout: Duration, mut done: F) -> Vec<Notification>
 where
     F: FnMut(&[Notification]) -> bool,
 {
@@ -236,7 +232,8 @@ fn prompt_turn_round_trip() {
 
     let chunk_count = count_agent_chunks(&notes);
     assert_eq!(
-        chunk_count, CHUNKS,
+        chunk_count,
+        CHUNKS,
         "expected {CHUNKS} streamed agent chunks, got {chunk_count}; notes={notes:#?}\nlog:\n{}",
         server.read_log()
     );
@@ -263,7 +260,8 @@ fn prompt_turn_round_trip() {
     });
     let replay_chunks = count_agent_chunks(&replay);
     assert_eq!(
-        replay_chunks, CHUNKS,
+        replay_chunks,
+        CHUNKS,
         "replay to a fresh attach must reproduce the full transcript ({CHUNKS} chunks), got {replay_chunks}; \
          replay={replay:#?}\nlog:\n{}",
         server.read_log()
@@ -310,7 +308,8 @@ fn large_replay_reconnect() {
         });
         let got = count_agent_chunks(&notes);
         assert_eq!(
-            got, CHUNKS,
+            got,
+            CHUNKS,
             "owner connection should observe all {CHUNKS} chunks live, got {got}\nlog:\n{}",
             server.read_log()
         );
@@ -342,7 +341,8 @@ fn large_replay_reconnect() {
     });
     let replay_chunks = count_agent_chunks(&replay);
     assert_eq!(
-        replay_chunks, CHUNKS,
+        replay_chunks,
+        CHUNKS,
         "large-replay reconnect must replay ALL {CHUNKS} chunks on re-attach, got {replay_chunks}\nlog:\n{}",
         server.read_log()
     );
@@ -357,7 +357,9 @@ fn large_replay_reconnect() {
 
     // The session survived and is still usable: prompt again and see a NEW turn
     // complete on top of the replayed history.
-    client2.prompt(&sid, "again").expect("prompt after reconnect");
+    client2
+        .prompt(&sid, "again")
+        .expect("prompt after reconnect");
     let after = drain_until(&client2, Duration::from_secs(30), |n| {
         // A second TurnEnded (turn_count >= 2) means the new turn settled.
         n.iter().any(|note| {
@@ -397,7 +399,9 @@ fn mid_turn_reconnect_no_corruption() {
         client
             .attach(&info.session_id, AttachMode::Owner)
             .expect("attach owner #1");
-        client.prompt(&info.session_id, "stream slowly").expect("prompt");
+        client
+            .prompt(&info.session_id, "stream slowly")
+            .expect("prompt");
 
         // Wait until SOME chunks have arrived but the turn is NOT done yet, then
         // bail — this drops the client mid-turn.
@@ -406,7 +410,7 @@ fn mid_turn_reconnect_no_corruption() {
         });
         let saw = count_agent_chunks(&_partial);
         assert!(
-            saw >= 3 && saw < CHUNKS,
+            (3..CHUNKS).contains(&saw),
             "should have dropped mid-turn (saw {saw} of {CHUNKS}); the turn streamed too fast — \
              increase STUB_DELAY_MS\nlog:\n{}",
             server.read_log()
@@ -426,9 +430,9 @@ fn mid_turn_reconnect_no_corruption() {
     // client gets the WHOLE turn (everything streamed before AND after the
     // reconnect), ending with the turn boundary.
     let notes = drain_until(&client2, Duration::from_secs(30), |n| {
-        n.iter().any(|note| {
-            matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == sid)
-        })
+        n.iter().any(
+            |note| matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == sid),
+        )
     });
 
     // No corruption / no duplication: exactly CHUNKS distinct agent chunks, and
@@ -454,13 +458,16 @@ fn mid_turn_reconnect_no_corruption() {
     );
     let expected: Vec<String> = (0..CHUNKS).map(|i| format!("chunk {i}")).collect();
     assert_eq!(
-        chunk_texts, expected,
+        chunk_texts,
+        expected,
         "chunk sequence must be in-order and unique after a mid-turn reconnect (no dup/reorder)\nlog:\n{}",
         server.read_log()
     );
 
     // Session still usable: a follow-up prompt completes a fresh turn.
-    client2.prompt(&sid, "still there?").expect("prompt after midturn reconnect");
+    client2
+        .prompt(&sid, "still there?")
+        .expect("prompt after midturn reconnect");
     let after = drain_until(&client2, Duration::from_secs(30), |n| {
         n.iter().any(|note| {
             matches!(note, Notification::TurnEnded { session_id, turn_count, .. }
@@ -503,7 +510,9 @@ fn turn_completes_with_no_subscriber_attached() {
             .expect("attach owner");
         // Send the prompt, then leave IMMEDIATELY — before the turn can finish.
         // `prompt` is a round-trip, so on return the agent already has the work.
-        client.prompt(&info.session_id, "run with nobody watching").expect("prompt");
+        client
+            .prompt(&info.session_id, "run with nobody watching")
+            .expect("prompt");
         info.session_id
         // client dropped here → the GUI is gone. From now until the attach far
         // below, there are ZERO connections to the server.
@@ -523,7 +532,8 @@ fn turn_completes_with_no_subscriber_attached() {
         "session vanished while no GUI was attached; log:\n{}",
         server.read_log()
     );
-    gui.attach(&sid, AttachMode::Owner).expect("attach after the fact");
+    gui.attach(&sid, AttachMode::Owner)
+        .expect("attach after the fact");
 
     let replay = drain_until(&gui, Duration::from_secs(10), |n| {
         count_agent_chunks(n) >= CHUNKS
@@ -533,7 +543,8 @@ fn turn_completes_with_no_subscriber_attached() {
     });
     let chunks = count_agent_chunks(&replay);
     assert_eq!(
-        chunks, CHUNKS,
+        chunks,
+        CHUNKS,
         "turn must complete with no GUI attached: expected {CHUNKS} chunks in the durable log, \
          got {chunks}; replay={replay:#?}\nlog:\n{}",
         server.read_log()
@@ -611,7 +622,8 @@ fn admin_prompt_drives_turn_without_owner() {
     );
     let chunks = count_agent_chunks(&notes);
     assert_eq!(
-        chunks, CHUNKS,
+        chunks,
+        CHUNKS,
         "the agent must have streamed its reply ({CHUNKS} chunks) for the headless prompt, got {chunks}; \
          notes={notes:#?}\nlog:\n{}",
         server.read_log()
@@ -691,11 +703,11 @@ fn session_recovered_after_server_crash() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut present = false;
     while Instant::now() < deadline {
-        if let Ok(sessions) = client2.list_sessions() {
-            if sessions.iter().any(|s| s.session_id == sid) {
-                present = true;
-                break;
-            }
+        if let Ok(sessions) = client2.list_sessions()
+            && sessions.iter().any(|s| s.session_id == sid)
+        {
+            present = true;
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -795,7 +807,9 @@ fn slow_subscriber_is_disconnected_owner_unaffected() {
 
     // Drive a turn. The stub streams the big burst → the stuck observer's send
     // buffer fills → its forwarder write times out at 500ms → server drops it.
-    owner.prompt(&info.session_id, "flood the slow subscriber").expect("prompt");
+    owner
+        .prompt(&info.session_id, "flood the slow subscriber")
+        .expect("prompt");
 
     // (a) The stuck subscriber is reaped: the server logs the slow-subscriber
     // warning. Bounded wait — the timeout is 500ms; allow generous slack for the
@@ -830,7 +844,8 @@ fn slow_subscriber_is_disconnected_owner_unaffected() {
     });
     let got = count_agent_chunks(&notes);
     assert_eq!(
-        got, CHUNKS,
+        got,
+        CHUNKS,
         "owner must receive ALL {CHUNKS} chunks even while a slow subscriber is reaped, got {got}\nlog:\n{}",
         server.read_log()
     );
@@ -990,7 +1005,7 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                continue
+                continue;
             }
             Err(_) => {
                 saw_eof = true;
@@ -1019,7 +1034,11 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     let mut last = None;
     while Instant::now() < probe_deadline {
         let snap = admin.admin_status().expect("admin_status");
-        if let Some(s) = snap.sessions.iter().find(|s| s.session_id == info.session_id) {
+        if let Some(s) = snap
+            .sessions
+            .iter()
+            .find(|s| s.session_id == info.session_id)
+        {
             // The in-memory Vec must NEVER blow past the bound — assert on every
             // poll so a transient overshoot is caught, not just the final state.
             assert!(
@@ -1078,7 +1097,9 @@ fn cursor_reconnect_streams_only_tail() {
     owner
         .attach(&info.session_id, AttachMode::Owner)
         .expect("attach owner");
-    owner.prompt(&info.session_id, "hello cursor").expect("prompt");
+    owner
+        .prompt(&info.session_id, "hello cursor")
+        .expect("prompt");
 
     let _ = drain_until(&owner, Duration::from_secs(15), |n| {
         n.iter().any(|note| {
@@ -1119,10 +1140,8 @@ fn cursor_reconnect_streams_only_tail() {
             .count()
             >= 1
     });
-    let full_transcript: Vec<Notification> = full_notes
-        .into_iter()
-        .filter(is_transcript_note)
-        .collect();
+    let full_transcript: Vec<Notification> =
+        full_notes.into_iter().filter(is_transcript_note).collect();
     assert_eq!(
         full_transcript.len(),
         m,
@@ -1149,10 +1168,8 @@ fn cursor_reconnect_streams_only_tail() {
             .count()
             >= 1
     });
-    let tail_transcript: Vec<Notification> = tail_notes
-        .into_iter()
-        .filter(is_transcript_note)
-        .collect();
+    let tail_transcript: Vec<Notification> =
+        tail_notes.into_iter().filter(is_transcript_note).collect();
     assert_eq!(
         tail_transcript.len(),
         m - k,
@@ -1186,10 +1203,8 @@ fn cursor_reconnect_streams_only_tail() {
             .count()
             >= 1
     });
-    let stale_transcript: Vec<Notification> = stale_notes
-        .into_iter()
-        .filter(is_transcript_note)
-        .collect();
+    let stale_transcript: Vec<Notification> =
+        stale_notes.into_iter().filter(is_transcript_note).collect();
     assert_eq!(
         stale_transcript.len(),
         m,
@@ -1219,13 +1234,13 @@ fn is_compacted_summary(n: &Notification) -> bool {
 ///    guarantees, end-to-end against a real server + stub turn:
 ///
 ///    (a) The trim is SURFACED, not silent: a full-replay (from-base) observer
-///        receives a `CompactedSummary` marker as its FIRST transcript note, and
-///        the resident log stays bounded near the cap (NOT the full chunk count).
-///        `admin_status` reports a non-zero `log_base`.
+///    receives a `CompactedSummary` marker as its FIRST transcript note, and
+///    the resident log stays bounded near the cap (NOT the full chunk count).
+///    `admin_status` reports a non-zero `log_base`.
 ///
 ///    (b) A client whose acked `seq` fell BELOW `log_base` (it was trimmed past)
-///        gets a clean from-base rebuild — it sees the `CompactedSummary` marker
-///        too, never a silent gap (spec §6 fast-disconnect-before-gap).
+///    gets a clean from-base rebuild — it sees the `CompactedSummary` marker
+///    too, never a silent gap (spec §6 fast-disconnect-before-gap).
 #[test]
 fn ringbuffer_compaction_trims_and_surfaces_marker() {
     let _g = serial_lock();
@@ -1258,7 +1273,9 @@ fn ringbuffer_compaction_trims_and_surfaces_marker() {
     owner
         .attach(&info.session_id, AttachMode::Owner)
         .expect("attach owner");
-    owner.prompt(&info.session_id, "stream a lot").expect("prompt");
+    owner
+        .prompt(&info.session_id, "stream a lot")
+        .expect("prompt");
 
     // Drain the owner CONTINUOUSLY so its forwarder progress keeps advancing
     // (the floor follows it to the tip), letting trims keep the log bounded.
@@ -1336,11 +1353,7 @@ fn ringbuffer_compaction_trims_and_surfaces_marker() {
     );
     let fell_off = SessionServerClient::connect().expect("connect fell-off observer");
     fell_off
-        .attach_with_cursor(
-            &info.session_id,
-            AttachMode::Observer,
-            Some((0, stale_seq)),
-        )
+        .attach_with_cursor(&info.session_id, AttachMode::Observer, Some((0, stale_seq)))
         .expect("attach fell-off observer");
     let fo_notes = drain_until(&fell_off, Duration::from_secs(10), |n| {
         n.iter().filter(|x| is_transcript_note(x)).count() >= 1
@@ -1387,7 +1400,9 @@ fn cursor_reconnect_tails_after_compaction_when_in_range() {
     owner
         .attach(&info.session_id, AttachMode::Owner)
         .expect("attach owner");
-    owner.prompt(&info.session_id, "stream a lot").expect("prompt");
+    owner
+        .prompt(&info.session_id, "stream a lot")
+        .expect("prompt");
     let _ = drain_until(&owner, Duration::from_secs(20), |n| {
         n.iter().any(|note| {
             matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == info.session_id)
@@ -1403,7 +1418,10 @@ fn cursor_reconnect_tails_after_compaction_when_in_range() {
     let base = s.log_base;
     let len = s.event_log_len as u64;
     let tip = base + len; // exclusive logical tip
-    assert!(base > 0, "compaction must have advanced log_base; admin={s:#?}");
+    assert!(
+        base > 0,
+        "compaction must have advanced log_base; admin={s:#?}"
+    );
 
     // CONTROL: a from-base observer's transcript IS the resident log, in order —
     // ground truth for the suffix comparison.
@@ -1428,7 +1446,10 @@ fn cursor_reconnect_tails_after_compaction_when_in_range() {
     // the tail [K..] — exactly (tip - K) notes — and that tail must equal the
     // resident-log suffix at Vec offset (K - base).
     let k = base + (tip - base) / 2; // strictly inside the resident range
-    assert!(k > base && k < tip, "K={k} must be inside (base {base}, tip {tip})");
+    assert!(
+        k > base && k < tip,
+        "K={k} must be inside (base {base}, tip {tip})"
+    );
     let tail = SessionServerClient::connect().expect("connect tail observer");
     tail.attach_with_cursor(&info.session_id, AttachMode::Observer, Some((0, k)))
         .expect("attach tail observer with cursor");
@@ -1485,14 +1506,14 @@ fn stub_chunk_index(n: &Notification) -> Option<usize> {
 ///     mid-stream while the owner is live.
 ///
 ///     Two guarantees:
-///       (a) The owner receives EVERY chunk exactly once, in order — no gap, no
-///           dup. Before Bug 1a's fix, the forwarder tracked `sent` as a raw
-///           `Vec` index; a front-trim made `snapshot.len() > sent` go false
-///           (stall), then a re-slice at a stale offset gapped/duped the stream.
-///       (b) The trim NEVER drops below the owner's forwarded position (Bug 1b's
-///           owner hard-ceiling): the durable log stays AHEAD of the cap while the
-///           live owner is mid-stream, because the floor = min(live sent_seq)
-///           protects everything the owner hasn't yet been sent.
+///     (a) The owner receives EVERY chunk exactly once, in order — no gap, no
+///     dup. Before Bug 1a's fix, the forwarder tracked `sent` as a raw
+///     `Vec` index; a front-trim made `snapshot.len() > sent` go false
+///     (stall), then a re-slice at a stale offset gapped/duped the stream.
+///     (b) The trim NEVER drops below the owner's forwarded position (Bug 1b's
+///     owner hard-ceiling): the durable log stays AHEAD of the cap while the
+///     live owner is mid-stream, because the floor = min(live sent_seq)
+///     protects everything the owner hasn't yet been sent.
 ///
 ///     `STUB_DELAY_MS` paces the stream so the owner forwards incrementally
 ///     across several trims rather than after the whole turn is already logged.
@@ -1517,7 +1538,9 @@ fn live_owner_streams_across_trim_no_gap_or_dup() {
     owner
         .attach(&info.session_id, AttachMode::Owner)
         .expect("attach owner before turn");
-    owner.prompt(&info.session_id, "stream a lot").expect("prompt");
+    owner
+        .prompt(&info.session_id, "stream a lot")
+        .expect("prompt");
 
     // Collect everything the live owner receives until the turn ends.
     let notes = drain_until(&owner, Duration::from_secs(60), |n| {

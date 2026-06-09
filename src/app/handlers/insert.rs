@@ -52,14 +52,24 @@ impl App {
                 }
             }
             Key::Left => {
-                self.buffers[self.active_buffer].editor.cursor_mut().move_left();
+                self.buffers[self.active_buffer]
+                    .editor
+                    .cursor_mut()
+                    .move_left();
             }
             Key::Right => {
-                self.buffers[self.active_buffer].editor.move_right_clamped(true);
+                self.buffers[self.active_buffer]
+                    .editor
+                    .move_right_clamped(true);
             }
             Key::Up => {
-                self.buffers[self.active_buffer].editor.cursor_mut().move_up();
-                self.buffers[self.active_buffer].editor.clamp_cursor_col(true);
+                self.buffers[self.active_buffer]
+                    .editor
+                    .cursor_mut()
+                    .move_up();
+                self.buffers[self.active_buffer]
+                    .editor
+                    .clamp_cursor_col(true);
             }
             Key::Down => {
                 self.buffers[self.active_buffer].editor.move_down(true);
@@ -74,7 +84,10 @@ impl App {
         self.mode = AppMode::Normal;
         self.buffers[self.active_buffer].view_cache_dirty = true;
         if self.buffers[self.active_buffer].editor.cursor().col > 0 {
-            self.buffers[self.active_buffer].editor.cursor_mut().move_left();
+            self.buffers[self.active_buffer]
+                .editor
+                .cursor_mut()
+                .move_left();
         }
     }
 
@@ -89,7 +102,7 @@ impl App {
         let before_cursor = &line[..col.min(line.len())];
         // If everything before cursor is whitespace, remove up to 4 spaces
         if before_cursor.chars().all(|c| c == ' ') {
-            let remove = if col % 2 == 0 { 2 } else { 1 };
+            let remove = if col.is_multiple_of(2) { 2 } else { 1 };
             let remove = remove.min(col);
             for _ in 0..remove {
                 self.buffers[self.active_buffer].editor.backspace();
@@ -103,7 +116,11 @@ impl App {
         let editor = &self.buffers[self.active_buffer].editor;
         let line = editor.document().line_text(editor.cursor().line);
         let indent_len = line.chars().take_while(|c| *c == ' ').count();
-        let remove = if indent_len % 2 == 0 { 2.min(indent_len) } else { 1 };
+        let remove = if indent_len % 2 == 0 {
+            2.min(indent_len)
+        } else {
+            1
+        };
         if remove == 0 {
             return;
         }

@@ -94,7 +94,13 @@ impl AgentEvent {
         seq: u64,
         kind: AgentEventKind,
     ) -> Self {
-        Self { session_id, generation, turn, seq, kind }
+        Self {
+            session_id,
+            generation,
+            turn,
+            seq,
+            kind,
+        }
     }
 }
 
@@ -129,7 +135,9 @@ pub enum TurnOutcome {
     MaxTokens,
     Refusal,
     /// Retry-exhausted / agent error — a boundary, not a `Notice` string.
-    Failed { msg: String },
+    Failed {
+        msg: String,
+    },
     /// End of the replayed history prefix (spec §5) — old `ReplayComplete`.
     ReplayEnd,
 }
@@ -140,28 +148,46 @@ pub enum TurnOutcome {
 pub enum AgentEventKind {
     /// FIRST event of every (re)spawned channel (spec §4). `resumed` ==
     /// `resume_session_id.is_some()`.
-    ChannelOpened { resumed: bool },
+    ChannelOpened {
+        resumed: bool,
+    },
     /// Streamed text. `role` distinguishes assistant message from thought.
-    Chunk { text: String, role: ChunkRole },
+    Chunk {
+        text: String,
+        role: ChunkRole,
+    },
     ToolCallStarted(ToolCall),
     ToolCallUpdated(ToolCallUpdate),
     PlanUpdated(Plan),
     ModeChanged(SessionModeId),
     UsageUpdated(UsageSnapshot),
     /// Transient status ONLY (spec §1) — terminal failure is `TurnEnded`.
-    Notice { kind: NoticeKind, msg: String },
+    Notice {
+        kind: NoticeKind,
+        msg: String,
+    },
     /// Live submit + replay echo, unified; dedup by identity (spec §2/§5).
-    UserMessage { text: String },
+    UserMessage {
+        text: String,
+    },
     /// Turn boundary. Subsumes `ReplayComplete` (→ `ReplayEnd`) and terminal
     /// failure (→ `Failed`).
-    TurnEnded { outcome: TurnOutcome },
+    TurnEnded {
+        outcome: TurnOutcome,
+    },
     /// Ringbuffer-trim marker (spec §6/§7) — NOT a silent drop. (Stage B emits.)
-    CompactedSummary { through_turn: u64, summary: String },
+    CompactedSummary {
+        through_turn: u64,
+        summary: String,
+    },
     /// Forward-compat catch-all (spec §8): an older decoder lands an unknown
     /// `kind` HERE preserving the WHOLE object so a forwarding node round-trips
     /// it verbatim through the durable log. NEVER constructed by current code —
     /// only by [`Deserialize`] on an unrecognised tag.
-    Unknown { tag: String, raw: serde_json::Value },
+    Unknown {
+        tag: String,
+        raw: serde_json::Value,
+    },
 }
 
 // ── Serde ──────────────────────────────────────────────────────────────────
@@ -176,8 +202,13 @@ pub enum AgentEventKind {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum KnownKind {
-    ChannelOpened { resumed: bool },
-    Chunk { text: String, role: ChunkRole },
+    ChannelOpened {
+        resumed: bool,
+    },
+    Chunk {
+        text: String,
+        role: ChunkRole,
+    },
     ToolCallStarted(ToolCall),
     ToolCallUpdated(ToolCallUpdate),
     PlanUpdated(Plan),
@@ -190,9 +221,16 @@ enum KnownKind {
         kind: NoticeKind,
         msg: String,
     },
-    UserMessage { text: String },
-    TurnEnded { outcome: TurnOutcome },
-    CompactedSummary { through_turn: u64, summary: String },
+    UserMessage {
+        text: String,
+    },
+    TurnEnded {
+        outcome: TurnOutcome,
+    },
+    CompactedSummary {
+        through_turn: u64,
+        summary: String,
+    },
 }
 
 impl AgentEventKind {
@@ -202,29 +240,30 @@ impl AgentEventKind {
             AgentEventKind::ChannelOpened { resumed } => {
                 KnownKind::ChannelOpened { resumed: *resumed }
             }
-            AgentEventKind::Chunk { text, role } => {
-                KnownKind::Chunk { text: text.clone(), role: *role }
-            }
+            AgentEventKind::Chunk { text, role } => KnownKind::Chunk {
+                text: text.clone(),
+                role: *role,
+            },
             AgentEventKind::ToolCallStarted(tc) => KnownKind::ToolCallStarted(tc.clone()),
             AgentEventKind::ToolCallUpdated(u) => KnownKind::ToolCallUpdated(u.clone()),
             AgentEventKind::PlanUpdated(p) => KnownKind::PlanUpdated(p.clone()),
             AgentEventKind::ModeChanged(m) => KnownKind::ModeChanged(m.clone()),
             AgentEventKind::UsageUpdated(s) => KnownKind::UsageUpdated(s.clone()),
-            AgentEventKind::Notice { kind, msg } => {
-                KnownKind::Notice { kind: *kind, msg: msg.clone() }
-            }
-            AgentEventKind::UserMessage { text } => {
-                KnownKind::UserMessage { text: text.clone() }
-            }
-            AgentEventKind::TurnEnded { outcome } => {
-                KnownKind::TurnEnded { outcome: outcome.clone() }
-            }
-            AgentEventKind::CompactedSummary { through_turn, summary } => {
-                KnownKind::CompactedSummary {
-                    through_turn: *through_turn,
-                    summary: summary.clone(),
-                }
-            }
+            AgentEventKind::Notice { kind, msg } => KnownKind::Notice {
+                kind: *kind,
+                msg: msg.clone(),
+            },
+            AgentEventKind::UserMessage { text } => KnownKind::UserMessage { text: text.clone() },
+            AgentEventKind::TurnEnded { outcome } => KnownKind::TurnEnded {
+                outcome: outcome.clone(),
+            },
+            AgentEventKind::CompactedSummary {
+                through_turn,
+                summary,
+            } => KnownKind::CompactedSummary {
+                through_turn: *through_turn,
+                summary: summary.clone(),
+            },
             AgentEventKind::Unknown { .. } => return None,
         })
     }
@@ -241,9 +280,13 @@ impl AgentEventKind {
             KnownKind::Notice { kind, msg } => AgentEventKind::Notice { kind, msg },
             KnownKind::UserMessage { text } => AgentEventKind::UserMessage { text },
             KnownKind::TurnEnded { outcome } => AgentEventKind::TurnEnded { outcome },
-            KnownKind::CompactedSummary { through_turn, summary } => {
-                AgentEventKind::CompactedSummary { through_turn, summary }
-            }
+            KnownKind::CompactedSummary {
+                through_turn,
+                summary,
+            } => AgentEventKind::CompactedSummary {
+                through_turn,
+                summary,
+            },
         }
     }
 }
@@ -361,7 +404,9 @@ pub fn turn_ended_kind(outcome: TurnOutcome) -> AgentEventKind {
 
 /// The `TurnEnded { ReplayEnd }` kind — old `ReplayComplete` (spec §5).
 pub fn replay_end_kind() -> AgentEventKind {
-    AgentEventKind::TurnEnded { outcome: TurnOutcome::ReplayEnd }
+    AgentEventKind::TurnEnded {
+        outcome: TurnOutcome::ReplayEnd,
+    }
 }
 
 /// The `ChannelOpened` first-event kind (spec §4).
@@ -434,7 +479,9 @@ mod tests {
                 // The whole inner object is preserved.
                 assert_eq!(raw.get("tokens").and_then(|v| v.as_u64()), Some(128));
                 assert_eq!(
-                    raw.get("nested").and_then(|v| v.get("a")).and_then(|v| v.as_u64()),
+                    raw.get("nested")
+                        .and_then(|v| v.get("a"))
+                        .and_then(|v| v.as_u64()),
                     Some(1)
                 );
             }
@@ -457,19 +504,23 @@ mod tests {
 
     #[test]
     fn notice_classifies_retry_vs_info() {
-        let retry = agent_kind_from_reply(&ReplyEvent::Notice(
-            "API error — retrying 1/5 in 1s".into(),
-        ))
-        .unwrap();
+        let retry =
+            agent_kind_from_reply(&ReplyEvent::Notice("API error — retrying 1/5 in 1s".into()))
+                .unwrap();
         assert!(matches!(
             retry,
-            AgentEventKind::Notice { kind: NoticeKind::Retry, .. }
+            AgentEventKind::Notice {
+                kind: NoticeKind::Retry,
+                ..
+            }
         ));
-        let info =
-            agent_kind_from_reply(&ReplyEvent::Notice("heads up".into())).unwrap();
+        let info = agent_kind_from_reply(&ReplyEvent::Notice("heads up".into())).unwrap();
         assert!(matches!(
             info,
-            AgentEventKind::Notice { kind: NoticeKind::Info, .. }
+            AgentEventKind::Notice {
+                kind: NoticeKind::Info,
+                ..
+            }
         ));
     }
 

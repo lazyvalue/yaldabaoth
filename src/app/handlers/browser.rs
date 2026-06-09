@@ -110,11 +110,11 @@ impl App {
                 Key::Enter => {
                     let count = browser.visible_entries().len();
                     if count == 1 {
-                        if let Some(path) = browser.enter_selected() {
-                            if self.open_buffer(path) {
-                                self.screen = AppScreen::Editor;
-                                self.mode = AppMode::Normal;
-                            }
+                        if let Some(path) = browser.enter_selected()
+                            && self.open_buffer(path)
+                        {
+                            self.screen = AppScreen::Editor;
+                            self.mode = AppMode::Normal;
                         }
                     } else if count > 0 {
                         browser.filter_mode = false;
@@ -141,11 +141,11 @@ impl App {
             Key::Char('j') | Key::Down => browser.move_down(),
             Key::Char('k') | Key::Up => browser.move_up(),
             Key::Char('l') | Key::Enter => {
-                if let Some(path) = browser.enter_selected() {
-                    if self.open_buffer(path) {
-                        self.screen = AppScreen::Editor;
-                        self.mode = AppMode::Normal;
-                    }
+                if let Some(path) = browser.enter_selected()
+                    && self.open_buffer(path)
+                {
+                    self.screen = AppScreen::Editor;
+                    self.mode = AppMode::Normal;
                 }
             }
             Key::Char('o') => {
@@ -171,12 +171,14 @@ impl App {
                     browser.set_selected(0);
                     self.full_browser_pending_g = false;
                 } else {
-                    self.full_browser_pending_g = true;
-                    return; // wait for next key
+                    self.full_browser_pending_g = true; // wait for next key
                 }
             }
             Key::Tab => {
-                if let AppScreen::FileBrowser { came_from_dropdown: true } = self.screen {
+                if let AppScreen::FileBrowser {
+                    came_from_dropdown: true,
+                } = self.screen
+                {
                     self.close_full_browser();
                 }
             }
@@ -191,12 +193,16 @@ impl App {
 
     pub(crate) fn close_full_browser(&mut self) {
         match self.screen {
-            AppScreen::FileBrowser { came_from_dropdown: true } => {
+            AppScreen::FileBrowser {
+                came_from_dropdown: true,
+            } => {
                 self.screen = AppScreen::Editor;
                 // file_browser stays Some, mode stays FileBrowser for dropdown
                 self.mode = AppMode::FileBrowser;
             }
-            AppScreen::FileBrowser { came_from_dropdown: false } => {
+            AppScreen::FileBrowser {
+                came_from_dropdown: false,
+            } => {
                 self.screen = AppScreen::Editor;
                 self.mode = AppMode::Normal;
             }

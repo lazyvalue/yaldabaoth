@@ -21,11 +21,11 @@ impl App {
                     return;
                 }
                 Key::Up => {
-                    self.buffers[self.active_buffer].viewport.scroll_offset =
-                        self.buffers[self.active_buffer]
-                            .viewport
-                            .scroll_offset
-                            .saturating_sub(1);
+                    self.buffers[self.active_buffer].viewport.scroll_offset = self.buffers
+                        [self.active_buffer]
+                        .viewport
+                        .scroll_offset
+                        .saturating_sub(1);
                     return;
                 }
                 Key::Down => {
@@ -71,13 +71,12 @@ impl App {
                 let line = tb.editor.cursor().line;
                 let line_len = tb.editor.document().line_len_chars(line);
                 // Subtract 1 for the trailing newline if present
-                let text_len = if line_len > 0
-                    && tb.editor.document().line_text(line).ends_with('\n')
-                {
-                    line_len - 1
-                } else {
-                    line_len
-                };
+                let text_len =
+                    if line_len > 0 && tb.editor.document().line_text(line).ends_with('\n') {
+                        line_len - 1
+                    } else {
+                        line_len
+                    };
                 tb.editor.cursor_mut().col = text_len;
                 tb.editor.begin_insert();
                 tb.mode = AppMode::Insert;
@@ -116,9 +115,7 @@ impl App {
             Key::Char('$') if key.modifiers.is_empty() => {
                 let line = tb.editor.cursor().line;
                 let len = tb.editor.document().line_len_chars(line);
-                let text_len = if len > 0
-                    && tb.editor.document().line_text(line).ends_with('\n')
-                {
+                let text_len = if len > 0 && tb.editor.document().line_text(line).ends_with('\n') {
                     len - 1
                 } else {
                     len

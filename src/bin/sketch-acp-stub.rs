@@ -17,27 +17,28 @@
 //!   - `initialize`     → `{protocolVersion, agentCapabilities:{loadSession:true}}`
 //!   - `session/new`    → `{sessionId}`
 //!   - `session/load`   → replays the prior transcript as `session/update`
-//!                        notifications, then returns (used on resume)
+//!     notifications, then returns (used on resume)
 //!   - `session/prompt` → streams `STUB_CHUNKS` `agent_message_chunk` updates,
-//!                        then returns `{stopReason:"end_turn"}`
+//!     then returns `{stopReason:"end_turn"}`
 //!   - `session/cancel` → (notification) ends the in-flight turn early
+//!
 //! Anything else (other notifications, unknown methods, `_meta`, the
 //! system-prompt append) is ignored.
 //!
 //! ## Knobs (environment variables)
 //!
 //! - `STUB_CHUNKS=N`      — number of `agent_message_chunk` updates to stream
-//!                          per `session/prompt` (default 2). Set high (e.g.
-//!                          800) to force a LARGE event_log / replay.
+//!   per `session/prompt` (default 2). Set high (e.g.
+//!   800) to force a LARGE event_log / replay.
 //! - `STUB_CHUNK_TEXT=s`  — text emitted per chunk (default `"chunk "`). The
-//!                          chunk index is appended so chunks are distinct.
+//!   chunk index is appended so chunks are distinct.
 //! - `STUB_DELAY_MS=ms`   — delay between streamed chunks (default 0). Use a
-//!                          nonzero value to keep a turn streaming long enough
-//!                          for a mid-turn reconnect test.
+//!   nonzero value to keep a turn streaming long enough
+//!   for a mid-turn reconnect test.
 //! - `STUB_REPLAY_USER=s` — if set, `session/load` emits one
-//!                          `user_message_chunk` with this text before its
-//!                          agent chunks (mirrors how a real agent re-emits the
-//!                          user's own prior turn on resume). Default: unset.
+//!   `user_message_chunk` with this text before its
+//!   agent chunks (mirrors how a real agent re-emits the
+//!   user's own prior turn on resume). Default: unset.
 //!
 //! The stub is intentionally single-threaded and synchronous: it reads one
 //! request line, fully handles it (including streaming all chunks), then reads

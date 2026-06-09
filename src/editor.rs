@@ -7,13 +7,13 @@ use crate::cursor::CursorPos;
 use crate::document::Document;
 use crate::tree::{BlockInfo, TreeState};
 
-/// Test-only instrumentation for finding #9: counts every anchor visited by the
-/// O(transcript) reverse scan in `last_line_with_meta`. The `last_llm_line`
-/// cache should drive this to 0 on the common "continue current turn" streaming
-/// path, proving per-chunk work is independent of transcript size.
-///
-/// Thread-local so `cargo test`'s parallel runner doesn't cross-contaminate the
-/// count between tests — the scan always runs on the calling test's thread.
+// Test-only instrumentation for finding #9: counts every anchor visited by the
+// O(transcript) reverse scan in `last_line_with_meta`. The `last_llm_line`
+// cache should drive this to 0 on the common "continue current turn" streaming
+// path, proving per-chunk work is independent of transcript size.
+//
+// Thread-local so `cargo test`'s parallel runner doesn't cross-contaminate the
+// count between tests — the scan always runs on the calling test's thread.
 #[cfg(test)]
 thread_local! {
     static ANCHOR_SCAN_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -314,18 +314,15 @@ impl EditorCore {
     /// counter (test builds only) tallies every anchor this touches so a test
     /// can assert the cached common case visits 0 — i.e. work is independent of
     /// transcript size N.
-    fn last_line_with_meta<T: Any + Send + Sync + PartialEq>(
-        &self,
-        tag: &T,
-    ) -> Option<usize> {
+    fn last_line_with_meta<T: Any + Send + Sync + PartialEq>(&self, tag: &T) -> Option<usize> {
         let view = self.metadata::<T>();
         for (&line, &anchor) in self.line_anchors.by_line.iter().rev() {
             #[cfg(test)]
             ANCHOR_SCAN_VISITS.with(|c| c.set(c.get() + 1));
-            if let Some(v) = view.get(anchor) {
-                if v == tag {
-                    return Some(line);
-                }
+            if let Some(v) = view.get(anchor)
+                && v == tag
+            {
+                return Some(line);
             }
         }
         None
@@ -363,7 +360,8 @@ impl EditorCore {
         } else if self.lockable_through_line >= self.document.line_count() {
             self.document.rope().len_chars()
         } else {
-            self.document.line_col_to_char(self.lockable_through_line, 0)
+            self.document
+                .line_col_to_char(self.lockable_through_line, 0)
         }
     }
 
@@ -393,11 +391,11 @@ impl EditorCore {
         self.frozen_lines.sort_by_key(|&(s, _)| s);
         let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.frozen_lines.len());
         for (s, e) in self.frozen_lines.drain(..) {
-            if let Some(last) = merged.last_mut() {
-                if s <= last.1 {
-                    last.1 = last.1.max(e);
-                    continue;
-                }
+            if let Some(last) = merged.last_mut()
+                && s <= last.1
+            {
+                last.1 = last.1.max(e);
+                continue;
             }
             merged.push((s, e));
         }
@@ -444,7 +442,9 @@ impl EditorCore {
 
     /// True if `line` is in any frozen range.
     pub fn is_frozen_line(&self, line: usize) -> bool {
-        self.frozen_lines.iter().any(|&(s, e)| line >= s && line < e)
+        self.frozen_lines
+            .iter()
+            .any(|&(s, e)| line >= s && line < e)
     }
 
     /// True if `char_idx` falls within any frozen line. Boundary semantics:
@@ -471,9 +471,11 @@ impl EditorCore {
             return false;
         }
         let line_len = self.document.line_len_chars(line);
-        let line_end = line_len.saturating_sub(
-            if self.document.line_text(line).ends_with('\n') { 1 } else { 0 },
-        );
+        let line_end = line_len.saturating_sub(if self.document.line_text(line).ends_with('\n') {
+            1
+        } else {
+            0
+        });
         col == 0 || col >= line_end
     }
 
@@ -591,8 +593,7 @@ impl EditorCore {
             }
         }
         if self.lockable_through_line > start_line {
-            self.lockable_through_line =
-                self.lockable_through_line.saturating_sub(deleted_nl);
+            self.lockable_through_line = self.lockable_through_line.saturating_sub(deleted_nl);
         }
 
         let dropped = self
@@ -606,7 +607,11 @@ impl EditorCore {
         // consumed by the delete invalidate it; lines below shift up. Boundary
         // semantics match shift_for_delete (start line survives iff start_col>0).
         if let Some(llm) = self.last_llm_line {
-            let consumed_lo = if start_col == 0 { start_line } else { start_line + 1 };
+            let consumed_lo = if start_col == 0 {
+                start_line
+            } else {
+                start_line + 1
+            };
             let consumed_hi = start_line + deleted_nl; // inclusive
             if llm >= consumed_lo && llm <= consumed_hi {
                 self.last_llm_line = None;
@@ -815,10 +820,7 @@ impl EditorView {
     pub fn extend_by_line(&mut self, core: &EditorCore) {
         let line_count = core.document.line_count();
         if let Some(((sl, _), (el, _))) = self.selection_range() {
-            let prev_was_line_aligned = self
-                .selection_anchor
-                .map(|a| a.col == 0)
-                .unwrap_or(false)
+            let prev_was_line_aligned = self.selection_anchor.map(|a| a.col == 0).unwrap_or(false)
                 && self.cursor.col == core.document.line_len_chars(el);
             let target_end_line = if prev_was_line_aligned {
                 (el + 1).min(line_count.saturating_sub(1))
@@ -901,7 +903,8 @@ impl EditorView {
             self.cursor.col = line_len;
         }
         self.selection_anchor = None;
-        core.document.end_undo_group(self.cursor.line, self.cursor.col);
+        core.document
+            .end_undo_group(self.cursor.line, self.cursor.col);
         core.reparse();
         true
     }
@@ -1078,9 +1081,7 @@ impl EditorView {
     pub fn undo(&mut self, core: &mut EditorCore) {
         let cur_frozen = core.frozen_lines.clone();
         let cur_lockable = core.lockable_through_line;
-        if let Some((line, col, frozen, lockable)) =
-            core.document.undo(&cur_frozen, cur_lockable)
-        {
+        if let Some((line, col, frozen, lockable)) = core.document.undo(&cur_frozen, cur_lockable) {
             core.frozen_lines = frozen;
             core.lockable_through_line = lockable;
             core.reset_line_anchors();
@@ -1094,9 +1095,7 @@ impl EditorView {
     pub fn redo(&mut self, core: &mut EditorCore) {
         let cur_frozen = core.frozen_lines.clone();
         let cur_lockable = core.lockable_through_line;
-        if let Some((line, col, frozen, lockable)) =
-            core.document.redo(&cur_frozen, cur_lockable)
-        {
+        if let Some((line, col, frozen, lockable)) = core.document.redo(&cur_frozen, cur_lockable) {
             core.frozen_lines = frozen;
             core.lockable_through_line = lockable;
             core.reset_line_anchors();
@@ -1344,9 +1343,7 @@ impl Editor {
     {
         // Ensure the transcript ends with a newline so the appended body
         // starts on its own line. O(1) tail probe instead of full_text().
-        if !self.core.document().is_empty()
-            && self.core.document().last_char() != Some('\n')
-        {
+        if !self.core.document().is_empty() && self.core.document().last_char() != Some('\n') {
             let eof = self.core.document().rope().len_chars();
             self.core.programmatic_insert(eof, "\n");
         }
@@ -1367,10 +1364,7 @@ impl Editor {
         }
     }
 
-    fn find_llm_insertion_point<T: Any + Send + Sync + PartialEq>(
-        &self,
-        turn_tag: &T,
-    ) -> usize {
+    fn find_llm_insertion_point<T: Any + Send + Sync + PartialEq>(&self, turn_tag: &T) -> usize {
         let doc = self.core.document();
         let total_chars = doc.rope().len_chars();
         let total_lines = doc.line_count();
@@ -1698,9 +1692,7 @@ mod tests {
     /// tool block lands on its own dedicated blank line tagged with a turn
     /// distinct from the surrounding `Llm` prose.
     fn simulate_tool_call(ed: &mut Editor, turn: usize) {
-        if !ed.document().full_text().is_empty()
-            && !ed.document().full_text().ends_with('\n')
-        {
+        if !ed.document().full_text().is_empty() && !ed.document().full_text().ends_with('\n') {
             let len = ed.document().rope().len_chars();
             ed.programmatic_insert(len, "\n");
         }
@@ -1708,7 +1700,8 @@ mod tests {
         ed.programmatic_insert(len, "\n");
         let tool_line = ed.document().line_count().saturating_sub(2);
         let anchor = ed.anchor_for_line(tool_line);
-        ed.metadata_mut::<TurnId>().insert(anchor, TurnId::Tool(turn));
+        ed.metadata_mut::<TurnId>()
+            .insert(anchor, TurnId::Tool(turn));
     }
 
     #[test]
@@ -1723,8 +1716,14 @@ mod tests {
         ed.append_llm_chunk(TurnId::Llm(1), "Found it elsewhere.");
 
         let text = ed.document().full_text();
-        assert!(text.contains("The key line is here."), "pre-tool intact: {text:?}");
-        assert!(text.contains("Found it elsewhere."), "post-tool present: {text:?}");
+        assert!(
+            text.contains("The key line is here."),
+            "pre-tool intact: {text:?}"
+        );
+        assert!(
+            text.contains("Found it elsewhere."),
+            "post-tool present: {text:?}"
+        );
         // No splice/merge of the two stretches.
         assert!(
             !text.contains("The key line is here.Found")
@@ -1734,7 +1733,10 @@ mod tests {
         );
         let pre = text.lines().position(|l| l.contains("key line")).unwrap();
         let post = text.lines().position(|l| l.contains("Found it")).unwrap();
-        assert!(post > pre, "post-tool prose must come after pre-tool: {text:?}");
+        assert!(
+            post > pre,
+            "post-tool prose must come after pre-tool: {text:?}"
+        );
 
         // Collect per-line tags (immutable borrow snapshot).
         let tags: Vec<Option<TurnId>> = (0..ed.document().line_count())
@@ -1750,10 +1752,24 @@ mod tests {
         // The discriminating checks: post-tool prose lands on its OWN line
         // (tagged Llm(1)), strictly after the tool line — not spliced onto the
         // tool's line. Reverting the find_llm_insertion_point skip fails here.
-        assert_ne!(post, tool_line, "post-tool prose landed on the tool line: {text:?}");
-        assert!(pre < tool_line && tool_line < post, "expected pre < tool < post: {text:?}");
-        assert_eq!(tags[post], Some(TurnId::Llm(1)), "post-tool line keeps Llm(1): {text:?}");
-        assert_eq!(tags[pre], Some(TurnId::Llm(1)), "pre-tool line keeps Llm(1): {text:?}");
+        assert_ne!(
+            post, tool_line,
+            "post-tool prose landed on the tool line: {text:?}"
+        );
+        assert!(
+            pre < tool_line && tool_line < post,
+            "expected pre < tool < post: {text:?}"
+        );
+        assert_eq!(
+            tags[post],
+            Some(TurnId::Llm(1)),
+            "post-tool line keeps Llm(1): {text:?}"
+        );
+        assert_eq!(
+            tags[pre],
+            Some(TurnId::Llm(1)),
+            "pre-tool line keeps Llm(1): {text:?}"
+        );
     }
 
     #[test]
@@ -1786,16 +1802,34 @@ mod tests {
         // No System line was ever retagged Llm, and no Llm line became System.
         for (l, t) in tags.iter().enumerate() {
             if text.lines().nth(l).is_some_and(|s| s.contains("notice")) {
-                assert_eq!(*t, Some(TurnId::System), "notice line {l} must stay System: {text:?}");
+                assert_eq!(
+                    *t,
+                    Some(TurnId::System),
+                    "notice line {l} must stay System: {text:?}"
+                );
             }
         }
 
         // Both agent stretches are tagged Llm(1) — the notices did not shift
         // the turn number for the chunk that followed them.
-        let pre = text.lines().position(|l| l.contains("Agent prose")).unwrap();
-        let post = text.lines().position(|l| l.contains("More turn-one")).unwrap();
-        assert_eq!(tags[pre], Some(TurnId::Llm(1)), "pre-notice prose keeps Llm(1): {text:?}");
-        assert_eq!(tags[post], Some(TurnId::Llm(1)), "post-notice chunk keeps Llm(1): {text:?}");
+        let pre = text
+            .lines()
+            .position(|l| l.contains("Agent prose"))
+            .unwrap();
+        let post = text
+            .lines()
+            .position(|l| l.contains("More turn-one"))
+            .unwrap();
+        assert_eq!(
+            tags[pre],
+            Some(TurnId::Llm(1)),
+            "pre-notice prose keeps Llm(1): {text:?}"
+        );
+        assert_eq!(
+            tags[post],
+            Some(TurnId::Llm(1)),
+            "post-notice chunk keeps Llm(1): {text:?}"
+        );
 
         // The post-notice chunk landed on its own line, not spliced into a
         // notice line.
@@ -1813,7 +1847,11 @@ mod tests {
         let t2_tag = ed
             .anchor_for_line_opt(t2_line)
             .and_then(|a| ed.metadata::<TurnId>().get(a).copied());
-        assert_eq!(t2_tag, Some(TurnId::Llm(2)), "turn-two chunk keeps Llm(2): {text2:?}");
+        assert_eq!(
+            t2_tag,
+            Some(TurnId::Llm(2)),
+            "turn-two chunk keeps Llm(2): {text2:?}"
+        );
     }
 
     fn new_editor(text: &str) -> Editor {
@@ -1936,10 +1974,7 @@ mod tests {
         let mut ed = new_editor("");
         ed.append_llm_chunk(TurnId::Llm(1), "first turn\n");
         ed.append_llm_chunk(TurnId::Llm(2), "second turn\n");
-        assert_eq!(
-            ed.document().full_text(),
-            "first turn\nsecond turn\n"
-        );
+        assert_eq!(ed.document().full_text(), "first turn\nsecond turn\n");
         let a0 = ed.anchor_for_line(0);
         let a1 = ed.anchor_for_line(1);
         assert_eq!(ed.metadata::<TurnId>().get(a0), Some(&TurnId::Llm(1)));
@@ -2188,10 +2223,7 @@ mod tests {
         }
         let text = ed.document().full_text();
         for i in 1..=20 {
-            assert!(
-                text.contains(&format!("turn-{i}\n")),
-                "missing turn-{i}"
-            );
+            assert!(text.contains(&format!("turn-{i}\n")), "missing turn-{i}");
         }
         assert_eq!(ed.document().line_count(), 21); // 20 lines + trailing empty
     }
@@ -2263,10 +2295,7 @@ mod tests {
         let mut ed = new_editor("");
         ed.append_llm_chunk(TurnId::Llm(1), "first line\n");
         ed.append_llm_chunk(TurnId::Llm(1), "second line\n");
-        assert_eq!(
-            ed.document().full_text(),
-            "first line\nsecond line\n"
-        );
+        assert_eq!(ed.document().full_text(), "first line\nsecond line\n");
         assert!(ed.is_frozen_line(0));
         assert!(ed.is_frozen_line(1));
     }
@@ -2425,7 +2454,7 @@ fn f() { let x = 1; }
                 view.cursor.line = line;
                 view.cursor.col = col;
                 match rnd(7) {
-                    0 | 1 | 2 | 3 => {
+                    0..=3 => {
                         // Insert — the GUI wraps each keystroke in begin/end.
                         let ch = chars[rnd(chars.len())];
                         view.begin_insert(&mut core);

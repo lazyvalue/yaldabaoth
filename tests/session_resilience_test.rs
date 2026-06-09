@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use sketch::acp_channel::PermissionMode;
 use sketch::session_client::SessionServerClient;
-use sketch::session_proto::{socket_path, AdminSnapshot, AttachMode, Notification};
+use sketch::session_proto::{AdminSnapshot, AttachMode, Notification, socket_path};
 
 /// A running server instance bound to a private socket, with its stderr
 /// captured to a file we can scan for connect/disconnect lines.
@@ -247,7 +247,8 @@ fn session_survives_client_restart() {
         server.read_log()
     );
     assert_eq!(
-        closes, accepts,
+        closes,
+        accepts,
         "every connection must close (no zombies); accepts={accepts} closes={closes}; log:\n{}",
         server.read_log()
     );
@@ -377,7 +378,10 @@ fn second_server_does_not_steal_socket() {
             }
         }
     };
-    assert!(status.success(), "intruder server exited non-zero: {status:?}");
+    assert!(
+        status.success(),
+        "intruder server exited non-zero: {status:?}"
+    );
 
     // The intruder's stderr should say it deferred to the running server.
     let mut err = String::new();
@@ -463,7 +467,8 @@ fn server_socket_is_owner_only() {
         .mode()
         & 0o777;
     assert_eq!(
-        mode, 0o600,
+        mode,
+        0o600,
         "session-server socket must be 0600 (owner-only), got {mode:o}; log:\n{}",
         server.read_log()
     );
@@ -520,7 +525,8 @@ fn admin_status_reports_live_sessions() {
     // Empty to start.
     let snap: AdminSnapshot = client.admin_status().expect("admin_status (empty)");
     assert_eq!(
-        snap.session_count, 0,
+        snap.session_count,
+        0,
         "fresh server must report zero sessions; log:\n{}",
         server.read_log()
     );
@@ -536,7 +542,8 @@ fn admin_status_reports_live_sessions() {
 
     let snap = client.admin_status().expect("admin_status (two)");
     assert_eq!(
-        snap.session_count, 2,
+        snap.session_count,
+        2,
         "both sessions must appear in the snapshot; log:\n{}",
         server.read_log()
     );
@@ -564,7 +571,8 @@ fn admin_status_reports_live_sessions() {
         // A freshly-created session (agent is /usr/bin/true → no events) has an
         // empty transcript; the snapshot must report that, not a stale/garbage len.
         assert_eq!(
-            entry.event_log_len, 0,
+            entry.event_log_len,
+            0,
             "fresh session should have an empty event log; log:\n{}",
             server.read_log()
         );
@@ -626,7 +634,10 @@ fn in_place_reconnect_reattaches() {
         result.err(),
         server.read_log()
     );
-    assert!(client.is_connected(), "client not connected after reconnect");
+    assert!(
+        client.is_connected(),
+        "client not connected after reconnect"
+    );
     assert_eq!(
         client.client_id(),
         "gui-reconn",
@@ -670,7 +681,9 @@ fn same_client_id_reclaims_lease_without_retry() {
         let info = client
             .create_session(std::env::temp_dir(), "reclaim".into(), None)
             .expect("create_session");
-        let drove = client.attach(&info.session_id, AttachMode::Owner).expect("attach");
+        let drove = client
+            .attach(&info.session_id, AttachMode::Owner)
+            .expect("attach");
         assert!(drove, "first Owner attach must acquire the lease");
         client.prompt(&info.session_id, "hi").expect("prompt ok");
         info.session_id
@@ -858,7 +871,11 @@ fn detach_releases_now_eof_starts_the_clock() {
     );
 
     // (b) Re-take, then drop the SOCKET (EOF). The lease must persist until TTL.
-    assert!(client_a.attach(&sid, AttachMode::Owner).expect("A re-attach"));
+    assert!(
+        client_a
+            .attach(&sid, AttachMode::Owner)
+            .expect("A re-attach")
+    );
     drop(client_a);
     std::thread::sleep(Duration::from_millis(150));
     // A monitor client confirms the lease is STILL held shortly after EOF.
@@ -875,7 +892,9 @@ fn detach_releases_now_eof_starts_the_clock() {
 
     // A same-id reconnect within the TTL resumes drive rights on the first try.
     let client_a2 = connect_as("gui-A");
-    let drove = client_a2.attach(&sid, AttachMode::Owner).expect("A2 attach");
+    let drove = client_a2
+        .attach(&sid, AttachMode::Owner)
+        .expect("A2 attach");
     assert!(
         drove,
         "same-id reconnect within TTL must resume on the first try; log:\n{}",
@@ -900,7 +919,11 @@ fn promote_blocked_until_holder_releases() {
     assert!(client_a.attach(&sid, AttachMode::Owner).expect("A attach"));
 
     let client_b = connect_as("gui-B");
-    assert!(!client_b.attach(&sid, AttachMode::Observer).expect("B observe"));
+    assert!(
+        !client_b
+            .attach(&sid, AttachMode::Observer)
+            .expect("B observe")
+    );
     assert!(
         client_b.promote(&sid).is_err(),
         "B must not promote while A holds a live lease; log:\n{}",
@@ -935,12 +958,12 @@ fn await_lease_changed(
     let deadline = Instant::now() + timeout;
     loop {
         while let Some(note) = client.try_recv() {
-            if let Notification::LeaseChanged { session_id, lease } = &note {
-                if session_id == sid {
-                    let holder = lease.as_ref().map(|l| l.client_id.as_str());
-                    if holder == want_holder {
-                        return true;
-                    }
+            if let Notification::LeaseChanged { session_id, lease } = &note
+                && session_id == sid
+            {
+                let holder = lease.as_ref().map(|l| l.client_id.as_str());
+                if holder == want_holder {
+                    return true;
                 }
             }
         }
@@ -1019,7 +1042,9 @@ fn beating_holder_not_displaced_by_owner_attach() {
     // beats; probe B once per beat. ~9 iterations spans ~5 TTL windows.
     let beat = Duration::from_millis(ttl_ms / 3);
     for i in 0..9 {
-        client_a.heartbeat(&sid).expect("A heartbeat keeps the lease live");
+        client_a
+            .heartbeat(&sid)
+            .expect("A heartbeat keeps the lease live");
         let drove_b = client_b
             .attach(&sid, AttachMode::Owner)
             .expect("B attach must not error on contention");

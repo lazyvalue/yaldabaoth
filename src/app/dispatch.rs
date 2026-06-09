@@ -35,11 +35,11 @@ impl App {
         content_width: usize,
     ) {
         if let Some((action, args)) = self.registry.resolve(cmd_input) {
-            if action == Action::Reload {
-                if let Some(path_arg) = args.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                    self.edit_path(path_arg);
-                    return;
-                }
+            if action == Action::Reload
+                && let Some(path_arg) = args.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                self.edit_path(path_arg);
+                return;
             }
             if action == Action::SetMaxLineWidth {
                 let arg = args.as_deref().map(str::trim).unwrap_or("");
@@ -76,10 +76,19 @@ impl App {
         self.ensure_cursor_visible(viewport_height);
     }
 
-    pub(crate) fn execute_action(&mut self, action: Action, viewport_height: usize, content_width: usize) {
+    pub(crate) fn execute_action(
+        &mut self,
+        action: Action,
+        viewport_height: usize,
+        content_width: usize,
+    ) {
         match action {
             Action::Quit => {
-                if self.buffers[self.active_buffer].editor.document().is_modified() {
+                if self.buffers[self.active_buffer]
+                    .editor
+                    .document()
+                    .is_modified()
+                {
                     self.command_error =
                         "No write since last change (add ! to override)".to_string();
                 } else {
@@ -109,20 +118,31 @@ impl App {
                     if self.buffers[self.active_buffer].nav_mode != NavMode::Character {
                         self.nav_move_prev();
                     } else {
-                        self.buffers[self.active_buffer].rendered_cursor_row =
-                            self.buffers[self.active_buffer].rendered_cursor_row.saturating_sub(1);
+                        self.buffers[self.active_buffer].rendered_cursor_row = self.buffers
+                            [self.active_buffer]
+                            .rendered_cursor_row
+                            .saturating_sub(1);
                     }
                     self.ensure_rendered_cursor_visible(viewport_height);
                 } else {
                     self.buffers[self.active_buffer].editor.pre_move(false);
-                    self.buffers[self.active_buffer].editor.cursor_mut().move_up();
-                    self.buffers[self.active_buffer].editor.clamp_cursor_col(false);
+                    self.buffers[self.active_buffer]
+                        .editor
+                        .cursor_mut()
+                        .move_up();
+                    self.buffers[self.active_buffer]
+                        .editor
+                        .clamp_cursor_col(false);
                     self.ensure_cursor_visible(viewport_height);
                 }
             }
-            Action::MoveLeft | Action::MoveRight
-            | Action::MoveWordForward | Action::MoveWordBackward | Action::MoveWordEnd
-            | Action::MoveLineStart | Action::MoveLineEnd => {
+            Action::MoveLeft
+            | Action::MoveRight
+            | Action::MoveWordForward
+            | Action::MoveWordBackward
+            | Action::MoveWordEnd
+            | Action::MoveLineStart
+            | Action::MoveLineEnd => {
                 if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
                     let nav = self.buffers[self.active_buffer].nav_mode;
                     if nav == NavMode::Link || nav == NavMode::ListItem {
@@ -135,8 +155,10 @@ impl App {
                     } else if nav == NavMode::Character {
                         match action {
                             Action::MoveLeft => {
-                                self.buffers[self.active_buffer].rendered_cursor_col =
-                                    self.buffers[self.active_buffer].rendered_cursor_col.saturating_sub(1);
+                                self.buffers[self.active_buffer].rendered_cursor_col = self.buffers
+                                    [self.active_buffer]
+                                    .rendered_cursor_col
+                                    .saturating_sub(1);
                             }
                             Action::MoveRight => {
                                 self.buffers[self.active_buffer].rendered_cursor_col += 1;
@@ -257,12 +279,16 @@ impl App {
             }
             Action::DeleteChar => {
                 self.ensure_raw_for_editing();
-                self.buffers[self.active_buffer].editor.delete_char_at_cursor();
+                self.buffers[self.active_buffer]
+                    .editor
+                    .delete_char_at_cursor();
                 self.buffers[self.active_buffer].view_cache_dirty = true;
             }
             Action::DeleteLine => {
                 self.ensure_raw_for_editing();
-                self.buffers[self.active_buffer].editor.delete_current_line();
+                self.buffers[self.active_buffer]
+                    .editor
+                    .delete_current_line();
                 self.buffers[self.active_buffer].view_cache_dirty = true;
                 self.ensure_cursor_visible(viewport_height);
             }
@@ -282,7 +308,9 @@ impl App {
                 self.mode = AppMode::Command;
             }
             Action::ScrollDown => {
-                self.buffers[self.active_buffer].viewport.scroll_down(1, viewport_height);
+                self.buffers[self.active_buffer]
+                    .viewport
+                    .scroll_down(1, viewport_height);
             }
             Action::ScrollUp => {
                 self.buffers[self.active_buffer].viewport.scroll_up(1);
@@ -304,25 +332,30 @@ impl App {
                 self.page_move_cursor(viewport_height, false);
             }
             Action::JumpTop => {
-                self.buffers[self.active_buffer].editor.cursor_mut().jump_top();
+                self.buffers[self.active_buffer]
+                    .editor
+                    .cursor_mut()
+                    .jump_top();
                 self.buffers[self.active_buffer].viewport.jump_top();
             }
             Action::JumpBottom => {
                 self.buffers[self.active_buffer].editor.jump_cursor_bottom();
-                self.buffers[self.active_buffer].viewport.jump_bottom(viewport_height);
+                self.buffers[self.active_buffer]
+                    .viewport
+                    .jump_bottom(viewport_height);
             }
             Action::NextHeading => {
-                if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
-                    if let Some(y) = self.find_next_heading(None) {
-                        self.buffers[self.active_buffer].viewport.scroll_offset = y;
-                    }
+                if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered
+                    && let Some(y) = self.find_next_heading(None)
+                {
+                    self.buffers[self.active_buffer].viewport.scroll_offset = y;
                 }
             }
             Action::PrevHeading => {
-                if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered {
-                    if let Some(y) = self.find_prev_heading(None) {
-                        self.buffers[self.active_buffer].viewport.scroll_offset = y;
-                    }
+                if self.buffers[self.active_buffer].view_mode == ViewMode::Rendered
+                    && let Some(y) = self.find_prev_heading(None)
+                {
+                    self.buffers[self.active_buffer].viewport.scroll_offset = y;
                 }
             }
             Action::NextHeadingSameLevel => {
@@ -453,8 +486,7 @@ impl App {
                 self.outline_filter_mode = false;
                 self.outline_filter_text.clear();
                 self.outline_stack.clear();
-                self.outline_saved_scroll =
-                    self.buffers[self.active_buffer].viewport.scroll_offset;
+                self.outline_saved_scroll = self.buffers[self.active_buffer].viewport.scroll_offset;
                 self.mode = AppMode::Outline;
                 // Select the heading closest to current scroll position
                 let scroll = self.buffers[self.active_buffer].viewport.scroll_offset;
@@ -462,8 +494,7 @@ impl App {
                 self.outline_selected = entries
                     .iter()
                     .enumerate()
-                    .filter(|(_, e)| e.y_offset <= scroll)
-                    .last()
+                    .rfind(|(_, e)| e.y_offset <= scroll)
                     .map(|(i, _)| i)
                     .unwrap_or(0);
                 self.scroll_to_outline_entry();
@@ -608,11 +639,7 @@ impl App {
                         } else {
                             "STALE — re-run :claude-attach"
                         };
-                        format!(
-                            "Claude channel: {} ({})",
-                            c.socket_path().display(),
-                            live
-                        )
+                        format!("Claude channel: {} ({})", c.socket_path().display(), live)
                     }
                     None => format!(
                         "Not attached. Default socket: {}",
@@ -626,8 +653,7 @@ impl App {
                 self.append_to_claude_buffer(
                     "Hello from :claude-test.\n\nThis is paragraph two.\n\nThis is paragraph three.",
                 );
-                self.command_error =
-                    "Injected synthetic Claude reply into *claude* buffer.".into();
+                self.command_error = "Injected synthetic Claude reply into *claude* buffer.".into();
             }
             Action::ClaudeAcpAttach => {
                 // Bare keybinding invocation (no arg) → use default command.
@@ -728,9 +754,7 @@ impl App {
         let new_col = cursor_col_before.min(new_len);
         buf.editor.cursor_mut().line = line_idx;
         buf.editor.cursor_mut().col = new_col;
-        buf.editor
-            .document_mut()
-            .end_undo_group(line_idx, new_col);
+        buf.editor.document_mut().end_undo_group(line_idx, new_col);
         buf.view_cache_dirty = true;
     }
 
@@ -802,10 +826,10 @@ impl App {
             NavMode::CodeBlock => {
                 use std::io::Write;
                 use std::process::{Command, Stdio};
-                if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = stdin.write_all(obj.action_data.as_bytes());
-                    }
+                if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn()
+                    && let Some(mut stdin) = child.stdin.take()
+                {
+                    let _ = stdin.write_all(obj.action_data.as_bytes());
                 }
             }
             NavMode::ListItem => {
@@ -818,7 +842,8 @@ impl App {
     pub(crate) fn nav_move_next(&mut self) {
         let buf = &self.buffers[self.active_buffer];
         let mode = buf.nav_mode;
-        let filtered: Vec<usize> = buf.nav_objects
+        let filtered: Vec<usize> = buf
+            .nav_objects
             .iter()
             .enumerate()
             .filter(|(_, o)| o.kind == mode)
@@ -841,7 +866,8 @@ impl App {
     pub(crate) fn nav_move_prev(&mut self) {
         let buf = &self.buffers[self.active_buffer];
         let mode = buf.nav_mode;
-        let filtered: Vec<usize> = buf.nav_objects
+        let filtered: Vec<usize> = buf
+            .nav_objects
             .iter()
             .enumerate()
             .filter(|(_, o)| o.kind == mode)
@@ -852,7 +878,11 @@ impl App {
         }
         let current_idx = buf.nav_object_index;
         let pos = filtered.iter().position(|&i| i == current_idx).unwrap_or(0);
-        let prev_pos = if pos == 0 { filtered.len() - 1 } else { pos - 1 };
+        let prev_pos = if pos == 0 {
+            filtered.len() - 1
+        } else {
+            pos - 1
+        };
         let prev_idx = filtered[prev_pos];
         let buf = &mut self.buffers[self.active_buffer];
         buf.nav_object_index = prev_idx;
@@ -919,7 +949,8 @@ impl App {
     pub(crate) fn ensure_rendered_cursor_visible(&mut self, viewport_height: usize) {
         let buf = &self.buffers[self.active_buffer];
         let row = buf.rendered_cursor_row;
-        self.buffers[self.active_buffer].viewport
+        self.buffers[self.active_buffer]
+            .viewport
             .ensure_cursor_visible(row, viewport_height);
     }
 
@@ -969,10 +1000,9 @@ impl App {
         // outer auto-pin would scroll the viewport back and leave the
         // rendered cursor off-screen.
         let rendered_y = match buf.view_mode {
-            ViewMode::Raw => sketch::buffer::raw_cursor_visual_row(
-                &buf.editor,
-                self.last_wrap_width.max(1),
-            ),
+            ViewMode::Raw => {
+                sketch::buffer::raw_cursor_visual_row(&buf.editor, self.last_wrap_width.max(1))
+            }
             ViewMode::Rendered => buf.rendered_cursor_row,
         };
         self.buffers[self.active_buffer]
@@ -1006,7 +1036,9 @@ impl App {
         self.search_match_index = self
             .search_matches
             .iter()
-            .position(|&(line, col)| line > cursor_line || (line == cursor_line && col >= cursor_col))
+            .position(|&(line, col)| {
+                line > cursor_line || (line == cursor_line && col >= cursor_col)
+            })
             .unwrap_or(0);
     }
 
@@ -1017,7 +1049,8 @@ impl App {
             buf.editor.cursor_mut().col = col_idx;
             if buf.view_mode == ViewMode::Rendered {
                 // Find rendered position by counting matches (same as view does)
-                if let Some((row, col)) = self.find_rendered_match_position(self.search_match_index) {
+                if let Some((row, col)) = self.find_rendered_match_position(self.search_match_index)
+                {
                     self.buffers[self.active_buffer].rendered_cursor_row = row;
                     self.buffers[self.active_buffer].rendered_cursor_col = col;
                 }
@@ -1030,7 +1063,10 @@ impl App {
 
     /// Find the rendered (row, col) of the Nth search match by scanning
     /// rendered lines the same way the view does.
-    pub(crate) fn find_rendered_match_position(&self, match_index: usize) -> Option<(usize, usize)> {
+    pub(crate) fn find_rendered_match_position(
+        &self,
+        match_index: usize,
+    ) -> Option<(usize, usize)> {
         let buf = &self.buffers[self.active_buffer];
         let content_width = buf.viewport.content_width(200);
         let query: Vec<char> = self.search_query.to_lowercase().chars().collect();
@@ -1073,12 +1109,11 @@ impl App {
 
         for block in &buf.rendered_cache {
             let h = buf.viewport.block_height(block, content_width);
-            if y > current {
-                if let RenderedBlock::Heading { level, .. } = block {
-                    if level_filter.is_none() || level_filter == Some(*level) {
-                        return Some(y);
-                    }
-                }
+            if y > current
+                && let RenderedBlock::Heading { level, .. } = block
+                && (level_filter.is_none() || level_filter == Some(*level))
+            {
+                return Some(y);
             }
             y += h;
         }
@@ -1099,10 +1134,10 @@ impl App {
             if y >= current {
                 break;
             }
-            if let RenderedBlock::Heading { level, .. } = block {
-                if level_filter.is_none() || level_filter == Some(*level) {
-                    last_match = Some(y);
-                }
+            if let RenderedBlock::Heading { level, .. } = block
+                && (level_filter.is_none() || level_filter == Some(*level))
+            {
+                last_match = Some(y);
             }
             y += h;
         }
@@ -1117,10 +1152,10 @@ impl App {
 
         for block in &buf.rendered_cache {
             let h = buf.viewport.block_height(block, content_width);
-            if y == current {
-                if let RenderedBlock::Heading { level, .. } = block {
-                    return Some(*level);
-                }
+            if y == current
+                && let RenderedBlock::Heading { level, .. } = block
+            {
+                return Some(*level);
             }
             if y > current {
                 break;

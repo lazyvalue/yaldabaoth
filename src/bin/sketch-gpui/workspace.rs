@@ -65,19 +65,15 @@ pub struct Window<C> {
 /// restoring a non-`Empty` root before returning. The variant exists because
 /// `Layout<C>` is generic over `C` and can't construct an arbitrary placeholder
 /// otherwise.
+#[derive(Default)]
 pub enum Layout<C> {
+    #[default]
     Empty,
     Leaf(Window<C>),
     Split {
         dir: SplitDir,
         children: Vec<(f32, Layout<C>)>,
     },
-}
-
-impl<C> Default for Layout<C> {
-    fn default() -> Self {
-        Layout::Empty
-    }
 }
 
 impl<C> Layout<C> {
@@ -87,9 +83,7 @@ impl<C> Layout<C> {
             Layout::Empty => None,
             Layout::Leaf(w) if w.id == id => Some(w),
             Layout::Leaf(_) => None,
-            Layout::Split { children, .. } => {
-                children.iter().find_map(|(_, c)| c.find_leaf(id))
-            }
+            Layout::Split { children, .. } => children.iter().find_map(|(_, c)| c.find_leaf(id)),
         }
     }
 
@@ -194,9 +188,7 @@ impl<C> Layout<C> {
         match self {
             Layout::Empty => 0,
             Layout::Leaf(_) => 1,
-            Layout::Split { children, .. } => {
-                children.iter().map(|(_, c)| c.leaf_count()).sum()
-            }
+            Layout::Split { children, .. } => children.iter().map(|(_, c)| c.leaf_count()).sum(),
         }
     }
 
@@ -231,15 +223,11 @@ fn renormalize(children: &mut [(f32, impl Sized)]) {
 /// Which edge of the tab a rail anchors to (spec-rail.md §10). Default `Left`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RailSide {
+    #[default]
     Left,
     Right,
-}
-
-impl Default for RailSide {
-    fn default() -> Self {
-        RailSide::Left
-    }
 }
 
 /// Derived outline: heading entries from the focused window (spec-rail.md §13).
@@ -353,12 +341,16 @@ impl<C> Tab<C> {
 /// A pooled file-backed editor. One `FileBuffer` per canonical path; refcount
 /// tracks the number of `EditorView`s in the workspace currently bound to it.
 pub struct FileBuffer {
+    // buffer pool intentionally unwired — see ADR-0005 / backlog ff-buffer-pool
+    #[allow(dead_code)]
     pub id: FileBufferId,
     pub canonical_path: PathBuf,
     /// Shared, reference-counted core. Cloned into each `EditorView`/window
     /// that binds to this buffer so edits + undo are shared while the pool
     /// retains its own handle for lookups, modified-checks, and save.
     pub core: SharedCore,
+    // buffer pool intentionally unwired — see ADR-0005 / backlog ff-buffer-pool
+    #[allow(dead_code)]
     pub file_label: String,
     /// Active EditorViews referencing this core.
     pub refcount: usize,
@@ -560,10 +552,14 @@ impl<C> Workspace<C> {
         Ok(id)
     }
 
+    // buffer pool intentionally unwired — see ADR-0005 / backlog ff-buffer-pool
+    #[allow(dead_code)]
     pub fn buffer(&self, id: FileBufferId) -> Option<&FileBuffer> {
         self.file_buffers.get(&id)
     }
 
+    // buffer pool intentionally unwired — see ADR-0005 / backlog ff-buffer-pool
+    #[allow(dead_code)]
     pub fn buffer_mut(&mut self, id: FileBufferId) -> Option<&mut FileBuffer> {
         self.file_buffers.get_mut(&id)
     }
@@ -609,10 +605,7 @@ impl<C> Workspace<C> {
     /// buffer id plus a fresh clone of the shared core for a new window to
     /// bind to. The one-call path for creating a file-backed view: a window
     /// that holds the returned `(id, core)` must `buffer_release(id)` on close.
-    pub fn open_and_retain(
-        &mut self,
-        path: &Path,
-    ) -> std::io::Result<(FileBufferId, SharedCore)> {
+    pub fn open_and_retain(&mut self, path: &Path) -> std::io::Result<(FileBufferId, SharedCore)> {
         let id = self.open_buffer(path)?;
         self.buffer_retain(id);
         let core = self
@@ -624,6 +617,8 @@ impl<C> Workspace<C> {
     /// Decrement the refcount. Drops the buffer from the pool when refcount
     /// hits 0 AND it has no unsaved changes; dirty buffers stay pooled for
     /// recovery via `:buffers` (Behavior 21).
+    // buffer pool intentionally unwired — see ADR-0005 / backlog ff-buffer-pool
+    #[allow(dead_code)]
     pub fn buffer_release(&mut self, id: FileBufferId) {
         let drop = if let Some(b) = self.file_buffers.get_mut(&id) {
             b.refcount = b.refcount.saturating_sub(1);
@@ -631,10 +626,8 @@ impl<C> Workspace<C> {
         } else {
             false
         };
-        if drop {
-            if let Some(b) = self.file_buffers.remove(&id) {
-                self.path_index.remove(&b.canonical_path);
-            }
+        if drop && let Some(b) = self.file_buffers.remove(&id) {
+            self.path_index.remove(&b.canonical_path);
         }
     }
 }
@@ -673,7 +666,11 @@ impl<C> Workspace<C> {
             let (parent_path, tail) = path.split_at(path.len() - 1);
             let leaf_idx = tail[0];
             let parent = tab.layout.node_at_path_mut(parent_path)?;
-            let Layout::Split { dir: parent_dir, children } = parent else {
+            let Layout::Split {
+                dir: parent_dir,
+                children,
+            } = parent
+            else {
                 return None;
             };
             if *parent_dir == dir {
@@ -836,11 +833,7 @@ impl<C> Workspace<C> {
     /// pane was just moved away) simply adopts the leaf as its root.
     ///
     /// Returns `Err(())` if `tab_idx` is out of range.
-    pub fn insert_leaf_into_tab(
-        &mut self,
-        tab_idx: usize,
-        window: Window<C>,
-    ) -> Result<(), ()> {
+    pub fn insert_leaf_into_tab(&mut self, tab_idx: usize, window: Window<C>) -> Result<(), ()> {
         let id = window.id;
         let tab = self.tabs.get_mut(tab_idx).ok_or(())?;
         let root = std::mem::take(&mut tab.layout);
@@ -848,17 +841,13 @@ impl<C> Workspace<C> {
             Layout::Empty => Layout::Leaf(window),
             Layout::Leaf(existing) => Layout::Split {
                 dir: SplitDir::V,
-                children: vec![
-                    (0.5, Layout::Leaf(existing)),
-                    (0.5, Layout::Leaf(window)),
-                ],
+                children: vec![(0.5, Layout::Leaf(existing)), (0.5, Layout::Leaf(window))],
             },
             Layout::Split { dir, mut children } => {
                 let avg = if children.is_empty() {
                     1.0
                 } else {
-                    children.iter().map(|(w, _)| *w).sum::<f32>()
-                        / children.len() as f32
+                    children.iter().map(|(w, _)| *w).sum::<f32>() / children.len() as f32
                 };
                 children.push((avg, Layout::Leaf(window)));
                 renormalize(&mut children);
@@ -928,7 +917,11 @@ impl<C> Workspace<C> {
         let (left, right) = children.split_at_mut(b);
         let leaf_w = &mut left[a].0;
         let sib_w = &mut right[0].0;
-        let signed_delta = if leaf_idx < sibling_idx { delta } else { -delta };
+        let signed_delta = if leaf_idx < sibling_idx {
+            delta
+        } else {
+            -delta
+        };
         let new_leaf = (*leaf_w + signed_delta).clamp(0.05, 0.95);
         let new_sib = (*sib_w - signed_delta).clamp(0.05, 0.95);
         *leaf_w = new_leaf;
@@ -1001,7 +994,11 @@ impl<C> Workspace<C> {
             let parent_path = &path[..depth];
             let child_idx = path[depth];
             let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
-            let Layout::Split { dir: parent_dir, children } = parent else {
+            let Layout::Split {
+                dir: parent_dir,
+                children,
+            } = parent
+            else {
                 continue;
             };
             if *parent_dir != want_dir {
@@ -1472,8 +1469,14 @@ mod tests {
         drop(dirty_core);
 
         ws.gc_buffers();
-        assert!(ws.buffer(clean_id).is_none(), "clean, unreferenced → reaped");
-        assert!(ws.buffer(dirty_id).is_some(), "dirty → retained for recovery");
+        assert!(
+            ws.buffer(clean_id).is_none(),
+            "clean, unreferenced → reaped"
+        );
+        assert!(
+            ws.buffer(dirty_id).is_some(),
+            "dirty → retained for recovery"
+        );
     }
 
     #[test]
@@ -1533,7 +1536,10 @@ mod tests {
             focused: 0,
             rail: None,
         });
-        let w = Window { id: 9, content: TestContent("moved") };
+        let w = Window {
+            id: 9,
+            content: TestContent("moved"),
+        };
         ws.insert_leaf_into_tab(1, w).unwrap();
         match &ws.tabs[1].layout {
             Layout::Leaf(w) => assert_eq!(w.id, 9),
@@ -1552,7 +1558,10 @@ mod tests {
             focused: 5,
             rail: None,
         });
-        let w = Window { id: 9, content: TestContent("moved") };
+        let w = Window {
+            id: 9,
+            content: TestContent("moved"),
+        };
         ws.insert_leaf_into_tab(1, w).unwrap();
         match &ws.tabs[1].layout {
             Layout::Split { children, .. } => {

@@ -201,10 +201,7 @@ pub struct KeybindManager {
 }
 
 impl KeybindManager {
-    pub fn new(
-        single: HashMap<KeyPress, String>,
-        multi: HashMap<Vec<KeyPress>, String>,
-    ) -> Self {
+    pub fn new(single: HashMap<KeyPress, String>, multi: HashMap<Vec<KeyPress>, String>) -> Self {
         Self {
             single,
             multi,

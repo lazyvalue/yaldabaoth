@@ -6,7 +6,11 @@ use tempfile::TempDir;
 fn test_entries_have_metadata() {
     let dir = setup_test_dir();
     let browser = FileBrowser::new(dir.path().to_path_buf());
-    let file_entry = browser.entries().iter().find(|e| e.name == "README.md").unwrap();
+    let file_entry = browser
+        .entries()
+        .iter()
+        .find(|e| e.name == "README.md")
+        .unwrap();
     assert!(file_entry.size.is_some());
     assert!(file_entry.modified.is_some());
     // Dirs should also have modified time
@@ -52,7 +56,12 @@ fn test_directories_sorted_first() {
 fn test_hidden_files_excluded() {
     let dir = setup_test_dir();
     let browser = FileBrowser::new(dir.path().to_path_buf());
-    assert!(!browser.entries().iter().any(|e| e.name.starts_with('.') && e.name != ".."));
+    assert!(
+        !browser
+            .entries()
+            .iter()
+            .any(|e| e.name.starts_with('.') && e.name != "..")
+    );
 }
 
 #[test]

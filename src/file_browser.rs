@@ -243,9 +243,19 @@ impl FileBrowser {
             };
 
             let is_dir = metadata.is_dir();
-            let size = if metadata.is_file() { Some(metadata.len()) } else { None };
+            let size = if metadata.is_file() {
+                Some(metadata.len())
+            } else {
+                None
+            };
             let modified = metadata.modified().ok();
-            let browser_entry = BrowserEntry { name, is_dir, path, size, modified };
+            let browser_entry = BrowserEntry {
+                name,
+                is_dir,
+                path,
+                size,
+                modified,
+            };
 
             if is_dir {
                 dirs.push(browser_entry);
@@ -456,7 +466,11 @@ impl FileBrowser {
                 .to_string();
 
             if relative.to_lowercase().contains(query) {
-                let size = if metadata.is_file() { Some(metadata.len()) } else { None };
+                let size = if metadata.is_file() {
+                    Some(metadata.len())
+                } else {
+                    None
+                };
                 let modified = metadata.modified().ok();
                 results.push(BrowserEntry {
                     name: relative,

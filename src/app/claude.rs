@@ -3,8 +3,8 @@ use sketch::buffer::Buffer;
 use sketch::claude_channel::ChannelClient;
 use sketch::view::ViewMode;
 
-use super::{App, AppMode, char_to_line_col};
 use super::state::ComposeTextbox;
+use super::{App, AppMode, char_to_line_col};
 
 pub(crate) const CLAUDE_BUFFER_NAME: &str = "*claude*";
 
@@ -85,8 +85,7 @@ impl App {
         };
         match outcome {
             Ok(n) => {
-                self.command_error =
-                    format!("Sent {} ({} chars) to Claude channel", label, n);
+                self.command_error = format!("Sent {} ({} chars) to Claude channel", label, n);
                 true
             }
             Err(msg) => {
@@ -132,9 +131,7 @@ impl App {
     }
 
     pub(crate) fn claude_send_selection(&mut self) {
-        let sel = self.buffers[self.active_buffer]
-            .editor
-            .selection_text();
+        let sel = self.buffers[self.active_buffer].editor.selection_text();
         match sel {
             Some(t) if !t.is_empty() => {
                 self.claude_send_text(&t, "selection");
@@ -159,8 +156,7 @@ impl App {
         if stale {
             self.claude_channel = None;
             self.command_error =
-                "Claude channel went stale (server gone). Run :claude-attach to recover."
-                    .into();
+                "Claude channel went stale (server gone). Run :claude-attach to recover.".into();
         }
 
         let mut received: Vec<String> = Vec::new();
@@ -179,14 +175,13 @@ impl App {
         // even if the user is currently editing a different buffer.
         // Suppress when compose textbox is open — the user is typing and
         // doesn't want the viewport jumping under them.
-        if self.compose_textbox.is_none() {
-            if let Some(idx) = self
+        if self.compose_textbox.is_none()
+            && let Some(idx) = self
                 .buffers
                 .iter()
                 .position(|b| b.file_path().to_string_lossy() == CLAUDE_BUFFER_NAME)
-            {
-                self.ensure_buffer_cursor_visible(idx, viewport_height);
-            }
+        {
+            self.ensure_buffer_cursor_visible(idx, viewport_height);
         }
     }
 
@@ -231,14 +226,11 @@ impl App {
                 Ok(()) => Ok(text.len()),
                 Err(e) => Err(format!("ACP send error: {e}")),
             },
-            None => Err(
-                "No ACP agent attached. Use :claude-acp-attach first.".to_string(),
-            ),
+            None => Err("No ACP agent attached. Use :claude-acp-attach first.".to_string()),
         };
         match outcome {
             Ok(n) => {
-                self.command_error =
-                    format!("Sent {label} ({n} chars) to ACP agent");
+                self.command_error = format!("Sent {label} ({n} chars) to ACP agent");
                 true
             }
             Err(msg) => {
@@ -281,9 +273,7 @@ impl App {
     }
 
     pub(crate) fn acp_send_selection(&mut self) {
-        let sel = self.buffers[self.active_buffer]
-            .editor
-            .selection_text();
+        let sel = self.buffers[self.active_buffer].editor.selection_text();
         match sel {
             Some(t) if !t.is_empty() => {
                 self.acp_send_text(&t, "selection");
@@ -305,8 +295,7 @@ impl App {
             .unwrap_or(false);
         if stale {
             self.acp_channel = None;
-            self.command_error =
-                "ACP agent went away. Run :claude-acp-attach to recover.".into();
+            self.command_error = "ACP agent went away. Run :claude-acp-attach to recover.".into();
         }
 
         // The TUI only renders text chunks for now; tool-call notifications
@@ -347,14 +336,13 @@ impl App {
             self.finalize_claude_turn();
             self.acp_last_seen_turns = current_turns;
         }
-        if self.compose_textbox.is_none() {
-            if let Some(idx) = self
+        if self.compose_textbox.is_none()
+            && let Some(idx) = self
                 .buffers
                 .iter()
                 .position(|b| b.file_path().to_string_lossy() == CLAUDE_BUFFER_NAME)
-            {
-                self.ensure_buffer_cursor_visible(idx, viewport_height);
-            }
+        {
+            self.ensure_buffer_cursor_visible(idx, viewport_height);
         }
     }
 

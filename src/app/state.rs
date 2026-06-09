@@ -209,7 +209,9 @@ impl App {
     }
 
     pub(crate) fn effective_content_width(&self, terminal_width: usize) -> usize {
-        self.buffers[self.active_buffer].viewport.content_width(terminal_width)
+        self.buffers[self.active_buffer]
+            .viewport
+            .content_width(terminal_width)
     }
 
     pub(crate) fn ensure_raw_for_editing(&mut self) {

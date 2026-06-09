@@ -70,7 +70,7 @@ pub struct ViewState<'a> {
     pub rendered_cursor_col: usize,
     pub menu_active: bool,
     pub menu_nodes: Vec<(String, String, MenuNodeKind)>, // (key_display, label, kind)
-    pub menu_label: Option<String>,            // submenu breadcrumb label
+    pub menu_label: Option<String>,                      // submenu breadcrumb label
     pub file_browser_open: bool,
     pub file_browser_dir: String,
     pub file_browser_entries: Vec<(String, bool, bool)>, // (name, is_dir, is_selected)
@@ -158,8 +158,8 @@ pub fn draw(frame: &mut Frame, state: &ViewState, report: &mut DrawReport) {
     // Calculate buffer list height
     let buffer_list_height = if state.buffer_list_open {
         let max_height = (area.height as usize) / 3;
-        let entry_rows = state.buffer_list_entries.len()
-            + if state.buffer_list_filter_mode { 1 } else { 0 };
+        let entry_rows =
+            state.buffer_list_entries.len() + if state.buffer_list_filter_mode { 1 } else { 0 };
         entry_rows.min(max_height).max(1) as u16
     } else {
         0
@@ -171,7 +171,9 @@ pub fn draw(frame: &mut Frame, state: &ViewState, report: &mut DrawReport) {
         let header_rows = 1;
         let filter_rows = if state.file_browser_filter_mode { 1 } else { 0 };
         let entry_rows = state.file_browser_entries.len();
-        (header_rows + filter_rows + entry_rows).min(max_height).max(1) as u16
+        (header_rows + filter_rows + entry_rows)
+            .min(max_height)
+            .max(1) as u16
     } else {
         0
     };
@@ -179,36 +181,41 @@ pub fn draw(frame: &mut Frame, state: &ViewState, report: &mut DrawReport) {
     // Calculate outline height
     let outline_height = if state.outline_open {
         let max_height = (area.height as usize) / 3;
-        let header_rows = if state.outline_breadcrumb.is_some() { 1 } else { 0 };
+        let header_rows = if state.outline_breadcrumb.is_some() {
+            1
+        } else {
+            0
+        };
         let filter_rows = if state.outline_filter_mode { 1 } else { 0 };
         let entry_rows = state.outline_entries.len().max(1);
-        (header_rows + filter_rows + entry_rows).min(max_height).max(1) as u16
+        (header_rows + filter_rows + entry_rows)
+            .min(max_height)
+            .max(1) as u16
     } else {
         0
     };
 
-    let needs_bottom_bar = state.command_mode
-        || state.search_input_mode
-        || !state.command_error.is_empty();
+    let needs_bottom_bar =
+        state.command_mode || state.search_input_mode || !state.command_error.is_empty();
     let bottom_bar_height = if needs_bottom_bar { 1u16 } else { 0 };
 
     // Compose textbox panel
     let compose_height = if state.compose_active {
         let lines = state.compose_lines.len().max(1);
-        let capped = lines.min((area.height as usize) / 3).min(12).max(3);
+        let capped = lines.min((area.height as usize) / 3).clamp(3, 12);
         (capped + 1) as u16 // +1 for separator line
     } else {
         0
     };
 
     let chunks = Layout::vertical([
-        Constraint::Length(1),                        // top bar
-        Constraint::Length(buffer_list_height),        // buffer list
-        Constraint::Length(file_browser_height),       // file browser
-        Constraint::Length(outline_height),            // outline
-        Constraint::Min(1),                           // content
-        Constraint::Length(compose_height),            // compose textbox
-        Constraint::Length(bottom_bar_height),         // bottom bar (conditional)
+        Constraint::Length(1),                   // top bar
+        Constraint::Length(buffer_list_height),  // buffer list
+        Constraint::Length(file_browser_height), // file browser
+        Constraint::Length(outline_height),      // outline
+        Constraint::Min(1),                      // content
+        Constraint::Length(compose_height),      // compose textbox
+        Constraint::Length(bottom_bar_height),   // bottom bar (conditional)
     ])
     .split(area);
 
@@ -253,7 +260,11 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
     let percent = (state.viewport.scroll_offset * 100) / total.max(1);
 
     let buffer_info = if state.buffer_count > 1 {
-        format!(" [{}/{}]", state.active_buffer_index + 1, state.buffer_count)
+        format!(
+            " [{}/{}]",
+            state.active_buffer_index + 1,
+            state.buffer_count
+        )
     } else {
         String::new()
     };
@@ -268,7 +279,10 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
     let nav_display = format!("{}{}", nav_display, extend_display);
 
     let mode_display = format!(" {}", state.mode_label);
-    let position = format!("line {}/{} {}%{}{}", current_line, total, percent, buffer_info, nav_display);
+    let position = format!(
+        "line {}/{} {}%{}{}",
+        current_line, total, percent, buffer_info, nav_display
+    );
     let available = area.width as usize;
 
     let modified_indicator = if state.modified { " [+]" } else { "" };
@@ -280,7 +294,8 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, state: &ViewState) {
         &name_with_mod
     };
 
-    let padding = available.saturating_sub(name_display.len() + mode_display.len() + position.len() + 1);
+    let padding =
+        available.saturating_sub(name_display.len() + mode_display.len() + position.len() + 1);
     let line = Line::from(vec![
         Span::styled(format!(" {}", name_display), state.theme.top_bar),
         Span::styled(mode_display, state.theme.top_bar_mode),
@@ -415,7 +430,8 @@ fn draw_compose_box(frame: &mut Frame, area: Rect, state: &ViewState) {
     let cursor_row_in_view = state.compose_cursor_line.saturating_sub(scroll_offset);
     if cursor_row_in_view < text_height {
         let cursor_y = text_area.y + cursor_row_in_view as u16;
-        let cursor_x = text_area.x + (state.compose_cursor_col as u16).min(text_area.width.saturating_sub(1));
+        let cursor_x =
+            text_area.x + (state.compose_cursor_col as u16).min(text_area.width.saturating_sub(1));
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -435,7 +451,7 @@ fn draw_menu_popup(frame: &mut Frame, area: Rect, state: &ViewState) {
     let entry_count = entries.len();
     let use_two_cols = area.width >= 50 && entry_count > 1;
     let rows_needed = if use_two_cols {
-        (entry_count + 1) / 2
+        entry_count.div_ceil(2)
     } else {
         entry_count
     };
@@ -587,7 +603,11 @@ fn draw_file_browser_panel(frame: &mut Frame, area: Rect, state: &ViewState) {
 
     // Compute scroll offset to keep selected entry visible
     let visible_rows = (area.height - y) as usize;
-    let selected_idx = state.file_browser_entries.iter().position(|(_, _, sel)| *sel).unwrap_or(0);
+    let selected_idx = state
+        .file_browser_entries
+        .iter()
+        .position(|(_, _, sel)| *sel)
+        .unwrap_or(0);
     let scroll_offset = scroll_to_keep_visible(selected_idx, visible_rows);
 
     for (i, (name, is_dir, is_selected)) in state.file_browser_entries.iter().enumerate() {
@@ -632,30 +652,34 @@ fn draw_buffer_list(frame: &mut Frame, area: Rect, state: &ViewState) {
     let mut y = 0u16;
 
     // Filter input row
-    if state.buffer_list_filter_mode {
-        if y < area.height {
-            let filter_line = Line::from(vec![
-                Span::styled(" / ", Style::default().fg(Color::Rgb(255, 184, 108))),
-                Span::styled(
-                    &state.buffer_list_filter_text,
-                    Style::default().fg(Color::Rgb(241, 250, 140)),
-                ),
-                Span::styled("\u{258e}", Style::default().fg(Color::Rgb(102, 102, 102))),
-            ]);
-            frame.render_widget(
-                Paragraph::new(filter_line),
-                Rect::new(area.x, area.y + y, area.width, 1),
-            );
-            y += 1;
-        }
+    if state.buffer_list_filter_mode && y < area.height {
+        let filter_line = Line::from(vec![
+            Span::styled(" / ", Style::default().fg(Color::Rgb(255, 184, 108))),
+            Span::styled(
+                &state.buffer_list_filter_text,
+                Style::default().fg(Color::Rgb(241, 250, 140)),
+            ),
+            Span::styled("\u{258e}", Style::default().fg(Color::Rgb(102, 102, 102))),
+        ]);
+        frame.render_widget(
+            Paragraph::new(filter_line),
+            Rect::new(area.x, area.y + y, area.width, 1),
+        );
+        y += 1;
     }
 
     // Buffer entries — scroll to keep selection visible
     let visible_rows = (area.height - y) as usize;
-    let selected_idx = state.buffer_list_entries.iter().position(|(_, _, _, sel)| *sel).unwrap_or(0);
+    let selected_idx = state
+        .buffer_list_entries
+        .iter()
+        .position(|(_, _, _, sel)| *sel)
+        .unwrap_or(0);
     let scroll_offset = scroll_to_keep_visible(selected_idx, visible_rows);
 
-    for (i, (path, is_modified, is_active, is_selected)) in state.buffer_list_entries.iter().enumerate() {
+    for (i, (path, is_modified, is_active, is_selected)) in
+        state.buffer_list_entries.iter().enumerate()
+    {
         if i < scroll_offset {
             continue;
         }
@@ -673,7 +697,9 @@ fn draw_buffer_list(frame: &mut Frame, area: Rect, state: &ViewState) {
         };
 
         let path_style = if *is_active {
-            bg_style.fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD)
+            bg_style
+                .fg(Color::Rgb(139, 233, 253))
+                .add_modifier(Modifier::BOLD)
         } else {
             bg_style.fg(Color::Rgb(204, 204, 204))
         };
@@ -681,7 +707,10 @@ fn draw_buffer_list(frame: &mut Frame, area: Rect, state: &ViewState) {
         let line = Line::from(vec![
             Span::styled(marker, bg_style.fg(Color::Rgb(189, 147, 249))),
             Span::styled(path.clone(), path_style),
-            Span::styled(modified_indicator.to_string(), bg_style.fg(Color::Rgb(255, 184, 108))),
+            Span::styled(
+                modified_indicator.to_string(),
+                bg_style.fg(Color::Rgb(255, 184, 108)),
+            ),
         ]);
 
         frame.render_widget(
@@ -699,23 +728,23 @@ fn draw_outline(frame: &mut Frame, area: Rect, state: &ViewState) {
     let mut y = 0u16;
 
     // Breadcrumb header (when descended into a level)
-    if let Some(ref breadcrumb) = state.outline_breadcrumb {
-        if y < area.height {
-            let header_line = Line::from(vec![
-                Span::styled(" \u{25c2} ", Style::default().fg(Color::Rgb(98, 114, 164))),
-                Span::styled(
-                    breadcrumb.clone(),
-                    Style::default()
-                        .fg(Color::Rgb(98, 114, 164))
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]);
-            frame.render_widget(
-                Paragraph::new(header_line),
-                Rect::new(area.x, area.y + y, area.width, 1),
-            );
-            y += 1;
-        }
+    if let Some(ref breadcrumb) = state.outline_breadcrumb
+        && y < area.height
+    {
+        let header_line = Line::from(vec![
+            Span::styled(" \u{25c2} ", Style::default().fg(Color::Rgb(98, 114, 164))),
+            Span::styled(
+                breadcrumb.clone(),
+                Style::default()
+                    .fg(Color::Rgb(98, 114, 164))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(header_line),
+            Rect::new(area.x, area.y + y, area.width, 1),
+        );
+        y += 1;
     }
 
     // Filter input
@@ -772,8 +801,12 @@ fn draw_outline(frame: &mut Frame, area: Rect, state: &ViewState) {
 
         // Color by heading level
         let level_style = match level {
-            1 => bg_style.fg(Color::Rgb(189, 147, 249)).add_modifier(Modifier::BOLD),
-            2 => bg_style.fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD),
+            1 => bg_style
+                .fg(Color::Rgb(189, 147, 249))
+                .add_modifier(Modifier::BOLD),
+            2 => bg_style
+                .fg(Color::Rgb(139, 233, 253))
+                .add_modifier(Modifier::BOLD),
             3 => bg_style.fg(Color::Rgb(80, 250, 123)),
             4 => bg_style.fg(Color::Rgb(241, 250, 140)),
             5 => bg_style.fg(Color::Rgb(255, 184, 108)),
@@ -810,8 +843,8 @@ fn draw_content(frame: &mut Frame, area: Rect, state: &ViewState, report: &mut D
 /// only populated in Raw mode, rendered_blocks only in Rendered mode).
 fn is_buffer_empty(state: &ViewState) -> bool {
     let rendered_empty = state.rendered_blocks.is_empty();
-    let raw_empty = state.raw_lines.is_empty()
-        || (state.raw_lines.len() == 1 && state.raw_lines[0].is_empty());
+    let raw_empty =
+        state.raw_lines.is_empty() || (state.raw_lines.len() == 1 && state.raw_lines[0].is_empty());
     match state.view_mode {
         ViewMode::Rendered => rendered_empty,
         ViewMode::Raw => raw_empty,
@@ -896,7 +929,8 @@ fn draw_content_rendered(frame: &mut Frame, area: Rect, state: &ViewState) {
                                 let start = obj_col_start.min(line_chars.len());
                                 let end = obj_col_end.min(line_chars.len());
                                 if start < end {
-                                    let highlight_text: String = line_chars[start..end].iter().collect();
+                                    let highlight_text: String =
+                                        line_chars[start..end].iter().collect();
                                     let highlight_x = area.x + x_offset as u16 + start as u16;
                                     let w = (end - start) as u16;
                                     if highlight_x < area.x + area.width {
@@ -924,9 +958,9 @@ fn draw_content_rendered(frame: &mut Frame, area: Rect, state: &ViewState) {
                             // Character mode: single char cursor
                             let line_text = line.text_content();
                             let line_chars: Vec<char> = line_text.chars().collect();
-                            let col = state.rendered_cursor_col.min(
-                                line_chars.len().saturating_sub(1),
-                            );
+                            let col = state
+                                .rendered_cursor_col
+                                .min(line_chars.len().saturating_sub(1));
                             let cursor_char = line_chars.get(col).copied().unwrap_or(' ');
                             let cursor_x = area.x + x_offset as u16 + col as u16;
                             if cursor_x < area.x + area.width {
@@ -954,12 +988,8 @@ fn draw_content_rendered(frame: &mut Frame, area: Rect, state: &ViewState) {
                                         .fg(Color::Rgb(40, 42, 54))
                                         .bg(Color::Rgb(248, 248, 242))
                                 };
-                                let cursor_area = Rect::new(
-                                    cursor_x,
-                                    area.y + screen_y as u16,
-                                    1,
-                                    1,
-                                );
+                                let cursor_area =
+                                    Rect::new(cursor_x, area.y + screen_y as u16, 1, 1);
                                 frame.render_widget(
                                     Paragraph::new(Span::styled(
                                         cursor_char.to_string(),
@@ -982,21 +1012,20 @@ fn draw_content_rendered(frame: &mut Frame, area: Rect, state: &ViewState) {
                     while ci + qlen <= lower_chars.len() {
                         if lower_chars[ci..ci + qlen] == query_lower[..] {
                             if on_screen {
-                                let style = if rendered_match_counter == state.search_current_match {
+                                let style = if rendered_match_counter == state.search_current_match
+                                {
                                     state.theme.search_match_current
                                 } else {
                                     state.theme.search_match
                                 };
                                 let highlight_x = area.x + x_offset as u16 + ci as u16;
                                 if highlight_x < area.x + area.width {
-                                    let w = qlen.min((area.x + area.width - highlight_x) as usize) as u16;
-                                    let match_text: String = line_chars[ci..ci + w as usize].iter().collect();
-                                    let highlight_area = Rect::new(
-                                        highlight_x,
-                                        area.y + screen_y as u16,
-                                        w,
-                                        1,
-                                    );
+                                    let w = qlen.min((area.x + area.width - highlight_x) as usize)
+                                        as u16;
+                                    let match_text: String =
+                                        line_chars[ci..ci + w as usize].iter().collect();
+                                    let highlight_area =
+                                        Rect::new(highlight_x, area.y + screen_y as u16, w, 1);
                                     frame.render_widget(
                                         Paragraph::new(Span::styled(match_text, style)),
                                         highlight_area,
@@ -1080,28 +1109,24 @@ fn draw_splash(frame: &mut Frame, area: Rect, theme: &Theme) {
         1,
     );
     frame.render_widget(
-        Paragraph::new(Span::styled(
-            build_line,
-            theme.line_number,
-        )),
+        Paragraph::new(Span::styled(build_line, theme.line_number)),
         b_rect,
     );
 
     let _ = logo_w; // reserved for future centering refinements
 }
 
-fn draw_content_raw(
-    frame: &mut Frame,
-    area: Rect,
-    state: &ViewState,
-    report: &mut DrawReport,
-) {
+fn draw_content_raw(frame: &mut Frame, area: Rect, state: &ViewState, report: &mut DrawReport) {
     let terminal_width = area.width as usize;
     let viewport_height = area.height as usize;
     let view_start = state.viewport.scroll_offset;
 
     let total_lines = state.raw_lines.len();
-    let line_num_digits = if total_lines == 0 { 1 } else { total_lines.ilog10() as usize + 1 };
+    let line_num_digits = if total_lines == 0 {
+        1
+    } else {
+        total_lines.ilog10() as usize + 1
+    };
     let gutter_width = line_num_digits + 2; // digits + space + separator
 
     let text_area_width = terminal_width.saturating_sub(gutter_width + 1); // +1 for gap after gutter
@@ -1129,8 +1154,7 @@ fn draw_content_raw(
         acc += line.chars().count() + 1; // +1 for the implicit newline
         line_char_starts.push(acc);
     }
-    let has_range_styling = !state.frozen_ranges.is_empty()
-        || state.lockable_through_char > 0;
+    let has_range_styling = !state.frozen_ranges.is_empty() || state.lockable_through_char > 0;
 
     let mut screen_y: usize = 0;
     let mut visual_row_counter: usize = 0;
@@ -1142,19 +1166,20 @@ fn draw_content_raw(
         let is_cursor_line = doc_line == state.cursor_line;
         // Compute the selection's [start_col, end_col) range projected onto this line, if any.
         let line_char_count = raw_line.chars().count();
-        let sel_on_line: Option<(usize, usize)> = state.selection.and_then(|((sl, sc), (el, ec))| {
-            if doc_line < sl || doc_line > el {
-                None
-            } else {
-                let s = if doc_line == sl { sc } else { 0 };
-                let e = if doc_line == el {
-                    ec.min(line_char_count)
+        let sel_on_line: Option<(usize, usize)> =
+            state.selection.and_then(|((sl, sc), (el, ec))| {
+                if doc_line < sl || doc_line > el {
+                    None
                 } else {
-                    line_char_count
-                };
-                if s <= e { Some((s, e)) } else { None }
-            }
-        });
+                    let s = if doc_line == sl { sc } else { 0 };
+                    let e = if doc_line == el {
+                        ec.min(line_char_count)
+                    } else {
+                        line_char_count
+                    };
+                    if s <= e { Some((s, e)) } else { None }
+                }
+            });
 
         let empty_segments: Vec<(String, Style)>;
         let segments: &[(String, Style)] = if !state.search_query.is_empty() {
@@ -1222,10 +1247,7 @@ fn draw_content_raw(
                 .add_modifier(Modifier::BOLD);
             if visual_idx == skip_rows_in_line {
                 let num_style = if is_cursor_line {
-                    state
-                        .theme
-                        .line_number_current
-                        .add_modifier(Modifier::BOLD)
+                    state.theme.line_number_current.add_modifier(Modifier::BOLD)
                 } else {
                     state.theme.line_number
                 };
@@ -1242,10 +1264,7 @@ fn draw_content_raw(
                 // Continuation row of a wrapped cursor line: still paint the
                 // leftmost cell so the indicator runs the full visual height.
                 let gutter_area = Rect::new(area.x, y, 1, 1);
-                frame.render_widget(
-                    Paragraph::new(Span::styled("▎", marker_style)),
-                    gutter_area,
-                );
+                frame.render_widget(Paragraph::new(Span::styled("▎", marker_style)), gutter_area);
             }
 
             let line_area = Rect::new(
@@ -1281,7 +1300,9 @@ fn draw_content_raw(
             // Step 2: selection bg overlays everything.
             if let Some((sel_s, sel_e)) = sel_on_line {
                 let local_s = sel_s.saturating_sub(row_start_col);
-                let local_e = sel_e.saturating_sub(row_start_col).min(row_end_col - row_start_col);
+                let local_e = sel_e
+                    .saturating_sub(row_start_col)
+                    .min(row_end_col - row_start_col);
                 if local_s < local_e {
                     styled_row_segs =
                         apply_selection_bg(&styled_row_segs, local_s, local_e, selection_bg);
@@ -1293,9 +1314,7 @@ fn draw_content_raw(
             if user_line {
                 spans.push(Span::styled(
                     REPLY_PREFIX,
-                    Style::default()
-                        .fg(prefix_fg)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(prefix_fg).add_modifier(Modifier::BOLD),
                 ));
             }
             for (t, s) in styled_row_segs.iter() {
@@ -1303,7 +1322,11 @@ fn draw_content_raw(
             }
             frame.render_widget(Paragraph::new(Line::from(spans)), line_area);
 
-            let row_indent = if user_line { REPLY_PREFIX_LEN as u16 } else { 0 };
+            let row_indent = if user_line {
+                REPLY_PREFIX_LEN as u16
+            } else {
+                0
+            };
             if is_cursor_line && visual_idx == cursor_visual_row {
                 let cursor_x = text_x + row_indent + cursor_visual_col as u16;
                 if cursor_x < area.x + area.width {
@@ -1432,11 +1455,7 @@ fn apply_selection_bg(
         let mut started = false;
         for ch in text.chars() {
             let is_selected = col >= start_col && col < end_col;
-            let new_style = if is_selected {
-                style.bg(bg)
-            } else {
-                *style
-            };
+            let new_style = if is_selected { style.bg(bg) } else { *style };
             if started && new_style != current_style {
                 result.push((std::mem::take(&mut current_text), current_style));
                 current_style = new_style;
@@ -1498,11 +1517,7 @@ pub fn wrap_row_count(text: &str, width: usize) -> usize {
 /// Like `wrap_row_count` but ALSO returns the visual row offset within the
 /// wrapped line at character column `target_col`. Used by scroll math to
 /// place the cursor on the right visual row when the line wraps.
-pub fn wrap_row_count_with_cursor(
-    text: &str,
-    width: usize,
-    target_col: usize,
-) -> (usize, usize) {
+pub fn wrap_row_count_with_cursor(text: &str, width: usize, target_col: usize) -> (usize, usize) {
     if text.is_empty() || width == 0 {
         return (1, 0);
     }
@@ -1706,7 +1721,11 @@ fn build_highlighted_line<'a>(
 }
 
 /// Convert a RenderedBlock to terminal lines for display.
-pub fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme) -> Vec<StyledLine> {
+pub fn render_block_to_lines(
+    block: &RenderedBlock,
+    width: usize,
+    theme: &Theme,
+) -> Vec<StyledLine> {
     match block {
         RenderedBlock::Heading { level, content } => {
             let prefix = "#".repeat(*level as usize);
@@ -1750,7 +1769,9 @@ pub fn render_block_to_lines(block: &RenderedBlock, width: usize, theme: &Theme)
                             truncated_spans.push(span.clone());
                             remaining -= span_chars;
                         } else {
-                            let byte_end = span.text.char_indices()
+                            let byte_end = span
+                                .text
+                                .char_indices()
                                 .nth(remaining)
                                 .map(|(i, _)| i)
                                 .unwrap_or(span.text.len());
@@ -1949,8 +1970,16 @@ fn wrap_styled_line(line: &StyledLine, width: usize, out: &mut Vec<StyledLine>) 
         // Build a StyledLine from chars[pos..break_at]
         let mut spans: Vec<StyledSpan> = Vec::new();
         let mut current_text = String::new();
-        let mut current_style = if pos < chars.len() { chars[pos].1 } else { Style::default() };
-        let mut current_link = if pos < chars.len() { chars[pos].2.clone() } else { None };
+        let mut current_style = if pos < chars.len() {
+            chars[pos].1
+        } else {
+            Style::default()
+        };
+        let mut current_link = if pos < chars.len() {
+            chars[pos].2.clone()
+        } else {
+            None
+        };
 
         for &(ch, style, ref link) in &chars[pos..break_at] {
             if style != current_style || *link != current_link {
@@ -2050,10 +2079,7 @@ pub fn table_column_widths(
 
     if unsettled_count > 0 {
         // Distribute remaining space proportionally among unsettled columns
-        let unsettled_natural: usize = (0..ncols)
-            .filter(|&i| !settled[i])
-            .map(|i| widths[i])
-            .sum();
+        let unsettled_natural: usize = (0..ncols).filter(|&i| !settled[i]).map(|i| widths[i]).sum();
         for i in 0..ncols {
             if settled[i] {
                 continue;
@@ -2128,9 +2154,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
             .unwrap_or(remaining.len());
 
         // Look for the last space at or before the hard split point.
-        let break_at = remaining[..hard_byte]
-            .rfind(' ')
-            .unwrap_or(hard_byte);
+        let break_at = remaining[..hard_byte].rfind(' ').unwrap_or(hard_byte);
 
         let (chunk, rest) = remaining.split_at(break_at);
         lines.push(chunk.to_string());
@@ -2177,11 +2201,15 @@ fn format_file_size(bytes: u64) -> String {
 }
 
 fn format_mtime(time: std::time::SystemTime) -> String {
-    let duration = time.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let duration = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = duration.as_secs();
     let days = secs / 86400;
     let (_year, month, day) = days_to_ymd(days);
-    let months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     let mon = months.get(month as usize).unwrap_or(&"???");
     format!("{} {:2}", mon, day)
 }
@@ -2201,7 +2229,12 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     (y, m - 1, d) // month 0-indexed for array lookup
 }
 
-fn draw_full_file_browser(frame: &mut Frame, area: Rect, fb: &FullBrowserViewState, _theme: &Theme) {
+fn draw_full_file_browser(
+    frame: &mut Frame,
+    area: Rect,
+    fb: &FullBrowserViewState,
+    _theme: &Theme,
+) {
     // Background
     let bg = Paragraph::new("").style(Style::default().bg(Color::Rgb(30, 30, 48)));
     frame.render_widget(bg, area);
@@ -2209,10 +2242,10 @@ fn draw_full_file_browser(frame: &mut Frame, area: Rect, fb: &FullBrowserViewSta
     // Layout: header(1) + entries(fill) + filter(0 or 1) + hints(1)
     let filter_height = if fb.filter_mode { 1u16 } else { 0 };
     let chunks = Layout::vertical([
-        Constraint::Length(1),                // header
-        Constraint::Min(1),                   // entry list
-        Constraint::Length(filter_height),     // filter input
-        Constraint::Length(1),                // hint bar
+        Constraint::Length(1),             // header
+        Constraint::Min(1),                // entry list
+        Constraint::Length(filter_height), // filter input
+        Constraint::Length(1),             // hint bar
     ])
     .split(area);
 
@@ -2231,7 +2264,9 @@ fn draw_full_file_browser(frame: &mut Frame, area: Rect, fb: &FullBrowserViewSta
     };
     let header_line = Line::from(Span::styled(
         dir_display,
-        Style::default().fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Rgb(139, 233, 253))
+            .add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(
         Paragraph::new(header_line).style(Style::default().bg(Color::Rgb(40, 42, 54))),
@@ -2312,9 +2347,15 @@ fn draw_full_file_browser(frame: &mut Frame, area: Rect, fb: &FullBrowserViewSta
                 Span::styled(name_display, name_style),
                 Span::styled(" ".repeat(name_padding), bg_style),
                 Span::styled("  ", bg_style),
-                Span::styled(format!("{:>width$}", size_str, width = size_col_width as usize), bg_style.fg(Color::Rgb(98, 114, 164))),
+                Span::styled(
+                    format!("{:>width$}", size_str, width = size_col_width as usize),
+                    bg_style.fg(Color::Rgb(98, 114, 164)),
+                ),
                 Span::styled("  ", bg_style),
-                Span::styled(format!("{:>width$}", mtime_str, width = mtime_col_width as usize), bg_style.fg(Color::Rgb(98, 114, 164))),
+                Span::styled(
+                    format!("{:>width$}", mtime_str, width = mtime_col_width as usize),
+                    bg_style.fg(Color::Rgb(98, 114, 164)),
+                ),
             ];
 
             frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
@@ -2325,25 +2366,42 @@ fn draw_full_file_browser(frame: &mut Frame, area: Rect, fb: &FullBrowserViewSta
     // --- Filter input ---
     if fb.filter_mode {
         let filter_line = Line::from(vec![
-            Span::styled(" / ", Style::default().fg(Color::Rgb(255, 184, 108)).bg(Color::Rgb(30, 30, 48))),
+            Span::styled(
+                " / ",
+                Style::default()
+                    .fg(Color::Rgb(255, 184, 108))
+                    .bg(Color::Rgb(30, 30, 48)),
+            ),
             Span::styled(
                 &fb.filter_text,
-                Style::default().fg(Color::Rgb(241, 250, 140)).bg(Color::Rgb(30, 30, 48)),
+                Style::default()
+                    .fg(Color::Rgb(241, 250, 140))
+                    .bg(Color::Rgb(30, 30, 48)),
             ),
-            Span::styled("\u{258e}", Style::default().fg(Color::Rgb(102, 102, 102)).bg(Color::Rgb(30, 30, 48))),
+            Span::styled(
+                "\u{258e}",
+                Style::default()
+                    .fg(Color::Rgb(102, 102, 102))
+                    .bg(Color::Rgb(30, 30, 48)),
+            ),
         ]);
         frame.render_widget(Paragraph::new(filter_line), filter_area);
     }
 
     // --- Hint bar ---
-    let mut hints = format!(" enter:open  o:open+stay  -:parent  .:hidden  s:sort({})  /:filter", fb.sort_label);
+    let mut hints = format!(
+        " enter:open  o:open+stay  -:parent  .:hidden  s:sort({})  /:filter",
+        fb.sort_label
+    );
     if fb.came_from_dropdown {
         hints.push_str("  tab:collapse");
     }
     hints.push_str("  q:close");
     let hint_line = Line::from(Span::styled(
         hints,
-        Style::default().fg(Color::Rgb(98, 114, 164)).bg(Color::Rgb(25, 25, 40)),
+        Style::default()
+            .fg(Color::Rgb(98, 114, 164))
+            .bg(Color::Rgb(25, 25, 40)),
     ));
     frame.render_widget(
         Paragraph::new(hint_line).style(Style::default().bg(Color::Rgb(25, 25, 40))),
@@ -2351,17 +2409,22 @@ fn draw_full_file_browser(frame: &mut Frame, area: Rect, fb: &FullBrowserViewSta
     );
 }
 
-fn draw_full_buffer_list(frame: &mut Frame, area: Rect, bl: &FullBufferListViewState, _theme: &Theme) {
+fn draw_full_buffer_list(
+    frame: &mut Frame,
+    area: Rect,
+    bl: &FullBufferListViewState,
+    _theme: &Theme,
+) {
     // Background
     let bg = Paragraph::new("").style(Style::default().bg(Color::Rgb(30, 30, 48)));
     frame.render_widget(bg, area);
 
     let filter_height = if bl.filter_mode { 1u16 } else { 0 };
     let chunks = Layout::vertical([
-        Constraint::Length(1),                 // header
-        Constraint::Min(1),                    // entry list
-        Constraint::Length(filter_height),     // filter input
-        Constraint::Length(1),                 // hint bar
+        Constraint::Length(1),             // header
+        Constraint::Min(1),                // entry list
+        Constraint::Length(filter_height), // filter input
+        Constraint::Length(1),             // hint bar
     ])
     .split(area);
 
@@ -2484,8 +2547,7 @@ fn draw_full_buffer_list(frame: &mut Frame, area: Rect, bl: &FullBufferListViewS
     }
 
     // --- Hint bar ---
-    let hints =
-        " enter/l:switch  d:close  /:filter  g/G:top/bottom  q:close ";
+    let hints = " enter/l:switch  d:close  /:filter  g/G:top/bottom  q:close ";
     let hint_line = Line::from(Span::styled(
         hints,
         Style::default()

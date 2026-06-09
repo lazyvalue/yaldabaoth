@@ -34,7 +34,7 @@ fn test_move_right_insert_mode() {
 
 #[test]
 fn test_move_left() {
-    let d = doc("Hello");
+    let _d = doc("Hello");
     let mut c = CursorPos::new();
     c.col = 3;
     c.move_left();
@@ -43,7 +43,7 @@ fn test_move_left() {
 
 #[test]
 fn test_move_left_clamps() {
-    let d = doc("Hello");
+    let _d = doc("Hello");
     let mut c = CursorPos::new();
     c.move_left();
     assert_eq!(c.col, 0);
@@ -67,7 +67,7 @@ fn test_move_down_clamps() {
 
 #[test]
 fn test_move_up() {
-    let d = doc("Line1\nLine2");
+    let _d = doc("Line1\nLine2");
     let mut c = CursorPos::new();
     c.line = 1;
     c.move_up();
@@ -87,7 +87,7 @@ fn test_sticky_column() {
 
 #[test]
 fn test_move_line_start() {
-    let d = doc("Hello");
+    let _d = doc("Hello");
     let mut c = CursorPos::new();
     c.col = 3;
     c.move_line_start();
@@ -121,7 +121,7 @@ fn test_move_word_backward() {
 
 #[test]
 fn test_jump_top() {
-    let d = doc("Line1\nLine2\nLine3");
+    let _d = doc("Line1\nLine2\nLine3");
     let mut c = CursorPos::new();
     c.line = 2;
     c.col = 3;

@@ -256,7 +256,13 @@ fn highlight_source_line(line: &str, theme: &Theme, strip: bool) -> Vec<Segment>
         } else {
             segs.push((rest[..marker_end].to_string(), theme.list_marker));
         }
-        tokenize_inline(&rest[marker_end..], theme.paragraph, theme, &mut segs, strip);
+        tokenize_inline(
+            &rest[marker_end..],
+            theme.paragraph,
+            theme,
+            &mut segs,
+            strip,
+        );
         return segs;
     }
 
@@ -313,11 +319,7 @@ fn split_quote_prefix(s: &str) -> (&str, &str) {
             break;
         }
     }
-    if any {
-        (&s[..i], &s[i..])
-    } else {
-        ("", s)
-    }
+    if any { (&s[..i], &s[i..]) } else { ("", s) }
 }
 
 fn list_marker_len(s: &str) -> Option<usize> {
@@ -374,83 +376,83 @@ fn tokenize_inline(
         let b = bytes[i];
 
         // `code`
-        if b == b'`' {
-            if let Some(end) = find_unescaped(bytes, i + 1, b'`') {
-                flush_plain(out, text, plain_start, i);
-                if strip {
-                    out.push((text[i + 1..end].to_string(), theme.code_inline));
-                } else {
-                    out.push((text[i..=end].to_string(), theme.code_inline));
-                }
-                i = end + 1;
-                plain_start = i;
-                continue;
+        if b == b'`'
+            && let Some(end) = find_unescaped(bytes, i + 1, b'`')
+        {
+            flush_plain(out, text, plain_start, i);
+            if strip {
+                out.push((text[i + 1..end].to_string(), theme.code_inline));
+            } else {
+                out.push((text[i..=end].to_string(), theme.code_inline));
             }
+            i = end + 1;
+            plain_start = i;
+            continue;
         }
 
         // **bold**
-        if b == b'*' && bytes.get(i + 1) == Some(&b'*') {
-            if let Some(end) = find_double(bytes, i + 2, b'*') {
-                flush_plain(out, text, plain_start, i);
-                if strip {
-                    out.push((text[i + 2..end].to_string(), theme.bold));
-                } else {
-                    out.push((text[i..end + 2].to_string(), theme.bold));
-                }
-                i = end + 2;
-                plain_start = i;
-                continue;
+        if b == b'*'
+            && bytes.get(i + 1) == Some(&b'*')
+            && let Some(end) = find_double(bytes, i + 2, b'*')
+        {
+            flush_plain(out, text, plain_start, i);
+            if strip {
+                out.push((text[i + 2..end].to_string(), theme.bold));
+            } else {
+                out.push((text[i..end + 2].to_string(), theme.bold));
             }
+            i = end + 2;
+            plain_start = i;
+            continue;
         }
 
         // *italic* or _italic_
-        if b == b'*' || b == b'_' {
-            if let Some(end) = find_single_emphasis(bytes, i + 1, b) {
-                flush_plain(out, text, plain_start, i);
-                if strip {
-                    out.push((text[i + 1..end].to_string(), theme.italic));
-                } else {
-                    out.push((text[i..=end].to_string(), theme.italic));
-                }
-                i = end + 1;
-                plain_start = i;
-                continue;
+        if (b == b'*' || b == b'_')
+            && let Some(end) = find_single_emphasis(bytes, i + 1, b)
+        {
+            flush_plain(out, text, plain_start, i);
+            if strip {
+                out.push((text[i + 1..end].to_string(), theme.italic));
+            } else {
+                out.push((text[i..=end].to_string(), theme.italic));
             }
+            i = end + 1;
+            plain_start = i;
+            continue;
         }
 
         // ~~strike~~
-        if b == b'~' && bytes.get(i + 1) == Some(&b'~') {
-            if let Some(end) = find_double(bytes, i + 2, b'~') {
-                flush_plain(out, text, plain_start, i);
-                if strip {
-                    out.push((text[i + 2..end].to_string(), theme.strikethrough));
-                } else {
-                    out.push((text[i..end + 2].to_string(), theme.strikethrough));
-                }
-                i = end + 2;
-                plain_start = i;
-                continue;
+        if b == b'~'
+            && bytes.get(i + 1) == Some(&b'~')
+            && let Some(end) = find_double(bytes, i + 2, b'~')
+        {
+            flush_plain(out, text, plain_start, i);
+            if strip {
+                out.push((text[i + 2..end].to_string(), theme.strikethrough));
+            } else {
+                out.push((text[i..end + 2].to_string(), theme.strikethrough));
             }
+            i = end + 2;
+            plain_start = i;
+            continue;
         }
 
         // [text](url)
-        if b == b'[' {
-            if let Some(rb) = find_unescaped(bytes, i + 1, b']') {
-                if bytes.get(rb + 1) == Some(&b'(') {
-                    if let Some(rp) = find_unescaped(bytes, rb + 2, b')') {
-                        flush_plain(out, text, plain_start, i);
-                        if strip {
-                            // Show just the link text, styled as a link.
-                            out.push((text[i + 1..rb].to_string(), theme.link));
-                        } else {
-                            out.push((text[i..=rp].to_string(), theme.link));
-                        }
-                        i = rp + 1;
-                        plain_start = i;
-                        continue;
-                    }
-                }
+        if b == b'['
+            && let Some(rb) = find_unescaped(bytes, i + 1, b']')
+            && bytes.get(rb + 1) == Some(&b'(')
+            && let Some(rp) = find_unescaped(bytes, rb + 2, b')')
+        {
+            flush_plain(out, text, plain_start, i);
+            if strip {
+                // Show just the link text, styled as a link.
+                out.push((text[i + 1..rb].to_string(), theme.link));
+            } else {
+                out.push((text[i..=rp].to_string(), theme.link));
             }
+            i = rp + 1;
+            plain_start = i;
+            continue;
         }
 
         i += 1;

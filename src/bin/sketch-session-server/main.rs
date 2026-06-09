@@ -167,6 +167,8 @@ type ForwarderProgress = Arc<ForwarderHandle>;
 // `generation` on the pump-sourced commands (Record/TurnCount/AgentDisconnected)
 // is the fence (Blocker B): the actor ignores any whose generation !=
 // session.channel_generation.
+// wire/event enum — boxing the large variant would ripple through serialization + every match site
+#[allow(clippy::large_enum_variant)]
 enum Command {
     // ── External (connection-handler sourced; each carries a oneshot) ──
     Create {
@@ -192,6 +194,8 @@ enum Command {
         // LOGICAL `sent_seq` (Bug 1a), NOT a `Vec` index, so a later trim can't
         // re-alias it; the progress handle is the shared `AtomicU64` the actor
         // reads for the trim floor (Bug 1b).
+        // type alias would hurt readability here more than help
+        #[allow(clippy::type_complexity)]
         reply: tokio::sync::oneshot::Sender<
             Result<
                 (
@@ -312,7 +316,10 @@ enum Command {
 /// CLI: with no subcommand the binary runs the server (the default the GUI
 /// auto-launches); subcommands manage launchd supervision.
 #[derive(clap::Parser)]
-#[command(name = "sketch-session-server", about = "Sketch ACP session-server daemon")]
+#[command(
+    name = "sketch-session-server",
+    about = "Sketch ACP session-server daemon"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Subcmd>,
@@ -529,7 +536,8 @@ impl ManagedSession {
                     ),
                 },
             );
-            self.event_log.prepend(Notification::Agent { event: marker });
+            self.event_log
+                .prepend(Notification::Agent { event: marker });
         }
         self.publish_snapshot();
     }
@@ -803,7 +811,10 @@ fn new_managed_session(
     wal: Option<sketch::session_wal::SessionWal>,
 ) -> ManagedSession {
     let event_log = sketch::event_log::EventLog::new();
-    let (log_tx, _) = watch::channel(LogSnapshot { log: event_log.clone(), generation: 0 });
+    let (log_tx, _) = watch::channel(LogSnapshot {
+        log: event_log.clone(),
+        generation: 0,
+    });
     let (lease_tx, _) = watch::channel(None);
     let (gen_watch, _) = watch::channel(0u64);
     ManagedSession {
@@ -891,11 +902,7 @@ impl SessionManager {
     ) -> (Self, mpsc::UnboundedReceiver<Command>, PermissionMode) {
         let (events, _) = broadcast::channel(1024);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        (
-            Self { events, cmd_tx },
-            cmd_rx,
-            default_permission_mode,
-        )
+        (Self { events, cmd_tx }, cmd_rx, default_permission_mode)
     }
 
     /// Subscribe to manager-level session-list notifications.
@@ -1132,8 +1139,10 @@ fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<Re
         // log_base resets to the seq of the first recovered event, which is 0).
         let event_log = sketch::event_log::EventLog::from_recovered(rs.event_log, 0);
         // Seed the watch with the recovered log so the first tail sees history.
-        let (log_tx, _) =
-            watch::channel(LogSnapshot { log: event_log.clone(), generation: 0 });
+        let (log_tx, _) = watch::channel(LogSnapshot {
+            log: event_log.clone(),
+            generation: 0,
+        });
         let (lease_tx, _) = watch::channel(None);
         let (gen_watch, _) = watch::channel(0u64);
         let session = ManagedSession {
@@ -1187,19 +1196,17 @@ fn spawn_resume_worker(
         acp_session_id,
     } = job;
     std::thread::Builder::new()
-        .name(format!("acp-resume-{}", &session_id[..8.min(session_id.len())]))
+        .name(format!(
+            "acp-resume-{}",
+            &session_id[..8.min(session_id.len())]
+        ))
         .spawn(move || {
             // SAFETY: dedicated spawn thread; see create worker.
             unsafe {
                 std::env::set_var("SKETCH_SESSION_MANAGED", "1");
             }
             let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
-            match spawner.spawn(
-                &cmd,
-                Some(cwd),
-                Some(acp_session_id),
-                SketchFrontend::Gpui,
-            ) {
+            match spawner.spawn(&cmd, Some(cwd), Some(acp_session_id), SketchFrontend::Gpui) {
                 Ok(client) => {
                     // Resume from disk → is_respawn=false (generation stays 0).
                     //
@@ -1295,13 +1302,25 @@ impl Manager {
             } => {
                 let _ = reply.send(self.do_attach(&sid, mode, &client_id, cursor));
             }
-            Command::Detach { sid, client_id, reply } => {
+            Command::Detach {
+                sid,
+                client_id,
+                reply,
+            } => {
                 let _ = reply.send(self.do_detach(&sid, &client_id));
             }
-            Command::Heartbeat { sid, client_id, reply } => {
+            Command::Heartbeat {
+                sid,
+                client_id,
+                reply,
+            } => {
                 let _ = reply.send(self.do_heartbeat(&sid, &client_id));
             }
-            Command::Promote { sid, client_id, reply } => {
+            Command::Promote {
+                sid,
+                client_id,
+                reply,
+            } => {
                 let _ = reply.send(self.do_promote(&sid, &client_id));
             }
             Command::Prompt {
@@ -1320,13 +1339,25 @@ impl Manager {
                 // Ungated: enqueue directly, no owner check (ADR-0015).
                 let _ = reply.send(self.enqueue_prompt(&session_id, &text));
             }
-            Command::Cancel { sid, client_id, reply } => {
+            Command::Cancel {
+                sid,
+                client_id,
+                reply,
+            } => {
                 let _ = reply.send(self.do_cancel(&sid, &client_id));
             }
-            Command::Close { sid, client_id, reply } => {
+            Command::Close {
+                sid,
+                client_id,
+                reply,
+            } => {
                 let _ = reply.send(self.do_close(&sid, &client_id));
             }
-            Command::Restart { sid, client_id, reply } => {
+            Command::Restart {
+                sid,
+                client_id,
+                reply,
+            } => {
                 let _ = reply.send(self.do_restart(&sid, &client_id));
             }
             Command::Rename { sid, label, reply } => {
@@ -1503,12 +1534,7 @@ impl Manager {
                     std::env::set_var("SKETCH_SESSION_MANAGED", "1");
                 }
                 let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
-                match spawner.spawn(
-                    &cmd,
-                    Some(cwd),
-                    resume_session_id,
-                    SketchFrontend::Gpui,
-                ) {
+                match spawner.spawn(&cmd, Some(cwd), resume_session_id, SketchFrontend::Gpui) {
                     Ok(client) => {
                         // Fresh spawn → is_respawn = false, generation stays 0.
                         publish_channel(&cmd_tx, &session_id, client, false);
@@ -1537,7 +1563,9 @@ impl Manager {
                 // pump wakes immediately to self-terminate.
                 let session = self.sessions.remove(session_id);
                 if let Some(s) = &session {
-                    let _ = s.gen_watch.send_replace(s.channel_generation.wrapping_add(1));
+                    let _ = s
+                        .gen_watch
+                        .send_replace(s.channel_generation.wrapping_add(1));
                 }
                 // Explicit close = intentional end of life: delete the durable
                 // WAL so this session is NOT recovered on the next start.
@@ -1554,6 +1582,8 @@ impl Manager {
         }
     }
 
+    // type alias would hurt readability here more than help
+    #[allow(clippy::type_complexity)]
     fn do_attach(
         &mut self,
         session_id: &str,
@@ -1589,10 +1619,10 @@ impl Manager {
         let mut granted_drive = false;
         if mode == AttachMode::Owner && !client_id.is_empty() {
             let acquire = match &session.lease {
-                None => true,                                            // free
-                Some(l) if l.client_id == client_id => true,            // same id -> resume
-                Some(l) if l.expires_at <= now => true,                 // prior holder expired
-                Some(_) => false,                                       // different live id
+                None => true,                                // free
+                Some(l) if l.client_id == client_id => true, // same id -> resume
+                Some(l) if l.expires_at <= now => true,      // prior holder expired
+                Some(_) => false,                            // different live id
             };
             if acquire {
                 let changed_holder =
@@ -1820,12 +1850,7 @@ impl Manager {
                     std::env::set_var("SKETCH_SESSION_MANAGED", "1");
                 }
                 let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
-                match spawner.spawn(
-                    &cmd,
-                    Some(cwd),
-                    resume_id,
-                    SketchFrontend::Gpui,
-                ) {
+                match spawner.spawn(&cmd, Some(cwd), resume_id, SketchFrontend::Gpui) {
                     Ok(client) => {
                         // is_respawn=true bumps generation + gen_watch so the OLD
                         // pump self-terminates and drops its client off-actor.
@@ -1934,8 +1959,7 @@ impl Manager {
 /// `client_id` never holds a lease. Lazy expiry: an expired lease fails the
 /// gate even before a sweep clears it.
 fn holds_lease(session: &ManagedSession, client_id: &str, now: Instant) -> bool {
-    !client_id.is_empty()
-        && matches!(&session.lease, Some(l) if l.is_live_for(client_id, now))
+    !client_id.is_empty() && matches!(&session.lease, Some(l) if l.is_live_for(client_id, now))
 }
 
 // ── Session pump task ──────────────────────────────────────────────
@@ -2111,10 +2135,10 @@ fn spawn_pump_thread(
 
                 // Forward events first (in order).
                 for ev in events {
-                    if std::env::var("SKETCH_CHUNKLOG").is_ok() {
-                        if let sketch::acp_channel::ReplyEvent::Chunk(t) = &ev {
-                            tracing::info!("[chunklog srv] {t:?}");
-                        }
+                    if std::env::var("SKETCH_CHUNKLOG").is_ok()
+                        && let sketch::acp_channel::ReplyEvent::Chunk(t) = &ev
+                    {
+                        tracing::info!("[chunklog srv] {t:?}");
                     }
                     let _ = cmd_tx.send(Command::Record {
                         sid: session_id.clone(),
@@ -2151,7 +2175,6 @@ fn spawn_pump_thread(
         })
         .ok();
 }
-
 
 // ── Connection handler ─────────────────────────────────────────────
 

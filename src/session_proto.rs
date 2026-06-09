@@ -56,6 +56,8 @@ pub struct Lease {
 // ── Envelope types ─────────────────────────────────────────────────
 
 /// A framed message on the wire. Every line is one of these.
+// wire/event enum — boxing the large variant would ripple through serialization + every match site
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum Frame {
@@ -516,7 +518,10 @@ mod tests {
             lease: None,
         };
         let json = serde_json::to_string(&none).unwrap();
-        assert!(json.contains("\"lease_changed\""), "tag must be lease_changed: {json}");
+        assert!(
+            json.contains("\"lease_changed\""),
+            "tag must be lease_changed: {json}"
+        );
         assert!(matches!(
             serde_json::from_str::<Notification>(&json).unwrap(),
             Notification::LeaseChanged { lease: None, .. }

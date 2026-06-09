@@ -161,7 +161,11 @@ pub struct KeyParseError {
 
 impl fmt::Display for KeyParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "key parse error at position {}: {}", self.position, self.reason)
+        write!(
+            f,
+            "key parse error at position {}: {}",
+            self.position, self.reason
+        )
     }
 }
 

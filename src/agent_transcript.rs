@@ -134,7 +134,9 @@ impl UserTurnReconciler {
                 self.pending_local.push_back(n.clone());
                 self.last_inserted = Some(n);
                 // Live: k = current_turn(); never advance the replay cursor.
-                UserTurnAction::Insert { advance_boundary: false }
+                UserTurnAction::Insert {
+                    advance_boundary: false,
+                }
             }
             UserTurnOrigin::Echo => {
                 // 1. Live echo of our own optimistic submit? Match by content
@@ -162,7 +164,9 @@ impl UserTurnReconciler {
                 }
                 // 3. A genuinely new replayed/foreign turn.
                 self.last_inserted = Some(n);
-                UserTurnAction::Insert { advance_boundary: replaying }
+                UserTurnAction::Insert {
+                    advance_boundary: replaying,
+                }
             }
         }
     }
@@ -235,7 +239,10 @@ mod tests {
                     } else {
                         self.rt.current_turn()
                     };
-                    self.rows.push(Row::User { k, text: text.trim_end().to_string() });
+                    self.rows.push(Row::User {
+                        k,
+                        text: text.trim_end().to_string(),
+                    });
                 }
             }
         }
@@ -259,7 +266,10 @@ mod tests {
     }
 
     fn user_rows(m: &Model) -> Vec<&Row> {
-        m.rows.iter().filter(|r| matches!(r, Row::User { .. })).collect()
+        m.rows
+            .iter()
+            .filter(|r| matches!(r, Row::User { .. }))
+            .collect()
     }
 
     // ---------- the original bug: echo after assistant chunk ----------
@@ -274,7 +284,13 @@ mod tests {
         m.user(UserTurnOrigin::Echo, "hello agent\n"); // newline-normalized
         let users = user_rows(&m);
         assert_eq!(users.len(), 1, "user turn must appear exactly once");
-        assert_eq!(users[0], &Row::User { k: 1, text: "hello agent".into() });
+        assert_eq!(
+            users[0],
+            &Row::User {
+                k: 1,
+                text: "hello agent".into()
+            }
+        );
     }
 
     #[test]
@@ -336,8 +352,20 @@ mod tests {
         m.turn_ended(2);
         assert_eq!(m.rt.replay_turn, 0, "live path must never set replay_turn");
         let users = user_rows(&m);
-        assert_eq!(users[0], &Row::User { k: 1, text: "a".into() });
-        assert_eq!(users[1], &Row::User { k: 2, text: "b".into() });
+        assert_eq!(
+            users[0],
+            &Row::User {
+                k: 1,
+                text: "a".into()
+            }
+        );
+        assert_eq!(
+            users[1],
+            &Row::User {
+                k: 2,
+                text: "b".into()
+            }
+        );
     }
 
     #[test]
@@ -350,7 +378,10 @@ mod tests {
         m.user(UserTurnOrigin::LocalSubmit, "submitted");
         m.chunk();
         m.user(UserTurnOrigin::Echo, "totally different live echo");
-        assert_eq!(m.rt.replay_turn, 0, "live insert must not enter replay mode");
+        assert_eq!(
+            m.rt.replay_turn, 0,
+            "live insert must not enter replay mode"
+        );
     }
 
     // ---------- server replay: UserPrompt + UserMessage for one turn -------
@@ -370,8 +401,20 @@ mod tests {
         m.turn_ended(2);
         let users = user_rows(&m);
         assert_eq!(users.len(), 2);
-        assert_eq!(users[0], &Row::User { k: 1, text: "q1".into() });
-        assert_eq!(users[1], &Row::User { k: 2, text: "q2".into() });
+        assert_eq!(
+            users[0],
+            &Row::User {
+                k: 1,
+                text: "q1".into()
+            }
+        );
+        assert_eq!(
+            users[1],
+            &Row::User {
+                k: 2,
+                text: "q2".into()
+            }
+        );
     }
 
     #[test]
@@ -385,7 +428,11 @@ mod tests {
         m.chunk(); // assistant streams before the echo
         m.user(UserTurnOrigin::Echo, "q1"); // UserMessage echo, same turn, after chunk
         m.turn_ended(1);
-        assert_eq!(user_rows(&m).len(), 1, "dual source must not double even after a chunk");
+        assert_eq!(
+            user_rows(&m).len(),
+            1,
+            "dual source must not double even after a chunk"
+        );
     }
 
     #[test]
@@ -404,10 +451,17 @@ mod tests {
         m.user(UserTurnOrigin::Echo, "first line\nsecond line"); // server UserPrompt
         m.user(UserTurnOrigin::Echo, "first line\nsecond line"); // agent UserMessage, same turn
         let users = user_rows(&m);
-        assert_eq!(users.len(), 1, "a multi-line worksheet submit must render exactly once");
+        assert_eq!(
+            users.len(),
+            1,
+            "a multi-line worksheet submit must render exactly once"
+        );
         assert_eq!(
             users[0],
-            &Row::User { k: 1, text: "first line\nsecond line".into() }
+            &Row::User {
+                k: 1,
+                text: "first line\nsecond line".into()
+            }
         );
     }
 
@@ -416,25 +470,46 @@ mod tests {
         // On the direct-channel replay path each UserMessage is its own turn
         // (single source), so two identical consecutive replayed turns must
         // BOTH insert — case-2 dedup is gated off when advancing the boundary.
-        let mut m = Model::default();
-        m.replaying = true;
+        let mut m = Model {
+            replaying: true,
+            ..Default::default()
+        };
         m.user(UserTurnOrigin::Echo, "same");
         m.chunk();
         m.user(UserTurnOrigin::Echo, "same");
         m.chunk();
         m.replay_complete();
         let users = user_rows(&m);
-        assert_eq!(users.len(), 2, "identical consecutive direct-replay turns must both appear");
-        assert_eq!(users[0], &Row::User { k: 1, text: "same".into() });
-        assert_eq!(users[1], &Row::User { k: 2, text: "same".into() });
+        assert_eq!(
+            users.len(),
+            2,
+            "identical consecutive direct-replay turns must both appear"
+        );
+        assert_eq!(
+            users[0],
+            &Row::User {
+                k: 1,
+                text: "same".into()
+            }
+        );
+        assert_eq!(
+            users[1],
+            &Row::User {
+                k: 2,
+                text: "same".into()
+            }
+        );
     }
 
     // ---------- direct-channel replay advances the boundary ---------------
 
     #[test]
     fn direct_replay_advances_boundary_per_user_message() {
-        let mut m = Model::default();
-        m.replaying = true; // session/load burst active
+        // replaying: session/load burst active
+        let mut m = Model {
+            replaying: true,
+            ..Default::default()
+        };
         m.user(UserTurnOrigin::Echo, "u1");
         m.chunk();
         m.user(UserTurnOrigin::Echo, "u2");
@@ -442,15 +517,30 @@ mod tests {
         m.replay_complete();
         let users = user_rows(&m);
         assert_eq!(users.len(), 2);
-        assert_eq!(users[0], &Row::User { k: 1, text: "u1".into() });
-        assert_eq!(users[1], &Row::User { k: 2, text: "u2".into() });
+        assert_eq!(
+            users[0],
+            &Row::User {
+                k: 1,
+                text: "u1".into()
+            }
+        );
+        assert_eq!(
+            users[1],
+            &Row::User {
+                k: 2,
+                text: "u2".into()
+            }
+        );
         // After ReplayComplete the live counter is reconciled and we leave
         // replay mode, so the next live submit continues from k=3.
         assert_eq!(m.rt.replay_turn, 0);
         m.user(UserTurnOrigin::LocalSubmit, "u3");
         assert_eq!(
             user_rows(&m).last().unwrap(),
-            &&Row::User { k: 3, text: "u3".into() }
+            &&Row::User {
+                k: 3,
+                text: "u3".into()
+            }
         );
     }
 

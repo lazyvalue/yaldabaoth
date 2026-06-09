@@ -8,7 +8,9 @@ impl App {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
         // Check if already open
         for (i, buf) in self.buffers.iter().enumerate() {
-            let buf_path = buf.file_path().canonicalize()
+            let buf_path = buf
+                .file_path()
+                .canonicalize()
                 .unwrap_or_else(|_| buf.file_path().to_path_buf());
             if buf_path == canonical {
                 self.active_buffer = i;
@@ -63,11 +65,12 @@ impl App {
         }
 
         // Check parent directory exists before creating an unsaved buffer.
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                self.command_error = format!("No such directory: {}", parent.display());
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            self.command_error = format!("No such directory: {}", parent.display());
+            return;
         }
 
         // Already open with this target path? Switch to it.
@@ -112,7 +115,11 @@ impl App {
     }
 
     pub(crate) fn close_current_buffer(&mut self) {
-        if self.buffers[self.active_buffer].editor.document().is_modified() {
+        if self.buffers[self.active_buffer]
+            .editor
+            .document()
+            .is_modified()
+        {
             self.command_error = "No write since last change (add ! to override)".to_string();
             return;
         }
@@ -126,7 +133,12 @@ impl App {
         }
     }
 
-    pub(crate) fn handle_full_buffer_list_key(&mut self, key: KeyPress, _viewport_height: usize, _content_width: usize) {
+    pub(crate) fn handle_full_buffer_list_key(
+        &mut self,
+        key: KeyPress,
+        _viewport_height: usize,
+        _content_width: usize,
+    ) {
         if self.buffer_list_filter_mode {
             match key.key {
                 Key::Esc => {
@@ -239,7 +251,11 @@ impl App {
         let query = self.buffer_list_filter_text.to_lowercase();
         (0..self.buffers.len())
             .filter(|&i| {
-                let path = self.buffers[i].file_path().display().to_string().to_lowercase();
+                let path = self.buffers[i]
+                    .file_path()
+                    .display()
+                    .to_string()
+                    .to_lowercase();
                 fuzzy_match(&path, &query)
             })
             .collect()

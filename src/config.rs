@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::acp_channel::{PermissionMode, DEFAULT_PERMISSION_MODE};
+use crate::acp_channel::{DEFAULT_PERMISSION_MODE, PermissionMode};
 use crate::command::CommandRegistry;
 use crate::keys::{self, KeyPress};
 use crate::menu::MenuNode;
@@ -109,9 +109,10 @@ impl Config {
         if let Some(node) = doc.get("default-permission-mode")
             && let Some(val) = node.get(0).and_then(|v| v.as_string())
         {
-            config.default_permission_mode = PermissionMode::parse(val).ok_or_else(|| ConfigError {
-                message: format!("unknown permission mode \"{}\"", val),
-            })?;
+            config.default_permission_mode =
+                PermissionMode::parse(val).ok_or_else(|| ConfigError {
+                    message: format!("unknown permission mode \"{}\"", val),
+                })?;
         }
 
         // Keybindings
@@ -230,12 +231,12 @@ impl Config {
                 Ok(MenuNode::label(&text))
             }
             "entry" => {
-                let key_str = node
-                    .get("key")
-                    .and_then(|v| v.as_string())
-                    .ok_or_else(|| ConfigError {
-                        message: "menu entry missing required attribute \"key\"".into(),
-                    })?;
+                let key_str =
+                    node.get("key")
+                        .and_then(|v| v.as_string())
+                        .ok_or_else(|| ConfigError {
+                            message: "menu entry missing required attribute \"key\"".into(),
+                        })?;
                 let label = node
                     .get("label")
                     .and_then(|v| v.as_string())
@@ -268,12 +269,12 @@ impl Config {
                 })
             }
             "submenu" => {
-                let key_str = node
-                    .get("key")
-                    .and_then(|v| v.as_string())
-                    .ok_or_else(|| ConfigError {
-                        message: "submenu missing required attribute \"key\"".into(),
-                    })?;
+                let key_str =
+                    node.get("key")
+                        .and_then(|v| v.as_string())
+                        .ok_or_else(|| ConfigError {
+                            message: "submenu missing required attribute \"key\"".into(),
+                        })?;
                 let label = node
                     .get("label")
                     .and_then(|v| v.as_string())

@@ -14,9 +14,9 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 
 use serde::{Deserialize, Serialize};
@@ -241,7 +241,10 @@ mod tests {
         meta.insert("label".into(), "buffer".into());
         client.send("hello world", meta).expect("send");
 
-        let received = server.received.recv_timeout(Duration::from_secs(1)).expect("recv");
+        let received = server
+            .received
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recv");
         let v: serde_json::Value = serde_json::from_str(&received).expect("parse");
         assert_eq!(v["type"], "send");
         assert_eq!(v["content"], "hello world");

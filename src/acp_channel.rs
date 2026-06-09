@@ -69,8 +69,8 @@ use agent_client_protocol::schema::{
 // match on tool-call events. `pub use` also brings these into local
 // scope, so anything below this line can refer to them unqualified.
 pub use agent_client_protocol::schema::{
-    Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionModeId, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind,
+    Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionModeId, ToolCall, ToolCallContent,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -95,20 +95,15 @@ pub const DEFAULT_AGENT_COMMAND: &str = "claude-code-acp";
 /// system-prompt append so Claude knows whether it's running inside the
 /// terminal TUI or the GPUI desktop app — affects nothing protocol-side,
 /// only the host-description sentence at the top of the prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SketchFrontend {
     /// Terminal frontend (ratatui + crossterm). The default — preserves
     /// existing behaviour for any caller that didn't opt in to the
     /// frontend-aware spawn variants.
+    #[default]
     Tui,
     /// Desktop frontend (GPUI). Selected by `sketch-gpui`.
     Gpui,
-}
-
-impl Default for SketchFrontend {
-    fn default() -> Self {
-        Self::Tui
-    }
 }
 
 impl SketchFrontend {
@@ -230,7 +225,10 @@ pub struct ReplayTurns {
 
 impl ReplayTurns {
     pub fn new(last_seen: usize) -> Self {
-        Self { last_seen, replay_turn: 0 }
+        Self {
+            last_seen,
+            replay_turn: 0,
+        }
     }
 
     /// The in-flight turn number `k` used to tag chunks/tools. Single source
@@ -474,8 +472,7 @@ mod fake {
             let connected = Arc::new(AtomicBool::new(true));
             let turns = Arc::new(AtomicUsize::new(0));
             let permission_mode = Arc::new(AtomicU8::new(DEFAULT_PERMISSION_MODE as u8));
-            let session_id =
-                Arc::new(std::sync::Mutex::new(Some(sid.to_string())));
+            let session_id = Arc::new(std::sync::Mutex::new(Some(sid.to_string())));
 
             let transport = FakeTransport {
                 reply_rx,
@@ -591,8 +588,14 @@ mod fake {
     pub struct FakeAgentSpawner {
         #[allow(clippy::type_complexity)]
         factory: std::sync::Mutex<
-            Box<dyn FnMut(&str, Option<PathBuf>, Option<String>) -> io::Result<Box<dyn AgentTransport>>
-                + Send>,
+            Box<
+                dyn FnMut(
+                        &str,
+                        Option<PathBuf>,
+                        Option<String>,
+                    ) -> io::Result<Box<dyn AgentTransport>>
+                    + Send,
+            >,
         >,
     }
 
@@ -796,9 +799,8 @@ impl AcpChannelClient {
         resume_session_id: Option<String>,
         frontend: SketchFrontend,
     ) -> io::Result<Self> {
-        let cwd = cwd.unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-        });
+        let cwd =
+            cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
 
         let parts = shell_words::split(command).map_err(|e| {
             io::Error::new(
@@ -869,9 +871,9 @@ impl AcpChannelClient {
 
         // Wait for the initialize+new-session handshake to either succeed or
         // fail. We drop the channel afterwards — readiness is signalled once.
-        let initial = ready_rx.recv().map_err(|_| {
-            io::Error::other("acp worker exited before reporting readiness")
-        })?;
+        let initial = ready_rx
+            .recv()
+            .map_err(|_| io::Error::other("acp worker exited before reporting readiness"))?;
         if let Err(e) = initial {
             // The worker has bailed; tear it down before returning.
             connected.store(false, Ordering::SeqCst);
@@ -897,9 +899,7 @@ impl AcpChannelClient {
     /// Take the wake-channel receiver. Returns `Some` exactly once per
     /// client; subsequent calls return `None`. Caller (typically the
     /// GPUI pump task) uses it to await events without polling.
-    pub fn take_wake_receiver(
-        &self,
-    ) -> Option<futures::channel::mpsc::UnboundedReceiver<()>> {
+    pub fn take_wake_receiver(&self) -> Option<futures::channel::mpsc::UnboundedReceiver<()>> {
         self.wake_rx.lock().ok().and_then(|mut g| g.take())
     }
 
@@ -1201,8 +1201,15 @@ fn resolve_via_login_shell(command: &str) -> Option<String> {
     if parts.is_empty() {
         Some(resolved)
     } else {
-        let quoted_args: Vec<String> = parts.iter().map(|a| shell_words::quote(a).into_owned()).collect();
-        Some(format!("{} {}", shell_words::quote(&resolved), quoted_args.join(" ")))
+        let quoted_args: Vec<String> = parts
+            .iter()
+            .map(|a| shell_words::quote(a).into_owned())
+            .collect();
+        Some(format!(
+            "{} {}",
+            shell_words::quote(&resolved),
+            quoted_args.join(" ")
+        ))
     }
 }
 
@@ -1255,6 +1262,8 @@ fn short_err(e: &agent_client_protocol::Error) -> String {
     }
 }
 
+// builder/render fn — arg count is inherent, splitting would obscure
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     parts: Vec<String>,
     cwd: PathBuf,
@@ -1363,11 +1372,13 @@ async fn worker_async(
         // claude-agent-acp) may log diagnostics there; keeping it inherit
         // would corrupt sketch's TUI. Set SKETCH_ACP_AGENT_STDERR=inherit to
         // surface it for debugging.
-        .stderr(if std::env::var("SKETCH_ACP_AGENT_STDERR").as_deref() == Ok("inherit") {
-            std::process::Stdio::inherit()
-        } else {
-            std::process::Stdio::null()
-        })
+        .stderr(
+            if std::env::var("SKETCH_ACP_AGENT_STDERR").as_deref() == Ok("inherit") {
+                std::process::Stdio::inherit()
+            } else {
+                std::process::Stdio::null()
+            },
+        )
         .kill_on_drop(true);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1433,8 +1444,7 @@ async fn worker_async(
 
     // 3) Bridge the std mpsc prompt channel into a tokio mpsc the async
     //    driver loop can await on. spawn_blocking holds the std recv() call.
-    let (async_prompt_tx, mut async_prompt_rx) =
-        tokio::sync::mpsc::unbounded_channel::<String>();
+    let (async_prompt_tx, mut async_prompt_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let bridge_task = tokio::task::spawn_blocking(move || {
         while let Ok(prompt) = prompt_rx.recv() {
             if async_prompt_tx.send(prompt).is_err() {
@@ -1796,7 +1806,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         // Drop any cancel signal that queued while idle so a
                         // stale Stop click can't abort the turn we're about
                         // to start.
-                        while let Ok(Some(_)) = cancel_rx.try_next() {}
+                        while cancel_rx.try_recv().is_ok() {}
 
                         let mut attempt: u32 = 0;
                         loop {
@@ -1961,7 +1971,10 @@ mod tests {
             assert!(!allow_tool_kind(mode, ToolKind::Delete));
         }
         // AutoEdit allows edits but still declines shell/delete.
-        assert!(!allow_tool_kind(PermissionMode::AutoEdit, ToolKind::Execute));
+        assert!(!allow_tool_kind(
+            PermissionMode::AutoEdit,
+            ToolKind::Execute
+        ));
         assert!(!allow_tool_kind(PermissionMode::AutoEdit, ToolKind::Delete));
     }
 
@@ -2076,11 +2089,9 @@ while True:
         let tmp = tempfile::tempdir().expect("tmpdir");
         let script = write_fake_agent_script(tmp.path());
 
-        let mut client = AcpChannelClient::spawn(
-            script.to_str().unwrap(),
-            Some(tmp.path().to_path_buf()),
-        )
-        .expect("spawn ACP agent");
+        let mut client =
+            AcpChannelClient::spawn(script.to_str().unwrap(), Some(tmp.path().to_path_buf()))
+                .expect("spawn ACP agent");
         assert!(client.is_connected());
         assert!(client.description().contains("fake_acp_agent"));
 
@@ -2137,11 +2148,9 @@ while True:
         let tmp = tempfile::tempdir().expect("tmpdir");
         let script = write_fake_agent_script(tmp.path());
 
-        let mut client = AcpChannelClient::spawn(
-            script.to_str().unwrap(),
-            Some(tmp.path().to_path_buf()),
-        )
-        .expect("spawn ACP agent");
+        let mut client =
+            AcpChannelClient::spawn(script.to_str().unwrap(), Some(tmp.path().to_path_buf()))
+                .expect("spawn ACP agent");
         assert!(client.is_connected());
 
         client.send("hi there").expect("send prompt");
@@ -2186,10 +2195,7 @@ while True:
 
     #[test]
     fn spawn_fails_with_missing_binary() {
-        let err = match AcpChannelClient::spawn(
-            "/no/such/binary/that/exists-please",
-            None,
-        ) {
+        let err = match AcpChannelClient::spawn("/no/such/binary/that/exists-please", None) {
             Ok(_) => panic!("expected spawn failure for missing binary"),
             Err(e) => e,
         };
@@ -2281,21 +2287,16 @@ while True:
         let (tags, finalizes) = drive_replay(
             0,
             &[
-                Ev::User,           // first exchange opens turn 1
+                Ev::User, // first exchange opens turn 1
                 Ev::Chunk,
-                Ev::User,           // second exchange opens turn 2
+                Ev::User, // second exchange opens turn 2
                 Ev::Chunk,
                 Ev::ReplayComplete, // end-of-replay marker
             ],
         );
         assert_eq!(
             tags,
-            vec![
-                Tag::User(1),
-                Tag::Llm(1),
-                Tag::User(2),
-                Tag::Llm(2),
-            ],
+            vec![Tag::User(1), Tag::Llm(1), Tag::User(2), Tag::Llm(2),],
             "replayed turns must count up per user boundary, not collapse to all-1s (INV-3)"
         );
         // Sanity: the regression we're guarding against is all-1s.
@@ -2351,7 +2352,10 @@ while True:
         assert_eq!(rt.current_turn(), 2);
         rt.finish_replay();
         assert_eq!(rt.replay_turn, 0, "replay cursor cleared");
-        assert_eq!(rt.last_seen, 2, "live counter caught up to last replayed turn");
+        assert_eq!(
+            rt.last_seen, 2,
+            "live counter caught up to last replayed turn"
+        );
         // The next live turn in flight is turn 3.
         assert_eq!(rt.current_turn(), 3);
     }

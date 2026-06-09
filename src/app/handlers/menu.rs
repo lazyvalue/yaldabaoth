@@ -3,7 +3,12 @@ use sketch::keys::{Key, KeyPress};
 use crate::app::{App, AppMode};
 
 impl App {
-    pub(crate) fn handle_menu_key(&mut self, key: KeyPress, viewport_height: usize, content_width: usize) {
+    pub(crate) fn handle_menu_key(
+        &mut self,
+        key: KeyPress,
+        viewport_height: usize,
+        content_width: usize,
+    ) {
         match key.key {
             Key::Esc => {
                 self.menu_state.handle_escape();

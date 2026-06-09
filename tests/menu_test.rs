@@ -1,5 +1,5 @@
 use sketch::keys::{Key, KeyPress, Modifiers};
-use sketch::menu::{default_menu, MenuAction, MenuNode, MenuState};
+use sketch::menu::{MenuAction, MenuNode, MenuState, default_menu};
 
 fn k(c: char) -> KeyPress {
     KeyPress::new(Key::Char(c), Modifiers::NONE)

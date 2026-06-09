@@ -22,8 +22,8 @@
 use std::sync::Arc;
 
 use sketch::acp_channel::{
-    AgentSpawner, AgentTransport, FakeAgentSpawner, FakeTransport, PermissionMode, ReplyEvent,
-    RealAgentSpawner, SketchFrontend, DEFAULT_PERMISSION_MODE,
+    AgentSpawner, AgentTransport, DEFAULT_PERMISSION_MODE, FakeAgentSpawner, FakeTransport,
+    PermissionMode, RealAgentSpawner, ReplyEvent, SketchFrontend,
 };
 
 /// A faithful re-implementation of the session-server pump's CORE drain logic
@@ -33,10 +33,7 @@ use sketch::acp_channel::{
 /// checks `turn_count()` against `last_turns` to detect a completed turn.
 ///
 /// Returns `(events, turn_ended)` for one drain cycle.
-fn pump_cycle(
-    transport: &dyn AgentTransport,
-    last_turns: &mut usize,
-) -> (Vec<ReplyEvent>, bool) {
+fn pump_cycle(transport: &dyn AgentTransport, last_turns: &mut usize) -> (Vec<ReplyEvent>, bool) {
     let mut events = Vec::new();
     while let Some(ev) = transport.try_recv() {
         events.push(ev);
@@ -74,14 +71,21 @@ fn fake_preserves_event_order_and_turn_boundary() {
 
     // 5 chunks, in submission order, no dupes, no loss — and NO TurnEnded record,
     // matching the real default reply stream.
-    assert_eq!(events.len(), 5, "all 5 chunks drained in one cycle, no TurnEnded");
+    assert_eq!(
+        events.len(),
+        5,
+        "all 5 chunks drained in one cycle, no TurnEnded"
+    );
     for (i, ev) in events.iter().enumerate() {
         match ev {
             ReplyEvent::Chunk(t) => assert_eq!(t, &format!("chunk-{i}")),
             other => panic!("expected Chunk at {i}, got {other:?}"),
         }
     }
-    assert!(turn_ended, "turn boundary detected via the counter, not a TurnEnded event");
+    assert!(
+        turn_ended,
+        "turn boundary detected via the counter, not a TurnEnded event"
+    );
     assert_eq!(transport.turn_count(), 1);
 
     // A subsequent idle cycle yields nothing and no new boundary.
@@ -240,10 +244,7 @@ fn fake_emit_turn_ended_event_is_opt_in() {
 #[test]
 fn fake_spawner_can_fail_on_demand() {
     let spawner = FakeAgentSpawner::new(|_cmd, _cwd, _resume| {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "simulated spawn failure",
-        ))
+        Err(std::io::Error::other("simulated spawn failure"))
     });
     let err = spawner
         .spawn("", None, None, SketchFrontend::Gpui)

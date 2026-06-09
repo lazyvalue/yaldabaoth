@@ -125,7 +125,10 @@ fn test_extend_mode_preserves_selection() {
     ed.set_extend_mode(true);
     ed.pre_move(false);
     ed.move_right_clamped(false);
-    assert!(ed.selection_range().is_some(), "extend mode + char motion creates selection");
+    assert!(
+        ed.selection_range().is_some(),
+        "extend mode + char motion creates selection"
+    );
     // Subsequent motion should keep the same anchor
     let anchor_before = ed.selection_anchor().unwrap();
     ed.pre_move(false);
@@ -463,7 +466,10 @@ fn open_line_above_on_first_line_of_frozen_range_shifts_range_down() {
     assert_eq!(ed.document().line_text(3), "Baz\n");
     assert_eq!(ed.cursor().line, 0);
     assert_eq!(ed.cursor().col, 0);
-    assert!(!ed.is_frozen_line(0), "new empty line at top must be editable");
+    assert!(
+        !ed.is_frozen_line(0),
+        "new empty line at top must be editable"
+    );
     assert_eq!(ed.frozen_lines(), &[(1, 4)]);
 
     ed.insert_char('Q');
@@ -680,7 +686,10 @@ fn lockable_prefix_blocks_all_edits_below() {
     ed.begin_insert();
     ed.insert_char('!');
     ed.end_insert();
-    assert_eq!(ed.document().line_text(1).trim_end_matches('\n'), "editable!");
+    assert_eq!(
+        ed.document().line_text(1).trim_end_matches('\n'),
+        "editable!"
+    );
 }
 
 #[test]
@@ -689,7 +698,10 @@ fn delete_selection_rejects_frozen_overlap() {
     ed.add_frozen_lines(0, 1);
     ed.select_all();
     let deleted = ed.delete_selection();
-    assert!(!deleted, "should refuse to delete a selection that overlaps frozen text");
+    assert!(
+        !deleted,
+        "should refuse to delete a selection that overlaps frozen text"
+    );
     assert_eq!(ed.document().line_text(0), "ABC\n");
 }
 

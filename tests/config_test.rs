@@ -1,4 +1,4 @@
-use sketch::acp_channel::{PermissionMode, DEFAULT_PERMISSION_MODE};
+use sketch::acp_channel::{DEFAULT_PERMISSION_MODE, PermissionMode};
 use sketch::config::Config;
 use sketch::keybind::KeybindManager;
 use sketch::keys::{Key, KeyPress, Modifiers};
@@ -19,12 +19,14 @@ fn test_empty_config() {
 
 #[test]
 fn test_keybindings_basic() {
-    let config = parse_config(r#"
+    let config = parse_config(
+        r#"
         keybindings {
             "ctrl-d" "half-page-down"
             "g g" "goto-top"
         }
-    "#);
+    "#,
+    );
     let kb = config.keybinds.unwrap();
     assert!(!kb.reset_defaults);
     assert_eq!(kb.bindings.len(), 2);
@@ -34,12 +36,14 @@ fn test_keybindings_basic() {
 
 #[test]
 fn test_keybindings_reset_defaults() {
-    let config = parse_config(r#"
+    let config = parse_config(
+        r#"
         keybindings {
             reset-defaults #true
             "j" "move-down"
         }
-    "#);
+    "#,
+    );
     let kb = config.keybinds.unwrap();
     assert!(kb.reset_defaults);
     assert_eq!(kb.bindings.len(), 1);
@@ -47,23 +51,27 @@ fn test_keybindings_reset_defaults() {
 
 #[test]
 fn test_keybindings_command_with_args() {
-    let config = parse_config(r#"
+    let config = parse_config(
+        r#"
         keybindings {
             "ctrl-k h" ":goto-heading 2"
         }
-    "#);
+    "#,
+    );
     let kb = config.keybinds.unwrap();
     assert_eq!(kb.bindings[0].1, ":goto-heading 2");
 }
 
 #[test]
 fn test_menu_basic() {
-    let config = parse_config(r#"
+    let config = parse_config(
+        r#"
         menu {
             entry key="f" label="file browser" action="file-browser"
             entry key="q" label="quit" action="quit"
         }
-    "#);
+    "#,
+    );
     let menu = config.menu.unwrap();
     assert!(!menu.reset_defaults);
     assert_eq!(menu.nodes.len(), 2);
@@ -71,95 +79,113 @@ fn test_menu_basic() {
 
 #[test]
 fn test_menu_with_submenu() {
-    let config = parse_config(r#"
+    let config = parse_config(
+        r#"
         menu {
             submenu key="g" label="goto" {
                 entry key="g" label="top" action="goto-top"
                 entry key="e" label="bottom" action="goto-bottom"
             }
         }
-    "#);
+    "#,
+    );
     let menu = config.menu.unwrap();
     assert_eq!(menu.nodes.len(), 1);
 }
 
 #[test]
 fn test_menu_separator_and_label() {
-    let config = parse_config(r#"
+    let config = parse_config(
+        r#"
         menu {
             entry key="f" label="files" action="file-browser"
             separator
             label "Navigation"
             entry key="g" label="goto top" action="goto-top"
         }
-    "#);
+    "#,
+    );
     let menu = config.menu.unwrap();
     assert_eq!(menu.nodes.len(), 4);
 }
 
 #[test]
 fn test_menu_reset_defaults() {
-    let config = parse_config(r#"
+    let config = parse_config(
+        r#"
         menu {
             reset-defaults #true
             entry key="q" label="quit" action="quit"
         }
-    "#);
+    "#,
+    );
     let menu = config.menu.unwrap();
     assert!(menu.reset_defaults);
 }
 
 #[test]
 fn test_invalid_key_sequence_fails() {
-    let result = Config::load_from_str(r#"
+    let result = Config::load_from_str(
+        r#"
         keybindings {
             "ctrl-" "half-page-down"
         }
-    "#);
+    "#,
+    );
     assert!(result.is_err());
 }
 
 #[test]
 fn test_unknown_command_fails() {
-    let result = Config::load_from_str(r#"
+    let result = Config::load_from_str(
+        r#"
         keybindings {
             "ctrl-d" "nonexistent-command"
         }
-    "#);
+    "#,
+    );
     assert!(result.is_err());
 }
 
 #[test]
 fn test_missing_menu_entry_action_fails() {
-    let result = Config::load_from_str(r#"
+    let result = Config::load_from_str(
+        r#"
         menu {
             entry key="f" label="file browser"
         }
-    "#);
+    "#,
+    );
     assert!(result.is_err());
 }
 
 #[test]
 fn test_unknown_theme_fails() {
-    let result = Config::load_from_str(r#"
+    let result = Config::load_from_str(
+        r#"
         theme "nonexistent"
-    "#);
+    "#,
+    );
     assert!(result.is_err());
 }
 
 #[test]
 fn test_default_permission_mode_parses() {
-    let config = parse_config(r#"
+    let config = parse_config(
+        r#"
         default-permission-mode "auto-edit"
-    "#);
+    "#,
+    );
     assert_eq!(config.default_permission_mode, PermissionMode::AutoEdit);
 }
 
 #[test]
 fn test_unknown_permission_mode_fails() {
-    let result = Config::load_from_str(r#"
+    let result = Config::load_from_str(
+        r#"
         default-permission-mode "nonsense"
-    "#);
+    "#,
+    );
     assert!(result.is_err());
 }
 
@@ -172,11 +198,14 @@ fn test_default_permission_mode_absent_yields_default() {
 
 #[test]
 fn test_config_keybinds_override_default() {
-    let config = Config::load_from_str(r#"
+    let config = Config::load_from_str(
+        r#"
         keybindings {
             "j" "scroll-up"
         }
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
 
     let kb = config.keybinds.unwrap();
     let mut mgr = KeybindManager::default();
@@ -193,12 +222,15 @@ fn test_config_keybinds_override_default() {
 
 #[test]
 fn test_config_keybinds_reset_defaults() {
-    let config = Config::load_from_str(r#"
+    let config = Config::load_from_str(
+        r#"
         keybindings {
             reset-defaults #true
             "j" "move-down"
         }
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
 
     let kb = config.keybinds.unwrap();
     let mut mgr = if kb.reset_defaults {
@@ -222,7 +254,8 @@ fn test_config_keybinds_reset_defaults() {
 
 #[test]
 fn test_config_full_round_trip() {
-    let config = Config::load_from_str(r#"
+    let config = Config::load_from_str(
+        r#"
         theme "nightfox"
 
         display {
@@ -240,7 +273,9 @@ fn test_config_full_round_trip() {
                 entry key="g" label="top" action="goto-top"
             }
         }
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
 
     assert_eq!(config.theme, ThemeName::Nightfox);
     assert_eq!(config.max_line_width, 120);

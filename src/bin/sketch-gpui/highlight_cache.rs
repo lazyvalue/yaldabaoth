@@ -22,7 +22,7 @@
 use std::rc::Rc;
 
 use sketch::highlight::Highlighter;
-use sketch::md_highlight::{advance_fence, highlight_one_line, FenceState, Segment};
+use sketch::md_highlight::{FenceState, Segment, advance_fence, highlight_one_line};
 use sketch::style::Style;
 use sketch::theme::Theme;
 
@@ -157,6 +157,8 @@ impl HighlightCache {
     /// Reconcile against `lines` and return a cheap shareable snapshot for the
     /// list render closure. Only lines whose content hash or inbound fence
     /// state changed are re-highlighted; everything else is reused.
+    // kept for API symmetry / future use
+    #[allow(dead_code)]
     pub fn snapshot(
         &mut self,
         lines: &[String],
@@ -192,12 +194,11 @@ impl HighlightCache {
             && !theme_changed
             && edit_seq == self.last_edit_seq
             && lines.len() == self.lines.len()
+            && let Some(snap) = &self.snapshot
         {
-            if let Some(snap) = &self.snapshot {
-                self.last_recomputed = 0;
-                self.last_was_skip = true;
-                return snap.clone();
-            }
+            self.last_recomputed = 0;
+            self.last_was_skip = true;
+            return snap.clone();
         }
         self.last_was_skip = false;
 
@@ -224,6 +225,8 @@ impl HighlightCache {
 
         let mut fence = FenceState::new();
         let mut recomputed = 0;
+        // index drives parallel collections (lines + self.{hashes,fence_before,lines})
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             let h = hash_line(&lines[i]);
             let entry_fp = FenceFp::of(&fence);
@@ -281,7 +284,11 @@ mod tests {
         let stripped = highlight_markdown_lines_stripped(lines, theme);
         assert_eq!(cache_snap.len(), lines.len(), "line count");
         for i in 0..lines.len() {
-            assert_eq!(cache_snap[i].raw, raw[i], "raw mismatch at line {i}: {:?}", lines[i]);
+            assert_eq!(
+                cache_snap[i].raw, raw[i],
+                "raw mismatch at line {i}: {:?}",
+                lines[i]
+            );
             assert_eq!(
                 cache_snap[i].stripped, stripped[i],
                 "stripped mismatch at line {i}: {:?}",

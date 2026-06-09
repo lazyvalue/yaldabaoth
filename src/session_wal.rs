@@ -43,6 +43,8 @@ use crate::acp_channel::PermissionMode;
 use crate::session_proto::Notification;
 
 /// One line in a session WAL file.
+// wire/event enum — boxing the large variant would ripple through serialization + every match site
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum WalRecord {
@@ -386,14 +388,9 @@ mod tests {
         // line with no newline. Recovery must keep the intact prefix.
         let dir = tmp_dir("torn");
         {
-            let mut wal = SessionWal::create(
-                &dir,
-                "s2",
-                "l",
-                Path::new("/tmp"),
-                PermissionMode::Yolo,
-            )
-            .unwrap();
+            let mut wal =
+                SessionWal::create(&dir, "s2", "l", Path::new("/tmp"), PermissionMode::Yolo)
+                    .unwrap();
             wal.append(&attached("acp-x"), false).unwrap();
             wal.append(&chunk("good"), true).unwrap();
         }

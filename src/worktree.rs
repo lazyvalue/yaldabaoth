@@ -141,10 +141,21 @@ detached
     #[test]
     fn best_match_longest_prefix() {
         let wts = vec![
-            Worktree { path: PathBuf::from("/repo"), label: "main".into(), is_current: false },
-            Worktree { path: PathBuf::from("/repo/.claude/worktrees/feat"), label: "feat".into(), is_current: false },
+            Worktree {
+                path: PathBuf::from("/repo"),
+                label: "main".into(),
+                is_current: false,
+            },
+            Worktree {
+                path: PathBuf::from("/repo/.claude/worktrees/feat"),
+                label: "feat".into(),
+                is_current: false,
+            },
         ];
-        assert_eq!(best_match_index(&wts, Path::new("/repo/.claude/worktrees/feat/src")), 1);
+        assert_eq!(
+            best_match_index(&wts, Path::new("/repo/.claude/worktrees/feat/src")),
+            1
+        );
         assert_eq!(best_match_index(&wts, Path::new("/repo/src")), 0);
         assert_eq!(best_match_index(&wts, Path::new("/elsewhere")), 0);
     }

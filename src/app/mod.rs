@@ -6,10 +6,10 @@ mod handlers;
 mod runtime;
 mod screen;
 mod state;
-pub use state::App;
-use state::{AppMode, AppScreen};
 #[cfg(test)]
 use claude::CLAUDE_BUFFER_NAME;
+pub use state::App;
+use state::{AppMode, AppScreen};
 
 // Re-imports for tests (picked up via `use super::*`).
 #[cfg(test)]
@@ -18,7 +18,6 @@ use sketch::buffer::{Buffer, NavMode};
 use sketch::keybind::Action;
 #[cfg(test)]
 use sketch::view::ViewMode;
-
 
 /// Convert a rope char index to (line, col).
 fn char_to_line_col(doc: &sketch::document::Document, char_idx: usize) -> (usize, usize) {
@@ -287,16 +286,21 @@ mod tests {
         let before_text = app.buffers[buf_idx].editor.document().full_text();
         let before_cursor_char = {
             let e = &app.buffers[buf_idx].editor;
-            e.document().line_col_to_char(e.cursor().line, e.cursor().col)
+            e.document()
+                .line_col_to_char(e.cursor().line, e.cursor().col)
         };
-        assert_eq!(&before_text[before_cursor_char.saturating_sub(4)..before_cursor_char], "text");
+        assert_eq!(
+            &before_text[before_cursor_char.saturating_sub(4)..before_cursor_char],
+            "text"
+        );
 
         app.append_to_claude_buffer("REPLY");
 
         let after_text = app.buffers[buf_idx].editor.document().full_text();
         let after_cursor_char = {
             let e = &app.buffers[buf_idx].editor;
-            e.document().line_col_to_char(e.cursor().line, e.cursor().col)
+            e.document()
+                .line_col_to_char(e.cursor().line, e.cursor().col)
         };
         assert_eq!(
             &after_text[after_cursor_char.saturating_sub(4)..after_cursor_char],
@@ -627,7 +631,9 @@ mod tests {
     fn force_quit_sets_should_quit_unconditionally() {
         let mut app = raw_app(1);
         // Modify the document so a plain Quit would balk.
-        app.buffers[app.active_buffer].editor.programmatic_insert(0, "x");
+        app.buffers[app.active_buffer]
+            .editor
+            .programmatic_insert(0, "x");
         assert!(!app.should_quit);
         fire(&mut app, Action::ForceQuit);
         assert!(app.should_quit);
@@ -636,7 +642,9 @@ mod tests {
     #[test]
     fn quit_with_modified_buffer_blocks_and_sets_error() {
         let mut app = raw_app(1);
-        app.buffers[app.active_buffer].editor.programmatic_insert(0, "x");
+        app.buffers[app.active_buffer]
+            .editor
+            .programmatic_insert(0, "x");
         fire(&mut app, Action::Quit);
         assert!(!app.should_quit);
         assert!(
@@ -843,10 +851,7 @@ mod tests {
         let mut app = raw_app(1);
         app.buffers[app.active_buffer].view_mode = ViewMode::Rendered;
         fire(&mut app, Action::NavCharacter);
-        assert_eq!(
-            app.buffers[app.active_buffer].nav_mode,
-            NavMode::Character
-        );
+        assert_eq!(app.buffers[app.active_buffer].nav_mode, NavMode::Character);
     }
 
     #[test]
@@ -875,7 +880,9 @@ mod tests {
     #[test]
     fn dispatch_command_force_quit_alias_sets_should_quit() {
         let mut app = raw_app(1);
-        app.buffers[app.active_buffer].editor.programmatic_insert(0, "dirty");
+        app.buffers[app.active_buffer]
+            .editor
+            .programmatic_insert(0, "dirty");
         app.dispatch_command("q!", 24, 80);
         assert!(app.should_quit, "q! must force-quit even when modified");
     }

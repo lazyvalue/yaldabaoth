@@ -49,7 +49,7 @@ fn test_undo_insert() {
     let mut doc = Document::from_text("Hello".to_string(), PathBuf::from("test.md"));
     doc.begin_undo_group(0, 5, &[], 0);
     doc.insert_char(0, 5, 'X');
-    let _cursor = doc.end_undo_group(0, 6);
+    doc.end_undo_group(0, 6);
     doc.undo(&[], 0);
     assert_eq!(doc.line_text(0), "Hello");
     assert!(!doc.is_modified());

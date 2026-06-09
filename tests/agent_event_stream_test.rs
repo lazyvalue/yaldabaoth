@@ -19,8 +19,8 @@
 
 use sketch::acp_channel::{AgentTransport, FakeTransport, ReplyEvent};
 use sketch::agent_event::{
-    agent_kind_from_reply, replay_end_kind, turn_ended_kind, AgentEvent, AgentEventKind, ChunkRole,
-    TurnOutcome,
+    AgentEvent, AgentEventKind, ChunkRole, TurnOutcome, agent_kind_from_reply, replay_end_kind,
+    turn_ended_kind,
 };
 
 /// Model of the server's additive emit path (main.rs `Command::Record` +
@@ -49,7 +49,13 @@ impl ServerModel {
     }
 
     fn emit(&mut self, turn: u64, kind: AgentEventKind) {
-        let ev = AgentEvent::new(self.session_id.clone(), self.generation, turn, self.seq, kind);
+        let ev = AgentEvent::new(
+            self.session_id.clone(),
+            self.generation,
+            turn,
+            self.seq,
+            kind,
+        );
         self.seq += 1;
         self.agent_stream.push(ev);
     }
@@ -113,12 +119,19 @@ fn agent_stream_agrees_with_reply_inference_for_one_turn() {
     let (events, inferred_turn_ended) = pump_cycle(&transport, &mut last_turns);
 
     // The legacy stream the GUI applies: just the two chunks.
-    assert_eq!(events.len(), 2, "two chunks, no TurnEnded record (default worker)");
+    assert_eq!(
+        events.len(),
+        2,
+        "two chunks, no TurnEnded record (default worker)"
+    );
     for ev in &events {
         model.ingest_reply(ev);
     }
     // The inference fires the boundary; the server records the settled count.
-    assert!(inferred_turn_ended, "inference detects the boundary via the counter");
+    assert!(
+        inferred_turn_ended,
+        "inference detects the boundary via the counter"
+    );
     let inferred_count = transport.turn_count() as u64; // == 1
     model.settle_turn(inferred_count);
 
@@ -146,7 +159,10 @@ fn agent_stream_agrees_with_reply_inference_for_one_turn() {
 
     // Envelope invariants: seq is monotonic and dense, generation is stable.
     for (i, e) in model.agent_stream.iter().enumerate() {
-        assert_eq!(e.seq, i as u64, "seq monotonic + dense per (session,generation)");
+        assert_eq!(
+            e.seq, i as u64,
+            "seq monotonic + dense per (session,generation)"
+        );
         assert_eq!(e.generation, 0);
         assert_eq!(e.session_id, "sess-A");
     }
@@ -212,7 +228,10 @@ fn replay_complete_folds_into_replay_end() {
     assert!(matches!(kinds[0], AgentEventKind::UserMessage { .. }));
     assert!(matches!(
         kinds[1],
-        AgentEventKind::Chunk { role: ChunkRole::Message, .. }
+        AgentEventKind::Chunk {
+            role: ChunkRole::Message,
+            ..
+        }
     ));
     assert!(matches!(
         kinds[2],

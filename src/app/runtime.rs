@@ -20,7 +20,11 @@ impl App {
     ///
     /// Compare `cursor_screen_y` (where it was painted, or null = off-screen)
     /// against `expected_cursor_visual_row + content_area_y`.
-    pub(crate) fn write_debug_log(&mut self, report: &view::DrawReport, term_size: ratatui::prelude::Size) {
+    pub(crate) fn write_debug_log(
+        &mut self,
+        report: &view::DrawReport,
+        term_size: ratatui::prelude::Size,
+    ) {
         if std::env::var("SKETCH_DEBUG").ok().as_deref() != Some("1") {
             return;
         }
@@ -48,8 +52,7 @@ impl App {
         sig ^= (cursor_line as u64).wrapping_mul(0xD6E8FEB86659FD93);
         sig ^= (cursor_col as u64).wrapping_mul(0x165667B19E3779F9);
         sig ^= (total_lines as u64).wrapping_mul(0x85EBCA77C2B2AE63);
-        sig ^= (report.cursor_screen_y.unwrap_or(u16::MAX) as u64)
-            .wrapping_mul(0xC2B2AE3D27D4EB4F);
+        sig ^= (report.cursor_screen_y.unwrap_or(u16::MAX) as u64).wrapping_mul(0xC2B2AE3D27D4EB4F);
         sig ^= (report.painted_rows as u64).wrapping_mul(0x27D4EB2F165667C5);
         let force = off_screen_now || flipped;
         if !force && sig == self.debug_last_signature {
@@ -57,10 +60,9 @@ impl App {
         }
         self.debug_last_signature = sig;
         let expected_visual_row = match buf.view_mode {
-            ViewMode::Raw => sketch::buffer::raw_cursor_visual_row(
-                &buf.editor,
-                self.last_wrap_width.max(1),
-            ),
+            ViewMode::Raw => {
+                sketch::buffer::raw_cursor_visual_row(&buf.editor, self.last_wrap_width.max(1))
+            }
             ViewMode::Rendered => buf.rendered_cursor_row,
         };
         let off_screen = off_screen_now;
@@ -142,8 +144,14 @@ impl App {
             let max_height = total_height / 2;
             let header_rows = 1;
             let filter_rows = 0; // approximation; off in normal flow
-            let entry_rows = self.file_browser.as_ref().map(|fb| fb.entries().len()).unwrap_or(0);
-            (header_rows + filter_rows + entry_rows).min(max_height).max(1)
+            let entry_rows = self
+                .file_browser
+                .as_ref()
+                .map(|fb| fb.entries().len())
+                .unwrap_or(0);
+            (header_rows + filter_rows + entry_rows)
+                .min(max_height)
+                .max(1)
         } else {
             0
         };
@@ -153,21 +161,16 @@ impl App {
             let header_rows = 1; // breadcrumb (approximation)
             let filter_rows = if self.outline_filter_mode { 1 } else { 0 };
             let entry_rows = self.filtered_outline_entries().len().max(1);
-            (header_rows + filter_rows + entry_rows).min(max_height).max(1)
+            (header_rows + filter_rows + entry_rows)
+                .min(max_height)
+                .max(1)
         } else {
             0
         };
         // Compose textbox panel
-        let compose = if self.compose_textbox.is_some() {
-            let lines = self
-                .compose_textbox
-                .as_ref()
-                .unwrap()
-                .editor
-                .document()
-                .line_count()
-                .max(1);
-            let capped = lines.min(total_height / 3).min(12).max(3);
+        let compose = if let Some(compose_textbox) = &self.compose_textbox {
+            let lines = compose_textbox.editor.document().line_count().max(1);
+            let capped = lines.min(total_height / 3).clamp(3, 12);
             capped + 1 // +1 for separator line
         } else {
             0
@@ -219,20 +222,21 @@ impl App {
             }
 
             // Build raw lines for raw mode (cheap — just reads from rope)
-            let raw_lines: Vec<String> = if self.buffers[self.active_buffer].view_mode == ViewMode::Raw {
-                let doc = self.buffers[self.active_buffer].editor.document();
-                (0..doc.line_count())
-                    .map(|i| {
-                        let mut s = doc.line_text(i);
-                        if s.ends_with('\n') {
-                            s.pop();
-                        }
-                        s.replace('\t', "    ")
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            let raw_lines: Vec<String> =
+                if self.buffers[self.active_buffer].view_mode == ViewMode::Raw {
+                    let doc = self.buffers[self.active_buffer].editor.document();
+                    (0..doc.line_count())
+                        .map(|i| {
+                            let mut s = doc.line_text(i);
+                            if s.ends_with('\n') {
+                                s.pop();
+                            }
+                            s.replace('\t', "    ")
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             let raw_highlights: Vec<Vec<(String, sketch::style::Style)>> =
                 if self.buffers[self.active_buffer].view_mode == ViewMode::Raw {
                     sketch::md_highlight::highlight_markdown_lines(&raw_lines, &self.theme)
@@ -241,48 +245,53 @@ impl App {
                 };
 
             terminal.draw(|frame| {
-                let menu_nodes: Vec<(String, String, sketch::menu::MenuNodeKind)> = if self.menu_state.is_active() {
-                    self.menu_state
-                        .current_nodes(&self.menu_tree)
-                        .iter()
-                        .map(|n| {
-                            let key_display = sketch::keys::format_key_sequence(&n.key);
-                            (key_display, n.label.clone(), n.kind())
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                let (fb_open, fb_dir, fb_entries, fb_filter_mode, fb_filter_text) =
-                    if self.mode == AppMode::FileBrowser && let Some(browser) = &self.file_browser {
-                        let entries: Vec<(String, bool, bool)> = browser
-                            .visible_entries()
+                let menu_nodes: Vec<(String, String, sketch::menu::MenuNodeKind)> =
+                    if self.menu_state.is_active() {
+                        self.menu_state
+                            .current_nodes(&self.menu_tree)
                             .iter()
-                            .enumerate()
-                            .map(|(i, e)| (e.name.clone(), e.is_dir, i == browser.selected()))
-                            .collect();
-                        (
-                            true,
-                            browser.current_dir().display().to_string(),
-                            entries,
-                            browser.filter_mode,
-                            browser.filter_text().to_string(),
-                        )
+                            .map(|n| {
+                                let key_display = sketch::keys::format_key_sequence(&n.key);
+                                (key_display, n.label.clone(), n.kind())
+                            })
+                            .collect()
                     } else {
-                        (false, String::new(), Vec::new(), false, String::new())
+                        Vec::new()
                     };
+
+                let (fb_open, fb_dir, fb_entries, fb_filter_mode, fb_filter_text) = if self.mode
+                    == AppMode::FileBrowser
+                    && let Some(browser) = &self.file_browser
+                {
+                    let entries: Vec<(String, bool, bool)> = browser
+                        .visible_entries()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| (e.name.clone(), e.is_dir, i == browser.selected()))
+                        .collect();
+                    (
+                        true,
+                        browser.current_dir().display().to_string(),
+                        entries,
+                        browser.filter_mode,
+                        browser.filter_text().to_string(),
+                    )
+                } else {
+                    (false, String::new(), Vec::new(), false, String::new())
+                };
 
                 let full_buffer_list_state = if self.screen == AppScreen::BufferList {
                     let filtered = self.filtered_buffer_indices();
-                    let entries: Vec<view::FullBufferListEntry> = filtered.iter().enumerate().map(|(i, &buf_idx)| {
-                        view::FullBufferListEntry {
+                    let entries: Vec<view::FullBufferListEntry> = filtered
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &buf_idx)| view::FullBufferListEntry {
                             path: self.buffers[buf_idx].file_path().display().to_string(),
                             is_modified: self.buffers[buf_idx].editor.document().is_modified(),
                             is_active: buf_idx == self.active_buffer,
                             is_selected: i == self.buffer_list_selected,
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     Some(view::FullBufferListViewState {
                         entries,
                         filter_mode: self.buffer_list_filter_mode,
@@ -293,34 +302,35 @@ impl App {
                     None
                 };
 
-                let full_browser_state = if let AppScreen::FileBrowser { came_from_dropdown } = self.screen {
-                    if let Some(browser) = &self.file_browser {
-                        let entries: Vec<view::FullBrowserEntry> = browser
-                            .visible_entries()
-                            .iter()
-                            .enumerate()
-                            .map(|(i, e)| view::FullBrowserEntry {
-                                name: e.name.clone(),
-                                is_dir: e.is_dir,
-                                is_selected: i == browser.selected(),
-                                size: e.size,
-                                modified: e.modified,
+                let full_browser_state =
+                    if let AppScreen::FileBrowser { came_from_dropdown } = self.screen {
+                        if let Some(browser) = &self.file_browser {
+                            let entries: Vec<view::FullBrowserEntry> = browser
+                                .visible_entries()
+                                .iter()
+                                .enumerate()
+                                .map(|(i, e)| view::FullBrowserEntry {
+                                    name: e.name.clone(),
+                                    is_dir: e.is_dir,
+                                    is_selected: i == browser.selected(),
+                                    size: e.size,
+                                    modified: e.modified,
+                                })
+                                .collect();
+                            Some(view::FullBrowserViewState {
+                                dir: browser.current_dir().display().to_string(),
+                                entries,
+                                filter_mode: browser.filter_mode,
+                                filter_text: browser.filter_text().to_string(),
+                                came_from_dropdown,
+                                sort_label: browser.sort_order.label().to_string(),
                             })
-                            .collect();
-                        Some(view::FullBrowserViewState {
-                            dir: browser.current_dir().display().to_string(),
-                            entries,
-                            filter_mode: browser.filter_mode,
-                            filter_text: browser.filter_text().to_string(),
-                            came_from_dropdown,
-                            sort_label: browser.sort_order.label().to_string(),
-                        })
+                        } else {
+                            None
+                        }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
+                    };
 
                 let buf = &self.buffers[self.active_buffer];
                 let filename_display = buf.editor.document().file_path.display().to_string();
@@ -415,23 +425,27 @@ impl App {
                     outline_open: self.mode == AppMode::Outline,
                     outline_entries: if self.mode == AppMode::Outline {
                         let entries = self.filtered_outline_entries();
-                        entries.iter().enumerate().map(|(i, e)| {
-                            (e.title.clone(), e.level, i == self.outline_selected)
-                        }).collect()
+                        entries
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| (e.title.clone(), e.level, i == self.outline_selected))
+                            .collect()
                     } else {
                         Vec::new()
                     },
                     outline_filter_mode: self.outline_filter_mode,
                     outline_filter_text: self.outline_filter_text.clone(),
                     outline_breadcrumb: self.outline_breadcrumb(),
-                    nav_mode_label: self.buffers[self.active_buffer].nav_mode.label()
+                    nav_mode_label: self.buffers[self.active_buffer]
+                        .nav_mode
+                        .label()
                         .map(|s| s.to_string()),
                     nav_highlight: {
                         let buf = &self.buffers[self.active_buffer];
                         if buf.nav_mode != NavMode::Character {
-                            buf.nav_objects.get(buf.nav_object_index).map(|obj| {
-                                (obj.rendered_row, obj.col_start, obj.col_end)
-                            })
+                            buf.nav_objects
+                                .get(buf.nav_object_index)
+                                .map(|obj| (obj.rendered_row, obj.col_start, obj.col_end))
                         } else {
                             None
                         }

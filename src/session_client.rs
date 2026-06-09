@@ -10,7 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -93,9 +93,8 @@ impl SessionServerClient {
 
     fn connect_or_launch(path: &std::path::Path) -> io::Result<UnixStream> {
         // Try connecting first.
-        match UnixStream::connect(path) {
-            Ok(s) => return Ok(s),
-            Err(_) => {}
+        if let Ok(s) = UnixStream::connect(path) {
+            return Ok(s);
         }
 
         // Launch the server DETACHED so it outlives this GUI: its own process
@@ -125,10 +124,10 @@ impl SessionServerClient {
         }
         cmd.process_group(0); // detach from the GUI's process group
         cmd.spawn().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to launch session server at {}: {e}", server_bin.display()),
-            )
+            io::Error::other(format!(
+                "failed to launch session server at {}: {e}",
+                server_bin.display()
+            ))
         })?;
 
         // Retry with backoff.
@@ -360,9 +359,7 @@ impl SessionServerClient {
     }
 
     /// Move the wake receiver out for the pump task. Call once.
-    pub fn take_wake_receiver(
-        &mut self,
-    ) -> Option<futures::channel::mpsc::UnboundedReceiver<()>> {
+    pub fn take_wake_receiver(&mut self) -> Option<futures::channel::mpsc::UnboundedReceiver<()>> {
         self.wake_rx.take()
     }
 
@@ -444,7 +441,7 @@ impl SessionServerClient {
             Response::Ok {
                 data: ResponseData::Sessions { sessions },
             } => Ok(sessions),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected response",
@@ -459,7 +456,7 @@ impl SessionServerClient {
             Response::Ok {
                 data: ResponseData::AdminStatus { snapshot },
             } => Ok(snapshot),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected response",
@@ -481,7 +478,7 @@ impl SessionServerClient {
             Response::Ok {
                 data: ResponseData::Session { session },
             } => Ok(session),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected response",
@@ -535,7 +532,7 @@ impl SessionServerClient {
             // Tolerate a plain Ack (e.g. a server that pre-dates the Attached
             // variant): an Owner-mode Ack means we drove, Observer means not.
             Response::Ok { .. } => Ok(mode == AttachMode::Owner),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 
@@ -549,7 +546,7 @@ impl SessionServerClient {
             client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 
@@ -563,7 +560,7 @@ impl SessionServerClient {
             client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 
@@ -576,7 +573,7 @@ impl SessionServerClient {
             client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 
@@ -604,7 +601,7 @@ impl SessionServerClient {
             text: text.to_string(),
         })? {
             Response::Ok { .. } => Ok(()),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 
@@ -628,18 +625,14 @@ impl SessionServerClient {
         })
     }
 
-    pub fn set_permission_mode(
-        &self,
-        session_id: &str,
-        mode: PermissionMode,
-    ) -> io::Result<()> {
+    pub fn set_permission_mode(&self, session_id: &str, mode: PermissionMode) -> io::Result<()> {
         match self.request(Request::SetPermissionMode {
             session_id: session_id.to_string(),
             mode,
             client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 
@@ -656,14 +649,14 @@ impl SessionServerClient {
             client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 
     pub fn ping(&self) -> io::Result<()> {
         match self.request(Request::Ping)? {
             Response::Ok { .. } => Ok(()),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 
@@ -704,6 +697,8 @@ pub struct SessionServerHandle {
     request_tx: std_mpsc::Sender<(Frame, Option<std_mpsc::Sender<Response>>)>,
     connected: Arc<AtomicBool>,
     next_id: Arc<AtomicU64>,
+    // kept for API symmetry / future use
+    #[allow(dead_code)]
     pending: Arc<Mutex<std::collections::HashMap<u64, std_mpsc::Sender<Response>>>>,
     /// Shared (cloned `Arc`) with the owning client so off-thread attach /
     /// heartbeat present the SAME stable client_id the client set.
@@ -753,7 +748,7 @@ impl SessionServerHandle {
             Response::Ok {
                 data: ResponseData::Sessions { sessions },
             } => Ok(sessions),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected response",
@@ -775,7 +770,7 @@ impl SessionServerHandle {
             Response::Ok {
                 data: ResponseData::Session { session },
             } => Ok(session),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected response",
@@ -798,7 +793,7 @@ impl SessionServerHandle {
                 data: ResponseData::Attached { driver },
             } => Ok(driver),
             Response::Ok { .. } => Ok(mode == AttachMode::Owner),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 
@@ -810,7 +805,7 @@ impl SessionServerHandle {
             client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 
@@ -822,7 +817,7 @@ impl SessionServerHandle {
             client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 
@@ -832,7 +827,7 @@ impl SessionServerHandle {
             client_id: self.client_id(),
         })? {
             Response::Ok { .. } => Ok(()),
-            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            Response::Error { message } => Err(io::Error::other(message)),
         }
     }
 }

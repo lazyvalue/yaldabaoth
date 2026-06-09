@@ -130,7 +130,9 @@ impl Buffer {
                         }
                     }
                 }
-                RenderedBlock::CodeBlock { lines: code_lines, .. } => {
+                RenderedBlock::CodeBlock {
+                    lines: code_lines, ..
+                } => {
                     let code_text: String = code_lines
                         .iter()
                         .map(|l| l.text_content())
@@ -177,7 +179,10 @@ impl Buffer {
                         }
                         // Advance past this item's rendered lines
                         for content_block in &item.content {
-                            item_line += self.viewport.block_height(content_block, content_width.saturating_sub(marker_text.len()));
+                            item_line += self.viewport.block_height(
+                                content_block,
+                                content_width.saturating_sub(marker_text.len()),
+                            );
                         }
                     }
                 }
@@ -189,16 +194,16 @@ impl Buffer {
                 let mut col = 0;
                 for span in &line.spans {
                     let span_chars = span.text.chars().count();
-                    if let Some(ref url) = span.link {
-                        if span_chars > 0 {
-                            self.nav_objects.push(NavObject {
-                                rendered_row: rendered_row + line_idx,
-                                col_start: col,
-                                col_end: col + span_chars,
-                                kind: NavMode::Link,
-                                action_data: url.clone(),
-                            });
-                        }
+                    if let Some(ref url) = span.link
+                        && span_chars > 0
+                    {
+                        self.nav_objects.push(NavObject {
+                            rendered_row: rendered_row + line_idx,
+                            col_start: col,
+                            col_end: col + span_chars,
+                            kind: NavMode::Link,
+                            action_data: url.clone(),
+                        });
                     }
                     col += span_chars;
                 }
@@ -209,7 +214,8 @@ impl Buffer {
         }
 
         self.nav_objects.sort_by(|a, b| {
-            a.rendered_row.cmp(&b.rendered_row)
+            a.rendered_row
+                .cmp(&b.rendered_row)
                 .then(a.col_start.cmp(&b.col_start))
         });
     }
@@ -227,12 +233,9 @@ impl Buffer {
         if filtered.is_empty() {
             return None;
         }
-        let (best_filtered_idx, _) = filtered
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, (_, o))| {
-                (o.rendered_row as isize - rendered_row as isize).unsigned_abs()
-            })?;
+        let (best_filtered_idx, _) = filtered.iter().enumerate().min_by_key(|(_, (_, o))| {
+            (o.rendered_row as isize - rendered_row as isize).unsigned_abs()
+        })?;
         Some(filtered[best_filtered_idx].0)
     }
 }

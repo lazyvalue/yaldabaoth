@@ -82,11 +82,20 @@ impl Viewport {
             RenderedBlock::Table { headers, rows, .. } => {
                 let col_widths = crate::view::table_column_widths(headers, rows, width);
                 let wrap_height = |cells: &[StyledLine]| -> usize {
-                    cells.iter().enumerate().map(|(i, c)| {
-                        let cw = col_widths.get(i).copied().unwrap_or(5);
-                        let len = c.text_content().len();
-                        if cw == 0 || len <= cw { 1 } else { len.div_ceil(cw) }
-                    }).max().unwrap_or(1)
+                    cells
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let cw = col_widths.get(i).copied().unwrap_or(5);
+                            let len = c.text_content().len();
+                            if cw == 0 || len <= cw {
+                                1
+                            } else {
+                                len.div_ceil(cw)
+                            }
+                        })
+                        .max()
+                        .unwrap_or(1)
                 };
                 let header_h = wrap_height(headers);
                 let rows_h: usize = rows.iter().map(|r| wrap_height(r)).sum();
@@ -133,11 +142,7 @@ impl Viewport {
     /// whitespace below the last content row, so jumping/paging to the end of
     /// the buffer still leaves a small gutter at the bottom of the viewport.
     fn max_scroll(&self, viewport_height: usize) -> usize {
-        if self.total_lines + SCROLLOFF > viewport_height {
-            self.total_lines + SCROLLOFF - viewport_height
-        } else {
-            0
-        }
+        (self.total_lines + SCROLLOFF).saturating_sub(viewport_height)
     }
 
     pub fn visible_blocks<'a>(

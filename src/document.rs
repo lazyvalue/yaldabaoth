@@ -457,6 +457,8 @@ impl Document {
 
     /// Undo the last action. Returns the cursor position to restore, plus the
     /// frozen-line snapshot and lockable-through-line value to restore.
+    // type alias would hurt readability here more than help
+    #[allow(clippy::type_complexity)]
     pub fn undo(
         &mut self,
         current_frozen_lines: &[(usize, usize)],
@@ -490,6 +492,8 @@ impl Document {
     }
 
     /// Redo the last undone action. Returns cursor + frozen state to restore.
+    // type alias would hurt readability here more than help
+    #[allow(clippy::type_complexity)]
     pub fn redo(
         &mut self,
         current_frozen_lines: &[(usize, usize)],
@@ -599,7 +603,10 @@ mod tests {
         d.delete_range(0, 5); // remove "abcde"
         d.end_undo_group(0, 0);
         let bytes = d.last_undo_entry_bytes().expect("entry");
-        assert!(bytes < 64, "delta should hold only the removed slice: {bytes}");
+        assert!(
+            bytes < 64,
+            "delta should hold only the removed slice: {bytes}"
+        );
         assert!(n_bytes > 40_000);
     }
 

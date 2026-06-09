@@ -62,32 +62,31 @@
 //!   k / Up / Ctrl-P      previous entry
 //!   Enter / l            open entry (descend into dir, or open file)
 //!   - / h                go to parent directory
-//!   .                    toggle hidden files
-//!   s                    cycle sort order (name / date↓ / date↑)
-//!   q / Esc              close browser (returns to doc, or quits)
+//!     .                    toggle hidden files
+//!     s                    cycle sort order (name / date↓ / date↑)
+//!     q / Esc              close browser (returns to doc, or quits)
 
 mod highlight_cache;
-mod workspace;
 #[cfg(test)]
 mod verify_harness;
+mod workspace;
 
 use highlight_cache::{HighlightCache, LineHl};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::process;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    actions, div, point, px, rgb, rgba, size, AnyElement, App, AppContext, Application,
-    Bounds, Context, FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight,
-    Hsla, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke, Menu,
-    ListScrollEvent, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    Render, ScrollHandle, SharedString, StatefulInteractiveElement, StrikethroughStyle,
-    Styled, StyledText, Task, TextLayout, TextRun, TitlebarOptions, UnderlineStyle, Window,
-    WindowBounds, WindowOptions, Element, ElementId, GlobalElementId,
-    InspectorElementId, LayoutId, Pixels,
+    AnyElement, App, AppContext, Application, Bounds, Context, Element, ElementId, FocusHandle,
+    Focusable, Font, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hsla,
+    InspectorElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
+    LayoutId, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    StrikethroughStyle, Styled, StyledText, Task, TextLayout, TextRun, TitlebarOptions,
+    UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, point, px, rgb, rgba, size,
 };
 
 use sketch::acp_channel::AcpChannelClient;
@@ -96,12 +95,10 @@ use sketch::cursor::CursorPos;
 use sketch::document::Document;
 use sketch::editor::{Editor, EditorCore, EditorView, LineAnchor};
 use sketch::file_browser::{BrowserEntry, FileBrowser};
-use sketch::worktree;
 use sketch::keybind::KeybindManager;
 use sketch::keys::{Key, KeyPress, Modifiers as KMods};
 use sketch::md_highlight::{
-    highlight_markdown_lines_syn, highlight_markdown_lines_stripped_syn,
-    Segment,
+    Segment, highlight_markdown_lines_stripped_syn, highlight_markdown_lines_syn,
 };
 use sketch::menu::{MenuNode, MenuNodeKind, MenuState};
 use sketch::render;
@@ -111,6 +108,7 @@ use sketch::session_proto::Notification as ServerNotification;
 use sketch::session_proto::SessionInfo;
 use sketch::style::{Color as NColor, Modifier, Style as NStyle};
 use sketch::theme::{OverlayTheme, Theme, ThemeName};
+use sketch::worktree;
 
 // ----------------------------------------------------------------------------
 // Render performance knobs (env-gated, read once)
@@ -122,9 +120,7 @@ use sketch::theme::{OverlayTheme, Theme, ThemeName};
 fn perf_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(std::env::var("SKETCH_PERF"), Ok(v) if v != "0" && !v.is_empty())
-    })
+    *ON.get_or_init(|| matches!(std::env::var("SKETCH_PERF"), Ok(v) if v != "0" && !v.is_empty()))
 }
 
 /// `false` only when `SKETCH_HL_CACHE` is explicitly `0`/`off`/`false`. The
@@ -284,18 +280,12 @@ fn keystroke_to_keypress(ks: &Keystroke) -> KeyPress {
         "pageup" => Key::PageUp,
         "pagedown" => Key::PageDown,
         "space" => Key::Char(' '),
-        s if s.starts_with('f') && s[1..].parse::<u8>().is_ok() => {
-            Key::F(s[1..].parse().unwrap())
-        }
+        s if s.starts_with('f') && s[1..].parse::<u8>().is_ok() => Key::F(s[1..].parse().unwrap()),
         s => {
             // Prefer key_char when present (handles shifted chars properly:
             // shift-g → key="g", key_char=Some("G")).
             let ch_str = ks.key_char.as_deref().unwrap_or(s);
-            ch_str
-                .chars()
-                .next()
-                .map(Key::Char)
-                .unwrap_or(Key::Other)
+            ch_str.chars().next().map(Key::Char).unwrap_or(Key::Other)
         }
     };
     KeyPress::new(key, mods)
@@ -466,8 +456,7 @@ fn styled_line_element(
 
             // Pick code font for spans whose bg matches code_inline (yellow on dark);
             // simpler proxy: any span with explicit bg uses code font.
-            let font = if combined.bg.is_some() || combined.fg == Some(NColor::Rgb(241, 250, 140))
-            {
+            let font = if combined.bg.is_some() || combined.fg == Some(NColor::Rgb(241, 250, 140)) {
                 font_for(combined, code_font)
             } else {
                 font_for(combined, body_font)
@@ -579,8 +568,7 @@ fn doc_styled_line_element(
             {
                 wiki_link_ranges.push((span_start..span_start + len, link.to_string()));
             }
-            let font = if combined.bg.is_some() || combined.fg == Some(NColor::Rgb(241, 250, 140))
-            {
+            let font = if combined.bg.is_some() || combined.fg == Some(NColor::Rgb(241, 250, 140)) {
                 font_for(combined, code_font)
             } else {
                 font_for(combined, body_font)
@@ -630,14 +618,19 @@ fn doc_styled_line_element(
     // walk runs and split any that straddle a boundary.
     if let Some(sel) = ctx.doc_selection {
         let line_chars = styled_line_char_count(line);
-        if let Some((s_char, e_char)) = doc_selection_for_line(&sel, block_idx, line_idx, line_chars) {
+        if let Some((s_char, e_char)) =
+            doc_selection_for_line(&sel, block_idx, line_idx, line_chars)
+        {
             let s_byte = char_offset_to_byte_offset(&text, s_char);
             let e_byte = char_offset_to_byte_offset(&text, e_char);
             #[cfg(test)]
             DOC_RENDER_TAP.with(|t| {
-                t.borrow_mut().selection.push((block_idx, line_idx, s_byte, e_byte))
+                t.borrow_mut()
+                    .selection
+                    .push((block_idx, line_idx, s_byte, e_byte))
             });
-            runs = apply_selection_bg_to_runs(runs, s_byte, e_byte, ncolor_to_hsla(SELECTION_BG, BG));
+            runs =
+                apply_selection_bg_to_runs(runs, s_byte, e_byte, ncolor_to_hsla(SELECTION_BG, BG));
         }
     }
 
@@ -691,12 +684,10 @@ fn doc_styled_line_element(
 /// already clamps to `line_char_count`, but `text` here may include the
 /// defensive trailing space we add for empty lines).
 fn char_offset_to_byte_offset(s: &str, char_offset: usize) -> usize {
-    let mut chars_seen = 0;
-    for (byte_idx, _) in s.char_indices() {
+    for (chars_seen, (byte_idx, _)) in s.char_indices().enumerate() {
         if chars_seen == char_offset {
             return byte_idx;
         }
-        chars_seen += 1;
     }
     s.len()
 }
@@ -769,6 +760,8 @@ struct RenderCtx<'a> {
     /// `None` outside the view-mode render path (e.g. edit-mode rendering
     /// and nested ctxes inside blockquotes/lists where v1 doesn't yet
     /// support selection).
+    // type alias would hurt readability here more than help
+    #[allow(clippy::type_complexity)]
     line_layouts: Option<std::rc::Rc<RefCell<HashMap<(usize, usize), TextLayout>>>>,
     /// The top-level block index currently being rendered. Set by
     /// `block_element` and cleared (set to `None`) when `block_inner`
@@ -809,7 +802,13 @@ fn register_line_on_paint(
     key: (usize, usize),
     layout: TextLayout,
 ) -> AnyElement {
-    RegisterOnPaint { inner, sink, key, layout }.into_any_element()
+    RegisterOnPaint {
+        inner,
+        sink,
+        key,
+        layout,
+    }
+    .into_any_element()
 }
 
 impl IntoElement for RegisterOnPaint {
@@ -899,17 +898,11 @@ fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlock) -> AnyE
         .items_start()
         .w_full()
         .mb_2()
-        .child(
-            div()
-                .w(px(3.0))
-                .flex_none()
-                .h_full()
-                .bg(if highlighted {
-                    rgb(CURSOR_BAR_COLOR)
-                } else {
-                    rgba(0x00000000)
-                }),
-        )
+        .child(div().w(px(3.0)).flex_none().h_full().bg(if highlighted {
+            rgb(CURSOR_BAR_COLOR)
+        } else {
+            rgba(0x00000000)
+        }))
         .child(div().pl_3().flex_1().min_w_0().child(base))
         .into_any_element()
 }
@@ -949,10 +942,7 @@ fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElement {
             // line as its own row and rely on per-line spans. This matches
             // the TUI behaviour where pulldown emits separate StyledLines.
             let base = ctx.theme.paragraph;
-            let mut col = div()
-                .flex()
-                .flex_col()
-                .text_color(fg_or(base, DEFAULT_FG));
+            let mut col = div().flex().flex_col().text_color(fg_or(base, DEFAULT_FG));
             for (li, line) in lines.iter().enumerate() {
                 col = col.child(doc_styled_line_element(
                     ctx,
@@ -966,7 +956,11 @@ fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElement {
             }
             col.into_any_element()
         }
-        RenderedBlock::CodeBlock { language, lines, source_file } => {
+        RenderedBlock::CodeBlock {
+            language,
+            lines,
+            source_file,
+        } => {
             let mut col = div()
                 .flex()
                 .flex_col()
@@ -977,23 +971,19 @@ fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElement {
             } else {
                 // Fenced code block inside markdown: tinted background + padding.
                 let bg = ctx.theme.code_block_bg;
-                col = col
-                    .p_2()
-                    .rounded_md()
-                    .bg(bg_or(bg, BG));
+                col = col.p_2().rounded_md().bg(bg_or(bg, BG));
             }
-            if !*source_file {
-                if let Some(lang) = language {
-                    if !lang.is_empty() {
-                        col = col.child(
-                            div()
-                                .text_color(rgb(0x6272a4))
-                                .text_size(px(11.0))
-                                .pb_1()
-                                .child(format!("[{}]", lang)),
-                        );
-                    }
-                }
+            if !*source_file
+                && let Some(lang) = language
+                && !lang.is_empty()
+            {
+                col = col.child(
+                    div()
+                        .text_color(rgb(0x6272a4))
+                        .text_size(px(11.0))
+                        .pb_1()
+                        .child(format!("[{}]", lang)),
+                );
             }
             let row_style = NStyle::default();
             for (li, line) in lines.iter().enumerate() {
@@ -1240,7 +1230,10 @@ fn segments_to_styled_line(segs: &[Segment]) -> StyledLine {
 /// last character, `at_char` is a virtual space (cursor at end of line).
 /// Used by the cursor-line render path: before/after each go through
 /// `segments_to_styled_line` while the at_char drives the caret cell.
-fn split_segments_at_col(segs: &[Segment], col: usize) -> (Vec<Segment>, (char, NStyle), Vec<Segment>) {
+fn split_segments_at_col(
+    segs: &[Segment],
+    col: usize,
+) -> (Vec<Segment>, (char, NStyle), Vec<Segment>) {
     let mut before: Vec<Segment> = Vec::new();
     let mut at: Option<(char, NStyle)> = None;
     let mut after: Vec<Segment> = Vec::new();
@@ -1388,20 +1381,22 @@ fn lang_for_path(path: &std::path::Path) -> Option<&'static str> {
 /// the text is highlighted with syntect and returned as a single
 /// `CodeBlock` with `source_file: true` so the renderer skips container
 /// chrome (background tint, padding, rounded corners).
-fn render_with_wiki(text: &str, theme: &Theme, path: Option<&std::path::Path>) -> Vec<RenderedBlock> {
+fn render_with_wiki(
+    text: &str,
+    theme: &Theme,
+    path: Option<&std::path::Path>,
+) -> Vec<RenderedBlock> {
     if let Some(lang) = path.and_then(lang_for_path) {
         let hl = sketch::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
         // Use a transparent base style — source files render against the
         // normal document background, not the code-block tint.
         let base = sketch::style::Style::default();
-        let lines = hl
-            .highlight(lang, text, base)
-            .unwrap_or_else(|| {
-                // Fallback: plain text with default style.
-                text.lines()
-                    .map(|l| StyledLine::new(vec![StyledSpan::new(l, theme.paragraph)]))
-                    .collect()
-            });
+        let lines = hl.highlight(lang, text, base).unwrap_or_else(|| {
+            // Fallback: plain text with default style.
+            text.lines()
+                .map(|l| StyledLine::new(vec![StyledSpan::new(l, theme.paragraph)]))
+                .collect()
+        });
         return vec![RenderedBlock::CodeBlock {
             language: Some(lang.to_string()),
             lines,
@@ -1413,7 +1408,7 @@ fn render_with_wiki(text: &str, theme: &Theme, path: Option<&std::path::Path>) -
     blocks
 }
 
-fn expand_wiki_links_in_blocks(blocks: &mut Vec<RenderedBlock>, theme: &Theme) {
+fn expand_wiki_links_in_blocks(blocks: &mut [RenderedBlock], theme: &Theme) {
     for b in blocks.iter_mut() {
         expand_wiki_links_in_block(b, theme);
     }
@@ -1541,15 +1536,14 @@ fn re_render_layout_docs(layout: &mut workspace::Layout<WindowContent>, theme: &
             // Browser's underlying-stashed content is also restyled if it
             // happens to be a Doc — otherwise reverting via Esc lands on
             // stale-themed blocks.
-            if let WindowContent::Browser(b) = &mut win.content {
-                if let Some(under) = b.underlying.as_deref_mut() {
-                    if let WindowContent::Doc(d) = under {
-                        let path = PathBuf::from(d.file_label.as_ref());
-                        let text = std::fs::read_to_string(&path).unwrap_or_default();
-                        let doc = Document::from_text(text, path.clone());
-                        d.set_blocks(render_with_wiki(&doc.full_text(), theme, Some(&path)));
-                    }
-                }
+            if let WindowContent::Browser(b) = &mut win.content
+                && let Some(under) = b.underlying.as_deref_mut()
+                && let WindowContent::Doc(d) = under
+            {
+                let path = PathBuf::from(d.file_label.as_ref());
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let doc = Document::from_text(text, path.clone());
+                d.set_blocks(render_with_wiki(&doc.full_text(), theme, Some(&path)));
             }
         }
         workspace::Layout::Split { children, .. } => {
@@ -1599,11 +1593,7 @@ fn doc_selection_for_line(
     } else {
         line_char_count
     };
-    if s < e {
-        Some((s, e))
-    } else {
-        None
-    }
+    if s < e { Some((s, e)) } else { None }
 }
 
 /// Project a document-level selection range onto a single line. Returns
@@ -1696,10 +1686,11 @@ fn classify_wp_line(text: &str, in_fence: bool) -> WpLineKind {
 
     // Unordered list: -, *, + followed by a space.
     let mut chars = trimmed.chars();
-    if let Some(c) = chars.next() {
-        if matches!(c, '-' | '*' | '+') && chars.next() == Some(' ') {
-            return WpLineKind::BulletItem;
-        }
+    if let Some(c) = chars.next()
+        && matches!(c, '-' | '*' | '+')
+        && chars.next() == Some(' ')
+    {
+        return WpLineKind::BulletItem;
     }
 
     // Ordered list: digits + (`.` | `)`) + space.
@@ -1707,9 +1698,7 @@ fn classify_wp_line(text: &str, in_fence: bool) -> WpLineKind {
     if digit_count > 0 {
         let after = &trimmed[digit_count..];
         let mut after_chars = after.chars();
-        if matches!(after_chars.next(), Some('.') | Some(')'))
-            && after_chars.next() == Some(' ')
-        {
+        if matches!(after_chars.next(), Some('.') | Some(')')) && after_chars.next() == Some(' ') {
             return WpLineKind::OrderedItem;
         }
     }
@@ -1806,7 +1795,11 @@ fn build_line_content(
         .h(px(18.0))
         .bg(cursor_color)
         .text_color(rgb(BG))
-        .child(if mode == EditMode::Normal { at_char.to_string() } else { " ".into() })
+        .child(if mode == EditMode::Normal {
+            at_char.to_string()
+        } else {
+            " ".into()
+        })
         .into_any_element();
 
     // In insert mode the at_char isn't consumed by the block so it appears
@@ -1989,7 +1982,9 @@ fn connect_session_server() -> Option<SessionServerClient> {
             Some(client)
         }
         Err(e) => {
-            eprintln!("[sketch-gpui] session server connect failed: {e}; falling back to direct spawn");
+            eprintln!(
+                "[sketch-gpui] session server connect failed: {e}; falling back to direct spawn"
+            );
             None
         }
     }
@@ -2194,14 +2189,22 @@ fn save_preferences(prefs: &Preferences) {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "data")]
 enum PersistedKind {
-    Doc { path: PathBuf },
-    Edit { path: PathBuf },
-    Browser { dir: PathBuf },
+    Doc {
+        path: PathBuf,
+    },
+    Edit {
+        path: PathBuf,
+    },
+    Browser {
+        dir: PathBuf,
+    },
     /// JSON tag stays as "claude" so saved layouts from earlier builds load
     /// without migration; the in-memory variant is `Agent` to match the rest
     /// of the rename pass (spec-agent-window.md).
     #[serde(rename = "claude")]
-    Agent { session_id: Option<String> },
+    Agent {
+        session_id: Option<String>,
+    },
 }
 
 /// One leaf in a persisted layout. Carries the (stable) window id so
@@ -2360,7 +2363,11 @@ fn restore_rail(p: PersistedRail, fallback_pin: workspace::WindowId) -> workspac
             workspace::RailContent::Outline(workspace::OutlineState::new())
         }
     };
-    let pinned_to = if p.pinned_to != 0 { p.pinned_to } else { fallback_pin };
+    let pinned_to = if p.pinned_to != 0 {
+        p.pinned_to
+    } else {
+        fallback_pin
+    };
     workspace::RailState {
         content,
         side: p.side,
@@ -2379,7 +2386,11 @@ fn restore_layout(
     ws: &mut workspace::Workspace<WindowContent>,
     theme: &Theme,
     layout: PersistedLayout,
-) -> (workspace::Layout<WindowContent>, workspace::WindowId, Vec<workspace::WindowId>) {
+) -> (
+    workspace::Layout<WindowContent>,
+    workspace::WindowId,
+    Vec<workspace::WindowId>,
+) {
     match layout {
         PersistedLayout::Leaf(leaf) => {
             let id = leaf.id;
@@ -2583,7 +2594,10 @@ fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<PersistedSlot> {
     };
     // Canonical key first; lazy fallback to the old raw spelling (ADR-0010).
     let raw = cwd.to_string_lossy();
-    let Some(entry) = json.get(&persist_cwd_key(cwd)).or_else(|| json.get(raw.as_ref())) else {
+    let Some(entry) = json
+        .get(persist_cwd_key(cwd))
+        .or_else(|| json.get(raw.as_ref()))
+    else {
         return Vec::new();
     };
     // Legacy single-string shape: synthesize a one-slot list with the
@@ -2611,10 +2625,7 @@ fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<PersistedSlot> {
                 .and_then(|s| s.as_str())
                 .unwrap_or("claude")
                 .to_string();
-            let active = obj
-                .get("active")
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false);
+            let active = obj.get("active").and_then(|b| b.as_bool()).unwrap_or(false);
             // Spec §35 additions. Missing keys default per the same
             // table (chatbox, false, false). Unknown mode strings fall
             // back to Chatbox.
@@ -2637,10 +2648,7 @@ fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<PersistedSlot> {
             // spec-agent-cwd.md §5: optional per-slot cwd. Absent (old
             // file, or pre-spec save) is loaded as None so the restore
             // path can fall back to process cwd per §1.
-            let cwd = obj
-                .get("cwd")
-                .and_then(|c| c.as_str())
-                .map(PathBuf::from);
+            let cwd = obj.get("cwd").and_then(|c| c.as_str()).map(PathBuf::from);
             Some(PersistedSlot {
                 id,
                 label,
@@ -2758,12 +2766,16 @@ fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRing) {
         .filter_map(|(i, slot)| {
             // resume_id wins over channel id: if we were trying to resume,
             // keep retrying the original id even when load fell back.
-            let id = slot.resume_id.clone().or_else(|| {
-                slot.state.channel.as_ref().and_then(|c| c.session_id())
-            })?;
+            let id = slot
+                .resume_id
+                .clone()
+                .or_else(|| slot.state.channel.as_ref().and_then(|c| c.session_id()))?;
             let mut obj = serde_json::Map::new();
             obj.insert("id".into(), serde_json::Value::String(id));
-            obj.insert("label".into(), serde_json::Value::String(slot.label.clone()));
+            obj.insert(
+                "label".into(),
+                serde_json::Value::String(slot.label.clone()),
+            );
             if i == active_index {
                 obj.insert("active".into(), serde_json::Value::Bool(true));
             }
@@ -2815,10 +2827,7 @@ fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRing) {
             // Clear the old raw spelling, then write under the canonical key
             // (ADR-0010: next save rewrites canonical).
             obj.remove(cwd.to_string_lossy().as_ref());
-            obj.insert(
-                persist_cwd_key(cwd),
-                serde_json::Value::Array(entries),
-            );
+            obj.insert(persist_cwd_key(cwd), serde_json::Value::Array(entries));
         }
     }
     if let Ok(serialized) = serde_json::to_string_pretty(&json) {
@@ -2826,9 +2835,9 @@ fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRing) {
     }
 }
 
-/// Test-only counter: incremented every time `render_agent` rebuilds the
-/// memoized view-model (flat_items + gutter). A fingerprint hit must leave
-/// this unchanged. Asserted by `view_model_memoization_fast_skip`.
+// Test-only counter: incremented every time `render_agent` rebuilds the
+// memoized view-model (flat_items + gutter). A fingerprint hit must leave
+// this unchanged. Asserted by `view_model_memoization_fast_skip`.
 #[cfg(test)]
 thread_local! {
     static VIEW_MODEL_REBUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -2911,7 +2920,7 @@ impl ToolCallKey {
 
     /// Borrow the underlying id as a `&str` (render edge only).
     fn as_str(&self) -> &str {
-        &self.0 .0
+        &self.0.0
     }
 }
 
@@ -2941,9 +2950,7 @@ enum FlatItem {
     /// replaces a range of frozen lines with proper layout.
     Block(RenderedBlock),
     /// Visual divider at a turn boundary: role label + faint rule.
-    TurnHeader {
-        role: TurnRole,
-    },
+    TurnHeader { role: TurnRole },
     /// Pulsing indicator shown at transcript tail while awaiting reply.
     ThinkingIndicator,
 }
@@ -3046,8 +3053,7 @@ fn build_tool_block_with_weak(
         let diff_remove = nc(at.diff_remove);
         let diff_header = nc(at.diff_header);
         if let Some(input) = &tc.raw_input {
-            let pretty =
-                serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
+            let pretty = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
             block = block.child(tool_body_pane_free(
                 "input",
                 &pretty,
@@ -3097,6 +3103,8 @@ fn build_tool_block_with_weak(
 /// Free-function form of [`SketchGpuiView::tool_body_pane`] for the
 /// virtualised render path. Same content layout, accepts a borrowed
 /// `code_font` instead of reaching through `&self`.
+// builder/render fn — arg count is inherent, splitting would obscure
+#[allow(clippy::too_many_arguments)]
 fn tool_body_pane_free(
     label: &str,
     body: &str,
@@ -3180,18 +3188,12 @@ fn tool_render_policy(tc: &sketch::acp_channel::ToolCall) -> ToolRenderPolicy {
     // TodoWrite shows up as `kind=Think` (same as the Task subagent),
     // and its body is the running todo list — too noisy to render. Sniff
     // for the distinctive `todos` array on the input to tell them apart.
-    let is_todowrite = tc
-        .raw_input
-        .as_ref()
-        .and_then(|v| v.get("todos"))
-        .is_some();
+    let is_todowrite = tc.raw_input.as_ref().and_then(|v| v.get("todos")).is_some();
     if is_todowrite {
         return ToolRenderPolicy::HeaderOnly;
     }
     match tc.kind {
-        ToolKind::Read | ToolKind::Search | ToolKind::SwitchMode => {
-            ToolRenderPolicy::HeaderOnly
-        }
+        ToolKind::Read | ToolKind::Search | ToolKind::SwitchMode => ToolRenderPolicy::HeaderOnly,
         ToolKind::Execute => ToolRenderPolicy::Truncated { max_lines: 3 },
         ToolKind::Fetch => ToolRenderPolicy::Truncated { max_lines: 10 },
         ToolKind::Edit
@@ -3247,7 +3249,10 @@ fn tool_type_label(tc: &sketch::acp_channel::ToolCall) -> String {
     tc.title
         .split_whitespace()
         .next()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
         .filter(|w| !w.is_empty() && w.len() <= 12 && w.chars().all(|c| c.is_alphanumeric()))
         .unwrap_or_else(|| tool_kind_label(&tc.kind))
 }
@@ -3291,8 +3296,7 @@ fn append_tool_body(
     let diff_remove = nc(at.diff_remove);
     let diff_header = nc(at.diff_header);
     if let Some(input) = &tc.raw_input {
-        let pretty =
-            serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
+        let pretty = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
         block = block.child(tool_body_pane_free(
             "input",
             &pretty,
@@ -3320,8 +3324,7 @@ fn append_tool_body(
         ));
     }
     if let Some(output) = &tc.raw_output {
-        let pretty =
-            serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
+        let pretty = serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
         block = block.child(tool_body_pane_free(
             "output",
             &pretty,
@@ -3431,7 +3434,6 @@ fn truncate_lines(body: &str, max_lines: usize) -> String {
 /// the document, per spec-agent-window.md §E1. The renderer resolves it to
 /// a line index via `editor.line_for_anchor(a)`; a `None` (line consumed)
 /// falls back to EOF rendering.
-
 fn anchor_for_new_tool_call(editor: &mut Editor) -> LineAnchor {
     // Perf (finding 5): O(1) tail probe instead of cloning the whole transcript
     // (`full_text`) just to test emptiness + trailing newline per tool call.
@@ -3511,8 +3513,8 @@ fn cursor_visible_child_index(
 fn count_turn_headers_before(tags: &[Option<TurnId>], before_line: usize) -> usize {
     let mut count = 0usize;
     let mut prev: Option<TurnId> = None;
-    for i in 0..before_line.min(tags.len()) {
-        if let Some(tid) = tags[i] {
+    for tag in tags.iter().take(before_line) {
+        if let Some(tid) = *tag {
             let dominated_by = match tid {
                 // Mirror the flat-items loop: Tool and System are non-dominant
                 // (no header, no turn-run break) — Finding 5, INV-3.
@@ -3555,13 +3557,8 @@ fn should_follow_tail(input_mode: InputModeKind, follow_output: bool, cursor_at_
     }
 }
 
-fn detect_block_ranges(
-    lines: &[String],
-    frozen_ranges: &[(usize, usize)],
-) -> Vec<(usize, usize)> {
-    let is_frozen = |i: usize| -> bool {
-        frozen_ranges.iter().any(|&(s, e)| i >= s && i < e)
-    };
+fn detect_block_ranges(lines: &[String], frozen_ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let is_frozen = |i: usize| -> bool { frozen_ranges.iter().any(|&(s, e)| i >= s && i < e) };
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
@@ -3584,7 +3581,8 @@ fn detect_block_ranges(
             // and we avoid an O(block) re-parse-to-EOF every chunk (F12).
             let mut closed = false;
             while i < lines.len() {
-                if lines[i].trim().starts_with("```") && lines[i].trim().len() <= trimmed.len() + 20 {
+                if lines[i].trim().starts_with("```") && lines[i].trim().len() <= trimmed.len() + 20
+                {
                     i += 1; // include the closing fence
                     closed = true;
                     break;
@@ -3637,19 +3635,14 @@ enum BlockParse {
     FallBackToLines,
 }
 
-fn parse_block_range(
-    lines: &[String],
-    start: usize,
-    end: usize,
-    theme: &Theme,
-) -> BlockParse {
+fn parse_block_range(lines: &[String], start: usize, end: usize, theme: &Theme) -> BlockParse {
     let slice: String = lines[start..end].join("\n");
     let blocks = render_with_wiki(&slice, theme, None);
     // Take the first Table or CodeBlock produced.
     for b in blocks {
         match &b {
             RenderedBlock::Table { .. } | RenderedBlock::CodeBlock { .. } => {
-                return BlockParse::Parsed(b)
+                return BlockParse::Parsed(b);
             }
             _ => {}
         }
@@ -3675,22 +3668,20 @@ fn cap_tool_call_payloads(tc: &mut sketch::acp_channel::ToolCall) {
     for c in tc.content.iter_mut() {
         match c {
             ToolCallContent::Content(content) => {
-                if let agent_client_protocol::schema::ContentBlock::Text(t) =
-                    &mut content.content
+                if let agent_client_protocol::schema::ContentBlock::Text(t) = &mut content.content
+                    && t.text.chars().count() > TOOL_PAYLOAD_MAX_CHARS
                 {
-                    if t.text.chars().count() > TOOL_PAYLOAD_MAX_CHARS {
-                        t.text = cap_string_chars(&t.text, TOOL_PAYLOAD_MAX_CHARS);
-                    }
+                    t.text = cap_string_chars(&t.text, TOOL_PAYLOAD_MAX_CHARS);
                 }
             }
             ToolCallContent::Diff(d) => {
                 if d.new_text.chars().count() > TOOL_PAYLOAD_MAX_CHARS {
                     d.new_text = cap_string_chars(&d.new_text, TOOL_PAYLOAD_MAX_CHARS);
                 }
-                if let Some(old) = &mut d.old_text {
-                    if old.chars().count() > TOOL_PAYLOAD_MAX_CHARS {
-                        *old = cap_string_chars(old, TOOL_PAYLOAD_MAX_CHARS);
-                    }
+                if let Some(old) = &mut d.old_text
+                    && old.chars().count() > TOOL_PAYLOAD_MAX_CHARS
+                {
+                    *old = cap_string_chars(old, TOOL_PAYLOAD_MAX_CHARS);
                 }
             }
             _ => {}
@@ -3825,9 +3816,8 @@ fn build_wrapped_line(
     for (text, style) in &tokens {
         let token_chars = text.chars().count();
         let token_end_col = col_so_far + token_chars;
-        let caret_in_token = !caret_emitted
-            && cursor_col >= col_so_far
-            && cursor_col <= token_end_col;
+        let caret_in_token =
+            !caret_emitted && cursor_col >= col_so_far && cursor_col <= token_end_col;
 
         if caret_in_token {
             let split_point = cursor_col - col_so_far;
@@ -3882,6 +3872,8 @@ fn build_wrapped_line(
 /// visible without horizontal scrolling. The caret is emitted inline as its
 /// own flex child between the before/after halves of the containing token,
 /// so wrap behaviour stays consistent across cursor and non-cursor lines.
+// builder/render fn — arg count is inherent, splitting would obscure
+#[allow(clippy::too_many_arguments)]
 fn build_chatbox_line(
     full_text: &str,
     is_cursor_line: bool,
@@ -3958,25 +3950,26 @@ fn build_chatbox_line(
         let chunk_chars: Vec<char> = text.chars().collect();
         let chunk_len = chunk_chars.len();
         let chunk_end_col = chunk_start_col + chunk_len;
-        if let Some((ss, se)) = line_sel {
-            if se > chunk_start_col && ss < chunk_end_col {
-                let local_ss = ss.saturating_sub(chunk_start_col).min(chunk_len);
-                let local_se = se.saturating_sub(chunk_start_col).min(chunk_len);
-                let mut r = row;
-                if local_ss > 0 {
-                    let pre: String = chunk_chars[..local_ss].iter().collect();
-                    r = r.child(pre);
-                }
-                if local_se > local_ss {
-                    let in_sel: String = chunk_chars[local_ss..local_se].iter().collect();
-                    r = r.child(div().bg(sel_bg).child(in_sel));
-                }
-                if local_se < chunk_len {
-                    let post: String = chunk_chars[local_se..].iter().collect();
-                    r = r.child(post);
-                }
-                return r;
+        if let Some((ss, se)) = line_sel
+            && se > chunk_start_col
+            && ss < chunk_end_col
+        {
+            let local_ss = ss.saturating_sub(chunk_start_col).min(chunk_len);
+            let local_se = se.saturating_sub(chunk_start_col).min(chunk_len);
+            let mut r = row;
+            if local_ss > 0 {
+                let pre: String = chunk_chars[..local_ss].iter().collect();
+                r = r.child(pre);
             }
+            if local_se > local_ss {
+                let in_sel: String = chunk_chars[local_ss..local_se].iter().collect();
+                r = r.child(div().bg(sel_bg).child(in_sel));
+            }
+            if local_se < chunk_len {
+                let post: String = chunk_chars[local_se..].iter().collect();
+                r = r.child(post);
+            }
+            return r;
         }
         row.child(text)
     };
@@ -4063,7 +4056,11 @@ fn make_caret(mode: EditMode, cursor_char: char, cursor_color: Hsla) -> AnyEleme
         .h(px(18.0))
         .bg(cursor_color)
         .text_color(rgb(BG))
-        .child(if mode == EditMode::Normal { cursor_char.to_string() } else { " ".into() })
+        .child(if mode == EditMode::Normal {
+            cursor_char.to_string()
+        } else {
+            " ".into()
+        })
         .into_any_element()
 }
 
@@ -4318,10 +4315,10 @@ impl DocState {
     /// `edit_seq`.
     fn blocks_rc(&self) -> Rc<Vec<RenderedBlock>> {
         let mut slot = self.blocks_snapshot.borrow_mut();
-        if let Some((seq, rc)) = slot.as_ref() {
-            if *seq == self.blocks_seq {
-                return rc.clone();
-            }
+        if let Some((seq, rc)) = slot.as_ref()
+            && *seq == self.blocks_seq
+        {
+            return rc.clone();
         }
         let rc = Rc::new(self.blocks.clone());
         *slot = Some((self.blocks_seq, rc.clone()));
@@ -4398,6 +4395,8 @@ enum InputModeKind {
 /// no box, or Worksheet with a stranded box) are unrepresentable. New sessions
 /// start at `Chatbox` (compose-box-first); `Ctrl-Alt-Enter` toggles. NOT `Copy`
 /// (it owns a `Chatbox`).
+// wire/event enum — boxing the large variant would ripple through serialization + every match site
+#[allow(clippy::large_enum_variant)]
 enum InputSurface {
     Worksheet,
     Chatbox(Chatbox),
@@ -4923,13 +4922,15 @@ impl EditOps for SharedEditor {
         self.view.move_down(&self.core.borrow(), insert_mode);
     }
     fn move_right_clamped(&mut self, insert_mode: bool) {
-        self.view.move_right_clamped(&self.core.borrow(), insert_mode);
+        self.view
+            .move_right_clamped(&self.core.borrow(), insert_mode);
     }
     fn clamp_cursor_col(&mut self, insert_mode: bool) {
         self.view.clamp_cursor_col(&self.core.borrow(), insert_mode);
     }
     fn move_cursor_line_end(&mut self, insert_mode: bool) {
-        self.view.move_cursor_line_end(&self.core.borrow(), insert_mode);
+        self.view
+            .move_cursor_line_end(&self.core.borrow(), insert_mode);
     }
     fn move_cursor_word_forward(&mut self) {
         self.view.move_cursor_word_forward(&self.core.borrow());
@@ -4978,9 +4979,9 @@ impl EditOps for SharedEditor {
     }
 }
 
-/// Build the trimmed, tab-expanded per-line text for an Edit pane's body,
-/// reading the pooled core's rope once. Mirrors the prior per-line
-/// `document().line_text(i)` loop but takes a single `RefCell` borrow.
+// Build the trimmed, tab-expanded per-line text for an Edit pane's body,
+// reading the pooled core's rope once. Mirrors the prior per-line
+// `document().line_text(i)` loop but takes a single `RefCell` borrow.
 
 /// State held while the user is editing a buffer in the GPUI frontend.
 /// Raw buffer + cursor + Insert/Normal toggle + vim-style normal-mode
@@ -5085,6 +5086,8 @@ impl EditState {
     }
 }
 
+// wire/event enum — boxing the large variant would ripple through serialization + every match site
+#[allow(clippy::large_enum_variant)]
 enum WindowContent {
     Doc(DocState),
     Edit(EditState),
@@ -5122,6 +5125,8 @@ enum TurnPhase {
     StopRequested {
         started: std::time::Instant,
         last_event: std::time::Instant,
+        // kept for API symmetry / future use
+        #[allow(dead_code)]
         since: std::time::Instant,
         escalated: bool,
     },
@@ -5138,8 +5143,9 @@ impl TurnPhase {
     fn turn_started(&self) -> Option<std::time::Instant> {
         match self {
             TurnPhase::Idle => None,
-            TurnPhase::Awaiting { started, .. }
-            | TurnPhase::StopRequested { started, .. } => Some(*started),
+            TurnPhase::Awaiting { started, .. } | TurnPhase::StopRequested { started, .. } => {
+                Some(*started)
+            }
         }
     }
 
@@ -5180,7 +5186,11 @@ impl TurnPhase {
     /// awaiting, or already stop-requested (idempotent on repeat from a stale
     /// call path — escalation is decided by the handler before this runs).
     fn request_stop(&mut self, now: std::time::Instant) {
-        if let TurnPhase::Awaiting { started, last_event } = *self {
+        if let TurnPhase::Awaiting {
+            started,
+            last_event,
+        } = *self
+        {
             *self = TurnPhase::StopRequested {
                 started,
                 last_event,
@@ -5200,8 +5210,16 @@ impl TurnPhase {
     }
 
     /// Whether a pending Stop has been escalated to a hard kill (second Stop).
+    // kept for API symmetry / future use
+    #[allow(dead_code)]
     fn is_escalated(&self) -> bool {
-        matches!(self, TurnPhase::StopRequested { escalated: true, .. })
+        matches!(
+            self,
+            TurnPhase::StopRequested {
+                escalated: true,
+                ..
+            }
+        )
     }
 }
 
@@ -5248,6 +5266,8 @@ impl AgentViewModel {
     /// `&mut AgentState` (it reads `tools`/`editor` and writes
     /// `self.view_model.block_cache`), which cannot be borrowed while a method
     /// holds `&mut self` on the nested `view_model`.
+    // type alias would hurt readability here more than help
+    #[allow(clippy::type_complexity)]
     fn cached(
         &self,
         fp: u64,
@@ -5485,7 +5505,8 @@ impl AgentState {
     /// carries the originating tool-call id, label, and status, all read
     /// live from the underlying `ToolCall`.
     fn subagents(&self) -> Vec<SubAgent> {
-        self.tools.order
+        self.tools
+            .order
             .iter()
             .filter_map(|id| self.tools.calls.get(id))
             .filter_map(classify_subagent)
@@ -5516,7 +5537,8 @@ impl AgentState {
         // `edit_seq`". Cheap: one `line_for_anchor` per live tool call.
         for id in &self.tools.order {
             let resolved = self
-                .tools.anchor
+                .tools
+                .anchor
                 .get(id)
                 .and_then(|&anchor| self.editor.line_for_anchor(anchor));
             resolved.hash(&mut h);
@@ -5544,11 +5566,7 @@ impl AgentState {
             attach_pending: None,
             mode: EditMode::Insert,
             keybinds: KeybindManager::default(),
-            list_state: gpui::ListState::new(
-                0,
-                gpui::ListAlignment::Bottom,
-                gpui::px(256.0),
-            ),
+            list_state: gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0)),
             list_item_count: 0,
             status: None,
             turn_phase: TurnPhase::Idle,
@@ -5789,7 +5807,11 @@ impl AgentState {
     fn follow_tail(&self) -> bool {
         let line_count = self.editor.document().line_count();
         let cursor_at_eof = self.editor.cursor().line + 1 >= line_count;
-        should_follow_tail(self.input_surface.mode(), self.follow_output.get(), cursor_at_eof)
+        should_follow_tail(
+            self.input_surface.mode(),
+            self.follow_output.get(),
+            cursor_at_eof,
+        )
     }
 
     /// Reveal the tail item if we're following AND content has actually grown
@@ -5888,8 +5910,7 @@ impl AgentState {
     /// only the rendered transcript and its derived caches are cleared.
     fn reset_for_replay(&mut self) {
         self.editor = Editor::new(String::new(), PathBuf::from("*claude*"));
-        self.list_state =
-            gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0));
+        self.list_state = gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0));
         setup_list_follow_handler(&self.list_state, &self.follow_output);
         self.list_item_count = 0;
         // Fresh editor restarts `edit_seq` at 0; clear the follow-scroll
@@ -6142,9 +6163,9 @@ impl AgentRing {
 
     /// Find a slot by its server-assigned session id.
     fn slot_by_server_session_id_mut(&mut self, sid: &str) -> Option<&mut AgentSlot> {
-        self.slots.iter_mut().find(|s| {
-            s.server_session_id.as_deref() == Some(sid)
-        })
+        self.slots
+            .iter_mut()
+            .find(|s| s.server_session_id.as_deref() == Some(sid))
     }
 
     /// Position of the slot for `sid`, if any. Used to remove it via
@@ -6246,19 +6267,15 @@ enum RenameTarget {
 /// split-borrow (`m.state` + `&m.menu`) still type-checks. Do not add a
 /// per-field `&mut state` accessor. Non-exclusive chrome (`transient_status`
 /// toast, `splash_until`) is deliberately NOT folded in here.
+#[derive(Default)]
 enum ActiveOverlay {
+    #[default]
     None,
     Menu(MenuOverlay),
     BufferSwitcher(BufferSwitcher),
     SessionSwitcher(SessionSwitcher),
     WorkspacePicker(WorkspacePicker),
     Rename(RenameOverlay),
-}
-
-impl Default for ActiveOverlay {
-    fn default() -> Self {
-        ActiveOverlay::None
-    }
 }
 
 /// GPUI menu tree. Mirrors the TUI's `default_menu` for the navigation
@@ -6278,12 +6295,20 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("l", "list sessions", "claude-list"),
                 MenuNode::entry("x", "close session", "claude-close"),
                 MenuNode::entry("r", "rename session", "claude-rename"),
-                MenuNode::entry("w", "toggle worksheet/chatbox (Ctrl-Alt-Enter)", "agent-input-toggle"),
+                MenuNode::entry(
+                    "w",
+                    "toggle worksheet/chatbox (Ctrl-Alt-Enter)",
+                    "agent-input-toggle",
+                ),
                 MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
                 MenuNode::entry("g", "rebuild & restart gui", "dev-restart-gui"),
                 MenuNode::separator(),
                 MenuNode::label("Build loop"),
-                MenuNode::entry("p", "promote: build & launch candidate", "dev-build-candidate"),
+                MenuNode::entry(
+                    "p",
+                    "promote: build & launch candidate",
+                    "dev-build-candidate",
+                ),
                 MenuNode::entry("P", "take over sessions (candidate)", "dev-take-over"),
             ],
         ),
@@ -6346,7 +6371,11 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("[", "prev workspace (Ctrl-Shift-Tab)", "prev-tab"),
                 MenuNode::entry("r", "rename workspace (Cmd-Shift-R)", "rename-tab"),
                 MenuNode::entry("m", "move pane to workspace (Ctrl-W m)", "move-pane"),
-                MenuNode::entry("M", "also-show pane in workspace (Ctrl-W M)", "also-show-pane"),
+                MenuNode::entry(
+                    "M",
+                    "also-show pane in workspace (Ctrl-W M)",
+                    "also-show-pane",
+                ),
             ],
         ),
         MenuNode::separator(),
@@ -6557,11 +6586,7 @@ impl SketchGpuiView {
     /// Replace Browser stubs at the given leaf IDs with live agent sessions.
     /// Called as a post-pass after `restore_workspace_from_disk` installs the
     /// layout — by that point `self.workspace` is populated and we have `cx`.
-    fn restore_agent_leaves(
-        &mut self,
-        leaf_ids: &[workspace::WindowId],
-        cx: &mut Context<Self>,
-    ) {
+    fn restore_agent_leaves(&mut self, leaf_ids: &[workspace::WindowId], cx: &mut Context<Self>) {
         let proc_cwd = process_cwd();
 
         for &leaf_id in leaf_ids {
@@ -6569,17 +6594,10 @@ impl SketchGpuiView {
 
             if self.session_server.is_some() {
                 // Session-server path: placeholder + async attach.
-                let placeholder = AgentState::new_server_managed(Some(
-                    "connecting to session server…".into(),
-                ));
+                let placeholder =
+                    AgentState::new_server_managed(Some("connecting to session server…".into()));
                 let open_token = alloc_open_token();
-                ring.push(
-                    "claude-1".into(),
-                    placeholder,
-                    None,
-                    proc_cwd.clone(),
-                    None,
-                );
+                ring.push("claude-1".into(), placeholder, None, proc_cwd.clone(), None);
                 let server_pump = self.start_server_pump(cx);
                 if let Some(slot) = ring.slots.first_mut() {
                     slot.state._pump = Some(server_pump);
@@ -6599,18 +6617,11 @@ impl SketchGpuiView {
                 if persisted.is_empty() {
                     let slot_cwd = proc_cwd.clone();
                     let session_index = ring.next_index;
-                    let state = self.create_agent_session(
-                        None,
-                        slot_cwd.clone(),
-                        session_index,
-                        cx,
-                    );
+                    let state =
+                        self.create_agent_session(None, slot_cwd.clone(), session_index, cx);
                     ring.push("claude-1".into(), state, None, slot_cwd, None);
                 } else {
-                    let active_pos = persisted
-                        .iter()
-                        .position(|s| s.active)
-                        .unwrap_or(0);
+                    let active_pos = persisted.iter().position(|s| s.active).unwrap_or(0);
                     for slot in persisted {
                         let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
                         let session_index = ring.next_index;
@@ -6642,21 +6653,33 @@ impl SketchGpuiView {
 
     /// `Some(doc)` if currently viewing a document, else `None`.
     fn doc_mut(&mut self) -> Option<&mut DocState> {
-        match self.workspace.focused_content_mut().expect("no focused window") {
+        match self
+            .workspace
+            .focused_content_mut()
+            .expect("no focused window")
+        {
             WindowContent::Doc(d) => Some(d),
             _ => None,
         }
     }
 
     fn browser_mut(&mut self) -> Option<&mut BrowserWindow> {
-        match self.workspace.focused_content_mut().expect("no focused window") {
+        match self
+            .workspace
+            .focused_content_mut()
+            .expect("no focused window")
+        {
             WindowContent::Browser(b) => Some(b),
             _ => None,
         }
     }
 
     fn agent_mut(&mut self) -> Option<&mut AgentState> {
-        match self.workspace.focused_content_mut().expect("no focused window") {
+        match self
+            .workspace
+            .focused_content_mut()
+            .expect("no focused window")
+        {
             WindowContent::Agent(ring) if !ring.is_empty() => Some(&mut ring.active_mut().state),
             _ => None,
         }
@@ -6677,7 +6700,11 @@ impl SketchGpuiView {
     }
 
     fn agent_ring_mut(&mut self) -> Option<&mut AgentRing> {
-        match self.workspace.focused_content_mut().expect("no focused window") {
+        match self
+            .workspace
+            .focused_content_mut()
+            .expect("no focused window")
+        {
             WindowContent::Agent(ring) => Some(ring),
             _ => None,
         }
@@ -6793,21 +6820,21 @@ impl SketchGpuiView {
     // ---- Document actions ---------------------------------------------------
 
     fn scroll_down(&mut self, _: &ScrollDown, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut() {
-            if d.cursor_block + 1 < d.blocks.len() {
-                d.cursor_block += 1;
-                d.reveal_block(d.cursor_block);
-                cx.notify();
-            }
+        if let Some(d) = self.doc_mut()
+            && d.cursor_block + 1 < d.blocks.len()
+        {
+            d.cursor_block += 1;
+            d.reveal_block(d.cursor_block);
+            cx.notify();
         }
     }
     fn scroll_up(&mut self, _: &ScrollUp, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut() {
-            if d.cursor_block > 0 {
-                d.cursor_block -= 1;
-                d.reveal_block(d.cursor_block);
-                cx.notify();
-            }
+        if let Some(d) = self.doc_mut()
+            && d.cursor_block > 0
+        {
+            d.cursor_block -= 1;
+            d.reveal_block(d.cursor_block);
+            cx.notify();
         }
     }
     fn page_down(&mut self, _: &ScrollPageDown, _w: &mut Window, cx: &mut Context<Self>) {
@@ -6825,21 +6852,21 @@ impl SketchGpuiView {
         }
     }
     fn cursor_next(&mut self, _: &CursorNextBlock, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut() {
-            if d.cursor_block + 1 < d.blocks.len() {
-                d.cursor_block += 1;
-                d.reveal_block(d.cursor_block);
-                cx.notify();
-            }
+        if let Some(d) = self.doc_mut()
+            && d.cursor_block + 1 < d.blocks.len()
+        {
+            d.cursor_block += 1;
+            d.reveal_block(d.cursor_block);
+            cx.notify();
         }
     }
     fn cursor_prev(&mut self, _: &CursorPrevBlock, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut() {
-            if d.cursor_block > 0 {
-                d.cursor_block -= 1;
-                d.reveal_block(d.cursor_block);
-                cx.notify();
-            }
+        if let Some(d) = self.doc_mut()
+            && d.cursor_block > 0
+        {
+            d.cursor_block -= 1;
+            d.reveal_block(d.cursor_block);
+            cx.notify();
         }
     }
     fn cursor_top(&mut self, _: &CursorTop, _w: &mut Window, cx: &mut Context<Self>) {
@@ -6850,12 +6877,12 @@ impl SketchGpuiView {
         }
     }
     fn cursor_bottom(&mut self, _: &CursorBottom, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(d) = self.doc_mut() {
-            if !d.blocks.is_empty() {
-                d.cursor_block = d.blocks.len() - 1;
-                d.reveal_block(d.cursor_block);
-                cx.notify();
-            }
+        if let Some(d) = self.doc_mut()
+            && !d.blocks.is_empty()
+        {
+            d.cursor_block = d.blocks.len() - 1;
+            d.reveal_block(d.cursor_block);
+            cx.notify();
         }
     }
     fn open_browser(&mut self, _: &OpenBrowser, _w: &mut Window, cx: &mut Context<Self>) {
@@ -7281,11 +7308,11 @@ impl SketchGpuiView {
         let Some(pos) = self.doc_pos_at(ev.position) else {
             return;
         };
-        if let Some(sel) = self.doc_selection.as_mut() {
-            if sel.head != pos {
-                sel.head = pos;
-                cx.notify();
-            }
+        if let Some(sel) = self.doc_selection.as_mut()
+            && sel.head != pos
+        {
+            sel.head = pos;
+            cx.notify();
         }
     }
 
@@ -7334,7 +7361,11 @@ impl SketchGpuiView {
             if lines.is_empty() {
                 continue;
             }
-            let l_start = if bi == start.block_idx { start.line_idx } else { 0 };
+            let l_start = if bi == start.block_idx {
+                start.line_idx
+            } else {
+                0
+            };
             let l_end = if bi == end.block_idx {
                 end.line_idx
             } else {
@@ -7342,8 +7373,12 @@ impl SketchGpuiView {
             };
             for li in l_start..=l_end {
                 let Some(line) = lines.get(li) else { continue };
-                let line_text: String =
-                    line.spans.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join("");
+                let line_text: String = line
+                    .spans
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("");
                 let chars: Vec<char> = line_text.chars().collect();
                 let s = if bi == start.block_idx && li == start.line_idx {
                     start.char_offset.min(chars.len())
@@ -7430,20 +7465,14 @@ impl SketchGpuiView {
     /// Copy the current selection to the system clipboard. Dispatches based
     /// on which screen is active: doc view uses mouse selection, edit/agent
     /// views use editor selection.
-    fn copy_selection(
-        &mut self,
-        _: &CopySelection,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn copy_selection(&mut self, _: &CopySelection, _w: &mut Window, cx: &mut Context<Self>) {
         // Doc view: delegate to existing mouse-selection copy.
-        if let Some(sel) = self.doc_selection {
-            if let Some(text) = self.collect_doc_selection_text(&sel) {
-                if !text.is_empty() {
-                    Self::yank_to_clipboard(&text);
-                    return;
-                }
-            }
+        if let Some(sel) = self.doc_selection
+            && let Some(text) = self.collect_doc_selection_text(&sel)
+            && !text.is_empty()
+        {
+            Self::yank_to_clipboard(&text);
+            return;
         }
         // Edit / Agent views: copy editor selection.
         let text = match self.workspace.focused_content() {
@@ -7451,17 +7480,19 @@ impl SketchGpuiView {
             Some(WindowContent::Agent(ring)) => {
                 let c = &ring.active().state;
                 if c.input_surface.is_chatbox() {
-                    c.input_surface.chatbox().and_then(|cb| cb.editor.selection_text())
+                    c.input_surface
+                        .chatbox()
+                        .and_then(|cb| cb.editor.selection_text())
                 } else {
                     c.editor.selection_text()
                 }
             }
             _ => None,
         };
-        if let Some(t) = text {
-            if !t.is_empty() {
-                Self::yank_to_clipboard(&t);
-            }
+        if let Some(t) = text
+            && !t.is_empty()
+        {
+            Self::yank_to_clipboard(&t);
         }
         let _ = cx;
     }
@@ -7539,9 +7570,10 @@ impl SketchGpuiView {
     /// no-arg `:tabnew` / `Cmd-T` creates a browser tab so the user can pick
     /// what to load.
     fn new_tab(&mut self, _: &NewTab, _w: &mut Window, cx: &mut Context<Self>) {
-        self.workspace.push_initial_tab(WindowContent::Browser(BrowserWindow::standalone(
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        )));
+        self.workspace
+            .push_initial_tab(WindowContent::Browser(BrowserWindow::standalone(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            )));
         self.save_workspace_state();
         cx.notify();
     }
@@ -7613,9 +7645,8 @@ impl SketchGpuiView {
             Some(WindowContent::Edit(e)) => (Some(e.file_label.clone()), true),
             _ => (None, false),
         };
-        let browser_fallback = || {
-            WindowContent::Browser(BrowserWindow::standalone(cwd.to_path_buf()))
-        };
+        let browser_fallback =
+            || WindowContent::Browser(BrowserWindow::standalone(cwd.to_path_buf()));
         let Some(label) = label else {
             return browser_fallback();
         };
@@ -7778,12 +7809,12 @@ impl SketchGpuiView {
         }
     }
     fn browser_enter(&mut self, _: &BrowserEnter, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(b) = self.browser_mut() {
-            if b.fb.worktree_mode.is_some() {
-                b.fb.select_worktree();
-                cx.notify();
-                return;
-            }
+        if let Some(b) = self.browser_mut()
+            && b.fb.worktree_mode.is_some()
+        {
+            b.fb.select_worktree();
+            cx.notify();
+            return;
         }
         let to_open = match self.browser_mut() {
             Some(b) => b.fb.enter_selected(),
@@ -7803,12 +7834,7 @@ impl SketchGpuiView {
             cx.notify();
         }
     }
-    fn browser_worktrees(
-        &mut self,
-        _: &BrowserWorktrees,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn browser_worktrees(&mut self, _: &BrowserWorktrees, _w: &mut Window, cx: &mut Context<Self>) {
         if let Some(b) = self.browser_mut() {
             if b.fb.worktree_mode.is_some() {
                 b.fb.exit_worktree_mode();
@@ -7842,14 +7868,18 @@ impl SketchGpuiView {
     }
     fn browser_close(&mut self, _: &BrowserClose, _w: &mut Window, cx: &mut Context<Self>) {
         // If in worktree mode, Esc exits that overlay instead of closing.
-        if let Some(b) = self.browser_mut() {
-            if b.fb.worktree_mode.is_some() {
-                b.fb.exit_worktree_mode();
-                cx.notify();
-                return;
-            }
+        if let Some(b) = self.browser_mut()
+            && b.fb.worktree_mode.is_some()
+        {
+            b.fb.exit_worktree_mode();
+            cx.notify();
+            return;
         }
-        let underlying = match self.workspace.focused_content_mut().expect("no focused window") {
+        let underlying = match self
+            .workspace
+            .focused_content_mut()
+            .expect("no focused window")
+        {
             WindowContent::Browser(b) => b.underlying.take(),
             _ => return,
         };
@@ -7918,7 +7948,11 @@ impl SketchGpuiView {
             }
             Key::Enter => {
                 // Open the selected result and exit filter.
-                let entries: Vec<_> = b.fb.visible_entries().iter().map(|e| e.path.clone()).collect();
+                let entries: Vec<_> =
+                    b.fb.visible_entries()
+                        .iter()
+                        .map(|e| e.path.clone())
+                        .collect();
                 let selected = b.fb.selected();
                 if let Some(path) = entries.get(selected).cloned() {
                     let is_dir = path.is_dir();
@@ -7965,7 +7999,11 @@ impl SketchGpuiView {
             Key::Up => {
                 let count = b.fb.visible_entries().len();
                 if count > 0 {
-                    let sel = if b.fb.selected() == 0 { count - 1 } else { b.fb.selected() - 1 };
+                    let sel = if b.fb.selected() == 0 {
+                        count - 1
+                    } else {
+                        b.fb.selected() - 1
+                    };
                     b.fb.set_selected(sel);
                 }
                 cx.notify();
@@ -7994,8 +8032,12 @@ impl SketchGpuiView {
     /// Sync `rail.focused` after a focus-motion: the rail holds focus only
     /// when the newly focused leaf is the one the rail is pinned to.
     fn sync_rail_focus_after_motion(&mut self) {
-        let Some(tab) = self.workspace.active_tab_mut() else { return };
-        let Some(rail) = tab.rail.as_mut() else { return };
+        let Some(tab) = self.workspace.active_tab_mut() else {
+            return;
+        };
+        let Some(rail) = tab.rail.as_mut() else {
+            return;
+        };
         rail.focused = tab.focused == rail.pinned_to;
     }
 
@@ -8088,21 +8130,20 @@ impl SketchGpuiView {
     /// leaf (spec §7 — `tab.focused` is the single source of truth).
     fn rail_close(&mut self, _: &RailClose, _w: &mut Window, cx: &mut Context<Self>) {
         // If in worktree mode, Esc exits that overlay instead of closing the rail.
-        if let Some(r) = self.rail_mut() {
-            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
-                if fb.worktree_mode.is_some() {
-                    fb.exit_worktree_mode();
-                    cx.notify();
-                    return;
-                }
-            }
+        if let Some(r) = self.rail_mut()
+            && let workspace::RailContent::FileBrowser(fb) = &mut r.content
+            && fb.worktree_mode.is_some()
+        {
+            fb.exit_worktree_mode();
+            cx.notify();
+            return;
         }
-        if let Some(tab) = self.workspace.active_tab_mut() {
-            if tab.rail.is_some() {
-                tab.rail = None;
-                self.save_workspace_state();
-                cx.notify();
-            }
+        if let Some(tab) = self.workspace.active_tab_mut()
+            && tab.rail.is_some()
+        {
+            tab.rail = None;
+            self.save_workspace_state();
+            cx.notify();
         }
     }
 
@@ -8155,14 +8196,13 @@ impl SketchGpuiView {
     /// to the heading's block/line.
     fn rail_select(&mut self, _: &RailSelect, _w: &mut Window, cx: &mut Context<Self>) {
         // Worktree mode: select worktree and navigate.
-        if let Some(r) = self.rail_mut() {
-            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
-                if fb.worktree_mode.is_some() {
-                    fb.select_worktree();
-                    cx.notify();
-                    return;
-                }
-            }
+        if let Some(r) = self.rail_mut()
+            && let workspace::RailContent::FileBrowser(fb) = &mut r.content
+            && fb.worktree_mode.is_some()
+        {
+            fb.select_worktree();
+            cx.notify();
+            return;
         }
         // File browser: collect the action without holding the rail borrow.
         let to_open = match self.rail_mut() {
@@ -8191,7 +8231,9 @@ impl SketchGpuiView {
             .active_tab()
             .and_then(|t| t.rail.as_ref())
             .and_then(|r| match &r.content {
-                workspace::RailContent::Outline(o) => o.entries.get(o.selected).map(|(_, _, idx)| *idx),
+                workspace::RailContent::Outline(o) => {
+                    o.entries.get(o.selected).map(|(_, _, idx)| *idx)
+                }
                 _ => None,
             });
         if let Some(idx) = target {
@@ -8218,27 +8260,27 @@ impl SketchGpuiView {
     }
 
     fn rail_parent(&mut self, _: &RailParent, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(r) = self.rail_mut() {
-            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
-                if fb.worktree_mode.is_some() {
-                    return; // no-op in worktree mode
-                }
-                fb.go_parent();
-                cx.notify();
+        if let Some(r) = self.rail_mut()
+            && let workspace::RailContent::FileBrowser(fb) = &mut r.content
+        {
+            if fb.worktree_mode.is_some() {
+                return; // no-op in worktree mode
             }
+            fb.go_parent();
+            cx.notify();
         }
     }
 
     fn rail_worktrees(&mut self, _: &RailWorktrees, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(r) = self.rail_mut() {
-            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
-                if fb.worktree_mode.is_some() {
-                    fb.exit_worktree_mode();
-                } else {
-                    fb.enter_worktree_mode();
-                }
-                cx.notify();
+        if let Some(r) = self.rail_mut()
+            && let workspace::RailContent::FileBrowser(fb) = &mut r.content
+        {
+            if fb.worktree_mode.is_some() {
+                fb.exit_worktree_mode();
+            } else {
+                fb.enter_worktree_mode();
             }
+            cx.notify();
         }
     }
 
@@ -8248,34 +8290,34 @@ impl SketchGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(r) = self.rail_mut() {
-            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
-                fb.toggle_hidden();
-                cx.notify();
-            }
+        if let Some(r) = self.rail_mut()
+            && let workspace::RailContent::FileBrowser(fb) = &mut r.content
+        {
+            fb.toggle_hidden();
+            cx.notify();
         }
     }
 
     fn rail_cycle_sort(&mut self, _: &RailCycleSort, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(r) = self.rail_mut() {
-            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
-                fb.cycle_sort();
-                cx.notify();
-            }
+        if let Some(r) = self.rail_mut()
+            && let workspace::RailContent::FileBrowser(fb) = &mut r.content
+        {
+            fb.cycle_sort();
+            cx.notify();
         }
     }
 
     fn rail_filter(&mut self, _: &RailFilter, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(r) = self.rail_mut() {
-            if let workspace::RailContent::FileBrowser(fb) = &mut r.content {
-                if fb.filter_mode {
-                    fb.clear_filter();
-                } else {
-                    fb.filter_mode = true;
-                    fb.set_filter("");
-                }
-                cx.notify();
+        if let Some(r) = self.rail_mut()
+            && let workspace::RailContent::FileBrowser(fb) = &mut r.content
+        {
+            if fb.filter_mode {
+                fb.clear_filter();
+            } else {
+                fb.filter_mode = true;
+                fb.set_filter("");
             }
+            cx.notify();
         }
     }
 
@@ -8302,7 +8344,11 @@ impl SketchGpuiView {
                 cx.stop_propagation();
             }
             Key::Enter => {
-                let entries: Vec<_> = fb.visible_entries().iter().map(|e| e.path.clone()).collect();
+                let entries: Vec<_> = fb
+                    .visible_entries()
+                    .iter()
+                    .map(|e| e.path.clone())
+                    .collect();
                 let selected = fb.selected();
                 if let Some(path) = entries.get(selected).cloned() {
                     let is_dir = path.is_dir();
@@ -8352,7 +8398,11 @@ impl SketchGpuiView {
             Key::Up => {
                 let count = fb.visible_entries().len();
                 if count > 0 {
-                    let sel = if fb.selected() == 0 { count - 1 } else { fb.selected() - 1 };
+                    let sel = if fb.selected() == 0 {
+                        count - 1
+                    } else {
+                        fb.selected() - 1
+                    };
                     fb.set_selected(sel);
                 }
                 cx.notify();
@@ -8366,7 +8416,11 @@ impl SketchGpuiView {
 
     /// `Some(edit)` if currently editing, else `None`.
     fn edit_mut(&mut self) -> Option<&mut EditState> {
-        match self.workspace.focused_content_mut().expect("no focused window") {
+        match self
+            .workspace
+            .focused_content_mut()
+            .expect("no focused window")
+        {
             WindowContent::Edit(e) => Some(e),
             _ => None,
         }
@@ -8380,7 +8434,11 @@ impl SketchGpuiView {
         let core: workspace::SharedCore = std::rc::Rc::new(std::cell::RefCell::new(
             sketch::editor::EditorCore::new(text.to_string(), PathBuf::from("/tmp/harness.md")),
         ));
-        let mut e = EditState::new(SharedEditor::new(1, core), "harness.md".into(), EditView::Code);
+        let mut e = EditState::new(
+            SharedEditor::new(1, core),
+            "harness.md".into(),
+            EditView::Code,
+        );
         e.mode = EditMode::Insert;
         // Skip the boot splash so render() builds the real Edit body, not the
         // splash screen — the harness needs the highlight path to actually run.
@@ -8393,7 +8451,10 @@ impl SketchGpuiView {
     #[cfg(test)]
     fn test_edit_cache_stats(&mut self) -> (usize, bool) {
         let e = self.edit_mut().expect("focused window is not an Edit view");
-        (e.highlight_cache.last_recomputed, e.highlight_cache.last_was_skip)
+        (
+            e.highlight_cache.last_recomputed,
+            e.highlight_cache.last_was_skip,
+        )
     }
 
     /// Test-only: install a fresh Doc screen rendering `blocks` so the headless
@@ -8468,14 +8529,16 @@ impl SketchGpuiView {
         // undo), so edits show live in any Doc pane of the file and there's no
         // stash to shuttle. Snapshot the (id, core) without holding the borrow
         // across the pool mutation below.
-        let (shared, label): (Option<(workspace::FileBufferId, workspace::SharedCore)>, SharedString) =
-            match self.workspace.focused_content_mut() {
-                Some(WindowContent::Doc(d)) => (
-                    d.source.as_ref().map(|s| (s.buffer_id, s.core.clone())),
-                    d.file_label.clone(),
-                ),
-                _ => return,
-            };
+        let (shared, label): (
+            Option<(workspace::FileBufferId, workspace::SharedCore)>,
+            SharedString,
+        ) = match self.workspace.focused_content_mut() {
+            Some(WindowContent::Doc(d)) => (
+                d.source.as_ref().map(|s| (s.buffer_id, s.core.clone())),
+                d.file_label.clone(),
+            ),
+            _ => return,
+        };
         let (id, core) = match shared {
             Some(pair) => pair,
             None => {
@@ -8503,19 +8566,19 @@ impl SketchGpuiView {
         let prev = self
             .workspace
             .replace_focused_content(
-            // Placeholder; overwritten in every match arm below.
-            WindowContent::Doc(DocState {
-                blocks: Vec::new(),
-                file_label: SharedString::new_static(""),
-                cursor_block: 0,
-                list_state: DocState::new_list_state(0),
-                list_item_count: std::cell::Cell::new(0),
-                blocks_seq: 0,
-                blocks_snapshot: RefCell::new(None),
-                last_cursor_block: std::cell::Cell::new(None),
-                source: None,
-            }),
-        )
+                // Placeholder; overwritten in every match arm below.
+                WindowContent::Doc(DocState {
+                    blocks: Vec::new(),
+                    file_label: SharedString::new_static(""),
+                    cursor_block: 0,
+                    list_state: DocState::new_list_state(0),
+                    list_item_count: std::cell::Cell::new(0),
+                    blocks_seq: 0,
+                    blocks_snapshot: RefCell::new(None),
+                    last_cursor_block: std::cell::Cell::new(None),
+                    source: None,
+                }),
+            )
             .expect("workspace has no focused window");
         match prev {
             WindowContent::Edit(edit) => {
@@ -8566,6 +8629,7 @@ impl SketchGpuiView {
     ///      Obsidian / Foam / most wiki-aware editors do.
     ///   2. `<doc_dir>/<target>` — literal path, in case the user included
     ///      the extension already (or wants a non-md file).
+    ///
     /// If neither exists, log to stderr and no-op (the pane stays put;
     /// nothing to navigate to).
     fn open_wiki_link(
@@ -8614,8 +8678,11 @@ impl SketchGpuiView {
                 return;
             }
         };
-        let blocks =
-            render_with_wiki(&core.borrow().document().full_text(), &self.theme, Some(&path));
+        let blocks = render_with_wiki(
+            &core.borrow().document().full_text(),
+            &self.theme,
+            Some(&path),
+        );
         self.set_screen(WindowContent::Doc(DocState {
             blocks,
             file_label: label,
@@ -8709,8 +8776,7 @@ impl SketchGpuiView {
                     }
                     None => {
                         let doc = Document::from_text(text, path.clone());
-                        let blocks =
-                            render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
+                        let blocks = render_with_wiki(&doc.full_text(), &self.theme, Some(&path));
                         (blocks, None)
                     }
                 };
@@ -8738,32 +8804,27 @@ impl SketchGpuiView {
     /// subset of actions against the editor. `Ctrl-S` (save) and `Ctrl-V`
     /// (back to Doc view) are caught here before mode dispatch so they
     /// behave identically in both Insert and Normal.
-    fn handle_edit_key(
-        &mut self,
-        ev: &KeyDownEvent,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_edit_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
         let press = keystroke_to_keypress(&ev.keystroke);
 
         // Mode-independent shortcuts.
-        if press.modifiers.contains(KMods::CONTROL) {
-            if let Key::Char(c) = press.key {
-                match c {
-                    's' | 'S' => {
-                        self.save_buffer(cx);
-                        return;
-                    }
-                    'v' | 'V' => {
-                        self.back_to_doc(cx);
-                        return;
-                    }
-                    'w' | 'W' => {
-                        self.toggle_edit_view(cx);
-                        return;
-                    }
-                    _ => {}
+        if press.modifiers.contains(KMods::CONTROL)
+            && let Key::Char(c) = press.key
+        {
+            match c {
+                's' | 'S' => {
+                    self.save_buffer(cx);
+                    return;
                 }
+                'v' | 'V' => {
+                    self.back_to_doc(cx);
+                    return;
+                }
+                'w' | 'W' => {
+                    self.toggle_edit_view(cx);
+                    return;
+                }
+                _ => {}
             }
         }
 
@@ -9101,37 +9162,77 @@ impl SketchGpuiView {
     }
 
     fn menu_ref(&self) -> Option<&MenuOverlay> {
-        if let ActiveOverlay::Menu(m) = &self.active_overlay { Some(m) } else { None }
+        if let ActiveOverlay::Menu(m) = &self.active_overlay {
+            Some(m)
+        } else {
+            None
+        }
     }
     /// Hands back the WHOLE `&mut MenuOverlay` (never a per-field accessor) so
     /// `m.state.process_key(press, &m.menu)`'s disjoint two-field split-borrow
     /// keeps type-checking.
     fn menu_mut(&mut self) -> Option<&mut MenuOverlay> {
-        if let ActiveOverlay::Menu(m) = &mut self.active_overlay { Some(m) } else { None }
+        if let ActiveOverlay::Menu(m) = &mut self.active_overlay {
+            Some(m)
+        } else {
+            None
+        }
     }
     fn buffer_ref(&self) -> Option<&BufferSwitcher> {
-        if let ActiveOverlay::BufferSwitcher(b) = &self.active_overlay { Some(b) } else { None }
+        if let ActiveOverlay::BufferSwitcher(b) = &self.active_overlay {
+            Some(b)
+        } else {
+            None
+        }
     }
     fn buffer_mut(&mut self) -> Option<&mut BufferSwitcher> {
-        if let ActiveOverlay::BufferSwitcher(b) = &mut self.active_overlay { Some(b) } else { None }
+        if let ActiveOverlay::BufferSwitcher(b) = &mut self.active_overlay {
+            Some(b)
+        } else {
+            None
+        }
     }
     fn session_ref(&self) -> Option<&SessionSwitcher> {
-        if let ActiveOverlay::SessionSwitcher(s) = &self.active_overlay { Some(s) } else { None }
+        if let ActiveOverlay::SessionSwitcher(s) = &self.active_overlay {
+            Some(s)
+        } else {
+            None
+        }
     }
     fn session_mut(&mut self) -> Option<&mut SessionSwitcher> {
-        if let ActiveOverlay::SessionSwitcher(s) = &mut self.active_overlay { Some(s) } else { None }
+        if let ActiveOverlay::SessionSwitcher(s) = &mut self.active_overlay {
+            Some(s)
+        } else {
+            None
+        }
     }
     fn workspace_picker_ref(&self) -> Option<&WorkspacePicker> {
-        if let ActiveOverlay::WorkspacePicker(p) = &self.active_overlay { Some(p) } else { None }
+        if let ActiveOverlay::WorkspacePicker(p) = &self.active_overlay {
+            Some(p)
+        } else {
+            None
+        }
     }
     fn workspace_picker_mut(&mut self) -> Option<&mut WorkspacePicker> {
-        if let ActiveOverlay::WorkspacePicker(p) = &mut self.active_overlay { Some(p) } else { None }
+        if let ActiveOverlay::WorkspacePicker(p) = &mut self.active_overlay {
+            Some(p)
+        } else {
+            None
+        }
     }
     fn rename_ref(&self) -> Option<&RenameOverlay> {
-        if let ActiveOverlay::Rename(o) = &self.active_overlay { Some(o) } else { None }
+        if let ActiveOverlay::Rename(o) = &self.active_overlay {
+            Some(o)
+        } else {
+            None
+        }
     }
     fn rename_mut(&mut self) -> Option<&mut RenameOverlay> {
-        if let ActiveOverlay::Rename(o) = &mut self.active_overlay { Some(o) } else { None }
+        if let ActiveOverlay::Rename(o) = &mut self.active_overlay {
+            Some(o)
+        } else {
+            None
+        }
     }
 
     /// Open an overlay, **replacing** any currently-active one (overlays never
@@ -9167,12 +9268,7 @@ impl SketchGpuiView {
     /// Menu's key handler. Esc pops a level (or closes from root). Any
     /// other key is offered to `MenuState::process_key`; if it resolves
     /// to a command, the menu closes and `dispatch_menu_command` runs it.
-    fn handle_menu_key(
-        &mut self,
-        ev: &KeyDownEvent,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_menu_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
         let press = keystroke_to_keypress(&ev.keystroke);
 
         if press.key == Key::Esc {
@@ -9220,7 +9316,10 @@ impl SketchGpuiView {
                 // Only meaningful while the claude screen is active. Surface
                 // a hint via the doc/edit footer if it isn't, so the user
                 // gets a visible no-op instead of silent.
-                if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
+                if matches!(
+                    self.workspace.focused_content().expect("no focused window"),
+                    WindowContent::Agent(_)
+                ) {
                     // Mode-aware submit: Worksheet sweep (§12) or Chatbox
                     // submit (§18) depending on `AgentState::input_mode`.
                     self.submit_agent(cx);
@@ -9246,7 +9345,10 @@ impl SketchGpuiView {
             "rail-outline" => self.toggle_outline_rail_impl(cx),
             "rail-flip" => self.flip_rail_side_impl(cx),
             "compose-toggle" | "agent-input-toggle" => {
-                if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
+                if matches!(
+                    self.workspace.focused_content().expect("no focused window"),
+                    WindowContent::Agent(_)
+                ) {
                     self.toggle_agent_input_mode(cx);
                 }
             }
@@ -9348,11 +9450,10 @@ impl SketchGpuiView {
                 cx.notify();
             }
             "new-tab" => {
-                self.workspace.push_initial_tab(WindowContent::Browser(
-                    BrowserWindow::standalone(
+                self.workspace
+                    .push_initial_tab(WindowContent::Browser(BrowserWindow::standalone(
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                    ),
-                ));
+                    )));
                 self.save_workspace_state();
                 cx.notify();
             }
@@ -9429,10 +9530,10 @@ impl SketchGpuiView {
             .filter(|tab| {
                 let mut found = false;
                 tab.layout.for_each_leaf(&mut |w| {
-                    if let Some(l) = screen_file_label(&w.content) {
-                        if l.as_ref() == label {
-                            found = true;
-                        }
+                    if let Some(l) = screen_file_label(&w.content)
+                        && l.as_ref() == label
+                    {
+                        found = true;
                     }
                 });
                 found
@@ -9465,11 +9566,7 @@ impl SketchGpuiView {
 
     /// Open the workspace picker overlay. For `AlsoShow`, reject non-file
     /// panes up front with a footer message (the picker never opens).
-    fn open_workspace_picker(
-        &mut self,
-        mode: WorkspacePickerMode,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_workspace_picker(&mut self, mode: WorkspacePickerMode, cx: &mut Context<Self>) {
         if self.overlay_is_workspace() {
             return;
         }
@@ -9491,7 +9588,10 @@ impl SketchGpuiView {
         let selected = (0..self.workspace.tabs.len())
             .find(|&i| i != active)
             .unwrap_or(self.workspace.tabs.len());
-        self.open_overlay(ActiveOverlay::WorkspacePicker(WorkspacePicker { mode, selected }));
+        self.open_overlay(ActiveOverlay::WorkspacePicker(WorkspacePicker {
+            mode,
+            selected,
+        }));
         cx.notify();
     }
 
@@ -9522,17 +9622,21 @@ impl SketchGpuiView {
                 self.close_workspace_picker();
             }
             Key::Char('j') | Key::Down => {
-                if let Some(p) = self.workspace_picker_mut() {
-                    if count > 0 {
-                        p.selected = (p.selected + 1) % count;
-                    }
+                if let Some(p) = self.workspace_picker_mut()
+                    && count > 0
+                {
+                    p.selected = (p.selected + 1) % count;
                 }
             }
             Key::Char('k') | Key::Up => {
-                if let Some(p) = self.workspace_picker_mut() {
-                    if count > 0 {
-                        p.selected = if p.selected == 0 { count - 1 } else { p.selected - 1 };
-                    }
+                if let Some(p) = self.workspace_picker_mut()
+                    && count > 0
+                {
+                    p.selected = if p.selected == 0 {
+                        count - 1
+                    } else {
+                        p.selected - 1
+                    };
                 }
             }
             Key::Char('g') => {
@@ -9541,10 +9645,10 @@ impl SketchGpuiView {
                 }
             }
             Key::Char('G') => {
-                if let Some(p) = self.workspace_picker_mut() {
-                    if count > 0 {
-                        p.selected = count - 1;
-                    }
+                if let Some(p) = self.workspace_picker_mut()
+                    && count > 0
+                {
+                    p.selected = count - 1;
                 }
             }
             Key::Enter | Key::Char('l') => {
@@ -9677,7 +9781,9 @@ impl SketchGpuiView {
                 // Not on Claude screen — open Claude first, then show the list.
                 self.open_agent_inner(cx);
                 if let Some(r) = self.agent_ring() {
-                    if r.is_empty() { return; }
+                    if r.is_empty() {
+                        return;
+                    }
                 } else {
                     return;
                 }
@@ -9714,22 +9820,22 @@ impl SketchGpuiView {
             }
             Key::Char('j') | Key::Down => {
                 let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
-                if let Some(ss) = self.session_mut() {
-                    if count > 0 {
-                        ss.selected = (ss.selected + 1) % count;
-                    }
+                if let Some(ss) = self.session_mut()
+                    && count > 0
+                {
+                    ss.selected = (ss.selected + 1) % count;
                 }
             }
             Key::Char('k') | Key::Up => {
                 let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
-                if let Some(ss) = self.session_mut() {
-                    if count > 0 {
-                        ss.selected = if ss.selected == 0 {
-                            count - 1
-                        } else {
-                            ss.selected - 1
-                        };
-                    }
+                if let Some(ss) = self.session_mut()
+                    && count > 0
+                {
+                    ss.selected = if ss.selected == 0 {
+                        count - 1
+                    } else {
+                        ss.selected - 1
+                    };
                 }
             }
             Key::Char('g') => {
@@ -9739,10 +9845,10 @@ impl SketchGpuiView {
             }
             Key::Char('G') => {
                 let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
-                if let Some(ss) = self.session_mut() {
-                    if count > 0 {
-                        ss.selected = count - 1;
-                    }
+                if let Some(ss) = self.session_mut()
+                    && count > 0
+                {
+                    ss.selected = count - 1;
                 }
             }
             Key::Enter | Key::Char('l') => {
@@ -9778,10 +9884,10 @@ impl SketchGpuiView {
                         cx.notify();
                         return;
                     }
-                    if let Some(ss) = self.session_mut() {
-                        if ss.selected >= new_count {
-                            ss.selected = new_count - 1;
-                        }
+                    if let Some(ss) = self.session_mut()
+                        && ss.selected >= new_count
+                    {
+                        ss.selected = new_count - 1;
                     }
                     self.save_agent_ring();
                 }
@@ -9846,12 +9952,7 @@ impl SketchGpuiView {
                 normal_fg
             };
 
-            let mut row = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .px_2()
-                .py_0p5();
+            let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
 
             if is_selected {
                 row = row.bg(selected_bg);
@@ -9957,12 +10058,7 @@ impl SketchGpuiView {
             let label_text = format!("{}{}", tab_strip_label(tab), here);
             let name_color = if is_active { label_fg } else { normal_fg };
 
-            let mut row = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .px_2()
-                .py_0p5();
+            let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
             if is_selected {
                 row = row.bg(selected_bg);
             }
@@ -9987,12 +10083,7 @@ impl SketchGpuiView {
         {
             let is_selected = picker.selected == n_tabs;
             let marker = if is_selected { "\u{25b8} " } else { "  " };
-            let mut row = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .px_2()
-                .py_0p5();
+            let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
             if is_selected {
                 row = row.bg(selected_bg);
             }
@@ -10140,16 +10231,12 @@ impl SketchGpuiView {
                 // Update the label in the local ring and, if this session
                 // is managed by the session server, push the new label
                 // there so it persists across GUI restarts.
-                let server_sid = self
-                    .agent_ring_mut()
-                    .and_then(|ring| {
-                        let slot = ring.slot_by_index_mut(index)?;
-                        slot.label = new_label.clone();
-                        slot.server_session_id.clone()
-                    });
-                if let (Some(server), Some(sid)) =
-                    (&self.session_server, server_sid)
-                {
+                let server_sid = self.agent_ring_mut().and_then(|ring| {
+                    let slot = ring.slot_by_index_mut(index)?;
+                    slot.label = new_label.clone();
+                    slot.server_session_id.clone()
+                });
+                if let (Some(server), Some(sid)) = (&self.session_server, server_sid) {
                     let _ = server.rename_session(&sid, &new_label);
                 }
                 self.close_rename_overlay();
@@ -10182,30 +10269,23 @@ impl SketchGpuiView {
                     }
                 }
             }
-            RenameTarget::AgentChangeCwd { index } => {
-                match resolve_agent_cwd_arg(&new_label) {
-                    Ok(resolved) => {
-                        self.close_rename_overlay();
-                        self.change_agent_cwd(index, resolved, cx);
-                    }
-                    Err(msg) => {
-                        self.close_rename_overlay();
-                        if let Some(c) = self.agent_mut() {
-                            c.status = Some(msg.into());
-                        }
-                        cx.notify();
-                    }
+            RenameTarget::AgentChangeCwd { index } => match resolve_agent_cwd_arg(&new_label) {
+                Ok(resolved) => {
+                    self.close_rename_overlay();
+                    self.change_agent_cwd(index, resolved, cx);
                 }
-            }
+                Err(msg) => {
+                    self.close_rename_overlay();
+                    if let Some(c) = self.agent_mut() {
+                        c.status = Some(msg.into());
+                    }
+                    cx.notify();
+                }
+            },
         }
     }
 
-    fn handle_rename_key(
-        &mut self,
-        ev: &KeyDownEvent,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_rename_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
         let press = keystroke_to_keypress(&ev.keystroke);
         match press.key {
             Key::Esc => {
@@ -10275,10 +10355,10 @@ impl SketchGpuiView {
                         let idx = filtered[0];
                         self.close_buffer_switcher();
                         self.switch_to_buffer(idx);
-                    } else if !filtered.is_empty() {
-                        if let Some(bs) = self.buffer_mut() {
-                            bs.filter_mode = false;
-                        }
+                    } else if !filtered.is_empty()
+                        && let Some(bs) = self.buffer_mut()
+                    {
+                        bs.filter_mode = false;
                     }
                     cx.notify();
                     return;
@@ -10307,22 +10387,22 @@ impl SketchGpuiView {
             }
             Key::Char('j') | Key::Down => {
                 let count = self.filtered_buffer_indices().len();
-                if let Some(bs) = self.buffer_mut() {
-                    if count > 0 {
-                        bs.selected = (bs.selected + 1) % count;
-                    }
+                if let Some(bs) = self.buffer_mut()
+                    && count > 0
+                {
+                    bs.selected = (bs.selected + 1) % count;
                 }
             }
             Key::Char('k') | Key::Up => {
                 let count = self.filtered_buffer_indices().len();
-                if let Some(bs) = self.buffer_mut() {
-                    if count > 0 {
-                        bs.selected = if bs.selected == 0 {
-                            count - 1
-                        } else {
-                            bs.selected - 1
-                        };
-                    }
+                if let Some(bs) = self.buffer_mut()
+                    && count > 0
+                {
+                    bs.selected = if bs.selected == 0 {
+                        count - 1
+                    } else {
+                        bs.selected - 1
+                    };
                 }
             }
             Key::Char('g') => {
@@ -10332,10 +10412,10 @@ impl SketchGpuiView {
             }
             Key::Char('G') => {
                 let count = self.filtered_buffer_indices().len();
-                if let Some(bs) = self.buffer_mut() {
-                    if count > 0 {
-                        bs.selected = count - 1;
-                    }
+                if let Some(bs) = self.buffer_mut()
+                    && count > 0
+                {
+                    bs.selected = count - 1;
                 }
             }
             Key::Enter | Key::Char('l') => {
@@ -10350,10 +10430,11 @@ impl SketchGpuiView {
                 if let Some(&buf_idx) = filtered.get(selected) {
                     self.close_buffer_at(buf_idx, cx);
                     let count = self.filtered_buffer_indices().len();
-                    if let Some(bs) = self.buffer_mut() {
-                        if bs.selected >= count && count > 0 {
-                            bs.selected = count - 1;
-                        }
+                    if let Some(bs) = self.buffer_mut()
+                        && bs.selected >= count
+                        && count > 0
+                    {
+                        bs.selected = count - 1;
                     }
                 }
             }
@@ -10424,8 +10505,7 @@ impl SketchGpuiView {
             workspace::Layout::Empty => div().size_full().into_any_element(),
             workspace::Layout::Leaf(window) => {
                 let is_focused = window.id == focused_id;
-                let content_ptr: *mut WindowContent =
-                    &mut window.content as *mut _;
+                let content_ptr: *mut WindowContent = &mut window.content as *mut _;
                 // SAFETY: same as in render_focused_window — the leaf's
                 // content sits inside a layout tree we won't structurally
                 // mutate during this render call.
@@ -10438,7 +10518,9 @@ impl SketchGpuiView {
                 let painted: AnyElement = match content {
                     WindowContent::Doc(d) => self.render_doc(leaf_root, d, cx).into_any_element(),
                     WindowContent::Edit(e) => self.render_edit(leaf_root, e, cx).into_any_element(),
-                    WindowContent::Browser(b) => self.render_browser(leaf_root, b, cx).into_any_element(),
+                    WindowContent::Browser(b) => {
+                        self.render_browser(leaf_root, b, cx).into_any_element()
+                    }
                     WindowContent::Agent(ring) => {
                         self.render_agent(leaf_root, ring, cx).into_any_element()
                     }
@@ -10508,8 +10590,14 @@ impl SketchGpuiView {
                         .flex_col()
                         .bg(editor_bg)
                         .text_color(editor_fg);
-                    let child_el =
-                        self.render_layout(child_root, child, focused_id, attach_focus, rail_focusable, cx);
+                    let child_el = self.render_layout(
+                        child_root,
+                        child,
+                        focused_id,
+                        attach_focus,
+                        rail_focusable,
+                        cx,
+                    );
                     let mut slot = div().min_w_0().min_h_0().overflow_hidden();
                     {
                         let style = slot.style();
@@ -10536,11 +10624,7 @@ impl SketchGpuiView {
     /// If the workspace has more than one tab, stack a thin horizontal tab
     /// strip above the screen view. Single-tab workspaces render the screen
     /// alone (no strip).
-    fn wrap_with_tab_strip(
-        &self,
-        screen_view: AnyElement,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn wrap_with_tab_strip(&self, screen_view: AnyElement, cx: &mut Context<Self>) -> AnyElement {
         if self.workspace.tabs.len() <= 1 {
             return screen_view;
         }
@@ -10711,13 +10795,13 @@ impl SketchGpuiView {
             return;
         }
         let entries = self.derive_outline();
-        if let Some(r) = self.rail_mut() {
-            if let workspace::RailContent::Outline(o) = &mut r.content {
-                o.entries = entries;
-                o.last_key = Some(key);
-                if o.selected >= o.entries.len() {
-                    o.selected = o.entries.len().saturating_sub(1);
-                }
+        if let Some(r) = self.rail_mut()
+            && let workspace::RailContent::Outline(o) = &mut r.content
+        {
+            o.entries = entries;
+            o.last_key = Some(key);
+            if o.selected >= o.entries.len() {
+                o.selected = o.entries.len().saturating_sub(1);
             }
         }
     }
@@ -10852,12 +10936,7 @@ impl SketchGpuiView {
                         .overflow_hidden()
                         .child(SharedString::new_static("WORKTREES"));
 
-                    let mut list = div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_hidden();
+                    let mut list = div().flex().flex_col().flex_1().min_h_0().overflow_hidden();
 
                     if wm.worktrees.is_empty() {
                         list = list.child(
@@ -10869,11 +10948,8 @@ impl SketchGpuiView {
                         );
                     } else {
                         let visible_rows = 40usize;
-                        let scroll = scroll_to_keep_visible(
-                            wm.selected,
-                            visible_rows,
-                            wm.worktrees.len(),
-                        );
+                        let scroll =
+                            scroll_to_keep_visible(wm.selected, visible_rows, wm.worktrees.len());
                         for (i, wt) in wm
                             .worktrees
                             .iter()
@@ -10925,12 +11001,7 @@ impl SketchGpuiView {
                         .overflow_hidden()
                         .child(SharedString::from(header_text));
 
-                    let mut list = div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_hidden();
+                    let mut list = div().flex().flex_col().flex_1().min_h_0().overflow_hidden();
 
                     let entries = fb.visible_entries();
                     let selected = fb.selected();
@@ -10949,10 +11020,8 @@ impl SketchGpuiView {
                         );
                     } else {
                         let visible_rows = 40usize;
-                        let scroll =
-                            scroll_to_keep_visible(selected, visible_rows, entries.len());
-                        for (i, entry) in
-                            entries.iter().enumerate().skip(scroll).take(visible_rows)
+                        let scroll = scroll_to_keep_visible(selected, visible_rows, entries.len());
+                        for (i, entry) in entries.iter().enumerate().skip(scroll).take(visible_rows)
                         {
                             let is_sel = i == selected;
                             let suffix = if entry.is_dir { "/" } else { "" };
@@ -10988,12 +11057,7 @@ impl SketchGpuiView {
                     .font_weight(FontWeight::BOLD)
                     .child(SharedString::new_static("OUTLINE"));
 
-                let mut list = div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden();
+                let mut list = div().flex().flex_col().flex_1().min_h_0().overflow_hidden();
 
                 if o.entries.is_empty() {
                     list = list.child(
@@ -11005,8 +11069,7 @@ impl SketchGpuiView {
                     );
                 } else {
                     let visible_rows = 40usize;
-                    let scroll =
-                        scroll_to_keep_visible(o.selected, visible_rows, o.entries.len());
+                    let scroll = scroll_to_keep_visible(o.selected, visible_rows, o.entries.len());
                     for (i, (level, text, _)) in
                         o.entries.iter().enumerate().skip(scroll).take(visible_rows)
                     {
@@ -11015,11 +11078,7 @@ impl SketchGpuiView {
                         // section headers (accent + bold).
                         let indent = "  ".repeat((*level as usize).saturating_sub(1));
                         let label_text = format!("{}{}", indent, text);
-                        let mut row = div()
-                            .w_full()
-                            .px_2()
-                            .py_0p5()
-                            .overflow_hidden();
+                        let mut row = div().w_full().px_2().py_0p5().overflow_hidden();
                         if is_sel {
                             row = row.bg(selected_bg).text_color(selected_fg);
                         } else if *level == 1 {
@@ -11129,9 +11188,7 @@ impl SketchGpuiView {
             .h(px(22.0))
             .text_color(label_fg)
             .text_size(px(11.0))
-            .child(SharedString::new_static(
-                "press a key · Esc back / close",
-            ));
+            .child(SharedString::new_static("press a key · Esc back / close"));
 
         // Absolute-positioned popup at the top of the window. Width spans
         // full window width; height is content-sized. Opaque bg + bottom
@@ -11219,12 +11276,7 @@ impl SketchGpuiView {
 
             let name_color = if is_active { active_fg } else { normal_fg };
 
-            let mut row = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .px_2()
-                .py_0p5();
+            let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
 
             if is_selected {
                 row = row.bg(selected_bg);
@@ -11380,10 +11432,10 @@ impl SketchGpuiView {
     fn yank_to_clipboard(text: &str) {
         use std::io::Write;
         use std::process::{Command, Stdio};
-        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
+        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn()
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            let _ = stdin.write_all(text.as_bytes());
         }
     }
 
@@ -11412,7 +11464,10 @@ impl SketchGpuiView {
 
     fn open_agent_inner(&mut self, cx: &mut Context<Self>) {
         // If already on Claude screen, just add a new session to the ring.
-        if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
+        if matches!(
+            self.workspace.focused_content().expect("no focused window"),
+            WindowContent::Agent(_)
+        ) {
             self.new_agent_session(None, cx);
             return;
         }
@@ -11445,17 +11500,10 @@ impl SketchGpuiView {
             // pump — we never have to block the paint thread on an Ack. The
             // worst case the old synchronous path could hit was a ~30s freeze
             // (request `recv_timeout`) when the server stalled.
-            let placeholder = AgentState::new_server_managed(Some(
-                "connecting to session server…".into(),
-            ));
+            let placeholder =
+                AgentState::new_server_managed(Some("connecting to session server…".into()));
             let open_token = alloc_open_token();
-            ring.push(
-                "claude-1".into(),
-                placeholder,
-                None,
-                proc_cwd.clone(),
-                None,
-            );
+            ring.push("claude-1".into(), placeholder, None, proc_cwd.clone(), None);
             // Start the unified server pump (one per view, routes by
             // session_id) and stash it on the placeholder so it lives as long
             // as the ring does — events for the soon-to-be-attached sessions
@@ -11481,18 +11529,10 @@ impl SketchGpuiView {
             if persisted.is_empty() {
                 let slot_cwd = proc_cwd.clone();
                 let session_index = ring.next_index;
-                let state = self.create_agent_session(
-                    None,
-                    slot_cwd.clone(),
-                    session_index,
-                    cx,
-                );
+                let state = self.create_agent_session(None, slot_cwd.clone(), session_index, cx);
                 ring.push("claude-1".into(), state, None, slot_cwd, None);
             } else {
-                let active_pos = persisted
-                    .iter()
-                    .position(|s| s.active)
-                    .unwrap_or(0);
+                let active_pos = persisted.iter().position(|s| s.active).unwrap_or(0);
                 for slot in persisted {
                     let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
                     let session_index = ring.next_index;
@@ -11529,12 +11569,7 @@ impl SketchGpuiView {
     /// mutate it rather than replace it). If the window/ring is gone by the
     /// time the result lands (weak entity dropped, screen switched), every
     /// `this.update` is a no-op and the work is harmlessly discarded.
-    fn spawn_open_agent_server(
-        &self,
-        open_token: u64,
-        proc_cwd: PathBuf,
-        cx: &mut Context<Self>,
-    ) {
+    fn spawn_open_agent_server(&self, open_token: u64, proc_cwd: PathBuf, cx: &mut Context<Self>) {
         let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
             return;
         };
@@ -11671,13 +11706,16 @@ impl SketchGpuiView {
                     Self::append_system_notice(&mut ring.slots[pos].state, &m);
                     ring.slots[pos].state.status = Some(m.into());
                 }
-                OpenResolution::Created { sid, acp_id, permission_mode } => {
+                OpenResolution::Created {
+                    sid,
+                    acp_id,
+                    permission_mode,
+                } => {
                     let slot = &mut ring.slots[pos];
                     slot.server_session_id = Some(sid.clone());
                     slot.resume_id = acp_id;
                     slot.state.permission_mode = permission_mode;
-                    slot.state.status =
-                        Some("attaching to ACP agent via session server…".into());
+                    slot.state.status = Some("attaching to ACP agent via session server…".into());
                     bound_sids_c.borrow_mut().push(sid);
                 }
                 OpenResolution::Attached(attached) => {
@@ -11696,7 +11734,13 @@ impl SketchGpuiView {
                     for a in iter {
                         let mut state = AgentState::new_server_managed(Some(a.status.into()));
                         state.permission_mode = a.permission_mode;
-                        ring.push(a.label, state, a.acp_id, proc_cwd.clone(), Some(a.sid.clone()));
+                        ring.push(
+                            a.label,
+                            state,
+                            a.acp_id,
+                            proc_cwd.clone(),
+                            Some(a.sid.clone()),
+                        );
                         bound_sids_c.borrow_mut().push(a.sid);
                     }
                     // Land the user on the placeholder slot, not the last push.
@@ -11843,13 +11887,16 @@ impl SketchGpuiView {
         let mut f = Some(f);
         for tab in self.workspace.tabs.iter_mut() {
             let found = tab.layout.find_map_leaf_content_mut(&mut |content| {
-                if let WindowContent::Agent(ring) = content {
-                    if ring.slots.iter().any(|s| s.pending_open_token == Some(token)) {
-                        if let Some(f) = f.take() {
-                            f(ring);
-                        }
-                        return Some(());
+                if let WindowContent::Agent(ring) = content
+                    && ring
+                        .slots
+                        .iter()
+                        .any(|s| s.pending_open_token == Some(token))
+                {
+                    if let Some(f) = f.take() {
+                        f(ring);
                     }
+                    return Some(());
                 }
                 None
             });
@@ -11901,12 +11948,7 @@ impl SketchGpuiView {
             self.spawn_create_agent_session(open_token, label, slot_cwd, cx);
         } else {
             // Direct-spawn path.
-            let state = self.create_agent_session(
-                None,
-                slot_cwd.clone(),
-                session_index,
-                cx,
-            );
+            let state = self.create_agent_session(None, slot_cwd.clone(), session_index, cx);
             let ring = self.agent_ring_mut().unwrap();
             ring.push(label, state, None, slot_cwd, None);
         }
@@ -11917,9 +11959,7 @@ impl SketchGpuiView {
         if let Some(c) = self.agent_mut() {
             c.editor.begin_insert();
             if count >= 6 {
-                c.status = Some(
-                    format!("{count} sessions active — each uses ~100MB").into(),
-                );
+                c.status = Some(format!("{count} sessions active — each uses ~100MB").into());
             }
         }
         self.save_agent_ring();
@@ -11962,9 +12002,8 @@ impl SketchGpuiView {
         if self.session_server.is_some() {
             // Server path: placeholder + create-only round-trip (NO resolve /
             // reattach — that is the whole point of "fresh").
-            let placeholder = AgentState::new_server_managed(Some(
-                "connecting to session server…".into(),
-            ));
+            let placeholder =
+                AgentState::new_server_managed(Some("connecting to session server…".into()));
             let open_token = alloc_open_token();
             ring.push(label.clone(), placeholder, None, slot_cwd.clone(), None);
             let server_pump = self.start_server_pump(cx);
@@ -12039,12 +12078,7 @@ impl SketchGpuiView {
     /// to the transcript, and spawn a fresh channel. The transcript
     /// is otherwise preserved so the user can scroll back through
     /// the prior session's history above the divider.
-    fn change_agent_cwd(
-        &mut self,
-        slot_index: usize,
-        new_cwd: PathBuf,
-        cx: &mut Context<Self>,
-    ) {
+    fn change_agent_cwd(&mut self, slot_index: usize, new_cwd: PathBuf, cx: &mut Context<Self>) {
         // Resolve slot position once; the index is monotonic so it
         // doesn't shift unless the slot was closed.
         let pos = match self.agent_ring().and_then(|r| r.slot_by_index(slot_index)) {
@@ -12062,10 +12096,7 @@ impl SketchGpuiView {
             slot.state.channel = None;
             slot.state.attach_pending = None;
             slot.state.turn_phase = TurnPhase::Idle;
-            let msg = format!(
-                "changing cwd to {}…",
-                shorten_cwd_for_display(&new_cwd),
-            );
+            let msg = format!("changing cwd to {}…", shorten_cwd_for_display(&new_cwd),);
             Self::append_system_notice(&mut slot.state, &msg);
             slot.state.status = Some(msg.into());
             slot.cwd = new_cwd.clone();
@@ -12083,7 +12114,9 @@ impl SketchGpuiView {
             // sid into this slot (by its monotonic `slot_index`) when ready.
             let old_sid = {
                 if let Some(ring) = self.agent_ring_mut() {
-                    ring.slots.get_mut(pos).and_then(|s| s.server_session_id.take())
+                    ring.slots
+                        .get_mut(pos)
+                        .and_then(|s| s.server_session_id.take())
                 } else {
                     None
                 }
@@ -12092,18 +12125,18 @@ impl SketchGpuiView {
                 self.spawn_close_session(old_sid, cx);
             }
             let open_token = alloc_open_token();
-            if let Some(ring) = self.agent_ring_mut() {
-                if let Some(slot) = ring.slots.get_mut(pos) {
-                    slot.state.attach_pending = None;
-                    slot.state.channel = None;
-                    slot.pending_open_token = Some(open_token);
-                    let msg = format!(
-                        "cwd → {}, connecting to fresh session…",
-                        shorten_cwd_for_display(&new_cwd),
-                    );
-                    Self::append_system_notice(&mut slot.state, &msg);
-                    slot.state.status = Some(msg.into());
-                }
+            if let Some(ring) = self.agent_ring_mut()
+                && let Some(slot) = ring.slots.get_mut(pos)
+            {
+                slot.state.attach_pending = None;
+                slot.state.channel = None;
+                slot.pending_open_token = Some(open_token);
+                let msg = format!(
+                    "cwd → {}, connecting to fresh session…",
+                    shorten_cwd_for_display(&new_cwd),
+                );
+                Self::append_system_notice(&mut slot.state, &msg);
+                slot.state.status = Some(msg.into());
             }
             self.spawn_create_agent_session(
                 open_token,
@@ -12114,23 +12147,15 @@ impl SketchGpuiView {
         } else {
             // Direct-spawn path: graft a throwaway AgentState's
             // channel + pump into the existing slot.
-            let fresh = self.create_agent_session(
-                None,
-                new_cwd.clone(),
-                slot_index,
-                cx,
-            );
-            if let Some(ring) = self.agent_ring_mut() {
-                if let Some(slot) = ring.slots.get_mut(pos) {
-                    slot.state.attach_pending = fresh.attach_pending;
-                    slot.state._pump = fresh._pump;
-                    let msg = format!(
-                        "cwd → {}, fresh session",
-                        shorten_cwd_for_display(&new_cwd),
-                    );
-                    Self::append_system_notice(&mut slot.state, &msg);
-                    slot.state.status = Some(msg.into());
-                }
+            let fresh = self.create_agent_session(None, new_cwd.clone(), slot_index, cx);
+            if let Some(ring) = self.agent_ring_mut()
+                && let Some(slot) = ring.slots.get_mut(pos)
+            {
+                slot.state.attach_pending = fresh.attach_pending;
+                slot.state._pump = fresh._pump;
+                let msg = format!("cwd → {}, fresh session", shorten_cwd_for_display(&new_cwd),);
+                Self::append_system_notice(&mut slot.state, &msg);
+                slot.state.status = Some(msg.into());
             }
         }
 
@@ -12289,8 +12314,7 @@ impl SketchGpuiView {
             // so the idle path doesn't grab the model lock every 16ms.
             let anim_period = Duration::from_millis(120);
             let mut last_anim = std::time::Instant::now();
-            let mut wake_rx: Option<futures::channel::mpsc::UnboundedReceiver<()>> =
-                None;
+            let mut wake_rx: Option<futures::channel::mpsc::UnboundedReceiver<()>> = None;
             loop {
                 let cycle_start = std::time::Instant::now();
                 if wake_rx.is_some() {
@@ -12305,23 +12329,21 @@ impl SketchGpuiView {
                 } else {
                     cx.background_executor().timer(idle_delay).await;
                     let _ = this.update(cx, |this, _cx| {
-                        if let Some(ring) = this.agent_ring_mut() {
-                            if let Some(slot) = ring.slot_by_index_mut(session_index) {
-                                if let Some(ch) = &slot.state.channel {
-                                    wake_rx = ch.take_wake_receiver();
-                                }
-                            }
+                        if let Some(ring) = this.agent_ring_mut()
+                            && let Some(slot) = ring.slot_by_index_mut(session_index)
+                            && let Some(ch) = &slot.state.channel
+                        {
+                            wake_rx = ch.take_wake_receiver();
                         }
                     });
                 }
                 loop {
                     let t_apply = perf_enabled().then(std::time::Instant::now);
-                    let more = match this.update(cx, |this, cx| {
-                        this.pump_session(session_index, cx)
-                    }) {
-                        Ok(more) => more,
-                        Err(_) => return,
-                    };
+                    let more =
+                        match this.update(cx, |this, cx| this.pump_session(session_index, cx)) {
+                            Ok(more) => more,
+                            Err(_) => return,
+                        };
                     if let Some(t) = t_apply {
                         eprintln!(
                             "[perf] acp-pump drain+apply lock_held={:.2}ms more={more}",
@@ -12345,9 +12367,7 @@ impl SketchGpuiView {
                 }
                 let elapsed = cycle_start.elapsed();
                 if elapsed < min_cycle {
-                    cx.background_executor()
-                        .timer(min_cycle - elapsed)
-                        .await;
+                    cx.background_executor().timer(min_cycle - elapsed).await;
                 }
             }
         });
@@ -12358,11 +12378,7 @@ impl SketchGpuiView {
             attach_pending: Some(attach_rx),
             mode: EditMode::Insert,
             keybinds: KeybindManager::default(),
-            list_state: gpui::ListState::new(
-                0,
-                gpui::ListAlignment::Bottom,
-                gpui::px(256.0),
-            ),
+            list_state: gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0)),
             list_item_count: 0,
             status: Some("attaching to ACP agent…".into()),
             turn_phase: TurnPhase::Idle,
@@ -12395,7 +12411,6 @@ impl SketchGpuiView {
         setup_list_follow_handler(&state.list_state, &state.follow_output);
         state
     }
-
 
     /// Re-establish the session-server connection after a drop, then
     /// re-subscribe every live slot. Returns the fresh notification + wake
@@ -12525,8 +12540,8 @@ impl SketchGpuiView {
                 });
                 let (handle, sids) = match collected {
                     Ok((Some(handle), sids)) if !sids.is_empty() => (handle, sids),
-                    Ok(_) => continue,    // no server or nothing to beat
-                    Err(_) => break,      // view dropped: stop the beater
+                    Ok(_) => continue, // no server or nothing to beat
+                    Err(_) => break,   // view dropped: stop the beater
                 };
                 if !handle.is_connected() {
                     continue; // pump's reconnect path will re-attach
@@ -12571,8 +12586,8 @@ impl SketchGpuiView {
         // live owner's lease never falsely expires.
         self.start_lease_heartbeat(cx);
         cx.spawn(async move |this, cx| {
-            use futures::stream::StreamExt;
             use futures::FutureExt;
+            use futures::stream::StreamExt;
 
             // Take exclusive ownership of the notification + wake receivers
             // once (Phase 2 of spec-pump-fix-synthesis.md). Channel reads
@@ -12581,9 +12596,9 @@ impl SketchGpuiView {
             // keystrokes and render. After this, the loop only takes the lock
             // to *apply* a pre-drained batch.
             let (mut note_rx, mut wake_rx) = match this.update(cx, |this, _cx| {
-                this.session_server.as_mut().map(|s| {
-                    (s.take_notification_receiver(), s.take_wake_receiver())
-                })
+                this.session_server
+                    .as_mut()
+                    .map(|s| (s.take_notification_receiver(), s.take_wake_receiver()))
             }) {
                 Ok(Some((Some(rx), wake))) => (rx, wake),
                 // No server, or receivers already taken — nothing to pump.
@@ -12645,8 +12660,8 @@ impl SketchGpuiView {
                 // re-attach every slot so the durable session resumes.
                 if wake_rx.is_none() {
                     let now = std::time::Instant::now();
-                    let due = last_reconnect
-                        .map_or(true, |t| now.duration_since(t) >= reconnect_backoff);
+                    let due =
+                        last_reconnect.is_none_or(|t| now.duration_since(t) >= reconnect_backoff);
                     if due {
                         last_reconnect = Some(now);
                         match this.update(cx, |this, cx| this.reconnect_session_server(cx)) {
@@ -12660,7 +12675,7 @@ impl SketchGpuiView {
                                 last_reconnect = None;
                                 let _ = this.update(cx, |_t, cx| cx.notify());
                             }
-                            Ok(None) => {} // still down — retry after backoff
+                            Ok(None) => {}    // still down — retry after backoff
                             Err(_) => return, // view dropped
                         }
                     }
@@ -12735,18 +12750,14 @@ impl SketchGpuiView {
     /// search the whole workspace — not just the active tab — or a session
     /// living in a background tab silently drops its streamed output. The
     /// scan is cheap: a handful of tabs × panes × slots.
-    fn with_server_session_slot(
-        &mut self,
-        sid: &str,
-        mut f: impl FnMut(&mut AgentSlot),
-    ) -> bool {
+    fn with_server_session_slot(&mut self, sid: &str, mut f: impl FnMut(&mut AgentSlot)) -> bool {
         for tab in self.workspace.tabs.iter_mut() {
             let found = tab.layout.find_map_leaf_content_mut(&mut |content| {
-                if let WindowContent::Agent(ring) = content {
-                    if let Some(slot) = ring.slot_by_server_session_id_mut(sid) {
-                        f(slot);
-                        return Some(());
-                    }
+                if let WindowContent::Agent(ring) = content
+                    && let Some(slot) = ring.slot_by_server_session_id_mut(sid)
+                {
+                    f(slot);
+                    return Some(());
                 }
                 None
             });
@@ -12769,11 +12780,11 @@ impl SketchGpuiView {
         let mut count = 0;
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
-                if let WindowContent::Agent(ring) = content {
-                    if let Some(slot) = ring.slot_by_server_session_id_mut(sid) {
-                        f(slot);
-                        count += 1;
-                    }
+                if let WindowContent::Agent(ring) = content
+                    && let Some(slot) = ring.slot_by_server_session_id_mut(sid)
+                {
+                    f(slot);
+                    count += 1;
                 }
             });
         }
@@ -12845,8 +12856,7 @@ impl SketchGpuiView {
         // This GUI's stable lease client_id, for the LeaseChanged check below
         // (released == unleased OR held by us). Captured up front so the
         // per-note loop doesn't re-borrow `session_server`.
-        let my_client_id: Option<String> =
-            self.session_server.as_ref().map(|s| s.client_id());
+        let my_client_id: Option<String> = self.session_server.as_ref().map(|s| s.client_id());
         let mut ready_change: Option<bool> = None;
 
         let warn_unrouted = |routed: bool, sid: &str| {
@@ -12998,7 +13008,11 @@ impl SketchGpuiView {
                 // (or both) delivers it. `generation` is now consumed: the
                 // ledger key matches the reducer's, so a forwarded boundary and
                 // this legacy one for the same channel/turn collapse.
-                ServerNotification::TurnEnded { session_id, turn_count, generation } => {
+                ServerNotification::TurnEnded {
+                    session_id,
+                    turn_count,
+                    generation,
+                } => {
                     let routed = self.with_server_session_slot(&session_id, |slot| {
                         let claude = &mut slot.state;
                         // Turn boundary: clear last-inserted so the next turn's
@@ -13009,7 +13023,11 @@ impl SketchGpuiView {
                         // the reducer hasn't observed a generation yet (gen 0,
                         // pre-rebaseline) use the slot's current one so the two
                         // streams' ledger keys agree.
-                        let gen_ = if generation > 0 { generation } else { claude.generation };
+                        let gen_ = if generation > 0 {
+                            generation
+                        } else {
+                            claude.generation
+                        };
                         // Bug 3: key the ledger on the SAME basis as the forwarded
                         // `Agent { TurnEnded }` reducer arm, which uses the 0-based
                         // envelope `turn` (the server sets `completed_turn =
@@ -13042,7 +13060,10 @@ impl SketchGpuiView {
                     });
                     warn_unrouted(routed, &session_id);
                 }
-                ServerNotification::SessionAttached { session_id, acp_session_id } => {
+                ServerNotification::SessionAttached {
+                    session_id,
+                    acp_session_id,
+                } => {
                     let routed = self.with_server_session_slot(&session_id, |slot| {
                         let label = acp_session_id.as_deref().unwrap_or("connected");
                         let msg = format!("attached: {label}");
@@ -13066,7 +13087,7 @@ impl SketchGpuiView {
                         // succeed, so the candidate may take over.
                         let released = lease
                             .as_ref()
-                            .map_or(true, |l| Some(&l.client_id) == my_client_id.as_ref());
+                            .is_none_or(|l| Some(&l.client_id) == my_client_id.as_ref());
                         ready_change = Some(released);
                         self.with_server_session_slot(&session_id, |slot| {
                             let msg = if released {
@@ -13149,14 +13170,14 @@ impl SketchGpuiView {
             let mut found = None;
             for tab in self.workspace.tabs.iter_mut() {
                 found = tab.layout.find_map_leaf_content_mut(&mut |content| {
-                    if let WindowContent::Agent(ring) = content {
-                        if let Some(slot) = ring.slot_by_index_mut(session_index) {
-                            // SAFETY: pointer is valid for the scoped-borrow
-                            // block below — we don't structurally mutate the
-                            // layout.
-                            let ptr = &mut slot.state as *mut AgentState;
-                            return Some(ptr);
-                        }
+                    if let WindowContent::Agent(ring) = content
+                        && let Some(slot) = ring.slot_by_index_mut(session_index)
+                    {
+                        // SAFETY: pointer is valid for the scoped-borrow
+                        // block below — we don't structurally mutate the
+                        // layout.
+                        let ptr = &mut slot.state as *mut AgentState;
+                        return Some(ptr);
                     }
                     None
                 });
@@ -13238,10 +13259,13 @@ impl SketchGpuiView {
                     }
                 }
                 if events.len() == PUMP_EVENT_BUDGET {
-                    more_pending = client.try_recv().map(|ev| {
-                        events.push(ev);
-                        true
-                    }).unwrap_or(false);
+                    more_pending = client
+                        .try_recv()
+                        .map(|ev| {
+                            events.push(ev);
+                            true
+                        })
+                        .unwrap_or(false);
                 }
                 current_turns = client.turn_count();
             }
@@ -13329,9 +13353,7 @@ impl SketchGpuiView {
             claude.editor.programmatic_insert(eof, "\n");
         }
         let notice_line = format!("― {msg}\n");
-        claude
-            .editor
-            .append_llm_chunk(TurnId::System, &notice_line);
+        claude.editor.append_llm_chunk(TurnId::System, &notice_line);
     }
 
     /// Apply a batch of reply events to the AgentState. Text chunks are
@@ -13605,10 +13627,8 @@ impl SketchGpuiView {
                     existing.update(upd.fields.clone());
                     cap_tool_call_payloads(existing);
                 } else {
-                    let mut tc = sketch::acp_channel::ToolCall::new(
-                        upd.tool_call_id.clone(),
-                        String::new(),
-                    );
+                    let mut tc =
+                        sketch::acp_channel::ToolCall::new(upd.tool_call_id.clone(), String::new());
                     tc.update(upd.fields.clone());
                     cap_tool_call_payloads(&mut tc);
                     let anchor = anchor_for_new_tool_call(&mut claude.editor);
@@ -13677,7 +13697,10 @@ impl SketchGpuiView {
                         // turn (it is a boundary, not a transient Notice).
                         claude.status = Some(msg.clone().into());
                         claude.replay_turns.last_seen = turn;
-                        AgentEventEffect::TurnEnded { generation: event.generation, turn }
+                        AgentEventEffect::TurnEnded {
+                            generation: event.generation,
+                            turn,
+                        }
                     }
                     TurnOutcome::Completed
                     | TurnOutcome::Cancelled
@@ -13686,11 +13709,17 @@ impl SketchGpuiView {
                         // The live counter follows the forwarded turn so the
                         // next turn numbers correctly even with inference off.
                         claude.replay_turns.last_seen = turn;
-                        AgentEventEffect::TurnEnded { generation: event.generation, turn }
+                        AgentEventEffect::TurnEnded {
+                            generation: event.generation,
+                            turn,
+                        }
                     }
                 }
             }
-            AgentEventKind::CompactedSummary { through_turn, summary } => {
+            AgentEventKind::CompactedSummary {
+                through_turn,
+                summary,
+            } => {
                 // EXPLICIT arm (spec §7): the in-memory ring trimmed a prefix
                 // and surfaced this marker instead of a silent gap. Render a
                 // deterministic placeholder so a from-base rebuild shows
@@ -13773,7 +13802,10 @@ impl SketchGpuiView {
         // the existing AgentState because the underlying screen
         // (browser/doc) is also stashed there — preserving it is the
         // job of open_agent_inner via the prior-screen swap dance.
-        if matches!(self.workspace.focused_content().expect("no focused window"), WindowContent::Agent(_)) {
+        if matches!(
+            self.workspace.focused_content().expect("no focused window"),
+            WindowContent::Agent(_)
+        ) {
             // Restore underlying first so open_agent_inner can capture
             // it as the new "prior" screen. Otherwise we'd lose the
             // file/browser the user was viewing before they opened
@@ -13813,7 +13845,8 @@ impl SketchGpuiView {
         let next = current.next();
         let sid = self.active_server_session_id();
 
-        let server_result: Option<std::io::Result<()>> = match (&sid, self.session_server.as_ref()) {
+        let server_result: Option<std::io::Result<()>> = match (&sid, self.session_server.as_ref())
+        {
             (Some(sid), Some(server)) => Some(server.set_permission_mode(sid, next)),
             _ => None,
         };
@@ -13835,8 +13868,7 @@ impl SketchGpuiView {
                 }
                 Err(e) => {
                     if let Some(claude) = self.agent_mut() {
-                        claude.status =
-                            Some(format!("permission mode change failed: {e}").into());
+                        claude.status = Some(format!("permission mode change failed: {e}").into());
                     }
                 }
             }
@@ -13897,12 +13929,12 @@ impl SketchGpuiView {
     /// `resume_id` so persistence captures the new channel's id once it
     /// binds (rather than retrying the original-load id forever).
     fn attach_active_agent_session(&mut self, cx: &mut Context<Self>) {
-        if let Some(c) = self.agent_mut() {
-            if c.channel.is_some() || c.attach_pending.is_some() {
-                c.status = Some("session is already attached".into());
-                cx.notify();
-                return;
-            }
+        if let Some(c) = self.agent_mut()
+            && (c.channel.is_some() || c.attach_pending.is_some())
+        {
+            c.status = Some("session is already attached".into());
+            cx.notify();
+            return;
         }
 
         // Use the active slot's per-session cwd (spec-agent-cwd.md §3)
@@ -13939,11 +13971,11 @@ impl SketchGpuiView {
 
     /// Quit-and-relaunch sketch with the auto-open-claude flag set, so the
     /// new process boots straight into the claude screen and restores every
-    /// session that was in the ring at quit time via `load_persisted_acp_sessions`
-    /// + per-slot `spawn_with_resume`. Designed for "I broke something in
-    /// sketch and want to keep iterating with the same Claude context" —
-    /// the user's chat history (on the agent side) is preserved through
-    /// `session/load`.
+    /// session that was in the ring at quit time via
+    /// `load_persisted_acp_sessions` plus per-slot `spawn_with_resume`.
+    /// Designed for "I broke something in sketch and want to keep iterating
+    /// with the same Claude context" — the user's chat history (on the agent
+    /// side) is preserved through `session/load`.
     ///
     /// Spawns the child detached from the parent's stdio so the new GUI
     /// stays alive after `cx.quit()` tears down the current window. Args
@@ -14002,10 +14034,10 @@ impl SketchGpuiView {
     /// keeps focus pinned to the same sub-agent regardless of how the
     /// derived `subagents()` list is ordered (ADR-0006 quick win #1).
     fn focus_subagent(&mut self, key: ToolCallKey, cx: &mut Context<Self>) {
-        if let Some(c) = self.agent_mut() {
-            if c.tools.calls.contains_key(&key) {
-                c.focused_subagent = Some(key);
-            }
+        if let Some(c) = self.agent_mut()
+            && c.tools.calls.contains_key(&key)
+        {
+            c.focused_subagent = Some(key);
         }
         cx.notify();
     }
@@ -14048,22 +14080,16 @@ impl SketchGpuiView {
                     // appended draft starts on its own line, then drop
                     // the trailing newline of `text` so we don't leave a
                     // dangling blank below the cursor.
-                    let needs_nl = !claude
-                        .editor
-                        .document()
-                        .full_text()
-                        .ends_with('\n');
+                    let needs_nl = !claude.editor.document().full_text().ends_with('\n');
                     let eof = claude.editor.document().rope().len_chars();
                     if needs_nl {
                         claude.editor.programmatic_insert(eof, "\n");
                     }
-                    let to_append =
-                        text.strip_suffix('\n').unwrap_or(&text).to_string();
+                    let to_append = text.strip_suffix('\n').unwrap_or(&text).to_string();
                     let eof2 = claude.editor.document().rope().len_chars();
                     claude.editor.programmatic_insert(eof2, &to_append);
                     let new_eof = claude.editor.document().rope().len_chars();
-                    let (cl, cc) =
-                        doc_char_to_line_col(claude.editor.document(), new_eof);
+                    let (cl, cc) = doc_char_to_line_col(claude.editor.document(), new_eof);
                     claude.editor.cursor_mut().line = cl;
                     claude.editor.cursor_mut().col = cc;
                 }
@@ -14111,10 +14137,10 @@ impl SketchGpuiView {
         let mut awaiting = false;
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
-                if let WindowContent::Agent(ring) = content {
-                    if ring.slots.iter().any(|s| s.state.turn_phase.is_awaiting()) {
-                        awaiting = true;
-                    }
+                if let WindowContent::Agent(ring) = content
+                    && ring.slots.iter().any(|s| s.state.turn_phase.is_awaiting())
+                {
+                    awaiting = true;
                 }
             });
         }
@@ -14345,7 +14371,8 @@ impl SketchGpuiView {
         let sent = if let Some(sid) = &server_sid {
             // Server path: prompt via session server (fire-and-forget; `Ok`
             // means written, not accepted — ownership is reasserted on resume).
-            self.session_server.as_ref()
+            self.session_server
+                .as_ref()
                 .and_then(|s| s.prompt(sid, &prompt_body).ok())
                 .is_some()
         } else if let Some(claude) = self.agent_mut() {
@@ -14418,7 +14445,8 @@ impl SketchGpuiView {
             // rejection is invisible here). Ownership is instead guaranteed on
             // resume by the retrying attach in `spawn_attach_sessions`, so by
             // the time the user can type, this connection owns the session.
-            self.session_server.as_ref()
+            self.session_server
+                .as_ref()
                 .and_then(|s| s.prompt(sid, &prompt_body).ok())
                 .is_some()
         } else if let Some(claude) = self.agent_mut() {
@@ -14460,12 +14488,7 @@ impl SketchGpuiView {
     /// `Ctrl-V` leave, session-cycle `Ctrl-]`/`Ctrl-[`) before routing
     /// remaining keys to either the chatbox (in Chatbox mode) or the
     /// transcript editor (in Worksheet mode). See spec-agent-window.md §32.
-    fn handle_claude_key(
-        &mut self,
-        ev: &KeyDownEvent,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_claude_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
         let press = keystroke_to_keypress(&ev.keystroke);
 
         // Session switcher overlay intercepts all keys when open.
@@ -14643,7 +14666,7 @@ impl SketchGpuiView {
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
                 // Ignore bare modifier presses (shift, ctrl, etc.) — only
                 // dismiss on a real key.
-                let modifier_only = ev.keystroke.key.as_str().is_empty()
+                let modifier_only = ev.keystroke.key.is_empty()
                     || matches!(
                         ev.keystroke.key.as_str(),
                         "shift" | "control" | "alt" | "meta" | "fn"
@@ -14655,10 +14678,13 @@ impl SketchGpuiView {
                 cx.notify();
                 cx.stop_propagation();
             }))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _w, cx| {
-                this.splash_until = None;
-                cx.notify();
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseDownEvent, _w, cx| {
+                    this.splash_until = None;
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .flex()
@@ -14701,10 +14727,10 @@ impl Render for SketchGpuiView {
         self.viewport_width_px = f32::from(_window.viewport_size().width);
 
         // Auto-clear expired splash.
-        if let Some(deadline) = self.splash_until {
-            if std::time::Instant::now() >= deadline {
-                self.splash_until = None;
-            }
+        if let Some(deadline) = self.splash_until
+            && std::time::Instant::now() >= deadline
+        {
+            self.splash_until = None;
         }
         if self.splash_until.is_some() {
             return self.render_splash(cx);
@@ -14895,9 +14921,9 @@ impl Render for SketchGpuiView {
     }
 }
 
-/// Test-only counter of how many `block_element`s the virtualized doc list
-/// builds. The latency gate (verify_harness) asserts this stays O(visible) —
-/// a few dozen for a 3000-block doc — proving render is no longer O(document).
+// Test-only counter of how many `block_element`s the virtualized doc list
+// builds. The latency gate (verify_harness) asserts this stays O(visible) —
+// a few dozen for a 3000-block doc — proving render is no longer O(document).
 #[cfg(test)]
 thread_local! {
     static DOC_BLOCK_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -14927,12 +14953,7 @@ thread_local! {
 }
 
 impl SketchGpuiView {
-    fn render_doc(
-        &self,
-        root: gpui::Div,
-        d: &DocState,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    fn render_doc(&self, root: gpui::Div, d: &DocState, cx: &mut Context<Self>) -> gpui::Div {
         // Clear the per-render layout sink before re-emitting lines. Mouse
         // hit-testing reads this map between renders, so stale entries from
         // a now-removed block would otherwise leak through.
@@ -15146,12 +15167,7 @@ impl SketchGpuiView {
             .child(footer)
     }
 
-    fn render_edit(
-        &self,
-        root: gpui::Div,
-        e: &mut EditState,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    fn render_edit(&self, root: gpui::Div, e: &mut EditState, cx: &mut Context<Self>) -> gpui::Div {
         let cursor = e.editor.cursor();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
@@ -15186,7 +15202,10 @@ impl SketchGpuiView {
             .bg(bg_or(top, STATUS_BG))
             .text_color(fg_or(top, STATUS_FG))
             .font_weight(FontWeight::BOLD)
-            .child(format!("sketch-gpui [{}] — {}", header_view_label, e.file_label))
+            .child(format!(
+                "sketch-gpui [{}] — {}",
+                header_view_label, e.file_label
+            ))
             .child(self.multi_home_dot(e.file_label.as_ref()));
 
         let dirty_mark = if e.editor.is_modified() { "•" } else { " " };
@@ -15194,7 +15213,11 @@ impl SketchGpuiView {
         let sel_size: Option<usize> = e.editor.selection_range().map(|((sl, sc), (el, ec))| {
             // Cheap size summary: char count for single-line, line count otherwise.
             // Mirrors the kind of one-glance status the user wants in the footer.
-            if sl == el { ec.saturating_sub(sc) } else { (el - sl) + 1 }
+            if sl == el {
+                ec.saturating_sub(sc)
+            } else {
+                (el - sl) + 1
+            }
         });
         let mut left_status = format!(
             "{} {} {}{} · L{}:C{}",
@@ -15327,10 +15350,10 @@ impl SketchGpuiView {
                 .unwrap_or_else(|| vec![(line_str.clone(), base_style)]);
             if let Some(sel) = sel {
                 let line_chars = line_str.chars().count();
-                if let Some((s, e_col)) = line_selection_range(sel, line_idx, line_chars) {
-                    if e_col > s {
-                        segs = apply_selection_bg(&segs, s, e_col, SELECTION_BG);
-                    }
+                if let Some((s, e_col)) = line_selection_range(sel, line_idx, line_chars)
+                    && e_col > s
+                {
+                    segs = apply_selection_bg(&segs, s, e_col, SELECTION_BG);
                 }
             }
 
@@ -15353,7 +15376,12 @@ impl SketchGpuiView {
                 &code_font,
             );
 
-            div().flex().flex_row().child(gutter).child(content).into_any_element()
+            div()
+                .flex()
+                .flex_row()
+                .child(gutter)
+                .child(content)
+                .into_any_element()
         };
 
         div()
@@ -15437,7 +15465,10 @@ impl SketchGpuiView {
 
         let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut App| -> AnyElement {
             let line_str = lines_snap.get(line_idx).cloned().unwrap_or_default();
-            let kind = kinds.get(line_idx).copied().unwrap_or(WpLineKind::Paragraph);
+            let kind = kinds
+                .get(line_idx)
+                .copied()
+                .unwrap_or(WpLineKind::Paragraph);
 
             let mut segs = hl_snap
                 .get(line_idx)
@@ -15445,10 +15476,10 @@ impl SketchGpuiView {
                 .unwrap_or_else(|| vec![(line_str.clone(), base_style)]);
             if let Some(sel) = sel {
                 let line_chars = line_str.chars().count();
-                if let Some((s, e_col)) = line_selection_range(sel, line_idx, line_chars) {
-                    if e_col > s {
-                        segs = apply_selection_bg(&segs, s, e_col, SELECTION_BG);
-                    }
+                if let Some((s, e_col)) = line_selection_range(sel, line_idx, line_chars)
+                    && e_col > s
+                {
+                    segs = apply_selection_bg(&segs, s, e_col, SELECTION_BG);
                 }
             }
 
@@ -15462,9 +15493,7 @@ impl SketchGpuiView {
                 WpLineKind::Heading(4) => (16.0, FontWeight::BOLD, 5.0),
                 WpLineKind::Heading(5) => (15.0, FontWeight::BOLD, 4.0),
                 WpLineKind::Heading(_) => (14.0, FontWeight::BOLD, 4.0),
-                WpLineKind::CodeFence | WpLineKind::CodeContent => {
-                    (13.0, FontWeight::NORMAL, 0.0)
-                }
+                WpLineKind::CodeFence | WpLineKind::CodeContent => (13.0, FontWeight::NORMAL, 0.0),
                 WpLineKind::TableRow => (13.0, FontWeight::NORMAL, 0.0),
                 _ => (14.0, FontWeight::NORMAL, 0.0),
             };
@@ -15547,20 +15576,20 @@ impl SketchGpuiView {
             )
     }
 
-    /// Render a single ACP tool call as a collapsible block. The
-    /// expanded body honours a per-tool render policy that mirrors the
-    /// Claude Code TUI:
-    ///
-    /// - `Read` / `Search` / `SwitchMode` and `TodoWrite`: header only.
-    ///   The model gets the data; the user only needs to know the action
-    ///   happened. Click does nothing for these (no body to expand).
-    /// - `Execute` (Bash): show the first 3 lines of output + a "+N more"
-    ///   marker — same `tb1 = 3` cap the TUI uses (`Tw9` in cli.js).
-    /// - `Fetch`: 10 lines (web fetches are usually short HTML excerpts).
-    /// - `Edit` / `Move` / `Delete`: full diff/content — the visible
-    ///   change is the whole point.
-    /// - `Think` (subagents) / `Other` (MCP tools): full content.
-    ///
+    // Render a single ACP tool call as a collapsible block. The
+    // expanded body honours a per-tool render policy that mirrors the
+    // Claude Code TUI:
+    //
+    // - `Read` / `Search` / `SwitchMode` and `TodoWrite`: header only.
+    //   The model gets the data; the user only needs to know the action
+    //   happened. Click does nothing for these (no body to expand).
+    // - `Execute` (Bash): show the first 3 lines of output + a "+N more"
+    //   marker — same `tb1 = 3` cap the TUI uses (`Tw9` in cli.js).
+    // - `Fetch`: 10 lines (web fetches are usually short HTML excerpts).
+    // - `Edit` / `Move` / `Delete`: full diff/content — the visible
+    //   change is the whole point.
+    // - `Think` (subagents) / `Other` (MCP tools): full content.
+    //
     // The previous `build_tool_block` / `tool_body_pane` lived here as
     // `&self` methods. They've been replaced by the free-function
     // `build_tool_block_with_weak` / `tool_body_pane_free` further up
@@ -15655,10 +15684,12 @@ impl SketchGpuiView {
         // the two paths are directly comparable.
         let t_hl0 = perf.then(std::time::Instant::now);
         let hl_snap: std::rc::Rc<Vec<std::rc::Rc<LineHl>>> = if hl_cache_enabled() {
-            c.highlight_cache.snapshot_syn(lines, &self.theme, edit_seq, &self.syntect_hl)
+            c.highlight_cache
+                .snapshot_syn(lines, &self.theme, edit_seq, &self.syntect_hl)
         } else {
             let raw = highlight_markdown_lines_syn(lines, &self.theme, &self.syntect_hl);
-            let stripped = highlight_markdown_lines_stripped_syn(lines, &self.theme, &self.syntect_hl);
+            let stripped =
+                highlight_markdown_lines_stripped_syn(lines, &self.theme, &self.syntect_hl);
             std::rc::Rc::new(
                 raw.into_iter()
                     .zip(stripped)
@@ -15671,7 +15702,10 @@ impl SketchGpuiView {
         let perf_hl_ms = t_hl0.map(|t| t.elapsed().as_secs_f64() * 1e3);
         let perf_extract_ms = t_extract.map(|d| d.as_secs_f64() * 1e3);
         let (perf_recomputed, perf_skip) = if hl_cache_enabled() {
-            (c.highlight_cache.last_recomputed, c.highlight_cache.last_was_skip)
+            (
+                c.highlight_cache.last_recomputed,
+                c.highlight_cache.last_was_skip,
+            )
         } else {
             (lines.len(), false)
         };
@@ -15708,237 +15742,240 @@ impl SketchGpuiView {
         let (flat_items_arc, gutter_tag_snap) = match c.view_model.cached(view_model_fp) {
             Some(hit) => hit,
             None => {
+                // Per-line gutter tag, sourced from the editor's `TurnId` metadata
+                // keyed by `LineAnchor` (spec §11, §E2). Lines without a tag yet
+                // (currently-editable, not yet swept by Submit) render as a blank
+                // gutter. Lines whose anchor hasn't been allocated count as
+                // untagged — happens for editable lines the user just typed.
+                // Hoist the metadata view out of the per-line loop: `metadata::<TurnId>()`
+                // does a HashMap-by-TypeId lookup and builds a fresh view each call, so
+                // calling it once per line was O(n) view constructions per frame. Build
+                // it once and reuse it across all lines.
+                let gutter_tag_per_line: Vec<Option<TurnId>> = {
+                    let turn_meta = c.editor.metadata::<TurnId>();
+                    (0..lines.len())
+                        .map(|i| {
+                            c.editor
+                                .anchor_for_line_opt(i)
+                                .and_then(|a| turn_meta.get(a).copied())
+                        })
+                        .collect()
+                };
 
-        // Per-line gutter tag, sourced from the editor's `TurnId` metadata
-        // keyed by `LineAnchor` (spec §11, §E2). Lines without a tag yet
-        // (currently-editable, not yet swept by Submit) render as a blank
-        // gutter. Lines whose anchor hasn't been allocated count as
-        // untagged — happens for editable lines the user just typed.
-        // Hoist the metadata view out of the per-line loop: `metadata::<TurnId>()`
-        // does a HashMap-by-TypeId lookup and builds a fresh view each call, so
-        // calling it once per line was O(n) view constructions per frame. Build
-        // it once and reuse it across all lines.
-        let gutter_tag_per_line: Vec<Option<TurnId>> = {
-            let turn_meta = c.editor.metadata::<TurnId>();
-            (0..lines.len())
-                .map(|i| {
-                    c.editor
-                        .anchor_for_line_opt(i)
-                        .and_then(|a| turn_meta.get(a).copied())
-                })
-                .collect()
-        };
+                // ============ Virtualised list build ============
+                //
+                // Frozen (agent) content is parsed into RenderedBlocks so that
+                // tables, code blocks, headings, and lists display properly.
+                // Editable (user) content stays as per-line rendering with
+                // cursor/selection support.
 
-        // ============ Virtualised list build ============
-        //
-        // Frozen (agent) content is parsed into RenderedBlocks so that
-        // tables, code blocks, headings, and lists display properly.
-        // Editable (user) content stays as per-line rendering with
-        // cursor/selection support.
-
-        // Build "tool calls anchored at line N" lookup, grouped by
-        // anchor line. All calls at the same anchor form one ToolGroup.
-        // Anchors are opaque `LineAnchor` ids (spec §E1); resolve via the
-        // editor each paint. Anchors whose line got consumed by a delete
-        // fall back to EOF so the tool block still renders, just at the
-        // tail of the transcript.
-        let eof_line = c.editor.document().line_count().saturating_sub(1);
-        let mut tools_at_line: std::collections::HashMap<usize, Vec<ToolCallKey>> =
-            std::collections::HashMap::new();
-        for id in &c.tools.order {
-            if let Some(&anchor) = c.tools.anchor.get(id) {
-                let line = c.editor.line_for_anchor(anchor).unwrap_or(eof_line);
-                tools_at_line.entry(line).or_default().push(id.clone());
-            }
-        }
-
-        // Detect tables and fenced code blocks in frozen content for
-        // block-level rendering. Everything else stays line-by-line.
-        // Cached: only re-detect/re-parse when frozen line count changes.
-        // (`frozen_ranges` / `frozen_line_count` were resolved above for the
-        // view-model fingerprint and are reused here.)
-        if frozen_line_count != c.view_model.block_cache_frozen_count {
-            let block_ranges = detect_block_ranges(lines, &frozen_ranges);
-            let mut new_cache: std::collections::HashMap<(usize, usize), RenderedBlock> =
-                std::collections::HashMap::new();
-            for &(start, end) in &block_ranges {
-                // Reuse existing cache entry if the range is unchanged. A
-                // range that `parse_block_range` rejects (`FallBackToLines`)
-                // gets NO cache entry, so the partition below renders its
-                // source lines individually (Finding 10, INV-10).
-                if let Some(cached) = c.view_model.block_cache.get(&(start, end)) {
-                    new_cache.insert((start, end), cached.clone());
-                } else if let BlockParse::Parsed(block) =
-                    parse_block_range(lines, start, end, theme_ref)
-                {
-                    new_cache.insert((start, end), block);
+                // Build "tool calls anchored at line N" lookup, grouped by
+                // anchor line. All calls at the same anchor form one ToolGroup.
+                // Anchors are opaque `LineAnchor` ids (spec §E1); resolve via the
+                // editor each paint. Anchors whose line got consumed by a delete
+                // fall back to EOF so the tool block still renders, just at the
+                // tail of the transcript.
+                let eof_line = c.editor.document().line_count().saturating_sub(1);
+                let mut tools_at_line: std::collections::HashMap<usize, Vec<ToolCallKey>> =
+                    std::collections::HashMap::new();
+                for id in &c.tools.order {
+                    if let Some(&anchor) = c.tools.anchor.get(id) {
+                        let line = c.editor.line_for_anchor(anchor).unwrap_or(eof_line);
+                        tools_at_line.entry(line).or_default().push(id.clone());
+                    }
                 }
-            }
-            c.block_ranges = block_ranges;
-            c.view_model.block_cache = new_cache;
-            c.view_model.block_cache_frozen_count = frozen_line_count;
-        }
 
-        // Build the block/line partition from ONE source: `block_cache` holds
-        // exactly the ranges that became a `Parsed` block. `block_at_start`
-        // (the line that emits a `FlatItem::Block`) and `in_block` (the
-        // interior lines that the Block subsumes) are derived from the same
-        // iteration, so `in_block` cannot disagree with what was emitted — a
-        // detected-but-unparsed range contributes neither, and the flat build
-        // falls back to a Line per source line (Finding 10, INV-10).
-        let block_ranges = c.block_ranges.clone();
-        let mut block_at_start: std::collections::HashMap<usize, RenderedBlock> =
-            std::collections::HashMap::new();
-        let mut in_block: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
-        for &(start, end) in &block_ranges {
-            if let Some(block) = c.view_model.block_cache.get(&(start, end)) {
-                block_at_start.insert(start, block.clone());
-                for li in start..end {
-                    in_block.insert(li);
+                // Detect tables and fenced code blocks in frozen content for
+                // block-level rendering. Everything else stays line-by-line.
+                // Cached: only re-detect/re-parse when frozen line count changes.
+                // (`frozen_ranges` / `frozen_line_count` were resolved above for the
+                // view-model fingerprint and are reused here.)
+                if frozen_line_count != c.view_model.block_cache_frozen_count {
+                    let block_ranges = detect_block_ranges(lines, &frozen_ranges);
+                    let mut new_cache: std::collections::HashMap<(usize, usize), RenderedBlock> =
+                        std::collections::HashMap::new();
+                    for &(start, end) in &block_ranges {
+                        // Reuse existing cache entry if the range is unchanged. A
+                        // range that `parse_block_range` rejects (`FallBackToLines`)
+                        // gets NO cache entry, so the partition below renders its
+                        // source lines individually (Finding 10, INV-10).
+                        if let Some(cached) = c.view_model.block_cache.get(&(start, end)) {
+                            new_cache.insert((start, end), cached.clone());
+                        } else if let BlockParse::Parsed(block) =
+                            parse_block_range(lines, start, end, theme_ref)
+                        {
+                            new_cache.insert((start, end), block);
+                        }
+                    }
+                    c.block_ranges = block_ranges;
+                    c.view_model.block_cache = new_cache;
+                    c.view_model.block_cache_frozen_count = frozen_line_count;
                 }
-            }
-        }
 
-        // Flat ordering: TurnHeader?, line_0, tool_group_at[0], line_1, …
-        // Lines inside a detected block range are replaced by one
-        // FlatItem::Block at the range start; interior lines are skipped.
-        // TurnHeader items are inserted at turn boundaries (role changes).
-        let mut flat_items: Vec<FlatItem> = Vec::with_capacity(lines.len() * 2);
-        let mut prev_turn: Option<TurnId> = None;
-        for line_idx in 0..lines.len() {
-            // Insert a TurnHeader whenever the dominant turn changes.
-            let cur_turn = gutter_tag_per_line.get(line_idx).copied().flatten();
-            // Tools and sketch-local System notices don't get their own header
-            // and don't break the current turn run — a notice landing mid-turn
-            // must not re-emit a Claude header (Finding 5, INV-3). The
-            // total `HeaderRole::from_turn` returns `None` for those, so the
-            // header-owning turn set `{Llm, User}` is enforced by the type
-            // rather than an `unreachable!()` arm (Finding 6).
-            if let Some(tid) = cur_turn {
-                if let Some(role) = HeaderRole::from_turn(tid) {
-                    let changed = match prev_turn {
-                        Some(prev) => prev != tid,
-                        None => true,
-                    };
-                    if changed {
-                        flat_items.push(FlatItem::TurnHeader {
-                            role: role.into_turn_role(),
+                // Build the block/line partition from ONE source: `block_cache` holds
+                // exactly the ranges that became a `Parsed` block. `block_at_start`
+                // (the line that emits a `FlatItem::Block`) and `in_block` (the
+                // interior lines that the Block subsumes) are derived from the same
+                // iteration, so `in_block` cannot disagree with what was emitted — a
+                // detected-but-unparsed range contributes neither, and the flat build
+                // falls back to a Line per source line (Finding 10, INV-10).
+                let block_ranges = c.block_ranges.clone();
+                let mut block_at_start: std::collections::HashMap<usize, RenderedBlock> =
+                    std::collections::HashMap::new();
+                let mut in_block: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                for &(start, end) in &block_ranges {
+                    if let Some(block) = c.view_model.block_cache.get(&(start, end)) {
+                        block_at_start.insert(start, block.clone());
+                        for li in start..end {
+                            in_block.insert(li);
+                        }
+                    }
+                }
+
+                // Flat ordering: TurnHeader?, line_0, tool_group_at[0], line_1, …
+                // Lines inside a detected block range are replaced by one
+                // FlatItem::Block at the range start; interior lines are skipped.
+                // TurnHeader items are inserted at turn boundaries (role changes).
+                let mut flat_items: Vec<FlatItem> = Vec::with_capacity(lines.len() * 2);
+                let mut prev_turn: Option<TurnId> = None;
+                for line_idx in 0..lines.len() {
+                    // Insert a TurnHeader whenever the dominant turn changes.
+                    let cur_turn = gutter_tag_per_line.get(line_idx).copied().flatten();
+                    // Tools and sketch-local System notices don't get their own header
+                    // and don't break the current turn run — a notice landing mid-turn
+                    // must not re-emit a Claude header (Finding 5, INV-3). The
+                    // total `HeaderRole::from_turn` returns `None` for those, so the
+                    // header-owning turn set `{Llm, User}` is enforced by the type
+                    // rather than an `unreachable!()` arm (Finding 6).
+                    if let Some(tid) = cur_turn {
+                        if let Some(role) = HeaderRole::from_turn(tid) {
+                            let changed = match prev_turn {
+                                Some(prev) => prev != tid,
+                                None => true,
+                            };
+                            if changed {
+                                flat_items.push(FlatItem::TurnHeader {
+                                    role: role.into_turn_role(),
+                                });
+                                prev_turn = Some(tid);
+                            }
+                        }
+                    } else if prev_turn.is_some() {
+                        // Editable (untagged) lines after frozen content = user input.
+                        // Suppress the "You" header when the editable tail is all
+                        // blank — in Chatbox mode the compose area is separate, so
+                        // an empty transcript tail is just whitespace, not a turn.
+                        let remaining_non_empty =
+                            (line_idx..lines.len()).any(|j| !lines[j].trim().is_empty());
+                        if remaining_non_empty {
+                            flat_items.push(FlatItem::TurnHeader {
+                                role: TurnRole::User,
+                            });
+                        }
+                        prev_turn = None;
+                    }
+
+                    if let Some(block) = block_at_start.remove(&line_idx) {
+                        flat_items.push(FlatItem::Block(block));
+                    } else if !in_block.contains(&line_idx) {
+                        flat_items.push(FlatItem::Line(line_idx));
+                    }
+                    // Tool groups anchored inside a block range still render.
+                    if let Some(ids) = tools_at_line.get(&line_idx) {
+                        flat_items.push(FlatItem::ToolGroup {
+                            anchor_line: line_idx,
+                            ids: ids.clone(),
                         });
-                        prev_turn = Some(tid);
                     }
                 }
-            } else if prev_turn.is_some() {
-                // Editable (untagged) lines after frozen content = user input.
-                // Suppress the "You" header when the editable tail is all
-                // blank — in Chatbox mode the compose area is separate, so
-                // an empty transcript tail is just whitespace, not a turn.
-                let remaining_non_empty = (line_idx..lines.len())
-                    .any(|j| !lines[j].trim().is_empty());
-                if remaining_non_empty {
-                    flat_items.push(FlatItem::TurnHeader {
-                        role: TurnRole::User,
-                    });
-                }
-                prev_turn = None;
-            }
 
-            if let Some(block) = block_at_start.remove(&line_idx) {
-                flat_items.push(FlatItem::Block(block));
-            } else if !in_block.contains(&line_idx) {
-                flat_items.push(FlatItem::Line(line_idx));
-            }
-            // Tool groups anchored inside a block range still render.
-            if let Some(ids) = tools_at_line.get(&line_idx) {
-                flat_items.push(FlatItem::ToolGroup {
-                    anchor_line: line_idx,
-                    ids: ids.clone(),
-                });
-            }
-        }
-
-        // Collapse blank lines: (a) strip blank frozen (Claude) Lines
-        // entirely — they're protocol padding with no visual purpose,
-        // (b) strip blank Lines adjacent to ToolGroup / TurnHeader /
-        // Block items, and (c) collapse runs of consecutive blank
-        // user Lines to at most one.
-        {
-            let is_blank_line = |item: &FlatItem| -> bool {
-                matches!(item, FlatItem::Line(idx) if lines.get(*idx).map_or(true, |s| s.trim().is_empty()))
-            };
-            let is_frozen_line = |item: &FlatItem| -> bool {
-                matches!(item, FlatItem::Line(idx) if frozen_ranges.iter().any(|&(s, e)| *idx >= s && *idx < e))
-            };
-            let is_structural = |item: &FlatItem| -> bool {
-                matches!(
-                    item,
-                    FlatItem::ToolGroup { .. }
-                        | FlatItem::TurnHeader { .. }
-                        | FlatItem::Block(_)
-                )
-            };
-            let mut keep = vec![true; flat_items.len()];
-            for i in 0..flat_items.len() {
-                if !is_blank_line(&flat_items[i]) {
-                    continue;
-                }
-                // Blank frozen lines are always stripped — they're just
-                // anchor padding inserted by the ACP splice logic.
-                if is_frozen_line(&flat_items[i]) {
-                    keep[i] = false;
-                    continue;
-                }
-                // Drop blank line if adjacent to a structural item.
-                let adj_structural = (i > 0 && is_structural(&flat_items[i - 1]))
-                    || (i + 1 < flat_items.len() && is_structural(&flat_items[i + 1]));
-                if adj_structural {
-                    keep[i] = false;
-                    continue;
-                }
-                // Collapse consecutive blanks to one.
-                if i > 0 && is_blank_line(&flat_items[i - 1]) && keep[i - 1] {
-                    keep[i] = false;
-                }
-            }
-            let mut j = 0;
-            for i in 0..flat_items.len() {
-                if keep[i] {
-                    flat_items.swap(i, j);
-                    j += 1;
-                }
-            }
-            flat_items.truncate(j);
-        }
-
-        // Coalesce a contiguous run of tool calls into ONE collapsible group
-        // so a long sequence (grep → grep → edit → read → …) doesn't flood the
-        // transcript. The blank anchor lines between adjacent tool calls were
-        // already stripped by the blank-collapse pass above, so a run shows up
-        // as directly-adjacent `ToolGroup`s; merge their ids into the first.
-        // Any prose Line, Block, or TurnHeader between two runs breaks the run
-        // (those are real content), so tool calls separated by agent text stay
-        // in separate groups. The merged group renders as a typed-count header
-        // (e.g. "4 grep, 3 edit, 7 read"), collapsed by default.
-        {
-            let mut merged: Vec<FlatItem> = Vec::with_capacity(flat_items.len());
-            for item in flat_items.drain(..) {
-                if let FlatItem::ToolGroup { ids, .. } = &item {
-                    if let Some(FlatItem::ToolGroup { ids: prev_ids, .. }) = merged.last_mut() {
-                        prev_ids.extend(ids.iter().cloned());
-                        continue;
+                // Collapse blank lines: (a) strip blank frozen (Claude) Lines
+                // entirely — they're protocol padding with no visual purpose,
+                // (b) strip blank Lines adjacent to ToolGroup / TurnHeader /
+                // Block items, and (c) collapse runs of consecutive blank
+                // user Lines to at most one.
+                {
+                    let is_blank_line = |item: &FlatItem| -> bool {
+                        matches!(item, FlatItem::Line(idx) if lines.get(*idx).is_none_or(|s| s.trim().is_empty()))
+                    };
+                    let is_frozen_line = |item: &FlatItem| -> bool {
+                        matches!(item, FlatItem::Line(idx) if frozen_ranges.iter().any(|&(s, e)| *idx >= s && *idx < e))
+                    };
+                    let is_structural = |item: &FlatItem| -> bool {
+                        matches!(
+                            item,
+                            FlatItem::ToolGroup { .. }
+                                | FlatItem::TurnHeader { .. }
+                                | FlatItem::Block(_)
+                        )
+                    };
+                    let mut keep = vec![true; flat_items.len()];
+                    for i in 0..flat_items.len() {
+                        if !is_blank_line(&flat_items[i]) {
+                            continue;
+                        }
+                        // Blank frozen lines are always stripped — they're just
+                        // anchor padding inserted by the ACP splice logic.
+                        if is_frozen_line(&flat_items[i]) {
+                            keep[i] = false;
+                            continue;
+                        }
+                        // Drop blank line if adjacent to a structural item.
+                        let adj_structural = (i > 0 && is_structural(&flat_items[i - 1]))
+                            || (i + 1 < flat_items.len() && is_structural(&flat_items[i + 1]));
+                        if adj_structural {
+                            keep[i] = false;
+                            continue;
+                        }
+                        // Collapse consecutive blanks to one.
+                        if i > 0 && is_blank_line(&flat_items[i - 1]) && keep[i - 1] {
+                            keep[i] = false;
+                        }
                     }
+                    let mut j = 0;
+                    // index drives an in-place compaction (keep[i] gates flat_items.swap(i, j))
+                    #[allow(clippy::needless_range_loop)]
+                    for i in 0..flat_items.len() {
+                        if keep[i] {
+                            flat_items.swap(i, j);
+                            j += 1;
+                        }
+                    }
+                    flat_items.truncate(j);
                 }
-                merged.push(item);
-            }
-            flat_items = merged;
-        }
 
-        // Thinking indicator at the tail while waiting for Claude.
-        if c.turn_phase.is_awaiting() {
-            flat_items.push(FlatItem::ThinkingIndicator);
-        }
+                // Coalesce a contiguous run of tool calls into ONE collapsible group
+                // so a long sequence (grep → grep → edit → read → …) doesn't flood the
+                // transcript. The blank anchor lines between adjacent tool calls were
+                // already stripped by the blank-collapse pass above, so a run shows up
+                // as directly-adjacent `ToolGroup`s; merge their ids into the first.
+                // Any prose Line, Block, or TurnHeader between two runs breaks the run
+                // (those are real content), so tool calls separated by agent text stay
+                // in separate groups. The merged group renders as a typed-count header
+                // (e.g. "4 grep, 3 edit, 7 read"), collapsed by default.
+                {
+                    let mut merged: Vec<FlatItem> = Vec::with_capacity(flat_items.len());
+                    for item in flat_items.drain(..) {
+                        if let FlatItem::ToolGroup { ids, .. } = &item
+                            && let Some(FlatItem::ToolGroup { ids: prev_ids, .. }) =
+                                merged.last_mut()
+                        {
+                            prev_ids.extend(ids.iter().cloned());
+                            continue;
+                        }
+                        merged.push(item);
+                    }
+                    flat_items = merged;
+                }
 
-            c.view_model.store(view_model_fp, flat_items, gutter_tag_per_line)
+                // Thinking indicator at the tail while waiting for Claude.
+                if c.turn_phase.is_awaiting() {
+                    flat_items.push(FlatItem::ThinkingIndicator);
+                }
+
+                c.view_model
+                    .store(view_model_fp, flat_items, gutter_tag_per_line)
             }
         };
 
@@ -15977,16 +16014,15 @@ impl SketchGpuiView {
         // O(1) pointer clone — the closure shares the cached line vec for the
         // frame instead of deep-copying every transcript line each render.
         let lines_snap: std::rc::Rc<Vec<String>> = lines_rc.clone();
-        // O(1) pointer clone of the per-line highlight snapshot; the closure
-        // owns it for the frame and indexes `.raw` / `.stripped` per line.
-        let hl_snap = hl_snap;
+        // The per-line highlight snapshot `hl_snap` (an O(1) pointer clone)
+        // is moved into the closure below, which indexes `.raw` / `.stripped`
+        // per line.
         // `gutter_tag_snap` and `flat_items_arc` come from the memoized
         // view-model tuple above (cached `Rc`s reused across frames when the
         // structural fingerprint is unchanged).
         let tool_calls_snap = c.tools.calls.clone();
         let expanded_snap = c.tools.expanded.clone();
-        let frozen_lines_snap: Vec<(usize, usize)> =
-            c.editor.frozen_lines().to_vec();
+        let frozen_lines_snap: Vec<(usize, usize)> = c.editor.frozen_lines().to_vec();
         let lockable_through_snap = c.editor.lockable_through_line();
         let sel_snap = c.editor.selection_range();
         let mode_snap = c.mode;
@@ -16046,12 +16082,9 @@ impl SketchGpuiView {
                             let line_chars = line_str.chars().count();
                             if let Some((s, e_col)) =
                                 line_selection_range(sel, line_idx, line_chars)
+                                && e_col > s
                             {
-                                if e_col > s {
-                                    segs = apply_selection_bg(
-                                        &segs, s, e_col, at_snap.selection_bg,
-                                    );
-                                }
+                                segs = apply_selection_bg(&segs, s, e_col, at_snap.selection_bg);
                             }
                         }
 
@@ -16109,14 +16142,10 @@ impl SketchGpuiView {
                             ("   ".into(), dim_fg)
                         } else {
                             match tag {
-                                Some(TurnId::Llm(n)) => (
-                                    format!("{:>3}", n).into(),
-                                    frozen_bar,
-                                ),
-                                Some(TurnId::User(n)) => (
-                                    format!("{:>3}", format!("U{}", n)).into(),
-                                    user_bar,
-                                ),
+                                Some(TurnId::Llm(n)) => (format!("{:>3}", n).into(), frozen_bar),
+                                Some(TurnId::User(n)) => {
+                                    (format!("{:>3}", format!("U{}", n)).into(), user_bar)
+                                }
                                 Some(TurnId::Tool(n)) => (
                                     format!("{:>3}", format!("T{}", n)).into(),
                                     nc(at_snap.tool_label),
@@ -16163,13 +16192,7 @@ impl SketchGpuiView {
                                     .pr_1()
                                     .child(label_text),
                             )
-                            .child(
-                                div()
-                                    .w(px(3.0))
-                                    .flex_none()
-                                    .bg(bar_color)
-                                    .mr_2(),
-                            )
+                            .child(div().w(px(3.0)).flex_none().bg(bar_color).mr_2())
                             .child(content)
                             .into_any_element()
                     }
@@ -16189,8 +16212,12 @@ impl SketchGpuiView {
                         // Aggregate status for the group header glyph.
                         use sketch::acp_channel::ToolCallStatus;
                         let has_failed = calls.iter().any(|tc| tc.status == ToolCallStatus::Failed);
-                        let has_in_progress = calls.iter().any(|tc| tc.status == ToolCallStatus::InProgress);
-                        let all_completed = calls.iter().all(|tc| tc.status == ToolCallStatus::Completed);
+                        let has_in_progress = calls
+                            .iter()
+                            .any(|tc| tc.status == ToolCallStatus::InProgress);
+                        let all_completed = calls
+                            .iter()
+                            .all(|tc| tc.status == ToolCallStatus::Completed);
                         let (group_glyph, group_color): (&str, Hsla) = if has_failed {
                             ("✗", nc(at_snap.tool_failed))
                         } else if has_in_progress {
@@ -16203,7 +16230,11 @@ impl SketchGpuiView {
 
                         let header_title: String = if count == 1 {
                             let tc = calls[0];
-                            let base = if tc.title.is_empty() { "(tool)".to_string() } else { tc.title.clone() };
+                            let base = if tc.title.is_empty() {
+                                "(tool)".to_string()
+                            } else {
+                                tc.title.clone()
+                            };
                             // Append a useful detail for single-tool groups so
                             // the user doesn't need to expand to see *what* was
                             // read/edited/executed.
@@ -16247,7 +16278,11 @@ impl SketchGpuiView {
                         };
                         let arrow = if !expandable {
                             " "
-                        } else if group_expanded { "▼" } else { "▶" };
+                        } else if group_expanded {
+                            "▼"
+                        } else {
+                            "▶"
+                        };
 
                         let anchor_str = anchor.to_string();
                         let weak = weak_self.clone();
@@ -16262,7 +16297,13 @@ impl SketchGpuiView {
                             .px_2()
                             .child(div().text_color(dim_fg).child(arrow))
                             .child(div().text_color(group_color).child(group_glyph))
-                            .child(div().flex_1().text_color(self_editor_fg).text_size(px(12.0)).child(header_title));
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_color(self_editor_fg)
+                                    .text_size(px(12.0))
+                                    .child(header_title),
+                            );
 
                         if expandable {
                             header_row = header_row.cursor_pointer().on_click(
@@ -16301,16 +16342,15 @@ impl SketchGpuiView {
                                 );
                             } else {
                                 for tc in &calls {
-                                    let expanded_detail = expanded_snap.contains(&tc.tool_call_id.0.to_string());
-                                    block = block.child(
-                                        build_tool_block_with_weak(
-                                            tc,
-                                            expanded_detail,
-                                            &code_font_snap,
-                                            weak_self.clone(),
-                                            &at_snap,
-                                        ),
-                                    );
+                                    let expanded_detail =
+                                        expanded_snap.contains(&tc.tool_call_id.0.to_string());
+                                    block = block.child(build_tool_block_with_weak(
+                                        tc,
+                                        expanded_detail,
+                                        &code_font_snap,
+                                        weak_self.clone(),
+                                        &at_snap,
+                                    ));
                                 }
                             }
                         }
@@ -16368,12 +16408,7 @@ impl SketchGpuiView {
                                     .font_family(body_font_snap.clone())
                                     .child(SharedString::from(label)),
                             )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .h(px(1.0))
-                                    .bg(rule_color),
-                            )
+                            .child(div().flex_1().h(px(1.0)).bg(rule_color))
                             .into_any_element()
                     }
                     FlatItem::ThinkingIndicator => {
@@ -16393,10 +16428,12 @@ impl SketchGpuiView {
                         // wedged. Past STALL_WARN_S we switch to an explicit
                         // warning so the user knows it's abnormal.
                         const STALL_WARN_S: u64 = 30;
-                        let elapsed_s =
-                            turn_started_snap.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-                        let quiet_s =
-                            last_event_at_snap.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                        let elapsed_s = turn_started_snap
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let quiet_s = last_event_at_snap
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
                         let fmt_ms = |s: u64| format!("{}:{:02}", s / 60, s % 60);
                         let stalled = quiet_s >= STALL_WARN_S;
 
@@ -16404,7 +16441,12 @@ impl SketchGpuiView {
                             // Amber when stalled, regardless of pulse phase.
                             nc(at_snap.warm_accent)
                         } else {
-                            Hsla { h: 0.53, s: 0.9, l: 0.76, a: alpha }
+                            Hsla {
+                                h: 0.53,
+                                s: 0.9,
+                                l: 0.76,
+                                a: alpha,
+                            }
                         };
                         let (label, label_color) = if stalled {
                             (
@@ -16418,7 +16460,12 @@ impl SketchGpuiView {
                         } else {
                             (
                                 format!("Thinking\u{2026} {}", fmt_ms(elapsed_s)),
-                                Hsla { h: 0.0, s: 0.0, l: 0.6, a: alpha },
+                                Hsla {
+                                    h: 0.0,
+                                    s: 0.0,
+                                    l: 0.6,
+                                    a: alpha,
+                                },
                             )
                         };
                         div()
@@ -16431,12 +16478,7 @@ impl SketchGpuiView {
                             .pl_1()
                             .pr_4()
                             .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(14.0))
-                                    .text_color(dot_color)
-                                    .child("●"),
-                            )
+                            .child(div().text_size(px(14.0)).text_color(dot_color).child("●"))
                             .child(
                                 div()
                                     .flex_1()
@@ -16514,16 +16556,16 @@ impl SketchGpuiView {
         }
 
         // Sub-agent breadcrumb (only when focused).
-        if let Some(key) = c.focused_subagent.as_ref() {
-            if let Some(sa) = c.tools.calls.get(key).and_then(classify_subagent) {
-                let crumb = format!(" ⏵ {} ◂", sa.label);
-                strip = strip.child(
-                    div()
-                        .pr_2()
-                        .text_color(strip_warm)
-                        .child(SharedString::from(crumb)),
-                );
-            }
+        if let Some(key) = c.focused_subagent.as_ref()
+            && let Some(sa) = c.tools.calls.get(key).and_then(classify_subagent)
+        {
+            let crumb = format!(" ⏵ {} ◂", sa.label);
+            strip = strip.child(
+                div()
+                    .pr_2()
+                    .text_color(strip_warm)
+                    .child(SharedString::from(crumb)),
+            );
         }
 
         // Per-slot cwd (spec-agent-cwd.md §6). Hidden when the slot cwd
@@ -16547,9 +16589,7 @@ impl SketchGpuiView {
             .agent_mode
             .as_ref()
             .map(|m| m.0.to_string())
-            .or_else(|| {
-                c.channel.as_ref().map(|ch| ch.command().to_string())
-            });
+            .or_else(|| c.channel.as_ref().map(|ch| ch.command().to_string()));
         if let Some(m) = model_label {
             strip = strip.child(
                 div()
@@ -16597,10 +16637,7 @@ impl SketchGpuiView {
             } else {
                 0.0
             };
-            let usage_text = format!(
-                "{:.1}k / {:.0}k ({:.0}%)",
-                used_k, total_k, pct
-            );
+            let usage_text = format!("{:.1}k / {:.0}k ({:.0}%)", used_k, total_k, pct);
             strip = strip.child(
                 div()
                     .pr_2()
@@ -16619,11 +16656,7 @@ impl SketchGpuiView {
 
         // Turn / elapsed. Show "turn N · M:SS" when a turn has run; "turn
         // N" alone if no timer is active; nothing if no turns have run.
-        let completed_turns = c
-            .channel
-            .as_ref()
-            .map(|ch| ch.turn_count())
-            .unwrap_or(0);
+        let completed_turns = c.channel.as_ref().map(|ch| ch.turn_count()).unwrap_or(0);
         let display_turn = if c.turn_phase.is_awaiting() {
             completed_turns + 1
         } else {
@@ -16647,13 +16680,11 @@ impl SketchGpuiView {
             } else {
                 format!("turn {} · {}", display_turn, elapsed_str)
             };
-            strip = strip
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .text_color(turn_color)
-                        .child(SharedString::from(label)),
-                );
+            strip = strip.child(div().flex_1()).child(
+                div()
+                    .text_color(turn_color)
+                    .child(SharedString::from(label)),
+            );
         }
 
         let header = strip;
@@ -16791,7 +16822,11 @@ impl SketchGpuiView {
                 EditMode::Insert => "WORKSHEET INSERT",
             }
         };
-        let dirty_mark = if c.editor.document().is_modified() { "•" } else { " " };
+        let dirty_mark = if c.editor.document().is_modified() {
+            "•"
+        } else {
+            " "
+        };
         let extend_mark = if c.editor.extend_mode() { " EXT" } else { "" };
         let mut left_status = format!(
             "{} CLAUDE {}{} · L{}:C{}",
@@ -16845,11 +16880,13 @@ impl SketchGpuiView {
                     .border_color(stop_fg)
                     .text_color(stop_fg)
                     .cursor_pointer()
-                    .on_click(move |_ev: &gpui::ClickEvent, window: &mut Window, app: &mut App| {
-                        let _ = weak_stop.update(app, |this, cx| {
-                            this.stop_agent(&StopAgent, window, cx);
-                        });
-                    })
+                    .on_click(
+                        move |_ev: &gpui::ClickEvent, window: &mut Window, app: &mut App| {
+                            let _ = weak_stop.update(app, |this, cx| {
+                                this.stop_agent(&StopAgent, window, cx);
+                            });
+                        },
+                    )
                     .child(SharedString::from(stop_label)),
             );
         }
@@ -16895,10 +16932,7 @@ impl SketchGpuiView {
             let compose_cursor_color: Hsla = nc(at.cursor);
             let compose_code_font = self.code_font.clone();
 
-            let separator = div()
-                .w_full()
-                .h(px(1.0))
-                .bg(dim_fg);
+            let separator = div().w_full().h(px(1.0)).bg(dim_fg);
 
             // Cap height at ~8 logical lines, then vertical scroll kicks in.
             // Wrapped lines may exceed one row visually, so the actual cap
@@ -17020,8 +17054,7 @@ impl SketchGpuiView {
                             _ => "✗",
                         };
                         let line_text = if entry.content.chars().count() > 22 {
-                            let truncated: String =
-                                entry.content.chars().take(21).collect();
+                            let truncated: String = entry.content.chars().take(21).collect();
                             format!("{}  {}…", glyph, truncated)
                         } else {
                             format!("{}  {}", glyph, entry.content)
@@ -17121,12 +17154,14 @@ impl SketchGpuiView {
                         .cursor_pointer()
                         .text_color(row_fg)
                         .bg(row_bg)
-                        .on_click(move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
-                            let key = row_key.clone();
-                            let _ = weak.update(app, |this, cx| {
-                                this.focus_subagent(key, cx);
-                            });
-                        })
+                        .on_click(
+                            move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
+                                let key = row_key.clone();
+                                let _ = weak.update(app, |this, cx| {
+                                    this.focus_subagent(key, cx);
+                                });
+                            },
+                        )
                         .child(SharedString::from(row_text));
                     pane = pane.child(row);
                 }
@@ -17136,20 +17171,15 @@ impl SketchGpuiView {
             None
         };
 
-        let mut transcript_row = div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .min_h_0()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(body),
-            );
+        let mut transcript_row = div().flex().flex_row().flex_1().min_h_0().child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(body),
+        );
         if let Some(p) = tasklist_pane {
             transcript_row = transcript_row.child(p);
         }
@@ -17316,7 +17346,13 @@ impl SketchGpuiView {
             } else {
                 let visible_rows = 28usize;
                 let scroll = scroll_to_keep_visible(wm.selected, visible_rows, wm.worktrees.len());
-                for (i, wt) in wm.worktrees.iter().enumerate().skip(scroll).take(visible_rows) {
+                for (i, wt) in wm
+                    .worktrees
+                    .iter()
+                    .enumerate()
+                    .skip(scroll)
+                    .take(visible_rows)
+                {
                     list = list.child(worktree_row(wt, i == wm.selected, ov));
                 }
             }
@@ -17380,12 +17416,19 @@ impl SketchGpuiView {
                         .py_1()
                         .bg(nc(ov.selected_bg))
                         .text_color(nc(ov.input))
-                        .child(SharedString::from(format!("/ {}\u{2588}", b.fb.filter_text()))),
+                        .child(SharedString::from(format!(
+                            "/ {}\u{2588}",
+                            b.fb.filter_text()
+                        ))),
                 );
             }
 
             if entries.is_empty() {
-                let msg = if b.fb.filter_mode { "  (no matches)" } else { "  (empty)" };
+                let msg = if b.fb.filter_mode {
+                    "  (no matches)"
+                } else {
+                    "  (empty)"
+                };
                 list = list.child(
                     div()
                         .px_4()
@@ -17511,11 +17554,18 @@ fn scroll_to_keep_visible(selected: usize, rows: usize, total: usize) -> usize {
     }
     // Keep the selected item centered when the list is long enough to scroll.
     let half = rows / 2;
-    selected.saturating_sub(half).min(total.saturating_sub(rows))
+    selected
+        .saturating_sub(half)
+        .min(total.saturating_sub(rows))
 }
 
 /// One row in the file-browser list.
-fn browser_row(entry: &BrowserEntry, selected: bool, code_font: &SharedString, ov: &OverlayTheme) -> AnyElement {
+fn browser_row(
+    entry: &BrowserEntry,
+    selected: bool,
+    code_font: &SharedString,
+    ov: &OverlayTheme,
+) -> AnyElement {
     let row_bg = if selected {
         nc(ov.selected_bg)
     } else {
@@ -17587,8 +17637,18 @@ fn browser_row(entry: &BrowserEntry, selected: bool, code_font: &SharedString, o
 
 /// One row in the worktree-picker list.
 fn worktree_row(wt: &worktree::Worktree, selected: bool, ov: &OverlayTheme) -> AnyElement {
-    let row_bg = if selected { nc(ov.selected_bg) } else { nc(ov.bg) };
-    let marker = if wt.is_current { "* " } else if selected { "▸ " } else { "  " };
+    let row_bg = if selected {
+        nc(ov.selected_bg)
+    } else {
+        nc(ov.bg)
+    };
+    let marker = if wt.is_current {
+        "* "
+    } else if selected {
+        "▸ "
+    } else {
+        "  "
+    };
     let path_str = wt.path.display().to_string();
 
     div()
@@ -17721,10 +17781,7 @@ fn screen_file_label(screen: &WindowContent) -> Option<SharedString> {
 fn screen_is_modified(screen: &WindowContent) -> bool {
     match screen {
         WindowContent::Edit(e) => e.editor.is_modified(),
-        WindowContent::Doc(d) => d
-            .source
-            .as_ref()
-            .map_or(false, |s| s.is_modified()),
+        WindowContent::Doc(d) => d.source.as_ref().is_some_and(|s| s.is_modified()),
         _ => false,
     }
 }
@@ -17980,96 +18037,96 @@ fn main() {
         .detach();
 
         let bounds = Bounds::new(point(px(120.0), px(80.0)), size(px(900.0), px(700.0)));
-        let window_handle = app.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                // Titled window so the standard system title bar (with
-                // close/minimize/maximize buttons AND the resize affordance
-                // that comes with it) is rendered. Previously `None` →
-                // chromeless window that couldn't be resized.
-                titlebar: Some(TitlebarOptions {
-                    title: Some("sketch".into()),
+        let window_handle = app
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    // Titled window so the standard system title bar (with
+                    // close/minimize/maximize buttons AND the resize affordance
+                    // that comes with it) is rendered. Previously `None` →
+                    // chromeless window that couldn't be resized.
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("sketch".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            move |window, app| {
-                app.new(|cx| {
-                    let focus_handle = cx.focus_handle();
-                    focus_handle.focus(window);
-                    let mut view = match initial_doc.clone() {
-                        Some((blocks, canon, path)) => {
-                            let mut v = SketchGpuiView::new_doc(
-                                blocks,
-                                theme.clone(),
-                                canon,
-                                focus_handle,
-                            );
-                            // 5c: pool-bind the startup Doc now that the
-                            // workspace (and its buffer pool) exists, so the
-                            // CLI file shares its core with any Edit view and
-                            // live-tracks.
-                            if let Ok((id, core)) = v.workspace.open_and_retain(&path) {
-                                if let Some(WindowContent::Doc(d)) =
-                                    v.workspace.focused_content_mut()
+                },
+                move |window, app| {
+                    app.new(|cx| {
+                        let focus_handle = cx.focus_handle();
+                        focus_handle.focus(window);
+                        let mut view = match initial_doc.clone() {
+                            Some((blocks, canon, path)) => {
+                                let mut v = SketchGpuiView::new_doc(
+                                    blocks,
+                                    theme.clone(),
+                                    canon,
+                                    focus_handle,
+                                );
+                                // 5c: pool-bind the startup Doc now that the
+                                // workspace (and its buffer pool) exists, so the
+                                // CLI file shares its core with any Edit view and
+                                // live-tracks.
+                                if let Ok((id, core)) = v.workspace.open_and_retain(&path)
+                                    && let Some(WindowContent::Doc(d)) =
+                                        v.workspace.focused_content_mut()
                                 {
                                     d.source = Some(DocSource::new(id, core));
                                 }
+                                v
                             }
-                            v
+                            None => SketchGpuiView::new_browser(
+                                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                                theme.clone(),
+                                focus_handle,
+                            ),
+                        };
+                        // Agent info bar placement from preferences.
+                        if let Some(pos) = prefs.agent_status_position.as_deref() {
+                            view.agent_status_position = AgentStatusPosition::parse(pos);
                         }
-                        None => SketchGpuiView::new_browser(
-                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                            theme.clone(),
-                            focus_handle,
-                        ),
-                    };
-                    // Agent info bar placement from preferences.
-                    if let Some(pos) = prefs.agent_status_position.as_deref() {
-                        view.agent_status_position = AgentStatusPosition::parse(pos);
-                    }
-                    // Restore the saved text zoom (clamped so a hand-edited
-                    // preferences file can't push the body off-screen).
-                    if let Some(scale) = prefs.text_scale {
-                        view.text_scale = scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
-                    }
-                    // If we were launched with no explicit file arg, try to
-                    // restore the saved workspace for this cwd. With an
-                    // explicit arg the user wants that file, so the saved
-                    // snapshot stays on disk for the next no-arg launch.
-                    if initial_doc.is_none() {
-                        view.restore_workspace_from_disk(cx);
-                    }
-                    // Reboot handoff: the previous sketch process set this
-                    // env var via `reboot_into_claude` to mean "boot
-                    // straight into the claude screen and resume every
-                    // saved session." The downstream `open_agent_inner`
-                    // consults `load_persisted_acp_sessions`, so
-                    // session/load fires once per persisted slot.
-                    if std::env::var("SKETCH_OPEN_CLAUDE").is_ok() {
-                        view.open_agent_inner(cx);
-                    }
-                    // Set splash deadline AFTER all init (workspace
-                    // restoration, agent attach) so the countdown starts
-                    // from the moment the window is ready to paint.
-                    view.splash_until =
-                        Some(std::time::Instant::now() + Duration::from_millis(1500));
-                    // Auto-dismiss splash after 1.5s.
-                    cx.spawn(async move |this, cx| {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(1500))
-                            .await;
-                        let _ = this.update(cx, |this, cx| {
-                            this.splash_until = None;
-                            cx.notify();
-                        });
+                        // Restore the saved text zoom (clamped so a hand-edited
+                        // preferences file can't push the body off-screen).
+                        if let Some(scale) = prefs.text_scale {
+                            view.text_scale = scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
+                        }
+                        // If we were launched with no explicit file arg, try to
+                        // restore the saved workspace for this cwd. With an
+                        // explicit arg the user wants that file, so the saved
+                        // snapshot stays on disk for the next no-arg launch.
+                        if initial_doc.is_none() {
+                            view.restore_workspace_from_disk(cx);
+                        }
+                        // Reboot handoff: the previous sketch process set this
+                        // env var via `reboot_into_claude` to mean "boot
+                        // straight into the claude screen and resume every
+                        // saved session." The downstream `open_agent_inner`
+                        // consults `load_persisted_acp_sessions`, so
+                        // session/load fires once per persisted slot.
+                        if std::env::var("SKETCH_OPEN_CLAUDE").is_ok() {
+                            view.open_agent_inner(cx);
+                        }
+                        // Set splash deadline AFTER all init (workspace
+                        // restoration, agent attach) so the countdown starts
+                        // from the moment the window is ready to paint.
+                        view.splash_until =
+                            Some(std::time::Instant::now() + Duration::from_millis(1500));
+                        // Auto-dismiss splash after 1.5s.
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(1500))
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.splash_until = None;
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                        view
                     })
-                    .detach();
-                    view
-                })
-            },
-        )
-        .unwrap();
+                },
+            )
+            .unwrap();
 
         // Run the ACP teardown synchronously when the app is quitting,
         // *before* `App::shutdown` clears windows and races view Drop
@@ -18197,16 +18254,31 @@ mod tests {
         let mut phase = TurnPhase::begin(Instant::now());
         assert!(phase.is_awaiting(), "submit must enter awaiting");
         assert!(!phase.stop_requested(), "fresh turn has no pending stop");
-        assert!(phase.turn_started().is_some(), "awaiting carries the elapsed timer");
-        assert!(phase.last_event_at().is_some(), "awaiting carries the quiet clock");
+        assert!(
+            phase.turn_started().is_some(),
+            "awaiting carries the elapsed timer"
+        );
+        assert!(
+            phase.last_event_at().is_some(),
+            "awaiting carries the quiet clock"
+        );
 
         // First Stop → StopRequested, graceful (not escalated). The handler
         // gate `stop_requested()` is what decides escalate-vs-graceful.
         let first_stop_escalates = phase.stop_requested();
-        assert!(!first_stop_escalates, "the FIRST stop must be graceful, not a hard kill");
+        assert!(
+            !first_stop_escalates,
+            "the FIRST stop must be graceful, not a hard kill"
+        );
         phase.request_stop(Instant::now());
-        assert!(phase.is_awaiting(), "a pending stop is still in flight (timers run)");
-        assert!(phase.stop_requested(), "first stop records a pending cancel");
+        assert!(
+            phase.is_awaiting(),
+            "a pending stop is still in flight (timers run)"
+        );
+        assert!(
+            phase.stop_requested(),
+            "first stop records a pending cancel"
+        );
         assert!(!phase.is_escalated(), "first stop has not escalated");
         // Timers survive the transition so the indicator keeps reading.
         assert!(phase.turn_started().is_some());
@@ -18214,9 +18286,15 @@ mod tests {
 
         // Second Stop → the handler sees `stop_requested()` and escalates.
         let second_stop_escalates = phase.stop_requested();
-        assert!(second_stop_escalates, "the SECOND stop while awaiting must escalate");
+        assert!(
+            second_stop_escalates,
+            "the SECOND stop while awaiting must escalate"
+        );
         phase.escalate();
-        assert!(phase.is_escalated(), "second stop marks the phase escalated");
+        assert!(
+            phase.is_escalated(),
+            "second stop marks the phase escalated"
+        );
 
         // finalize (turn end / force-restart) → Idle, all markers cleared.
         phase = TurnPhase::Idle;
@@ -18236,13 +18314,19 @@ mod tests {
         phase.request_stop(Instant::now());
         assert!(matches!(phase, TurnPhase::Idle), "stop on idle is a no-op");
         phase.escalate();
-        assert!(matches!(phase, TurnPhase::Idle), "escalate on idle is a no-op");
+        assert!(
+            matches!(phase, TurnPhase::Idle),
+            "escalate on idle is a no-op"
+        );
         phase.note_event(Instant::now());
         assert!(matches!(phase, TurnPhase::Idle), "event on idle is a no-op");
 
         // note_event refreshes the quiet clock only while in flight.
         let t0 = Instant::now();
-        let mut awaiting = TurnPhase::Awaiting { started: t0, last_event: t0 };
+        let mut awaiting = TurnPhase::Awaiting {
+            started: t0,
+            last_event: t0,
+        };
         let later = t0 + std::time::Duration::from_secs(5);
         awaiting.note_event(later);
         assert_eq!(
@@ -18326,9 +18410,9 @@ mod tests {
 
         // Cold cache: miss → rebuild at the call site, then `store`.
         assert!(st.view_model.cached(fp1).is_none(), "cold cache must miss");
-        let (flat1, gut1) =
-            st.view_model
-                .store(fp1, vec![FlatItem::Line(0)], vec![None]);
+        let (flat1, gut1) = st
+            .view_model
+            .store(fp1, vec![FlatItem::Line(0)], vec![None]);
         assert_eq!(
             VIEW_MODEL_REBUILDS.with(|n| n.get()),
             1,
@@ -18418,8 +18502,7 @@ mod tests {
 
         // Insert on the started key, look up on the (separately parsed) updated
         // key — the live ToolCallUpdated path. The lookup must hit.
-        let mut map: std::collections::HashMap<ToolCallKey, u32> =
-            std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<ToolCallKey, u32> = std::collections::HashMap::new();
         map.insert(key_started, 7);
         assert_eq!(
             map.get(&key_updated),
@@ -18543,8 +18626,7 @@ mod tests {
                 block_cache.insert((s, e), b);
             }
         }
-        let mut in_block: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
+        let mut in_block: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for &(s, e) in &ranges {
             if block_cache.contains_key(&(s, e)) {
                 for li in s..e {
@@ -18553,9 +18635,7 @@ mod tests {
             }
         }
         let line_items: Vec<usize> = (0..lines.len())
-            .filter(|i| {
-                !block_cache.keys().any(|&(s, _)| s == *i) && !in_block.contains(i)
-            })
+            .filter(|i| !block_cache.keys().any(|&(s, _)| s == *i) && !in_block.contains(i))
             .collect();
         // Count parity over the range: a Line for EVERY source line, no Block.
         assert!(
@@ -18585,8 +18665,11 @@ mod tests {
         let id1: ToolCallId = "t1".into();
         let k1 = ToolCallKey::from_id(&id1);
 
-        st.tools
-            .register(k1.clone(), ToolCall::new(id1.clone(), String::from("ls")), st.editor.anchor_for_line(0));
+        st.tools.register(
+            k1.clone(),
+            ToolCall::new(id1.clone(), String::from("ls")),
+            st.editor.anchor_for_line(0),
+        );
         assert_eq!(st.tools.order.len(), 1);
         assert!(st.tools.calls.contains_key(&k1) && st.tools.anchor.contains_key(&k1));
 
@@ -18597,14 +18680,21 @@ mod tests {
             ToolCall::new(id1.clone(), String::from("ls -la")),
             st.editor.anchor_for_line(0),
         );
-        assert_eq!(st.tools.order.len(), 1, "re-register must not duplicate the order entry");
+        assert_eq!(
+            st.tools.order.len(),
+            1,
+            "re-register must not duplicate the order entry"
+        );
         assert_eq!(st.tools.calls.len(), 1);
 
         // A distinct id appends.
         let id2: ToolCallId = "t2".into();
         let k2 = ToolCallKey::from_id(&id2);
-        st.tools
-            .register(k2.clone(), ToolCall::new(id2, String::from("grep")), st.editor.anchor_for_line(0));
+        st.tools.register(
+            k2.clone(),
+            ToolCall::new(id2, String::from("grep")),
+            st.editor.anchor_for_line(0),
+        );
         assert_eq!(st.tools.order.len(), 2);
         assert!(st.tools.order.contains(&k2));
 
@@ -18686,7 +18776,8 @@ mod tests {
         // adds no row, so the flat-item count is UNCHANGED. This is exactly
         // the case the old `new_count != old_count` trigger missed.
         let char_len = st.editor.document().rope().len_chars();
-        st.editor.programmatic_insert(char_len, "more streamed prose");
+        st.editor
+            .programmatic_insert(char_len, "more streamed prose");
         let seq1 = st.editor.document().edit_seq();
         assert_ne!(seq1, seq0, "an intra-line insert must advance edit_seq");
 
@@ -18874,7 +18965,10 @@ mod tests {
         assert_eq!(classify_wp_line("### H3", false), WpLineKind::Heading(3));
         assert_eq!(classify_wp_line("###### H6", false), WpLineKind::Heading(6));
         // 7 hashes = not a valid heading per CommonMark; treat as paragraph.
-        assert_eq!(classify_wp_line("####### too many", false), WpLineKind::Paragraph);
+        assert_eq!(
+            classify_wp_line("####### too many", false),
+            WpLineKind::Paragraph
+        );
     }
 
     #[test]
@@ -18890,7 +18984,10 @@ mod tests {
         assert_eq!(classify_wp_line("- item", false), WpLineKind::BulletItem);
         assert_eq!(classify_wp_line("* item", false), WpLineKind::BulletItem);
         assert_eq!(classify_wp_line("+ item", false), WpLineKind::BulletItem);
-        assert_eq!(classify_wp_line("  - nested", false), WpLineKind::BulletItem);
+        assert_eq!(
+            classify_wp_line("  - nested", false),
+            WpLineKind::BulletItem
+        );
         // Dash without trailing space is not a bullet.
         assert_eq!(classify_wp_line("-no-space", false), WpLineKind::Paragraph);
     }
@@ -18919,16 +19016,25 @@ mod tests {
         assert_eq!(classify_wp_line("```rust", false), WpLineKind::CodeFence);
         assert_eq!(classify_wp_line("~~~", false), WpLineKind::CodeFence);
         // Inside a fence: any line is content unless it's a closer.
-        assert_eq!(classify_wp_line("let x = 1;", true), WpLineKind::CodeContent);
+        assert_eq!(
+            classify_wp_line("let x = 1;", true),
+            WpLineKind::CodeContent
+        );
         assert_eq!(classify_wp_line("```", true), WpLineKind::CodeFence);
         // A heading inside a fence is still code, not a heading.
-        assert_eq!(classify_wp_line("# not a heading", true), WpLineKind::CodeContent);
+        assert_eq!(
+            classify_wp_line("# not a heading", true),
+            WpLineKind::CodeContent
+        );
     }
 
     #[test]
     fn classify_wp_line_table_row_heuristic() {
         // 2+ pipes → table row.
-        assert_eq!(classify_wp_line("| col1 | col2 |", false), WpLineKind::TableRow);
+        assert_eq!(
+            classify_wp_line("| col1 | col2 |", false),
+            WpLineKind::TableRow
+        );
         assert_eq!(classify_wp_line("|---|---|", false), WpLineKind::TableRow);
         // Single pipe falls through to paragraph (heuristic requires 2+).
         assert_eq!(classify_wp_line("a | b", false), WpLineKind::Paragraph);
@@ -18938,8 +19044,14 @@ mod tests {
 
     #[test]
     fn classify_wp_line_paragraph_fallback() {
-        assert_eq!(classify_wp_line("hello world", false), WpLineKind::Paragraph);
-        assert_eq!(classify_wp_line("**bold** text", false), WpLineKind::Paragraph);
+        assert_eq!(
+            classify_wp_line("hello world", false),
+            WpLineKind::Paragraph
+        );
+        assert_eq!(
+            classify_wp_line("**bold** text", false),
+            WpLineKind::Paragraph
+        );
     }
 
     // ---- doc_char_to_line_col ----

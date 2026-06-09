@@ -66,7 +66,10 @@ impl Harness {
         let deadline = Instant::now() + Duration::from_secs(2);
         while !socket_path.exists() {
             if Instant::now() > deadline {
-                panic!("sketch-channel never bound socket {}", socket_path.display());
+                panic!(
+                    "sketch-channel never bound socket {}",
+                    socket_path.display()
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -143,7 +146,11 @@ fn tools_list_exposes_reply() {
     h.send_rpc(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
     let resp = h.read_rpc();
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert!(tools.iter().any(|t| t["name"] == "reply"), "no reply tool: {}", resp);
+    assert!(
+        tools.iter().any(|t| t["name"] == "reply"),
+        "no reply tool: {}",
+        resp
+    );
 }
 
 #[test]

@@ -71,10 +71,7 @@ impl InlineState {
 
 impl<'a, 't> Renderer<'a, 't> {
     fn new(theme: &'t Theme, highlighter: &'a Highlighter) -> Self {
-        Self {
-            theme,
-            highlighter,
-        }
+        Self { theme, highlighter }
     }
 
     fn render(&mut self, events: &[Event<'_>]) -> Vec<RenderedBlock> {
@@ -156,7 +153,11 @@ impl<'a, 't> Renderer<'a, 't> {
                         self.plain_code_lines(&code_text)
                     };
 
-                    blocks.push(RenderedBlock::CodeBlock { language, lines, source_file: false });
+                    blocks.push(RenderedBlock::CodeBlock {
+                        language,
+                        lines,
+                        source_file: false,
+                    });
                 }
                 Event::Start(Tag::Table(alignments)) => {
                     let aligns: Vec<ColumnAlignment> = alignments

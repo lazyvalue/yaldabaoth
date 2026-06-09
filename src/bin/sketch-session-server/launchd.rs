@@ -135,7 +135,10 @@ pub fn uninstall() -> io::Result<()> {
         std::fs::remove_file(&plist)?;
         println!("Uninstalled {LABEL} (removed {}).", plist.display());
     } else {
-        println!("{LABEL} is not installed (no plist at {}).", plist.display());
+        println!(
+            "{LABEL} is not installed (no plist at {}).",
+            plist.display()
+        );
     }
     Ok(())
 }
@@ -159,7 +162,10 @@ pub fn status() -> io::Result<()> {
     println!("{LABEL}");
     println!("  installed (plist present): {installed}");
     println!("  loaded (launchctl):        {loaded}");
-    println!("  socket listening:          {listening}  ({})", socket.display());
+    println!(
+        "  socket listening:          {listening}  ({})",
+        socket.display()
+    );
     if !installed {
         println!("  → run `sketch-session-server install` to supervise it via launchd.");
     }

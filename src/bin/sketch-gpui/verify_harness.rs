@@ -15,7 +15,7 @@
 
 #![cfg(test)]
 
-use gpui::{point, px, AppContext, TestAppContext};
+use gpui::{AppContext, TestAppContext, point, px};
 
 use crate::SketchGpuiView;
 use sketch::theme::Theme;
@@ -57,7 +57,10 @@ fn constructs_and_renders_real_view(cx: &mut TestAppContext) {
     // State is readable through the entity handle (the hook future stones use to
     // assert post-action state).
     let readable = view.read_with(vcx, |_v, _cx| true);
-    assert!(readable, "real SketchGpuiView constructs + renders headlessly");
+    assert!(
+        readable,
+        "real SketchGpuiView constructs + renders headlessly"
+    );
 }
 
 /// Tier-3 latency gate: prove the Edit view does **O(changed)** highlight work
@@ -116,7 +119,10 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
         idle_recomputed, 0,
         "no-change re-render must recompute 0 lines (fast skip), got {idle_recomputed}"
     );
-    assert!(idle_skip, "no-change re-render must take the fast-skip path");
+    assert!(
+        idle_skip,
+        "no-change re-render must take the fast-skip path"
+    );
 
     // --- One keystroke: insert a single char, then render. Only the edited
     //     line (a plain prose line, no fence toggle) should re-highlight. ---
@@ -240,7 +246,10 @@ fn doc_hit_test_never_touches_unpainted_layout(cx: &mut TestAppContext) {
     // zero-height body — which removing `Auto` could cause if the parent didn't
     // bound the height). Otherwise the hit-test below would be vacuous.
     let registered = view.update(vcx, |v, _cx| v.line_layouts.borrow().len());
-    assert!(registered > 0, "doc body rendered no lines (list collapsed?)");
+    assert!(
+        registered > 0,
+        "doc body rendered no lines (list collapsed?)"
+    );
     assert!(
         registered < N,
         "registered {registered} of {N} layouts — measuring all lines again (Auto regressed?)"
@@ -260,7 +269,10 @@ fn doc_hit_test_never_touches_unpainted_layout(cx: &mut TestAppContext) {
         point(b.left() + px(2.0), b.top() + px(2.0))
     });
     let hit = view.update(vcx, |v, _cx| v.doc_pos_at(p));
-    assert!(hit.is_some(), "a point inside a painted line resolves to a DocPos");
+    assert!(
+        hit.is_some(),
+        "a point inside a painted line resolves to a DocPos"
+    );
 }
 
 /// End-to-end click-drag selection, verified WITHOUT pixels (GPUI's test
@@ -301,7 +313,11 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
         let ll = v.line_layouts.borrow();
         let mut keys: Vec<(usize, usize)> = ll.keys().copied().collect();
         keys.sort();
-        assert!(keys.len() >= 3, "need several painted lines, got {}", keys.len());
+        assert!(
+            keys.len() >= 3,
+            "need several painted lines, got {}",
+            keys.len()
+        );
         let a = keys[0];
         let b = keys[keys.len() - 1];
         let ba = ll.get(&a).unwrap().bounds();
@@ -332,12 +348,18 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     let tap = SketchGpuiView::test_doc_render_tap();
 
-    assert!(!tap.selection.is_empty(), "no line received selection background");
+    assert!(
+        !tap.selection.is_empty(),
+        "no line received selection background"
+    );
     let selected: HashSet<(usize, usize)> =
         tap.selection.iter().map(|&(b, l, ..)| (b, l)).collect();
     // No inverted byte ranges.
     for &(b, l, s, e) in &tap.selection {
-        assert!(e >= s, "inverted selection byte range on ({b},{l}): {s}..{e}");
+        assert!(
+            e >= s,
+            "inverted selection byte range on ({b},{l}): {s}..{e}"
+        );
     }
     // Every PAINTED line within the dragged block range is highlighted — the
     // visual correctness claim, deterministic and pixel-free.
@@ -442,7 +464,10 @@ fn agent_seam_suppresses_double_render_when_chunk_precedes_echo(cx: &mut TestApp
         1,
         "user input must render exactly once; transcript was:\n{text}"
     );
-    assert!(text.contains("world response text"), "assistant chunk missing");
+    assert!(
+        text.contains("world response text"),
+        "assistant chunk missing"
+    );
 }
 
 /// The resume routing-drop invariant: a ReplyEvent whose `session_id` has no
@@ -519,7 +544,7 @@ fn agent_seam_routes_reply_only_after_session_is_bound(cx: &mut TestAppContext) 
 fn cmd_b_toggles_file_browser_rail(cx: &mut TestAppContext) {
     // Install the production keymap on the test app — the extraction this stone
     // depended on. Without it, `simulate_keystrokes` would no-op.
-    cx.update(|cx| crate::register_keymap(cx));
+    cx.update(crate::register_keymap);
 
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
@@ -544,7 +569,11 @@ fn cmd_b_toggles_file_browser_rail(cx: &mut TestAppContext) {
     };
 
     // Precondition: a fresh browser view has no rail open.
-    assert_eq!(rail_kind(&view, vcx), None, "fresh view should have no rail");
+    assert_eq!(
+        rail_kind(&view, vcx),
+        None,
+        "fresh view should have no rail"
+    );
 
     // Dismiss the splash overlay so input dispatches against the real screen
     // (the production app auto-clears it after 1.5s; do it directly here).
@@ -644,7 +673,9 @@ fn agent_seam_worksheet_submit_suppresses_double_render(cx: &mut TestAppContext)
         assert_eq!(k, Some(1), "first worksheet submit is turn 1");
     });
     assert_eq!(
-        active_transcript_text(&view, &mut *vcx).matches(TOKEN).count(),
+        active_transcript_text(&view, &mut *vcx)
+            .matches(TOKEN)
+            .count(),
         1,
         "authored worksheet line should appear once before the echo"
     );
@@ -672,7 +703,10 @@ fn agent_seam_worksheet_submit_suppresses_double_render(cx: &mut TestAppContext)
         1,
         "worksheet prompt must render exactly once after the echo; transcript:\n{text}"
     );
-    assert!(text.contains("assistant reply text"), "assistant chunk missing");
+    assert!(
+        text.contains("assistant reply text"),
+        "assistant chunk missing"
+    );
 }
 
 /// Negative control proving the test above is not vacuous: an authored
@@ -717,7 +751,9 @@ fn agent_seam_worksheet_unregistered_line_double_renders(cx: &mut TestAppContext
     });
 
     assert_eq!(
-        active_transcript_text(&view, &mut *vcx).matches(TOKEN).count(),
+        active_transcript_text(&view, &mut *vcx)
+            .matches(TOKEN)
+            .count(),
         2,
         "an un-registered worksheet prompt is double-rendered by the echo (the bug the \
          reconciler chokepoint closes — this is what keeps the suppression test honest)"
@@ -859,9 +895,14 @@ fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
 
         // open REPLACES, never stacks: opening a different overlay drops the
         // previous one (the tab-double-click-behind-menu case can't strand).
-        v.open_overlay(ActiveOverlay::SessionSwitcher(SessionSwitcher { selected: 0 }));
+        v.open_overlay(ActiveOverlay::SessionSwitcher(SessionSwitcher {
+            selected: 0,
+        }));
         assert!(v.overlay_is_session());
-        assert!(v.buffer_ref().is_none(), "buffer overlay dropped on replace");
+        assert!(
+            v.buffer_ref().is_none(),
+            "buffer overlay dropped on replace"
+        );
 
         v.clear_overlay();
         assert!(!v.has_overlay(), "clear_overlay returns to None");
@@ -892,7 +933,10 @@ fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
     view.update(vcx, |v, _cx| {
         let c = v.agent_mut().unwrap();
         assert!(c.input_surface.is_chatbox());
-        assert!(c.input_surface.chatbox().is_some(), "chatbox exists iff Chatbox variant");
+        assert!(
+            c.input_surface.chatbox().is_some(),
+            "chatbox exists iff Chatbox variant"
+        );
     });
 
     // Toggle -> Worksheet: the box is gone (no stranded Some).
@@ -900,7 +944,10 @@ fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
     view.update(vcx, |v, _cx| {
         let c = v.agent_mut().unwrap();
         assert!(!c.input_surface.is_chatbox());
-        assert!(c.input_surface.chatbox().is_none(), "worksheet carries no chatbox");
+        assert!(
+            c.input_surface.chatbox().is_none(),
+            "worksheet carries no chatbox"
+        );
     });
 
     // Toggle back -> Chatbox: a fresh box.
@@ -940,7 +987,10 @@ fn agent_note(
 fn boot_with_bound_slot<'a>(
     cx: &'a mut TestAppContext,
     sid: &str,
-) -> (gpui::Entity<SketchGpuiView>, &'a mut gpui::VisualTestContext) {
+) -> (
+    gpui::Entity<SketchGpuiView>,
+    &'a mut gpui::VisualTestContext,
+) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
@@ -980,9 +1030,20 @@ fn agent_reducer_drives_transcript_after_gate_flips(cx: &mut TestAppContext) {
                 1,
                 1,
                 1,
-                K::Chunk { text: "pre-gate chunk".into(), role: ChunkRole::Message },
+                K::Chunk {
+                    text: "pre-gate chunk".into(),
+                    role: ChunkRole::Message,
+                },
             ),
-            agent_note("S1", 1, 1, 2, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                1,
+                1,
+                2,
+                K::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            ),
         ];
         v.apply_server_batch(batch, cx);
     });
@@ -1016,9 +1077,20 @@ fn agent_reducer_drives_transcript_after_gate_flips(cx: &mut TestAppContext) {
                 1,
                 2,
                 3,
-                K::Chunk { text: "live turn-2 prose".into(), role: ChunkRole::Message },
+                K::Chunk {
+                    text: "live turn-2 prose".into(),
+                    role: ChunkRole::Message,
+                },
             ),
-            agent_note("S1", 1, 2, 4, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                1,
+                2,
+                4,
+                K::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            ),
         ];
         v.apply_server_batch(batch, cx);
     });
@@ -1040,7 +1112,10 @@ fn agent_reducer_drives_transcript_after_gate_flips(cx: &mut TestAppContext) {
         let tagged_turn_2 = anchors
             .iter()
             .any(|a| matches!(meta.get(*a), Some(crate::TurnId::Llm(2))));
-        assert!(tagged_turn_2, "the turn-2 chunk must be tagged Llm(2) from event.turn");
+        assert!(
+            tagged_turn_2,
+            "the turn-2 chunk must be tagged Llm(2) from event.turn"
+        );
         assert!(c.finalized.contains(&(1, 2)), "turn 2 finalized once");
     });
 }
@@ -1059,13 +1134,24 @@ fn agent_reducer_finalize_is_idempotent_on_generation_turn(cx: &mut TestAppConte
     view.update(vcx, |v, cx| {
         let batch = vec![
             agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
-            agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                1,
+                1,
+                1,
+                K::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            ),
             agent_note(
                 "S1",
                 1,
                 2,
                 2,
-                K::Chunk { text: "no newline here".into(), role: ChunkRole::Message },
+                K::Chunk {
+                    text: "no newline here".into(),
+                    role: ChunkRole::Message,
+                },
             ),
         ];
         v.apply_server_batch(batch, cx);
@@ -1074,7 +1160,15 @@ fn agent_reducer_finalize_is_idempotent_on_generation_turn(cx: &mut TestAppConte
     // First TurnEnded for (1,2): finalizes, adds the trailing newline.
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
-            vec![agent_note("S1", 1, 2, 3, K::TurnEnded { outcome: TurnOutcome::Completed })],
+            vec![agent_note(
+                "S1",
+                1,
+                2,
+                3,
+                K::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            )],
             cx,
         );
     });
@@ -1083,7 +1177,15 @@ fn agent_reducer_finalize_is_idempotent_on_generation_turn(cx: &mut TestAppConte
     // SECOND TurnEnded for the SAME (1,2): must be a no-op on the buffer.
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
-            vec![agent_note("S1", 1, 2, 4, K::TurnEnded { outcome: TurnOutcome::Completed })],
+            vec![agent_note(
+                "S1",
+                1,
+                2,
+                4,
+                K::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            )],
             cx,
         );
     });
@@ -1119,13 +1221,24 @@ fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         let batch = vec![
             agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
-            agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                1,
+                1,
+                1,
+                K::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            ),
             agent_note(
                 "S1",
                 1,
                 2,
                 2,
-                K::Chunk { text: "GEN1-CONTENT".into(), role: ChunkRole::Message },
+                K::Chunk {
+                    text: "GEN1-CONTENT".into(),
+                    role: ChunkRole::Message,
+                },
             ),
         ];
         v.apply_server_batch(batch, cx);
@@ -1138,15 +1251,34 @@ fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         let batch = vec![
             agent_note("S1", 2, 1, 0, K::ChannelOpened { resumed: true }),
-            agent_note("S1", 2, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                2,
+                1,
+                1,
+                K::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            ),
             agent_note(
                 "S1",
                 2,
                 2,
                 2,
-                K::Chunk { text: "GEN2-CONTENT".into(), role: ChunkRole::Message },
+                K::Chunk {
+                    text: "GEN2-CONTENT".into(),
+                    role: ChunkRole::Message,
+                },
             ),
-            agent_note("S1", 2, 2, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                2,
+                2,
+                3,
+                K::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            ),
         ];
         v.apply_server_batch(batch, cx);
     });
@@ -1170,7 +1302,10 @@ fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
                 1,
                 9,
                 99,
-                K::Chunk { text: "STRAY-OLD-GEN".into(), role: ChunkRole::Message },
+                K::Chunk {
+                    text: "STRAY-OLD-GEN".into(),
+                    role: ChunkRole::Message,
+                },
             )],
             cx,
         );
@@ -1197,13 +1332,24 @@ fn agent_reducer_unknown_and_compacted_summary_arms(cx: &mut TestAppContext) {
         };
         let batch = vec![
             agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
-            agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                1,
+                1,
+                1,
+                K::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            ),
             agent_note(
                 "S1",
                 1,
                 2,
                 2,
-                K::CompactedSummary { through_turn: 5, summary: "earlier work".into() },
+                K::CompactedSummary {
+                    through_turn: 5,
+                    summary: "earlier work".into(),
+                },
             ),
             agent_note("S1", 1, 2, 3, unknown),
         ];
@@ -1215,7 +1361,10 @@ fn agent_reducer_unknown_and_compacted_summary_arms(cx: &mut TestAppContext) {
         text.contains("history compacted through turn 5"),
         "CompactedSummary must surface a deterministic placeholder; got:\n{text}"
     );
-    assert!(text.contains("earlier work"), "the summary text is included");
+    assert!(
+        text.contains("earlier work"),
+        "the summary text is included"
+    );
     assert!(
         !text.contains("speculative_decode"),
         "an Unknown event must render nothing (no broken block)"
@@ -1238,7 +1387,15 @@ fn agent_reducer_no_double_apply_across_streams(cx: &mut TestAppContext) {
         v.apply_server_batch(
             vec![
                 agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
-                agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+                agent_note(
+                    "S1",
+                    1,
+                    1,
+                    1,
+                    K::TurnEnded {
+                        outcome: TurnOutcome::Completed,
+                    },
+                ),
             ],
             cx,
         );
@@ -1257,9 +1414,20 @@ fn agent_reducer_no_double_apply_across_streams(cx: &mut TestAppContext) {
                 1,
                 2,
                 2,
-                K::Chunk { text: "DEDUP-ME".into(), role: ChunkRole::Message },
+                K::Chunk {
+                    text: "DEDUP-ME".into(),
+                    role: ChunkRole::Message,
+                },
             ),
-            agent_note("S1", 1, 2, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                1,
+                2,
+                3,
+                K::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            ),
         ];
         v.apply_server_batch(batch, cx);
     });
@@ -1297,7 +1465,13 @@ fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContex
     // Rebaseline to generation 1 so both streams share the same generation key.
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
-            vec![agent_note("S1", 1, 0, 0, K::ChannelOpened { resumed: false })],
+            vec![agent_note(
+                "S1",
+                1,
+                0,
+                0,
+                K::ChannelOpened { resumed: false },
+            )],
             cx,
         );
     });
@@ -1307,7 +1481,15 @@ fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContex
     // It finalizes the ledger key (generation 1, turn 1).
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
-            vec![agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed })],
+            vec![agent_note(
+                "S1",
+                1,
+                1,
+                1,
+                K::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            )],
             cx,
         );
     });
@@ -1415,7 +1597,15 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
                     session_id: "S1".into(),
                     event: ReplyEvent::Chunk("replayed turn-0 prose".into()),
                 },
-                agent_note("S1", 0, 0, 0, K::TurnEnded { outcome: TurnOutcome::Completed }),
+                agent_note(
+                    "S1",
+                    0,
+                    0,
+                    0,
+                    K::TurnEnded {
+                        outcome: TurnOutcome::Completed,
+                    },
+                ),
             ],
             cx,
         );
@@ -1433,7 +1623,15 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
     // which aliases the upcoming live turn's `completed_turn` (1).
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
-            vec![agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::ReplayEnd })],
+            vec![agent_note(
+                "S1",
+                0,
+                1,
+                1,
+                K::TurnEnded {
+                    outcome: TurnOutcome::ReplayEnd,
+                },
+            )],
             cx,
         );
     });
@@ -1477,9 +1675,20 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
                     0,
                     1,
                     2,
-                    K::Chunk { text: "LIVE-AFTER-REPLAY".into(), role: ChunkRole::Message },
+                    K::Chunk {
+                        text: "LIVE-AFTER-REPLAY".into(),
+                        role: ChunkRole::Message,
+                    },
                 ),
-                agent_note("S1", 0, 1, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+                agent_note(
+                    "S1",
+                    0,
+                    1,
+                    3,
+                    K::TurnEnded {
+                        outcome: TurnOutcome::Completed,
+                    },
+                ),
             ],
             cx,
         );
@@ -1534,8 +1743,24 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
             vec![
-                agent_note("S1", 0, 0, 0, K::TurnEnded { outcome: TurnOutcome::Completed }),
-                agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+                agent_note(
+                    "S1",
+                    0,
+                    0,
+                    0,
+                    K::TurnEnded {
+                        outcome: TurnOutcome::Completed,
+                    },
+                ),
+                agent_note(
+                    "S1",
+                    0,
+                    1,
+                    1,
+                    K::TurnEnded {
+                        outcome: TurnOutcome::Completed,
+                    },
+                ),
             ],
             cx,
         );
@@ -1550,7 +1775,15 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
     // ReplayEnd: `finish_replay` folds `last_seen` → 2, aliasing the live turn.
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
-            vec![agent_note("S1", 0, 2, 2, K::TurnEnded { outcome: TurnOutcome::ReplayEnd })],
+            vec![agent_note(
+                "S1",
+                0,
+                2,
+                2,
+                K::TurnEnded {
+                    outcome: TurnOutcome::ReplayEnd,
+                },
+            )],
             cx,
         );
     });
@@ -1558,8 +1791,14 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
     view.update(vcx, |v, _cx| {
         let c = v.agent_mut().unwrap();
         assert!(c.agent_stream_authoritative, "gate flipped after replay");
-        assert!(c.finalized.contains(&(0, 0)), "replayed turn 0 finalized its own key");
-        assert!(c.finalized.contains(&(0, 1)), "replayed turn 1 finalized its own key");
+        assert!(
+            c.finalized.contains(&(0, 0)),
+            "replayed turn 0 finalized its own key"
+        );
+        assert!(
+            c.finalized.contains(&(0, 1)),
+            "replayed turn 1 finalized its own key"
+        );
         assert_eq!(
             c.replay_turns.last_seen, 2,
             "finish_replay folded the cursor to the live turn's index"
@@ -1573,8 +1812,7 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
 
     // Live turn 2: begin (thinking), stream content, end. Stamped turn 2.
     view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().turn_phase =
-            crate::TurnPhase::begin(std::time::Instant::now());
+        v.agent_mut().unwrap().turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
     });
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
@@ -1584,9 +1822,20 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
                     0,
                     2,
                     3,
-                    K::Chunk { text: "LIVE-PROSE".into(), role: ChunkRole::Message },
+                    K::Chunk {
+                        text: "LIVE-PROSE".into(),
+                        role: ChunkRole::Message,
+                    },
                 ),
-                agent_note("S1", 0, 2, 4, K::TurnEnded { outcome: TurnOutcome::Completed }),
+                agent_note(
+                    "S1",
+                    0,
+                    2,
+                    4,
+                    K::TurnEnded {
+                        outcome: TurnOutcome::Completed,
+                    },
+                ),
             ],
             cx,
         );
@@ -1595,7 +1844,10 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
     view.update(vcx, |v, _cx| {
         let c = v.agent_mut().unwrap();
         let text = c.editor.document().full_text();
-        assert!(text.contains("LIVE-PROSE"), "live content folded; transcript:\n{text}");
+        assert!(
+            text.contains("LIVE-PROSE"),
+            "live content folded; transcript:\n{text}"
+        );
         assert!(
             matches!(c.turn_phase, crate::TurnPhase::Idle),
             "live turn after multi-turn replay must finalize (Idle), not stay thinking; \
@@ -1639,7 +1891,15 @@ fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppCo
     // Step 1: replayed turn 0 completes. Note last_seen advances to 0.
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
-            vec![agent_note("S1", 0, 0, 0, K::TurnEnded { outcome: TurnOutcome::Completed })],
+            vec![agent_note(
+                "S1",
+                0,
+                0,
+                0,
+                K::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            )],
             cx,
         );
     });
@@ -1658,7 +1918,15 @@ fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppCo
     // must NOT flip to Idle — and it must NOT finalize the live turn's key.
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
-            vec![agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::ReplayEnd })],
+            vec![agent_note(
+                "S1",
+                0,
+                1,
+                1,
+                K::TurnEnded {
+                    outcome: TurnOutcome::ReplayEnd,
+                },
+            )],
             cx,
         );
     });
@@ -1687,9 +1955,20 @@ fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppCo
                     0,
                     1,
                     2,
-                    K::Chunk { text: "LIVE-MID-RESUME".into(), role: ChunkRole::Message },
+                    K::Chunk {
+                        text: "LIVE-MID-RESUME".into(),
+                        role: ChunkRole::Message,
+                    },
                 ),
-                agent_note("S1", 0, 1, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+                agent_note(
+                    "S1",
+                    0,
+                    1,
+                    3,
+                    K::TurnEnded {
+                        outcome: TurnOutcome::Completed,
+                    },
+                ),
             ],
             cx,
         );
@@ -1698,7 +1977,10 @@ fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppCo
     view.update(vcx, |v, _cx| {
         let c = v.agent_mut().unwrap();
         let text = c.editor.document().full_text();
-        assert!(text.contains("LIVE-MID-RESUME"), "live content folded; transcript:\n{text}");
+        assert!(
+            text.contains("LIVE-MID-RESUME"),
+            "live content folded; transcript:\n{text}"
+        );
         assert!(
             matches!(c.turn_phase, crate::TurnPhase::Idle),
             "STUCK-THINKING BUG: the live turn after replay must finalize (Idle), not stay \
