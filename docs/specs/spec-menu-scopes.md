@@ -474,3 +474,11 @@ to `gpui_menu()` in `main.rs`.
   position toggle removed from the menu entirely (rails keep their global
   chords). Menu overlay now lays sections out in 1–3 columns (≤8 rows → 1,
   ≤18 → 2, else 3; separator-delimited sections never split mid-group).
+- 2026-06-09 — Global root restructured into four submenus: `n` new
+  (file-browser pane / buffer list / claude session pane — the pane
+  entries SPLIT and create a new panel via `new-browser-pane` /
+  `new-agent-pane` instead of replacing the focused one), `w` windows
+  (split/close/focus/size), `s` workspace (tabs/move/also-show), `l`
+  layout (layouts/marks/tags, keys lowercased). Theme submenu killed.
+  Claude session management (incl. mode-cycle and the build loop) is now
+  Agent-local only (`. m`, `. p`, `. P`, `. g`).

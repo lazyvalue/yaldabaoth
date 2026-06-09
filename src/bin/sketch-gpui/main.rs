@@ -6407,61 +6407,24 @@ struct TagInputOverlay {
 /// (search, claude-attach via socket, save-quit, …) that have no GPUI
 /// counterpart yet.
 fn gpui_menu() -> Vec<MenuNode> {
+    // Pane-scoped entries (edit views, reload, claude session management)
+    // live in the `.` local menus; rails live on their global chords
+    // (Cmd-B / Cmd-Shift-O / Cmd-Shift-B). The global menu is workspace-
+    // scoped only: create panels, arrange windows, manage workspaces,
+    // layouts, quit.
     vec![
-        MenuNode::label("Open"),
-        MenuNode::entry("f", "file browser", "open-browser"),
-        MenuNode::entry("b", "buffer list", "buffer-list"),
         MenuNode::submenu(
-            "c",
-            "claude",
+            "n",
+            "new",
             vec![
-                MenuNode::entry("n", "new session", "claude-new"),
-                MenuNode::entry("l", "list sessions", "claude-list"),
-                MenuNode::entry("x", "close session", "claude-close"),
-                MenuNode::entry("r", "rename session", "claude-rename"),
-                MenuNode::entry(
-                    "w",
-                    "toggle worksheet/chatbox (Ctrl-Alt-Enter)",
-                    "agent-input-toggle",
-                ),
-                MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
-                MenuNode::entry("g", "rebuild & restart gui", "dev-restart-gui"),
-                MenuNode::separator(),
-                MenuNode::label("Build loop"),
-                MenuNode::entry(
-                    "p",
-                    "promote: build & launch candidate",
-                    "dev-build-candidate",
-                ),
-                MenuNode::entry("P", "take over sessions (candidate)", "dev-take-over"),
+                MenuNode::entry("f", "file browser pane", "new-browser-pane"),
+                MenuNode::entry("b", "buffer list", "buffer-list"),
+                MenuNode::entry("c", "claude session pane", "new-agent-pane"),
             ],
         ),
-        // Edit (enter-edit / enter-wp / reload-file) moved to the Doc/Edit
-        // local menus (`.`) — spec-menu-scopes.md Phase 2 cleanup. They're
-        // pane-scoped, not workspace-scoped.
-        MenuNode::separator(),
-        MenuNode::label("View"),
-        MenuNode::entry("v", "back to doc", "back-to-doc"),
         MenuNode::submenu(
-            "t",
-            "theme",
-            vec![
-                MenuNode::entry("d", "Dracula (dark)", "theme-dracula"),
-                MenuNode::entry("n", "Nightfox (dark)", "theme-nightfox"),
-                MenuNode::entry("g", "Gruvbox (dark)", "theme-gruvbox-dark"),
-                MenuNode::entry("l", "Solarized Light", "theme-solarized-light"),
-                MenuNode::entry("L", "Solarized Dark", "theme-solarized-dark"),
-                MenuNode::entry("f", "Financial Times", "theme-financial-times"),
-                MenuNode::entry("F", "Financial Times Dark", "theme-financial-times-dark"),
-                MenuNode::entry("o", "Folio", "theme-folio"),
-            ],
-        ),
-        // Rail commands removed from the menu — they live on their global
-        // chords (Cmd-B / Cmd-Shift-O / Cmd-Shift-B) and `.` Doc outline.
-        MenuNode::separator(),
-        MenuNode::submenu(
-            "W",
-            "window (splits/workspaces)",
+            "w",
+            "windows",
             vec![
                 MenuNode::label("Split"),
                 MenuNode::entry("s", "split horizontal (Ctrl-W s)", "split-h"),
@@ -6481,8 +6444,12 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("-", "shrink (Ctrl-W -)", "resize-shrink"),
                 MenuNode::entry("+", "grow (Ctrl-W +)", "resize-grow"),
                 MenuNode::entry("=", "equalize (Ctrl-W =)", "equalize"),
-                MenuNode::separator(),
-                MenuNode::label("Workspaces"),
+            ],
+        ),
+        MenuNode::submenu(
+            "s",
+            "workspace",
+            vec![
                 MenuNode::entry("t", "new workspace (Cmd-T)", "new-tab"),
                 MenuNode::entry("x", "close workspace (Cmd-Shift-W)", "close-tab"),
                 MenuNode::entry("]", "next workspace (Ctrl-Tab)", "next-tab"),
@@ -6494,25 +6461,32 @@ fn gpui_menu() -> Vec<MenuNode> {
                     "also-show pane in workspace (Ctrl-W M)",
                     "also-show-pane",
                 ),
-                MenuNode::separator(),
+            ],
+        ),
+        MenuNode::submenu(
+            "l",
+            "layout",
+            vec![
                 MenuNode::label("Layout"),
-                MenuNode::entry("L", "cycle layout mode (Ctrl-W Space)", "cycle-layout"),
-                MenuNode::entry("P", "promote to master (Ctrl-W Enter)", "promote-master"),
-                MenuNode::entry("I", "increase master count (Ctrl-W i)", "inc-master"),
-                MenuNode::entry("D", "decrease master count (Ctrl-W d)", "dec-master"),
+                MenuNode::entry("l", "cycle layout mode (Ctrl-W Space)", "cycle-layout"),
+                MenuNode::entry("p", "promote to master (Ctrl-W Enter)", "promote-master"),
+                MenuNode::entry("i", "increase master count (Ctrl-W i)", "inc-master"),
+                MenuNode::entry("d", "decrease master count (Ctrl-W d)", "dec-master"),
                 MenuNode::separator(),
                 MenuNode::label("Marks"),
                 MenuNode::entry("'", "list marks", "list-marks"),
                 MenuNode::separator(),
                 MenuNode::label("Tags"),
-                MenuNode::entry("T", "tag buffer", "tag-add"),
-                MenuNode::entry("U", "untag buffer", "tag-remove"),
-                MenuNode::entry("V", "view tag", "tag-view"),
-                MenuNode::entry("A", "also-tag buffer", "tag-also"),
-                MenuNode::entry("X", "tag + view", "tag-send"),
-                MenuNode::entry("K", "bind tag shortcut", "tag-bind"),
+                MenuNode::entry("t", "tag buffer", "tag-add"),
+                MenuNode::entry("u", "untag buffer", "tag-remove"),
+                MenuNode::entry("v", "view tag", "tag-view"),
+                MenuNode::entry("a", "also-tag buffer", "tag-also"),
+                MenuNode::entry("x", "tag + view", "tag-send"),
+                MenuNode::entry("k", "bind tag shortcut", "tag-bind"),
             ],
         ),
+        MenuNode::separator(),
+        MenuNode::entry("v", "back to doc", "back-to-doc"),
         MenuNode::separator(),
         MenuNode::entry("q", "quit", "quit"),
     ]
@@ -6587,10 +6561,15 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("w", "toggle worksheet/chatbox", "agent-input-toggle"),
         MenuNode::entry("s", "send buffer", "claude-send"),
         MenuNode::entry("S", "send selection", "claude-send-selection"),
+        MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
         MenuNode::entry("d", "detach", "claude-detach"),
         MenuNode::entry("a", "attach", "claude-attach"),
         MenuNode::separator(),
+        // Build loop (moved here from the global claude submenu — these act
+        // on the focused session, so they're pane-scoped).
         MenuNode::entry("p", "promote (build candidate)", "dev-build-candidate"),
+        MenuNode::entry("P", "take over sessions (candidate)", "dev-take-over"),
+        MenuNode::entry("g", "rebuild & restart gui", "dev-restart-gui"),
     ]
 }
 
@@ -10383,6 +10362,38 @@ impl SketchGpuiView {
             "tag-also" => self.open_tag_input(TagInputMode::AlsoTag, cx),
             "tag-send" => self.open_tag_input(TagInputMode::SendTag, cx),
             "tag-bind" => self.open_tag_input(TagInputMode::TagBind, cx),
+            // New-panel commands (global `n` submenu): create a NEW pane
+            // (vertical split of the focused one) instead of replacing
+            // the focused pane's content.
+            "new-browser-pane" => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let _ = self.workspace.split_focused(
+                    workspace::SplitDir::V,
+                    WindowContent::Browser(BrowserWindow::standalone(cwd)),
+                );
+                self.workspace.retile_active();
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "new-agent-pane" => {
+                // Split with a placeholder browser (focus lands on the new
+                // pane), then let `open_agent_inner` swap the focused pane
+                // for the agent ring — reusing all the session machinery.
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                if self
+                    .workspace
+                    .split_focused(
+                        workspace::SplitDir::V,
+                        WindowContent::Browser(BrowserWindow::standalone(cwd)),
+                    )
+                    .is_some()
+                {
+                    self.workspace.retile_active();
+                    self.open_agent_inner(cx);
+                    self.save_workspace_state();
+                    cx.notify();
+                }
+            }
             // Local menus (spec-menu-scopes.md)
             "doc-goto-top" => {
                 if let Some(d) = self.doc_mut() {
@@ -20915,13 +20926,16 @@ mod tests {
         collect_leaves(&menu, &mut leaf_actions);
         // The expected leaf actions — change here if gpui_menu changes.
         let expected = [
-            "open-browser",
+            "new-browser-pane",
             "buffer-list",
-            "claude-new",
-            "claude-list",
-            "claude-close",
-            "claude-rename",
-            "agent-input-toggle",
+            "new-agent-pane",
+            "split-h",
+            "close-window",
+            "new-tab",
+            "move-pane",
+            "cycle-layout",
+            "tag-add",
+            "list-marks",
             "back-to-doc",
             "quit",
         ];
@@ -20934,7 +20948,8 @@ mod tests {
             );
         }
         // Pane-scoped + chrome entries removed from the global menu
-        // (Phase 2 cleanup): they live in the `.` local menus / on chords.
+        // (Phase 2 cleanup + restructure): they live in the `.` local
+        // menus / on chords; themes were killed outright.
         for gone in [
             "enter-edit",
             "enter-wp",
@@ -20943,6 +20958,18 @@ mod tests {
             "rail-files",
             "rail-outline",
             "rail-flip",
+            "open-browser",
+            "claude-new",
+            "claude-list",
+            "claude-close",
+            "claude-rename",
+            "agent-input-toggle",
+            "claude-mode-cycle",
+            "dev-build-candidate",
+            "dev-take-over",
+            "dev-restart-gui",
+            "theme-dracula",
+            "theme-folio",
         ] {
             assert!(
                 !leaf_actions.contains(&gone),
@@ -21024,37 +21051,59 @@ mod tests {
     }
 
     #[test]
-    fn menu_c_n_resolves_to_claude_new() {
-        // `c` opens the claude submenu; `n` then resolves to claude-new.
-        // Regression check that the Label node preceding `c` doesn't shadow
-        // it (process_key must skip Labels).
+    fn agent_local_n_resolves_to_claude_new() {
+        // Claude session management lives in the Agent local menu now.
         let mut state = MenuState::new();
         state.open();
-        let menu = gpui_menu();
-        let after_c = state.process_key(KeyPress::new(Key::Char('c'), KMods::NONE), &menu);
-        assert_eq!(after_c, None, "c alone should open the claude submenu");
-        assert!(state.is_active(), "submenu open keeps menu state active");
+        let menu = agent_local_menu();
         let cmd = state.process_key(KeyPress::new(Key::Char('n'), KMods::NONE), &menu);
         assert_eq!(cmd, Some("claude-new".to_string()));
     }
 
     #[test]
-    fn menu_c_l_resolves_to_claude_list() {
+    fn agent_local_l_resolves_to_claude_list() {
         let mut state = MenuState::new();
         state.open();
-        let menu = gpui_menu();
-        state.process_key(KeyPress::new(Key::Char('c'), KMods::NONE), &menu);
+        let menu = agent_local_menu();
         let cmd = state.process_key(KeyPress::new(Key::Char('l'), KMods::NONE), &menu);
         assert_eq!(cmd, Some("claude-list".to_string()));
     }
 
     #[test]
-    fn menu_f_resolves_to_open_browser() {
+    fn menu_n_f_resolves_to_new_browser_pane() {
+        // `n` opens the new submenu; `f` creates a file-browser pane.
         let mut state = MenuState::new();
         state.open();
         let menu = gpui_menu();
+        let after_n = state.process_key(KeyPress::new(Key::Char('n'), KMods::NONE), &menu);
+        assert_eq!(after_n, None, "n alone should open the new submenu");
+        assert!(state.is_active(), "submenu open keeps menu state active");
         let cmd = state.process_key(KeyPress::new(Key::Char('f'), KMods::NONE), &menu);
-        assert_eq!(cmd, Some("open-browser".to_string()));
+        assert_eq!(cmd, Some("new-browser-pane".to_string()));
+    }
+
+    #[test]
+    fn menu_root_submenus_resolve() {
+        // Root layout after the restructure: n=new, w=windows, s=workspace,
+        // l=layout — each a submenu; theme is gone entirely.
+        let menu = gpui_menu();
+        for (ch, follow, expected) in &[
+            ('w', 's', "split-h"),
+            ('s', 't', "new-tab"),
+            ('l', 'l', "cycle-layout"),
+            ('n', 'c', "new-agent-pane"),
+        ] {
+            let mut state = MenuState::new();
+            state.open();
+            let after = state.process_key(KeyPress::new(Key::Char(*ch), KMods::NONE), &menu);
+            assert_eq!(after, None, "{ch:?} should open a submenu");
+            let cmd = state.process_key(KeyPress::new(Key::Char(*follow), KMods::NONE), &menu);
+            assert_eq!(
+                cmd,
+                Some(expected.to_string()),
+                "{ch:?} {follow:?} should resolve to {expected:?}"
+            );
+        }
     }
 
     #[test]
