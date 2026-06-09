@@ -237,7 +237,15 @@ enum KnownKind {
         tool_call_update: ToolCallUpdate,
     },
     PlanUpdated(Plan),
-    ModeChanged(SessionModeId),
+    // `SessionModeId` is a newtype around a STRING, and an internally-tagged
+    // (`#[serde(tag = "kind")]`) newtype variant wrapping a non-map value cannot
+    // serialize — serde errors with "cannot serialize tagged newtype variant
+    // ... containing a string", which made every mode change fail to record to
+    // the WAL. Nest it under a named field so the value rides as `"mode":"..."`.
+    // (Plan/UsageSnapshot wrap MAPS, so their newtype flatten is fine.)
+    ModeChanged {
+        mode: SessionModeId,
+    },
     UsageUpdated(UsageSnapshot),
     // `kind` is the internal enum tag, so the Notice severity rides the wire as
     // `level` to avoid colliding with it.
@@ -276,7 +284,7 @@ impl AgentEventKind {
                 tool_call_update: u.clone(),
             },
             AgentEventKind::PlanUpdated(p) => KnownKind::PlanUpdated(p.clone()),
-            AgentEventKind::ModeChanged(m) => KnownKind::ModeChanged(m.clone()),
+            AgentEventKind::ModeChanged(m) => KnownKind::ModeChanged { mode: m.clone() },
             AgentEventKind::UsageUpdated(s) => KnownKind::UsageUpdated(s.clone()),
             AgentEventKind::Notice { kind, msg } => KnownKind::Notice {
                 kind: *kind,
@@ -306,7 +314,7 @@ impl AgentEventKind {
                 AgentEventKind::ToolCallUpdated(tool_call_update)
             }
             KnownKind::PlanUpdated(p) => AgentEventKind::PlanUpdated(p),
-            KnownKind::ModeChanged(m) => AgentEventKind::ModeChanged(m),
+            KnownKind::ModeChanged { mode } => AgentEventKind::ModeChanged(mode),
             KnownKind::UsageUpdated(s) => AgentEventKind::UsageUpdated(s),
             KnownKind::Notice { kind, msg } => AgentEventKind::Notice { kind, msg },
             KnownKind::UserMessage { text } => AgentEventKind::UserMessage { text },
@@ -716,6 +724,23 @@ mod tests {
             "all {checked} real tool-call WAL records must recover; {dropped} still dropped"
         );
         eprintln!("[wal-recover-check] {checked} tool-call records, all recovered");
+    }
+
+    /// Regression: `ModeChanged` wraps a `SessionModeId` (a newtype around a
+    /// STRING). As a `#[serde(tag="kind")]` newtype variant it could NOT
+    /// serialize ("cannot serialize tagged newtype variant ... containing a
+    /// string"), so every agent mode change failed to record to the WAL. Nesting
+    /// under `mode` fixes serialize + round-trip.
+    #[test]
+    fn mode_changed_serializes_and_round_trips() {
+        let mode: crate::acp_channel::SessionModeId = serde_json::from_str("\"plan\"").unwrap();
+        let e = ev(AgentEventKind::ModeChanged(mode));
+        // Previously this `unwrap` panicked (serialize error).
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains(r#""kind":"mode_changed""#), "{json}");
+        assert!(json.contains(r#""mode":"plan""#), "{json}");
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
     }
 
     /// The load-bearing spec §8 guarantee: an older decoder lands an unknown
