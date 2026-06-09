@@ -468,3 +468,9 @@ to `gpui_menu()` in `main.rs`.
   (sends the transcript selection as a prompt, input surface untouched);
   `browser-open-workspace` / `browser-open-split` (selected file → Doc in a
   new tab / vertical split; directories rejected with a toast).
+- 2026-06-09 — Phase 2 cleanup (Behavior 5): Edit group (`enter-edit` /
+  `enter-wp` / `reload-file`) removed from the global menu — pane-scoped,
+  lives in the `.` local menus. Rail group and the agent status-bar
+  position toggle removed from the menu entirely (rails keep their global
+  chords). Menu overlay now lays sections out in 1–3 columns (≤8 rows → 1,
+  ≤18 → 2, else 3; separator-delimited sections never split mid-group).

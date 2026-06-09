@@ -6436,15 +6436,12 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("P", "take over sessions (candidate)", "dev-take-over"),
             ],
         ),
-        MenuNode::separator(),
-        MenuNode::label("Edit"),
-        MenuNode::entry("e", "edit (raw markdown)", "enter-edit"),
-        MenuNode::entry("w", "edit (word processor)", "enter-wp"),
-        MenuNode::entry("r", "reload from disk (discards unsaved)", "reload-file"),
+        // Edit (enter-edit / enter-wp / reload-file) moved to the Doc/Edit
+        // local menus (`.`) — spec-menu-scopes.md Phase 2 cleanup. They're
+        // pane-scoped, not workspace-scoped.
         MenuNode::separator(),
         MenuNode::label("View"),
         MenuNode::entry("v", "back to doc", "back-to-doc"),
-        MenuNode::entry("s", "toggle agent status bar position", "claude-status-bar"),
         MenuNode::submenu(
             "t",
             "theme",
@@ -6459,11 +6456,8 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("o", "Folio", "theme-folio"),
             ],
         ),
-        MenuNode::separator(),
-        MenuNode::label("Rail"),
-        MenuNode::entry("B", "file browser rail (Cmd-B)", "rail-files"),
-        MenuNode::entry("O", "outline rail (Cmd-Shift-O)", "rail-outline"),
-        MenuNode::entry("S", "flip rail side (Cmd-Shift-B)", "rail-flip"),
+        // Rail commands removed from the menu — they live on their global
+        // chords (Cmd-B / Cmd-Shift-O / Cmd-Shift-B) and `.` Doc outline.
         MenuNode::separator(),
         MenuNode::submenu(
             "W",
@@ -10035,17 +10029,13 @@ impl SketchGpuiView {
     /// menu layout stays spatially stable.
     fn global_menu_disabled(&self) -> HashSet<String> {
         let mut d = HashSet::new();
-        match self.workspace.focused_content() {
-            Some(WindowContent::Agent(_)) | Some(WindowContent::Browser(_)) => {
-                d.insert("reload-file".to_string());
-                d.insert("enter-edit".to_string());
-                d.insert("enter-wp".to_string());
-                d.insert("back-to-doc".to_string());
-            }
-            Some(WindowContent::Doc(_)) => {
-                d.insert("back-to-doc".to_string());
-            }
-            _ => {}
+        // `back-to-doc` only makes sense from an Edit pane. (The other
+        // pane-scoped entries moved to the `.` local menus — Phase 2.)
+        if !matches!(
+            self.workspace.focused_content(),
+            Some(WindowContent::Edit(_))
+        ) {
+            d.insert("back-to-doc".to_string());
         }
         d
     }
@@ -12449,23 +12439,48 @@ impl SketchGpuiView {
             .font_weight(FontWeight::BOLD)
             .child(format!("{} — {}", m.header, breadcrumb.to_uppercase()));
 
-        let mut entries_col = div()
-            .flex()
-            .flex_col()
-            .px_4()
-            .py_2()
-            .text_color(label_text_fg)
-            .text_size(px(14.0))
-            .font_family(self.body_font.clone());
-
+        // ---- Multi-column layout ----
+        //
+        // Partition the level into sections (separator-delimited groups,
+        // each usually starting with a Label), then distribute whole
+        // sections across 1–3 columns so a large menu fits on screen
+        // without scrolling. Sections never split mid-group.
+        let mut sections: Vec<Vec<&MenuNode>> = vec![Vec::new()];
         for node in nodes {
-            let row: AnyElement = match node.kind() {
-                MenuNodeKind::Separator => div()
-                    .h(px(8.0))
-                    .border_b_1()
-                    .border_color(popup_border)
-                    .my_1()
-                    .into_any_element(),
+            if node.kind() == MenuNodeKind::Separator {
+                if !sections.last().map(Vec::is_empty).unwrap_or(true) {
+                    sections.push(Vec::new());
+                }
+            } else {
+                sections.last_mut().unwrap().push(node);
+            }
+        }
+        if sections.last().map(Vec::is_empty).unwrap_or(false) {
+            sections.pop();
+        }
+        let total_rows: usize = sections.iter().map(Vec::len).sum();
+        let n_cols = if total_rows <= 8 {
+            1
+        } else if total_rows <= 18 {
+            2
+        } else {
+            3
+        };
+        let target_rows = total_rows.div_ceil(n_cols);
+        let mut columns: Vec<Vec<Vec<&MenuNode>>> = vec![Vec::new()];
+        let mut col_rows = 0usize;
+        for sec in sections {
+            if col_rows >= target_rows && columns.len() < n_cols {
+                columns.push(Vec::new());
+                col_rows = 0;
+            }
+            col_rows += sec.len();
+            columns.last_mut().unwrap().push(sec);
+        }
+
+        let render_node = |node: &MenuNode| -> AnyElement {
+            match node.kind() {
+                MenuNodeKind::Separator => unreachable!("separators delimit sections"),
                 MenuNodeKind::Label => div()
                     .py_0p5()
                     .text_color(label_fg)
@@ -12506,8 +12521,40 @@ impl SketchGpuiView {
                         .child(div().text_color(label_color).child(trailing))
                         .into_any_element()
                 }
-            };
-            entries_col = entries_col.child(row);
+            }
+        };
+
+        let mut entries_col = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap_8()
+            .px_4()
+            .py_2()
+            .text_color(label_text_fg)
+            .text_size(px(14.0))
+            .font_family(self.body_font.clone());
+        for col_sections in columns {
+            let mut col_div = div().flex().flex_col().min_w(px(220.0));
+            let mut first = true;
+            for sec in col_sections {
+                if !first {
+                    // Inter-section gap inside a column (replaces the old
+                    // full-width separator rule).
+                    col_div = col_div.child(
+                        div()
+                            .h(px(8.0))
+                            .border_b_1()
+                            .border_color(popup_border)
+                            .my_1(),
+                    );
+                }
+                first = false;
+                for node in sec {
+                    col_div = col_div.child(render_node(node));
+                }
+            }
+            entries_col = entries_col.child(col_div);
         }
 
         let footer = div()
@@ -20875,10 +20922,6 @@ mod tests {
             "claude-close",
             "claude-rename",
             "agent-input-toggle",
-            "claude-status-bar",
-            "enter-edit",
-            "enter-wp",
-            "reload-file",
             "back-to-doc",
             "quit",
         ];
@@ -20888,6 +20931,22 @@ mod tests {
                 "expected menu to contain leaf {:?}, got {:?}",
                 e,
                 leaf_actions
+            );
+        }
+        // Pane-scoped + chrome entries removed from the global menu
+        // (Phase 2 cleanup): they live in the `.` local menus / on chords.
+        for gone in [
+            "enter-edit",
+            "enter-wp",
+            "reload-file",
+            "claude-status-bar",
+            "rail-files",
+            "rail-outline",
+            "rail-flip",
+        ] {
+            assert!(
+                !leaf_actions.contains(&gone),
+                "{gone:?} should no longer be in the global menu"
             );
         }
     }
@@ -21000,15 +21059,23 @@ mod tests {
 
     #[test]
     fn menu_e_and_w_resolve_to_edit_views() {
+        // Phase 2 cleanup: enter-edit / enter-wp moved from the global menu
+        // to the Doc local menu; only `v` (back-to-doc) stays global.
         let menu = gpui_menu();
-        for (ch, expected) in &[('e', "enter-edit"), ('w', "enter-wp"), ('v', "back-to-doc")] {
+        let mut state = MenuState::new();
+        state.open();
+        let cmd = state.process_key(KeyPress::new(Key::Char('v'), KMods::NONE), &menu);
+        assert_eq!(cmd, Some("back-to-doc".to_string()));
+
+        let local = doc_local_menu();
+        for (ch, expected) in &[('e', "enter-edit"), ('w', "enter-wp")] {
             let mut state = MenuState::new();
             state.open();
-            let cmd = state.process_key(KeyPress::new(Key::Char(*ch), KMods::NONE), &menu);
+            let cmd = state.process_key(KeyPress::new(Key::Char(*ch), KMods::NONE), &local);
             assert_eq!(
                 cmd,
                 Some(expected.to_string()),
-                "key {:?} should resolve to {:?}",
+                "doc-local key {:?} should resolve to {:?}",
                 ch,
                 expected
             );
