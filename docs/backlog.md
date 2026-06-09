@@ -126,8 +126,9 @@ verified via the resilience+transcript harness. Worklogs:
   Behavior-preserving → foldable after build-check. Overlaps
   `tests/session_resilience_test.rs` with phase 4 at integrate (kept additive).
   Unblocks the phase-8 eventlog reducer/forwarder headless tests.
-- **GUI projection + full eventlog end-to-end (phase 8)** — `NEEDS-RUNTIME`
-  (headless-complete, branch `phase8-eventlog`, **uncommitted**, 2026-06-08).
+- **GUI projection + full eventlog end-to-end (phase 8)** — `MERGED` to master
+  (`f0710fc`, 2026-06-08; v3 WAL cutover landed). Post-merge runtime confirms still
+  owed (see end of entry) but non-blocking — headless + reviews are green.
   Producer collapse `Notification::{ReplyEvent,TurnEnded,UserPrompt}` +
   `WorkerEvent::Reply` → one `AgentEvent` (`src/agent_event.rs`, byte-preserving
   `Unknown{tag,raw}`); emit chokepoint (worker stamps gen/turn, server `record()`
@@ -159,7 +160,7 @@ verified via the resilience+transcript harness. Worklogs:
   `replay_prefix_finalized` (re-armed on `reset_for_replay`), never taking a
   per-turn slot. Reproduced + fixed headlessly (verify_harness), independently
   re-reviewed `SOLID` (multi-resume re-arm + no-other-aliasing-pair + no §9
-  regression confirmed). **Owed before merge:** (1) one-shot GPUI paint confirm —
+  regression confirmed). **Post-merge confirms (NEEDS-RUNTIME, non-blocking):** (1) one-shot GPUI paint confirm —
   the now-`Idle` spinner visibly clears on screen (fold/`turn_phase` proven correct
   headlessly; only the paint is unverifiable without a GPUI run); (2) App-Nap-paused-owner
   high-water eviction → clean reconnect + lease reclaim in the live app; (3) the
