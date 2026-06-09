@@ -11,7 +11,7 @@
 //! liveness back every file-backed Doc/Edit view, so splits share a rope).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -86,6 +86,11 @@ impl<C> Layout<C> {
             Layout::Leaf(_) => None,
             Layout::Split { children, .. } => children.iter().find_map(|(_, c)| c.find_leaf(id)),
         }
+    }
+
+    /// Does this subtree contain a leaf with the given id?
+    pub fn contains_leaf(&self, id: WindowId) -> bool {
+        self.find_leaf(id).is_some()
     }
 
     /// Find the leaf with the given id (mutable, recursive).
@@ -198,6 +203,38 @@ impl<C> Layout<C> {
         let mut out = Vec::new();
         self.for_each_leaf(&mut |w| out.push(w.id));
         out
+    }
+
+    /// Swap the content of two leaves in the tree, identified by their window ids.
+    /// Both ids must exist in this tree. No-op if either is missing.
+    pub fn swap_leaf_contents(&mut self, id_a: WindowId, id_b: WindowId) {
+        // Collect raw pointers to the two windows, then swap their contents.
+        // SAFETY: `id_a != id_b` guarantees the two pointers are non-aliasing.
+        if id_a == id_b {
+            return;
+        }
+        let ptr_a = self.find_leaf_mut(id_a).map(|w| w as *mut Window<C>);
+        let ptr_b = self.find_leaf_mut(id_b).map(|w| w as *mut Window<C>);
+        if let (Some(pa), Some(pb)) = (ptr_a, ptr_b) {
+            // SAFETY: we verified id_a != id_b so these can't alias.
+            unsafe {
+                std::ptr::swap(&mut (*pa).content, &mut (*pb).content);
+            }
+        }
+    }
+
+    /// Extract the tree shape as a [`LayoutSkeleton`] (ids + weights + dirs,
+    /// no content). Used to save the manual tree before switching to an
+    /// automatic layout mode.
+    pub fn skeleton(&self) -> LayoutSkeleton {
+        match self {
+            Layout::Empty => LayoutSkeleton::Empty,
+            Layout::Leaf(w) => LayoutSkeleton::Leaf(w.id),
+            Layout::Split { dir, children } => LayoutSkeleton::Split {
+                dir: *dir,
+                children: children.iter().map(|(w, c)| (*w, c.skeleton())).collect(),
+            },
+        }
     }
 }
 
@@ -312,6 +349,136 @@ impl RailState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Marks (spec-layout-patterns.md Phase 1)
+// ---------------------------------------------------------------------------
+
+/// Workspace-global mark table. Maps single characters to `WindowId`s.
+/// Stored on `Workspace<C>`, not per-tab — marks span all tabs.
+pub struct MarkTable {
+    marks: HashMap<char, WindowId>,
+    /// The window where the last text edit occurred (special mark `.`).
+    pub last_edit: Option<WindowId>,
+    /// The window focused before the last cross-tab jump (special mark `'`).
+    pub prev_jump: Option<WindowId>,
+}
+
+impl MarkTable {
+    pub fn new() -> Self {
+        Self {
+            marks: HashMap::new(),
+            last_edit: None,
+            prev_jump: None,
+        }
+    }
+
+    /// Set a user mark. Keys `.` and `'` are reserved for special marks.
+    pub fn set(&mut self, key: char, id: WindowId) {
+        if key != '.' && key != '\'' {
+            self.marks.insert(key, id);
+        }
+    }
+
+    /// Look up a mark. Dispatches `.` and `'` to the special fields.
+    pub fn get(&self, key: char) -> Option<WindowId> {
+        match key {
+            '.' => self.last_edit,
+            '\'' => self.prev_jump,
+            c => self.marks.get(&c).copied(),
+        }
+    }
+
+    /// Reverse lookup: given a window id, return the first mark char pointing
+    /// at it (for rendering the `[a]` badge). Returns `None` if unmarked.
+    pub fn mark_for_window(&self, id: WindowId) -> Option<char> {
+        self.marks
+            .iter()
+            .find(|&(_, &wid)| wid == id)
+            .map(|(&k, _)| k)
+    }
+
+    /// Return all user marks as a sorted list.
+    pub fn all_marks(&self) -> Vec<(char, WindowId)> {
+        let mut out: Vec<_> = self.marks.iter().map(|(&k, &v)| (k, v)).collect();
+        out.sort_by_key(|(k, _)| *k);
+        out
+    }
+
+    /// Remove marks pointing to windows not in `live_ids`.
+    pub fn gc(&mut self, live_ids: &HashSet<WindowId>) {
+        self.marks.retain(|_, id| live_ids.contains(id));
+        if let Some(id) = self.last_edit
+            && !live_ids.contains(&id)
+        {
+            self.last_edit = None;
+        }
+        if let Some(id) = self.prev_jump
+            && !live_ids.contains(&id)
+        {
+            self.prev_jump = None;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Automatic layouts (spec-layout-patterns.md Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Layout mode for a tab. `Manual` is the default (user-built split tree);
+/// the automatic modes compute the tree algorithmically on each structural
+/// change (split/close/mode-switch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutMode {
+    #[default]
+    Manual,
+    MasterStack,
+    Monocle,
+    Columns,
+}
+
+impl LayoutMode {
+    /// Cycle to the next mode: Manual → MasterStack → Monocle → Columns → Manual.
+    pub fn cycle(self) -> Self {
+        match self {
+            LayoutMode::Manual => LayoutMode::MasterStack,
+            LayoutMode::MasterStack => LayoutMode::Monocle,
+            LayoutMode::Monocle => LayoutMode::Columns,
+            LayoutMode::Columns => LayoutMode::Manual,
+        }
+    }
+
+    /// Short sigil for the status bar (spec-layout-patterns.md Behavior 16).
+    pub fn sigil(&self) -> &'static str {
+        match self {
+            LayoutMode::Manual => "[]=",
+            LayoutMode::MasterStack => "[M]=",
+            LayoutMode::Monocle => "[M]", // caller computes [n/N] dynamically
+            LayoutMode::Columns => "|||",
+        }
+    }
+}
+
+/// A skeleton of a layout tree — just the shape (window ids, weights, split
+/// dirs) without the actual content. Used to save the manual tree when
+/// switching to an automatic mode, so it can be restored later.
+#[derive(Debug, Clone)]
+pub enum LayoutSkeleton {
+    Empty,
+    Leaf(WindowId),
+    Split {
+        dir: SplitDir,
+        children: Vec<(f32, LayoutSkeleton)>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Tags (spec-layout-patterns.md Phase 3)
+// ---------------------------------------------------------------------------
+
+/// A set of user-assigned tag names.
+pub type TagSet = BTreeSet<String>;
+
 /// One tab in the workspace's tab strip.
 ///
 /// User-facing name: **"Workspace"**. The product presents each `Tab` as a
@@ -331,6 +498,19 @@ pub struct Tab<C> {
     /// Persistent side column (spec-rail.md). `None` when no rail is open.
     /// Per-tab — switching tabs shows/hides the arriving/departing tab's rail.
     pub rail: Option<RailState>,
+    // --- Layout patterns (spec-layout-patterns.md) ---
+    /// Current layout algorithm. `Manual` is the default (hand-built splits).
+    pub layout_mode: LayoutMode,
+    /// Saved manual tree shape. When switching from Manual to an automatic
+    /// mode, the manual tree's skeleton is saved here so it can be restored.
+    pub saved_manual_layout: Option<LayoutSkeleton>,
+    /// MasterStack: fraction of tab width allocated to the master region.
+    pub master_ratio: f32,
+    /// MasterStack: number of windows in the master region.
+    pub master_count: usize,
+    /// Tag-view filter. When non-empty, the tab shows only windows whose
+    /// buffer carries at least one tag in this set. Empty = show all.
+    pub tag_view: TagSet,
 }
 
 impl<C> Tab<C> {
@@ -357,6 +537,10 @@ pub struct FileBuffer {
     pub file_label: String,
     /// Active EditorViews referencing this core.
     pub refcount: usize,
+    /// User-assigned tags (spec-layout-patterns.md Phase 3). Tags live on the
+    /// pooled buffer so they survive window close/reopen and are shared across
+    /// all views of the same file.
+    pub tags: TagSet,
 }
 
 /// Top-level container for the GPUI frontend. Owns the tab strip, the file-
@@ -372,6 +556,12 @@ pub struct Workspace<C> {
     pub next_window_id: u64,
     /// Monotonic counter feeding `Tab::auto_name`. Bumped on each tab create.
     pub next_tab_index: usize,
+    // --- Layout patterns (spec-layout-patterns.md) ---
+    /// Workspace-global mark table (Phase 1). Cross-tab bookmarks on windows.
+    pub marks: MarkTable,
+    /// Shortcut keys bound to tag names (Phase 3). `Ctrl-W t {key}` views
+    /// the tag mapped to `{key}`.
+    pub tag_shortcuts: HashMap<char, String>,
 }
 
 impl<C> Workspace<C> {
@@ -384,6 +574,8 @@ impl<C> Workspace<C> {
             next_buffer_id: 1,
             next_window_id: 1,
             next_tab_index: 1,
+            marks: MarkTable::new(),
+            tag_shortcuts: HashMap::new(),
         }
     }
 
@@ -443,6 +635,11 @@ impl<C> Workspace<C> {
             layout: Layout::Leaf(Window { id, content }),
             focused: id,
             rail: None,
+            layout_mode: LayoutMode::Manual,
+            saved_manual_layout: None,
+            master_ratio: 0.6,
+            master_count: 1,
+            tag_view: BTreeSet::new(),
         });
         self.active_tab = self.tabs.len() - 1;
         id
@@ -549,6 +746,7 @@ impl<C> Workspace<C> {
             core: Rc::new(RefCell::new(EditorCore::new(text, key.clone()))),
             file_label,
             refcount: 0,
+            tags: BTreeSet::new(),
         };
         self.file_buffers.insert(id, buf);
         self.path_index.insert(key, id);
@@ -1046,6 +1244,104 @@ impl<C> Workspace<C> {
         }
         Ok(())
     }
+
+    // --- Layout patterns: marks (Phase 1) ----------------------------------
+
+    /// Find which tab (by index) contains the window with the given id.
+    pub fn tab_containing(&self, id: WindowId) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.layout.find_leaf(id).is_some())
+    }
+
+    /// Collect all window ids across all tabs (for mark GC).
+    pub fn all_window_ids(&self) -> HashSet<WindowId> {
+        let mut out = HashSet::new();
+        for tab in &self.tabs {
+            tab.layout.for_each_leaf(&mut |w| {
+                out.insert(w.id);
+            });
+        }
+        out
+    }
+
+    // --- Layout patterns: automatic layouts (Phase 2) ----------------------
+
+    /// Re-tile the active tab's layout according to its current `layout_mode`.
+    /// No-op in Manual mode. Called after split/close/mode-switch.
+    pub fn retile_active(&mut self) {
+        let tab = match self.active_tab_mut() {
+            Some(t) => t,
+            None => return,
+        };
+        if tab.layout_mode == LayoutMode::Manual {
+            return;
+        }
+        let focused = tab.focused;
+        let windows = drain_leaves(&mut tab.layout);
+        if windows.is_empty() {
+            return;
+        }
+        let has_focused = windows.iter().any(|w| w.id == focused);
+
+        tab.layout = match tab.layout_mode {
+            LayoutMode::Manual => unreachable!(),
+            LayoutMode::MasterStack => {
+                build_master_stack(windows, tab.master_count, tab.master_ratio)
+            }
+            LayoutMode::Monocle => build_monocle(windows),
+            LayoutMode::Columns => build_columns(windows),
+        };
+
+        if has_focused {
+            tab.focused = focused;
+        } else if let Some(&first) = tab.layout.leaf_ids().first() {
+            tab.focused = first;
+        }
+    }
+
+    /// Switch the active tab's layout mode. Saves/restores the manual tree
+    /// as needed.
+    pub fn set_layout_mode(&mut self, new_mode: LayoutMode) {
+        let tab = match self.active_tab_mut() {
+            Some(t) => t,
+            None => return,
+        };
+        let old_mode = tab.layout_mode;
+        if old_mode == new_mode {
+            return;
+        }
+
+        // Save manual tree skeleton when leaving Manual mode.
+        if old_mode == LayoutMode::Manual && new_mode != LayoutMode::Manual {
+            tab.saved_manual_layout = Some(tab.layout.skeleton());
+        }
+
+        tab.layout_mode = new_mode;
+
+        // Restore manual tree when returning to Manual mode.
+        if new_mode == LayoutMode::Manual {
+            if let Some(skeleton) = tab.saved_manual_layout.take() {
+                let mut current_windows = drain_leaves(&mut tab.layout);
+                tab.layout = restore_from_skeleton(skeleton, &mut current_windows);
+                // Append any windows created during auto mode that don't
+                // exist in the saved skeleton as new leaves.
+                for leftover in current_windows {
+                    let root = std::mem::take(&mut tab.layout);
+                    tab.layout = match root {
+                        Layout::Empty => Layout::Leaf(leftover),
+                        _ => Layout::Split {
+                            dir: SplitDir::V,
+                            children: vec![(0.9, root), (0.1, Layout::Leaf(leftover))],
+                        },
+                    };
+                }
+            }
+            return;
+        }
+
+        self.retile_active();
+    }
 }
 
 impl<C> Default for Workspace<C> {
@@ -1058,6 +1354,142 @@ impl<C> Default for Workspace<C> {
 /// freshly-created workspace (today's `Tab`) when the user hasn't renamed it.
 pub fn auto_tab_name(idx: usize) -> String {
     format!("workspace-{idx}")
+}
+
+// ---------------------------------------------------------------------------
+// Layout algorithms (spec-layout-patterns.md Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Recursively extract all leaf windows from a layout tree, leaving `Empty`.
+pub fn drain_leaves<C>(layout: &mut Layout<C>) -> Vec<Window<C>> {
+    let mut out = Vec::new();
+    drain_leaves_inner(layout, &mut out);
+    out
+}
+
+fn drain_leaves_inner<C>(layout: &mut Layout<C>, out: &mut Vec<Window<C>>) {
+    let taken = std::mem::take(layout);
+    match taken {
+        Layout::Empty => {}
+        Layout::Leaf(w) => out.push(w),
+        Layout::Split { children, .. } => {
+            for (_, mut child) in children {
+                drain_leaves_inner(&mut child, out);
+            }
+        }
+    }
+}
+
+/// Build a MasterStack layout: master region on the left, stack on the right.
+/// `master_count` windows go in the left column (stacked vertically if >1),
+/// remaining windows go in the right column (stacked vertically).
+pub fn build_master_stack<C>(
+    mut windows: Vec<Window<C>>,
+    master_count: usize,
+    master_ratio: f32,
+) -> Layout<C> {
+    if windows.is_empty() {
+        return Layout::Empty;
+    }
+    if windows.len() == 1 {
+        return Layout::Leaf(windows.remove(0));
+    }
+    let mc = master_count.min(windows.len());
+    let stack_windows: Vec<Window<C>> = windows.split_off(mc);
+    let master_windows = windows;
+
+    let master_layout = stack_vertical(master_windows);
+
+    if stack_windows.is_empty() {
+        return master_layout;
+    }
+
+    let stack_layout = stack_vertical(stack_windows);
+
+    Layout::Split {
+        dir: SplitDir::V,
+        children: vec![
+            (master_ratio, master_layout),
+            (1.0 - master_ratio, stack_layout),
+        ],
+    }
+}
+
+/// Build a Monocle layout: flat split of all windows. Only the focused one
+/// is rendered (handled by the render path).
+pub fn build_monocle<C>(windows: Vec<Window<C>>) -> Layout<C> {
+    stack_vertical(windows)
+}
+
+/// Build a Columns layout: equal-width vertical columns, full height each.
+pub fn build_columns<C>(windows: Vec<Window<C>>) -> Layout<C> {
+    if windows.is_empty() {
+        return Layout::Empty;
+    }
+    if windows.len() == 1 {
+        return Layout::Leaf(windows.into_iter().next().unwrap());
+    }
+    let n = windows.len() as f32;
+    Layout::Split {
+        dir: SplitDir::V,
+        children: windows
+            .into_iter()
+            .map(|w| (1.0 / n, Layout::Leaf(w)))
+            .collect(),
+    }
+}
+
+/// Helper: stack windows vertically (H-split) with equal heights.
+fn stack_vertical<C>(windows: Vec<Window<C>>) -> Layout<C> {
+    if windows.is_empty() {
+        return Layout::Empty;
+    }
+    if windows.len() == 1 {
+        return Layout::Leaf(windows.into_iter().next().unwrap());
+    }
+    let n = windows.len() as f32;
+    Layout::Split {
+        dir: SplitDir::H,
+        children: windows
+            .into_iter()
+            .map(|w| (1.0 / n, Layout::Leaf(w)))
+            .collect(),
+    }
+}
+
+/// Reconstruct a layout from a saved [`LayoutSkeleton`] by matching window ids.
+/// Windows matched by id are placed in their saved positions; unmatched slots
+/// become `Empty`. Consumed windows are removed from `pool` so the caller can
+/// detect leftovers (windows created after the skeleton was saved).
+fn restore_from_skeleton<C>(skeleton: LayoutSkeleton, pool: &mut Vec<Window<C>>) -> Layout<C> {
+    match skeleton {
+        LayoutSkeleton::Empty => Layout::Empty,
+        LayoutSkeleton::Leaf(id) => {
+            if let Some(pos) = pool.iter().position(|w| w.id == id) {
+                Layout::Leaf(pool.remove(pos))
+            } else {
+                Layout::Empty
+            }
+        }
+        LayoutSkeleton::Split { dir, children } => {
+            let mut rebuilt: Vec<(f32, Layout<C>)> = children
+                .into_iter()
+                .map(|(w, skel)| (w, restore_from_skeleton(skel, pool)))
+                .filter(|(_, layout)| !matches!(layout, Layout::Empty))
+                .collect();
+            match rebuilt.len() {
+                0 => Layout::Empty,
+                1 => rebuilt.remove(0).1,
+                _ => {
+                    renormalize(&mut rebuilt);
+                    Layout::Split {
+                        dir,
+                        children: rebuilt,
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1210,6 +1642,11 @@ mod tests {
             layout,
             focused,
             rail: None,
+            layout_mode: LayoutMode::Manual,
+            saved_manual_layout: None,
+            master_ratio: 0.6,
+            master_count: 1,
+            tag_view: BTreeSet::new(),
         });
         // Ensure window-id allocator skips past the ids we hand-rolled.
         let max_id = ws.tabs[0].layout.leaf_ids().into_iter().max().unwrap_or(0);
@@ -1596,6 +2033,11 @@ mod tests {
             layout: Layout::Empty,
             focused: 0,
             rail: None,
+            layout_mode: LayoutMode::Manual,
+            saved_manual_layout: None,
+            master_ratio: 0.6,
+            master_count: 1,
+            tag_view: BTreeSet::new(),
         });
         let w = Window {
             id: 9,
@@ -1618,6 +2060,11 @@ mod tests {
             layout: leaf(5, "x"),
             focused: 5,
             rail: None,
+            layout_mode: LayoutMode::Manual,
+            saved_manual_layout: None,
+            master_ratio: 0.6,
+            master_count: 1,
+            tag_view: BTreeSet::new(),
         });
         let w = Window {
             id: 9,
@@ -1649,6 +2096,11 @@ mod tests {
             layout: Layout::Empty,
             focused: 0,
             rail: None,
+            layout_mode: LayoutMode::Manual,
+            saved_manual_layout: None,
+            master_ratio: 0.6,
+            master_count: 1,
+            tag_view: BTreeSet::new(),
         });
         let (window, empty) = ws.detach_focused().unwrap();
         assert!(!empty);

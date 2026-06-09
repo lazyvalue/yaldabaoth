@@ -244,6 +244,16 @@ actions!(
         RailCycleSort,
         RailWorktrees,
         RailFilter,
+        // Layout patterns (spec-layout-patterns.md)
+        // Phase 2: automatic layouts
+        CycleLayoutMode,
+        PromoteToMaster,
+        IncreaseMasterCount,
+        DecreaseMasterCount,
+        // Phase 3: tags
+        ClearTagView,
+        TagViewChord,
+        TagToggleChord,
     ]
 );
 
@@ -2286,12 +2296,36 @@ struct PersistedTab {
     /// Optional rail (spec-rail.md §14). Absent in old snapshots → no rail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rail: Option<PersistedRail>,
+    // Layout patterns: per-tab layout mode + master-stack params
+    #[serde(default)]
+    layout_mode: workspace::LayoutMode,
+    #[serde(default = "default_master_ratio")]
+    master_ratio: f32,
+    #[serde(default = "default_master_count")]
+    master_count: usize,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    tag_view: std::collections::BTreeSet<String>,
+}
+
+fn default_master_ratio() -> f32 {
+    0.6
+}
+fn default_master_count() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedWorkspace {
     tabs: Vec<PersistedTab>,
     active_tab: usize,
+    // Layout patterns: workspace-global marks
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    marks: HashMap<char, workspace::WindowId>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    tag_shortcuts: HashMap<char, String>,
+    // Buffer-level tags (keyed by canonical path string)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    buffer_tags: HashMap<String, Vec<String>>,
 }
 
 /// Snapshot a live `WindowContent` into its persisted shadow. Returns `None`
@@ -2527,9 +2561,27 @@ fn snapshot_workspace(ws: &workspace::Workspace<WindowContent>) -> PersistedWork
                 focused_window: t.focused,
                 layout: snapshot_layout(&t.layout),
                 rail: t.rail.as_ref().map(snapshot_rail),
+                layout_mode: t.layout_mode,
+                master_ratio: t.master_ratio,
+                master_count: t.master_count,
+                tag_view: t.tag_view.clone(),
             })
             .collect(),
         active_tab: ws.active_tab,
+        marks: ws.marks.all_marks().into_iter().collect(),
+        tag_shortcuts: ws.tag_shortcuts.clone(),
+        buffer_tags: {
+            let mut bt = HashMap::new();
+            for buf in ws.file_buffers.values() {
+                if !buf.tags.is_empty() {
+                    bt.insert(
+                        buf.canonical_path.display().to_string(),
+                        buf.tags.iter().cloned().collect(),
+                    );
+                }
+            }
+            bt
+        },
     }
 }
 
@@ -6295,6 +6347,24 @@ enum ActiveOverlay {
     SessionSwitcher(SessionSwitcher),
     WorkspacePicker(WorkspacePicker),
     Rename(RenameOverlay),
+    TagInput(TagInputOverlay),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagInputMode {
+    Tag,
+    Untag,
+    ViewTag,
+    SendTag,
+    AlsoTag,
+    TagBind,
+}
+
+#[derive(Debug, Clone)]
+struct TagInputOverlay {
+    mode: TagInputMode,
+    text: String,
+    prompt: &'static str,
 }
 
 /// GPUI menu tree. Mirrors the TUI's `default_menu` for the navigation
@@ -6395,6 +6465,23 @@ fn gpui_menu() -> Vec<MenuNode> {
                     "also-show pane in workspace (Ctrl-W M)",
                     "also-show-pane",
                 ),
+                MenuNode::separator(),
+                MenuNode::label("Layout"),
+                MenuNode::entry("L", "cycle layout mode (Ctrl-W Space)", "cycle-layout"),
+                MenuNode::entry("P", "promote to master (Ctrl-W Enter)", "promote-master"),
+                MenuNode::entry("I", "increase master count (Ctrl-W i)", "inc-master"),
+                MenuNode::entry("D", "decrease master count (Ctrl-W d)", "dec-master"),
+                MenuNode::separator(),
+                MenuNode::label("Marks"),
+                MenuNode::entry("'", "list marks", "list-marks"),
+                MenuNode::separator(),
+                MenuNode::label("Tags"),
+                MenuNode::entry("T", "tag buffer", "tag-add"),
+                MenuNode::entry("U", "untag buffer", "tag-remove"),
+                MenuNode::entry("V", "view tag", "tag-view"),
+                MenuNode::entry("A", "also-tag buffer", "tag-also"),
+                MenuNode::entry("X", "tag + view", "tag-send"),
+                MenuNode::entry("K", "bind tag shortcut", "tag-bind"),
             ],
         ),
         MenuNode::separator(),
@@ -6463,6 +6550,13 @@ struct SketchGpuiView {
     /// Splash screen shown at startup. `Some(deadline)` while visible;
     /// `None` after dismissal (auto-timeout or keypress).
     splash_until: Option<std::time::Instant>,
+    // Layout patterns (spec-layout-patterns.md)
+    /// Pending mark chord: `Some('m')` = set mark, `Some('\'')` = jump to mark.
+    /// Next keystroke completes the chord.
+    pending_mark_chord: Option<char>,
+    /// Pending tag chord: `Some('t')` = view tag, `Some('T')` = toggle tag.
+    /// Next keystroke is looked up in tag_shortcuts.
+    pending_tag_chord: Option<char>,
     /// Shared syntect highlighter for code block syntax coloring in Edit Mode
     /// and the agent transcript pane. Loaded once at startup.
     syntect_hl: sketch::highlight::Highlighter,
@@ -6516,6 +6610,8 @@ impl SketchGpuiView {
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
             syntect_hl: sketch::highlight::Highlighter::new(),
             _lease_heartbeat: None,
+            pending_mark_chord: None,
+            pending_tag_chord: None,
         }
     }
 
@@ -6540,6 +6636,8 @@ impl SketchGpuiView {
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
             syntect_hl: sketch::highlight::Highlighter::new(),
             _lease_heartbeat: None,
+            pending_mark_chord: None,
+            pending_tag_chord: None,
         }
     }
 
@@ -6584,6 +6682,11 @@ impl SketchGpuiView {
                 focused: ptab.focused_window,
                 layout,
                 rail: ptab.rail.map(|r| restore_rail(r, ptab.focused_window)),
+                layout_mode: ptab.layout_mode,
+                saved_manual_layout: None,
+                master_ratio: ptab.master_ratio,
+                master_count: ptab.master_count,
+                tag_view: ptab.tag_view,
             });
             ws.next_tab_index += 1;
         }
@@ -6592,6 +6695,45 @@ impl SketchGpuiView {
         }
         if ws.tabs.is_empty() {
             return false;
+        }
+        // Restore marks — load from snapshot, then GC stale window ids.
+        for (ch, wid) in snap.marks {
+            ws.marks.set(ch, wid);
+        }
+        let live_ids = ws.all_window_ids();
+        ws.marks.gc(&live_ids);
+        ws.tag_shortcuts = snap.tag_shortcuts;
+        // Restore buffer tags: match by canonical path.
+        for (path_str, tags) in &snap.buffer_tags {
+            let path = PathBuf::from(path_str);
+            if let Some(&buf_id) = ws.path_index.get(&path)
+                && let Some(buf) = ws.file_buffers.get_mut(&buf_id)
+            {
+                buf.tags = tags.iter().cloned().collect();
+            }
+        }
+        // If a tab was saved in automatic layout mode, retile now.
+        for t in &mut ws.tabs {
+            if t.layout_mode != workspace::LayoutMode::Manual {
+                // Retile in-place for non-manual tabs.
+                let windows: Vec<workspace::Window<WindowContent>> =
+                    workspace::drain_leaves(&mut t.layout);
+                if !windows.is_empty() {
+                    let focused = t.focused;
+                    t.layout = match t.layout_mode {
+                        workspace::LayoutMode::MasterStack => {
+                            workspace::build_master_stack(windows, t.master_count, t.master_ratio)
+                        }
+                        workspace::LayoutMode::Monocle => workspace::build_monocle(windows),
+                        workspace::LayoutMode::Columns => workspace::build_columns(windows),
+                        workspace::LayoutMode::Manual => unreachable!(),
+                    };
+                    // Restore focus
+                    if t.layout.find_leaf(focused).is_some() {
+                        t.focused = focused;
+                    }
+                }
+            }
         }
         self.workspace = ws;
 
@@ -7629,6 +7771,7 @@ impl SketchGpuiView {
     /// `Ctrl-W s` — horizontal split: new pane below the focused one.
     fn split_h(&mut self, _: &SplitH, _w: &mut Window, cx: &mut Context<Self>) {
         self.split_focused_with_browser(workspace::SplitDir::H);
+        self.workspace.retile_active();
         self.save_workspace_state();
         cx.notify();
     }
@@ -7636,6 +7779,7 @@ impl SketchGpuiView {
     /// `Ctrl-W v` — vertical split: new pane to the right of the focused one.
     fn split_v(&mut self, _: &SplitV, _w: &mut Window, cx: &mut Context<Self>) {
         self.split_focused_with_browser(workspace::SplitDir::V);
+        self.workspace.retile_active();
         self.save_workspace_state();
         cx.notify();
     }
@@ -7715,6 +7859,7 @@ impl SketchGpuiView {
     fn close_window(&mut self, _: &CloseWindow, _w: &mut Window, cx: &mut Context<Self>) {
         match self.workspace.close_focused() {
             Ok(Some(_new_focus)) => {
+                self.workspace.retile_active();
                 self.save_workspace_state();
                 cx.notify();
             }
@@ -7803,6 +7948,393 @@ impl SketchGpuiView {
         let _ = self.workspace.equalize_focused();
         self.save_workspace_state();
         cx.notify();
+    }
+
+    // ---- Layout patterns (spec-layout-patterns.md) -------------------------
+
+    // Phase 1: marks
+
+    /// Check if a bare key press starts a mark chord (`m` or `'`).
+    /// Returns true if the key was consumed.
+    fn try_start_mark_chord(
+        &mut self,
+        key: &Key,
+        modifiers: &KMods,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !modifiers.is_empty() {
+            return false;
+        }
+        match key {
+            Key::Char('m') => {
+                self.pending_mark_chord = Some('m');
+                cx.notify();
+                true
+            }
+            Key::Char('\'') => {
+                self.pending_mark_chord = Some('\'');
+                cx.notify();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `on_key_down` handler for the Doc view — intercepts bare `m`/`'` to
+    /// start a mark chord.
+    fn handle_doc_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        if self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Complete a pending mark chord (the follow-up key after `m` or `'`).
+    fn complete_mark_chord(&mut self, key: char, cx: &mut Context<Self>) {
+        let chord_type = match self.pending_mark_chord.take() {
+            Some(c) => c,
+            None => return,
+        };
+        cx.notify();
+
+        match chord_type {
+            'm' => {
+                // Set mark
+                if let Some(wid) = self.workspace.focused_window_id() {
+                    self.workspace.marks.set(key, wid);
+                    self.transient_status = Some(format!("mark '{key}' set").into());
+                    self.save_workspace_state();
+                }
+            }
+            '\'' => {
+                // Jump to mark
+                if let Some(target_wid) = self.workspace.marks.get(key) {
+                    self.jump_to_window(target_wid);
+                    self.save_workspace_state();
+                } else {
+                    self.transient_status = Some(format!("mark '{key}' not set").into());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Jump focus to a specific window (cross-tab). Updates `prev_jump`.
+    fn jump_to_window(&mut self, target_id: workspace::WindowId) {
+        let Some(tab_idx) = self.workspace.tab_containing(target_id) else {
+            // Stale mark — GC
+            let live = self.workspace.all_window_ids();
+            self.workspace.marks.gc(&live);
+            self.transient_status = Some("mark target no longer exists".into());
+            return;
+        };
+
+        let current_wid = self.workspace.focused_window_id();
+        let cross_tab = tab_idx != self.workspace.active_tab;
+
+        if cross_tab {
+            if let Some(wid) = current_wid {
+                self.workspace.marks.prev_jump = Some(wid);
+            }
+            self.workspace.active_tab = tab_idx;
+        }
+
+        if let Some(tab) = self.workspace.active_tab_mut() {
+            tab.focused = target_id;
+        }
+    }
+
+    // Phase 2: automatic layouts
+
+    fn cycle_layout_mode(&mut self, _: &CycleLayoutMode, _w: &mut Window, cx: &mut Context<Self>) {
+        let new_mode = self
+            .workspace
+            .active_tab()
+            .map(|t| t.layout_mode.cycle())
+            .unwrap_or(workspace::LayoutMode::Manual);
+        self.workspace.set_layout_mode(new_mode);
+        let sigil = new_mode.sigil();
+        self.transient_status = Some(format!("layout: {sigil}").into());
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    fn promote_to_master(&mut self, _: &PromoteToMaster, _w: &mut Window, cx: &mut Context<Self>) {
+        let is_master_stack = self
+            .workspace
+            .active_tab()
+            .map(|t| t.layout_mode == workspace::LayoutMode::MasterStack)
+            .unwrap_or(false);
+        if !is_master_stack {
+            return;
+        }
+        // Swap focused window with master (first in tree order).
+        let tab = match self.workspace.active_tab_mut() {
+            Some(t) => t,
+            None => return,
+        };
+        let ids = tab.layout.leaf_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        let focused = tab.focused;
+        let master_id = ids[0];
+        if focused == master_id {
+            return;
+        }
+        // Swap the content of the two leaves in place.
+        tab.layout.swap_leaf_contents(focused, master_id);
+        self.workspace.retile_active();
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    fn increase_master_count(
+        &mut self,
+        _: &IncreaseMasterCount,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.workspace.active_tab_mut() {
+            if tab.layout_mode != workspace::LayoutMode::MasterStack {
+                return;
+            }
+            let max = tab.layout.leaf_count().saturating_sub(1).max(1);
+            tab.master_count = (tab.master_count + 1).min(max);
+        }
+        self.workspace.retile_active();
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    fn decrease_master_count(
+        &mut self,
+        _: &DecreaseMasterCount,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.workspace.active_tab_mut() {
+            if tab.layout_mode != workspace::LayoutMode::MasterStack {
+                return;
+            }
+            tab.master_count = tab.master_count.saturating_sub(1).max(1);
+        }
+        self.workspace.retile_active();
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    // Phase 3: tags
+
+    fn tag_view_chord(&mut self, _: &TagViewChord, _w: &mut Window, cx: &mut Context<Self>) {
+        self.pending_tag_chord = Some('t');
+        cx.notify();
+    }
+
+    fn tag_toggle_chord(&mut self, _: &TagToggleChord, _w: &mut Window, cx: &mut Context<Self>) {
+        self.pending_tag_chord = Some('T');
+        cx.notify();
+    }
+
+    fn clear_tag_view(&mut self, _: &ClearTagView, _w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.workspace.active_tab_mut() {
+            tab.tag_view.clear();
+        }
+        self.transient_status = Some("tag filter cleared".into());
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    /// Complete a pending tag chord (the follow-up key after `Ctrl-W t`/`Ctrl-W Ctrl-T`).
+    fn complete_tag_chord(&mut self, key: char, cx: &mut Context<Self>) {
+        let chord_type = match self.pending_tag_chord.take() {
+            Some(c) => c,
+            None => return,
+        };
+        cx.notify();
+
+        let tag_name = match self.workspace.tag_shortcuts.get(&key) {
+            Some(name) => name.clone(),
+            None => {
+                self.transient_status = Some(format!("no tag bound to '{key}'").into());
+                return;
+            }
+        };
+
+        match chord_type {
+            't' => {
+                // View tag (replace)
+                if let Some(tab) = self.workspace.active_tab_mut() {
+                    tab.tag_view.clear();
+                    tab.tag_view.insert(tag_name.clone());
+                }
+                self.adjust_focus_for_tag_view();
+                self.transient_status = Some(format!("viewing tag: {tag_name}").into());
+            }
+            'T' => {
+                // Toggle tag in view
+                if let Some(tab) = self.workspace.active_tab_mut() {
+                    if tab.tag_view.contains(&tag_name) {
+                        tab.tag_view.remove(&tag_name);
+                    } else {
+                        tab.tag_view.insert(tag_name.clone());
+                    }
+                }
+                self.adjust_focus_for_tag_view();
+            }
+            _ => {}
+        }
+        self.save_workspace_state();
+    }
+
+    /// Get the FileBufferId for the focused window, if file-backed.
+    fn focused_buffer_id(&self) -> Option<workspace::FileBufferId> {
+        match self.workspace.focused_content()? {
+            WindowContent::Doc(d) => d.source.as_ref().map(|s| s.buffer_id),
+            WindowContent::Edit(e) => Some(e.editor.buffer_id),
+            _ => None,
+        }
+    }
+
+    /// Tag the focused buffer. Returns false if not file-backed.
+    fn tag_focused(&mut self, tag: String) -> bool {
+        let id = match self.focused_buffer_id() {
+            Some(id) => id,
+            None => return false,
+        };
+        if let Some(buf) = self.workspace.file_buffers.get_mut(&id) {
+            buf.tags.insert(tag);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Untag the focused buffer.
+    fn untag_focused(&mut self, tag: &str) -> bool {
+        let id = match self.focused_buffer_id() {
+            Some(id) => id,
+            None => return false,
+        };
+        if let Some(buf) = self.workspace.file_buffers.get_mut(&id) {
+            buf.tags.remove(tag);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Collect all tags across all buffers in the pool.
+    fn all_tags(&self) -> std::collections::BTreeSet<String> {
+        let mut tags = std::collections::BTreeSet::new();
+        for buf in self.workspace.file_buffers.values() {
+            tags.extend(buf.tags.iter().cloned());
+        }
+        tags
+    }
+
+    /// Check if a window should be visible given the active tab's tag_view.
+    fn window_visible_for_tag_view(
+        content: &WindowContent,
+        tag_view: &workspace::TagSet,
+        file_buffers: &HashMap<workspace::FileBufferId, workspace::FileBuffer>,
+    ) -> bool {
+        if tag_view.is_empty() {
+            return true;
+        }
+        let buf_id = match content {
+            WindowContent::Doc(d) => d.source.as_ref().map(|s| s.buffer_id),
+            WindowContent::Edit(e) => Some(e.editor.buffer_id),
+            _ => return false, // Agent/Browser hidden when filter active
+        };
+        let Some(id) = buf_id else { return false };
+        let Some(buf) = file_buffers.get(&id) else {
+            return false;
+        };
+        buf.tags.iter().any(|t| tag_view.contains(t))
+    }
+
+    /// Check if a layout subtree has any visible leaves for the given tag view.
+    fn subtree_has_visible_leaf(
+        layout: &workspace::Layout<WindowContent>,
+        tag_view: &workspace::TagSet,
+        file_buffers: &HashMap<workspace::FileBufferId, workspace::FileBuffer>,
+    ) -> bool {
+        match layout {
+            workspace::Layout::Empty => false,
+            workspace::Layout::Leaf(w) => {
+                Self::window_visible_for_tag_view(&w.content, tag_view, file_buffers)
+            }
+            workspace::Layout::Split { children, .. } => children
+                .iter()
+                .any(|(_, c)| Self::subtree_has_visible_leaf(c, tag_view, file_buffers)),
+        }
+    }
+
+    /// If the focused window is hidden by the tag filter, move focus to the
+    /// first visible window.
+    fn adjust_focus_for_tag_view(&mut self) {
+        let tag_view = match self.workspace.active_tab() {
+            Some(t) => t.tag_view.clone(),
+            None => return,
+        };
+        if tag_view.is_empty() {
+            return;
+        }
+
+        // Check if currently focused window is visible.
+        let focused = match self.workspace.focused_window_id() {
+            Some(id) => id,
+            None => return,
+        };
+
+        let focused_visible = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.layout.find_leaf(focused))
+            .map(|w| {
+                Self::window_visible_for_tag_view(
+                    &w.content,
+                    &tag_view,
+                    &self.workspace.file_buffers,
+                )
+            })
+            .unwrap_or(false);
+
+        if focused_visible {
+            return;
+        }
+
+        // Find first visible window.
+        let ids = self
+            .workspace
+            .active_tab()
+            .map(|t| t.layout.leaf_ids())
+            .unwrap_or_default();
+
+        for id in ids {
+            let visible = self
+                .workspace
+                .active_tab()
+                .and_then(|t| t.layout.find_leaf(id))
+                .map(|w| {
+                    Self::window_visible_for_tag_view(
+                        &w.content,
+                        &tag_view,
+                        &self.workspace.file_buffers,
+                    )
+                })
+                .unwrap_or(false);
+            if visible {
+                if let Some(tab) = self.workspace.active_tab_mut() {
+                    tab.focused = id;
+                }
+                return;
+            }
+        }
+        // No visible windows
+        let tags: Vec<_> = tag_view.iter().cloned().collect();
+        self.transient_status = Some(format!("no buffers match tags: {}", tags.join(", ")).into());
     }
 
     // ---- Browser actions ----------------------------------------------------
@@ -8879,6 +9411,11 @@ impl SketchGpuiView {
             }
         }
 
+        // In normal mode, intercept bare `m`/`'` to start a mark chord.
+        if mode == EditMode::Normal && self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
+            return;
+        }
+
         match mode {
             EditMode::Insert => self.dispatch_insert(press, cx),
             EditMode::Normal => self.dispatch_normal(press, cx),
@@ -8921,7 +9458,12 @@ impl SketchGpuiView {
         };
         // Any non-save key invalidates the transient save message.
         edit.last_save_msg = None;
+        let was_insert = edit.mode == EditMode::Insert;
         Self::dispatch_insert_core(&mut edit.editor, &mut edit.mode, press);
+        // Track the `.` (last-edit) mark on any text-producing key in insert mode.
+        if was_insert && let Some(wid) = self.workspace.focused_window_id() {
+            self.workspace.marks.last_edit = Some(wid);
+        }
         cx.notify();
     }
 
@@ -9179,6 +9721,9 @@ impl SketchGpuiView {
     fn overlay_is_rename(&self) -> bool {
         matches!(self.active_overlay, ActiveOverlay::Rename(_))
     }
+    fn overlay_is_tag_input(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::TagInput(_))
+    }
 
     fn menu_ref(&self) -> Option<&MenuOverlay> {
         if let ActiveOverlay::Menu(m) = &self.active_overlay {
@@ -9248,6 +9793,20 @@ impl SketchGpuiView {
     }
     fn rename_mut(&mut self) -> Option<&mut RenameOverlay> {
         if let ActiveOverlay::Rename(o) = &mut self.active_overlay {
+            Some(o)
+        } else {
+            None
+        }
+    }
+    fn tag_input_ref(&self) -> Option<&TagInputOverlay> {
+        if let ActiveOverlay::TagInput(o) = &self.active_overlay {
+            Some(o)
+        } else {
+            None
+        }
+    }
+    fn tag_input_mut(&mut self) -> Option<&mut TagInputOverlay> {
+        if let ActiveOverlay::TagInput(o) = &mut self.active_overlay {
             Some(o)
         } else {
             None
@@ -9502,6 +10061,83 @@ impl SketchGpuiView {
             }
             "move-pane" => self.open_workspace_picker(WorkspacePickerMode::Move, cx),
             "also-show-pane" => self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx),
+            // Layout patterns
+            "cycle-layout" => {
+                self.workspace.set_layout_mode(
+                    self.workspace
+                        .active_tab()
+                        .map(|t| t.layout_mode.cycle())
+                        .unwrap_or_default(),
+                );
+                let sigil = self
+                    .workspace
+                    .active_tab()
+                    .map(|t| t.layout_mode.sigil())
+                    .unwrap_or("");
+                self.transient_status = Some(format!("layout: {sigil}").into());
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "promote-master" => {
+                let is_ms = self
+                    .workspace
+                    .active_tab()
+                    .map(|t| t.layout_mode == workspace::LayoutMode::MasterStack)
+                    .unwrap_or(false);
+                if is_ms {
+                    if let Some(tab) = self.workspace.active_tab_mut() {
+                        let ids = tab.layout.leaf_ids();
+                        if ids.len() >= 2 && tab.focused != ids[0] {
+                            tab.layout.swap_leaf_contents(tab.focused, ids[0]);
+                        }
+                    }
+                    self.workspace.retile_active();
+                    self.save_workspace_state();
+                    cx.notify();
+                }
+            }
+            "inc-master" => {
+                if let Some(tab) = self.workspace.active_tab_mut()
+                    && tab.layout_mode == workspace::LayoutMode::MasterStack
+                {
+                    let max = tab.layout.leaf_count().saturating_sub(1).max(1);
+                    tab.master_count = (tab.master_count + 1).min(max);
+                }
+                self.workspace.retile_active();
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "dec-master" => {
+                if let Some(tab) = self.workspace.active_tab_mut()
+                    && tab.layout_mode == workspace::LayoutMode::MasterStack
+                {
+                    tab.master_count = tab.master_count.saturating_sub(1).max(1);
+                }
+                self.workspace.retile_active();
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "list-marks" => {
+                let marks = self.workspace.marks.all_marks();
+                if marks.is_empty() {
+                    self.transient_status = Some("no marks set".into());
+                } else {
+                    let list: String = marks
+                        .iter()
+                        .map(|(ch, id)| format!("'{ch}' → window {id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.transient_status = Some(list.into());
+                }
+                cx.notify();
+            }
+            // Tags
+            "tag-add" => self.open_tag_input(TagInputMode::Tag, cx),
+            "tag-remove" => self.open_tag_input(TagInputMode::Untag, cx),
+            "tag-view" => self.open_tag_input(TagInputMode::ViewTag, cx),
+            "tag-also" => self.open_tag_input(TagInputMode::AlsoTag, cx),
+            "tag-send" => self.open_tag_input(TagInputMode::SendTag, cx),
+            "tag-bind" => self.open_tag_input(TagInputMode::TagBind, cx),
             "quit" | "force-quit" => cx.quit(),
             _ => {
                 // Unknown command — keep the menu closed but no-op so the
@@ -9731,6 +10367,11 @@ impl SketchGpuiView {
             layout: workspace::Layout::Empty,
             focused: 0,
             rail: None,
+            layout_mode: workspace::LayoutMode::Manual,
+            saved_manual_layout: None,
+            master_ratio: 0.6,
+            master_count: 1,
+            tag_view: std::collections::BTreeSet::new(),
         });
     }
 
@@ -10328,6 +10969,172 @@ impl SketchGpuiView {
         }
     }
 
+    fn handle_tag_input_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        match press.key {
+            Key::Esc => {
+                self.active_overlay = ActiveOverlay::None;
+                cx.notify();
+            }
+            Key::Enter => self.commit_tag_input(cx),
+            Key::Backspace => {
+                if let Some(o) = self.tag_input_mut() {
+                    o.text.pop();
+                }
+                cx.notify();
+            }
+            Key::Char(c) => {
+                if let Some(o) = self.tag_input_mut() {
+                    o.text.push(c);
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn commit_tag_input(&mut self, cx: &mut Context<Self>) {
+        let (mode, text) = match self.tag_input_ref() {
+            Some(o) => (o.mode, o.text.clone()),
+            None => return,
+        };
+        let tag = text.trim().to_string();
+        if tag.is_empty() && mode != TagInputMode::ViewTag {
+            self.active_overlay = ActiveOverlay::None;
+            cx.notify();
+            return;
+        }
+        match mode {
+            TagInputMode::Tag => {
+                if self.tag_focused(tag.clone()) {
+                    self.transient_status = Some(format!("tagged '{tag}'").into());
+                } else {
+                    self.transient_status = Some("cannot tag this pane".into());
+                }
+            }
+            TagInputMode::Untag => {
+                if self.untag_focused(&tag) {
+                    self.transient_status = Some(format!("untagged '{tag}'").into());
+                } else {
+                    self.transient_status = Some(format!("tag '{tag}' not found").into());
+                }
+            }
+            TagInputMode::ViewTag => {
+                if let Some(tab) = self.workspace.active_tab_mut() {
+                    if tag.is_empty() {
+                        tab.tag_view.clear();
+                        self.transient_status = Some("tag filter cleared".into());
+                    } else {
+                        tab.tag_view.clear();
+                        tab.tag_view.insert(tag.clone());
+                        self.transient_status = Some(format!("viewing tag '{tag}'").into());
+                    }
+                }
+                self.adjust_focus_for_tag_view();
+            }
+            TagInputMode::SendTag => {
+                self.tag_focused(tag.clone());
+                if let Some(tab) = self.workspace.active_tab_mut() {
+                    tab.tag_view.clear();
+                    tab.tag_view.insert(tag.clone());
+                }
+                self.adjust_focus_for_tag_view();
+                self.transient_status = Some(format!("tagged + viewing '{tag}'").into());
+            }
+            TagInputMode::AlsoTag => {
+                if self.tag_focused(tag.clone()) {
+                    self.transient_status = Some(format!("also-tagged '{tag}'").into());
+                } else {
+                    self.transient_status = Some("cannot tag this pane".into());
+                }
+            }
+            TagInputMode::TagBind => {
+                // Expect "x tagname" format
+                let parts: Vec<&str> = tag.splitn(2, ' ').collect();
+                if parts.len() == 2 && parts[0].len() == 1 {
+                    let key = parts[0].chars().next().unwrap();
+                    let name = parts[1].to_string();
+                    self.workspace.tag_shortcuts.insert(key, name.clone());
+                    self.transient_status = Some(format!("bound '{key}' → tag '{name}'").into());
+                } else {
+                    self.transient_status = Some("usage: <key> <tag-name>".into());
+                }
+            }
+        }
+        self.active_overlay = ActiveOverlay::None;
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    fn render_tag_input_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let o = self.tag_input_ref().unwrap();
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let popup_border: Hsla = nc(ov.border);
+        let label_fg: Hsla = nc(ov.label);
+        let input_fg: Hsla = nc(ov.input);
+
+        let header = div()
+            .px_4()
+            .py_1()
+            .text_color(label_fg)
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::new_static(o.prompt));
+
+        let input_row = div()
+            .px_4()
+            .py_2()
+            .text_color(input_fg)
+            .text_size(px(14.0))
+            .font_family(self.code_font.clone())
+            .child(SharedString::from(format!("{}\u{2588}", o.text)));
+
+        let footer = div()
+            .px_4()
+            .py_1()
+            .text_color(label_fg)
+            .text_size(px(11.0))
+            .child(SharedString::new_static("enter:submit  esc:cancel"));
+
+        div()
+            .absolute()
+            .top(px(80.0))
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_row()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(360.0))
+                    .bg(menu_bg)
+                    .border_2()
+                    .border_color(popup_border)
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .child(input_row)
+                    .child(footer),
+            )
+    }
+
+    fn open_tag_input(&mut self, mode: TagInputMode, cx: &mut Context<Self>) {
+        let prompt = match mode {
+            TagInputMode::Tag => "TAG BUFFER",
+            TagInputMode::Untag => "UNTAG BUFFER",
+            TagInputMode::ViewTag => "VIEW TAG (empty = clear)",
+            TagInputMode::SendTag => "TAG + VIEW",
+            TagInputMode::AlsoTag => "ALSO TAG",
+            TagInputMode::TagBind => "BIND: <key> <tag>",
+        };
+        self.active_overlay = ActiveOverlay::TagInput(TagInputOverlay {
+            mode,
+            text: String::new(),
+            prompt,
+        });
+        cx.notify();
+    }
+
     /// Return the indices of buffers matching the current filter query.
     fn filtered_buffer_indices(&self) -> Vec<usize> {
         let bs = match self.buffer_ref() {
@@ -10561,39 +11368,120 @@ impl SketchGpuiView {
                 // Focus indicator: thick border around the whole pane+rail
                 // group when there's more than one leaf, plus a small "focused"
                 // tag in the upper-right corner.
-                if is_focused && self.active_tab_leaf_count() > 1 {
+                let multi_leaf = self.active_tab_leaf_count() > 1;
+                let mark_ch = self.workspace.marks.mark_for_window(window.id);
+                if (is_focused && multi_leaf) || mark_ch.is_some() {
                     let accent: Hsla = rgb(STATUS_FG).into();
-                    let tag = div()
-                        .absolute()
-                        .top_1()
-                        .right_1()
-                        .px_1p5()
-                        .py_0p5()
-                        .bg(accent)
-                        .text_color(rgb(BG))
-                        .text_size(px(10.0))
-                        .font_weight(FontWeight::BOLD)
-                        .rounded_sm()
-                        .child("focused");
-                    div()
-                        .size_full()
-                        .relative()
-                        .border_2()
-                        .border_color(accent)
-                        .child(with_rail)
-                        .child(tag)
-                        .into_any_element()
+                    let mut wrapper = div().size_full().relative();
+                    if is_focused && multi_leaf {
+                        wrapper = wrapper.border_2().border_color(accent);
+                    }
+                    wrapper = wrapper.child(with_rail);
+                    if is_focused && multi_leaf {
+                        let tag = div()
+                            .absolute()
+                            .top_1()
+                            .right_1()
+                            .px_1p5()
+                            .py_0p5()
+                            .bg(accent)
+                            .text_color(rgb(BG))
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .rounded_sm()
+                            .child("focused");
+                        wrapper = wrapper.child(tag);
+                    }
+                    // Mark badge: small orange label in top-left corner
+                    if let Some(ch) = mark_ch {
+                        let mark_badge = div()
+                            .absolute()
+                            .top_1()
+                            .left_1()
+                            .px_1p5()
+                            .py_0p5()
+                            .bg(gpui::hsla(0.08, 0.9, 0.55, 1.0))
+                            .text_color(gpui::hsla(0.0, 0.0, 0.0, 1.0))
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .rounded_sm()
+                            .child(SharedString::from(format!("[{ch}]")));
+                        wrapper = wrapper.child(mark_badge);
+                    }
+                    wrapper.into_any_element()
                 } else {
                     with_rail
                 }
             }
             workspace::Layout::Split { dir, children } => {
+                // Monocle mode: render only the child subtree containing
+                // the focused leaf, giving it the full area.
+                let is_monocle = self
+                    .workspace
+                    .active_tab()
+                    .map(|t| t.layout_mode == workspace::LayoutMode::Monocle)
+                    .unwrap_or(false);
+                if is_monocle {
+                    // Find the child subtree containing the focused leaf.
+                    let focused_idx = children
+                        .iter()
+                        .position(|(_, child)| child.contains_leaf(focused_id))
+                        .unwrap_or(0);
+                    let (_, child) = &mut children[focused_idx];
+                    let child_root = div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .bg(self.editor_bg())
+                        .text_color(self.editor_fg());
+                    let child_el = self.render_layout(
+                        child_root,
+                        child,
+                        focused_id,
+                        attach_focus,
+                        rail_focusable,
+                        cx,
+                    );
+                    return root.child(child_el).into_any_element();
+                }
+
                 // The `root` div carries `track_focus(&self.focus_handle)`
                 // when no overlay is open, so we must include it in the
                 // tree. Without it the focus handle isn't attached to any
                 // rendered element and global key bindings (e.g. Space →
                 // OpenMenu) have nowhere to dispatch. Wrap the split's
                 // flex container inside `root` rather than discarding it.
+                // Tag view filtering: when active, check which children
+                // have visible leaves and skip the rest.
+                let tag_view = self
+                    .workspace
+                    .active_tab()
+                    .map(|t| &t.tag_view)
+                    .cloned()
+                    .unwrap_or_default();
+                let has_tag_filter = !tag_view.is_empty();
+                let visible_mask: Vec<bool> = if has_tag_filter {
+                    children
+                        .iter()
+                        .map(|(_, child)| {
+                            Self::subtree_has_visible_leaf(
+                                child,
+                                &tag_view,
+                                &self.workspace.file_buffers,
+                            )
+                        })
+                        .collect()
+                } else {
+                    vec![true; children.len()]
+                };
+                // Calculate total visible weight for redistribution.
+                let total_visible_weight: f32 = children
+                    .iter()
+                    .zip(visible_mask.iter())
+                    .filter(|&(_, vis)| *vis)
+                    .map(|((w, _), _)| *w)
+                    .sum();
+
                 let mut container = div().size_full().flex().min_w_0().min_h_0();
                 container = match dir {
                     workspace::SplitDir::V => container.flex_row(),
@@ -10601,8 +11489,15 @@ impl SketchGpuiView {
                 };
                 let editor_bg = self.editor_bg();
                 let editor_fg = self.editor_fg();
-                for (weight, child) in children.iter_mut() {
-                    let w = *weight;
+                for (i, (weight, child)) in children.iter_mut().enumerate() {
+                    if !visible_mask[i] {
+                        continue;
+                    }
+                    let w = if has_tag_filter && total_visible_weight > 0.0 {
+                        *weight / total_visible_weight
+                    } else {
+                        *weight
+                    };
                     let child_root = div()
                         .size_full()
                         .flex()
@@ -10712,6 +11607,59 @@ impl SketchGpuiView {
             .flex_row()
             .child(strip)
             .child(div().flex_1().min_w_0().min_h_0().child(screen_view))
+            .into_any_element()
+    }
+
+    /// Render a thin tag bar above the content when any buffers in the workspace
+    /// have tags. Tags in the active tab's tag_view get accent background.
+    fn wrap_with_tag_bar(&self, screen_view: AnyElement) -> AnyElement {
+        let all_tags = self.all_tags();
+        if all_tags.is_empty() {
+            return screen_view;
+        }
+        let tag_view = self
+            .workspace
+            .active_tab()
+            .map(|t| &t.tag_view)
+            .cloned()
+            .unwrap_or_default();
+        let accent: Hsla = rgb(STATUS_FG).into();
+        let dimmed: Hsla = rgb(0x666666).into();
+        let strip_bg: Hsla = bg_or(self.theme.top_bar, STATUS_BG);
+
+        let mut bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_4()
+            .h(px(20.0))
+            .bg(strip_bg)
+            .text_size(px(10.0));
+
+        for tag in &all_tags {
+            let is_active = tag_view.contains(tag);
+            let chip = div()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .bg(if is_active { accent } else { strip_bg })
+                .text_color(if is_active { rgb(BG).into() } else { dimmed })
+                .font_weight(if is_active {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .child(SharedString::from(tag.clone()));
+            bar = bar.child(chip);
+        }
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(bar)
+            .child(div().flex_1().min_h_0().child(screen_view))
             .into_any_element()
     }
 
@@ -14836,6 +15784,10 @@ impl Render for SketchGpuiView {
         // tab-creation commands are still landing.
         let screen_view = self.wrap_with_tab_strip(screen_view, cx);
 
+        // Tag bar: thin strip above content showing tag labels when any
+        // buffers have tags. Active-view tags get accent background.
+        let screen_view = self.wrap_with_tag_bar(screen_view);
+
         // Overlay a one-shot transient status toast (e.g. an also-show
         // rejection for a non-file pane) in the bottom-right.
         let screen_view = if let Some(msg) = self.transient_status.clone() {
@@ -14868,6 +15820,55 @@ impl Render for SketchGpuiView {
         } else {
             screen_view
         };
+
+        // When a mark chord or tag chord is pending, capture the next
+        // keypress to complete the chord before any action dispatch can fire.
+        if self.pending_mark_chord.is_some() || self.pending_tag_chord.is_some() {
+            let chord_label = if self.pending_mark_chord == Some('m') {
+                "m …"
+            } else if self.pending_mark_chord == Some('\'') {
+                "' …"
+            } else {
+                "tag …"
+            };
+            let editor_bg = self.editor_bg();
+            return div()
+                .track_focus(&self.focus_handle)
+                .size_full()
+                .bg(editor_bg)
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                    let press = keystroke_to_keypress(&ev.keystroke);
+                    if let Key::Char(ch) = press.key {
+                        if this.pending_mark_chord.is_some() {
+                            this.complete_mark_chord(ch, cx);
+                        } else if this.pending_tag_chord.is_some() {
+                            this.complete_tag_chord(ch, cx);
+                        }
+                    } else {
+                        // Non-char key cancels the chord
+                        this.pending_mark_chord = None;
+                        this.pending_tag_chord = None;
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                // Show a small indicator of the pending chord
+                .child(
+                    div()
+                        .absolute()
+                        .bottom(px(4.0))
+                        .right(px(4.0))
+                        .px_2()
+                        .py_1()
+                        .bg(gpui::hsla(0.08, 0.9, 0.55, 1.0))
+                        .text_color(gpui::hsla(0.0, 0.0, 0.0, 1.0))
+                        .text_size(px(11.0))
+                        .rounded_sm()
+                        .child(SharedString::from(chord_label)),
+                )
+                .into_any_element();
+        }
 
         if !has_overlay {
             return screen_view;
@@ -14943,6 +15944,22 @@ impl Render for SketchGpuiView {
                 }))
                 .child(screen_view)
                 .child(self.render_workspace_picker(cx))
+                .into_any_element();
+        }
+
+        // Tag input overlay.
+        if self.overlay_is_tag_input() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("TagInputView")
+                .size_full()
+                .bg(editor_bg)
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_tag_input_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_tag_input_overlay(cx))
                 .into_any_element();
         }
 
@@ -15147,16 +16164,52 @@ impl SketchGpuiView {
             .bg(bg_or(bot, STATUS_BG))
             .text_color(fg_or(bot, 0x666666))
             .text_size(px(11.0))
-            .child(format!(
-                "block {} / {}",
-                d.cursor_block.saturating_add(1),
-                d.blocks.len()
-            ))
+            .child({
+                let layout_sigil = self
+                    .workspace
+                    .active_tab()
+                    .map(|t| t.layout_mode)
+                    .unwrap_or_default();
+                if layout_sigil == workspace::LayoutMode::Monocle {
+                    // Dynamic [n/N] for monocle
+                    let leaf_ids = self
+                        .workspace
+                        .active_tab()
+                        .map(|t| t.layout.leaf_ids())
+                        .unwrap_or_default();
+                    let total = leaf_ids.len();
+                    let pos = self
+                        .workspace
+                        .focused_window_id()
+                        .and_then(|fid| leaf_ids.iter().position(|&id| id == fid))
+                        .map(|p| p + 1)
+                        .unwrap_or(0);
+                    format!(
+                        "[{pos}/{total}] block {} / {}",
+                        d.cursor_block.saturating_add(1),
+                        d.blocks.len()
+                    )
+                } else if layout_sigil == workspace::LayoutMode::Manual {
+                    format!(
+                        "block {} / {}",
+                        d.cursor_block.saturating_add(1),
+                        d.blocks.len()
+                    )
+                } else {
+                    format!(
+                        "{} block {} / {}",
+                        layout_sigil.sigil(),
+                        d.cursor_block.saturating_add(1),
+                        d.blocks.len()
+                    )
+                }
+            })
             .child(SharedString::new_static(
                 "j/k scroll · h/l block · g/G top/bot · Ctrl-O browse · Space menu",
             ));
 
         root.key_context("SketchView")
+            .on_key_down(cx.listener(Self::handle_doc_key))
             .on_action(cx.listener(Self::scroll_down))
             .on_action(cx.listener(Self::scroll_up))
             .on_action(cx.listener(Self::page_down))
@@ -15191,6 +16244,14 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::resize_shrink))
             .on_action(cx.listener(Self::resize_grow))
             .on_action(cx.listener(Self::equalize))
+            // Layout patterns
+            .on_action(cx.listener(Self::cycle_layout_mode))
+            .on_action(cx.listener(Self::promote_to_master))
+            .on_action(cx.listener(Self::increase_master_count))
+            .on_action(cx.listener(Self::decrease_master_count))
+            .on_action(cx.listener(Self::tag_view_chord))
+            .on_action(cx.listener(Self::tag_toggle_chord))
+            .on_action(cx.listener(Self::clear_tag_view))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
@@ -15260,8 +16321,35 @@ impl SketchGpuiView {
                 (el - sl) + 1
             }
         });
+        let layout_prefix = {
+            let lm = self
+                .workspace
+                .active_tab()
+                .map(|t| t.layout_mode)
+                .unwrap_or_default();
+            if lm == workspace::LayoutMode::Manual {
+                String::new()
+            } else if lm == workspace::LayoutMode::Monocle {
+                let leaf_ids = self
+                    .workspace
+                    .active_tab()
+                    .map(|t| t.layout.leaf_ids())
+                    .unwrap_or_default();
+                let total = leaf_ids.len();
+                let pos = self
+                    .workspace
+                    .focused_window_id()
+                    .and_then(|fid| leaf_ids.iter().position(|&id| id == fid))
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                format!("[{pos}/{total}] ")
+            } else {
+                format!("{} ", lm.sigil())
+            }
+        };
         let mut left_status = format!(
-            "{} {} {}{} · L{}:C{}",
+            "{}{} {} {}{} · L{}:C{}",
+            layout_prefix,
             dirty_mark,
             view_label,
             mode_label,
@@ -15325,6 +16413,14 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::focus_down))
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
+            // Layout patterns
+            .on_action(cx.listener(Self::cycle_layout_mode))
+            .on_action(cx.listener(Self::promote_to_master))
+            .on_action(cx.listener(Self::increase_master_count))
+            .on_action(cx.listener(Self::decrease_master_count))
+            .on_action(cx.listener(Self::tag_view_chord))
+            .on_action(cx.listener(Self::tag_toggle_chord))
+            .on_action(cx.listener(Self::clear_tag_view))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
@@ -17309,7 +18405,15 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::focus_prev))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_outline_rail))
-            .on_action(cx.listener(Self::flip_rail_side));
+            .on_action(cx.listener(Self::flip_rail_side))
+            // Layout patterns
+            .on_action(cx.listener(Self::cycle_layout_mode))
+            .on_action(cx.listener(Self::promote_to_master))
+            .on_action(cx.listener(Self::increase_master_count))
+            .on_action(cx.listener(Self::decrease_master_count))
+            .on_action(cx.listener(Self::tag_view_chord))
+            .on_action(cx.listener(Self::tag_toggle_chord))
+            .on_action(cx.listener(Self::clear_tag_view));
         if let Some(banner) = candidate_banner {
             root = root.child(banner);
         }
@@ -17554,6 +18658,14 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
+            // Layout patterns
+            .on_action(cx.listener(Self::cycle_layout_mode))
+            .on_action(cx.listener(Self::promote_to_master))
+            .on_action(cx.listener(Self::increase_master_count))
+            .on_action(cx.listener(Self::decrease_master_count))
+            .on_action(cx.listener(Self::tag_view_chord))
+            .on_action(cx.listener(Self::tag_toggle_chord))
+            .on_action(cx.listener(Self::clear_tag_view))
             .child(header)
             .child(list)
             .child(hint)
@@ -17953,6 +19065,16 @@ fn register_keymap(app: &mut App) {
         KeyBinding::new("ctrl-w >", ResizeGrow, None),
         KeyBinding::new("ctrl-w +", ResizeGrow, None),
         KeyBinding::new("ctrl-w =", Equalize, None),
+        // Layout patterns (spec-layout-patterns.md)
+        // Phase 2: automatic layouts
+        KeyBinding::new("ctrl-w space", CycleLayoutMode, None),
+        KeyBinding::new("ctrl-w enter", PromoteToMaster, None),
+        KeyBinding::new("ctrl-w i", IncreaseMasterCount, None),
+        KeyBinding::new("ctrl-w d", DecreaseMasterCount, None),
+        // Phase 3: tags
+        KeyBinding::new("ctrl-w t", TagViewChord, None),
+        KeyBinding::new("ctrl-w ctrl-t", TagToggleChord, None),
+        KeyBinding::new("ctrl-w shift-t", ClearTagView, None),
         // Document text zoom — same chord set every Mac app uses for
         // browser/editor zoom (Cmd-=, Cmd-+, Cmd--, Cmd-0). Scales the
         // doc/edit body + heading sizes; chrome stays fixed.
