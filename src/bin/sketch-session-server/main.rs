@@ -87,6 +87,76 @@ fn lease_to_wire(state: &LeaseState, now: Instant) -> Lease {
     }
 }
 
+// ── Forwarder progress + published log snapshot (Bug 1) ─────────────
+//
+// The forwarder runs as a detached task and tails `event_log` on each wake.
+// Two pieces of plumbing make it log_base-aware (so a Stage-B trim can't corrupt
+// the LIVE stream) and let the trim site treat the owner / live forwarders as a
+// hard compaction ceiling (spec §6 "never compact past owner.acked_seq"):
+//
+// * `LogSnapshot` is what rides the `log_tx` watch instead of a bare
+//   `Arc<Vec<Notification>>`. It carries the whole `EventLog` (a cheap clone —
+//   an `Arc` pointer + a `u64` base) plus the session's current `generation`, so
+//   the forwarder can translate its LOGICAL `sent_seq` into a `Vec` offset
+//   against the CURRENT `log_base` on every wake (Bug 1a) via
+//   `EventLog::resolve_sent` — the same translation the attach-time resolver
+//   uses, never a duplicated-and-drifting copy.
+//
+// * `ForwarderProgress` is a shared handle holding a forwarder's last forwarded
+//   `sent_seq` plus an `evicted` kill flag. One clone lives in the forwarder
+//   task; one clone is registered on `ManagedSession::forwarders`. The actor
+//   reads the MINIMUM `sent_seq` over all still-live forwarders (a dead forwarder
+//   drops its `Arc`, so `Arc::strong_count == 1` prunes it) to compute the trim
+//   floor — so the trim never drops below the slowest live forwarder, the OWNER
+//   (which is always a live forwarder) included. That is the spec §6 owner
+//   hard-ceiling in its shippable minimal form (Bug 1b).
+//
+//   HIGH-WATER DISCONNECT (spec §6, MAJOR): the owner hard-ceiling means a
+//   slow/paused forwarder pins `min(sent_seq)` and the trim can't fire, so the
+//   in-memory `Vec` grows. When the backlog (`tip_seq - floor`) crosses
+//   `event_log_high_water()`, the actor sets `evicted` on the SLOWEST forwarder
+//   (the one holding the floor) and prunes it from `forwarders`, dropping it
+//   from the `min` so the trim resumes — bounding growth. The forwarder task
+//   observes `evicted` on its next wake (every `push_event` publishes a snapshot
+//   that wakes it) and returns, closing its write half → the client sees EOF and
+//   does a clean from-base reconnect (NOT a silent gap). The owner is NOT exempt:
+//   a wedged owner that crosses the mark is cleanly bounced and reclaims its
+//   lease deterministically via same-`client_id` reclaim on reconnect (phase 4).
+#[derive(Clone)]
+struct LogSnapshot {
+    log: sketch::event_log::EventLog,
+    /// The session's `channel_generation` at publish time. A live forwarder
+    /// shares this epoch (a generation bump forces a fresh attach), so it is the
+    /// `current_gen` passed to `resolve_sent`.
+    generation: u64,
+}
+
+/// A live forwarder's shared state, held by both the forwarder task and the
+/// actor. `sent_seq` is the last forwarded logical seq (the actor reads the
+/// `min` over live handles for the trim floor); `evicted` is the high-water
+/// kill flag (the actor sets it to force-disconnect the slowest forwarder when
+/// the backlog crosses the high-water bound, spec §6 — the forwarder observes it
+/// on its next wake and returns).
+struct ForwarderHandle {
+    sent_seq: std::sync::atomic::AtomicU64,
+    /// Set by the actor's high-water disconnect (spec §6). When `true`, the
+    /// forwarder task exits at its next wake, closing its write half so the
+    /// client gets a clean EOF + from-base reconnect (NOT a silent gap).
+    evicted: std::sync::atomic::AtomicBool,
+}
+
+impl ForwarderHandle {
+    fn new(initial_sent_seq: u64) -> Self {
+        Self {
+            sent_seq: std::sync::atomic::AtomicU64::new(initial_sent_seq),
+            evicted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+/// A shared [`ForwarderHandle`] (the actor's clone + the forwarder task's clone).
+type ForwarderProgress = Arc<ForwarderHandle>;
+
 // ── Actor command inlet ────────────────────────────────────────────
 //
 // All session-state mutation flows through this single inlet, drained by the
@@ -117,13 +187,18 @@ enum Command {
         /// `usize` in the reply): the tail starts there. `None` / stale /
         /// out-of-range ⇒ `0` ⇒ full replay (unchanged behavior).
         cursor: Option<(u64, u64)>,
-        // On success: (lease watch, log watch, initial tail index, granted_drive).
+        // On success: (lease watch, log watch, initial forwarder cursor,
+        // forwarder progress handle, granted_drive). The forwarder cursor is a
+        // LOGICAL `sent_seq` (Bug 1a), NOT a `Vec` index, so a later trim can't
+        // re-alias it; the progress handle is the shared `AtomicU64` the actor
+        // reads for the trim floor (Bug 1b).
         reply: tokio::sync::oneshot::Sender<
             Result<
                 (
                     watch::Receiver<Option<Lease>>,
-                    watch::Receiver<Arc<Vec<Notification>>>,
-                    usize,
+                    watch::Receiver<LogSnapshot>,
+                    u64,
+                    ForwarderProgress,
                     bool,
                 ),
                 String,
@@ -291,7 +366,14 @@ struct ManagedSession {
     /// updated snapshot via `send_replace`. The forwarder tails `[sent..]` of
     /// the latest snapshot lock-free — watch coalescing self-heals exactly like
     /// the old broadcast `Lagged` path.
-    log_tx: watch::Sender<Arc<Vec<Notification>>>,
+    log_tx: watch::Sender<LogSnapshot>,
+    /// Live forwarders' progress handles (Bug 1b). Each entry is a shared
+    /// `AtomicU64` holding that forwarder's last forwarded logical `sent_seq`.
+    /// `push_event` reads the MINIMUM over the still-live entries (pruning any
+    /// whose `Arc::strong_count == 1` — the forwarder task dropped its clone) to
+    /// compute the trim floor, so a trim never gaps the slowest live forwarder,
+    /// the owner included (spec §6 owner hard-ceiling).
+    forwarders: Vec<ForwarderProgress>,
     /// Per-session lease control channel (phase 4). Holds the current wire
     /// [`Lease`] (or `None`). The forwarder selects on this and emits a single
     /// `LeaseChanged` control note on holder change — replaces the old
@@ -316,7 +398,12 @@ struct ManagedSession {
     /// `Arc::make_mut`, which is a cheap in-place mutation whenever the only
     /// reference is this field (the common case — snapshots are short-lived and
     /// released before the next push).
-    event_log: Arc<Vec<Notification>>,
+    ///
+    /// Phase-8 Stage B (spec §6): now an [`EventLog`] ringbuffer — the IN-MEMORY
+    /// `Vec` is bounded to [`event_log_cap`], with a logical `log_base` seq
+    /// offset so a trim never re-aliases a client's acked `seq`. The on-disk WAL
+    /// stays append-only / unbounded.
+    event_log: sketch::event_log::EventLog,
     /// Persisted turn count at restore time. The pump thread suppresses
     /// logging while the ACP agent's turn counter is ≤ this value, since
     /// those events are replays of turns already in `event_log`. Once the
@@ -328,6 +415,16 @@ struct ManagedSession {
     /// transcript. `None` only if the WAL couldn't be opened (we degrade to
     /// in-memory-only rather than refusing to run).
     wal: Option<sketch::session_wal::SessionWal>,
+    /// Phase-8 Stage A (spec §2/§3): the authoritative durable `seq` for the
+    /// canonical `AgentEvent` envelope — monotonic per `(session, generation)`,
+    /// assigned at the server's `record()` chokepoint. During the additive
+    /// rollout (spec §9) the `Agent` records interleave with the legacy
+    /// `ReplyEvent`/`TurnEnded` records in the SAME `event_log`, so this seq is a
+    /// dedicated logical counter for the agent stream, NOT the `Vec` index (the
+    /// `seq == Vec position` identity the spec resolves to is the post-deletion
+    /// steady state, once the legacy variants are gone). Reset to 0 on every
+    /// channel (re)spawn alongside `channel_generation`.
+    agent_seq: u64,
 }
 
 impl ManagedSession {
@@ -361,9 +458,204 @@ impl ManagedSession {
     /// deliberately NOT routed through here: it is transient lease state,
     /// not transcript, and must never land in `event_log`.
     fn record(&mut self, note: Notification) {
+        self.push_event(note);
+    }
+
+    /// The single in-memory + WAL push, with Stage B ringbuffer trim (spec §6).
+    /// Appends to the durable WAL (unbounded), pushes onto the bounded in-memory
+    /// [`EventLog`], trims the front (with hysteresis) when it exceeds
+    /// [`event_log_cap`] — splicing a `CompactedSummary` marker so a trim
+    /// surfaces as a deterministic placeholder (NOT a silent drop) — then
+    /// publishes the new snapshot on `log_tx`.
+    ///
+    /// HYSTERESIS (spec §11 / risk #2): a `Vec` front-drain + the marker
+    /// `prepend(0)` are each O(resident), so trimming one entry per push at the
+    /// cap would be O(cap) per push. We trim only when over `cap` and drop down
+    /// to a low-water `target` (≈ ¾ cap), amortising the cost across many pushes.
+    ///
+    /// COMPACTION FLOOR (spec §6, N3 / Bug 1b): the trim treats every LIVE
+    /// forwarder as a hard ceiling — it never drops below the slowest live
+    /// forwarder's last-forwarded `sent_seq`, and since the owner (lease holder)
+    /// is always one of the live forwarders, the owner is never gapped mid-stream
+    /// ("never compact past owner.acked_seq"). The floor is `min(sent_seq)` over
+    /// [`compaction_floor`]; with no live forwarders it is `u64::MAX` (nothing to
+    /// protect → cap-only).
+    ///
+    /// HIGH-WATER DISCONNECT (spec §6, MAJOR): the owner hard-ceiling means a
+    /// slow/paused forwarder (e.g. a backgrounded GUI owner under App Nap that
+    /// stops draining its socket) pins the floor — the trim can't fire and the
+    /// `Vec` grows. The 60s slow-sub write timeout is the only other reaper, and
+    /// a forwarder that drains just enough to keep resetting that timer could pin
+    /// growth EFFECTIVELY unbounded. So BEFORE computing the floor we
+    /// [`enforce_high_water`](Self::enforce_high_water): when the backlog
+    /// (`tip_seq - floor`) crosses [`event_log_high_water`], the slowest
+    /// forwarder is force-DISCONNECTED (a clean from-base reconnect, NOT a silent
+    /// gap) and dropped from the floor `min`, so the trim resumes and growth is
+    /// bounded. The owner is NOT exempt (the App Nap case) — a wedged owner is
+    /// cleanly bounced and reclaims its lease via same-`client_id` reclaim.
+    fn push_event(&mut self, note: Notification) {
         self.wal_append(&note);
-        Arc::make_mut(&mut self.event_log).push(note);
-        let _ = self.log_tx.send_replace(Arc::clone(&self.event_log));
+        self.event_log.push(note);
+        let cap = sketch::event_log::event_log_cap();
+        // Low-water mark: ¾ of the cap, leaving a slot for the prepended marker
+        // and headroom so the next several pushes don't re-trim.
+        let target = (cap * 3 / 4).max(1).min(cap.saturating_sub(1));
+        // Disconnect-before-gap (spec §6): evict any forwarder whose backlog has
+        // crossed the high-water bound, so the floor below is not pinned by a
+        // wedged consumer and the trim can bound growth.
+        self.enforce_high_water();
+        let floor = self.compaction_floor();
+        if let Some(trim) = self.event_log.trim(cap, target, floor) {
+            // Splice a CompactedSummary marker at the NEW front carrying the new
+            // base seq, so a from-base rebuild begins with "history compacted
+            // through turn N" rather than an unexplained jump (spec §6/§7).
+            //
+            // Bug 2: the marker reuses the LAST-DROPPED slot — `prepend` decrements
+            // `log_base` by one so survivor seqs stay stable. The marker's own seq
+            // must therefore be `new_base - 1` (the decremented base), so that after
+            // the prepend `marker.seq == log_base` and the seq space is contiguous.
+            let through_turn = trim.through_turn.unwrap_or(0);
+            let marker_seq = trim.new_base.saturating_sub(1);
+            let marker = sketch::agent_event::AgentEvent::new(
+                self.id.clone(),
+                self.channel_generation,
+                through_turn,
+                marker_seq,
+                sketch::agent_event::AgentEventKind::CompactedSummary {
+                    through_turn,
+                    summary: format!(
+                        "history compacted: {} earlier event(s) trimmed (through turn {through_turn})",
+                        trim.dropped
+                    ),
+                },
+            );
+            self.event_log.prepend(Notification::Agent { event: marker });
+        }
+        self.publish_snapshot();
+    }
+
+    /// Publish the current `event_log` (plus the live `channel_generation`) on the
+    /// `log_tx` watch, waking every forwarder. The forwarder re-resolves its
+    /// logical `sent_seq` against the published `log_base` (Bug 1a), so a trim
+    /// that shortened the `Vec` can never make it slice a stale offset.
+    fn publish_snapshot(&self) {
+        let _ = self.log_tx.send_replace(LogSnapshot {
+            log: self.event_log.clone(),
+            generation: self.channel_generation,
+        });
+    }
+
+    /// The trim floor (spec §6 owner hard-ceiling, Bug 1b): the minimum logical
+    /// `sent_seq` over all still-live forwarders. A dead forwarder dropped its
+    /// progress `Arc`, so it is the SOLE remaining ref (`strong_count == 1`) and
+    /// is pruned here; `u64::MAX` (no floor) when no live forwarder remains.
+    ///
+    /// `&mut self` because it prunes dead handles as a side effect. The owner is
+    /// always a live forwarder, so it is implicitly included in the `min` — the
+    /// trim can never drop below the owner's forwarded position.
+    fn compaction_floor(&mut self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.forwarders.retain(|p| Arc::strong_count(p) > 1);
+        self.forwarders
+            .iter()
+            .map(|p| p.sent_seq.load(Ordering::Acquire))
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// High-water backlog bound (spec §6, MAJOR — disconnect-before-gap).
+    ///
+    /// The floor ([`compaction_floor`]) is a HARD ceiling, so a slow/paused
+    /// forwarder (e.g. a backgrounded GUI owner under macOS App Nap that stops
+    /// draining its socket) pins `min(sent_seq)` and prevents the trim from
+    /// firing, letting the in-memory `Vec` grow without bound. When the backlog
+    /// `tip_seq - floor` crosses [`event_log_high_water`], force-DISCONNECT the
+    /// SLOWEST live forwarder (the one whose `sent_seq == floor`): set its
+    /// `evicted` flag (the forwarder task observes it on its next wake — the
+    /// `publish_snapshot` at the end of `push_event` provides that wake — and
+    /// returns, closing its write half) and prune its handle from `forwarders`
+    /// HERE so it immediately drops out of the floor `min`. The trim then
+    /// proceeds and growth is bounded.
+    ///
+    /// This is NOT a silent in-place gap (which §6 forbids for the owner): the
+    /// disconnected client gets a clean EOF, reconnects, and rebuilds from base
+    /// via `resolve_cursor` → `FromBase` (surfacing the `CompactedSummary`
+    /// marker). The owner is therefore NOT exempt — a wedged owner that crosses
+    /// the mark is bounced and reclaims its lease deterministically on reconnect
+    /// (phase-4 same-`client_id` resume). The lease lives in `ManagedSession`
+    /// keyed by `client_id`, independent of the forwarder task, so evicting a
+    /// forwarder does NOT touch or free the lease.
+    ///
+    /// Loops so multiple forwarders past the mark are all evicted in one pass:
+    /// after dropping the slowest, the floor rises to the next-slowest, which may
+    /// itself still be past the bound. No live forwarders → floor is `u64::MAX`,
+    /// the backlog is `0` (saturating), nothing to evict (cap-only mode, spec §6
+    /// "no live subscribers" — floor = tip).
+    fn enforce_high_water(&mut self) {
+        use std::sync::atomic::Ordering;
+        let high_water = sketch::event_log::event_log_high_water() as u64;
+        let tip = self.event_log.tip_seq();
+        loop {
+            // Prune dead handles, then find the slowest live forwarder.
+            self.forwarders.retain(|p| Arc::strong_count(p) > 1);
+            let Some((slowest_idx, floor)) = self
+                .forwarders
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i, p.sent_seq.load(Ordering::Acquire)))
+                .min_by_key(|&(_, seq)| seq)
+            else {
+                return; // no live forwarders → cap-only mode, nothing to evict
+            };
+            // Backlog is tip minus the slowest forwarded position. Saturating so a
+            // forwarder somehow ahead of tip can't underflow.
+            let backlog = tip.saturating_sub(floor);
+            if backlog <= high_water {
+                return; // slowest forwarder is within the bound — done
+            }
+            // Force-disconnect the slowest forwarder: flag it (the forwarder task
+            // exits at its next wake) and drop the actor's handle now so the floor
+            // `min` no longer includes it and the trim can proceed.
+            let handle = self.forwarders.swap_remove(slowest_idx);
+            handle.evicted.store(true, Ordering::Release);
+            tracing::warn!(
+                session_id = %&self.id[..8.min(self.id.len())],
+                backlog,
+                high_water,
+                "high-water disconnect: evicting slowest forwarder (sent_seq {floor}) — \
+                 in-memory backlog past threshold (wedged/paused consumer)"
+            );
+            // Loop: the floor rises to the next-slowest, which may still be past
+            // the bound.
+        }
+    }
+
+    /// Phase-8 Stage A (spec §1/§2/§3, ADDITIVE): record the canonical
+    /// `AgentEvent` for `kind`, ALONGSIDE the legacy notification the caller
+    /// already recorded. This is the server's piece of the §3 emit chokepoint:
+    /// it assigns the authoritative envelope identity under the actor's single-
+    /// writer discipline — `session_id` = this session, `generation` =
+    /// `channel_generation`, `turn` = `self.turns`, `seq` = a monotonic
+    /// `agent_seq` (per `(session, generation)`). seq/turn ride the durable WAL
+    /// for free (the envelope is inside the persisted `Notification::Agent`), so
+    /// on resume the server forwards them verbatim (spec §5).
+    ///
+    /// Emitting alongside the inference (not instead of it) is the spec §9
+    /// reversible rollout: deleting the legacy path is a follow-up once the
+    /// forwarded stream is confirmed to agree with the inference on real
+    /// sessions. `turn` is the CURRENT (post-increment for TurnEnded) settled
+    /// count — callers that record a TurnEnded must bump `self.turns` first so
+    /// the boundary's envelope `turn` matches the completed turn number.
+    fn record_agent(&mut self, kind: sketch::agent_event::AgentEventKind) {
+        let event = sketch::agent_event::AgentEvent::new(
+            self.id.clone(),
+            self.channel_generation,
+            self.turns as u64,
+            self.agent_seq,
+            kind,
+        );
+        self.agent_seq += 1;
+        self.record(Notification::Agent { event });
     }
 
     /// Append a transcript event to `event_log` + WAL and fire the watch wake.
@@ -373,9 +665,7 @@ impl ManagedSession {
     /// broadcast tail did). Distinguished from [`record`] only in intent — both
     /// now publish through the per-session `log_tx` watch.
     fn log_only(&mut self, note: Notification) {
-        self.wal_append(&note);
-        Arc::make_mut(&mut self.event_log).push(note);
-        let _ = self.log_tx.send_replace(Arc::clone(&self.event_log));
+        self.push_event(note);
     }
 
     /// Append `note` to the durable WAL. `fsync`s at turn boundaries
@@ -385,10 +675,23 @@ impl ManagedSession {
     /// event for live subscribers.
     fn wal_append(&mut self, note: &Notification) {
         if let Some(wal) = self.wal.as_mut() {
-            let boundary = matches!(
-                note,
-                Notification::UserPrompt { .. } | Notification::TurnEnded { .. }
-            );
+            // Turn boundaries fsync (UserPrompt / TurnEnded), streamed chunks do
+            // not (ADR-0009). Phase-8 Stage A: an `Agent` record carrying a
+            // boundary kind (UserMessage or a real TurnEnded) is the same
+            // guarantee in the new vocabulary — fsync those too. ReplayEnd is a
+            // replay-prefix marker, not a completed turn, so it need not fsync,
+            // but it's cheap and harmless to treat all TurnEnded alike here.
+            let boundary = match note {
+                Notification::UserPrompt { .. } | Notification::TurnEnded { .. } => true,
+                Notification::Agent { event } => {
+                    use sketch::agent_event::AgentEventKind;
+                    matches!(
+                        event.kind,
+                        AgentEventKind::UserMessage { .. } | AgentEventKind::TurnEnded { .. }
+                    )
+                }
+                _ => false,
+            };
             if let Err(e) = wal.append(note, boundary) {
                 tracing::error!(
                     session_id = %&self.id[..8.min(self.id.len())],
@@ -441,9 +744,47 @@ impl ManagedSession {
         if is_respawn {
             self.channel_generation = self.channel_generation.wrapping_add(1);
             let _ = self.gen_watch.send_replace(self.channel_generation);
+            // Phase-8 Stage A (spec §2/§4): a respawn is a NEW channel, so the
+            // per-(session, generation) agent seq restarts at 0. The
+            // `ChannelOpened` first-event below then rides this new generation
+            // with seq 0 — the uniform rebaseline signal a consumer keys on
+            // (spec §4 rebaseline rule).
+            //
+            // NOTE (minor, re-review): this resets `agent_seq` to 0 but does NOT
+            // clear `event_log` — the respawn's events APPEND to the existing
+            // in-memory log. That is correct because `event.seq` is the
+            // PER-GENERATION envelope seq, which is NOT the forwarding/reconnect
+            // cursor. The cursor is ALWAYS the logical `log_base + vec_index`
+            // computed by `EventLog::seq_of` / resolved by `resolve_cursor`
+            // (which carry the generation alongside the seq, so a generation
+            // mismatch forces a from-base rebuild — see `CursorResolution`). A
+            // future client-wiring phase (phase-5 cursor reconnect) MUST source
+            // its acked position from `seq_of(vec_index)` of the entry it last
+            // consumed, NEVER from `event.seq` — the two diverge after a respawn
+            // (agent_seq restarts at 0 while the log_base seq keeps climbing) and
+            // after any trim.
+            self.agent_seq = 0;
         }
         handle.generation = self.channel_generation;
         self.channel = Some(handle);
+        // ADDITIVE (spec §4/§9): emit `ChannelOpened` as the FIRST event of this
+        // (re)spawned channel, BEFORE `SessionAttached`. `resumed` is true when
+        // we are reconnecting to an existing ACP session id (the respawn /
+        // restore case). This rides the new generation + seq 0 so a consumer
+        // that adopts the uniform rebaseline rule (Stage C) resets before
+        // applying. It is recorded alongside the kept `SessionAttached` control
+        // variant, which still carries the resume id for WAL recovery.
+        //
+        // MINOR (4) — INTENTIONAL SPEC DEVIATION: spec §2/§4 says envelope facts
+        // (incl. `ChannelOpened`) are sourced "at the worker". In Stage A the
+        // server sources `ChannelOpened` here instead (it owns the authoritative
+        // `channel_generation` and the spawn lifecycle). A future reader must NOT
+        // assume these envelopes are worker-sourced: the worker-sourced emission
+        // (§4 "emit before the load RPC") is a later-phase move; today the SERVER
+        // stamps the generation + seq 0 at this site.
+        self.record_agent(sketch::agent_event::channel_opened_kind(
+            acp_session_id.is_some(),
+        ));
         self.record(Notification::SessionAttached {
             session_id: self.id.clone(),
             acp_session_id,
@@ -461,8 +802,8 @@ fn new_managed_session(
     permission_mode: PermissionMode,
     wal: Option<sketch::session_wal::SessionWal>,
 ) -> ManagedSession {
-    let event_log = Arc::new(Vec::new());
-    let (log_tx, _) = watch::channel(Arc::clone(&event_log));
+    let event_log = sketch::event_log::EventLog::new();
+    let (log_tx, _) = watch::channel(LogSnapshot { log: event_log.clone(), generation: 0 });
     let (lease_tx, _) = watch::channel(None);
     let (gen_watch, _) = watch::channel(0u64);
     ManagedSession {
@@ -475,12 +816,14 @@ fn new_managed_session(
         turns: 0,
         permission_mode,
         log_tx,
+        forwarders: Vec::new(),
         lease_tx,
         lease: None,
         pending_prompts: Vec::new(),
         event_log,
         replay_fence: 0,
         wal,
+        agent_seq: 0,
     }
 }
 
@@ -587,8 +930,9 @@ impl SessionManager {
     ) -> Result<
         (
             watch::Receiver<Option<Lease>>,
-            watch::Receiver<Arc<Vec<Notification>>>,
-            usize,
+            watch::Receiver<LogSnapshot>,
+            u64,
+            ForwarderProgress,
             bool,
         ),
         String,
@@ -768,9 +1112,28 @@ fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<Re
             }
         };
 
-        let event_log = Arc::new(rs.event_log);
+        // Phase-8 Stage A: resume the agent seq one past the highest persisted
+        // `Agent` seq on this (generation-0) recovered log, so post-restore
+        // agent events extend the durable seq space monotonically (spec §2/§5 —
+        // turn/seq forwarded verbatim, then continue).
+        let agent_seq = rs
+            .event_log
+            .iter()
+            .filter_map(|n| match n {
+                Notification::Agent { event } => Some(event.seq),
+                _ => None,
+            })
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        // Stage B: recovery always starts from `log_base == 0` — the on-disk WAL
+        // is never trimmed, so the restored transcript is a faithful append-
+        // ordered prefix from seq 0 (spec §6 / ringbuffer note: on restart
+        // log_base resets to the seq of the first recovered event, which is 0).
+        let event_log = sketch::event_log::EventLog::from_recovered(rs.event_log, 0);
         // Seed the watch with the recovered log so the first tail sees history.
-        let (log_tx, _) = watch::channel(Arc::clone(&event_log));
+        let (log_tx, _) =
+            watch::channel(LogSnapshot { log: event_log.clone(), generation: 0 });
         let (lease_tx, _) = watch::channel(None);
         let (gen_watch, _) = watch::channel(0u64);
         let session = ManagedSession {
@@ -783,12 +1146,14 @@ fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<Re
             turns: rs.turns,
             permission_mode: rs.permission_mode,
             log_tx,
+            forwarders: Vec::new(),
             lease_tx,
             lease: None,
             pending_prompts: Vec::new(),
             event_log,
             replay_fence: rs.turns,
             wal,
+            agent_seq,
         };
 
         tracing::info!(
@@ -837,6 +1202,16 @@ fn spawn_resume_worker(
             ) {
                 Ok(client) => {
                     // Resume from disk → is_respawn=false (generation stays 0).
+                    //
+                    // MINOR (5): `apply_channel_state` then records a ChannelOpened
+                    // at generation 0 — but the RECOVERED log may ALREADY contain a
+                    // gen-0 ChannelOpened from the original session, so the restored
+                    // transcript can carry TWO gen-0 ChannelOpened events. This is
+                    // HARMLESS for the §4 generation-delta rebaseline: a consumer
+                    // rebaselines only on a STRICTLY-newer generation, and both are
+                    // gen 0, so the second is an idempotent no-op (its
+                    // `reset_for_replay` would just rebuild the same prefix). Noted
+                    // so a future reader doesn't treat the duplicate as a bug.
                     publish_channel(&cmd_tx, &session_id, client, false);
                 }
                 Err(e) => {
@@ -1012,6 +1387,22 @@ impl Manager {
                 if generation != s.channel_generation {
                     return; // stale reader (superseded by a restart)
                 }
+                // ADDITIVE (spec §9): record the canonical AgentEvent ALONGSIDE
+                // the legacy ReplyEvent. The legacy variant still drives the GUI
+                // transcript this pass; the Agent stream is forwarded for the §9
+                // agreement check. ReplayComplete / TurnEnded carry their
+                // identity in the envelope, not the payload, so they map to the
+                // ReplayEnd / (handled-below) boundary kinds rather than a Chunk.
+                if let Some(kind) = sketch::agent_event::agent_kind_from_reply(&event) {
+                    s.record_agent(kind);
+                } else if matches!(event, sketch::acp_channel::ReplyEvent::ReplayComplete) {
+                    s.record_agent(sketch::agent_event::replay_end_kind());
+                }
+                // NOTE: a worker `ReplyEvent::TurnEnded { count }` (only emitted
+                // under SKETCH_EMIT_TURN_ENDED=1) is intentionally NOT mapped
+                // here — the authoritative live boundary is recorded by the
+                // TurnCount handler below, where `self.turns` is already updated
+                // so the envelope `turn` matches the settled count.
                 s.record(Notification::ReplyEvent {
                     session_id: sid.clone(),
                     event,
@@ -1036,6 +1427,28 @@ impl Manager {
                 }
                 s.turns = turns;
                 let channel_generation = s.channel_generation;
+                // ADDITIVE (spec §9): record the canonical AgentEvent TurnEnded
+                // ALONGSIDE the legacy TurnEnded. The envelope `turn` is the
+                // COMPLETED turn index (0-based): a 1-based settled count of
+                // `turns` means turn `turns - 1` just ended — this is exactly the
+                // value the WAL recovery derives via `max(turn) + 1`. The outcome
+                // is `Completed` here; richer outcomes (Cancelled / MaxTokens /
+                // Failed) become available once the worker forwards the verbatim
+                // ACP stopReason (a follow-up; the inference has no stopReason).
+                let completed_turn = turns.saturating_sub(1) as u64;
+                let agent_seq = s.agent_seq;
+                s.agent_seq += 1;
+                s.record(Notification::Agent {
+                    event: sketch::agent_event::AgentEvent::new(
+                        sid.clone(),
+                        channel_generation,
+                        completed_turn,
+                        agent_seq,
+                        sketch::agent_event::turn_ended_kind(
+                            sketch::agent_event::TurnOutcome::Completed,
+                        ),
+                    ),
+                });
                 s.record(Notification::TurnEnded {
                     session_id: sid.clone(),
                     turn_count: turns,
@@ -1150,8 +1563,9 @@ impl Manager {
     ) -> Result<
         (
             watch::Receiver<Option<Lease>>,
-            watch::Receiver<Arc<Vec<Notification>>>,
-            usize,
+            watch::Receiver<LogSnapshot>,
+            u64,
+            ForwarderProgress,
             bool,
         ),
         String,
@@ -1200,34 +1614,45 @@ impl Manager {
 
         let lease_rx = session.lease_tx.subscribe();
         let log_rx = session.log_tx.subscribe();
-        let log_len = session.event_log.len();
 
-        // Resolve the reconnect cursor into the forwarder's initial `sent`.
-        //
-        // Incremental tail ONLY when the cursor's generation matches the
-        // session's current `channel_generation` AND its index is within the
-        // current log. Falls back to `0` ⇒ full replay (exactly today's
-        // behavior) for any of:
+        // Resolve the reconnect cursor into the forwarder's initial `sent` (a
+        // `Vec` index) under the §6 epoch predicate. The cursor's second field is
+        // a LOGICAL `acked_seq` (not a raw `Vec` index) — `EventLog::resolve_cursor`
+        // owns the single `seq ↔ Vec-offset` translation via `log_base` (spec §6,
+        // risk #3). Incremental tail ONLY when the cursor's generation matches the
+        // session's current `channel_generation` AND `log_base <= acked_seq <= tip`.
+        // Falls back to a from-base rebuild (`Vec` index 0) for any of:
         //   - no cursor (every client today);
         //   - generation mismatch — a *force-restart* bumped the epoch, so the
         //     client's pre-restart cursor is stale;
-        //   - index past the log — WAL compaction-past-cursor or a bogus client.
-        // NOTE on server restart: WAL recovery resets `channel_generation` to 0
-        // AND restores the full durable log as a faithful append-ordered prefix.
-        // So a never-force-restarted client's (gen 0, idx) cursor MATCHES the
-        // restored gen 0 and correctly tails the restored log — [0..idx] is
-        // exactly what it already saw, [idx..] the right suffix. If un-fsynced
-        // mid-turn chunks were lost on crash, idx > log_len trips the
-        // full-replay fallback. Safe either way; behavior-preserving.
-        let initial_sent = match cursor {
-            Some((cursor_gen, idx))
-                if cursor_gen == session.channel_generation && (idx as usize) <= log_len =>
-            {
-                idx as usize
-            }
-            _ => 0,
-        };
-        Ok((lease_rx, log_rx, initial_sent, granted_drive))
+        //   - `acked_seq < log_base` — the slow subscriber fell off the trimmed
+        //     tail (Stage B compaction-past-cursor); a clean from-base rebuild
+        //     (which begins with the `CompactedSummary` marker), NEVER a gap;
+        //   - `acked_seq > tip` — bogus client / lost un-fsynced mid-turn tail.
+        // Evaluated under the actor lock so `log_base` can't advance mid-decision.
+        //
+        // BACK-COMPAT: before any trim `log_base == 0`, so `acked_seq == Vec
+        // index` and this is byte-identical to the phase-5 steady state — a
+        // never-force-restarted (gen 0, idx) cursor tails exactly `[idx..]`.
+        let initial_vec_index = session
+            .event_log
+            .resolve_cursor(cursor, session.channel_generation)
+            .initial_vec_index();
+        // Hand the forwarder a LOGICAL `sent_seq` (Bug 1a), not the raw `Vec`
+        // index, so a later trim re-resolves it correctly: the entries up to
+        // `initial_vec_index` are considered already-sent, so `sent_seq` is the
+        // seq of the FIRST not-yet-sent entry == `log_base + initial_vec_index`.
+        let initial_sent_seq = session.event_log.seq_of(initial_vec_index);
+
+        // Register this forwarder's progress handle (Bug 1b): one clone goes to
+        // the forwarder task (returned), one is retained on the session so the
+        // trim floor `min`s over it. Seed it at the initial `sent_seq`. Prune any
+        // dead handles while we're here.
+        session.forwarders.retain(|p| Arc::strong_count(p) > 1);
+        let progress: ForwarderProgress = Arc::new(ForwarderHandle::new(initial_sent_seq));
+        session.forwarders.push(Arc::clone(&progress));
+
+        Ok((lease_rx, log_rx, initial_sent_seq, progress, granted_drive))
     }
 
     /// Renew a held lease (phase 4). Same-`client_id` live → push expiry (no
@@ -1336,6 +1761,14 @@ impl Manager {
         // appended to event_log + WAL, not broadcast.
         session.log_only(Notification::UserPrompt {
             session_id: session_id.to_string(),
+            text: text.to_string(),
+        });
+        // ADDITIVE (spec §9): the canonical AgentEvent for the user's prompt —
+        // `UserMessage` folds both the live submit and the replay echo, deduped
+        // by identity (session, generation, turn) per spec §2/§5. Recorded
+        // alongside the legacy UserPrompt; the GUI reducer ignores the Agent
+        // stream this pass.
+        session.record_agent(sketch::agent_event::AgentEventKind::UserMessage {
             text: text.to_string(),
         });
         match session.channel.as_ref() {
@@ -1465,6 +1898,7 @@ impl Manager {
                     .map(|l| lease_to_wire(l, now)),
                 turns: s.turns,
                 event_log_len: s.event_log.len(),
+                log_base: s.event_log.log_base(),
                 subscriber_count: s.log_tx.receiver_count(),
                 channel_generation: s.channel_generation,
                 permission_mode: s.permission_mode,
@@ -1837,17 +2271,18 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                     .send_attach(&session_id, mode, client_id, cursor)
                     .await
                 {
-                    Ok((lease_rx, log_rx, initial_sent, granted_drive)) => {
-                        // `initial_sent` is the actor-resolved tail start (see
-                        // `do_attach`): 0 for a full replay (no/stale cursor —
-                        // the forwarder tails `event_log` from index 0, the
-                        // unchanged behavior), or the cursor index for an
-                        // incremental reconnect that streams only `[idx..]`.
-                        // Either way history + live events flow over one
-                        // ordered, gap-free path.
+                    Ok((lease_rx, log_rx, initial_sent_seq, progress, granted_drive)) => {
+                        // `initial_sent_seq` is the actor-resolved tail start as a
+                        // LOGICAL seq (Bug 1a): the seq of the first not-yet-sent
+                        // entry. `log_base` for a from-replay attach (so the first
+                        // tail streams from `Vec` index 0), or the cursor's resolved
+                        // seq for an incremental reconnect. The forwarder translates
+                        // it to a `Vec` offset against the CURRENT `log_base` on
+                        // every wake, so a Stage-B trim can't make it slice a stale
+                        // offset. `progress` is its shared trim-floor handle (Bug 1b).
                         tracing::info!(
                             session_id = %&session_id[..8],
-                            initial_sent,
+                            initial_sent_seq,
                             cursor = ?cursor,
                             "attach: forwarder tail start resolved"
                         );
@@ -1858,7 +2293,8 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                             w,
                             lease_rx,
                             log_rx,
-                            initial_sent,
+                            initial_sent_seq,
+                            progress,
                         ));
                         subscribed.insert(session_id, handle);
                         // Phase 4: tell the client its role explicitly so it
@@ -2053,29 +2489,80 @@ async fn forward_notifications(
     session_id: ServerSessionId,
     writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
     mut lease_rx: watch::Receiver<Option<Lease>>,
-    mut log_rx: watch::Receiver<Arc<Vec<Notification>>>,
-    initial_sent: usize,
+    mut log_rx: watch::Receiver<LogSnapshot>,
+    initial_sent_seq: u64,
+    progress: ForwarderProgress,
 ) {
-    // Number of `event_log` entries already written to this client. Starts at
-    // the actor-resolved `initial_sent`: `0` for a full replay (no/stale
-    // cursor — unchanged behavior), or the reconnect cursor index so the first
-    // tail pass streams only `[initial_sent..]` (incremental reconnect, spec
-    // phase 5). Everything below (tail loop, owner watch, slow-subscriber
-    // timeout) is identical regardless.
-    let mut sent = initial_sent;
+    use std::sync::atomic::Ordering;
+
+    // The forwarder's position is a LOGICAL `sent_seq` (Bug 1a), NOT a raw `Vec`
+    // index: the seq of the FIRST entry this client has NOT yet been sent.
+    // Starts at the actor-resolved `initial_sent_seq` (`log_base` for a full
+    // replay, or the reconnect cursor's resolved seq for an incremental reconnect).
+    //
+    // On every wake we translate `sent_seq` → a `Vec` offset against the CURRENT
+    // published `log_base` (via `EventLog::resolve_sent`, the SAME translation the
+    // attach resolver uses — not a duplicated copy). A Stage-B trim front-drains
+    // the `Vec` and advances `log_base`, so the same `sent_seq` maps to a smaller
+    // offset; if the trim passed this forwarder entirely (`sent_seq < log_base`),
+    // `resolve_sent` returns `FromBase` and we re-slice from index 0 (which now
+    // begins with the `CompactedSummary` marker) — never a stale-offset gap/dup.
+    let mut sent_seq = initial_sent_seq;
+
+    // Tail the given published snapshot from `sent_seq`: resolve the offset,
+    // flush `[offset..]`, advance `sent_seq` to the snapshot tip, and publish the
+    // new position to the shared progress handle so the trim floor sees it.
+    // Returns `false` if the write failed/stalled (caller exits, dropping the
+    // progress handle → it falls out of the trim-floor `min`).
+    async fn tail_snapshot(
+        snap: &LogSnapshot,
+        writer: &Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
+        session_id: &str,
+        sent_seq: &mut u64,
+        progress: &ForwarderProgress,
+    ) -> bool {
+        // High-water disconnect (spec §6): the actor set `evicted` because this
+        // forwarder is the slowest and its backlog crossed the high-water bound.
+        // Shut down the write half so the CLIENT sees a clean EOF and does a
+        // from-base reconnect (NOT a silent gap) — merely returning would only
+        // stop this forwarder task while the connection's read loop kept the
+        // socket open (a wedged owner under App Nap would never notice). The
+        // progress handle drops on return, falling out of the trim-floor `min`
+        // (the actor already pruned it from `forwarders`, so the trim resumed).
+        if progress.evicted.load(Ordering::Acquire) {
+            tracing::warn!(
+                session_id = %&session_id[..8.min(session_id.len())],
+                "high-water disconnect: backlog past threshold — closing wedged forwarder's socket"
+            );
+            use tokio::io::AsyncWriteExt as _;
+            let _ = writer.lock().await.shutdown().await;
+            return false;
+        }
+        let offset = match snap.log.resolve_sent(*sent_seq, snap.generation) {
+            sketch::event_log::CursorResolution::FromBase => 0,
+            sketch::event_log::CursorResolution::Tail { vec_index } => vec_index,
+        };
+        let entries = snap.log.entries();
+        if entries.len() > offset {
+            if !flush_tail(writer, session_id, &entries[offset..]).await {
+                return false;
+            }
+            // Advance to the tip seq: everything resident is now sent.
+            *sent_seq = snap.log.tip_seq();
+            progress.sent_seq.store(*sent_seq, Ordering::Release);
+        }
+        true
+    }
 
     // First pass: `watch::Sender::subscribe()` marks the current value as
     // already-seen, so the initial transcript replay IS the first tail. Mark
     // the current snapshot seen with `borrow_and_update()` and tail it from
-    // `sent` (the cursor index, or 0 for full replay) to subsume attach replay
-    // (no separate replay path).
+    // `sent_seq` (the resolved cursor seq, or `log_base` for full replay) to
+    // subsume attach replay (no separate replay path).
     {
-        let snapshot = log_rx.borrow_and_update().clone();
-        if snapshot.len() > sent {
-            if !flush_tail(&writer, &session_id, &snapshot[sent..]).await {
-                return;
-            }
-            sent = snapshot.len();
+        let snap = log_rx.borrow_and_update().clone();
+        if !tail_snapshot(&snap, &writer, &session_id, &mut sent_seq, &progress).await {
+            return;
         }
     }
 
@@ -2086,27 +2573,22 @@ async fn forward_notifications(
     loop {
         tokio::select! {
             // Transcript log channel: a new snapshot was published. Tail the
-            // latest snapshot lock-free from the cloned `Arc` — no manager lock
-            // in the hot path. Coalesced wakes self-heal: we always tail
-            // [sent..] of whatever the latest snapshot is.
+            // latest snapshot lock-free from the cloned snapshot — no manager
+            // lock in the hot path. Coalesced wakes self-heal: we always
+            // re-resolve `sent_seq` against the latest published `log_base`.
             changed = log_rx.changed() => {
                 match changed {
                     Ok(()) => {
-                        let snapshot = log_rx.borrow_and_update().clone();
-                        if snapshot.len() > sent {
-                            if !flush_tail(&writer, &session_id, &snapshot[sent..]).await {
-                                return;
-                            }
-                            sent = snapshot.len();
+                        let snap = log_rx.borrow_and_update().clone();
+                        if !tail_snapshot(&snap, &writer, &session_id, &mut sent_seq, &progress).await {
+                            return;
                         }
                     }
                     Err(_) => {
                         // Sender dropped (session closing). One final tail of
                         // the last snapshot, then exit.
-                        let snapshot = log_rx.borrow().clone();
-                        if snapshot.len() > sent {
-                            let _ = flush_tail(&writer, &session_id, &snapshot[sent..]).await;
-                        }
+                        let snap = log_rx.borrow().clone();
+                        let _ = tail_snapshot(&snap, &writer, &session_id, &mut sent_seq, &progress).await;
                         return;
                     }
                 }

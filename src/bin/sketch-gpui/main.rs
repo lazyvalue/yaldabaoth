@@ -4141,6 +4141,31 @@ fn setup_list_follow_handler(
 /// chunk has a clean starting point. The cursor stays where the user put
 /// it (the worksheet is cursor-anchored, not auto-following the agent —
 /// spec-agent-window.md §19).
+/// The pump-side decision an [`AgentEventKind`] fold surfaces (spec §7). The
+/// reducer ([`SketchGpuiView::apply_agent_event`]) is a pure state-fold and
+/// does NOT finalize or flip `turn_phase` inside itself; instead it returns one
+/// of these so the CALLER routes a boundary through the idempotent
+/// `finalize_agent_turn_idem` ledger and owns the `turn_phase = Idle` flip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentEventEffect {
+    /// Streamed content / non-boundary event — no finalize.
+    None,
+    /// A live/terminal turn boundary (spec §5). The caller finalizes
+    /// `(generation, turn)` idempotently and flips the phase to `Idle`.
+    TurnEnded { generation: u64, turn: usize },
+    /// End of the replayed history prefix (old `ReplayComplete`). This is a
+    /// replay-prefix MARKER, not a turn completion: it must NOT occupy a
+    /// `(generation, turn)` slot in the per-turn finalize ledger, because the
+    /// server stamps the `ReplayEnd` envelope `turn` with the CURRENT settled
+    /// count `self.turns` — the SAME index the next live turn's `completed_turn`
+    /// carries — so keying the turn ledger here would pre-occupy the upcoming
+    /// live turn's entry and wedge its finalize (the stuck-thinking-after-resume
+    /// bug). The caller instead settles the replay buffer through a DEDICATED
+    /// idempotency (`finalize_replay_prefix`) and flips the phase to `Idle` only
+    /// if no live turn is in flight.
+    ReplayEnded,
+}
+
 fn finalize_agent_turn(editor: &mut Editor) {
     let total_len = editor.document().rope().len_chars();
     let needs_newline = total_len == 0
@@ -5413,6 +5438,37 @@ struct AgentState {
     /// into a loud, located failure. Scoped per generation (cleared on
     /// transcript wipe) so a reconnect's `k`-restart is not a false positive.
     user_turn_ks: std::collections::HashSet<usize>,
+    /// The channel generation this transcript is rebaselined to (spec §4).
+    /// `0` until the first `AgentEvent` carrying a generation is folded. The
+    /// uniform rebaseline rule fires when a folded event's `generation` is
+    /// strictly greater than this value: `reset_for_replay` runs FIRST, then
+    /// this field advances. Cleared to `0` by `reset_for_replay` so a
+    /// re-attach replaying gen-N events rebaselines exactly once.
+    generation: u64,
+    /// Idempotent-finalize ledger keyed on `(generation, turn)` (spec §7/H5).
+    /// `finalize_agent_turn_idem` no-ops when the pair is already present, so
+    /// a duplicate `TurnEnded` (the forwarded `AgentEvent` boundary AND a
+    /// lingering inference during the §9 additive rollout) finalizes the turn
+    /// exactly once — no double trailing newline, no double phase flip.
+    /// Cleared by `reset_for_replay` (a fresh generation re-numbers turns).
+    finalized: std::collections::HashSet<(u64, usize)>,
+    /// Dedicated idempotency for the `ReplayEnd` replay-prefix marker, decoupled
+    /// from the per-turn `finalized` ledger above. The `ReplayEnd` envelope
+    /// `turn` collides with the next live turn's `completed_turn` (both = the
+    /// server's settled count at emit time), so keying `ReplayEnd` into the turn
+    /// ledger would steal the live turn's finalize slot and wedge it
+    /// ("thinking" forever after resume). This flag settles the replayed prefix
+    /// exactly once without consuming a turn key. Reset by `reset_for_replay`.
+    replay_prefix_finalized: bool,
+    /// Set once this session has observed a real forwarded `TurnEnded` in the
+    /// canonical `AgentEvent` stream (the per-session `has_forwarded_turn_ended
+    /// _in_stream` gate, spec §9). While `false` the legacy inference is the
+    /// SOLE driver of transcript mutation + finalize and the `Agent` arm is
+    /// diagnostic-only; once `true` the `AgentEvent` reducer drives mutation
+    /// and the idempotent ledger neutralises the still-live inference. Reset
+    /// to `false` on `reset_for_replay` so a logless reconnect falls back to
+    /// inference until the new channel forwards its first boundary.
+    agent_stream_authoritative: bool,
     /// Background polling task that drains the ACP channel into the editor
     /// every ~50ms. Held only so that dropping `AgentState` (e.g. on
     /// `back_to_doc`) cancels the task. The leading `_` mutes unused-field
@@ -5515,6 +5571,10 @@ impl AgentState {
             server_managed: true,
             reconciler: sketch::agent_transcript::UserTurnReconciler::new(),
             user_turn_ks: std::collections::HashSet::new(),
+            generation: 0,
+            finalized: std::collections::HashSet::new(),
+            replay_prefix_finalized: false,
+            agent_stream_authoritative: false,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         }
@@ -5558,6 +5618,10 @@ impl AgentState {
             server_managed: true,
             reconciler: sketch::agent_transcript::UserTurnReconciler::new(),
             user_turn_ks: std::collections::HashSet::new(),
+            generation: 0,
+            finalized: std::collections::HashSet::new(),
+            replay_prefix_finalized: false,
+            agent_stream_authoritative: false,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         };
@@ -5774,6 +5838,48 @@ impl AgentState {
         self.replay_turns.finish_replay();
     }
 
+    /// Idempotent turn finalize keyed on `(generation, turn)` (spec §7/H5).
+    ///
+    /// The newline-guard `finalize_agent_turn(editor)` is itself idempotent on
+    /// the buffer (it only appends a `\n` when one is missing), but the PHASE
+    /// transition (`turn_phase = Idle`) and any future per-turn side effect are
+    /// NOT — and during the §9 additive rollout a turn boundary can arrive
+    /// TWICE (the forwarded `AgentEvent::TurnEnded` AND the still-live
+    /// inference). This ledger collapses both into exactly one finalize: the
+    /// second call for the same `(generation, turn)` is a no-op. Returns
+    /// whether this call actually finalized (the first time for the pair), so
+    /// callers can gate the phase flip on it.
+    ///
+    /// The caller — NOT this method, and NOT the reducer fold — owns the
+    /// `turn_phase = Idle` decision (it is a pump-side concern, spec §7): this
+    /// keeps finalize a pure ledger op and lets the caller flip the phase only
+    /// when a finalize genuinely happened.
+    fn finalize_agent_turn_idem(&mut self, generation: u64, turn: usize) -> bool {
+        if !self.finalized.insert((generation, turn)) {
+            return false; // already finalized this (generation, turn)
+        }
+        finalize_agent_turn(&mut self.editor);
+        true
+    }
+
+    /// Settle the replayed history prefix exactly once on `ReplayEnd`, WITHOUT
+    /// consuming a per-turn `(generation, turn)` ledger slot. The `ReplayEnd`
+    /// marker is not a turn boundary and its envelope `turn` aliases the next
+    /// live turn's index, so it must NOT route through `finalize_agent_turn_idem`
+    /// (that would pre-occupy the live turn's key and wedge its finalize). Like
+    /// the turn ledger this applies the buffer-idempotent newline guard; the
+    /// boolean exists only to keep the phase flip a one-shot. Returns whether
+    /// this call actually settled (the first `ReplayEnd` of this generation), so
+    /// the caller can gate the phase flip on it. Reset by `reset_for_replay`.
+    fn finalize_replay_prefix(&mut self) -> bool {
+        if self.replay_prefix_finalized {
+            return false;
+        }
+        self.replay_prefix_finalized = true;
+        finalize_agent_turn(&mut self.editor);
+        true
+    }
+
     /// Reset all transcript-derived state to the empty baseline so that a
     /// server re-attach — which replays the session's full `event_log` — can
     /// rebuild the transcript from scratch without duplicating what's already
@@ -5798,6 +5904,18 @@ impl AgentState {
         // reset runs inside the reconnect update before re-attach.
         self.reconciler.reset();
         self.user_turn_ks.clear();
+        // A fresh generation re-numbers turns from 1 and discards the finalize
+        // ledger (spec §4/§7): a (gen, turn) that finalized in the OLD channel
+        // must not suppress the SAME (gen, turn) replayed in the new one. The
+        // `generation` field is NOT reset here — the uniform rebaseline rule
+        // (`apply_agent_event`) advances it to the bumped value AFTER calling
+        // this, so zeroing it would make the very event that triggered the
+        // reset re-trigger it. `agent_stream_authoritative` IS reset: a logless
+        // reconnect must fall back to inference until the new channel forwards
+        // its first `TurnEnded`.
+        self.finalized.clear();
+        self.replay_prefix_finalized = false;
+        self.agent_stream_authoritative = false;
         self.tools.clear();
         self.block_ranges.clear();
         self.view_model = AgentViewModel::new();
@@ -12267,6 +12385,10 @@ impl SketchGpuiView {
             server_managed: false,
             reconciler: sketch::agent_transcript::UserTurnReconciler::new(),
             user_turn_ks: std::collections::HashSet::new(),
+            generation: 0,
+            finalized: std::collections::HashSet::new(),
+            replay_prefix_finalized: false,
+            agent_stream_authoritative: false,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: Some(pump),
         };
@@ -12781,14 +12903,30 @@ impl SketchGpuiView {
                     }
                     let routed = self.with_server_session_slot(&session_id, |slot| {
                         let claude = &mut slot.state;
+                        // §9 gate: once the canonical `AgentEvent` stream is the
+                        // authoritative driver for this session (it has forwarded
+                        // a real `TurnEnded`), the legacy `ReplyEvent` stream is
+                        // INERT — applying its chunks too would double-render
+                        // (the sharp double-apply risk). The reducer owns the
+                        // transcript from here on.
+                        if claude.agent_stream_authoritative {
+                            return;
+                        }
                         // The server path finalizes on its own `TurnEnded`
                         // notification, but if a `ReplayComplete` marker is
                         // forwarded in the event stream, honor it here too so
                         // the resumed transcript finalizes exactly once
                         // (Finding 13, INV-4).
                         if Self::apply_reply_events(claude, std::mem::take(&mut events)) {
-                            finalize_agent_turn(&mut claude.editor);
-                            claude.turn_phase = TurnPhase::Idle;
+                            // Idempotent finalize keyed on (generation, turn):
+                            // the legacy ReplayComplete and a forwarded
+                            // `AgentEvent` ReplayEnd for the same boundary
+                            // finalize the transcript exactly once.
+                            let gen_ = claude.generation;
+                            let turn = claude.replay_turns.last_seen;
+                            if claude.finalize_agent_turn_idem(gen_, turn) {
+                                claude.turn_phase = TurnPhase::Idle;
+                            }
                         }
                     });
                     if routed && !scrolled_sessions.iter().any(|s| s == &session_id) {
@@ -12796,19 +12934,95 @@ impl SketchGpuiView {
                     }
                     warn_unrouted(routed, &session_id);
                 }
-                // `generation` is carried additively (A.8a) but not yet
-                // consumed here — the GUI still trusts this explicit boundary
-                // by `turn_count`. 8b will bind `generation` to reject a
-                // boundary replayed from a superseded channel.
-                ServerNotification::TurnEnded { session_id, turn_count, generation: _ } => {
+                // Phase-8 Stage C (ADDITIVE, spec §9): the canonical AgentEvent
+                // stream is forwarded ALONGSIDE the legacy ReplyEvent/TurnEnded/
+                // UserPrompt variants. The GUI now folds it through the TOTAL
+                // reducer (`apply_agent_event`) — but to avoid the sharp double-
+                // apply risk (chunks applied from BOTH streams), the per-session
+                // `has_forwarded_turn_ended_in_stream` gate
+                // (`agent_stream_authoritative`) picks exactly ONE driver:
+                //   - until the session's FIRST forwarded `TurnEnded`, the
+                //     legacy `ReplyEvent`/inference path drives the transcript
+                //     and the reducer runs only to OBSERVE the boundary (which
+                //     flips the gate) — it makes no transcript mutation that the
+                //     legacy stream also makes, except the idempotent finalize;
+                //   - once authoritative, the reducer drives mutation and the
+                //     legacy `ReplyEvent` arm goes inert for this session (see
+                //     the guard there). The still-live inference is neutralised
+                //     by the idempotent `(generation, turn)` finalize ledger.
+                // NEEDS-RUNTIME: GPUI is not headlessly verifiable end-to-end.
+                ServerNotification::Agent { event } => {
+                    // Drain the contiguous run of Agent events for this session
+                    // (same coalescing as the ReplyEvent run above): one slot
+                    // lookup + one borrow for a streaming burst.
+                    let session_id = event.session_id.clone();
+                    let mut events = vec![event];
+                    while let Some(ServerNotification::Agent { event: next }) = batch.peek() {
+                        if next.session_id != session_id {
+                            break;
+                        }
+                        match batch.next() {
+                            Some(ServerNotification::Agent { event }) => events.push(event),
+                            _ => unreachable!(),
+                        }
+                    }
                     let routed = self.with_server_session_slot(&session_id, |slot| {
                         let claude = &mut slot.state;
-                        finalize_agent_turn(&mut claude.editor);
+                        for event in &events {
+                            // BEFORE the gate flips, the reducer would race the
+                            // legacy stream and double-apply mutating events, so
+                            // we only let it OBSERVE the boundary (which sets
+                            // `agent_stream_authoritative`) and finalize
+                            // idempotently. AFTER it flips, the reducer owns the
+                            // transcript and the legacy ReplyEvent arm is inert.
+                            let authoritative_before = claude.agent_stream_authoritative;
+                            let is_boundary = matches!(
+                                &event.kind,
+                                sketch::agent_event::AgentEventKind::TurnEnded { .. }
+                            );
+                            if authoritative_before || is_boundary {
+                                let effect = Self::apply_agent_event(claude, event);
+                                Self::settle_agent_effect(claude, effect);
+                            }
+                        }
+                    });
+                    if routed && !scrolled_sessions.iter().any(|s| s == &session_id) {
+                        scrolled_sessions.push(session_id.clone());
+                    }
+                    warn_unrouted(routed, &session_id);
+                }
+                // Legacy explicit boundary. During the §9 additive rollout this
+                // coexists with the forwarded `AgentEvent::TurnEnded`; both route
+                // through the idempotent `(generation, turn)` finalize ledger so
+                // the boundary finalizes EXACTLY ONCE regardless of which stream
+                // (or both) delivers it. `generation` is now consumed: the
+                // ledger key matches the reducer's, so a forwarded boundary and
+                // this legacy one for the same channel/turn collapse.
+                ServerNotification::TurnEnded { session_id, turn_count, generation } => {
+                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                        let claude = &mut slot.state;
                         // Turn boundary: clear last-inserted so the next turn's
                         // user echo isn't mistaken for a duplicate of this one.
                         claude.reconciler.note_turn_progressed();
                         claude.replay_turns.last_seen = turn_count;
-                        claude.turn_phase = TurnPhase::Idle;
+                        // The legacy boundary carries the channel generation; if
+                        // the reducer hasn't observed a generation yet (gen 0,
+                        // pre-rebaseline) use the slot's current one so the two
+                        // streams' ledger keys agree.
+                        let gen_ = if generation > 0 { generation } else { claude.generation };
+                        // Bug 3: key the ledger on the SAME basis as the forwarded
+                        // `Agent { TurnEnded }` reducer arm, which uses the 0-based
+                        // envelope `turn` (the server sets `completed_turn =
+                        // turns - 1` at session-server main.rs:1290). The legacy
+                        // `turn_count` is the 1-based SETTLED count, so convert it
+                        // to the 0-based completed-turn index before keying —
+                        // otherwise the forwarded boundary (key `turns-1`) and this
+                        // legacy boundary (key `turns`) are DISTINCT and BOTH
+                        // finalize, defeating the §7/§9 exactly-once backstop.
+                        let completed_turn = turn_count.saturating_sub(1);
+                        if claude.finalize_agent_turn_idem(gen_, completed_turn) {
+                            claude.turn_phase = TurnPhase::Idle;
+                        }
                     });
                     warn_unrouted(routed, &session_id);
                 }
@@ -13054,8 +13268,16 @@ impl SketchGpuiView {
                     claude.replay_turns.last_seen = current_turns;
                 }
                 if turn_ended || replay_complete {
-                    finalize_agent_turn(&mut claude.editor);
-                    claude.turn_phase = TurnPhase::Idle;
+                    // Idempotent finalize keyed on (generation, turn): the
+                    // direct-pump inference and any forwarded `AgentEvent`
+                    // boundary for the same (generation, turn) collapse to one
+                    // finalize. The direct (logless) path has no server-side
+                    // generation, so the slot's current generation keys it.
+                    let gen_ = claude.generation;
+                    let turn = claude.replay_turns.last_seen;
+                    if claude.finalize_agent_turn_idem(gen_, turn) {
+                        claude.turn_phase = TurnPhase::Idle;
+                    }
                 }
                 // Spec §19 auto-scroll. Shares the `follow_tail` decision (F4).
                 // Stale-count pre-pin only; the authoritative reveal with the
@@ -13270,6 +13492,265 @@ impl SketchGpuiView {
             }
         }
         replay_complete
+    }
+
+    /// TOTAL reducer over the canonical [`AgentEventKind`] vocabulary (spec §7).
+    ///
+    /// This is the Stage C end-state of the GUI reducer: one `match` driven once
+    /// per [`AgentEvent`], EXHAUSTIVE over every kind so a new variant is a
+    /// compile error, with EXPLICIT arms for `Unknown` (render nothing + one
+    /// diagnostic, bytes still round-trip through the durable log) and
+    /// `CompactedSummary` (a deterministic "history compacted" placeholder, NOT
+    /// a silent gap). Turn-numbered content is tagged by the FORWARDED
+    /// `event.turn` (spec §5), not by `current_turn()` inference.
+    ///
+    /// ## What it does NOT do
+    ///
+    /// Turn FINALIZATION is a pump-side decision (spec §7) — the fold does NOT
+    /// finalize or flip `turn_phase` inside itself. It returns a
+    /// [`AgentEventEffect`] telling the caller what boundary it observed; the
+    /// caller routes that through the idempotent `finalize_agent_turn_idem`
+    /// ledger and owns the `turn_phase = Idle` flip. This keeps the reducer a
+    /// pure state-fold and the finalize idempotent across the dual streams.
+    ///
+    /// ## Rebaseline (spec §4)
+    ///
+    /// The uniform generation rule lives HERE: any event whose `generation` is
+    /// strictly greater than `claude.generation` runs `reset_for_replay` FIRST,
+    /// then advances `claude.generation`. `ChannelOpened` guarantees the bump
+    /// arrives as the channel's first event, but the rule is idempotent if a
+    /// later event is first-observed (a stray older-generation event after the
+    /// bump is ignored — its `generation < claude.generation`).
+    ///
+    /// ## Additive gate (spec §9)
+    ///
+    /// During rollout this is invoked ONLY for transcript mutation once the
+    /// session is `agent_stream_authoritative` (it has seen a real forwarded
+    /// `TurnEnded`); until then the legacy `ReplyEvent`/inference path is the
+    /// sole driver and the `Agent` stream is observed diagnostically (so chunks
+    /// are never double-applied from both streams). The caller enforces that
+    /// gate; this method assumes it owns the stream when called.
+    fn apply_agent_event(
+        claude: &mut AgentState,
+        event: &sketch::agent_event::AgentEvent,
+    ) -> AgentEventEffect {
+        use sketch::agent_event::{AgentEventKind, ChunkRole, TurnOutcome};
+
+        // ── Uniform rebaseline rule (spec §4) ───────────────────────────────
+        // A strictly-newer generation means a respawned channel; rebuild from
+        // scratch BEFORE applying this (the channel's first) event, then adopt
+        // the new generation. Idempotent: equal/older generations skip it, and
+        // an older-than-current event after a bump is dropped below.
+        if event.generation > claude.generation {
+            claude.reset_for_replay();
+            claude.generation = event.generation;
+        } else if event.generation < claude.generation {
+            // A late straggler from a superseded channel — ignore it so it
+            // can't perturb the rebaselined transcript (spec §4 idempotency).
+            return AgentEventEffect::None;
+        }
+
+        // Any inbound activity refreshes the quiet-clock the thinking indicator
+        // reads, so a streaming turn never looks stalled (parity with
+        // `apply_reply_events`). A no-op when idle.
+        claude.turn_phase.note_event(std::time::Instant::now());
+
+        // The authoritative turn number rides the envelope (spec §5); content
+        // is tagged by it directly, NOT by `current_turn()` inference.
+        let turn = event.turn as usize;
+
+        match &event.kind {
+            AgentEventKind::ChannelOpened { resumed: _ } => {
+                // The rebaseline already ran above (this is the channel's first
+                // event); nothing more to mutate. The status line is owned by
+                // the attach/reconnect path, so this arm is a near-no-op.
+                AgentEventEffect::None
+            }
+            AgentEventKind::Chunk { text, role } => {
+                claude.status = None;
+                match role {
+                    ChunkRole::Message => {
+                        claude
+                            .editor
+                            .append_llm_chunk(TurnId::Llm(turn), text.as_str());
+                    }
+                    ChunkRole::Thought => {
+                        // Thought text un-parks the parked `AgentThoughtChunk`
+                        // path. Until a dedicated thought style ships it shares
+                        // the LLM-turn surface (tagged by the same turn) so the
+                        // reasoning is still attributed to the right turn and
+                        // never silently dropped.
+                        claude
+                            .editor
+                            .append_llm_chunk(TurnId::Llm(turn), text.as_str());
+                    }
+                }
+                AgentEventEffect::None
+            }
+            AgentEventKind::ToolCallStarted(tc) => {
+                let mut tc = tc.clone();
+                cap_tool_call_payloads(&mut tc);
+                let anchor = anchor_for_new_tool_call(&mut claude.editor);
+                let id = ToolCallKey::from_id(&tc.tool_call_id);
+                claude
+                    .editor
+                    .metadata_mut::<TurnId>()
+                    .insert(anchor, TurnId::Tool(turn));
+                claude.tools.register(id, tc, anchor);
+                AgentEventEffect::None
+            }
+            AgentEventKind::ToolCallUpdated(upd) => {
+                let id = ToolCallKey::from_id(&upd.tool_call_id);
+                if let Some(existing) = claude.tools.calls.get_mut(&id) {
+                    existing.update(upd.fields.clone());
+                    cap_tool_call_payloads(existing);
+                } else {
+                    let mut tc = sketch::acp_channel::ToolCall::new(
+                        upd.tool_call_id.clone(),
+                        String::new(),
+                    );
+                    tc.update(upd.fields.clone());
+                    cap_tool_call_payloads(&mut tc);
+                    let anchor = anchor_for_new_tool_call(&mut claude.editor);
+                    claude
+                        .editor
+                        .metadata_mut::<TurnId>()
+                        .insert(anchor, TurnId::Tool(turn));
+                    claude.tools.register(id, tc, anchor);
+                }
+                AgentEventEffect::None
+            }
+            AgentEventKind::PlanUpdated(plan) => {
+                claude.current_plan = Some(plan.clone());
+                AgentEventEffect::None
+            }
+            AgentEventKind::ModeChanged(mode_id) => {
+                claude.agent_mode = Some(mode_id.clone());
+                AgentEventEffect::None
+            }
+            AgentEventKind::UsageUpdated(snap) => {
+                claude.usage = Some(snap.clone());
+                AgentEventEffect::None
+            }
+            AgentEventKind::Notice { kind: _, msg } => {
+                // Transient status ONLY (spec §1): terminal failure is now a
+                // `TurnEnded { Failed }` boundary, not a Notice. Surface inline
+                // + in the footer, exactly as the legacy `Notice` arm did.
+                Self::append_system_notice(claude, msg);
+                claude.status = Some(msg.clone().into());
+                AgentEventEffect::None
+            }
+            AgentEventKind::UserMessage { text } => {
+                // Live submit + replay echo unified. Dedup is by identity
+                // (session, generation, turn) via the reconciler, which already
+                // suppresses our own optimistic insert. Server-managed slots do
+                // not advance the replay boundary (their boundaries arrive as
+                // forwarded `TurnEnded`); a logless direct channel does.
+                let advance = !claude.server_managed;
+                claude.insert_user_turn(
+                    text,
+                    sketch::agent_transcript::UserTurnOrigin::Echo,
+                    advance,
+                );
+                AgentEventEffect::None
+            }
+            AgentEventKind::TurnEnded { outcome } => {
+                // The authoritative boundary (spec §5). Mark the session as
+                // agent-stream-authoritative the first time a real forwarded
+                // boundary lands (the per-session §9 gate), so subsequent
+                // events drive the reducer instead of the inference.
+                claude.agent_stream_authoritative = true;
+                claude.reconciler.note_turn_progressed();
+                match outcome {
+                    TurnOutcome::ReplayEnd => {
+                        // Old `ReplayComplete`: fold the replay cursor back into
+                        // the live counter. The marker is NOT a turn boundary —
+                        // its finalize is settled by the caller through a
+                        // dedicated replay-prefix idempotency, NOT the per-turn
+                        // `(generation, turn)` ledger (whose key it would share
+                        // with the next live turn → stuck-thinking after resume).
+                        claude.finish_replay();
+                        AgentEventEffect::ReplayEnded
+                    }
+                    TurnOutcome::Failed { msg } => {
+                        // Terminal failure surfaces a status line, then ends the
+                        // turn (it is a boundary, not a transient Notice).
+                        claude.status = Some(msg.clone().into());
+                        claude.replay_turns.last_seen = turn;
+                        AgentEventEffect::TurnEnded { generation: event.generation, turn }
+                    }
+                    TurnOutcome::Completed
+                    | TurnOutcome::Cancelled
+                    | TurnOutcome::MaxTokens
+                    | TurnOutcome::Refusal => {
+                        // The live counter follows the forwarded turn so the
+                        // next turn numbers correctly even with inference off.
+                        claude.replay_turns.last_seen = turn;
+                        AgentEventEffect::TurnEnded { generation: event.generation, turn }
+                    }
+                }
+            }
+            AgentEventKind::CompactedSummary { through_turn, summary } => {
+                // EXPLICIT arm (spec §7): the in-memory ring trimmed a prefix
+                // and surfaced this marker instead of a silent gap. Render a
+                // deterministic placeholder so a from-base rebuild shows
+                // "history compacted" rather than starting mid-conversation.
+                let note = if summary.is_empty() {
+                    format!("history compacted through turn {through_turn}")
+                } else {
+                    format!("history compacted through turn {through_turn}: {summary}")
+                };
+                Self::append_system_notice(claude, &note);
+                AgentEventEffect::None
+            }
+            AgentEventKind::Unknown { tag, .. } => {
+                // EXPLICIT arm (spec §7/§8): a variant this GUI version doesn't
+                // understand. Render NOTHING (so an old decoder doesn't show a
+                // broken block) but emit one diagnostic — the bytes still
+                // round-trip verbatim through the durable WAL for a newer node.
+                eprintln!(
+                    "[sketch-gpui] agent-stream: ignoring unknown event kind {tag:?} \
+                     (sid={} gen={} turn={} seq={})",
+                    &event.session_id[..event.session_id.len().min(8)],
+                    event.generation,
+                    event.turn,
+                    event.seq,
+                );
+                AgentEventEffect::None
+            }
+        }
+    }
+
+    /// Apply the pump-side boundary decision an [`AgentEventEffect`] carries
+    /// (spec §7): route a turn boundary through the idempotent
+    /// `finalize_agent_turn_idem` ledger and flip `turn_phase` to `Idle` only
+    /// when a finalize actually happened. This is the SINGLE place the
+    /// `AgentEvent` reducer's finalize lands, so the dual-stream duplicate
+    /// `TurnEnded` (forwarded event + lingering inference) finalizes once.
+    fn settle_agent_effect(claude: &mut AgentState, effect: AgentEventEffect) {
+        match effect {
+            AgentEventEffect::None => {}
+            AgentEventEffect::TurnEnded { generation, turn } => {
+                if claude.finalize_agent_turn_idem(generation, turn) {
+                    claude.turn_phase = TurnPhase::Idle;
+                }
+            }
+            AgentEventEffect::ReplayEnded => {
+                // Replay end settles the replayed prefix exactly once through a
+                // DEDICATED idempotency that does NOT touch the per-turn
+                // `(generation, turn)` ledger: the server stamps the `ReplayEnd`
+                // envelope `turn` with the current settled count, which is the
+                // SAME index the next live turn's `completed_turn` carries, so
+                // keying the turn ledger here would pre-occupy that live turn's
+                // entry and make its `TurnEnded` a no-op → "thinking" forever.
+                // Flip to Idle only if no live turn is in flight (a live submit
+                // during/after replay keeps `Awaiting`).
+                let settled = claude.finalize_replay_prefix();
+                if settled && !claude.turn_phase.is_awaiting() {
+                    claude.turn_phase = TurnPhase::Idle;
+                }
+            }
+        }
     }
 
     /// Wipe the local claude buffer + tool-call state, drop the saved

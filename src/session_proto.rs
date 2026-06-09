@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::acp_channel::{PermissionMode, ReplyEvent};
+use crate::agent_event::AgentEvent;
 
 /// Server-assigned stable session handle (UUID string).
 pub type ServerSessionId = String;
@@ -303,6 +304,13 @@ pub struct AdminSessionInfo {
     pub lease_holder: Option<Lease>,
     pub turns: usize,
     pub event_log_len: usize,
+    /// Lowest logical `seq` still resident in the in-memory `event_log`
+    /// ringbuffer (spec-event-stream §6, phase-8 Stage B). `0` until a
+    /// compaction trim advances it; a non-zero value means earlier events have
+    /// been trimmed from memory (a `CompactedSummary` marker fronts the log).
+    /// `#[serde(default)]` keeps it additive for pre-Stage-B admin clients.
+    #[serde(default)]
+    pub log_base: u64,
     /// Active broadcast receivers = attached connections (owner + observers).
     pub subscriber_count: usize,
     pub channel_generation: u64,
@@ -314,6 +322,18 @@ pub struct AdminSessionInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Notification {
+    /// Canonical agent fact (spec-event-stream §1) — phase 8 Stage A, ADDITIVE.
+    /// Carries an [`AgentEvent`] with its self-attributing identity envelope
+    /// `(session_id, generation, turn, seq)` INSIDE the event (spec §2), so the
+    /// server never grafts identity at its hop. This variant is broadcast and
+    /// WAL-persisted ALONGSIDE the legacy `ReplyEvent` / `TurnEnded` /
+    /// `UserPrompt` variants during the additive rollout (spec §9); the legacy
+    /// variants are deleted only after real-session soak. The GUI reducer folds
+    /// the `Agent` stream while the existing inference still drives finalize,
+    /// with the idempotent `(generation, turn)` guard as backstop.
+    #[serde(rename = "agent")]
+    Agent { event: AgentEvent },
+
     /// Wraps a `ReplyEvent` from the agent. The GUI processes it the same
     /// way it currently processes events from `AcpChannelClient::try_recv`.
     #[serde(rename = "reply_event")]

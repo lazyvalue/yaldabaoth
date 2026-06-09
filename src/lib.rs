@@ -1,4 +1,5 @@
 pub mod acp_channel;
+pub mod agent_event;
 pub mod agent_transcript;
 pub mod blocks;
 pub mod buffer;
@@ -8,6 +9,7 @@ pub mod config;
 pub mod cursor;
 pub mod document;
 pub mod editor;
+pub mod event_log;
 pub mod file_browser;
 pub mod highlight;
 pub mod keybind;

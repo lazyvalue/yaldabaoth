@@ -60,12 +60,21 @@ enum WalRecord {
     Event(Notification),
 }
 
-/// On-disk WAL format version. Bumped 1→2 for the phase-4 lease migration: the
-/// `OwnerChanged → LeaseChanged` wire rename is a breaking schema change, so it
-/// rides this one-time version bump. `recover_one` discards any header whose
-/// version != `WAL_VERSION` (no converter — locked decision), so pre-v2 logs
-/// are dropped and those sessions resume empty (re-load from the agent).
-const WAL_VERSION: u32 = 2;
+/// On-disk WAL format version.
+///
+/// - 1→2: phase-4 lease migration (`OwnerChanged → LeaseChanged` wire rename).
+/// - 2→3: phase-8 Stage A — the `Notification::{ReplyEvent, TurnEnded,
+///   UserPrompt}` + `WorkerEvent::Reply` collapse into `Notification::Agent {
+///   event: AgentEvent }` (spec-event-stream §1). A v3 log may now interleave the
+///   new `agent` records (carrying `turn`/`seq` per-event in the §2 envelope) with
+///   the legacy variants kept for the additive rollout (spec §9).
+///
+/// `recover_one` discards any header whose version != `WAL_VERSION` (no
+/// converter — locked decision), so pre-v3 logs are dropped and those sessions
+/// resume empty (re-load from the agent). This reuses the EXACT phase-4 v1→v2
+/// discard-on-read machinery: the `Header` is always the first record, so the
+/// version gate fires before any incompatible `Event` line reaches serde.
+const WAL_VERSION: u32 = 3;
 
 /// A live write handle to one session's WAL file. The session server's
 /// `ManagedSession` owns exactly one of these and is its only writer.
@@ -235,7 +244,7 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
                 if version != WAL_VERSION {
                     eprintln!(
                         "[session-wal] discarding pre-v{WAL_VERSION} WAL {} (version {version}, \
-                         lease migration); session resumes empty",
+                         AgentEvent collapse); session resumes empty",
                         path.display()
                     );
                     return Ok(None);
@@ -250,16 +259,45 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
         return Ok(None);
     };
 
-    // Re-derive the agent resume id from the last SessionAttached, and the
-    // completed-turn count from TurnEnded events.
+    // Re-derive the agent resume id from the last SessionAttached. KEPT as a
+    // control variant in the collapse (spec §1) precisely so this recovery
+    // dependency survives — folding it into ChannelOpened would lose the id.
     let acp_session_id = event_log.iter().rev().find_map(|n| match n {
         Notification::SessionAttached { acp_session_id, .. } => acp_session_id.clone(),
         _ => None,
     });
-    let turns = event_log
+
+    // Completed-turn count = the durable tip (spec §5). During the additive
+    // rollout (spec §9) a log may carry BOTH legacy `TurnEnded` records AND the
+    // new `Agent { TurnEnded }` records describing the SAME boundaries, so we
+    // take the max of the two interpretations rather than summing (which would
+    // double-count). Legacy: count of `TurnEnded`. Agent: `max(turn)+1` over
+    // `Agent` events whose kind is a real `TurnEnded` (excluding `ReplayEnd`,
+    // which marks the end of a replayed prefix, not a completed live turn).
+    use crate::agent_event::{AgentEventKind, TurnOutcome};
+    let legacy_turns = event_log
         .iter()
         .filter(|n| matches!(n, Notification::TurnEnded { .. }))
         .count();
+    let agent_turns = event_log
+        .iter()
+        .filter_map(|n| match n {
+            Notification::Agent { event } => match &event.kind {
+                AgentEventKind::TurnEnded { outcome }
+                    if !matches!(outcome, TurnOutcome::ReplayEnd) =>
+                {
+                    Some(event.turn)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .max()
+        // `turn` is 0-based in the envelope; a completed turn `k` means `k+1`
+        // turns have settled. `max(turn)+1` is the count.
+        .map(|max_turn| (max_turn + 1) as usize)
+        .unwrap_or(0);
+    let turns = legacy_turns.max(agent_turns);
 
     Ok(Some(RecoveredSession {
         path: path.to_path_buf(),
@@ -394,9 +432,9 @@ mod tests {
 
     #[test]
     fn v1_wal_is_discarded_on_read() {
-        // Hand-write a pre-v2 (version:1) log with a header + a couple events,
-        // including the retired `owner_changed` control line. The v2 reader must
-        // discard the whole file (Ok(None)) and not crash.
+        // Hand-write a pre-v3 (version:1) log with a header + a couple events,
+        // including the retired `owner_changed` control line. The current reader
+        // must discard the whole file (Ok(None)) and not crash.
         let dir = tmp_dir("v1discard");
         std::fs::create_dir_all(&dir).unwrap();
         let path = wal_path(&dir, "old1");
@@ -425,17 +463,139 @@ mod tests {
             "discarded v1 session must be absent from recovery"
         );
 
-        // A fresh v2 create→append→recover round-trip still works afterward.
+        // A fresh v3 create→append→recover round-trip still works afterward.
         {
             let mut wal =
-                SessionWal::create(&dir, "new2", "l", Path::new("/tmp"), PermissionMode::Yolo)
+                SessionWal::create(&dir, "new3", "l", Path::new("/tmp"), PermissionMode::Yolo)
                     .unwrap();
-            wal.append(&attached("acp-v2"), false).unwrap();
+            wal.append(&attached("acp-v3"), false).unwrap();
             wal.append(&turn_ended(1), true).unwrap();
         }
         let recovered = recover_all(&dir);
-        assert_eq!(recovered.len(), 1, "v2 session must recover normally");
-        assert_eq!(recovered[0].server_session_id, "new2");
+        assert_eq!(recovered.len(), 1, "v3 session must recover normally");
+        assert_eq!(recovered[0].server_session_id, "new3");
+    }
+
+    /// Phase-8 Stage A: a pre-v3 (version:2) log — which may carry a legacy
+    /// `reply_event` line that the post-collapse reader still understands but
+    /// whose schema is nonetheless retired — is discarded wholesale by the
+    /// version gate before any Event line is parsed (mirrors `v1_wal_is_...`).
+    #[test]
+    fn v2_wal_is_discarded_on_read() {
+        let dir = tmp_dir("v2discard");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = wal_path(&dir, "old2");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"t":"header","version":2,"server_session_id":"old2","label":"l","cwd":"/tmp","permission_mode":"yolo"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"t":"event","type":"reply_event","session_id":"old2","event":{{"Chunk":"hi"}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let one = recover_one(&path).expect("recover_one must not error on a v2 log");
+        assert!(one.is_none(), "v2 log must be discarded (Ok(None))");
+        assert!(recover_all(&dir).is_empty());
+    }
+
+    /// Phase-8 Stage A: a v3 log persists the `Agent { AgentEvent }` record and
+    /// the `turn`/`seq` ride the envelope verbatim. `turns` derives from the
+    /// agent `TurnEnded` (max(turn)+1), and `acp_session_id` still derives from
+    /// the kept `SessionAttached` control variant.
+    #[test]
+    fn v3_agent_event_round_trips_turn_and_seq() {
+        use crate::agent_event::{AgentEvent, AgentEventKind, ChunkRole, TurnOutcome};
+
+        fn agent(seq: u64, turn: u64, kind: AgentEventKind) -> Notification {
+            Notification::Agent {
+                event: AgentEvent::new("s1".into(), 0, turn, seq, kind),
+            }
+        }
+
+        let dir = tmp_dir("v3agent");
+        {
+            let mut wal =
+                SessionWal::create(&dir, "s1", "l", Path::new("/tmp"), PermissionMode::Yolo)
+                    .unwrap();
+            wal.append(&attached("acp-v3"), false).unwrap();
+            wal.append(
+                &agent(
+                    0,
+                    0,
+                    AgentEventKind::Chunk {
+                        text: "hi".into(),
+                        role: ChunkRole::Message,
+                    },
+                ),
+                false,
+            )
+            .unwrap();
+            wal.append(
+                &agent(
+                    1,
+                    0,
+                    AgentEventKind::TurnEnded {
+                        outcome: TurnOutcome::Completed,
+                    },
+                ),
+                true,
+            )
+            .unwrap();
+        }
+        let recovered = recover_all(&dir);
+        assert_eq!(recovered.len(), 1);
+        let s = &recovered[0];
+        assert_eq!(s.acp_session_id.as_deref(), Some("acp-v3"));
+        // One completed turn at envelope turn 0 ⇒ turns == 1.
+        assert_eq!(s.turns, 1, "turns derive from agent TurnEnded max(turn)+1");
+
+        // The Agent record's envelope survived intact.
+        let agent_ev = s.event_log.iter().find_map(|n| match n {
+            Notification::Agent { event } => Some(event),
+            _ => None,
+        });
+        let ev = agent_ev.expect("an Agent record must survive recovery");
+        assert_eq!(ev.session_id, "s1");
+        assert_eq!(ev.seq, 0); // first Agent record's local seq persisted verbatim
+    }
+
+    /// ReplayEnd is NOT a completed live turn — it must not bump the recovered
+    /// turn count.
+    #[test]
+    fn v3_replay_end_does_not_count_as_turn() {
+        use crate::agent_event::{AgentEvent, AgentEventKind, TurnOutcome};
+        let dir = tmp_dir("v3replayend");
+        {
+            let mut wal =
+                SessionWal::create(&dir, "s1", "l", Path::new("/tmp"), PermissionMode::Yolo)
+                    .unwrap();
+            wal.append(
+                &Notification::Agent {
+                    event: AgentEvent::new(
+                        "s1".into(),
+                        0,
+                        5,
+                        0,
+                        AgentEventKind::TurnEnded {
+                            outcome: TurnOutcome::ReplayEnd,
+                        },
+                    ),
+                },
+                true,
+            )
+            .unwrap();
+        }
+        let recovered = recover_all(&dir);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].turns, 0,
+            "ReplayEnd is a replay-prefix marker, not a completed turn"
+        );
     }
 
     #[test]

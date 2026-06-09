@@ -909,3 +909,801 @@ fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
         assert!(v.agent_mut().unwrap().input_surface.is_chatbox());
     });
 }
+
+// ---- Phase 8 Stage C: AgentEvent TOTAL reducer (NEEDS-RUNTIME) ------------
+//
+// These drive the canonical `AgentEvent` stream through the REAL
+// `apply_server_batch` -> `apply_agent_event` -> `settle_agent_effect` path on a
+// headless view. They cover the spec §7 reducer contract (total match, explicit
+// Unknown / CompactedSummary arms), the §4 generation rebaseline rule, and the
+// §7/H5 idempotent finalize. The events→reducer→VIEW (render) leg is NOT
+// covered (GPUI is not headlessly verifiable end-to-end) — see the worklog's
+// NEEDS-RUNTIME list.
+
+/// Build a `Notification::Agent` for session `sid` with the given envelope+kind.
+#[cfg(test)]
+fn agent_note(
+    sid: &str,
+    generation: u64,
+    turn: u64,
+    seq: u64,
+    kind: sketch::agent_event::AgentEventKind,
+) -> sketch::session_proto::Notification {
+    sketch::session_proto::Notification::Agent {
+        event: sketch::agent_event::AgentEvent::new(sid.into(), generation, turn, seq, kind),
+    }
+}
+
+/// A boot + one bound server-managed slot, ready to feed batches. Returns the
+/// borrowed `VisualTestContext` (lifetime tied to `cx`, like the inline tests).
+#[cfg(test)]
+fn boot_with_bound_slot<'a>(
+    cx: &'a mut TestAppContext,
+    sid: &str,
+) -> (gpui::Entity<SketchGpuiView>, &'a mut gpui::VisualTestContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        SketchGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, vcx, Some(sid));
+    (view, vcx)
+}
+
+/// The end-to-end Stage C reducer: a synthetic AgentEvent sequence drives the
+/// transcript via the TOTAL reducer once the §9 gate flips on the first
+/// forwarded `TurnEnded`. Asserts (a) the gate stays closed until a boundary so
+/// the first turn's chunks are NOT double-applied (legacy stream owns them — but
+/// here no legacy stream runs, so they're simply absent until the gate flips on
+/// the next turn), (b) once authoritative, chunks land tagged by the FORWARDED
+/// `event.turn`, (c) finalize ran (phase Idle) after `TurnEnded`.
+#[gpui::test]
+fn agent_reducer_drives_transcript_after_gate_flips(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Turn 1: ChannelOpened (rebaselines to gen 1), a chunk, then a TurnEnded.
+    // The chunk arrives BEFORE the gate flips, so the reducer must NOT apply it
+    // (the legacy stream would, but there's none here). The TurnEnded flips the
+    // gate and finalizes turn 1.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
+            agent_note(
+                "S1",
+                1,
+                1,
+                1,
+                K::Chunk { text: "pre-gate chunk".into(), role: ChunkRole::Message },
+            ),
+            agent_note("S1", 1, 1, 2, K::TurnEnded { outcome: TurnOutcome::Completed }),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert_eq!(c.generation, 1, "ChannelOpened rebaselined to gen 1");
+        assert!(
+            c.agent_stream_authoritative,
+            "the forwarded TurnEnded must flip the per-session gate"
+        );
+        assert!(
+            !c.editor.document().full_text().contains("pre-gate chunk"),
+            "a pre-gate chunk must NOT be applied by the reducer (legacy stream owns it)"
+        );
+        assert!(
+            matches!(c.turn_phase, crate::TurnPhase::Idle),
+            "TurnEnded finalized turn 1 (phase Idle)"
+        );
+        assert!(
+            c.finalized.contains(&(1, 1)),
+            "the (generation, turn) ledger records the finalized boundary"
+        );
+    });
+
+    // Turn 2: now authoritative — chunks land, tagged by event.turn==2.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            agent_note(
+                "S1",
+                1,
+                2,
+                3,
+                K::Chunk { text: "live turn-2 prose".into(), role: ChunkRole::Message },
+            ),
+            agent_note("S1", 1, 2, 4, K::TurnEnded { outcome: TurnOutcome::Completed }),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        let text = c.editor.document().full_text();
+        assert!(
+            text.contains("live turn-2 prose"),
+            "post-gate chunk must be applied by the reducer; transcript:\n{text}"
+        );
+        // The chunk's line is tagged Llm(2) — sourced from the FORWARDED turn,
+        // not current_turn() inference. Resolve anchors first (immutable), then
+        // read the metadata view.
+        let anchors: Vec<_> = (0..c.editor.document().line_count())
+            .filter_map(|line| c.editor.anchor_for_line_opt(line))
+            .collect();
+        let meta = c.editor.metadata::<crate::TurnId>();
+        let tagged_turn_2 = anchors
+            .iter()
+            .any(|a| matches!(meta.get(*a), Some(crate::TurnId::Llm(2))));
+        assert!(tagged_turn_2, "the turn-2 chunk must be tagged Llm(2) from event.turn");
+        assert!(c.finalized.contains(&(1, 2)), "turn 2 finalized once");
+    });
+}
+
+/// §7/H5 idempotent finalize: delivering `TurnEnded` for the SAME
+/// `(generation, turn)` twice finalizes once — no double trailing newline,
+/// single phase flip. (Models the dual-stream duplicate: a forwarded boundary
+/// plus a lingering inference during additive rollout.)
+#[gpui::test]
+fn agent_reducer_finalize_is_idempotent_on_generation_turn(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Flip the gate + stream a chunk WITHOUT a trailing newline.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
+            agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                1,
+                2,
+                2,
+                K::Chunk { text: "no newline here".into(), role: ChunkRole::Message },
+            ),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    // First TurnEnded for (1,2): finalizes, adds the trailing newline.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 1, 2, 3, K::TurnEnded { outcome: TurnOutcome::Completed })],
+            cx,
+        );
+    });
+    let after_first = active_transcript_text(&view, vcx);
+
+    // SECOND TurnEnded for the SAME (1,2): must be a no-op on the buffer.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 1, 2, 4, K::TurnEnded { outcome: TurnOutcome::Completed })],
+            cx,
+        );
+    });
+    let after_second = active_transcript_text(&view, vcx);
+
+    assert_eq!(
+        after_first, after_second,
+        "a duplicate TurnEnded for the same (generation, turn) must NOT mutate the buffer"
+    );
+    assert_eq!(
+        after_second.matches("no newline here").count(),
+        1,
+        "the chunk text appears exactly once"
+    );
+    // Exactly one trailing newline (the finalize added one; the dup added none).
+    assert!(after_second.ends_with('\n'));
+    assert!(
+        !after_second.ends_with("\n\n"),
+        "idempotent finalize must not append a second trailing newline"
+    );
+}
+
+/// §4 generation rebaseline: a strictly-newer generation wipes the transcript
+/// FIRST, then adopts the new generation; a stray OLDER-generation event after
+/// the bump is ignored.
+#[gpui::test]
+fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Gen 1: authoritative, with content on screen.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
+            agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                1,
+                2,
+                2,
+                K::Chunk { text: "GEN1-CONTENT".into(), role: ChunkRole::Message },
+            ),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+    assert!(active_transcript_text(&view, vcx).contains("GEN1-CONTENT"));
+
+    // Gen 2 ChannelOpened: must reset_for_replay (wipe GEN1-CONTENT) and adopt
+    // gen 2. The gate resets too (a fresh channel), so the gen-2 chunk before
+    // the gen-2 boundary is NOT applied — matching the §9 first-turn rule.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            agent_note("S1", 2, 1, 0, K::ChannelOpened { resumed: true }),
+            agent_note("S1", 2, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                2,
+                2,
+                2,
+                K::Chunk { text: "GEN2-CONTENT".into(), role: ChunkRole::Message },
+            ),
+            agent_note("S1", 2, 2, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert_eq!(c.generation, 2, "adopted the newer generation");
+        let text = c.editor.document().full_text();
+        assert!(
+            !text.contains("GEN1-CONTENT"),
+            "the newer generation must wipe the old transcript; got:\n{text}"
+        );
+        assert!(text.contains("GEN2-CONTENT"), "gen-2 content rebuilt");
+    });
+
+    // A stray OLDER-generation (gen 1) event after the bump is ignored.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note(
+                "S1",
+                1,
+                9,
+                99,
+                K::Chunk { text: "STRAY-OLD-GEN".into(), role: ChunkRole::Message },
+            )],
+            cx,
+        );
+    });
+    assert!(
+        !active_transcript_text(&view, vcx).contains("STRAY-OLD-GEN"),
+        "an event from a superseded (older) generation must be ignored"
+    );
+}
+
+/// §7/§8 explicit Unknown + CompactedSummary arms: Unknown renders nothing (but
+/// is not an error), CompactedSummary inserts a deterministic placeholder.
+#[gpui::test]
+fn agent_reducer_unknown_and_compacted_summary_arms(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, TurnOutcome};
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Flip the gate so the reducer drives, then feed CompactedSummary + Unknown.
+    view.update(vcx, |v, cx| {
+        let unknown = K::Unknown {
+            tag: "speculative_decode".into(),
+            raw: serde_json::json!({"kind":"speculative_decode","tokens":128}),
+        };
+        let batch = vec![
+            agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
+            agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            agent_note(
+                "S1",
+                1,
+                2,
+                2,
+                K::CompactedSummary { through_turn: 5, summary: "earlier work".into() },
+            ),
+            agent_note("S1", 1, 2, 3, unknown),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    let text = active_transcript_text(&view, vcx);
+    assert!(
+        text.contains("history compacted through turn 5"),
+        "CompactedSummary must surface a deterministic placeholder; got:\n{text}"
+    );
+    assert!(text.contains("earlier work"), "the summary text is included");
+    assert!(
+        !text.contains("speculative_decode"),
+        "an Unknown event must render nothing (no broken block)"
+    );
+}
+
+/// §9 no-double-apply guard: with BOTH the legacy `ReplyEvent` stream and the
+/// canonical `Agent` stream carrying the same turn-2 chunk, the gate routes the
+/// chunk through exactly ONE driver — it must appear EXACTLY ONCE.
+#[gpui::test]
+fn agent_reducer_no_double_apply_across_streams(cx: &mut TestAppContext) {
+    use sketch::acp_channel::ReplyEvent;
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use sketch::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Turn 1 boundary flips the gate -> the Agent stream becomes authoritative.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false }),
+                agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            ],
+            cx,
+        );
+    });
+
+    // Turn 2: the SAME chunk arrives on BOTH streams in one batch. The legacy
+    // ReplyEvent arm is now inert (gate is set), the Agent arm applies it once.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            ServerNotification::ReplyEvent {
+                session_id: "S1".into(),
+                event: ReplyEvent::Chunk("DEDUP-ME".into()),
+            },
+            agent_note(
+                "S1",
+                1,
+                2,
+                2,
+                K::Chunk { text: "DEDUP-ME".into(), role: ChunkRole::Message },
+            ),
+            agent_note("S1", 1, 2, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    let text = active_transcript_text(&view, vcx);
+    assert_eq!(
+        text.matches("DEDUP-ME").count(),
+        1,
+        "the chunk must apply from exactly one stream; transcript:\n{text}"
+    );
+}
+
+/// Bug 3: the forwarded `Agent { TurnEnded }` boundary and the legacy
+/// `ServerNotification::TurnEnded` for the SAME (generation, turn) must collapse
+/// to ONE ledger entry, so finalize fires EXACTLY ONCE.
+///
+/// The bug: the legacy arm keyed the idempotent ledger with `turn_count` (1-based
+/// SETTLED count), while the Agent reducer arm keys with the envelope's 0-based
+/// `turn` (the server sets `completed_turn = turns - 1`). So the two streams
+/// inserted DISTINCT keys — `(gen, turns-1)` and `(gen, turns)` — and BOTH
+/// finalized, defeating the §7/§9 exactly-once backstop. It was benign only
+/// because `finalize_agent_turn` happens to be buffer-idempotent; the ledger
+/// itself is the ground truth, so this test asserts on the ledger directly.
+///
+/// FAILS before the fix (ledger holds both `(1,1)` and `(1,2)` → two finalizes);
+/// PASSES after (the legacy arm converts `turn_count - 1`, so both collapse to
+/// `(1,1)` and the second finalize is a no-op).
+#[gpui::test]
+fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, TurnOutcome};
+    use sketch::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Rebaseline to generation 1 so both streams share the same generation key.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 1, 0, 0, K::ChannelOpened { resumed: false })],
+            cx,
+        );
+    });
+
+    // The FORWARDED boundary for turn 1: envelope `turn` is 0-based, so the
+    // server emits `turn = 1` for the SECOND completed turn (settled count 2).
+    // It finalizes the ledger key (generation 1, turn 1).
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 1, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed })],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert!(
+            c.finalized.contains(&(1, 1)),
+            "forwarded TurnEnded must finalize the 0-based (generation 1, turn 1) key; \
+             ledger={:?}",
+            c.finalized
+        );
+    });
+
+    // The LEGACY boundary for the SAME turn: `turn_count` is the 1-based settled
+    // count, so it is 2 for the turn whose 0-based index is 1. With the fix the
+    // legacy arm converts `turn_count - 1 == 1`, hitting the SAME ledger key, so
+    // the second finalize is a no-op. With the BUG it would key `(1, 2)` — a
+    // DISTINCT entry — and finalize a second time.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::TurnEnded {
+                session_id: "S1".into(),
+                turn_count: 2,
+                generation: 1,
+            }],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        // The forwarded and legacy boundaries collapsed to a SINGLE ledger entry.
+        assert!(
+            c.finalized.contains(&(1, 1)),
+            "the shared 0-based key must be present; ledger={:?}",
+            c.finalized
+        );
+        assert!(
+            !c.finalized.contains(&(1, 2)),
+            "BUG 3: the legacy boundary must NOT key a DISTINCT 1-based entry — that \
+             would finalize a second time for the same turn; ledger={:?}",
+            c.finalized
+        );
+        // Exactly one ledger entry for this (generation, turn) boundary: the two
+        // streams deduped to one finalize.
+        let entries_for_turn = c.finalized.iter().filter(|(g, _)| *g == 1).count();
+        assert_eq!(
+            entries_for_turn, 1,
+            "the forwarded + legacy TurnEnded for one (generation, turn) must collapse to \
+             ONE ledger entry (exactly-once finalize); ledger={:?}",
+            c.finalized
+        );
+    });
+}
+
+/// LIVE-TURN-AFTER-REPLAY (the phase-8 runtime "stuck thinking" bug),
+/// SUBMIT-AFTER-REPLAY ordering — the user types only once replay has fully
+/// completed and the phase has already returned to Idle.
+///
+/// Reproduces the real symptom at the fold level: resume a server-managed
+/// session (a daemon restart / re-attach replays the full `event_log` at
+/// generation 0), then send a fresh LIVE prompt. The replayed stream ends with
+/// `TurnOutcome::ReplayEnd`, which flips `agent_stream_authoritative = true`
+/// (the §9 gate) so the legacy `ReplyEvent` path goes inert and the live turn is
+/// supposed to drive entirely through the `AgentEvent` reducer.
+///
+/// The flow modelled (all at generation 0 — a re-attach does NOT respawn, and a
+/// disk-recovered log is at gen 0):
+///   replay: legacy ReplyEvent chunk for turn 0  (gate still closed)
+///           forwarded Agent TurnEnded{Completed, turn 0}  (flips the gate)
+///           forwarded Agent TurnEnded{ReplayEnd}  (no live turn in flight → Idle)
+///   live:   forwarded Agent Chunk{Message, turn 1}
+///           forwarded Agent TurnEnded{Completed, turn 1}
+///
+/// The key the bug turns on: the server stamps the `ReplayEnd` envelope `turn`
+/// with the current settled count, and `finish_replay` folds the replay cursor
+/// into `last_seen`, so `last_seen` ends up EQUAL to the upcoming live turn's
+/// `completed_turn` index (1). The buggy `ReplayEnded` arm keyed the per-turn
+/// ledger on `last_seen`, pre-occupying `(0, 1)` — the LIVE turn's key. To
+/// faithfully reproduce that aliasing the replay cursor must be driven up to the
+/// live index BEFORE `ReplayEnd` (the legacy replay path leaves it there); a
+/// `replay_turn` left at 0 folds `last_seen` to 0 and never collides, which is
+/// why an under-driven version of this test passed even against the bug.
+///
+/// Asserts the live turn (a) folds its message content into the transcript and
+/// (b) FINALIZES — `turn_phase` returns to `Idle` (not stuck "thinking") and the
+/// live `(generation, turn)` lands in the finalize ledger exactly once.
+#[gpui::test]
+fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
+    use sketch::acp_channel::ReplyEvent;
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use sketch::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // ── REPLAY burst (generation 0) ────────────────────────────────────────
+    // Replayed turn 0: the legacy ReplyEvent stream drives the chunk (gate is
+    // still closed), and the forwarded Agent TurnEnded{Completed, turn 0} marks
+    // the boundary — that first forwarded boundary FLIPS the §9 gate.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ServerNotification::ReplyEvent {
+                    session_id: "S1".into(),
+                    event: ReplyEvent::Chunk("replayed turn-0 prose".into()),
+                },
+                agent_note("S1", 0, 0, 0, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            ],
+            cx,
+        );
+    });
+
+    // Drive the replay cursor up to the live turn's index, the way the legacy
+    // replay path leaves it just before `ReplayEnd` (a replayed user boundary
+    // seeds replay_turn = last_seen + 1 = 1). Without this `finish_replay` folds
+    // `last_seen` to 0 and the bug's aliasing never occurs.
+    view.update(vcx, |v, _cx| {
+        v.agent_mut().unwrap().replay_turns.replay_turn = 1;
+    });
+
+    // End of the replayed prefix. `finish_replay` now folds `last_seen` → 1,
+    // which aliases the upcoming live turn's `completed_turn` (1).
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::ReplayEnd })],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert!(
+            c.agent_stream_authoritative,
+            "the forwarded TurnEnded must flip the §9 gate after replay"
+        );
+        assert!(
+            matches!(c.turn_phase, crate::TurnPhase::Idle),
+            "after replay (no live turn in flight) the phase is Idle, not thinking"
+        );
+        assert_eq!(
+            c.replay_turns.last_seen, 1,
+            "finish_replay folded the cursor to the live turn's index (the aliasing \
+             precondition the bug needs)"
+        );
+        assert!(
+            !c.finalized.contains(&(0, 1)),
+            "ReplayEnd must NOT pre-occupy the live turn's (0, 1) key; ledger={:?}",
+            c.finalized
+        );
+    });
+
+    // ── LIVE turn after replay ─────────────────────────────────────────────
+    // The user submits a fresh prompt: the turn begins (thinking indicator on),
+    // then the live content + boundary stream through the now-authoritative
+    // reducer. envelope turn == 1 (settled count 2 -> completed_turn 1).
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
+    });
+
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note(
+                    "S1",
+                    0,
+                    1,
+                    2,
+                    K::Chunk { text: "LIVE-AFTER-REPLAY".into(), role: ChunkRole::Message },
+                ),
+                agent_note("S1", 0, 1, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            ],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        let text = c.editor.document().full_text();
+        assert!(
+            text.contains("LIVE-AFTER-REPLAY"),
+            "the live turn's message content must fold into the transcript; \
+             transcript:\n{text}"
+        );
+        assert!(
+            matches!(c.turn_phase, crate::TurnPhase::Idle),
+            "BUG: the live turn must FINALIZE — turn_phase back to Idle, not stuck \
+             'thinking'; phase={:?}",
+            c.turn_phase
+        );
+        assert!(
+            c.finalized.contains(&(0, 1)),
+            "the live (generation 0, turn 1) boundary must finalize exactly once; \
+             ledger={:?}",
+            c.finalized
+        );
+    });
+}
+
+/// LIVE-TURN-AFTER-REPLAY across a MULTI-TURN replayed prefix (two replayed
+/// turns, then a live turn). Confirms the aliasing holds at a higher turn index
+/// and that the replayed turn boundaries' OWN ledger keys stay distinct from
+/// both the ReplayEnd settle and the live turn's finalize.
+///
+/// Replay turns 0 and 1 each finalize their own boundary keys `(0, 0)`/`(0, 1)`.
+/// `finish_replay` folds the cursor to 2 — which aliases the upcoming live
+/// turn's `completed_turn` (settled count 3 → 2). The buggy `ReplayEnded` arm
+/// keyed the per-turn ledger on that folded `last_seen` (2), pre-occupying the
+/// LIVE turn's `(0, 2)` key so its `TurnEnded` no-op'd and `turn_phase` never
+/// returned to Idle → STUCK THINKING.
+///
+/// As with the single-turn case, the replay cursor must be driven up to the live
+/// index before `ReplayEnd` — an under-driven cursor folds `last_seen` low and
+/// never collides, so the test would pass even against the bug.
+#[gpui::test]
+fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Replay two completed turns (0 and 1). Each is applied via the boundary
+    // observe-path and finalizes its OWN key; the first flips the gate.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note("S1", 0, 0, 0, K::TurnEnded { outcome: TurnOutcome::Completed }),
+                agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            ],
+            cx,
+        );
+    });
+
+    // Drive the replay cursor to the upcoming live turn's index (2), the way the
+    // legacy replay path leaves it after two replayed user boundaries.
+    view.update(vcx, |v, _cx| {
+        v.agent_mut().unwrap().replay_turns.replay_turn = 2;
+    });
+
+    // ReplayEnd: `finish_replay` folds `last_seen` → 2, aliasing the live turn.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 0, 2, 2, K::TurnEnded { outcome: TurnOutcome::ReplayEnd })],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert!(c.agent_stream_authoritative, "gate flipped after replay");
+        assert!(c.finalized.contains(&(0, 0)), "replayed turn 0 finalized its own key");
+        assert!(c.finalized.contains(&(0, 1)), "replayed turn 1 finalized its own key");
+        assert_eq!(
+            c.replay_turns.last_seen, 2,
+            "finish_replay folded the cursor to the live turn's index"
+        );
+        assert!(
+            !c.finalized.contains(&(0, 2)),
+            "ReplayEnd must NOT pre-occupy the live turn's (0, 2) key; ledger={:?}",
+            c.finalized
+        );
+    });
+
+    // Live turn 2: begin (thinking), stream content, end. Stamped turn 2.
+    view.update(vcx, |v, _cx| {
+        v.agent_mut().unwrap().turn_phase =
+            crate::TurnPhase::begin(std::time::Instant::now());
+    });
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note(
+                    "S1",
+                    0,
+                    2,
+                    3,
+                    K::Chunk { text: "LIVE-PROSE".into(), role: ChunkRole::Message },
+                ),
+                agent_note("S1", 0, 2, 4, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            ],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        let text = c.editor.document().full_text();
+        assert!(text.contains("LIVE-PROSE"), "live content folded; transcript:\n{text}");
+        assert!(
+            matches!(c.turn_phase, crate::TurnPhase::Idle),
+            "live turn after multi-turn replay must finalize (Idle), not stay thinking; \
+             phase={:?}",
+            c.turn_phase
+        );
+        assert!(
+            c.finalized.contains(&(0, 2)),
+            "live turn 2 finalized its own ledger key; ledger={:?}",
+            c.finalized
+        );
+    });
+}
+
+/// LIVE-TURN-AFTER-REPLAY — the STUCK-THINKING root cause (suspect b, ReplayEnd
+/// finalize pre-occupies the live turn's ledger key).
+///
+/// Models the real ordering where the user submits the live prompt while replay
+/// is still finishing (or the `ReplayEnd` marker simply trails the live submit):
+///
+///   1. replayed turn 0 boundary  -> finalizes (0, 0), last_seen = 0
+///   2. USER SUBMITS  -> turn_phase = Awaiting (thinking); next live turn is 1
+///   3. ReplayEnd (envelope turn 1)  -> `settle` finalizes (gen, replay_turns
+///      .last_seen). After `finish_replay`, last_seen has been folded to the
+///      replay cursor, which is the SAME index the live turn will carry.
+///   4. live Chunk (turn 1)  -> folds content
+///   5. live TurnEnded{Completed, turn 1}  -> `settle` finalizes (gen, 1)
+///
+/// BUG: step 3 finalizes the live turn's key (gen, 1) ahead of step 5, so step 5
+/// is an idempotent no-op and never flips `turn_phase` back to Idle — the live
+/// turn renders its content but the "thinking" indicator never clears.
+///
+/// FAILS before the fix (turn_phase stuck Awaiting); PASSES after (ReplayEnd
+/// finalizes its OWN envelope turn, leaving the live turn's key free).
+#[gpui::test]
+fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppContext) {
+    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    // Step 1: replayed turn 0 completes. Note last_seen advances to 0.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 0, 0, 0, K::TurnEnded { outcome: TurnOutcome::Completed })],
+            cx,
+        );
+    });
+
+    // Step 2: the user submits a live prompt mid-resume → turn begins (thinking).
+    // Drive `replay_turns` so the replay cursor lands on the live turn index, the
+    // way the legacy replay path leaves it just before `ReplayEnd` (a replayed
+    // user boundary seeds replay_turn = last_seen + 1 = 1).
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        c.replay_turns.replay_turn = 1; // pending replayed boundary for turn 1
+        c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
+    });
+
+    // Step 3: ReplayEnd arrives (envelope turn 1). A live turn is in flight, so it
+    // must NOT flip to Idle — and it must NOT finalize the live turn's key.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 0, 1, 1, K::TurnEnded { outcome: TurnOutcome::ReplayEnd })],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        assert!(
+            c.turn_phase.is_awaiting(),
+            "ReplayEnd with a live turn in flight must keep the phase Awaiting"
+        );
+        assert!(
+            !c.finalized.contains(&(0, 1)),
+            "BUG: ReplayEnd must NOT finalize the live turn's (0, 1) key ahead of the \
+             live TurnEnded — that pre-occupies the ledger and wedges the live finalize; \
+             ledger={:?}",
+            c.finalized
+        );
+    });
+
+    // Step 4 + 5: the live turn streams its content and ends (envelope turn 1).
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                agent_note(
+                    "S1",
+                    0,
+                    1,
+                    2,
+                    K::Chunk { text: "LIVE-MID-RESUME".into(), role: ChunkRole::Message },
+                ),
+                agent_note("S1", 0, 1, 3, K::TurnEnded { outcome: TurnOutcome::Completed }),
+            ],
+            cx,
+        );
+    });
+
+    view.update(vcx, |v, _cx| {
+        let c = v.agent_mut().unwrap();
+        let text = c.editor.document().full_text();
+        assert!(text.contains("LIVE-MID-RESUME"), "live content folded; transcript:\n{text}");
+        assert!(
+            matches!(c.turn_phase, crate::TurnPhase::Idle),
+            "STUCK-THINKING BUG: the live turn after replay must finalize (Idle), not stay \
+             Awaiting forever; phase={:?}",
+            c.turn_phase
+        );
+    });
+}
