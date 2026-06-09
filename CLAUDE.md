@@ -124,8 +124,7 @@ renderer to a JSON-lines log:
 
 ```
 SKETCH_DEBUG=1 sketch <file>
-tail -f ~/Library/Caches/sketch/debug.log | jq .   # macOS
-tail -f ~/.cache/sketch/debug.log | jq .           # Linux
+tail -f ~/.sketch/debug.log | jq .   # all platforms (durable home, ADR-0018)
 ```
 
 Each line records terminal size, computed vs. actual content-area height,

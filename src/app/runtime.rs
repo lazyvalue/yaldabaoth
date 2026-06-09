@@ -11,12 +11,12 @@ use sketch::view::{self, ViewMode, ViewState};
 use super::{App, AppMode, AppScreen};
 
 impl App {
-    /// When SKETCH_DEBUG=1, append one line of JSON to ~/.cache/sketch/debug.log
+    /// When SKETCH_DEBUG=1, append one line of JSON to ~/.sketch/debug.log
     /// for routine frames (1-in-5) plus EVERY frame where the cursor was off
     /// screen, plus EVERY frame where off-screen status flipped. Use to chase
     /// viewport mismatches:
     ///
-    ///   tail -f ~/.cache/sketch/debug.log | jq .
+    ///   tail -f ~/.sketch/debug.log | jq .
     ///
     /// Compare `cursor_screen_y` (where it was painted, or null = off-screen)
     /// against `expected_cursor_visual_row + content_area_y`.
@@ -104,8 +104,8 @@ impl App {
             buf.editor.lockable_through_line(),
         );
         // Best-effort write; never panic during render.
-        let log_path = match dirs::cache_dir() {
-            Some(d) => d.join("sketch").join("debug.log"),
+        let log_path = match sketch::paths::sketch_home() {
+            Some(d) => d.join("debug.log"),
             None => return,
         };
         if let Some(parent) = log_path.parent() {

@@ -172,7 +172,7 @@ Methods (all SHIPPED): `active`, `active_mut`, `next`, `prev`, `push`, `close_ac
 }
 ```
 
-- Path: `~/.cache/sketch/acp_sessions.json` (unchanged).
+- Path: `~/.sketch/acp_sessions.json` (unchanged).
 - Order: list order is the ring slot order; preserved across reboot.
 - `active` is a single optional flag on one entry. If no entry has `active: true`, the loader picks slot 0; if multiple entries have it, the loader picks the first one with the flag set (manual editing artifact — saver only ever writes one).
 - Slots without a session id (e.g., detached, never-attached) are not written. Persistence captures resumable sessions only.
@@ -217,7 +217,7 @@ The single-session names (`save_persisted_acp_session`, `load_persisted_acp_sess
 
 4. **Sidebar width.** The sidebar is fixed at 20 chars wide. Labels are truncated with `…` if they exceed the available space. The sidebar scrolls vertically when sessions exceed the viewport height. Clicking a session label switches to it; `Ctrl-]`/`Ctrl-[` remain the keyboard-first navigation.
 
-5. **Persistence migration.** The loader handles both old format (bare string) and new format (list of `{id, label, active?}`). The saver always writes the new format. Old sketch versions that read the new format will see a parse error and start a fresh session. With multi-session this means a downgrade silently abandons *all* persisted sessions for that cwd (not just one). Documented downgrade path: manually edit `~/.cache/sketch/acp_sessions.json` to replace the array with a single bare string id for the slot the user wants to keep.
+5. **Persistence migration.** The loader handles both old format (bare string) and new format (list of `{id, label, active?}`). The saver always writes the new format. Old sketch versions that read the new format will see a parse error and start a fresh session. With multi-session this means a downgrade silently abandons *all* persisted sessions for that cwd (not just one). Documented downgrade path: manually edit `~/.sketch/acp_sessions.json` to replace the array with a single bare string id for the slot the user wants to keep.
 
 6. **Restore concurrency.** Each restored slot spawns its `AcpChannelClient` on its own background thread (matches today's per-session attach behavior). With N restored slots, restore produces N concurrent agent subprocess spawns — ~100MB RSS per slot during the restore window. No serialization; the agent SDK handles independent concurrent `session/load` calls already because each subprocess has its own stdio pipe.
 

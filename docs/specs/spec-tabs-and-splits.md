@@ -126,7 +126,7 @@ Buffers follow a hybrid model: file-backed `EditorCore`s live in the global `Wor
 
 ### Persistence
 
-23. **Workspace persistence.** [SHIPPED — every structural mutation triggers a write; focus-change debounce is a follow-up] On change, the workspace is serialized to `~/.cache/sketch/workspace.json` keyed by `cwd`. Format:
+23. **Workspace persistence.** [SHIPPED — every structural mutation triggers a write; focus-change debounce is a follow-up] On change, the workspace is serialized to `~/.sketch/workspace.json` keyed by `cwd`. Format:
 
     ```json
     {

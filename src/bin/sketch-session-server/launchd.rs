@@ -36,8 +36,8 @@ pub fn plist_path() -> Option<PathBuf> {
 /// Where the supervised server's stdout/stderr go — the same log the
 /// GUI-auto-launched server uses, so diagnostics land in one place.
 pub fn log_path() -> PathBuf {
-    dirs::cache_dir()
-        .map(|d| d.join("sketch").join("session-server.log"))
+    sketch::paths::sketch_home()
+        .map(|d| d.join("session-server.log"))
         .unwrap_or_else(|| PathBuf::from("/tmp/sketch-session-server.log"))
 }
 
@@ -221,7 +221,7 @@ mod tests {
     fn plist_contains_required_keys() {
         let p = launch_agent_plist(
             Path::new("/Applications/sketch.app/Contents/MacOS/sketch-session-server"),
-            Path::new("/Users/x/Library/Caches/sketch/session-server.log"),
+            Path::new("/Users/x/.sketch/session-server.log"),
         );
         assert!(p.contains("<string>com.sketch.session-server</string>"));
         assert!(p.contains("/Applications/sketch.app/Contents/MacOS/sketch-session-server"));

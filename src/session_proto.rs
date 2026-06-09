@@ -446,24 +446,24 @@ pub fn pid_file_path() -> PathBuf {
 /// Path to the JSON file where the session server persists session metadata
 /// across restarts. When the socket is overridden (tests, alternate
 /// instances) the state file lives next to that socket so instances never
-/// share persistence; otherwise it lives in the cache dir alongside other
-/// sketch state (the default, unchanged).
+/// share persistence; otherwise it lives in the durable sketch home
+/// (`~/.sketch`, ADR-0018) alongside other sketch state.
 pub fn session_server_persist_path() -> Option<PathBuf> {
     if std::env::var_os("SKETCH_SESSION_SOCKET").is_some() {
         return Some(socket_path().with_extension("state.json"));
     }
-    dirs::cache_dir().map(|d| d.join("sketch").join("session_server.json"))
+    crate::paths::sketch_home().map(|d| d.join("session_server.json"))
 }
 
 /// Directory holding the durable per-session write-ahead logs (ADR-0009). Like
 /// [`session_server_persist_path`], it follows `SKETCH_SESSION_SOCKET` so test
 /// and alternate instances never share durable state; otherwise it lives in the
-/// cache dir alongside other sketch state. `None` only if no cache dir exists.
+/// durable sketch home (`~/.sketch`, ADR-0018). `None` only if no home dir exists.
 pub fn session_wal_dir() -> Option<PathBuf> {
     if std::env::var_os("SKETCH_SESSION_SOCKET").is_some() {
         return Some(socket_path().with_extension("wal"));
     }
-    dirs::cache_dir().map(|d| d.join("sketch").join("wal"))
+    crate::paths::sketch_home().map(|d| d.join("wal"))
 }
 
 #[cfg(test)]

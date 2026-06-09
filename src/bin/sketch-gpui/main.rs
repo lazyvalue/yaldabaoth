@@ -1859,16 +1859,16 @@ fn build_line_content(
 /// next to `debug.log` so all sketch-managed transient state stays in one
 /// place.
 fn acp_session_persist_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("sketch").join("acp_sessions.json"))
+    sketch::paths::sketch_home().map(|d| d.join("acp_sessions.json"))
 }
 
 /// Path to the one-line UUID file holding this GUI install's STABLE client id
 /// (spec phase 4). Sibling to `acp_session_persist_path` under
-/// `~/.cache/sketch/`. Chosen over `config.kdl` (this is an implementation
+/// `~/.sketch/`. Chosen over `config.kdl` (this is an implementation
 /// detail, not user-facing) and `preferences.json` (no JSON restructure; `rm`
 /// to reset).
 fn client_id_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("sketch").join("client_id"))
+    sketch::paths::sketch_home().map(|d| d.join("client_id"))
 }
 
 /// Load (or first-time generate) this GUI's stable `client_id`. The lease model
@@ -1995,7 +1995,7 @@ fn connect_session_server() -> Option<SessionServerClient> {
             // Install the stable lease identity (phase 4) right after connect so
             // every attach / heartbeat / gated action carries it. Survives
             // in-place reconnect (the client re-applies it onto the rebuilt
-            // struct) AND app restart (persisted to ~/.cache/sketch/client_id).
+            // struct) AND app restart (persisted to ~/.sketch/client_id).
             client.set_client_id(load_or_create_client_id());
             eprintln!("[sketch-gpui] connected to session server");
             Some(client)
@@ -2115,7 +2115,7 @@ fn shorten_cwd_for_display(cwd: &std::path::Path) -> String {
 /// Path to the JSON file that maps cwd → workspace snapshot (tabs + layout
 /// tree). Companion to acp_sessions.json; cleared by clearing cache_dir.
 fn workspace_persist_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("sketch").join("workspace.json"))
+    sketch::paths::sketch_home().map(|d| d.join("workspace.json"))
 }
 
 /// Path to the JSON file holding app-managed runtime preferences (theme
@@ -2126,7 +2126,7 @@ fn workspace_persist_path() -> Option<PathBuf> {
 /// from the menu, that's what they expect next time, regardless of what
 /// the kdl says.
 fn preferences_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("sketch").join("preferences.json"))
+    sketch::paths::sketch_home().map(|d| d.join("preferences.json"))
 }
 
 /// Where the agent info bar sits relative to the transcript.
@@ -17999,6 +17999,10 @@ fn register_keymap(app: &mut App) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Relocate state written by older builds under <cache_dir>/sketch into the
+    // durable `~/.sketch` home (ADR-0018), BEFORE any persisted state (prefs,
+    // workspace, client_id, acp_sessions) is read. One-time, idempotent.
+    sketch::paths::migrate_legacy_cache_dir();
     let config = sketch::config::Config::load().unwrap_or_default();
     // App-managed preferences override config.kdl's theme — that's where
     // the menu-driven "View → Theme" picks land. Falls back to the kdl

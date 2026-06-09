@@ -2745,6 +2745,11 @@ async fn main() -> io::Result<()> {
         )
         .init();
 
+    // Relocate any state written by older builds under <cache_dir>/sketch into
+    // the durable `~/.sketch` home (ADR-0018), BEFORE the WAL dir is read below.
+    // One-time, idempotent, best-effort.
+    sketch::paths::migrate_legacy_cache_dir();
+
     use clap::Parser;
     // Subcommands manage launchd supervision and exit; no subcommand = run the
     // server (the default path the GUI auto-launches).

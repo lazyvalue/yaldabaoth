@@ -21,7 +21,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOCK="${SKETCH_SESSION_SOCKET:-/tmp/sketch-session-$USER.sock}"
-LOG="${SKETCH_SERVER_LOG:-$HOME/Library/Caches/sketch/session-server.log}"
+LOG="${SKETCH_SERVER_LOG:-$HOME/.sketch/session-server.log}"
 DAEMON_PAT='sketch-session-server$'
 GUI_PAT='sketch-gpui$'
 
@@ -71,7 +71,7 @@ fi
 for _ in $(seq 1 100); do          # up to ~10s (GUI reconnect backoff can be slow)
   pid="$(pgrep -f "$DAEMON_PAT" | head -1 || true)"
   if [ -n "$pid" ] && [ -S "$SOCK" ] && [ "$(exe_path "$pid")" = "$BIN" ]; then
-    n=$(ls "$HOME/Library/Caches/sketch/wal"/*.log 2>/dev/null | wc -l | tr -d ' ')
+    n=$(ls "$HOME/.sketch/wal"/*.log 2>/dev/null | wc -l | tr -d ' ')
     echo "==> up: pid $pid"
     echo "    $BIN listening on $SOCK; $n session WAL(s) replayed."
     exit 0

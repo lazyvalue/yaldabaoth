@@ -147,11 +147,11 @@ impl SessionServerClient {
 
     /// Append-mode log file for the detached server's stdout/stderr, so the
     /// daemon's output survives the terminal that launched the GUI. Lives at
-    /// `<cache>/sketch/session-server.log` (macOS: `~/Library/Caches/...`).
-    /// `None` if the cache dir or file can't be opened (caller falls back to
+    /// `~/.sketch/session-server.log` (the durable sketch home, ADR-0018).
+    /// `None` if the home dir or file can't be opened (caller falls back to
     /// discarding output).
     fn server_log_file() -> Option<std::fs::File> {
-        let path = dirs::cache_dir()?.join("sketch").join("session-server.log");
+        let path = crate::paths::sketch_home()?.join("session-server.log");
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -297,7 +297,7 @@ impl SessionServerClient {
 
     /// Install the stable client identity (spec phase 4). Call once right after
     /// [`connect`](Self::connect) (the GUI loads/creates it from
-    /// `~/.cache/sketch/client_id`). Threaded into every `attach`/`heartbeat`
+    /// `~/.sketch/client_id`). Threaded into every `attach`/`heartbeat`
     /// request and shared with handles so the lease keys on a stable id.
     pub fn set_client_id(&self, id: String) {
         if let Ok(mut g) = self.client_id.lock() {

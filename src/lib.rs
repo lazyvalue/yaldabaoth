@@ -17,6 +17,7 @@ pub mod keys;
 pub mod md_highlight;
 pub mod menu;
 pub mod parse;
+pub mod paths;
 pub mod render;
 pub mod session_client;
 pub mod session_proto;
