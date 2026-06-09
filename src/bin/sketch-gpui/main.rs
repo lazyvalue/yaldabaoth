@@ -73,7 +73,7 @@ mod workspace;
 
 use highlight_cache::{HighlightCache, LineHl};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process;
 use std::rc::Rc;
@@ -100,7 +100,7 @@ use sketch::keys::{Key, KeyPress, Modifiers as KMods};
 use sketch::md_highlight::{
     Segment, highlight_markdown_lines_stripped_syn, highlight_markdown_lines_syn,
 };
-use sketch::menu::{MenuNode, MenuNodeKind, MenuState};
+use sketch::menu::{MenuAction, MenuNode, MenuNodeKind, MenuState};
 use sketch::render;
 use sketch::session_client::SessionServerClient;
 use sketch::session_proto::AttachMode;
@@ -158,6 +158,7 @@ actions!(
         EnterWp,
         OpenAgent,
         OpenMenu,
+        OpenLocalMenu,
         Quit,
         Restart,
         // Buffer cycling
@@ -6257,6 +6258,15 @@ impl AgentRing {
 struct MenuOverlay {
     state: MenuState,
     menu: Vec<MenuNode>,
+    /// Scope tag shown in the overlay header (spec-menu-scopes.md): "MENU"
+    /// for the global leader; "DOC"/"EDIT"/"AGENT"/"BROWSE" for the local one.
+    header: &'static str,
+    /// Leaf focused when the menu was opened — if focus moves while the menu
+    /// is open the overlay dismisses (Behavior 9: no stale dispatch).
+    opened_from: workspace::WindowId,
+    /// Command names disabled in the current context (Behavior 10). Rendered
+    /// dimmed; key presses on them are ignored (menu stays open).
+    disabled: HashSet<String>,
 }
 
 /// Overlay state for the buffer-list picker (TUI: `AppScreen::BufferList`).
@@ -6486,6 +6496,78 @@ fn gpui_menu() -> Vec<MenuNode> {
         ),
         MenuNode::separator(),
         MenuNode::entry("q", "quit", "quit"),
+    ]
+}
+
+// ---- Local menus (spec-menu-scopes.md Behavior 2) --------------------------
+//
+// One static tree per content kind, opened with the `.` local leader. Same
+// overlay machinery as the global menu — only the tree (and header) differ.
+// v1 contains only entries with existing GPUI backing; the spec's nav-*
+// (links/headings/list-items/code-blocks) and browser-open-* entries are
+// deferred until those features exist.
+
+fn doc_local_menu() -> Vec<MenuNode> {
+    vec![
+        MenuNode::entry("e", "edit (raw markdown)", "enter-edit"),
+        MenuNode::entry("w", "edit (word processor)", "enter-wp"),
+        MenuNode::entry("r", "reload from disk", "reload-file"),
+        MenuNode::entry("o", "outline", "rail-outline"),
+        MenuNode::separator(),
+        MenuNode::submenu(
+            "g",
+            "goto",
+            vec![
+                MenuNode::entry("g", "top", "doc-goto-top"),
+                MenuNode::entry("e", "bottom", "doc-goto-bottom"),
+            ],
+        ),
+    ]
+}
+
+fn edit_local_menu() -> Vec<MenuNode> {
+    vec![
+        MenuNode::entry("v", "back to doc view", "back-to-doc"),
+        MenuNode::entry("w", "toggle code/word-processor", "wp-toggle"),
+        MenuNode::entry("r", "reload from disk", "reload-file"),
+        MenuNode::separator(),
+        MenuNode::entry("a", "select all", "select-all"),
+        MenuNode::entry("y", "yank selection", "yank-selection"),
+        MenuNode::entry("d", "delete selection", "delete-selection"),
+        MenuNode::submenu(
+            "e",
+            "edit",
+            vec![
+                MenuNode::entry("v", "extend mode", "toggle-extend-mode"),
+                MenuNode::entry(";", "collapse selection", "collapse-selection"),
+                MenuNode::entry(",", "flip selection", "flip-selection"),
+                MenuNode::entry("x", "extend by line", "extend-line"),
+            ],
+        ),
+    ]
+}
+
+fn agent_local_menu() -> Vec<MenuNode> {
+    vec![
+        MenuNode::entry("n", "new session", "claude-new"),
+        MenuNode::entry("l", "list sessions", "claude-list"),
+        MenuNode::entry("x", "close session", "claude-close"),
+        MenuNode::entry("r", "rename session", "claude-rename"),
+        MenuNode::separator(),
+        MenuNode::entry("w", "toggle worksheet/chatbox", "agent-input-toggle"),
+        MenuNode::entry("s", "send buffer", "claude-send"),
+        MenuNode::entry("d", "detach", "claude-detach"),
+        MenuNode::entry("a", "attach", "claude-attach"),
+        MenuNode::separator(),
+        MenuNode::entry("p", "promote (build candidate)", "dev-build-candidate"),
+    ]
+}
+
+fn browser_local_menu() -> Vec<MenuNode> {
+    vec![
+        MenuNode::entry("s", "cycle sort", "browser-sort"),
+        MenuNode::entry(".", "toggle hidden files", "browser-hidden"),
+        MenuNode::entry("-", "go up", "browser-up"),
     ]
 }
 
@@ -9425,6 +9507,13 @@ impl SketchGpuiView {
             return;
         }
 
+        // Local leader: bare `.` in normal mode opens the Edit local menu
+        // (spec-menu-scopes.md Behavior 3 — insert mode keeps `.` as text).
+        if mode == EditMode::Normal && press.modifiers.is_empty() && press.key == Key::Char('.') {
+            self.open_local_menu_inner(cx);
+            return;
+        }
+
         match mode {
             EditMode::Insert => self.dispatch_insert(press, cx),
             EditMode::Normal => self.dispatch_normal(press, cx),
@@ -9841,6 +9930,9 @@ impl SketchGpuiView {
         if self.overlay_is_menu() {
             return;
         }
+        let Some(opened_from) = self.workspace.focused_window_id() else {
+            return;
+        };
         // Opening the menu dismisses any lingering toast.
         self.transient_status = None;
         let mut state = MenuState::new();
@@ -9848,8 +9940,65 @@ impl SketchGpuiView {
         self.open_overlay(ActiveOverlay::Menu(MenuOverlay {
             state,
             menu: gpui_menu(),
+            header: "MENU",
+            opened_from,
+            disabled: self.global_menu_disabled(),
         }));
         cx.notify();
+    }
+
+    /// Behavior 10: global-menu entries inapplicable to the focused content
+    /// kind are disabled (dimmed, non-dispatching) rather than hidden, so the
+    /// menu layout stays spatially stable.
+    fn global_menu_disabled(&self) -> HashSet<String> {
+        let mut d = HashSet::new();
+        match self.workspace.focused_content() {
+            Some(WindowContent::Agent(_)) | Some(WindowContent::Browser(_)) => {
+                d.insert("reload-file".to_string());
+                d.insert("enter-edit".to_string());
+                d.insert("enter-wp".to_string());
+                d.insert("back-to-doc".to_string());
+            }
+            Some(WindowContent::Doc(_)) => {
+                d.insert("back-to-doc".to_string());
+            }
+            _ => {}
+        }
+        d
+    }
+
+    /// `.` — open the content-kind-specific local menu (spec-menu-scopes.md
+    /// Behavior 2). Same overlay machinery as the global menu; only the tree
+    /// and header differ.
+    fn open_local_menu_inner(&mut self, cx: &mut Context<Self>) {
+        if self.overlay_is_menu() {
+            return;
+        }
+        let Some(opened_from) = self.workspace.focused_window_id() else {
+            return;
+        };
+        let (menu, header) = match self.workspace.focused_content() {
+            Some(WindowContent::Doc(_)) => (doc_local_menu(), "DOC"),
+            Some(WindowContent::Edit(_)) => (edit_local_menu(), "EDIT"),
+            Some(WindowContent::Agent(_)) => (agent_local_menu(), "AGENT"),
+            Some(WindowContent::Browser(_)) => (browser_local_menu(), "BROWSE"),
+            None => return,
+        };
+        self.transient_status = None;
+        let mut state = MenuState::new();
+        state.open();
+        self.open_overlay(ActiveOverlay::Menu(MenuOverlay {
+            state,
+            menu,
+            header,
+            opened_from,
+            disabled: HashSet::new(),
+        }));
+        cx.notify();
+    }
+
+    fn open_local_menu(&mut self, _: &OpenLocalMenu, _w: &mut Window, cx: &mut Context<Self>) {
+        self.open_local_menu_inner(cx);
     }
 
     /// Menu's key handler. Esc pops a level (or closes from root). Any
@@ -9878,7 +10027,21 @@ impl SketchGpuiView {
         // `m.state` (mut) + `&m.menu` (shared) are disjoint fields of one
         // `&mut MenuOverlay`, so the split-borrow type-checks (see menu_mut doc).
         let cmd = match self.menu_mut() {
-            Some(m) => m.state.process_key(press, &m.menu),
+            Some(m) => {
+                // Behavior 10: a key targeting a disabled command is treated
+                // as unrecognized — no dispatch, the menu stays open. Peek
+                // before `process_key` (which would close the menu state).
+                let hits_disabled = m.state.current_nodes(&m.menu).iter().any(|node| {
+                    node.key.len() == 1
+                        && node.key[0] == press
+                        && matches!(&node.action,
+                            MenuAction::Command(name) if m.disabled.contains(name))
+                });
+                if hits_disabled {
+                    return;
+                }
+                m.state.process_key(press, &m.menu)
+            }
             None => return,
         };
         if let Some(name) = cmd {
@@ -10147,6 +10310,45 @@ impl SketchGpuiView {
             "tag-also" => self.open_tag_input(TagInputMode::AlsoTag, cx),
             "tag-send" => self.open_tag_input(TagInputMode::SendTag, cx),
             "tag-bind" => self.open_tag_input(TagInputMode::TagBind, cx),
+            // Local menus (spec-menu-scopes.md)
+            "doc-goto-top" => {
+                if let Some(d) = self.doc_mut() {
+                    d.cursor_block = 0;
+                    d.reveal_block(0);
+                    cx.notify();
+                }
+            }
+            "doc-goto-bottom" => {
+                if let Some(d) = self.doc_mut()
+                    && !d.blocks.is_empty()
+                {
+                    d.cursor_block = d.blocks.len() - 1;
+                    d.reveal_block(d.cursor_block);
+                    cx.notify();
+                }
+            }
+            "wp-toggle" => self.toggle_edit_view(cx),
+            "browser-sort" => {
+                if let Some(b) = self.browser_mut() {
+                    b.fb.cycle_sort();
+                    cx.notify();
+                }
+            }
+            "browser-hidden" => {
+                if let Some(b) = self.browser_mut() {
+                    b.fb.toggle_hidden();
+                    cx.notify();
+                }
+            }
+            "browser-up" => {
+                if let Some(b) = self.browser_mut() {
+                    if b.fb.worktree_mode.is_some() {
+                        return; // no-op in worktree mode
+                    }
+                    b.fb.go_parent();
+                    cx.notify();
+                }
+            }
             "quit" | "force-quit" => cx.quit(),
             _ => {
                 // Unknown command — keep the menu closed but no-op so the
@@ -12099,7 +12301,7 @@ impl SketchGpuiView {
             .h(px(28.0))
             .text_color(label_fg)
             .font_weight(FontWeight::BOLD)
-            .child(format!("MENU — {}", breadcrumb.to_uppercase()));
+            .child(format!("{} — {}", m.header, breadcrumb.to_uppercase()));
 
         let mut entries_col = div()
             .flex()
@@ -12131,11 +12333,18 @@ impl SketchGpuiView {
                     } else {
                         format!(" {}", node.label)
                     };
-                    let label_color = if node.kind() == MenuNodeKind::Submenu {
+                    // Behavior 10: disabled entries render dimmed (key and
+                    // label both in the label color) and don't dispatch.
+                    let is_disabled = matches!(&node.action,
+                        MenuAction::Command(name) if m.disabled.contains(name));
+                    let label_color = if is_disabled {
+                        label_fg
+                    } else if node.kind() == MenuNodeKind::Submenu {
                         submenu_fg
                     } else {
                         label_text_fg
                     };
+                    let entry_key_fg = if is_disabled { label_fg } else { key_fg };
                     div()
                         .flex()
                         .flex_row()
@@ -12144,7 +12353,7 @@ impl SketchGpuiView {
                         .child(
                             div()
                                 .min_w(px(48.0))
-                                .text_color(key_fg)
+                                .text_color(entry_key_fg)
                                 .font_weight(FontWeight::BOLD)
                                 .child(key_display),
                         )
@@ -15583,6 +15792,14 @@ impl SketchGpuiView {
             return;
         }
 
+        // Local leader: bare `.` in NORMAL mode opens the Agent local menu
+        // (spec-menu-scopes.md Behavior 3 — `.` stays a text character in
+        // the compose box / worksheet insert mode).
+        if in_normal && press.modifiers.is_empty() && press.key == Key::Char('.') {
+            self.open_local_menu_inner(cx);
+            return;
+        }
+
         if in_chatbox {
             let outcome = {
                 let claude = match self.agent_mut() {
@@ -15768,6 +15985,15 @@ impl Render for SketchGpuiView {
                     }
                 });
             }
+        }
+
+        // Behavior 9 (spec-menu-scopes.md): if the focused window changed
+        // while a menu was open, dismiss it — stale entries must not
+        // dispatch against the wrong content.
+        if let ActiveOverlay::Menu(m) = &self.active_overlay
+            && self.workspace.focused_window_id() != Some(m.opened_from)
+        {
+            self.clear_overlay();
         }
 
         let has_overlay = self.has_overlay();
@@ -16253,6 +16479,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::enter_wp))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_menu))
+            .on_action(cx.listener(Self::open_local_menu))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::next_buffer))
@@ -18645,7 +18872,7 @@ impl SketchGpuiView {
                     .text_color(nc(ov.label))
                     .text_size(px(11.0))
                     .child(format!(
-                        "enter:open · -:parent · /:filter · .:hidden · s:sort({}) · w:wt · q:close",
+                        "enter:open · -:parent · /:filter · .:menu · s:sort({}) · w:wt · q:close",
                         b.fb.sort_order.label()
                     ))
             };
@@ -18664,6 +18891,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::browser_toggle_hidden))
             .on_action(cx.listener(Self::browser_cycle_sort))
             .on_action(cx.listener(Self::open_menu))
+            .on_action(cx.listener(Self::open_local_menu))
             .on_action(cx.listener(Self::browser_close))
             .on_action(cx.listener(Self::browser_worktrees))
             .on_action(cx.listener(Self::browser_filter))
@@ -19031,6 +19259,10 @@ fn register_keymap(app: &mut App) {
         KeyBinding::new("ctrl-shift-e", EnterWp, Some("SketchView")),
         KeyBinding::new("ctrl-k", OpenAgent, Some("SketchView")),
         KeyBinding::new("space", OpenMenu, Some("SketchView")),
+        // Local leader (spec-menu-scopes.md): `.` opens the content-kind
+        // local menu. Edit/Agent views intercept `.` in their key handlers
+        // instead (insert mode must keep `.` as a text character).
+        KeyBinding::new(".", OpenLocalMenu, Some("SketchView")),
         // Doc-view Esc and bare `q` used to dispatch `Quit` — that
         // made it too easy to lose the app by mashing keys. Quit now
         // lives only on Cmd-Q (the macOS-standard chord). Esc in the
@@ -19143,7 +19375,9 @@ fn register_keymap(app: &mut App) {
         KeyBinding::new("h", BrowserParent, Some("BrowserView")),
         KeyBinding::new("left", BrowserParent, Some("BrowserView")),
         KeyBinding::new("-", BrowserParent, Some("BrowserView")),
-        KeyBinding::new(".", BrowserToggleHidden, Some("BrowserView")),
+        // `.` was BrowserToggleHidden; it's now the local leader
+        // (spec-menu-scopes.md) — toggle-hidden lives in the local menu (`. .`).
+        KeyBinding::new(".", OpenLocalMenu, Some("BrowserView")),
         KeyBinding::new("s", BrowserCycleSort, Some("BrowserView")),
         KeyBinding::new("space", OpenMenu, Some("BrowserView")),
         KeyBinding::new("q", BrowserClose, Some("BrowserView")),
@@ -20422,6 +20656,67 @@ mod tests {
         let cmd = state.process_key(KeyPress::new(Key::Char('q'), KMods::NONE), &menu);
         assert_eq!(cmd, Some("quit".to_string()));
         assert!(!state.is_active(), "menu should close after a leaf select");
+    }
+
+    #[test]
+    fn local_menus_have_no_duplicate_keys_per_level() {
+        // spec-menu-scopes.md: every local menu must be unambiguous — one
+        // key, one entry, at each depth.
+        fn check_level(nodes: &[MenuNode], path: &str) {
+            let mut seen: Vec<&[KeyPress]> = Vec::new();
+            for n in nodes {
+                match &n.action {
+                    sketch::menu::MenuAction::Command(_) | sketch::menu::MenuAction::Submenu(_) => {
+                        assert!(
+                            !seen.contains(&n.key.as_slice()),
+                            "duplicate key {:?} at {path}",
+                            n.key
+                        );
+                        seen.push(&n.key);
+                    }
+                    _ => {}
+                }
+                if let sketch::menu::MenuAction::Submenu(children) = &n.action {
+                    check_level(children, &format!("{path}/{}", n.label));
+                }
+            }
+        }
+        check_level(&doc_local_menu(), "doc");
+        check_level(&edit_local_menu(), "edit");
+        check_level(&agent_local_menu(), "agent");
+        check_level(&browser_local_menu(), "browser");
+    }
+
+    #[test]
+    fn doc_local_menu_g_g_resolves_goto_top() {
+        let mut state = MenuState::new();
+        state.open();
+        let menu = doc_local_menu();
+        let after_g = state.process_key(KeyPress::new(Key::Char('g'), KMods::NONE), &menu);
+        assert_eq!(after_g, None, "g alone should open the goto submenu");
+        let cmd = state.process_key(KeyPress::new(Key::Char('g'), KMods::NONE), &menu);
+        assert_eq!(cmd, Some("doc-goto-top".to_string()));
+    }
+
+    #[test]
+    fn browser_local_menu_dot_resolves_toggle_hidden() {
+        // `.` opens the local menu; `. .` is the relocated toggle-hidden.
+        let mut state = MenuState::new();
+        state.open();
+        let menu = browser_local_menu();
+        let cmd = state.process_key(KeyPress::new(Key::Char('.'), KMods::NONE), &menu);
+        assert_eq!(cmd, Some("browser-hidden".to_string()));
+    }
+
+    #[test]
+    fn edit_local_menu_e_v_resolves_extend_mode() {
+        let mut state = MenuState::new();
+        state.open();
+        let menu = edit_local_menu();
+        let after_e = state.process_key(KeyPress::new(Key::Char('e'), KMods::NONE), &menu);
+        assert_eq!(after_e, None, "e alone should open the edit submenu");
+        let cmd = state.process_key(KeyPress::new(Key::Char('v'), KMods::NONE), &menu);
+        assert_eq!(cmd, Some("toggle-extend-mode".to_string()));
     }
 
     #[test]
