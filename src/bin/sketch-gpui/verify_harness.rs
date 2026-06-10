@@ -395,13 +395,13 @@ fn install_agent_slot(
     vcx: &mut gpui::VisualTestContext,
     server_sid: Option<&str>,
 ) {
-    use crate::{AgentRing, AgentState, WindowContent};
+    use crate::{AgentRing, AgentState, App};
     let sid = server_sid.map(|s| s.to_string());
     view.update(vcx, |v, _cx| {
         let mut ring = AgentRing::new(None);
         let state = AgentState::new_server_managed(None);
         ring.push("claude-1".into(), state, None, PathBuf::from("."), sid);
-        v.set_screen(WindowContent::Agent(ring));
+        v.set_screen(App::Agent(ring));
     });
 }
 

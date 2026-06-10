@@ -16,7 +16,7 @@ fn re_render_one_doc_sources_live_core_not_disk() {
     // Disk holds a single paragraph → exactly one rendered block.
     std::fs::write(&path, "disk only\n").unwrap();
 
-    let mut ws: workspace::Workspace<WindowContent> = workspace::Workspace::new();
+    let mut ws: workspace::Workspace<App> = workspace::Workspace::new();
     let (id, core) = ws.open_and_retain(&path).unwrap();
 
     // A pool-bound Doc, rendered at the disk content (rendered_seq stamped at

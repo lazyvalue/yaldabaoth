@@ -69,7 +69,7 @@ impl SketchGpuiView {
         let weak_view = cx.entity().downgrade();
         let blocks_rc = d.blocks_rc();
 
-        let render_fn = move |idx: usize, _w: &mut Window, _app: &mut App| -> AnyElement {
+        let render_fn = move |idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
             let Some(block) = blocks_rc.get(idx) else {
                 return div().into_any_element();
             };
@@ -487,7 +487,7 @@ impl SketchGpuiView {
         let editor_fg = self.editor_fg();
         let text_size = px(14.0 * self.text_scale);
 
-        let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut App| -> AnyElement {
+        let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
             let line_str = lines_snap.get(line_idx).cloned().unwrap_or_default();
             let mut segs = hl_snap
                 .get(line_idx)
@@ -608,7 +608,7 @@ impl SketchGpuiView {
         let editor_fg = self.editor_fg();
         let text_scale = self.text_scale;
 
-        let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut App| -> AnyElement {
+        let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
             let line_str = lines_snap.get(line_idx).cloned().unwrap_or_default();
             let kind = kinds
                 .get(line_idx)
@@ -967,7 +967,7 @@ impl SketchGpuiView {
 
         let render_fn = {
             let flat_items = flat_items_arc.clone();
-            move |idx: usize, _w: &mut Window, _app: &mut App| -> AnyElement {
+            move |idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
                 let item = &flat_items[idx];
                 match item {
                     FlatItem::Line(line_idx) => {
@@ -1224,7 +1224,7 @@ impl SketchGpuiView {
 
                         if expandable {
                             header_row = header_row.cursor_pointer().on_click(
-                                move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
+                                move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut GpuiApp| {
                                     let id = click_id.clone();
                                     let _ = weak.update(app, |this, cx| {
                                         if let Some(c) = this.agent_mut() {
@@ -1799,7 +1799,7 @@ impl SketchGpuiView {
                     .text_color(stop_fg)
                     .cursor_pointer()
                     .on_click(
-                        move |_ev: &gpui::ClickEvent, window: &mut Window, app: &mut App| {
+                        move |_ev: &gpui::ClickEvent, window: &mut Window, app: &mut GpuiApp| {
                             let _ = weak_stop.update(app, |this, cx| {
                                 this.stop_agent(&StopAgent, window, cx);
                             });
@@ -2073,7 +2073,7 @@ impl SketchGpuiView {
                         .text_color(row_fg)
                         .bg(row_bg)
                         .on_click(
-                            move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
+                            move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut GpuiApp| {
                                 let key = row_key.clone();
                                 let _ = weak.update(app, |this, cx| {
                                     this.focus_subagent(key, cx);

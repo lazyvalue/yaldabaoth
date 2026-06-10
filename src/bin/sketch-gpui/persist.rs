@@ -357,29 +357,41 @@ pub(crate) fn save_preferences(prefs: &Preferences) {
     }
 }
 
-/// Serializable shadow of `WindowContent` for spec-tabs-and-splits.md
-/// Behavior 23. Doc/Edit persist their file path; Browser its current_dir;
-/// Claude its session_id (or `None` if not yet attached). Window-local view
-/// state (scroll, cursor) is intentionally NOT persisted (Constraint §4).
+/// Serializable shadow of `App` for spec-tiles-and-apps.md (ADR-0019).
+///
+/// The tag set is `{buffer{mode}, agent}` (was `{doc, edit, browser, claude}`).
+/// A `Buffer` tile persists its mode (`viewing`/`editing`/`picking`) plus the
+/// payload that mode needs: a file `path` for viewing/editing, a `dir` for
+/// picking. An `Agent` tile persists its session_id (or `None` if not yet
+/// attached). Window-local view state (scroll, cursor) and the `underlying`
+/// stashes are intentionally NOT persisted — no on-disk layout can encode an
+/// agent-behind-picker (B7). There is no schema version field: the load path
+/// (`restore_kind`) already discards an entry that fails to deserialize via
+/// `serde_json::from_value(...).ok()` and falls back to defaults, so a stale
+/// `workspace.json` from an older build silently re-opens at defaults.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "data")]
 pub(crate) enum PersistedKind {
-    Doc {
-        path: PathBuf,
+    /// A Buffer tile in one of its three modes.
+    Buffer {
+        mode: PersistedBufferMode,
     },
-    Edit {
-        path: PathBuf,
-    },
-    Browser {
-        dir: PathBuf,
-    },
-    /// JSON tag stays as "claude" so saved layouts from earlier builds load
-    /// without migration; the in-memory variant is `Agent` to match the rest
-    /// of the rename pass (spec-agent-window.md).
+    /// JSON tag stays as "claude" so the ACP-session side-channel keys line up;
+    /// the in-memory variant is `Agent` to match the rename pass.
     #[serde(rename = "claude")]
     Agent {
         session_id: Option<String>,
     },
+}
+
+/// Persisted shadow of `BufferApp`'s mode (B1). `viewing`/`editing` carry the
+/// file path; `picking` carries the browser's current dir.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub(crate) enum PersistedBufferMode {
+    Viewing { path: PathBuf },
+    Editing { path: PathBuf },
+    Picking { dir: PathBuf },
 }
 
 /// One leaf in a persisted layout. Carries the (stable) window id so
@@ -481,21 +493,27 @@ pub(crate) struct PersistedWorkspace {
     pub(crate) buffer_tags: HashMap<String, Vec<String>>,
 }
 
-/// Snapshot a live `WindowContent` into its persisted shadow. Returns `None`
+/// Snapshot a live `App` into its persisted shadow. Returns `None`
 /// for content kinds that aren't worth persisting (e.g., an unattached
 /// transient state we'd lose nothing by skipping).
-pub(crate) fn snapshot_content(content: &WindowContent) -> PersistedKind {
+pub(crate) fn snapshot_content(content: &App) -> PersistedKind {
     match content {
-        WindowContent::Doc(d) => PersistedKind::Doc {
-            path: PathBuf::from(d.file_label.as_ref()),
+        App::Buffer(BufferApp::Viewing(d)) => PersistedKind::Buffer {
+            mode: PersistedBufferMode::Viewing {
+                path: PathBuf::from(d.file_label.as_ref()),
+            },
         },
-        WindowContent::Edit(e) => PersistedKind::Edit {
-            path: PathBuf::from(e.file_label.as_ref()),
+        App::Buffer(BufferApp::Editing(e)) => PersistedKind::Buffer {
+            mode: PersistedBufferMode::Editing {
+                path: PathBuf::from(e.file_label.as_ref()),
+            },
         },
-        WindowContent::Browser(b) => PersistedKind::Browser {
-            dir: b.fb.current_dir().to_path_buf(),
+        App::Buffer(BufferApp::Picking(b)) => PersistedKind::Buffer {
+            mode: PersistedBufferMode::Picking {
+                dir: b.fb.current_dir().to_path_buf(),
+            },
         },
-        WindowContent::Agent(ring) => {
+        App::Agent(ring) => {
             // Use the active session's id if any. Multi-session restore is
             // handled by the existing ACP persistence path; this is just
             // enough to know "this slot had a Claude session" so on restore
@@ -510,13 +528,15 @@ pub(crate) fn snapshot_content(content: &WindowContent) -> PersistedKind {
     }
 }
 
-/// Snapshot a live `Layout<WindowContent>` into its persisted shadow.
-pub(crate) fn snapshot_layout(layout: &workspace::Layout<WindowContent>) -> PersistedLayout {
+/// Snapshot a live `Layout<App>` into its persisted shadow.
+pub(crate) fn snapshot_layout(layout: &workspace::Layout<App>) -> PersistedLayout {
     match layout {
         workspace::Layout::Empty => PersistedLayout::Leaf(PersistedLeaf {
             id: 0,
-            kind: PersistedKind::Browser {
-                dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            kind: PersistedKind::Buffer {
+                mode: PersistedBufferMode::Picking {
+                    dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                },
             },
         }),
         workspace::Layout::Leaf(win) => PersistedLayout::Leaf(PersistedLeaf {
@@ -586,17 +606,17 @@ pub(crate) fn restore_rail(
     }
 }
 
-/// Reconstruct a persisted layout into live `WindowContent`, opening any
+/// Reconstruct a persisted layout into live `App`, opening any
 /// file-backed leaves through `ws`'s buffer pool so two restored views of the
 /// same file share one core. Returns the live layout plus the max window id
 /// seen (so the caller can advance the id allocator past restored ids).
 /// Returns (layout, max_window_id, agent_leaf_ids).
 pub(crate) fn restore_layout(
-    ws: &mut workspace::Workspace<WindowContent>,
+    ws: &mut workspace::Workspace<App>,
     theme: &Theme,
     layout: PersistedLayout,
 ) -> (
-    workspace::Layout<WindowContent>,
+    workspace::Layout<App>,
     workspace::WindowId,
     Vec<workspace::WindowId>,
 ) {
@@ -637,12 +657,14 @@ pub(crate) fn restore_layout(
 }
 
 pub(crate) fn restore_content(
-    ws: &mut workspace::Workspace<WindowContent>,
+    ws: &mut workspace::Workspace<App>,
     theme: &Theme,
     kind: PersistedKind,
-) -> WindowContent {
+) -> App {
     match kind {
-        PersistedKind::Doc { path } => {
+        PersistedKind::Buffer {
+            mode: PersistedBufferMode::Viewing { path },
+        } => {
             let label: SharedString = path.display().to_string().into();
             // 5c: restore the Doc bound to its pooled core (shared text/undo +
             // live tracking). Fall back to a Browser if the file vanished since
@@ -651,7 +673,7 @@ pub(crate) fn restore_content(
                 Ok((id, core)) => {
                     let blocks =
                         render_with_wiki(&core.borrow().document().full_text(), theme, Some(&path));
-                    WindowContent::Doc(DocState {
+                    App::Buffer(BufferApp::Viewing(DocState {
                         blocks,
                         file_label: label,
                         cursor_block: 0,
@@ -661,52 +683,56 @@ pub(crate) fn restore_content(
                         blocks_snapshot: RefCell::new(None),
                         last_cursor_block: std::cell::Cell::new(None),
                         source: Some(DocSource::new(id, core)),
-                    })
+                    }))
                 }
-                Err(_) => WindowContent::Browser(BrowserWindow::standalone(
+                Err(_) => App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
                     path.parent()
                         .map(|p| p.to_path_buf())
                         .unwrap_or_else(|| PathBuf::from(".")),
-                )),
+                ))),
             }
         }
-        PersistedKind::Edit { path } => {
+        PersistedKind::Buffer {
+            mode: PersistedBufferMode::Editing { path },
+        } => {
             let label: SharedString = path.display().to_string().into();
             // Restore through the pool — a second restored Edit view of the
             // same file binds to the same shared core.
             match ws.open_and_retain(&path) {
-                Ok((id, core)) => WindowContent::Edit(EditState::new(
+                Ok((id, core)) => App::Buffer(BufferApp::Editing(EditState::new(
                     SharedEditor::new(id, core),
                     label,
                     EditView::Code,
-                )),
-                Err(_) => WindowContent::Browser(BrowserWindow::standalone(
+                ))),
+                Err(_) => App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                )),
+                ))),
             }
         }
-        PersistedKind::Browser { dir } => {
+        PersistedKind::Buffer {
+            mode: PersistedBufferMode::Picking { dir },
+        } => {
             let dir = if dir.is_dir() {
                 dir
             } else {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
             };
-            WindowContent::Browser(BrowserWindow::standalone(dir))
+            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(dir)))
         }
         PersistedKind::Agent { .. } => {
             // Claude restore is its own subsystem (acp_sessions.json +
             // open_agent_inner). Replace with a Browser stub here so the
             // tab survives; user can re-attach via the existing Claude
             // commands.
-            WindowContent::Browser(BrowserWindow::standalone(
+            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            ))
+            )))
         }
     }
 }
 
 /// Snapshot a live workspace into a fully serializable shape.
-pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<WindowContent>) -> PersistedWorkspace {
+pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<App>) -> PersistedWorkspace {
     PersistedWorkspace {
         tabs: ws
             .tabs
@@ -751,7 +777,7 @@ pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<WindowContent>) -> Pe
 /// on any I/O / serialization failure (Behavior 23: best-effort + silent).
 pub(crate) fn save_persisted_workspace(
     cwd: &std::path::Path,
-    ws: &workspace::Workspace<WindowContent>,
+    ws: &workspace::Workspace<App>,
 ) {
     let Some(path) = workspace_persist_path() else {
         return;

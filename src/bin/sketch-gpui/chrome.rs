@@ -32,7 +32,7 @@ impl SketchGpuiView {
         // Re-derive the outline rail (if any) once before rendering the tree,
         // so the focused leaf can render it inline without a second pass.
         self.refresh_outline_rail();
-        let layout_ptr: *mut workspace::Layout<WindowContent> =
+        let layout_ptr: *mut workspace::Layout<App> =
             &mut self.workspace.tabs[tab_idx].layout as *mut _;
         // SAFETY: `layout_ptr` is valid for as long as the active tab's
         // `layout` field isn't structurally mutated (no splits/closes/etc.).
@@ -40,7 +40,7 @@ impl SketchGpuiView {
         // and the layout subtree via this pointer; structural mutations
         // happen in action handlers, never inside render. This sidesteps a
         // Rust borrowck limitation where the compiler can't prove that
-        // &mut Layout<WindowContent> (a field inside self.workspace.tabs)
+        // &mut Layout<App> (a field inside self.workspace.tabs)
         // is disjoint from &self.render_X's other field accesses.
         let layout = unsafe { &mut *layout_ptr };
         if self.workspace.tabs[tab_idx].layout_mode == workspace::LayoutMode::Desktop {
@@ -58,7 +58,7 @@ impl SketchGpuiView {
     fn render_desktop(
         &mut self,
         root: gpui::Div,
-        layout: &mut workspace::Layout<WindowContent>,
+        layout: &mut workspace::Layout<App>,
         focused_id: workspace::WindowId,
         attach_focus: bool,
         rail_focusable: bool,
@@ -244,7 +244,7 @@ impl SketchGpuiView {
             let Some(window) = layout.find_leaf_mut(id) else {
                 continue; // stale entry; reconcile drops it next frame
             };
-            let content_ptr: *mut WindowContent = &mut window.content as *mut _;
+            let content_ptr: *mut App = &mut window.content as *mut _;
             // SAFETY: same argument as `render_focused_window` — no
             // structural tree mutation happens during this render pass.
             let content = unsafe { &mut *content_ptr };
@@ -272,12 +272,12 @@ impl SketchGpuiView {
                 base
             };
             let inner: AnyElement = match content {
-                WindowContent::Doc(d) => self.render_doc(leaf_root, d, cx).into_any_element(),
-                WindowContent::Edit(e) => self.render_edit(leaf_root, e, cx).into_any_element(),
-                WindowContent::Browser(b) => {
+                App::Buffer(BufferApp::Viewing(d)) => self.render_doc(leaf_root, d, cx).into_any_element(),
+                App::Buffer(BufferApp::Editing(e)) => self.render_edit(leaf_root, e, cx).into_any_element(),
+                App::Buffer(BufferApp::Picking(b)) => {
                     self.render_browser(leaf_root, b, cx).into_any_element()
                 }
-                WindowContent::Agent(ring) => {
+                App::Agent(ring) => {
                     self.render_agent(leaf_root, ring, cx).into_any_element()
                 }
             };
@@ -371,12 +371,12 @@ impl SketchGpuiView {
     }
 
     /// Title-bar label for a tile.
-    fn desktop_tile_title(content: &WindowContent) -> String {
+    fn desktop_tile_title(content: &App) -> String {
         match content {
-            WindowContent::Doc(d) => d.file_label.to_string(),
-            WindowContent::Edit(e) => e.file_label.to_string(),
-            WindowContent::Browser(_) => "files".to_string(),
-            WindowContent::Agent(ring) => ring
+            App::Buffer(BufferApp::Viewing(d)) => d.file_label.to_string(),
+            App::Buffer(BufferApp::Editing(e)) => e.file_label.to_string(),
+            App::Buffer(BufferApp::Picking(_)) => "files".to_string(),
+            App::Agent(ring) => ring
                 .slots
                 .get(ring.active)
                 .map(|s| s.label.clone())
@@ -504,7 +504,7 @@ impl SketchGpuiView {
         pan.1 = (pan.1 + dy).max(0.0);
     }
 
-    /// Recursively render a `Layout<WindowContent>`. The `root` div is used
+    /// Recursively render a `Layout<App>`. The `root` div is used
     /// only for the leaf case (so leaves can attach focus + key bindings);
     /// split branches build their own container.
     ///
@@ -515,7 +515,7 @@ impl SketchGpuiView {
     pub(crate) fn render_layout(
         &mut self,
         root: gpui::Div,
-        layout: &mut workspace::Layout<WindowContent>,
+        layout: &mut workspace::Layout<App>,
         focused_id: workspace::WindowId,
         attach_focus: bool,
         rail_focusable: bool,
@@ -525,7 +525,7 @@ impl SketchGpuiView {
             workspace::Layout::Empty => div().size_full().into_any_element(),
             workspace::Layout::Leaf(window) => {
                 let is_focused = window.id == focused_id;
-                let content_ptr: *mut WindowContent = &mut window.content as *mut _;
+                let content_ptr: *mut App = &mut window.content as *mut _;
                 // SAFETY: same as in render_focused_window — the leaf's
                 // content sits inside a layout tree we won't structurally
                 // mutate during this render call.
@@ -536,12 +536,12 @@ impl SketchGpuiView {
                     root
                 };
                 let painted: AnyElement = match content {
-                    WindowContent::Doc(d) => self.render_doc(leaf_root, d, cx).into_any_element(),
-                    WindowContent::Edit(e) => self.render_edit(leaf_root, e, cx).into_any_element(),
-                    WindowContent::Browser(b) => {
+                    App::Buffer(BufferApp::Viewing(d)) => self.render_doc(leaf_root, d, cx).into_any_element(),
+                    App::Buffer(BufferApp::Editing(e)) => self.render_edit(leaf_root, e, cx).into_any_element(),
+                    App::Buffer(BufferApp::Picking(b)) => {
                         self.render_browser(leaf_root, b, cx).into_any_element()
                     }
-                    WindowContent::Agent(ring) => {
+                    App::Agent(ring) => {
                         self.render_agent(leaf_root, ring, cx).into_any_element()
                     }
                 };
@@ -922,11 +922,11 @@ impl SketchGpuiView {
         }
         match self.workspace.focused_content() {
             // Edit: edit_seq is the exact monotonic content version.
-            Some(WindowContent::Edit(e)) => e.editor.edit_seq().hash(&mut h),
+            Some(App::Buffer(BufferApp::Editing(e))) => e.editor.edit_seq().hash(&mut h),
             // Doc: blocks only change on load/reload/edit-flush; block count is
             // a cheap proxy (outline is cosmetic, so a same-count content change
             // leaving it briefly stale is acceptable).
-            Some(WindowContent::Doc(d)) => d.blocks.len().hash(&mut h),
+            Some(App::Buffer(BufferApp::Viewing(d))) => d.blocks.len().hash(&mut h),
             // Agent/Browser have no outline; constant so it derives once (empty).
             _ => 0u64.hash(&mut h),
         }
@@ -975,7 +975,7 @@ impl SketchGpuiView {
     /// focused window's content (spec §13).
     pub(crate) fn derive_outline(&self) -> Vec<(u8, String, usize)> {
         match self.workspace.focused_content() {
-            Some(WindowContent::Doc(d)) => {
+            Some(App::Buffer(BufferApp::Viewing(d))) => {
                 let mut out = Vec::new();
                 for (idx, block) in d.blocks.iter().enumerate() {
                     if let RenderedBlock::Heading { level, content } = block {
@@ -984,7 +984,7 @@ impl SketchGpuiView {
                 }
                 out
             }
-            Some(WindowContent::Edit(e)) => {
+            Some(App::Buffer(BufferApp::Editing(e))) => {
                 let text = e.editor.full_text();
                 let mut out = Vec::new();
                 for (line_no, line) in text.lines().enumerate() {

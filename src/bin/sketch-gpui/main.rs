@@ -91,7 +91,8 @@ pub(crate) use std::rc::Rc;
 pub(crate) use std::time::Duration;
 
 pub(crate) use gpui::{
-    AnyElement, App, AppContext, Application, Bounds, Context, Element, ElementId, FocusHandle,
+    AnyElement, App as GpuiApp, AppContext, Application, Bounds, Context, Element, ElementId,
+    FocusHandle,
     Focusable, Font, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hsla,
     InspectorElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
     LayoutId, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
@@ -562,7 +563,7 @@ impl DocState {
 /// content" doesn't carry meaning across process restarts.
 struct BrowserWindow {
     fb: FileBrowser,
-    underlying: Option<Box<WindowContent>>,
+    underlying: Option<Box<App>>,
 }
 
 impl BrowserWindow {
@@ -1105,12 +1106,26 @@ impl EditState {
 }
 
 // wire/event enum — boxing the large variant would ripple through serialization + every match site
+//
+// `App` is the per-Tile content (ADR-0019 / spec-tiles-and-apps.md). A Tile
+// holds exactly one App: a `Buffer` (a view onto the pooled file buffer, in one
+// of three modes — see `BufferApp`) or an `Agent` (the ACP session ring).
 #[allow(clippy::large_enum_variant)]
-enum WindowContent {
-    Doc(DocState),
-    Edit(EditState),
+enum App {
+    Buffer(BufferApp),
     Agent(AgentRing),
-    Browser(BrowserWindow),
+}
+
+/// A view onto the pooled file buffer, always in exactly one mode (B1):
+/// `Picking` (file browser, no file chosen yet), `Viewing` (rendered markdown),
+/// or `Editing` (raw markdown). `Viewing ⇄ Editing` toggle over the same pooled
+/// `SharedCore` (ADR-0007). The `Picking` payload is the existing
+/// `BrowserWindow`; `Viewing` tolerates a source-less `DocState` placeholder.
+#[allow(clippy::large_enum_variant)]
+enum BufferApp {
+    Picking(BrowserWindow),
+    Viewing(DocState),
+    Editing(EditState),
 }
 
 /// Overlay popup that lets the user pick a top-level command by single
@@ -1481,7 +1496,7 @@ struct SketchGpuiView {
     transient_status: Option<SharedString>,
     /// Tabs + n-ary split tree (spec-tabs-and-splits.md). The focused
     /// window's content is the authoritative live state for the workspace.
-    workspace: workspace::Workspace<WindowContent>,
+    workspace: workspace::Workspace<App>,
     /// Active mouse-driven text selection in the doc view. Spans block/line/char.
     /// `None` when nothing is selected. Cleared on Esc, on a fresh MouseDown
     /// without modifier, and when entering edit mode.
@@ -1558,7 +1573,7 @@ impl SketchGpuiView {
         let syntect_hl =
             sketch::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
         let label: SharedString = file_label.into();
-        let initial = WindowContent::Doc(DocState {
+        let initial = App::Buffer(BufferApp::Viewing(DocState {
             blocks,
             file_label: label.clone(),
             cursor_block: 0,
@@ -1568,7 +1583,7 @@ impl SketchGpuiView {
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
             source: None,
-        });
+        }));
         Self {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
@@ -1601,7 +1616,7 @@ impl SketchGpuiView {
     fn new_browser(start_dir: PathBuf, theme: Theme, focus_handle: FocusHandle) -> Self {
         let syntect_hl =
             sketch::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
-        let initial = WindowContent::Browser(BrowserWindow::standalone(start_dir));
+        let initial = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(start_dir)));
         Self {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
@@ -1632,7 +1647,7 @@ impl SketchGpuiView {
     }
 
     /// Replace the focused window's content (old `self.screen = X` writes).
-    fn set_screen(&mut self, content: WindowContent) {
+    fn set_screen(&mut self, content: App) {
         self.workspace.replace_focused_content(content);
     }
 
@@ -1660,7 +1675,7 @@ impl SketchGpuiView {
         let Some(snap) = load_persisted_workspace(&cwd) else {
             return false;
         };
-        let mut ws: workspace::Workspace<WindowContent> = workspace::Workspace::new();
+        let mut ws: workspace::Workspace<App> = workspace::Workspace::new();
         let mut agent_leaf_ids: Vec<workspace::WindowId> = Vec::new();
         for ptab in snap.tabs {
             let (layout, max_id, agents) = restore_layout(&mut ws, &self.theme, ptab.layout);
@@ -1730,7 +1745,7 @@ impl SketchGpuiView {
                 workspace::LayoutMode::Manual | workspace::LayoutMode::Desktop
             ) {
                 // Retile in-place for automatic-mode tabs.
-                let windows: Vec<workspace::Window<WindowContent>> =
+                let windows: Vec<workspace::Window<App>> =
                     workspace::drain_leaves(&mut t.layout);
                 if !windows.is_empty() {
                     let focused = t.focused;
@@ -1782,7 +1797,7 @@ impl SketchGpuiView {
                 // Install the ring, then kick off async attach.
                 for tab in &mut self.workspace.tabs {
                     if let Some(win) = tab.layout.find_leaf_mut(leaf_id) {
-                        win.content = WindowContent::Agent(ring);
+                        win.content = App::Agent(ring);
                         break;
                     }
                 }
@@ -1818,7 +1833,7 @@ impl SketchGpuiView {
                 }
                 for tab in &mut self.workspace.tabs {
                     if let Some(win) = tab.layout.find_leaf_mut(leaf_id) {
-                        win.content = WindowContent::Agent(ring);
+                        win.content = App::Agent(ring);
                         break;
                     }
                 }
@@ -1834,7 +1849,7 @@ impl SketchGpuiView {
             .focused_content_mut()
             .expect("no focused window")
         {
-            WindowContent::Doc(d) => Some(d),
+            App::Buffer(BufferApp::Viewing(d)) => Some(d),
             _ => None,
         }
     }
@@ -1845,7 +1860,7 @@ impl SketchGpuiView {
             .focused_content_mut()
             .expect("no focused window")
         {
-            WindowContent::Browser(b) => Some(b),
+            App::Buffer(BufferApp::Picking(b)) => Some(b),
             _ => None,
         }
     }
@@ -1856,7 +1871,7 @@ impl SketchGpuiView {
             .focused_content_mut()
             .expect("no focused window")
         {
-            WindowContent::Agent(ring) if !ring.is_empty() => Some(&mut ring.active_mut().state),
+            App::Agent(ring) if !ring.is_empty() => Some(&mut ring.active_mut().state),
             _ => None,
         }
     }
@@ -1870,7 +1885,7 @@ impl SketchGpuiView {
 
     fn agent_ring(&self) -> Option<&AgentRing> {
         match self.workspace.focused_content().expect("no focused window") {
-            WindowContent::Agent(ring) => Some(ring),
+            App::Agent(ring) => Some(ring),
             _ => None,
         }
     }
@@ -1881,18 +1896,18 @@ impl SketchGpuiView {
             .focused_content_mut()
             .expect("no focused window")
         {
-            WindowContent::Agent(ring) => Some(ring),
+            App::Agent(ring) => Some(ring),
             _ => None,
         }
     }
 
     /// Open `path` as a doc. If it's already in a tab, switch to that tab.
     /// Otherwise push a new tab containing the doc. Returns false on read error.
-    /// Build a Doc `WindowContent` for `path`, bound to the shared buffer
+    /// Build a Doc `App` for `path`, bound to the shared buffer
     /// pool (5c: dedup by canonical path so Edit views of the same file
     /// share the exact same rope + undo and edits show live in this Doc).
     /// `None` if the file can't be read.
-    fn make_doc_content(&mut self, path: &std::path::Path) -> Option<WindowContent> {
+    fn make_doc_content(&mut self, path: &std::path::Path) -> Option<App> {
         let canon = path
             .canonicalize()
             .unwrap_or_else(|_| path.to_path_buf())
@@ -1910,7 +1925,7 @@ impl SketchGpuiView {
             &self.theme,
             Some(path),
         );
-        Some(WindowContent::Doc(DocState {
+        Some(App::Buffer(BufferApp::Viewing(DocState {
             blocks,
             file_label: canon.into(),
             cursor_block: 0,
@@ -1920,7 +1935,7 @@ impl SketchGpuiView {
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
             source: Some(DocSource::new(buf_id, core)),
-        }))
+        })))
     }
 
     fn open_file(&mut self, path: PathBuf) -> bool {
@@ -1947,7 +1962,7 @@ impl SketchGpuiView {
         // Doc/Edit/Claude, push a new tab so the existing work isn't lost.
         let replace_in_place = matches!(
             self.workspace.focused_content(),
-            Some(WindowContent::Browser(_))
+            Some(App::Buffer(BufferApp::Picking(_)))
         );
         if replace_in_place {
             self.set_screen(new_content);
@@ -1964,8 +1979,8 @@ impl SketchGpuiView {
         for (i, tab) in self.workspace.tabs.iter().enumerate() {
             if let workspace::Layout::Leaf(w) = &tab.layout {
                 match &w.content {
-                    WindowContent::Doc(d) if d.file_label.as_ref() == label => return Some(i),
-                    WindowContent::Edit(e) if e.file_label.as_ref() == label => return Some(i),
+                    App::Buffer(BufferApp::Viewing(d)) if d.file_label.as_ref() == label => return Some(i),
+                    App::Buffer(BufferApp::Editing(e)) if e.file_label.as_ref() == label => return Some(i),
                     _ => {}
                 }
             }
@@ -2111,7 +2126,7 @@ impl SketchGpuiView {
     fn open_browser_inner(&mut self, cx: &mut Context<Self>) {
         if matches!(
             self.workspace.focused_content().expect("no focused window"),
-            WindowContent::Browser(_)
+            App::Buffer(BufferApp::Picking(_))
         ) {
             return;
         }
@@ -2121,17 +2136,17 @@ impl SketchGpuiView {
         // file in this same tile (see `open_file`'s `replace_in_place`
         // branch). This keeps the browser tile-scoped instead of tab-
         // scoped so splits/tabs aren't disrupted by file picking.
-        let placeholder = WindowContent::Browser(BrowserWindow::standalone(
+        let placeholder = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        ));
+        )));
         let prior = self
             .workspace
             .replace_focused_content(placeholder)
             .expect("workspace has no focused window");
-        self.set_screen(WindowContent::Browser(BrowserWindow {
+        self.set_screen(App::Buffer(BufferApp::Picking(BrowserWindow {
             fb: FileBrowser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
             underlying: Some(Box::new(prior)),
-        }));
+        })));
         self.save_workspace_state();
         cx.notify();
     }
@@ -2577,7 +2592,7 @@ impl SketchGpuiView {
         let (start, end) = sel.normalized();
         let content = self.workspace.focused_content()?;
         let blocks = match content {
-            WindowContent::Doc(d) => &d.blocks,
+            App::Buffer(BufferApp::Viewing(d)) => &d.blocks,
             _ => return None,
         };
         let mut out = String::new();
@@ -2647,7 +2662,7 @@ impl SketchGpuiView {
         }
         // Find the active editor + mode. Chatbox takes priority in chatbox mode.
         let pasted = match self.workspace.focused_content_mut() {
-            Some(WindowContent::Edit(e)) => {
+            Some(App::Buffer(BufferApp::Editing(e))) => {
                 if e.mode == EditMode::Insert {
                     for ch in text.chars() {
                         e.editor.insert_char(ch);
@@ -2657,7 +2672,7 @@ impl SketchGpuiView {
                     false
                 }
             }
-            Some(WindowContent::Agent(ring)) => {
+            Some(App::Agent(ring)) => {
                 let c = &mut ring.active_mut().state;
                 if c.input_surface.is_chatbox() {
                     if let Some(cb) = c.input_surface.chatbox_mut() {
@@ -2702,8 +2717,8 @@ impl SketchGpuiView {
         }
         // Edit / Agent views: copy editor selection.
         let text = match self.workspace.focused_content() {
-            Some(WindowContent::Edit(e)) => e.editor.selection_text(),
-            Some(WindowContent::Agent(ring)) => {
+            Some(App::Buffer(BufferApp::Editing(e))) => e.editor.selection_text(),
+            Some(App::Agent(ring)) => {
                 let c = &ring.active().state;
                 if c.input_surface.is_chatbox() {
                     c.input_surface
@@ -2726,7 +2741,7 @@ impl SketchGpuiView {
     /// Drop every live `AcpChannelClient` we hold so its `Drop` impl can
     /// run the explicit teardown (signal worker, join thread, kill child)
     /// before the rest of the GPUI shutdown clears windows. Without this,
-    /// the join races with `App::shutdown` clearing entities; the worker
+    /// the join races with `GpuiApp::shutdown` clearing entities; the worker
     /// usually finishes in time but the order is non-deterministic and
     /// lingering child agents have been observed at exit. Called from
     /// `on_app_quit` in `main`.
@@ -2736,7 +2751,7 @@ impl SketchGpuiView {
         // teardown races with us.
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
-                if let WindowContent::Agent(ring) = content {
+                if let App::Agent(ring) = content {
                     for slot in &mut ring.slots {
                         let _dropped = slot.state.channel.take();
                     }
@@ -2797,9 +2812,9 @@ impl SketchGpuiView {
     /// what to load.
     fn new_tab(&mut self, _: &NewTab, _w: &mut Window, cx: &mut Context<Self>) {
         self.workspace
-            .push_initial_tab(WindowContent::Browser(BrowserWindow::standalone(
+            .push_initial_tab(App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            )));
+            ))));
         self.save_workspace_state();
         cx.notify();
     }
@@ -2867,14 +2882,14 @@ impl SketchGpuiView {
         let _ = self.workspace.split_focused(dir, content);
     }
 
-    fn clone_focused_for_split(&mut self, cwd: &std::path::Path) -> WindowContent {
+    fn clone_focused_for_split(&mut self, cwd: &std::path::Path) -> App {
         let (label, is_edit) = match self.workspace.focused_content() {
-            Some(WindowContent::Doc(d)) => (Some(d.file_label.clone()), false),
-            Some(WindowContent::Edit(e)) => (Some(e.file_label.clone()), true),
+            Some(App::Buffer(BufferApp::Viewing(d))) => (Some(d.file_label.clone()), false),
+            Some(App::Buffer(BufferApp::Editing(e))) => (Some(e.file_label.clone()), true),
             _ => (None, false),
         };
         let browser_fallback =
-            || WindowContent::Browser(BrowserWindow::standalone(cwd.to_path_buf()));
+            || App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.to_path_buf())));
         let Some(label) = label else {
             return browser_fallback();
         };
@@ -2884,11 +2899,11 @@ impl SketchGpuiView {
             // open_and_retain returns the existing buffer id, so unsaved text
             // + undo are shared. Only cursor/scroll/selection are independent.
             match self.workspace.open_and_retain(&path) {
-                Ok((id, core)) => WindowContent::Edit(EditState::new(
+                Ok((id, core)) => App::Buffer(BufferApp::Editing(EditState::new(
                     SharedEditor::new(id, core),
                     label,
                     EditView::Code,
-                )),
+                ))),
                 Err(_) => browser_fallback(),
             }
         } else {
@@ -2902,7 +2917,7 @@ impl SketchGpuiView {
                         &self.theme,
                         Some(&path),
                     );
-                    WindowContent::Doc(DocState {
+                    App::Buffer(BufferApp::Viewing(DocState {
                         blocks,
                         file_label: label,
                         cursor_block: 0,
@@ -2912,7 +2927,7 @@ impl SketchGpuiView {
                         blocks_snapshot: RefCell::new(None),
                         last_cursor_block: std::cell::Cell::new(None),
                         source: Some(DocSource::new(id, core)),
-                    })
+                    }))
                 }
                 Err(_) => browser_fallback(),
             }
@@ -3255,8 +3270,8 @@ impl SketchGpuiView {
     /// Get the FileBufferId for the focused window, if file-backed.
     fn focused_buffer_id(&self) -> Option<workspace::FileBufferId> {
         match self.workspace.focused_content()? {
-            WindowContent::Doc(d) => d.source.as_ref().map(|s| s.buffer_id),
-            WindowContent::Edit(e) => Some(e.editor.buffer_id),
+            App::Buffer(BufferApp::Viewing(d)) => d.source.as_ref().map(|s| s.buffer_id),
+            App::Buffer(BufferApp::Editing(e)) => Some(e.editor.buffer_id),
             _ => None,
         }
     }
@@ -3300,7 +3315,7 @@ impl SketchGpuiView {
 
     /// Check if a window should be visible given the active tab's tag_view.
     fn window_visible_for_tag_view(
-        content: &WindowContent,
+        content: &App,
         tag_view: &workspace::TagSet,
         file_buffers: &HashMap<workspace::FileBufferId, workspace::FileBuffer>,
     ) -> bool {
@@ -3308,8 +3323,8 @@ impl SketchGpuiView {
             return true;
         }
         let buf_id = match content {
-            WindowContent::Doc(d) => d.source.as_ref().map(|s| s.buffer_id),
-            WindowContent::Edit(e) => Some(e.editor.buffer_id),
+            App::Buffer(BufferApp::Viewing(d)) => d.source.as_ref().map(|s| s.buffer_id),
+            App::Buffer(BufferApp::Editing(e)) => Some(e.editor.buffer_id),
             _ => return false, // Agent/Browser hidden when filter active
         };
         let Some(id) = buf_id else { return false };
@@ -3321,7 +3336,7 @@ impl SketchGpuiView {
 
     /// Check if a layout subtree has any visible leaves for the given tag view.
     fn subtree_has_visible_leaf(
-        layout: &workspace::Layout<WindowContent>,
+        layout: &workspace::Layout<App>,
         tag_view: &workspace::TagSet,
         file_buffers: &HashMap<workspace::FileBufferId, workspace::FileBuffer>,
     ) -> bool {
@@ -3578,7 +3593,7 @@ impl SketchGpuiView {
         // tile-scoped entries moved to the `.` local menus — Phase 2.)
         if !matches!(
             self.workspace.focused_content(),
-            Some(WindowContent::Edit(_))
+            Some(App::Buffer(BufferApp::Editing(_)))
         ) {
             d.insert("back-to-doc".to_string());
         }
@@ -3596,10 +3611,10 @@ impl SketchGpuiView {
             return;
         };
         let (menu, header) = match self.workspace.focused_content() {
-            Some(WindowContent::Doc(_)) => (doc_local_menu(), "DOC"),
-            Some(WindowContent::Edit(_)) => (edit_local_menu(), "EDIT"),
-            Some(WindowContent::Agent(_)) => (agent_local_menu(), "AGENT"),
-            Some(WindowContent::Browser(_)) => (browser_local_menu(), "BROWSE"),
+            Some(App::Buffer(BufferApp::Viewing(_))) => (doc_local_menu(), "DOC"),
+            Some(App::Buffer(BufferApp::Editing(_))) => (edit_local_menu(), "EDIT"),
+            Some(App::Agent(_)) => (agent_local_menu(), "AGENT"),
+            Some(App::Buffer(BufferApp::Picking(_))) => (browser_local_menu(), "BROWSE"),
             None => return,
         };
         self.transient_status = None;
@@ -3686,7 +3701,7 @@ impl SketchGpuiView {
                 // gets a visible no-op instead of silent.
                 if matches!(
                     self.workspace.focused_content().expect("no focused window"),
-                    WindowContent::Agent(_)
+                    App::Agent(_)
                 ) {
                     // Mode-aware submit: Worksheet sweep (§12) or Chatbox
                     // submit (§18) depending on `AgentState::input_mode`.
@@ -3715,7 +3730,7 @@ impl SketchGpuiView {
             "compose-toggle" | "agent-input-toggle" => {
                 if matches!(
                     self.workspace.focused_content().expect("no focused window"),
-                    WindowContent::Agent(_)
+                    App::Agent(_)
                 ) {
                     self.toggle_agent_input_mode(cx);
                 }
@@ -3819,9 +3834,9 @@ impl SketchGpuiView {
             }
             "new-tab" => {
                 self.workspace
-                    .push_initial_tab(WindowContent::Browser(BrowserWindow::standalone(
+                    .push_initial_tab(App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                    )));
+                    ))));
                 self.save_workspace_state();
                 cx.notify();
             }
@@ -3945,7 +3960,7 @@ impl SketchGpuiView {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let _ = self.workspace.split_focused(
                     workspace::SplitDir::V,
-                    WindowContent::Browser(BrowserWindow::standalone(cwd)),
+                    App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
                 );
                 self.workspace.retile_active();
                 self.save_workspace_state();
@@ -3960,7 +3975,7 @@ impl SketchGpuiView {
                     .workspace
                     .split_focused(
                         workspace::SplitDir::V,
-                        WindowContent::Browser(BrowserWindow::standalone(cwd)),
+                        App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
                     )
                     .is_some()
                 {
@@ -3975,7 +3990,7 @@ impl SketchGpuiView {
             "inplace-browser-tile" => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.workspace
-                    .replace_focused_content(WindowContent::Browser(BrowserWindow::standalone(cwd)));
+                    .replace_focused_content(App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))));
                 self.save_workspace_state();
                 cx.notify();
             }
@@ -4019,7 +4034,7 @@ impl SketchGpuiView {
             "claude-send-selection" => {
                 if matches!(
                     self.workspace.focused_content(),
-                    Some(WindowContent::Agent(_))
+                    Some(App::Agent(_))
                 ) {
                     self.send_agent_selection(cx);
                 }
@@ -4163,7 +4178,7 @@ impl SketchGpuiView {
     fn focused_is_file_backed(&self) -> bool {
         matches!(
             self.workspace.focused_content(),
-            Some(WindowContent::Doc(_)) | Some(WindowContent::Edit(_))
+            Some(App::Buffer(BufferApp::Viewing(_))) | Some(App::Buffer(BufferApp::Editing(_)))
         )
     }
 
@@ -5782,7 +5797,7 @@ impl SketchGpuiView {
 }
 
 impl Focusable for SketchGpuiView {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+    fn focus_handle(&self, _cx: &GpuiApp) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
@@ -5810,7 +5825,7 @@ impl Render for SketchGpuiView {
             let theme = &self.theme;
             for tab in self.workspace.tabs.iter_mut() {
                 tab.layout.for_each_leaf_content_mut(&mut |content| {
-                    if let WindowContent::Doc(d) = content {
+                    if let App::Buffer(BufferApp::Viewing(d)) = content {
                         d.refresh_blocks(theme);
                     }
                 });
@@ -6311,13 +6326,13 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 /// Short display label for the tab strip. Doc/Edit tabs show the file's
 /// basename (`E ` prefix for Edit); Browser/Claude show their kind.
-fn tab_strip_label(tab: &workspace::Tab<WindowContent>) -> String {
+fn tab_strip_label(tab: &workspace::Tab<App>) -> String {
     if let workspace::Layout::Leaf(w) = &tab.layout {
         match &w.content {
-            WindowContent::Doc(d) => basename_or_full(d.file_label.as_ref()),
-            WindowContent::Edit(e) => format!("E {}", basename_or_full(e.file_label.as_ref())),
-            WindowContent::Browser(_) => format!("Browser ({})", tab.display_label()),
-            WindowContent::Agent(_) => format!("Claude ({})", tab.display_label()),
+            App::Buffer(BufferApp::Viewing(d)) => basename_or_full(d.file_label.as_ref()),
+            App::Buffer(BufferApp::Editing(e)) => format!("E {}", basename_or_full(e.file_label.as_ref())),
+            App::Buffer(BufferApp::Picking(_)) => format!("Browser ({})", tab.display_label()),
+            App::Agent(_) => format!("Claude ({})", tab.display_label()),
         }
     } else {
         tab.display_label().to_string()
@@ -6333,11 +6348,11 @@ fn basename_or_full(path: &str) -> String {
 
 /// Extract the file label of a tab's focused window, if Doc or Edit.
 /// Returns `None` for Browser/Claude tabs or non-leaf layouts.
-fn tab_doc_label(tab: &workspace::Tab<WindowContent>) -> Option<String> {
+fn tab_doc_label(tab: &workspace::Tab<App>) -> Option<String> {
     if let workspace::Layout::Leaf(w) = &tab.layout {
         match &w.content {
-            WindowContent::Doc(d) => Some(d.file_label.to_string()),
-            WindowContent::Edit(e) => Some(e.file_label.to_string()),
+            App::Buffer(BufferApp::Viewing(d)) => Some(d.file_label.to_string()),
+            App::Buffer(BufferApp::Editing(e)) => Some(e.file_label.to_string()),
             _ => None,
         }
     } else {
@@ -6346,19 +6361,19 @@ fn tab_doc_label(tab: &workspace::Tab<WindowContent>) -> Option<String> {
 }
 
 /// Extract the file label from a screen, if it's a Doc or Edit screen.
-fn screen_file_label(screen: &WindowContent) -> Option<SharedString> {
+fn screen_file_label(screen: &App) -> Option<SharedString> {
     match screen {
-        WindowContent::Doc(d) => Some(d.file_label.clone()),
-        WindowContent::Edit(e) => Some(e.file_label.clone()),
+        App::Buffer(BufferApp::Viewing(d)) => Some(d.file_label.clone()),
+        App::Buffer(BufferApp::Editing(e)) => Some(e.file_label.clone()),
         _ => None,
     }
 }
 
 /// Check whether the screen's underlying editor has unsaved modifications.
-fn screen_is_modified(screen: &WindowContent) -> bool {
+fn screen_is_modified(screen: &App) -> bool {
     match screen {
-        WindowContent::Edit(e) => e.editor.is_modified(),
-        WindowContent::Doc(d) => d.source.as_ref().is_some_and(|s| s.is_modified()),
+        App::Buffer(BufferApp::Editing(e)) => e.editor.is_modified(),
+        App::Buffer(BufferApp::Viewing(d)) => d.source.as_ref().is_some_and(|s| s.is_modified()),
         _ => false,
     }
 }
@@ -6399,7 +6414,7 @@ fn fuzzy_match_gpui(text: &str, query: &str) -> bool {
 /// so action-level smokes were impossible while this lived inline. The
 /// production path calls this once from the run-closure; tests call it via
 /// `cx.update(|cx| register_keymap(cx))`.
-fn register_keymap(app: &mut App) {
+fn register_keymap(app: &mut GpuiApp) {
     // Document-view bindings.
     app.bind_keys([
         KeyBinding::new("j", ScrollDown, Some("SketchView")),
@@ -6579,7 +6594,7 @@ fn main() {
     // workspace, client_id, acp_sessions) is read. One-time, idempotent.
     sketch::paths::migrate_legacy_cache_dir();
     let config = sketch::config::Config::load().unwrap_or_default();
-    // App-managed preferences override config.kdl's theme — that's where
+    // GpuiApp-managed preferences override config.kdl's theme — that's where
     // the menu-driven "View → Theme" picks land. Falls back to the kdl
     // theme (or built-in default) when the user hasn't switched themes via
     // the UI yet.
@@ -6618,7 +6633,7 @@ fn main() {
         }
     };
 
-    Application::new().run(move |app: &mut App| {
+    Application::new().run(move |app: &mut GpuiApp| {
         register_keymap(app);
 
         // Quit when the last window closes. macOS apps typically stay
@@ -6666,7 +6681,7 @@ fn main() {
                                 // CLI file shares its core with any Edit view and
                                 // live-tracks.
                                 if let Ok((id, core)) = v.workspace.open_and_retain(&path)
-                                    && let Some(WindowContent::Doc(d)) =
+                                    && let Some(App::Buffer(BufferApp::Viewing(d))) =
                                         v.workspace.focused_content_mut()
                                 {
                                     d.source = Some(DocSource::new(id, core));
@@ -6747,7 +6762,7 @@ fn main() {
             .unwrap();
 
         // Run the ACP teardown synchronously when the app is quitting,
-        // *before* `App::shutdown` clears windows and races view Drop
+        // *before* `GpuiApp::shutdown` clears windows and races view Drop
         // against worker-thread joins. The hook gives us a 100ms budget
         // (`SHUTDOWN_TIMEOUT`) — comfortably enough for the worker to
         // signal its child, since the agent process has `kill_on_drop`

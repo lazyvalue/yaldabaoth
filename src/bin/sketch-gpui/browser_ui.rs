@@ -122,7 +122,7 @@ impl SketchGpuiView {
             .focused_content_mut()
             .expect("no focused window")
         {
-            WindowContent::Browser(b) => b.underlying.take(),
+            App::Buffer(BufferApp::Picking(b)) => b.underlying.take(),
             _ => return,
         };
         // If the browser was opened over an existing tile (Cmd-O from a
@@ -499,11 +499,11 @@ impl SketchGpuiView {
             });
         if let Some(idx) = target {
             match self.workspace.focused_content_mut() {
-                Some(WindowContent::Doc(d)) => {
+                Some(App::Buffer(BufferApp::Viewing(d))) => {
                     d.cursor_block = idx.min(d.blocks.len().saturating_sub(1));
                     d.reveal_block(d.cursor_block);
                 }
-                Some(WindowContent::Edit(e)) => {
+                Some(App::Buffer(BufferApp::Editing(e))) => {
                     let lines = e.editor.line_count();
                     let line = idx.min(lines.saturating_sub(1));
                     e.editor.set_cursor(line, 0);

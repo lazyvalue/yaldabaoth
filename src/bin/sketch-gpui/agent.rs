@@ -129,7 +129,7 @@ pub(crate) enum TurnRole {
 
 /// Free-function variant of `SketchGpuiView::build_tool_block` that
 /// works without an active `&Context<Self>`. Used inside `gpui::list`'s
-/// per-item render closure (which only gets `&mut Window, &mut App`).
+/// per-item render closure (which only gets `&mut Window, &mut GpuiApp`).
 /// Click handlers are wired through a `WeakEntity<SketchGpuiView>`
 /// captured at render-build time so toggling `expanded_tool_calls`
 /// still goes through the same entity update path.
@@ -184,7 +184,7 @@ pub(crate) fn build_tool_block_with_weak(
     if has_body {
         let id_for_click = id_str.clone();
         summary_row = summary_row.cursor_pointer().on_click(
-            move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
+            move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut GpuiApp| {
                 let id = id_for_click.clone();
                 let _ = weak_view.update(app, |this, cx| {
                     if let Some(c) = this.agent_mut() {
@@ -1719,7 +1719,7 @@ impl AgentViewModel {
 /// build and blank-collapse. A top-level fn (not inlined in `render_agent`)
 /// so the per-keystroke cost is testable headlessly: `lines` /
 /// `frozen_ranges` are plain data and `c` comes from
-/// `AgentState::new_for_test` — no Window or App required.
+/// `AgentState::new_for_test` — no Window or GpuiApp required.
 pub(crate) fn rebuild_agent_view_model(
     c: &mut AgentState,
     lines: &[String],
@@ -2707,13 +2707,13 @@ pub(crate) struct AgentRing {
     pub(crate) active: usize,
     /// Monotonic counter for `AgentSlot::index` — never reused.
     pub(crate) next_index: usize,
-    /// WindowContent to restore when leaving Claude entirely (Ctrl-V / back_to_doc).
+    /// App to restore when leaving Claude entirely (Ctrl-V / back_to_doc).
     /// Belongs to the ring, not any individual session.
-    pub(crate) underlying: Option<Box<WindowContent>>,
+    pub(crate) underlying: Option<Box<App>>,
 }
 
 impl AgentRing {
-    pub(crate) fn new(underlying: Option<Box<WindowContent>>) -> Self {
+    pub(crate) fn new(underlying: Option<Box<App>>) -> Self {
         Self {
             slots: Vec::new(),
             active: 0,
