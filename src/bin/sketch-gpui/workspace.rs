@@ -426,8 +426,10 @@ impl MarkTable {
 
 /// Layout mode for a tab. `Manual` is the default (user-built split tree);
 /// the automatic modes compute the tree algorithmically on each structural
-/// change (split/close/mode-switch).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// change (split/close/mode-switch). `Desktop` (spec-desktop-mode.md) keeps
+/// the tree as the CONTENT owner and takes geometry from the tab's
+/// [`DesktopState`] slot map instead — it never drains/rebuilds the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutMode {
     #[default]
@@ -435,16 +437,39 @@ pub enum LayoutMode {
     MasterStack,
     Monocle,
     Columns,
+    Desktop,
+}
+
+/// Hand-rolled deserialize with an unknown-variant fallback to `Manual`
+/// (spec-desktop-mode.md Behavior 7): the workspace snapshot loader treats a
+/// failed parse as "no snapshot", so a derived deserializer meeting a mode
+/// string from a NEWER binary would discard — and on next save overwrite —
+/// the user's whole arrangement. Falling back degrades one tab's layout mode
+/// instead. Keep in sync with the variant list (a test enforces round-trip).
+impl<'de> serde::Deserialize<'de> for LayoutMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "master_stack" => LayoutMode::MasterStack,
+            "monocle" => LayoutMode::Monocle,
+            "columns" => LayoutMode::Columns,
+            "desktop" => LayoutMode::Desktop,
+            // "manual" and any string from the future
+            _ => LayoutMode::Manual,
+        })
+    }
 }
 
 impl LayoutMode {
-    /// Cycle to the next mode: Manual → MasterStack → Monocle → Columns → Manual.
+    /// Cycle to the next mode:
+    /// Manual → MasterStack → Monocle → Columns → Desktop → Manual.
     pub fn cycle(self) -> Self {
         match self {
             LayoutMode::Manual => LayoutMode::MasterStack,
             LayoutMode::MasterStack => LayoutMode::Monocle,
             LayoutMode::Monocle => LayoutMode::Columns,
-            LayoutMode::Columns => LayoutMode::Manual,
+            LayoutMode::Columns => LayoutMode::Desktop,
+            LayoutMode::Desktop => LayoutMode::Manual,
         }
     }
 
@@ -455,8 +480,258 @@ impl LayoutMode {
             LayoutMode::MasterStack => "[M]=",
             LayoutMode::Monocle => "[M]", // caller computes [n/N] dynamically
             LayoutMode::Columns => "|||",
+            LayoutMode::Desktop => "[#]",
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Desktop mode (spec-desktop-mode.md)
+// ---------------------------------------------------------------------------
+
+/// A cell address on the unbounded desktop grid. Origin top-left; growth is
+/// rightward/downward (no negative coordinates). Ordered row-major — the
+/// derived `(row, col)` lexicographic `Ord` IS the sequence order that
+/// insert-and-shift and `focus_next/prev` operate on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Slot {
+    pub row: u32,
+    pub col: u32,
+}
+
+impl Slot {
+    pub fn new(row: u32, col: u32) -> Self {
+        Self { row, col }
+    }
+
+    /// Row-major successor under the W-wrapped chain (spec Behavior 4):
+    /// `(row, col+1)` while `col + 1 < w`, else `(row+1, 0)`. Slots at
+    /// `col >= w` are OUTSIDE every successor chain by construction — ripples
+    /// never touch them.
+    pub fn succ(self, w: u32) -> Slot {
+        let w = w.max(1);
+        if self.col + 1 < w {
+            Slot::new(self.row, self.col + 1)
+        } else {
+            Slot::new(self.row + 1, 0)
+        }
+    }
+}
+
+/// Transient drag state while a panel is being dragged. View-layer units are
+/// plain `f32` pixels in DESKTOP coordinates (pre-pan); the view converts at
+/// the boundary so this module stays gpui-free. Never persisted.
+#[derive(Debug, Clone, Copy)]
+pub struct DesktopDrag {
+    /// The panel being dragged.
+    pub id: WindowId,
+    /// Pointer offset within the panel at grab time (so the ghost doesn't
+    /// jump to the pointer corner).
+    pub grab: (f32, f32),
+    /// Current pointer position in desktop coordinates.
+    pub pointer: (f32, f32),
+    /// Resolved drop target for the current pointer (recomputed on move).
+    pub target: Option<Slot>,
+}
+
+/// Per-tab desktop-mode geometry (spec-desktop-mode.md). The layout tree
+/// remains the content owner; this owns ONLY placement. Invariant
+/// (Behavior 2): exactly one entry per tree leaf, no two entries share a
+/// slot — maintained by [`reconcile`](Self::reconcile), which callers run on
+/// mode entry and structural changes (the render path runs it every frame;
+/// it is O(n) and a no-op when the invariant already holds).
+#[derive(Debug, Default)]
+pub struct DesktopState {
+    /// Placement AND sequence: sorted by `Slot` (row-major), one entry per
+    /// leaf. Kept sorted by every mutator so "the sequence" is never a second
+    /// piece of state that can drift.
+    pub slots: Vec<(WindowId, Slot)>,
+    /// Viewport pan over the desktop, in pixels. Transient-but-kept across
+    /// mode switches; not persisted.
+    pub pan: (f32, f32),
+    /// Live drag, if any.
+    pub drag: Option<DesktopDrag>,
+}
+
+impl DesktopState {
+    pub fn slot_of(&self, id: WindowId) -> Option<Slot> {
+        self.slots.iter().find(|(w, _)| *w == id).map(|&(_, s)| s)
+    }
+
+    pub fn occupant(&self, slot: Slot) -> Option<WindowId> {
+        self.slots
+            .iter()
+            .find(|&&(_, s)| s == slot)
+            .map(|&(id, _)| id)
+    }
+
+    fn sort(&mut self) {
+        self.slots.sort_by_key(|&(_, s)| s);
+    }
+
+    /// First unoccupied slot in W-wrapped chain order starting at the origin.
+    fn first_free(&self, w: u32) -> Slot {
+        let mut s = Slot::new(0, 0);
+        while self.occupant(s).is_some() {
+            s = s.succ(w);
+        }
+        s
+    }
+
+    /// First-entry placement (spec Behavior 1): leaves in tree order, row-
+    /// major at effective width `w`. Replaces any existing map.
+    pub fn seed(&mut self, leaves: &[WindowId], w: u32) {
+        self.slots.clear();
+        let mut s = Slot::new(0, 0);
+        for &id in leaves {
+            self.slots.push((id, s));
+            s = s.succ(w);
+        }
+        // Built in chain order = already sorted.
+    }
+
+    /// Restore the Behavior-2 invariant: drop entries whose window is gone
+    /// (their slot becomes a gap — neighbors never move); give every slotless
+    /// leaf a placement after the focused panel (insert-and-shift), or at the
+    /// first free slot when the focused panel has no slot yet. Returns true
+    /// if anything changed.
+    pub fn reconcile(&mut self, leaves: &[WindowId], focused: WindowId, w: u32) -> bool {
+        let mut changed = false;
+        let before = self.slots.len();
+        self.slots.retain(|(id, _)| leaves.contains(id));
+        changed |= self.slots.len() != before;
+
+        for &leaf in leaves {
+            if self.slot_of(leaf).is_some() {
+                continue;
+            }
+            let target = match self.slot_of(focused) {
+                Some(f) => f.succ(w),
+                None => self.first_free(w),
+            };
+            self.insert_shift(leaf, target, w);
+            changed = true;
+        }
+        changed
+    }
+
+    /// The Behavior-4 drop: place `id` at `target`. An empty target is a
+    /// plain move (the old slot becomes a gap). An occupied target inserts:
+    /// the occupant and each subsequent panel in the contiguous occupied run
+    /// along the W-wrapped successor chain shift forward one slot; the run
+    /// stops at the first gap, which absorbs the ripple. Shifts are applied
+    /// back-to-front so no two panels ever share a slot mid-flight.
+    pub fn insert_shift(&mut self, id: WindowId, target: Slot, w: u32) {
+        // Vacate the dragged panel first — its old slot is the natural gap
+        // left behind, and it must not participate in its own run.
+        self.slots.retain(|(wid, _)| *wid != id);
+
+        // Collect the contiguous occupied run starting at `target`.
+        let mut run: Vec<(WindowId, Slot)> = Vec::new();
+        let mut s = target;
+        while let Some(occ) = self.occupant(s) {
+            run.push((occ, s));
+            s = s.succ(w);
+        }
+        // Shift back-to-front.
+        for &(occ, from) in run.iter().rev() {
+            let to = from.succ(w);
+            if let Some(entry) = self.slots.iter_mut().find(|(wid, _)| *wid == occ) {
+                entry.1 = to;
+            }
+        }
+
+        self.slots.push((id, target));
+        self.sort();
+    }
+
+    /// Spatial focus navigation (spec Behavior 5): nearest occupied slot
+    /// strictly in `direction` from `from`'s slot — primary-axis-aligned
+    /// candidates first, then squared slot distance, then row-major order as
+    /// the deterministic tiebreak.
+    pub fn spatial_neighbor(&self, from: WindowId, direction: SpatialDir) -> Option<WindowId> {
+        let origin = self.slot_of(from)?;
+        self.slots
+            .iter()
+            .filter(|&&(id, s)| {
+                id != from
+                    && match direction {
+                        SpatialDir::Left => s.col < origin.col,
+                        SpatialDir::Right => s.col > origin.col,
+                        SpatialDir::Up => s.row < origin.row,
+                        SpatialDir::Down => s.row > origin.row,
+                    }
+            })
+            .min_by_key(|&&(_, s)| {
+                let dr = s.row.abs_diff(origin.row) as u64;
+                let dc = s.col.abs_diff(origin.col) as u64;
+                let aligned = match direction {
+                    SpatialDir::Left | SpatialDir::Right => dr == 0,
+                    SpatialDir::Up | SpatialDir::Down => dc == 0,
+                };
+                (if aligned { 0u64 } else { 1 }, dr * dr + dc * dc, s)
+            })
+            .map(|&(id, _)| id)
+    }
+
+    /// Row-major sequence neighbor for `focus_next` / `focus_prev`.
+    pub fn sequence_neighbor(&self, from: WindowId, forward: bool) -> Option<WindowId> {
+        let idx = self.slots.iter().position(|&(id, _)| id == from)?;
+        let n = self.slots.len();
+        if n < 2 {
+            return None;
+        }
+        let next = if forward { (idx + 1) % n } else { (idx + n - 1) % n };
+        Some(self.slots[next].0)
+    }
+
+    /// Bounding box of occupied slots: `(max_row, max_col)` inclusive, or
+    /// `None` when empty. The pan clamp allows one slot of margin beyond it.
+    pub fn occupied_extent(&self) -> Option<(u32, u32)> {
+        let mut it = self.slots.iter();
+        let &(_, first) = it.next()?;
+        let mut max = (first.row, first.col);
+        for &(_, s) in it {
+            max.0 = max.0.max(s.row);
+            max.1 = max.1.max(s.col);
+        }
+        Some(max)
+    }
+}
+
+/// Direction for desktop spatial focus navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpatialDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+// Pure geometry (spec Interfaces). Desktop coordinates are pre-pan pixels;
+// the view layer applies pan and converts to gpui units at its boundary.
+
+/// Top-left of `slot`, given the panel pixel size and gutter.
+pub fn slot_origin(slot: Slot, panel: (f32, f32), gutter: f32) -> (f32, f32) {
+    (
+        gutter + slot.col as f32 * (panel.0 + gutter),
+        gutter + slot.row as f32 * (panel.1 + gutter),
+    )
+}
+
+/// The slot whose cell contains (or is nearest to) a desktop-coordinate
+/// point. Clamps to the non-negative grid.
+pub fn slot_at(point: (f32, f32), panel: (f32, f32), gutter: f32) -> Slot {
+    let cell = (panel.0 + gutter, panel.1 + gutter);
+    let col = ((point.0 - gutter) / cell.0).floor().max(0.0) as u32;
+    let row = ((point.1 - gutter) / cell.1).floor().max(0.0) as u32;
+    Slot::new(row, col)
+}
+
+/// Drop-time effective width W (spec Overview): panel columns that fit the
+/// viewport, minimum 1. Stored slots are never re-derived from it.
+pub fn effective_width(viewport_w: f32, panel_w: f32, gutter: f32) -> u32 {
+    (((viewport_w - gutter) / (panel_w + gutter)).floor() as i64).max(1) as u32
 }
 
 /// A skeleton of a layout tree — just the shape (window ids, weights, split
@@ -511,6 +786,10 @@ pub struct Tab<C> {
     /// Tag-view filter. When non-empty, the tab shows only windows whose
     /// buffer carries at least one tag in this set. Empty = show all.
     pub tag_view: TagSet,
+    /// Desktop-mode placement (spec-desktop-mode.md). Geometry only — the
+    /// layout tree above remains the content owner. Kept (not cleared) when
+    /// switching away from Desktop so the arrangement survives round-trips.
+    pub desktop: DesktopState,
 }
 
 impl<C> Tab<C> {
@@ -640,6 +919,7 @@ impl<C> Workspace<C> {
             master_ratio: 0.6,
             master_count: 1,
             tag_view: BTreeSet::new(),
+            desktop: DesktopState::default(),
         });
         self.active_tab = self.tabs.len() - 1;
         id
@@ -1274,7 +1554,11 @@ impl<C> Workspace<C> {
             Some(t) => t,
             None => return,
         };
-        if tab.layout_mode == LayoutMode::Manual {
+        // Manual: the user's hand-built tree IS the layout. Desktop: the tree
+        // is the content owner only — geometry lives in `tab.desktop`
+        // (spec-desktop-mode.md); draining/rebuilding here would destroy the
+        // tree the next Manual restore appends leftovers to. Neither retiles.
+        if matches!(tab.layout_mode, LayoutMode::Manual | LayoutMode::Desktop) {
             return;
         }
         let focused = tab.focused;
@@ -1285,7 +1569,7 @@ impl<C> Workspace<C> {
         let has_focused = windows.iter().any(|w| w.id == focused);
 
         tab.layout = match tab.layout_mode {
-            LayoutMode::Manual => unreachable!(),
+            LayoutMode::Manual | LayoutMode::Desktop => unreachable!(),
             LayoutMode::MasterStack => {
                 build_master_stack(windows, tab.master_count, tab.master_ratio)
             }
@@ -1493,6 +1777,162 @@ fn restore_from_skeleton<C>(skeleton: LayoutSkeleton, pool: &mut Vec<Window<C>>)
 }
 
 #[cfg(test)]
+mod desktop_tests {
+    use super::*;
+
+    fn slots_of(d: &DesktopState) -> Vec<(WindowId, (u32, u32))> {
+        d.slots.iter().map(|&(id, s)| (id, (s.row, s.col))).collect()
+    }
+
+    #[test]
+    fn seed_fills_row_major_at_width() {
+        let mut d = DesktopState::default();
+        d.seed(&[1, 2, 3, 4, 5], 3);
+        assert_eq!(
+            slots_of(&d),
+            vec![
+                (1, (0, 0)),
+                (2, (0, 1)),
+                (3, (0, 2)),
+                (4, (1, 0)),
+                (5, (1, 1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn drop_on_empty_slot_is_plain_move_leaving_gap() {
+        let mut d = DesktopState::default();
+        d.seed(&[1, 2, 3], 3);
+        d.insert_shift(1, Slot::new(2, 2), 3);
+        assert_eq!(d.slot_of(1), Some(Slot::new(2, 2)));
+        assert_eq!(d.slot_of(2), Some(Slot::new(0, 1)));
+        assert_eq!(d.slot_of(3), Some(Slot::new(0, 2)));
+        assert_eq!(d.occupant(Slot::new(0, 0)), None, "old slot becomes a gap");
+    }
+
+    #[test]
+    fn drop_on_occupied_slot_ripples_run_until_gap() {
+        let mut d = DesktopState::default();
+        d.seed(&[1, 2, 3, 4], 3); // (0,0) (0,1) (0,2) (1,0)
+        // Drop 4 onto 2's slot (0,1). 4's own (1,0) is vacated FIRST, so the
+        // run is [2 @ (0,1), 3 @ (0,2)] and 3's wrap target (1,0) is the gap
+        // that absorbs the ripple.
+        d.insert_shift(4, Slot::new(0, 1), 3);
+        assert_eq!(d.slot_of(4), Some(Slot::new(0, 1)));
+        assert_eq!(d.slot_of(2), Some(Slot::new(0, 2)));
+        assert_eq!(d.slot_of(3), Some(Slot::new(1, 0)));
+        assert_eq!(
+            d.slot_of(1),
+            Some(Slot::new(0, 0)),
+            "panel before the run never moves"
+        );
+    }
+
+    #[test]
+    fn ripple_wraps_rows_at_effective_width() {
+        let mut d = DesktopState::default();
+        d.seed(&[1, 2], 2); // (0,0), (0,1)
+        // Drop 2 onto (0,0): run = [1 @ (0,0)] → 1 shifts to (0,1) (2's gap).
+        d.insert_shift(2, Slot::new(0, 0), 2);
+        assert_eq!(d.slot_of(2), Some(Slot::new(0, 0)));
+        assert_eq!(d.slot_of(1), Some(Slot::new(0, 1)));
+        // Drop 2 onto (0,1): run = [1 @ (0,1)] → 1 wraps to (1,0).
+        d.insert_shift(2, Slot::new(0, 1), 2);
+        assert_eq!(d.slot_of(2), Some(Slot::new(0, 1)));
+        assert_eq!(d.slot_of(1), Some(Slot::new(1, 0)));
+    }
+
+    /// Spec Behavior 4: panels at `col >= W` sit outside every successor
+    /// chain — ripples never touch them.
+    #[test]
+    fn panels_beyond_effective_width_never_ripple() {
+        let mut d = DesktopState::default();
+        d.seed(&[1, 2, 3], 5); // seeded wide: cols 0, 1, 2
+        // Window narrowed to W = 2; panel 3 at (0,2) is beyond W.
+        d.insert_shift(2, Slot::new(0, 0), 2);
+        // Run at (0,0) = [1]; succ((0,0), 2) = (0,1), 2's vacated gap.
+        assert_eq!(d.slot_of(2), Some(Slot::new(0, 0)));
+        assert_eq!(d.slot_of(1), Some(Slot::new(0, 1)));
+        assert_eq!(d.slot_of(3), Some(Slot::new(0, 2)), "beyond-W panel untouched");
+    }
+
+    #[test]
+    fn reconcile_drops_stale_and_inserts_after_focused() {
+        let mut d = DesktopState::default();
+        d.seed(&[1, 2, 3], 3);
+        // Window 2 closed; window 9 opened; focused = 1.
+        let changed = d.reconcile(&[1, 3, 9], 1, 3);
+        assert!(changed);
+        assert_eq!(d.slot_of(2), None);
+        assert_eq!(
+            d.slot_of(9),
+            Some(Slot::new(0, 1)),
+            "new window lands after focused, in the gap 2 left"
+        );
+        assert_eq!(d.slot_of(3), Some(Slot::new(0, 2)), "no ripple needed");
+        assert!(
+            !d.reconcile(&[1, 3, 9], 1, 3),
+            "idempotent when the invariant already holds"
+        );
+    }
+
+    #[test]
+    fn spatial_neighbor_prefers_aligned_then_nearest() {
+        let mut d = DesktopState::default();
+        d.slots = vec![
+            (1, Slot::new(0, 0)),
+            (2, Slot::new(0, 2)),
+            (3, Slot::new(1, 1)),
+        ];
+        d.slots.sort_by_key(|&(_, s)| s);
+        assert_eq!(
+            d.spatial_neighbor(1, SpatialDir::Right),
+            Some(2),
+            "same-row beats nearer diagonal"
+        );
+        assert_eq!(d.spatial_neighbor(1, SpatialDir::Down), Some(3));
+        assert_eq!(d.spatial_neighbor(1, SpatialDir::Left), None);
+        assert_eq!(d.sequence_neighbor(1, true), Some(2));
+        assert_eq!(d.sequence_neighbor(2, true), Some(3));
+        assert_eq!(d.sequence_neighbor(1, false), Some(3), "wraps");
+    }
+
+    #[test]
+    fn geometry_round_trips() {
+        let panel = (960.0, 800.0);
+        let g = 12.0;
+        let s = Slot::new(2, 3);
+        let (x, y) = slot_origin(s, panel, g);
+        assert_eq!(slot_at((x + 5.0, y + 5.0), panel, g), s);
+        assert_eq!(effective_width(2000.0, panel.0, g), 2);
+        assert_eq!(effective_width(100.0, panel.0, g), 1, "minimum 1");
+    }
+
+    /// Old-binary safety (spec Behavior 7): unknown mode strings fall back
+    /// to Manual instead of failing the whole snapshot parse; known strings
+    /// round-trip.
+    #[test]
+    fn layout_mode_deserialize_falls_back_to_manual() {
+        for (s, want) in [
+            ("\"manual\"", LayoutMode::Manual),
+            ("\"master_stack\"", LayoutMode::MasterStack),
+            ("\"monocle\"", LayoutMode::Monocle),
+            ("\"columns\"", LayoutMode::Columns),
+            ("\"desktop\"", LayoutMode::Desktop),
+            ("\"some_future_mode\"", LayoutMode::Manual),
+        ] {
+            let got: LayoutMode = serde_json::from_str(s).unwrap();
+            assert_eq!(got, want, "{s}");
+        }
+        assert_eq!(
+            serde_json::to_string(&LayoutMode::Desktop).unwrap(),
+            "\"desktop\""
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1647,6 +2087,7 @@ mod tests {
             master_ratio: 0.6,
             master_count: 1,
             tag_view: BTreeSet::new(),
+            desktop: DesktopState::default(),
         });
         // Ensure window-id allocator skips past the ids we hand-rolled.
         let max_id = ws.tabs[0].layout.leaf_ids().into_iter().max().unwrap_or(0);
@@ -2038,6 +2479,7 @@ mod tests {
             master_ratio: 0.6,
             master_count: 1,
             tag_view: BTreeSet::new(),
+            desktop: DesktopState::default(),
         });
         let w = Window {
             id: 9,
@@ -2065,6 +2507,7 @@ mod tests {
             master_ratio: 0.6,
             master_count: 1,
             tag_view: BTreeSet::new(),
+            desktop: DesktopState::default(),
         });
         let w = Window {
             id: 9,
@@ -2101,6 +2544,7 @@ mod tests {
             master_ratio: 0.6,
             master_count: 1,
             tag_view: BTreeSet::new(),
+            desktop: DesktopState::default(),
         });
         let (window, empty) = ws.detach_focused().unwrap();
         assert!(!empty);

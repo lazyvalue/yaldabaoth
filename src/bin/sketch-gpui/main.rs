@@ -1431,6 +1431,11 @@ struct SketchGpuiView {
     /// the unzoomed default; clamped to [MIN_TEXT_SCALE, MAX_TEXT_SCALE] on
     /// every adjustment.
     text_scale: f32,
+    /// Desktop-mode panel size in mono cells (spec-desktop-mode.md
+    /// Behavior 6) — one global setting for all panels in all tabs,
+    /// persisted in `Preferences`, clamped to [20, 400] × [5, 200].
+    desktop_panel_cols: u32,
+    desktop_panel_rows: u32,
     /// Cached viewport width in pixels, updated every render frame from
     /// `Window::viewport_size()`. Used by the chatbox to compute visible
     /// columns for horizontal scroll tracking.
@@ -1529,6 +1534,8 @@ impl SketchGpuiView {
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
+            desktop_panel_cols: 120,
+            desktop_panel_rows: 40,
             viewport_width_px: 800.0,
             focus_handle,
             active_overlay: ActiveOverlay::None,
@@ -1555,6 +1562,8 @@ impl SketchGpuiView {
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
+            desktop_panel_cols: 120,
+            desktop_panel_rows: 40,
             viewport_width_px: 800.0,
             focus_handle,
             active_overlay: ActiveOverlay::None,
@@ -1620,6 +1629,23 @@ impl SketchGpuiView {
                 master_ratio: ptab.master_ratio,
                 master_count: ptab.master_count,
                 tag_view: ptab.tag_view,
+                desktop: workspace::DesktopState {
+                    // Restored leaves keep their persisted WindowIds, so the
+                    // id-keyed slots round-trip with no mapping. Stale ids
+                    // (or an absent field) are handled by the first desktop
+                    // render's reconcile/seed (spec Behavior 7).
+                    slots: {
+                        let mut v: Vec<(workspace::WindowId, workspace::Slot)> = ptab
+                            .desktop_slots
+                            .into_iter()
+                            .map(|(id, row, col)| (id, workspace::Slot::new(row, col)))
+                            .collect();
+                        v.sort_by_key(|&(_, s)| s);
+                        v
+                    },
+                    pan: (0.0, 0.0),
+                    drag: None,
+                },
             });
             ws.next_tab_index += 1;
         }
@@ -1645,10 +1671,16 @@ impl SketchGpuiView {
                 buf.tags = tags.iter().cloned().collect();
             }
         }
-        // If a tab was saved in automatic layout mode, retile now.
+        // If a tab was saved in automatic layout mode, retile now. Manual
+        // keeps the restored tree verbatim; Desktop also keeps it — the tree
+        // is the content owner and geometry comes from the restored slot map
+        // (spec-desktop-mode.md), seeded/reconciled on first render.
         for t in &mut ws.tabs {
-            if t.layout_mode != workspace::LayoutMode::Manual {
-                // Retile in-place for non-manual tabs.
+            if !matches!(
+                t.layout_mode,
+                workspace::LayoutMode::Manual | workspace::LayoutMode::Desktop
+            ) {
+                // Retile in-place for automatic-mode tabs.
                 let windows: Vec<workspace::Window<WindowContent>> =
                     workspace::drain_leaves(&mut t.layout);
                 if !windows.is_empty() {
@@ -1659,7 +1691,9 @@ impl SketchGpuiView {
                         }
                         workspace::LayoutMode::Monocle => workspace::build_monocle(windows),
                         workspace::LayoutMode::Columns => workspace::build_columns(windows),
-                        workspace::LayoutMode::Manual => unreachable!(),
+                        workspace::LayoutMode::Manual | workspace::LayoutMode::Desktop => {
+                            unreachable!()
+                        }
                     };
                     // Restore focus
                     if t.layout.find_leaf(focused).is_some() {
@@ -2347,6 +2381,8 @@ impl SketchGpuiView {
             theme: Some(self.theme.name.as_kebab().to_string()),
             agent_status_position: Some(self.agent_status_position.as_str().to_string()),
             text_scale: Some(self.text_scale),
+            desktop_panel_cols: Some(self.desktop_panel_cols),
+            desktop_panel_rows: Some(self.desktop_panel_rows),
         });
     }
 
@@ -4207,6 +4243,7 @@ impl SketchGpuiView {
             master_ratio: 0.6,
             master_count: 1,
             tag_view: std::collections::BTreeSet::new(),
+            desktop: workspace::DesktopState::default(),
         });
     }
 
@@ -6504,6 +6541,13 @@ fn main() {
                         // preferences file can't push the body off-screen).
                         if let Some(scale) = prefs.text_scale {
                             view.text_scale = scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
+                        }
+                        // Desktop panel size (clamped per spec Behavior 6).
+                        if let Some(c) = prefs.desktop_panel_cols {
+                            view.desktop_panel_cols = c.clamp(20, 400);
+                        }
+                        if let Some(r) = prefs.desktop_panel_rows {
+                            view.desktop_panel_rows = r.clamp(5, 200);
                         }
                         // If we were launched with no explicit file arg, try to
                         // restore the saved workspace for this cwd. With an

@@ -325,6 +325,12 @@ pub(crate) struct Preferences {
     /// on load so a hand-edited file can't push the body off-screen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) text_scale: Option<f32>,
+    /// Desktop-mode panel size in mono cells (spec-desktop-mode.md
+    /// Behavior 6). One global setting; clamped on use, not on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) desktop_panel_cols: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) desktop_panel_rows: Option<u32>,
 }
 
 pub(crate) fn load_preferences() -> Preferences {
@@ -445,6 +451,13 @@ pub(crate) struct PersistedTab {
     pub(crate) master_count: usize,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub(crate) tag_view: std::collections::BTreeSet<String>,
+    /// Desktop-mode slot assignments (spec-desktop-mode.md Behavior 7),
+    /// keyed by the same stable per-leaf `WindowId` the layout snapshot
+    /// uses — NOT positional, so a mismatched entry degrades to
+    /// reconciliation instead of scrambling the arrangement. Absent in old
+    /// snapshots → seed on the first desktop render.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) desktop_slots: Vec<(workspace::WindowId, u32, u32)>,
 }
 
 pub(crate) fn default_master_ratio() -> f32 {
@@ -708,6 +721,12 @@ pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<WindowContent>) -> Pe
                 master_ratio: t.master_ratio,
                 master_count: t.master_count,
                 tag_view: t.tag_view.clone(),
+                desktop_slots: t
+                    .desktop
+                    .slots
+                    .iter()
+                    .map(|&(id, s)| (id, s.row, s.col))
+                    .collect(),
             })
             .collect(),
         active_tab: ws.active_tab,

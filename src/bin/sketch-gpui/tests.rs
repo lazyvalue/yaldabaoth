@@ -108,12 +108,16 @@ fn preferences_round_trip_with_text_scale() {
         theme: Some("dracula".into()),
         agent_status_position: Some("top".into()),
         text_scale: Some(1.21),
+        desktop_panel_cols: Some(100),
+        desktop_panel_rows: Some(30),
     };
     let json = serde_json::to_string(&prefs).unwrap();
     let back: Preferences = serde_json::from_str(&json).unwrap();
     assert_eq!(back.theme.as_deref(), Some("dracula"));
     assert_eq!(back.agent_status_position.as_deref(), Some("top"));
     assert_eq!(back.text_scale, Some(1.21));
+    assert_eq!(back.desktop_panel_cols, Some(100));
+    assert_eq!(back.desktop_panel_rows, Some(30));
 
     // Default (no zoom) is omitted from the serialized form.
     let bare = Preferences::default();
