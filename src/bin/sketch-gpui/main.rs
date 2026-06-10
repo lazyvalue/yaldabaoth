@@ -1260,6 +1260,7 @@ fn gpui_menu() -> Vec<MenuNode> {
             "n",
             "new",
             vec![
+                MenuNode::entry("o", "open file in this pane (Cmd-O)", "open-browser"),
                 MenuNode::entry("f", "file browser pane", "new-browser-pane"),
                 MenuNode::entry("b", "buffer list", "buffer-list"),
                 MenuNode::entry("c", "claude session pane", "new-agent-pane"),
