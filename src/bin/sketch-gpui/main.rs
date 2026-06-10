@@ -6655,6 +6655,19 @@ fn main() {
                                 focus_handle,
                             ),
                         };
+                        // Code font: "SF Mono" is only available to third-
+                        // party apps if the user installed it (the system's
+                        // built-in copy is the hidden ".SF NS Mono", which
+                        // can't be requested by name) — otherwise GPUI falls
+                        // back to a *proportional* face and code stops
+                        // looking like code. Probe the registry and fall
+                        // back to Menlo, which always ships with macOS.
+                        {
+                            let names = cx.text_system().all_font_names();
+                            if !names.iter().any(|n| n == "SF Mono") {
+                                view.code_font = SharedString::new_static("Menlo");
+                            }
+                        }
                         // Agent info bar placement from preferences.
                         if let Some(pos) = prefs.agent_status_position.as_deref() {
                             view.agent_status_position = AgentStatusPosition::parse(pos);

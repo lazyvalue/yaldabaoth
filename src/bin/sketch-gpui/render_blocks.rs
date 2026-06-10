@@ -771,16 +771,43 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                 );
             }
             let row_style = NStyle::default();
-            for (li, line) in lines.iter().enumerate() {
-                col = col.child(doc_styled_line_element(
-                    ctx,
-                    line,
-                    row_style,
-                    code_fg,
-                    &ctx.code_font,
-                    &ctx.code_font,
-                    li,
-                ));
+            if *source_file {
+                // Source file: line-number gutter, same as the edit view's
+                // Code gutter. Width-stable because every gutter cell is the
+                // same right-padded digit count in the monospace code font.
+                let digits = lines.len().max(1).to_string().len();
+                let num_fg = fg_or(ctx.theme.line_number, 0x6272a4);
+                for (li, line) in lines.iter().enumerate() {
+                    let num = format!("{:>width$}", li + 1, width = digits);
+                    col = col.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_start()
+                            .child(div().flex_none().pr_3().text_color(num_fg).child(num))
+                            .child(doc_styled_line_element(
+                                ctx,
+                                line,
+                                row_style,
+                                code_fg,
+                                &ctx.code_font,
+                                &ctx.code_font,
+                                li,
+                            )),
+                    );
+                }
+            } else {
+                for (li, line) in lines.iter().enumerate() {
+                    col = col.child(doc_styled_line_element(
+                        ctx,
+                        line,
+                        row_style,
+                        code_fg,
+                        &ctx.code_font,
+                        &ctx.code_font,
+                        li,
+                    ));
+                }
             }
             col.into_any_element()
         }
