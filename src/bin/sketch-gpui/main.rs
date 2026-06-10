@@ -3044,8 +3044,10 @@ enum FlatItem {
         ids: Vec<ToolCallKey>,
     },
     /// A structurally-rendered block (table or fenced code block) that
-    /// replaces a range of frozen lines with proper layout.
-    Block(RenderedBlock),
+    /// replaces a range of frozen lines with proper layout. `Rc` so the
+    /// per-keystroke S1 rebuild reuses the parsed block by refcount bump
+    /// instead of deep-cloning it (see `AgentViewModel::resolved_blocks`).
+    Block(std::rc::Rc<RenderedBlock>),
     /// Visual divider at a turn boundary: role label + faint rule.
     TurnHeader { role: TurnRole },
     /// Pulsing indicator shown at transcript tail while awaiting reply.
@@ -3652,6 +3654,20 @@ fn should_follow_tail(input_mode: InputModeKind, follow_output: bool, cursor_at_
         InputModeKind::Chatbox => follow_output,
         InputModeKind::Worksheet => cursor_at_eof,
     }
+}
+
+/// 64-bit content hash of a detected block range's source lines — the
+/// `AgentViewModel::block_cache` key. Content (not position) so a streamed
+/// chunk that shifts every range downward still reuses every prior parse;
+/// see the field docs for the collision tradeoff.
+fn block_content_hash(lines: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    lines.len().hash(&mut h);
+    for l in lines {
+        l.hash(&mut h);
+    }
+    h.finish()
 }
 
 fn detect_block_ranges(lines: &[String], frozen_ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
@@ -5329,13 +5345,31 @@ impl TurnPhase {
 /// needs `tools`/`editor` and writes `block_cache`), which can't be borrowed
 /// while a method holds `&mut self` here — hence the split rather than one
 /// closure-taking `memoize`.
+/// A detected frozen block range `(start, end)` and its parse result —
+/// `None` = rejected by `parse_block_range`, renders as plain source lines
+/// (INV-10). The `Rc` is shared with `AgentViewModel::block_cache` and bumped
+/// (never deep-cloned) into `FlatItem::Block` on each rebuild.
+type ResolvedBlock = ((usize, usize), Option<std::rc::Rc<RenderedBlock>>);
+
 #[derive(Default)]
 struct AgentViewModel {
-    /// Cache of parsed RenderedBlocks keyed by `(start, end)` range.
-    /// Invalidated when frozen line count changes.
-    block_cache: std::collections::HashMap<(usize, usize), RenderedBlock>,
-    /// Frozen line count when `block_cache` was last populated.
+    /// Parsed-block cache keyed by a 64-bit hash of the range's SOURCE LINES,
+    /// not its `(start, end)` position: a streamed chunk inserts lines and
+    /// shifts every later range, so position keys missed on every chunk and
+    /// the entire frozen transcript re-parsed (pulldown-cmark + syntect) per
+    /// chunk. Content keys survive shifts; identical ranges share one `Rc`.
+    /// A 64-bit collision would render the wrong block — per-session and
+    /// transient, the same accepted risk as `view_model_fp`.
+    block_cache: std::collections::HashMap<u64, std::rc::Rc<RenderedBlock>>,
+    /// Frozen line count when `block_cache` was last (re)validated.
     block_cache_frozen_count: usize,
+    /// The detected ranges resolved to their parsed blocks (`None` = rejected
+    /// by `parse_block_range`, renders as plain source lines per INV-10).
+    /// Sorted by start, disjoint. Rebuilt only when the frozen line count
+    /// changes; every other S1 rebuild (each worksheet keystroke) just walks
+    /// it — the rebuild previously deep-cloned EVERY parsed block into fresh
+    /// per-rebuild maps, the dominant per-keystroke cost on large transcripts.
+    resolved_blocks: Vec<ResolvedBlock>,
     /// Memoized flat-items list. On a `view_model_fp` hit `render_agent`
     /// reuses this `Rc` verbatim and skips the whole rebuild (gutter scan,
     /// tool-anchor resolution, flat build, blank-collapse).
@@ -5393,6 +5427,257 @@ impl AgentViewModel {
         self.view_model_seq = self.view_model_seq.wrapping_add(1);
         (flat_rc, gutter_rc)
     }
+}
+
+/// S1 view-model rebuild — the `cached()` miss path of `render_agent`: the
+/// gutter-tag scan, tool-anchor resolution, frozen-block partition, flat
+/// build and blank-collapse. A top-level fn (not inlined in `render_agent`)
+/// so the per-keystroke cost is testable headlessly: `lines` /
+/// `frozen_ranges` are plain data and `c` comes from
+/// `AgentState::new_for_test` — no Window or App required.
+fn rebuild_agent_view_model(
+    c: &mut AgentState,
+    lines: &[String],
+    frozen_ranges: &[(usize, usize)],
+    frozen_line_count: usize,
+    theme: &Theme,
+    view_model_fp: u64,
+) -> (std::rc::Rc<Vec<FlatItem>>, std::rc::Rc<Vec<Option<TurnId>>>) {
+    // Per-line gutter tag, sourced from the editor's `TurnId` metadata
+    // keyed by `LineAnchor` (spec §11, §E2). Lines without a tag yet
+    // (currently-editable, not yet swept by Submit) render as a blank
+    // gutter. Lines whose anchor hasn't been allocated count as
+    // untagged — happens for editable lines the user just typed.
+    // Hoist the metadata view out of the per-line loop: `metadata::<TurnId>()`
+    // does a HashMap-by-TypeId lookup and builds a fresh view each call, so
+    // calling it once per line was O(n) view constructions per frame. Build
+    // it once and reuse it across all lines.
+    let gutter_tag_per_line: Vec<Option<TurnId>> = {
+        let turn_meta = c.editor.metadata::<TurnId>();
+        (0..lines.len())
+            .map(|i| {
+                c.editor
+                    .anchor_for_line_opt(i)
+                    .and_then(|a| turn_meta.get(a).copied())
+            })
+            .collect()
+    };
+
+    // ============ Virtualised list build ============
+    //
+    // Frozen (agent) content is parsed into RenderedBlocks so that
+    // tables, code blocks, headings, and lists display properly.
+    // Editable (user) content stays as per-line rendering with
+    // cursor/selection support.
+
+    // Build "tool calls anchored at line N" lookup, grouped by
+    // anchor line. All calls at the same anchor form one ToolGroup.
+    // Anchors are opaque `LineAnchor` ids (spec §E1); resolve via the
+    // editor each paint. Anchors whose line got consumed by a delete
+    // fall back to EOF so the tool block still renders, just at the
+    // tail of the transcript.
+    let eof_line = c.editor.document().line_count().saturating_sub(1);
+    let mut tools_at_line: std::collections::HashMap<usize, Vec<ToolCallKey>> =
+        std::collections::HashMap::new();
+    for id in &c.tools.order {
+        if let Some(&anchor) = c.tools.anchor.get(id) {
+            let line = c.editor.line_for_anchor(anchor).unwrap_or(eof_line);
+            tools_at_line.entry(line).or_default().push(id.clone());
+        }
+    }
+
+    // Detect tables and fenced code blocks in frozen content for
+    // block-level rendering; everything else stays line-by-line.
+    // Re-validated only when the frozen line count changes (a
+    // streamed chunk / submit) — a worksheet keystroke in the
+    // editable tail leaves all of this untouched. Parses are
+    // reused by CONTENT (see `AgentViewModel::block_cache`), so a
+    // chunk that shifts every range only re-parses ranges whose
+    // text actually changed. Rejected ranges resolve to `None`
+    // and render as their source lines (Finding 10, INV-10).
+    if frozen_line_count != c.view_model.block_cache_frozen_count {
+        let block_ranges = detect_block_ranges(lines, frozen_ranges);
+        let mut new_cache: std::collections::HashMap<u64, std::rc::Rc<RenderedBlock>> =
+            std::collections::HashMap::new();
+        let mut resolved: Vec<ResolvedBlock> = Vec::with_capacity(block_ranges.len());
+        for &(start, end) in &block_ranges {
+            let key = block_content_hash(&lines[start..end]);
+            let parsed = if let Some(block) = c.view_model.block_cache.get(&key) {
+                Some(block.clone())
+            } else if let BlockParse::Parsed(block) = parse_block_range(lines, start, end, theme) {
+                Some(std::rc::Rc::new(block))
+            } else {
+                None
+            };
+            if let Some(block) = &parsed {
+                new_cache.insert(key, block.clone());
+            }
+            resolved.push(((start, end), parsed));
+        }
+        c.block_ranges = block_ranges;
+        c.view_model.block_cache = new_cache;
+        c.view_model.resolved_blocks = resolved;
+        c.view_model.block_cache_frozen_count = frozen_line_count;
+    }
+
+    // The block/line partition reads `resolved_blocks` directly —
+    // sorted, disjoint, parsed-or-None per range — via a cursor
+    // in the flat loop below. (This used to materialize per-
+    // rebuild lookup maps, deep-cloning every parsed block on
+    // every rebuild — the dominant per-keystroke cost on large
+    // transcripts.)
+    let resolved = &c.view_model.resolved_blocks;
+    let mut next_block = 0usize;
+
+    // Flat ordering: TurnHeader?, line_0, tool_group_at[0], line_1, …
+    // Lines inside a detected block range are replaced by one
+    // FlatItem::Block at the range start; interior lines are skipped.
+    // TurnHeader items are inserted at turn boundaries (role changes).
+    let mut flat_items: Vec<FlatItem> = Vec::with_capacity(lines.len() * 2);
+    let mut prev_turn: Option<TurnId> = None;
+    for line_idx in 0..lines.len() {
+        // Insert a TurnHeader whenever the dominant turn changes.
+        let cur_turn = gutter_tag_per_line.get(line_idx).copied().flatten();
+        // Tools and sketch-local System notices don't get their own header
+        // and don't break the current turn run — a notice landing mid-turn
+        // must not re-emit a Claude header (Finding 5, INV-3). The
+        // total `HeaderRole::from_turn` returns `None` for those, so the
+        // header-owning turn set `{Llm, User}` is enforced by the type
+        // rather than an `unreachable!()` arm (Finding 6).
+        if let Some(tid) = cur_turn {
+            if let Some(role) = HeaderRole::from_turn(tid) {
+                let changed = match prev_turn {
+                    Some(prev) => prev != tid,
+                    None => true,
+                };
+                if changed {
+                    flat_items.push(FlatItem::TurnHeader {
+                        role: role.into_turn_role(),
+                    });
+                    prev_turn = Some(tid);
+                }
+            }
+        } else if prev_turn.is_some() {
+            // Editable (untagged) lines after frozen content = user input.
+            // Suppress the "You" header when the editable tail is all
+            // blank — in Chatbox mode the compose area is separate, so
+            // an empty transcript tail is just whitespace, not a turn.
+            let remaining_non_empty = (line_idx..lines.len()).any(|j| !lines[j].trim().is_empty());
+            if remaining_non_empty {
+                flat_items.push(FlatItem::TurnHeader {
+                    role: TurnRole::User,
+                });
+            }
+            prev_turn = None;
+        }
+
+        // Advance the resolved-range cursor past ranges that
+        // ended, then place this line: a PARSED range emits one
+        // Block (an Rc bump) at its start and subsumes its
+        // interior; an unparsed range or plain region emits Lines.
+        while next_block < resolved.len() && resolved[next_block].0.1 <= line_idx {
+            next_block += 1;
+        }
+        match resolved.get(next_block) {
+            Some(((start, end), Some(block))) if line_idx >= *start && line_idx < *end => {
+                if line_idx == *start {
+                    flat_items.push(FlatItem::Block(block.clone()));
+                }
+            }
+            _ => flat_items.push(FlatItem::Line(line_idx)),
+        }
+        // Tool groups anchored inside a block range still render.
+        if let Some(ids) = tools_at_line.get(&line_idx) {
+            flat_items.push(FlatItem::ToolGroup {
+                anchor_line: line_idx,
+                ids: ids.clone(),
+            });
+        }
+    }
+
+    // Collapse blank lines: (a) strip blank frozen (Claude) Lines
+    // entirely — they're protocol padding with no visual purpose,
+    // (b) strip blank Lines adjacent to ToolGroup / TurnHeader /
+    // Block items, and (c) collapse runs of consecutive blank
+    // user Lines to at most one.
+    {
+        let is_blank_line = |item: &FlatItem| -> bool {
+            matches!(item, FlatItem::Line(idx) if lines.get(*idx).is_none_or(|s| s.trim().is_empty()))
+        };
+        let is_frozen_line = |item: &FlatItem| -> bool {
+            matches!(item, FlatItem::Line(idx) if frozen_ranges.iter().any(|&(s, e)| *idx >= s && *idx < e))
+        };
+        let is_structural = |item: &FlatItem| -> bool {
+            matches!(
+                item,
+                FlatItem::ToolGroup { .. } | FlatItem::TurnHeader { .. } | FlatItem::Block(_)
+            )
+        };
+        let mut keep = vec![true; flat_items.len()];
+        for i in 0..flat_items.len() {
+            if !is_blank_line(&flat_items[i]) {
+                continue;
+            }
+            // Blank frozen lines are always stripped — they're just
+            // anchor padding inserted by the ACP splice logic.
+            if is_frozen_line(&flat_items[i]) {
+                keep[i] = false;
+                continue;
+            }
+            // Drop blank line if adjacent to a structural item.
+            let adj_structural = (i > 0 && is_structural(&flat_items[i - 1]))
+                || (i + 1 < flat_items.len() && is_structural(&flat_items[i + 1]));
+            if adj_structural {
+                keep[i] = false;
+                continue;
+            }
+            // Collapse consecutive blanks to one.
+            if i > 0 && is_blank_line(&flat_items[i - 1]) && keep[i - 1] {
+                keep[i] = false;
+            }
+        }
+        let mut j = 0;
+        // index drives an in-place compaction (keep[i] gates flat_items.swap(i, j))
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..flat_items.len() {
+            if keep[i] {
+                flat_items.swap(i, j);
+                j += 1;
+            }
+        }
+        flat_items.truncate(j);
+    }
+
+    // Coalesce a contiguous run of tool calls into ONE collapsible group
+    // so a long sequence (grep → grep → edit → read → …) doesn't flood the
+    // transcript. The blank anchor lines between adjacent tool calls were
+    // already stripped by the blank-collapse pass above, so a run shows up
+    // as directly-adjacent `ToolGroup`s; merge their ids into the first.
+    // Any prose Line, Block, or TurnHeader between two runs breaks the run
+    // (those are real content), so tool calls separated by agent text stay
+    // in separate groups. The merged group renders as a typed-count header
+    // (e.g. "4 grep, 3 edit, 7 read"), collapsed by default.
+    {
+        let mut merged: Vec<FlatItem> = Vec::with_capacity(flat_items.len());
+        for item in flat_items.drain(..) {
+            if let FlatItem::ToolGroup { ids, .. } = &item
+                && let Some(FlatItem::ToolGroup { ids: prev_ids, .. }) = merged.last_mut()
+            {
+                prev_ids.extend(ids.iter().cloned());
+                continue;
+            }
+            merged.push(item);
+        }
+        flat_items = merged;
+    }
+
+    // Thinking indicator at the tail while waiting for Claude.
+    if c.turn_phase.is_awaiting() {
+        flat_items.push(FlatItem::ThinkingIndicator);
+    }
+
+    c.view_model
+        .store(view_model_fp, flat_items, gutter_tag_per_line)
 }
 
 /// State held while the user is conversing with an ACP-attached Claude
@@ -16162,13 +16447,20 @@ impl SketchGpuiView {
             let cursor_line = c.editor.cursor().line;
             let ranges = c.block_ranges.clone();
             let line_count = c.editor.document().line_count();
-            let gutter_tags: Vec<Option<TurnId>> = (0..line_count)
-                .map(|i| {
-                    c.editor
-                        .anchor_for_line_opt(i)
-                        .and_then(|a| c.editor.metadata::<TurnId>().get(a).copied())
-                })
-                .collect();
+            // Hoist the metadata view out of the per-line loop — same fix as
+            // the S1 gutter scan: `metadata::<TurnId>()` does a by-TypeId map
+            // lookup and builds a fresh view per call, so calling it per line
+            // made every Worksheet keystroke O(n) view constructions.
+            let gutter_tags: Vec<Option<TurnId>> = {
+                let turn_meta = c.editor.metadata::<TurnId>();
+                (0..line_count)
+                    .map(|i| {
+                        c.editor
+                            .anchor_for_line_opt(i)
+                            .and_then(|a| turn_meta.get(a).copied())
+                    })
+                    .collect()
+            };
             let th_before = count_turn_headers_before(&gutter_tags, cursor_line);
             let target = cursor_visible_child_index(c, cursor_line, &ranges, th_before);
             c.list_state.scroll_to_reveal_item(target);
@@ -17438,242 +17730,14 @@ impl SketchGpuiView {
         let theme_ref = &self.theme;
         let (flat_items_arc, gutter_tag_snap) = match c.view_model.cached(view_model_fp) {
             Some(hit) => hit,
-            None => {
-                // Per-line gutter tag, sourced from the editor's `TurnId` metadata
-                // keyed by `LineAnchor` (spec §11, §E2). Lines without a tag yet
-                // (currently-editable, not yet swept by Submit) render as a blank
-                // gutter. Lines whose anchor hasn't been allocated count as
-                // untagged — happens for editable lines the user just typed.
-                // Hoist the metadata view out of the per-line loop: `metadata::<TurnId>()`
-                // does a HashMap-by-TypeId lookup and builds a fresh view each call, so
-                // calling it once per line was O(n) view constructions per frame. Build
-                // it once and reuse it across all lines.
-                let gutter_tag_per_line: Vec<Option<TurnId>> = {
-                    let turn_meta = c.editor.metadata::<TurnId>();
-                    (0..lines.len())
-                        .map(|i| {
-                            c.editor
-                                .anchor_for_line_opt(i)
-                                .and_then(|a| turn_meta.get(a).copied())
-                        })
-                        .collect()
-                };
-
-                // ============ Virtualised list build ============
-                //
-                // Frozen (agent) content is parsed into RenderedBlocks so that
-                // tables, code blocks, headings, and lists display properly.
-                // Editable (user) content stays as per-line rendering with
-                // cursor/selection support.
-
-                // Build "tool calls anchored at line N" lookup, grouped by
-                // anchor line. All calls at the same anchor form one ToolGroup.
-                // Anchors are opaque `LineAnchor` ids (spec §E1); resolve via the
-                // editor each paint. Anchors whose line got consumed by a delete
-                // fall back to EOF so the tool block still renders, just at the
-                // tail of the transcript.
-                let eof_line = c.editor.document().line_count().saturating_sub(1);
-                let mut tools_at_line: std::collections::HashMap<usize, Vec<ToolCallKey>> =
-                    std::collections::HashMap::new();
-                for id in &c.tools.order {
-                    if let Some(&anchor) = c.tools.anchor.get(id) {
-                        let line = c.editor.line_for_anchor(anchor).unwrap_or(eof_line);
-                        tools_at_line.entry(line).or_default().push(id.clone());
-                    }
-                }
-
-                // Detect tables and fenced code blocks in frozen content for
-                // block-level rendering. Everything else stays line-by-line.
-                // Cached: only re-detect/re-parse when frozen line count changes.
-                // (`frozen_ranges` / `frozen_line_count` were resolved above for the
-                // view-model fingerprint and are reused here.)
-                if frozen_line_count != c.view_model.block_cache_frozen_count {
-                    let block_ranges = detect_block_ranges(lines, &frozen_ranges);
-                    let mut new_cache: std::collections::HashMap<(usize, usize), RenderedBlock> =
-                        std::collections::HashMap::new();
-                    for &(start, end) in &block_ranges {
-                        // Reuse existing cache entry if the range is unchanged. A
-                        // range that `parse_block_range` rejects (`FallBackToLines`)
-                        // gets NO cache entry, so the partition below renders its
-                        // source lines individually (Finding 10, INV-10).
-                        if let Some(cached) = c.view_model.block_cache.get(&(start, end)) {
-                            new_cache.insert((start, end), cached.clone());
-                        } else if let BlockParse::Parsed(block) =
-                            parse_block_range(lines, start, end, theme_ref)
-                        {
-                            new_cache.insert((start, end), block);
-                        }
-                    }
-                    c.block_ranges = block_ranges;
-                    c.view_model.block_cache = new_cache;
-                    c.view_model.block_cache_frozen_count = frozen_line_count;
-                }
-
-                // Build the block/line partition from ONE source: `block_cache` holds
-                // exactly the ranges that became a `Parsed` block. `block_at_start`
-                // (the line that emits a `FlatItem::Block`) and `in_block` (the
-                // interior lines that the Block subsumes) are derived from the same
-                // iteration, so `in_block` cannot disagree with what was emitted — a
-                // detected-but-unparsed range contributes neither, and the flat build
-                // falls back to a Line per source line (Finding 10, INV-10).
-                let block_ranges = c.block_ranges.clone();
-                let mut block_at_start: std::collections::HashMap<usize, RenderedBlock> =
-                    std::collections::HashMap::new();
-                let mut in_block: std::collections::HashSet<usize> =
-                    std::collections::HashSet::new();
-                for &(start, end) in &block_ranges {
-                    if let Some(block) = c.view_model.block_cache.get(&(start, end)) {
-                        block_at_start.insert(start, block.clone());
-                        for li in start..end {
-                            in_block.insert(li);
-                        }
-                    }
-                }
-
-                // Flat ordering: TurnHeader?, line_0, tool_group_at[0], line_1, …
-                // Lines inside a detected block range are replaced by one
-                // FlatItem::Block at the range start; interior lines are skipped.
-                // TurnHeader items are inserted at turn boundaries (role changes).
-                let mut flat_items: Vec<FlatItem> = Vec::with_capacity(lines.len() * 2);
-                let mut prev_turn: Option<TurnId> = None;
-                for line_idx in 0..lines.len() {
-                    // Insert a TurnHeader whenever the dominant turn changes.
-                    let cur_turn = gutter_tag_per_line.get(line_idx).copied().flatten();
-                    // Tools and sketch-local System notices don't get their own header
-                    // and don't break the current turn run — a notice landing mid-turn
-                    // must not re-emit a Claude header (Finding 5, INV-3). The
-                    // total `HeaderRole::from_turn` returns `None` for those, so the
-                    // header-owning turn set `{Llm, User}` is enforced by the type
-                    // rather than an `unreachable!()` arm (Finding 6).
-                    if let Some(tid) = cur_turn {
-                        if let Some(role) = HeaderRole::from_turn(tid) {
-                            let changed = match prev_turn {
-                                Some(prev) => prev != tid,
-                                None => true,
-                            };
-                            if changed {
-                                flat_items.push(FlatItem::TurnHeader {
-                                    role: role.into_turn_role(),
-                                });
-                                prev_turn = Some(tid);
-                            }
-                        }
-                    } else if prev_turn.is_some() {
-                        // Editable (untagged) lines after frozen content = user input.
-                        // Suppress the "You" header when the editable tail is all
-                        // blank — in Chatbox mode the compose area is separate, so
-                        // an empty transcript tail is just whitespace, not a turn.
-                        let remaining_non_empty =
-                            (line_idx..lines.len()).any(|j| !lines[j].trim().is_empty());
-                        if remaining_non_empty {
-                            flat_items.push(FlatItem::TurnHeader {
-                                role: TurnRole::User,
-                            });
-                        }
-                        prev_turn = None;
-                    }
-
-                    if let Some(block) = block_at_start.remove(&line_idx) {
-                        flat_items.push(FlatItem::Block(block));
-                    } else if !in_block.contains(&line_idx) {
-                        flat_items.push(FlatItem::Line(line_idx));
-                    }
-                    // Tool groups anchored inside a block range still render.
-                    if let Some(ids) = tools_at_line.get(&line_idx) {
-                        flat_items.push(FlatItem::ToolGroup {
-                            anchor_line: line_idx,
-                            ids: ids.clone(),
-                        });
-                    }
-                }
-
-                // Collapse blank lines: (a) strip blank frozen (Claude) Lines
-                // entirely — they're protocol padding with no visual purpose,
-                // (b) strip blank Lines adjacent to ToolGroup / TurnHeader /
-                // Block items, and (c) collapse runs of consecutive blank
-                // user Lines to at most one.
-                {
-                    let is_blank_line = |item: &FlatItem| -> bool {
-                        matches!(item, FlatItem::Line(idx) if lines.get(*idx).is_none_or(|s| s.trim().is_empty()))
-                    };
-                    let is_frozen_line = |item: &FlatItem| -> bool {
-                        matches!(item, FlatItem::Line(idx) if frozen_ranges.iter().any(|&(s, e)| *idx >= s && *idx < e))
-                    };
-                    let is_structural = |item: &FlatItem| -> bool {
-                        matches!(
-                            item,
-                            FlatItem::ToolGroup { .. }
-                                | FlatItem::TurnHeader { .. }
-                                | FlatItem::Block(_)
-                        )
-                    };
-                    let mut keep = vec![true; flat_items.len()];
-                    for i in 0..flat_items.len() {
-                        if !is_blank_line(&flat_items[i]) {
-                            continue;
-                        }
-                        // Blank frozen lines are always stripped — they're just
-                        // anchor padding inserted by the ACP splice logic.
-                        if is_frozen_line(&flat_items[i]) {
-                            keep[i] = false;
-                            continue;
-                        }
-                        // Drop blank line if adjacent to a structural item.
-                        let adj_structural = (i > 0 && is_structural(&flat_items[i - 1]))
-                            || (i + 1 < flat_items.len() && is_structural(&flat_items[i + 1]));
-                        if adj_structural {
-                            keep[i] = false;
-                            continue;
-                        }
-                        // Collapse consecutive blanks to one.
-                        if i > 0 && is_blank_line(&flat_items[i - 1]) && keep[i - 1] {
-                            keep[i] = false;
-                        }
-                    }
-                    let mut j = 0;
-                    // index drives an in-place compaction (keep[i] gates flat_items.swap(i, j))
-                    #[allow(clippy::needless_range_loop)]
-                    for i in 0..flat_items.len() {
-                        if keep[i] {
-                            flat_items.swap(i, j);
-                            j += 1;
-                        }
-                    }
-                    flat_items.truncate(j);
-                }
-
-                // Coalesce a contiguous run of tool calls into ONE collapsible group
-                // so a long sequence (grep → grep → edit → read → …) doesn't flood the
-                // transcript. The blank anchor lines between adjacent tool calls were
-                // already stripped by the blank-collapse pass above, so a run shows up
-                // as directly-adjacent `ToolGroup`s; merge their ids into the first.
-                // Any prose Line, Block, or TurnHeader between two runs breaks the run
-                // (those are real content), so tool calls separated by agent text stay
-                // in separate groups. The merged group renders as a typed-count header
-                // (e.g. "4 grep, 3 edit, 7 read"), collapsed by default.
-                {
-                    let mut merged: Vec<FlatItem> = Vec::with_capacity(flat_items.len());
-                    for item in flat_items.drain(..) {
-                        if let FlatItem::ToolGroup { ids, .. } = &item
-                            && let Some(FlatItem::ToolGroup { ids: prev_ids, .. }) =
-                                merged.last_mut()
-                        {
-                            prev_ids.extend(ids.iter().cloned());
-                            continue;
-                        }
-                        merged.push(item);
-                    }
-                    flat_items = merged;
-                }
-
-                // Thinking indicator at the tail while waiting for Claude.
-                if c.turn_phase.is_awaiting() {
-                    flat_items.push(FlatItem::ThinkingIndicator);
-                }
-
-                c.view_model
-                    .store(view_model_fp, flat_items, gutter_tag_per_line)
-            }
+            None => rebuild_agent_view_model(
+                c,
+                lines,
+                &frozen_ranges,
+                frozen_line_count,
+                theme_ref,
+                view_model_fp,
+            ),
         };
 
         // Splice ListState to match new item count. When block ranges
@@ -20191,6 +20255,163 @@ mod tests {
         assert!(before.is_empty());
         assert_eq!(ch, ' ');
         assert!(after.is_empty());
+    }
+
+    /// Builds a synthetic frozen transcript: `n_blocks` fenced code blocks
+    /// (`block_lines` lines each) separated by prose, plus one editable tail
+    /// line. Returns `(lines, frozen_ranges, frozen_line_count)`.
+    fn synthetic_transcript(
+        n_blocks: usize,
+        block_lines: usize,
+    ) -> (Vec<String>, Vec<(usize, usize)>, usize) {
+        let mut lines: Vec<String> = Vec::new();
+        for b in 0..n_blocks {
+            lines.push(format!("prose before block {b}"));
+            lines.push("```rust".to_string());
+            for i in 0..block_lines {
+                lines.push(format!("let x_{b}_{i} = {i};"));
+            }
+            lines.push("```".to_string());
+        }
+        lines.push(String::new()); // editable tail
+        let frozen_len = lines.len() - 1;
+        (lines, vec![(0usize, frozen_len)], frozen_len)
+    }
+
+    fn block_ptrs(flat: &[FlatItem]) -> Vec<*const RenderedBlock> {
+        flat.iter()
+            .filter_map(|f| match f {
+                FlatItem::Block(b) => Some(std::rc::Rc::as_ptr(b)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Worksheet-typing perf invariant: an S1 rebuild whose frozen prefix is
+    /// unchanged (a keystroke in the editable tail bumps the fingerprint but
+    /// not the frozen line count) must reuse every parsed `RenderedBlock` by
+    /// Rc IDENTITY — no re-parse, no deep clone. The old rebuild deep-cloned
+    /// every parsed block into fresh per-rebuild lookup maps on every
+    /// keystroke — the dominant per-keystroke cost on large transcripts (the
+    /// "Worksheet mode is slow to type" report).
+    #[test]
+    fn worksheet_rebuild_reuses_parsed_blocks_by_identity() {
+        let mut st = AgentState::new_for_test();
+        let theme = Theme::default();
+        let (lines, frozen, frozen_len) = synthetic_transcript(3, 4);
+
+        let (flat1, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &theme, 1);
+        let blocks1 = block_ptrs(&flat1);
+        assert_eq!(blocks1.len(), 3, "three fenced blocks must parse");
+
+        // Keystroke in the editable tail: new fingerprint, same frozen count.
+        let mut lines2 = lines.clone();
+        *lines2.last_mut().unwrap() = "x".to_string();
+        let (flat2, _) = rebuild_agent_view_model(&mut st, &lines2, &frozen, frozen_len, &theme, 2);
+        assert_eq!(
+            blocks1,
+            block_ptrs(&flat2),
+            "a tail keystroke must reuse every parsed block by Rc identity"
+        );
+    }
+
+    /// Streaming perf invariant: a chunk that inserts lines ABOVE the blocks
+    /// shifts every `(start, end)` range, but parses are keyed by CONTENT —
+    /// the revalidation must keep Rc identity for every block whose text is
+    /// unchanged. The old position-keyed cache missed on every shift, so each
+    /// streamed chunk re-parsed (pulldown-cmark + syntect) the entire frozen
+    /// transcript — the paint-thread flood behind "typing lags while a turn
+    /// streams".
+    #[test]
+    fn streamed_shift_reuses_parses_by_content() {
+        let mut st = AgentState::new_for_test();
+        let theme = Theme::default();
+        let (lines, frozen, frozen_len) = synthetic_transcript(3, 4);
+
+        let (flat1, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &theme, 1);
+        let blocks1 = block_ptrs(&flat1);
+        assert_eq!(blocks1.len(), 3);
+
+        // Simulated streamed chunk: one new prose line at the top; every
+        // block range shifts down by one and the frozen prefix grows.
+        let mut lines2 = vec!["new streamed prose".to_string()];
+        lines2.extend(lines.iter().cloned());
+        let frozen2 = vec![(0usize, frozen_len + 1)];
+        let (flat2, _) =
+            rebuild_agent_view_model(&mut st, &lines2, &frozen2, frozen_len + 1, &theme, 2);
+        assert_eq!(
+            blocks1,
+            block_ptrs(&flat2),
+            "a range shift with unchanged block text must reuse every parse by Rc identity"
+        );
+    }
+
+    /// INV-10 at the rebuild level: a detected range that `parse_block_range`
+    /// rejects (here a pipe "table" without a separator row) resolves to
+    /// `None` in `resolved_blocks` and must render as its source Lines — no
+    /// Block item, no swallowed lines.
+    #[test]
+    fn rebuild_renders_unparsed_range_as_lines() {
+        let mut st = AgentState::new_for_test();
+        let theme = Theme::default();
+        let lines: Vec<String> = vec![
+            "| a | b |".to_string(),
+            "| 1 | 2 |".to_string(),
+            "| 3 | 4 |".to_string(),
+            String::new(), // editable tail
+        ];
+        let frozen = vec![(0usize, 3)];
+        let (flat, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, 3, &theme, 1);
+        assert!(
+            !flat.iter().any(|f| matches!(f, FlatItem::Block(_))),
+            "rejected range must emit no Block item"
+        );
+        let line_items: Vec<usize> = flat
+            .iter()
+            .filter_map(|f| match f {
+                FlatItem::Line(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            line_items,
+            vec![0, 1, 2, 3],
+            "every source line of an unparsed range must render as a Line \
+             (plus the editable tail — a lone user blank not adjacent to a \
+             structural item is kept, not collapsed)"
+        );
+    }
+
+    /// Cost probe for the worksheet-keystroke path: repeated rebuilds over a
+    /// large transcript with the frozen prefix unchanged. Prints the per-
+    /// rebuild cost; the assert is a generous debug-build ceiling that only
+    /// trips if the rebuild regresses to re-parsing/deep-cloning per
+    /// keystroke again.
+    #[test]
+    fn worksheet_rebuild_cost_probe() {
+        let mut st = AgentState::new_for_test();
+        let theme = Theme::default();
+        let (mut lines, frozen, frozen_len) = synthetic_transcript(50, 60);
+
+        // Warm: parse all blocks once.
+        let _ = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &theme, 0);
+
+        const ROUNDS: u64 = 200;
+        let t0 = std::time::Instant::now();
+        for k in 0..ROUNDS {
+            let n = lines.len();
+            lines[n - 1] = format!("typing {k}");
+            let _ = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &theme, k + 1);
+        }
+        let per = t0.elapsed() / ROUNDS as u32;
+        eprintln!(
+            "[probe] worksheet rebuild: {} lines, 50 blocks → {per:?}/keystroke",
+            lines.len()
+        );
+        assert!(
+            per < std::time::Duration::from_millis(10),
+            "worksheet rebuild regressed to {per:?}/keystroke (budget 10ms debug)"
+        );
     }
 
     /// S1 enforcement, on the split `cached` + `store` API: an unchanged
