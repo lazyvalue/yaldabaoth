@@ -1,6 +1,6 @@
 # Tiles and Apps — Content Model
 
-**Status:** DRAFT
+**Status:** ACTIVE
 **Last updated:** 2026-06-10
 **Owner:** content model (`WindowContent` → `App`)
 
@@ -222,6 +222,13 @@ restore target it returns to the stashed `Viewing`/`Editing`.
   `WindowContent → App`, `Browser` folded into `BufferMode::Picking`, Cmd+O
   Buffer-scoped, stashes narrowed to `BufferApp`. Migration mapping and
   ~126-site impact captured for the implementation pass.
+- 2026-06-10 — **Implemented and ACTIVE.** Landed in two commits (mechanical
+  re-nest + behavioral pass): `WindowContent → App`, 125 sites migrated, stashes
+  narrowed to `BufferApp`, Cmd+O Buffer-scoped, no-stash fallbacks, persist tag
+  shape changed (no version field). Both bins build clean; 136+64 bin/lib tests
+  pass (the 2 pre-existing `snapshot_test` failures are unrelated). Human runtime
+  smoke passed (Cmd+O scoping, agent-inert, back-to-buffer, session-close
+  fallback, Doc↔Edit toggle). All 7 behaviors verified at file:line.
 - 2026-06-10 — Adversarial-review pass (verdict REVISE, all items folded in):
   B7 corrected to describe the existing `serde_json::...ok()` discard rather
   than a nonexistent version field; B6 now covers the Agent-side no-stash
