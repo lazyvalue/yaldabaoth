@@ -44,7 +44,7 @@ impl SketchGpuiView {
         // is disjoint from &self.render_X's other field accesses.
         let layout = unsafe { &mut *layout_ptr };
         if self.workspace.tabs[tab_idx].layout_mode == workspace::LayoutMode::Desktop {
-            return self.render_desktop(root, layout, focused_id, attach_focus, cx);
+            return self.render_desktop(root, layout, focused_id, attach_focus, rail_focusable, cx);
         }
         self.render_layout(root, layout, focused_id, attach_focus, rail_focusable, cx)
     }
@@ -61,6 +61,7 @@ impl SketchGpuiView {
         layout: &mut workspace::Layout<WindowContent>,
         focused_id: workspace::WindowId,
         attach_focus: bool,
+        rail_focusable: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tab_idx = self.workspace.active_tab;
@@ -330,11 +331,21 @@ impl SketchGpuiView {
             canvas = canvas.child(frame);
         }
 
-        CaptureBounds {
+        let canvas_el = CaptureBounds {
             inner: canvas.into_any_element(),
             sink: self.desktop_canvas_bounds.clone(),
         }
-        .into_any_element()
+        .into_any_element();
+        // Rail coexistence (spec Builds On / spec-rail.md): in desktop mode
+        // the rail wraps the whole CANVAS (there is no single focused-leaf
+        // wrapper to ride). This is also load-bearing for the keyboard: when
+        // the rail holds focus, `leaf_attach_focus` is false and the RAIL
+        // element must exist to carry the focus handle — before this wrap,
+        // opening the outline rail in desktop mode rendered no rail at all
+        // and attached focus to NOTHING, killing every key binding (menus
+        // included) until restart. CaptureBounds sits INSIDE the wrap so
+        // mouse math tracks the rail-shifted canvas origin.
+        self.wrap_leaf_with_rail(canvas_el, rail_focusable, cx)
     }
 
     /// Panel pixel size derived from the desktop GRID config (spec
