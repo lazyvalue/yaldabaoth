@@ -537,6 +537,52 @@ pub struct DesktopDrag {
     pub active: bool,
 }
 
+/// A tile's extent in slots (spec-desktop-mode Behavior 4b). Each axis ≥ 1;
+/// default 1 × 1. A tile at anchor `(r, c)` with span `(rows, cols)` occupies
+/// the rectangle `[r, r+rows) × [c, c+cols)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Span {
+    pub rows: u32,
+    pub cols: u32,
+}
+
+impl Span {
+    pub const ONE: Span = Span { rows: 1, cols: 1 };
+
+    pub fn new(rows: u32, cols: u32) -> Self {
+        Self {
+            rows: rows.max(1),
+            cols: cols.max(1),
+        }
+    }
+}
+
+impl Default for Span {
+    fn default() -> Self {
+        Span::ONE
+    }
+}
+
+/// Which edge a desktop resize drag is pulling (spec Behavior 4b). v1 grows
+/// east/south only, so the tile's anchor never moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeEdge {
+    East,
+    South,
+}
+
+/// Transient edge-resize gesture. Like `DesktopDrag`: plain pixels in desktop
+/// coordinates (pre-pan); never persisted.
+#[derive(Debug, Clone, Copy)]
+pub struct DesktopResize {
+    /// The tile being resized.
+    pub id: WindowId,
+    /// Which edge is being pulled.
+    pub edge: ResizeEdge,
+    /// Current pointer position in desktop coordinates.
+    pub pointer: (f32, f32),
+}
+
 /// Per-tab desktop-mode geometry (spec-desktop-mode.md). The layout tree
 /// remains the content owner; this owns ONLY placement. Invariant
 /// (Behavior 2): exactly one entry per tree leaf, no two entries share a
@@ -549,11 +595,16 @@ pub struct DesktopState {
     /// leaf. Kept sorted by every mutator so "the sequence" is never a second
     /// piece of state that can drift.
     pub slots: Vec<(WindowId, Slot)>,
+    /// Per-tile extent (spec Behavior 4b); absent = 1 × 1. Sparse: only tiles
+    /// grown past 1 × 1 appear here, so the common case stays empty.
+    pub spans: HashMap<WindowId, Span>,
     /// Viewport pan over the desktop, in pixels. Transient-but-kept across
     /// mode switches; not persisted.
     pub pan: (f32, f32),
     /// Live drag, if any.
     pub drag: Option<DesktopDrag>,
+    /// Live edge resize, if any (spec Behavior 4b).
+    pub resize: Option<DesktopResize>,
     /// The window the auto-pan last revealed. The render path pans to the
     /// focused tile only when focus CHANGED since the last frame, so a
     /// manual pan away from the focused tile isn't fought every frame.
@@ -565,11 +616,78 @@ impl DesktopState {
         self.slots.iter().find(|(w, _)| *w == id).map(|&(_, s)| s)
     }
 
+    /// The tile whose RECTANGLE covers `slot` (rectangle-aware, spec
+    /// Behavior 4b). With all spans 1 × 1 this is just the anchor match.
     pub fn occupant(&self, slot: Slot) -> Option<WindowId> {
-        self.slots
-            .iter()
-            .find(|&&(_, s)| s == slot)
-            .map(|&(id, _)| id)
+        self.slots.iter().find_map(|&(id, anchor)| {
+            let sp = self.span_of(id);
+            let covers = slot.row >= anchor.row
+                && slot.row < anchor.row + sp.rows
+                && slot.col >= anchor.col
+                && slot.col < anchor.col + sp.cols;
+            covers.then_some(id)
+        })
+    }
+
+    /// A tile's extent; absent from the map = 1 × 1.
+    pub fn span_of(&self, id: WindowId) -> Span {
+        self.spans.get(&id).copied().unwrap_or(Span::ONE)
+    }
+
+    /// Anchor + span, or `None` if the tile has no slot.
+    pub fn rect_of(&self, id: WindowId) -> Option<(Slot, Span)> {
+        self.slot_of(id).map(|s| (s, self.span_of(id)))
+    }
+
+    /// Commit a tile's span, keeping the map sparse (1 × 1 stores nothing).
+    pub fn set_span(&mut self, id: WindowId, span: Span) {
+        if span == Span::ONE {
+            self.spans.remove(&id);
+        } else {
+            self.spans.insert(id, span);
+        }
+    }
+
+    /// True if every slot in the rectangle at `anchor` of `span` is free of
+    /// any tile other than `exclude`.
+    fn rect_free(&self, anchor: Slot, span: Span, exclude: WindowId) -> bool {
+        for dr in 0..span.rows {
+            for dc in 0..span.cols {
+                let cell = Slot::new(anchor.row + dr, anchor.col + dc);
+                if matches!(self.occupant(cell), Some(id) if id != exclude) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Largest span reachable by growing `id`'s `edge` toward `desired` whole
+    /// slots, clamped so no other tile is overlapped (Block rule, spec
+    /// Behavior 4b). Shrinking is always allowed to the 1 × 1 minimum; the
+    /// other axis is held at its current value.
+    pub fn clamp_span(&self, id: WindowId, edge: ResizeEdge, desired: u32) -> Span {
+        let cur = self.span_of(id);
+        let Some(anchor) = self.slot_of(id) else {
+            return cur;
+        };
+        let desired = desired.max(1);
+        let mut ext = 1;
+        while ext < desired {
+            let cand = match edge {
+                ResizeEdge::East => Span::new(cur.rows, ext + 1),
+                ResizeEdge::South => Span::new(ext + 1, cur.cols),
+            };
+            if self.rect_free(anchor, cand, id) {
+                ext += 1;
+            } else {
+                break;
+            }
+        }
+        match edge {
+            ResizeEdge::East => Span::new(cur.rows, ext),
+            ResizeEdge::South => Span::new(ext, cur.cols),
+        }
     }
 
     fn sort(&mut self) {
@@ -607,49 +725,96 @@ impl DesktopState {
         let before = self.slots.len();
         self.slots.retain(|(id, _)| leaves.contains(id));
         changed |= self.slots.len() != before;
+        // Drop spans whose tile is gone (its rectangle becomes gaps).
+        let spans_before = self.spans.len();
+        self.spans.retain(|id, _| leaves.contains(id));
+        changed |= self.spans.len() != spans_before;
 
         for &leaf in leaves {
             if self.slot_of(leaf).is_some() {
                 continue;
             }
+            // New leaves are always 1 × 1. Prefer the slot after the focused
+            // tile; if that insertion is wall-rejected (Behavior 4b), fall back
+            // to the first free slot, which is guaranteed to accept.
             let target = match self.slot_of(focused) {
                 Some(f) => f.succ(w),
                 None => self.first_free(w),
             };
-            self.insert_shift(leaf, target, w);
+            if !self.insert_shift(leaf, target, w) {
+                let free = self.first_free(w);
+                self.insert_shift(leaf, free, w);
+            }
             changed = true;
         }
         changed
     }
 
-    /// The Behavior-4 drop: place `id` at `target`. An empty target is a
-    /// plain move (the old slot becomes a gap). An occupied target inserts:
-    /// the occupant and each subsequent tile in the contiguous occupied run
-    /// along the W-wrapped successor chain shift forward one slot; the run
-    /// stops at the first gap, which absorbs the ripple. Shifts are applied
-    /// back-to-front so no two tiles ever share a slot mid-flight.
-    pub fn insert_shift(&mut self, id: WindowId, target: Slot, w: u32) {
-        // Vacate the dragged tile first — its old slot is the natural gap
-        // left behind, and it must not participate in its own run.
+    /// The Behavior-4 drop, rectangle-aware (Behavior 4b). Returns whether
+    /// `id` was placed at `target`.
+    ///
+    /// A 1 × 1 tile inserts via the W-wrapped run, which collects only 1 × 1
+    /// occupants; a multi-slot tile (and a run that never meets a gap) is a
+    /// **wall** — a wall-blocked insertion is REJECTED and `id` stays at its
+    /// original slot. A multi-slot tile is placed only when its whole
+    /// rectangle is free; otherwise rejected. Either outcome preserves the
+    /// non-overlapping-rectangles invariant.
+    pub fn insert_shift(&mut self, id: WindowId, target: Slot, w: u32) -> bool {
+        let orig = self.slot_of(id);
+        let span = self.span_of(id);
+        // Tentatively vacate so `id` never collides with itself.
         self.slots.retain(|(wid, _)| *wid != id);
 
-        // Collect the contiguous occupied run starting at `target`.
-        let mut run: Vec<(WindowId, Slot)> = Vec::new();
-        let mut s = target;
-        while let Some(occ) = self.occupant(s) {
-            run.push((occ, s));
-            s = s.succ(w);
-        }
-        // Shift back-to-front.
-        for &(occ, from) in run.iter().rev() {
-            let to = from.succ(w);
-            if let Some(entry) = self.slots.iter_mut().find(|(wid, _)| *wid == occ) {
-                entry.1 = to;
+        let placed = if span != Span::ONE {
+            // Spanned tile: place only if the whole rectangle is free.
+            if self.rect_free(target, span, id) {
+                self.slots.push((id, target));
+                true
+            } else {
+                false
+            }
+        } else if let Some(run) = self.absorbable_run(target, w) {
+            // Shift the run back-to-front so no two tiles collide mid-flight.
+            for &(occ, from) in run.iter().rev() {
+                if let Some(entry) = self.slots.iter_mut().find(|(wid, _)| *wid == occ) {
+                    entry.1 = from.succ(w);
+                }
+            }
+            self.slots.push((id, target));
+            true
+        } else {
+            false
+        };
+
+        if !placed {
+            if let Some(o) = orig {
+                self.slots.push((id, o)); // drop rejected — restore.
             }
         }
-
-        self.slots.push((id, target));
         self.sort();
+        placed
+    }
+
+    /// The contiguous 1 × 1 occupied run starting at `target` along the
+    /// W-wrapped chain, IF a gap absorbs it. `None` when the run meets a
+    /// **wall** (a multi-slot tile) before any gap — an unabsorbable
+    /// insertion. Terminates: `succ` strictly increases in row-major order
+    /// and the tiles are finite, so a gap is always reached.
+    fn absorbable_run(&self, target: Slot, w: u32) -> Option<Vec<(WindowId, Slot)>> {
+        let mut run: Vec<(WindowId, Slot)> = Vec::new();
+        let mut s = target;
+        loop {
+            match self.occupant(s) {
+                None => return Some(run), // gap absorbs the ripple
+                Some(occ) => {
+                    if self.span_of(occ) != Span::ONE {
+                        return None; // multi-slot wall
+                    }
+                    run.push((occ, s));
+                    s = s.succ(w);
+                }
+            }
+        }
     }
 
     /// Spatial focus navigation (spec Behavior 5): nearest occupied slot
@@ -699,14 +864,17 @@ impl DesktopState {
     /// Bounding box of occupied slots: `(max_row, max_col)` inclusive, or
     /// `None` when empty. The pan clamp allows one slot of margin beyond it.
     pub fn occupied_extent(&self) -> Option<(u32, u32)> {
-        let mut it = self.slots.iter();
-        let &(_, first) = it.next()?;
-        let mut max = (first.row, first.col);
-        for &(_, s) in it {
-            max.0 = max.0.max(s.row);
-            max.1 = max.1.max(s.col);
+        let mut max: Option<(u32, u32)> = None;
+        for &(id, s) in &self.slots {
+            let sp = self.span_of(id);
+            // Inclusive far corner of the tile's rectangle.
+            let corner = (s.row + sp.rows - 1, s.col + sp.cols - 1);
+            max = Some(match max {
+                Some((mr, mc)) => (mr.max(corner.0), mc.max(corner.1)),
+                None => corner,
+            });
         }
-        Some(max)
+        max
     }
 }
 
@@ -728,6 +896,16 @@ pub fn slot_origin(slot: Slot, tile: (f32, f32), gutter: f32) -> (f32, f32) {
         gutter + slot.col as f32 * (tile.0 + gutter),
         gutter + slot.row as f32 * (tile.1 + gutter),
     )
+}
+
+/// Pixel rect of a tile: anchor origin plus span extent (spec Behavior 3 /
+/// 4b). Returns `(x, y, w, h)` in desktop coordinates; a 1 × 1 span is exactly
+/// one `tile`-sized cell.
+pub fn tile_rect(slot: Slot, span: Span, tile: (f32, f32), gutter: f32) -> (f32, f32, f32, f32) {
+    let (x, y) = slot_origin(slot, tile, gutter);
+    let w = span.cols as f32 * (tile.0 + gutter) - gutter;
+    let h = span.rows as f32 * (tile.1 + gutter) - gutter;
+    (x, y, w, h)
 }
 
 /// The slot whose cell contains (or is nearest to) a desktop-coordinate
@@ -1901,6 +2079,123 @@ mod desktop_tests {
             Some(Slot::new(0, 2)),
             "beyond-W tile untouched"
         );
+    }
+
+    // ── Tile span / edge resize (spec Behavior 4b) ──────────────────────
+
+    #[test]
+    fn occupant_is_rectangle_aware() {
+        let mut d = DesktopState::default();
+        d.slots.push((1, Slot::new(0, 0)));
+        d.set_span(1, Span::new(2, 2)); // covers (0,0),(0,1),(1,0),(1,1)
+        for cell in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            assert_eq!(d.occupant(Slot::new(cell.0, cell.1)), Some(1));
+        }
+        assert_eq!(d.occupant(Slot::new(0, 2)), None);
+        assert_eq!(d.occupant(Slot::new(2, 0)), None);
+    }
+
+    #[test]
+    fn resize_east_grows_into_free_desktop_and_clamps_at_neighbor() {
+        let mut d = DesktopState::default();
+        d.seed(&[1, 2], 5); // 1@(0,0), 2@(0,1)
+        // Tile 1 wants to grow east a lot, but tile 2 sits at (0,1).
+        assert_eq!(d.clamp_span(1, ResizeEdge::East, 4), Span::new(1, 1));
+        // Move 2 out of the way; now 1 can grow east up to the requested cols.
+        d.insert_shift(2, Slot::new(0, 4), 5);
+        assert_eq!(d.clamp_span(1, ResizeEdge::East, 3), Span::new(1, 3));
+        // ...but not past the relocated neighbor at col 4.
+        assert_eq!(d.clamp_span(1, ResizeEdge::East, 9), Span::new(1, 4));
+    }
+
+    #[test]
+    fn resize_south_independent_of_columns() {
+        let mut d = DesktopState::default();
+        d.slots.push((1, Slot::new(0, 0)));
+        assert_eq!(d.clamp_span(1, ResizeEdge::South, 3), Span::new(3, 1));
+        d.set_span(1, Span::new(3, 1));
+        // A blocker two rows down clamps further south growth.
+        d.slots.push((2, Slot::new(3, 0)));
+        assert_eq!(d.clamp_span(1, ResizeEdge::South, 5), Span::new(3, 1));
+    }
+
+    #[test]
+    fn shrink_is_always_allowed_to_one() {
+        let mut d = DesktopState::default();
+        d.slots.push((1, Slot::new(0, 0)));
+        d.set_span(1, Span::new(3, 3));
+        // Even fully surrounded, a tile may shrink.
+        d.slots.push((2, Slot::new(0, 3)));
+        d.slots.push((3, Slot::new(3, 0)));
+        assert_eq!(d.clamp_span(1, ResizeEdge::East, 1), Span::new(3, 1));
+        assert_eq!(d.clamp_span(1, ResizeEdge::South, 1), Span::new(1, 3));
+    }
+
+    #[test]
+    fn spanned_tile_is_a_wall_that_rejects_unabsorbable_inserts() {
+        let mut d = DesktopState::default();
+        d.seed(&[1, 2, 3], 3); // 1@(0,0) 2@(0,1) 3@(0,2)
+        d.set_span(2, Span::new(1, 2)); // 2 now covers (0,1),(0,2) — overlaps 3!
+        // (Set up directly for the test; reposition 3 to avoid overlap.)
+        d.slots.retain(|(id, _)| *id != 3);
+        d.slots.push((3, Slot::new(1, 0)));
+        d.sort();
+        // Drop 3 onto (0,0): run = [1@(0,0)], next is (0,1) which is the
+        // spanned tile 2 → wall, no gap before it → rejected, nothing moves.
+        let placed = d.insert_shift(3, Slot::new(0, 0), 3);
+        assert!(!placed, "insertion blocked by the spanned wall");
+        assert_eq!(d.slot_of(3), Some(Slot::new(1, 0)), "3 stays home");
+        assert_eq!(d.slot_of(1), Some(Slot::new(0, 0)), "1 didn't move");
+    }
+
+    #[test]
+    fn drop_onto_a_spanned_tile_is_rejected() {
+        let mut d = DesktopState::default();
+        d.slots.push((1, Slot::new(0, 0)));
+        d.set_span(1, Span::new(2, 2));
+        d.slots.push((2, Slot::new(2, 2)));
+        d.sort();
+        // Drop 2 onto (0,1) — inside 1's rectangle.
+        let placed = d.insert_shift(2, Slot::new(0, 1), 4);
+        assert!(!placed);
+        assert_eq!(d.slot_of(2), Some(Slot::new(2, 2)), "2 returns home");
+    }
+
+    #[test]
+    fn spanned_tile_moves_only_onto_a_free_rectangle() {
+        let mut d = DesktopState::default();
+        d.slots.push((1, Slot::new(0, 0)));
+        d.set_span(1, Span::new(2, 2));
+        d.slots.push((2, Slot::new(0, 2)));
+        d.sort();
+        // 1 (2×2) onto (0,1) would overlap 2 at (0,2)..(1,2)? 1's rect there is
+        // (0,1)(0,2)(1,1)(1,2) — overlaps 2@(0,2). Rejected.
+        assert!(!d.insert_shift(1, Slot::new(0, 1), 8));
+        assert_eq!(d.slot_of(1), Some(Slot::new(0, 0)), "stayed home");
+        // Onto (2,0): rect (2,0)(2,1)(3,0)(3,1) — all free. Accepted.
+        assert!(d.insert_shift(1, Slot::new(2, 0), 8));
+        assert_eq!(d.slot_of(1), Some(Slot::new(2, 0)));
+    }
+
+    #[test]
+    fn occupied_extent_accounts_for_span() {
+        let mut d = DesktopState::default();
+        d.slots.push((1, Slot::new(0, 0)));
+        d.set_span(1, Span::new(2, 3));
+        // Far corner is (0+2-1, 0+3-1) = (1, 2).
+        assert_eq!(d.occupied_extent(), Some((1, 2)));
+    }
+
+    #[test]
+    fn reconcile_drops_spans_of_closed_tiles() {
+        let mut d = DesktopState::default();
+        d.seed(&[1, 2], 3);
+        d.set_span(1, Span::new(2, 2));
+        // Tile 1 closes; only 2 remains.
+        d.reconcile(&[2], 2, 3);
+        assert_eq!(d.span_of(1), Span::ONE, "stale span dropped");
+        assert!(d.spans.is_empty());
+        assert_eq!(d.slot_of(2), Some(Slot::new(0, 1)), "2's slot untouched");
     }
 
     #[test]
