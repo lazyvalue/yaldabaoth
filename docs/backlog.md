@@ -86,11 +86,15 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
   sketch/server exits. Something on the teardown path (GUI direct-spawn drops?
   server crash-kills?) doesn't kill the child. Inventory: `pgrep -fl
   claude-code-acp`. Needs a teardown audit + maybe a startup reaper.
-- **Reconnect bursts at GUI launch** — `READY` (mild). ~25 conns
-  opened+closed within ~1s on each GUI start (server log 2026-06-09 05:47,
-  19:06). Self-terminating — the 2026-06-07 zombie-owner fix holds (every conn
-  closes) — but the client side shouldn't need 25 connection attempts to come
-  up. Likely a per-slot/per-probe connect fan-out; cheap log-driven repro.
+- **Reconnect bursts at GUI launch** — `NEEDS-RUNTIME` (probable root cause
+  fixed 2026-06-10, `3f85365`). The shared server pump was stored in an agent
+  SLOT; every slot-state replacement during startup (restore → re-bootstrap →
+  set_screen) cancelled the pump, dropped the notification receiver, killed
+  the connection, and triggered a reconnect — hence ~25 conns per launch and,
+  once timing shifted, hard "attach failed: session server disconnected" for
+  new sessions. Pump is now a view-lifetime singleton (like the lease
+  heartbeat). Verify the burst is gone in the server log after a few
+  launches.
 
 - **Edit-view typing crash + latency** — `FIXED` (2026-06-06). `reparse` fed
   tree-sitter a stale (never-`edit()`'d) tree → nondeterministic SIGSEGV
