@@ -1,4 +1,4 @@
-//! Browser pane + file-browser/outline rail methods on SketchGpuiView:
+//! Browser tile + file-browser/outline rail methods on SketchGpuiView:
 //! navigation, filtering, rail focus/resize and selection. Extracted
 //! verbatim from main.rs (split-gpui-main, stage 2).
 
@@ -125,7 +125,7 @@ impl SketchGpuiView {
             WindowContent::Browser(b) => b.underlying.take(),
             _ => return,
         };
-        // If the browser was opened over an existing pane (Cmd-O from a
+        // If the browser was opened over an existing tile (Cmd-O from a
         // Doc/Edit/Claude window), restore that prior content in place —
         // user pressed Esc/q to cancel the file pick.
         if let Some(boxed) = underlying {
@@ -135,10 +135,10 @@ impl SketchGpuiView {
             return;
         }
         // Standalone browser (new-tab open, persisted browser tab, split
-        // fallback). Try to dismiss the pane:
-        //   - one pane of a split → close just that pane.
-        //   - sole pane in tab, multiple tabs → close the tab.
-        //   - sole pane in sole tab → no-op. Esc/q is intentionally NOT a
+        // fallback). Try to dismiss the tile:
+        //   - one tile of a split → close just that tile.
+        //   - sole tile in tab, multiple tabs → close the tab.
+        //   - sole tile in sole tab → no-op. Esc/q is intentionally NOT a
         //     quit shortcut — too easy to lose the app by mashing keys.
         //     Quit lives on Cmd-Q.
         match self.workspace.close_focused() {
@@ -189,7 +189,7 @@ impl SketchGpuiView {
         };
         if !filter_mode {
             // Not filtering — bare `m`/`'` starts a mark chord so browser
-            // panes can be marked/jumped like any other pane.
+            // tiles can be marked/jumped like any other tile.
             if self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
                 cx.stop_propagation();
             }
@@ -476,7 +476,7 @@ impl SketchGpuiView {
         if let Some(path) = to_open {
             // Selecting a file opens it in the focused leaf; the rail stays
             // open but yields focus back to the content (spec §7, §12).
-            // `open_file` replaces a transient Browser pane in place or
+            // `open_file` replaces a transient Browser tile in place or
             // pushes a new tab otherwise.
             self.open_file(path);
             if let Some(r) = self.rail_mut() {

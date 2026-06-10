@@ -160,12 +160,12 @@ pub struct AgentTheme {
     pub tool_failed: Color,
     pub tool_pending: Color,
 
-    // -- tool body panes --
-    /// Background for tool input/content panes.
+    // -- tool body tiles --
+    /// Background for tool input/content tiles.
     pub tool_body_bg: Color,
-    /// Background for tool output panes.
+    /// Background for tool output tiles.
     pub tool_output_bg: Color,
-    /// Text color inside tool body panes.
+    /// Text color inside tool body tiles.
     pub tool_body_fg: Color,
 
     // -- diff highlighting in tool output --
@@ -186,13 +186,13 @@ pub struct AgentTheme {
     /// Cursor color in the agent window.
     pub cursor: Color,
 
-    // -- sidepane chrome --
-    /// Background for sidepanes (tasklist, subagents).
-    pub pane_bg: Color,
-    /// Border between sidepanes and the main transcript.
-    pub pane_border: Color,
-    /// Header text color in sidepanes.
-    pub pane_header: Color,
+    // -- sidebar chrome --
+    /// Background for sidebars (tasklist, subagents).
+    pub sidebar_bg: Color,
+    /// Border between sidebars and the main transcript.
+    pub sidebar_border: Color,
+    /// Header text color in sidebars.
+    pub sidebar_header: Color,
     /// Active/warm accent (in-flight timer, focused subagent).
     pub warm_accent: Color,
 }
@@ -1165,9 +1165,9 @@ impl AgentTheme {
             compose_separator: Color::Rgb(0x62, 0x72, 0xa4),
             cursor: Color::Rgb(0xff, 0x55, 0x55),
 
-            pane_bg: Color::Rgb(0x21, 0x22, 0x2c),
-            pane_border: Color::Rgb(0x44, 0x47, 0x5a),
-            pane_header: Color::Rgb(0x8b, 0xe9, 0xfd),
+            sidebar_bg: Color::Rgb(0x21, 0x22, 0x2c),
+            sidebar_border: Color::Rgb(0x44, 0x47, 0x5a),
+            sidebar_header: Color::Rgb(0x8b, 0xe9, 0xfd),
             warm_accent: Color::Rgb(0xf1, 0xfa, 0x8c),
         }
     }
@@ -1210,9 +1210,9 @@ impl AgentTheme {
             compose_separator: Color::Rgb(0x39, 0x50, 0x6d),
             cursor: Color::Rgb(0xc9, 0x4f, 0x6d),
 
-            pane_bg: Color::Rgb(0x17, 0x1e, 0x28),
-            pane_border: Color::Rgb(0x2b, 0x3b, 0x51),
-            pane_header: Color::Rgb(0x63, 0xcd, 0xcf),
+            sidebar_bg: Color::Rgb(0x17, 0x1e, 0x28),
+            sidebar_border: Color::Rgb(0x2b, 0x3b, 0x51),
+            sidebar_header: Color::Rgb(0x63, 0xcd, 0xcf),
             warm_accent: Color::Rgb(0xdb, 0xc0, 0x74),
         }
     }
@@ -1255,9 +1255,9 @@ impl AgentTheme {
             compose_separator: Color::Rgb(0x93, 0xa1, 0xa1),
             cursor: Color::Rgb(0xdc, 0x32, 0x2f),
 
-            pane_bg: Color::Rgb(0xee, 0xe8, 0xd5),
-            pane_border: Color::Rgb(0xd3, 0xcc, 0xbc),
-            pane_header: Color::Rgb(0x26, 0x8b, 0xd2),
+            sidebar_bg: Color::Rgb(0xee, 0xe8, 0xd5),
+            sidebar_border: Color::Rgb(0xd3, 0xcc, 0xbc),
+            sidebar_header: Color::Rgb(0x26, 0x8b, 0xd2),
             warm_accent: Color::Rgb(0xb5, 0x89, 0x00),
         }
     }
@@ -1300,9 +1300,9 @@ impl AgentTheme {
             compose_separator: Color::Rgb(0x58, 0x6e, 0x75),
             cursor: Color::Rgb(0xdc, 0x32, 0x2f),
 
-            pane_bg: Color::Rgb(0x04, 0x2d, 0x38),
-            pane_border: Color::Rgb(0x07, 0x42, 0x4e),
-            pane_header: Color::Rgb(0x26, 0x8b, 0xd2),
+            sidebar_bg: Color::Rgb(0x04, 0x2d, 0x38),
+            sidebar_border: Color::Rgb(0x07, 0x42, 0x4e),
+            sidebar_header: Color::Rgb(0x26, 0x8b, 0xd2),
             warm_accent: Color::Rgb(0xb5, 0x89, 0x00),
         }
     }
@@ -1345,9 +1345,9 @@ impl AgentTheme {
             compose_separator: Color::Rgb(0x50, 0x49, 0x45),
             cursor: Color::Rgb(0xfb, 0x49, 0x34),
 
-            pane_bg: Color::Rgb(0x1f, 0x1e, 0x1e),
-            pane_border: Color::Rgb(0x3c, 0x38, 0x36),
-            pane_header: Color::Rgb(0xfa, 0xbd, 0x2f),
+            sidebar_bg: Color::Rgb(0x1f, 0x1e, 0x1e),
+            sidebar_border: Color::Rgb(0x3c, 0x38, 0x36),
+            sidebar_header: Color::Rgb(0xfa, 0xbd, 0x2f),
             warm_accent: Color::Rgb(0xfa, 0xbd, 0x2f),
         }
     }
@@ -1390,9 +1390,9 @@ impl AgentTheme {
             compose_separator: Color::Rgb(0xcc, 0xc1, 0xb7),
             cursor: Color::Rgb(0x99, 0x0f, 0x3d),
 
-            pane_bg: Color::Rgb(0xf2, 0xdf, 0xce),
-            pane_border: Color::Rgb(0xd8, 0xd0, 0xc4),
-            pane_header: Color::Rgb(0x99, 0x0f, 0x3d),
+            sidebar_bg: Color::Rgb(0xf2, 0xdf, 0xce),
+            sidebar_border: Color::Rgb(0xd8, 0xd0, 0xc4),
+            sidebar_header: Color::Rgb(0x99, 0x0f, 0x3d),
             warm_accent: Color::Rgb(0xff, 0x88, 0x33),
         }
     }
@@ -1435,9 +1435,9 @@ impl AgentTheme {
             compose_separator: Color::Rgb(0x4a, 0x44, 0x40),
             cursor: Color::Rgb(0xd6, 0x3b, 0x6a),
 
-            pane_bg: Color::Rgb(0x22, 0x1f, 0x1d),
-            pane_border: Color::Rgb(0x36, 0x32, 0x2e),
-            pane_header: Color::Rgb(0xd6, 0x3b, 0x6a),
+            sidebar_bg: Color::Rgb(0x22, 0x1f, 0x1d),
+            sidebar_border: Color::Rgb(0x36, 0x32, 0x2e),
+            sidebar_header: Color::Rgb(0xd6, 0x3b, 0x6a),
             warm_accent: Color::Rgb(0xff, 0x88, 0x33),
         }
     }
@@ -1480,9 +1480,9 @@ impl AgentTheme {
             compose_separator: Color::Rgb(0xb5, 0xa4, 0x83),
             cursor: Color::Rgb(0x8b, 0x35, 0x35),
 
-            pane_bg: Color::Rgb(0xed, 0xeb, 0xe6),
-            pane_border: Color::Rgb(0xd6, 0xd2, 0xca),
-            pane_header: Color::Rgb(0x40, 0x5d, 0x72), // steel
+            sidebar_bg: Color::Rgb(0xed, 0xeb, 0xe6),
+            sidebar_border: Color::Rgb(0xd6, 0xd2, 0xca),
+            sidebar_header: Color::Rgb(0x40, 0x5d, 0x72), // steel
             warm_accent: Color::Rgb(0x8b, 0x70, 0x20),
         }
     }

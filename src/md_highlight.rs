@@ -27,7 +27,7 @@ pub fn highlight_markdown_lines(lines: &[String], theme: &Theme) -> Vec<Vec<Segm
 
 /// Like `highlight_markdown_lines`, but strips inline delimiters (`**`, `` ` ``,
 /// `~~`, `#` prefixes, link syntax) so the output reads as clean prose with
-/// styling only. Used by the agent pane where raw markup is noise.
+/// styling only. Used by the agent tile where raw markup is noise.
 pub fn highlight_markdown_lines_stripped(lines: &[String], theme: &Theme) -> Vec<Vec<Segment>> {
     highlight_markdown_lines_inner(lines, theme, true, None)
 }

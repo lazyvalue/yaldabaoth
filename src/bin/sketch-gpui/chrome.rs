@@ -49,11 +49,11 @@ impl SketchGpuiView {
         self.render_layout(root, layout, focused_id, attach_focus, rail_focusable, cx)
     }
 
-    /// Desktop mode (spec-desktop-mode.md): fixed-size panels at slot
+    /// Desktop mode (spec-desktop-mode.md): fixed-size tiles at slot
     /// positions on a pannable canvas. The layout tree is the CONTENT owner
     /// (leaves render exactly as in tiling); geometry comes from the tab's
-    /// `DesktopState`. Only viewport-intersecting panels render, except the
-    /// focused panel — it carries the focus handle and the per-screen action
+    /// `DesktopState`. Only viewport-intersecting tiles render, except the
+    /// focused tile — it carries the focus handle and the per-screen action
     /// wiring, and culling it would strand the keyboard (spec Behavior 3).
     fn render_desktop(
         &mut self,
@@ -65,7 +65,7 @@ impl SketchGpuiView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tab_idx = self.workspace.active_tab;
-        let panel = self.desktop_panel_px();
+        let tile = self.desktop_tile_px();
         let g = DESKTOP_GUTTER;
         let (_, _, mut canvas_w, mut canvas_h) = self.desktop_canvas_bounds.get();
         // First frame: bounds not captured yet — approximate with the window
@@ -78,12 +78,12 @@ impl SketchGpuiView {
         }
         // Grid semantics: the wrap width IS the configured column count —
         // no longer derived from the viewport (the viewport now derives the
-        // panel SIZE instead).
+        // tile SIZE instead).
         let eff_w = self.desktop_grid_cols.max(1);
 
         // ── Slot upkeep: seed on first entry, reconcile every frame (cheap,
         // O(n), no-op when the Behavior-2 invariant already holds), reveal
-        // the focused panel when focus changed, clamp pan to the occupied
+        // the focused tile when focus changed, clamp pan to the occupied
         // bounding box + one slot of margin. ──
         {
             let tab = &mut self.workspace.tabs[tab_idx];
@@ -95,17 +95,17 @@ impl SketchGpuiView {
             }
             if tab.desktop.last_reveal != Some(focused_id) {
                 if let Some(slot) = tab.desktop.slot_of(focused_id) {
-                    let (x, y) = workspace::slot_origin(slot, panel, g);
+                    let (x, y) = workspace::slot_origin(slot, tile, g);
                     let pan = &mut tab.desktop.pan;
                     if x - g < pan.0 {
                         pan.0 = (x - g).max(0.0);
-                    } else if x + panel.0 + g > pan.0 + canvas_w {
-                        pan.0 = x + panel.0 + g - canvas_w;
+                    } else if x + tile.0 + g > pan.0 + canvas_w {
+                        pan.0 = x + tile.0 + g - canvas_w;
                     }
                     if y - g < pan.1 {
                         pan.1 = (y - g).max(0.0);
-                    } else if y + panel.1 + g > pan.1 + canvas_h {
-                        pan.1 = y + panel.1 + g - canvas_h;
+                    } else if y + tile.1 + g > pan.1 + canvas_h {
+                        pan.1 = y + tile.1 + g - canvas_h;
                     }
                 }
                 tab.desktop.last_reveal = Some(focused_id);
@@ -113,7 +113,7 @@ impl SketchGpuiView {
             let (max_r, max_c) = tab.desktop.occupied_extent().unwrap_or((0, 0));
             // Pannable extent: through one margin slot beyond occupied.
             let extent =
-                workspace::slot_origin(workspace::Slot::new(max_r + 2, max_c + 2), panel, g);
+                workspace::slot_origin(workspace::Slot::new(max_r + 2, max_c + 2), tile, g);
             let pan = &mut tab.desktop.pan;
             pan.0 = pan.0.clamp(0.0, (extent.0 - canvas_w).max(0.0));
             pan.1 = pan.1.clamp(0.0, (extent.1 - canvas_h).max(0.0));
@@ -127,7 +127,7 @@ impl SketchGpuiView {
         let content_fg = self.editor_fg();
         let dim: Hsla = nc(self.theme.agent.dim);
         let accent: Hsla = rgb(CURSOR_BAR_COLOR).into();
-        let panel_bg = tint_bg(base_bg, 0.5, 0.06, 0.02);
+        let tile_bg = tint_bg(base_bg, 0.5, 0.06, 0.02);
         let title_bg = tint_bg(base_bg, 0.5, 0.12, 0.05);
 
         let mut canvas = root
@@ -161,7 +161,7 @@ impl SketchGpuiView {
 
         // ── Dot grid over the visible area (slot-pitch corners). ──
         {
-            let pitch = (panel.0 + g, panel.1 + g);
+            let pitch = (tile.0 + g, tile.1 + g);
             let first_col = (pan.0 / pitch.0).floor().max(0.0) as u32;
             let first_row = (pan.1 / pitch.1).floor().max(0.0) as u32;
             let ncols = (canvas_w / pitch.0).ceil() as u32 + 1;
@@ -169,7 +169,7 @@ impl SketchGpuiView {
             let dot = dim.opacity(0.35);
             for r in first_row..first_row + nrows {
                 for c in first_col..first_col + ncols {
-                    let (x, y) = workspace::slot_origin(workspace::Slot::new(r, c), panel, g);
+                    let (x, y) = workspace::slot_origin(workspace::Slot::new(r, c), tile, g);
                     canvas = canvas.child(
                         div()
                             .absolute()
@@ -191,28 +191,28 @@ impl SketchGpuiView {
                 .find(|&&(id, _)| id == d.id)
                 .map(|&(_, s)| s)
             {
-                let (x, y) = workspace::slot_origin(home, panel, g);
+                let (x, y) = workspace::slot_origin(home, tile, g);
                 canvas = canvas.child(
                     div()
                         .absolute()
                         .left(px(x - pan.0))
                         .top(px(y - pan.1))
-                        .w(px(panel.0))
-                        .h(px(panel.1))
+                        .w(px(tile.0))
+                        .h(px(tile.1))
                         .border_1()
                         .border_color(dim.opacity(0.6))
                         .rounded_md(),
                 );
             }
             if let Some(t) = d.target {
-                let (x, y) = workspace::slot_origin(t, panel, g);
+                let (x, y) = workspace::slot_origin(t, tile, g);
                 canvas = canvas.child(
                     div()
                         .absolute()
                         .left(px(x - pan.0))
                         .top(px(y - pan.1))
-                        .w(px(panel.0))
-                        .h(px(panel.1))
+                        .w(px(tile.0))
+                        .h(px(tile.1))
                         .border_2()
                         .border_color(accent.opacity(0.8))
                         .rounded_md(),
@@ -220,12 +220,12 @@ impl SketchGpuiView {
             }
         }
 
-        // ── Panels. ──
+        // ── Tiles. ──
         for (id, slot) in slot_list {
             let dragging = drag.filter(|d| d.active && d.id == id);
-            let (sx, sy) = workspace::slot_origin(slot, panel, g);
+            let (sx, sy) = workspace::slot_origin(slot, tile, g);
             let (x, y) = match dragging {
-                // The dragged panel itself follows the pointer — the real
+                // The dragged tile itself follows the pointer — the real
                 // content rides along semi-transparent (no separate ghost).
                 Some(d) => (
                     d.pointer.0 - d.grab.0 - pan.0,
@@ -233,9 +233,9 @@ impl SketchGpuiView {
                 ),
                 None => (sx - pan.0, sy - pan.1),
             };
-            let visible = x + panel.0 > 0.0 && x < canvas_w && y + panel.1 > 0.0 && y < canvas_h;
+            let visible = x + tile.0 > 0.0 && x < canvas_w && y + tile.1 > 0.0 && y < canvas_h;
             let is_focused = id == focused_id;
-            // Focused panel is exempt from culling — its element tree holds
+            // Focused tile is exempt from culling — its element tree holds
             // the focus handle + per-screen action wiring (spec Behavior 3).
             if !visible && !is_focused {
                 continue;
@@ -249,7 +249,7 @@ impl SketchGpuiView {
             // structural tree mutation happens during this render pass.
             let content = unsafe { &mut *content_ptr };
 
-            let title = Self::desktop_panel_title(content);
+            let title = Self::desktop_tile_title(content);
             let mark = self.workspace.marks.mark_for_window(id);
 
             // The leaf-root CONTRACT (see `screen_root` in render() and the
@@ -259,7 +259,7 @@ impl SketchGpuiView {
             // Missing any piece breaks them: without flex_col the header/
             // body/footer stack in block layout and the flex_1 virtualized
             // body collapses to its minimum height (content huddled at the
-            // top of the panel, dead space below).
+            // top of the tile, dead space below).
             let base = div()
                 .size_full()
                 .flex()
@@ -314,13 +314,13 @@ impl SketchGpuiView {
                 .absolute()
                 .left(px(x))
                 .top(px(y))
-                .w(px(panel.0))
-                .h(px(panel.1))
+                .w(px(tile.0))
+                .h(px(tile.1))
                 .flex()
                 .flex_col()
                 .overflow_hidden()
                 .rounded_md()
-                .bg(panel_bg)
+                .bg(tile_bg)
                 .border_1()
                 .border_color(if is_focused { accent } else { dim.opacity(0.4) })
                 .child(title_bar)
@@ -348,13 +348,13 @@ impl SketchGpuiView {
         self.wrap_leaf_with_rail(canvas_el, rail_focusable, cx)
     }
 
-    /// Panel pixel size derived from the desktop GRID config (spec
+    /// Tile pixel size derived from the desktop GRID config (spec
     /// Behavior 6, grid revision): the viewport is divided into
-    /// `desktop_grid_cols × desktop_grid_rows` panels (gutters between and
-    /// around), so changing the grid — or the window — resizes panels while
+    /// `desktop_grid_cols × desktop_grid_rows` tiles (gutters between and
+    /// around), so changing the grid — or the window — resizes tiles while
     /// slots stay untouched (slots, not pixels, remain the stored unit).
-    /// Floors keep panels usable when the window gets tiny.
-    fn desktop_panel_px(&self) -> (f32, f32) {
+    /// Floors keep tiles usable when the window gets tiny.
+    fn desktop_tile_px(&self) -> (f32, f32) {
         let (_, _, mut w, mut h) = self.desktop_canvas_bounds.get();
         if w <= 0.0 {
             w = self.viewport_width_px.max(1.0);
@@ -370,8 +370,8 @@ impl SketchGpuiView {
         )
     }
 
-    /// Title-bar label for a panel.
-    fn desktop_panel_title(content: &WindowContent) -> String {
+    /// Title-bar label for a tile.
+    fn desktop_tile_title(content: &WindowContent) -> String {
         match content {
             WindowContent::Doc(d) => d.file_label.to_string(),
             WindowContent::Edit(e) => e.file_label.to_string(),
@@ -384,7 +384,7 @@ impl SketchGpuiView {
         }
     }
 
-    /// Mouse-down on a panel title bar: focus the panel (spec Behavior 4 —
+    /// Mouse-down on a tile title bar: focus the tile (spec Behavior 4 —
     /// arming a drag also focuses) and arm a drag. The drag activates only
     /// once the pointer crosses the click threshold in
     /// [`desktop_pointer_move`](Self::desktop_pointer_move).
@@ -395,7 +395,7 @@ impl SketchGpuiView {
         cx: &mut Context<Self>,
     ) {
         let (cx0, cy0, _, _) = self.desktop_canvas_bounds.get();
-        let panel = self.desktop_panel_px();
+        let tile = self.desktop_tile_px();
         let tab_idx = self.workspace.active_tab;
         let tab = &mut self.workspace.tabs[tab_idx];
         tab.focused = id;
@@ -405,7 +405,7 @@ impl SketchGpuiView {
         };
         let pan = tab.desktop.pan;
         let desktop_pos = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
-        let (ox, oy) = workspace::slot_origin(slot, panel, DESKTOP_GUTTER);
+        let (ox, oy) = workspace::slot_origin(slot, tile, DESKTOP_GUTTER);
         tab.desktop.drag = Some(workspace::DesktopDrag {
             id,
             grab: (desktop_pos.0 - ox, desktop_pos.1 - oy),
@@ -421,7 +421,7 @@ impl SketchGpuiView {
     /// edge auto-pan). No-op when no drag is armed.
     pub(crate) fn desktop_pointer_move(&mut self, window_pos: (f32, f32), cx: &mut Context<Self>) {
         let (cx0, cy0, cw, ch) = self.desktop_canvas_bounds.get();
-        let panel = self.desktop_panel_px();
+        let tile = self.desktop_tile_px();
         let tab_idx = self.workspace.active_tab;
 
         // Edge auto-pan first (uses window-relative position within canvas).
@@ -460,10 +460,10 @@ impl SketchGpuiView {
         // Target from the ghost's CENTER, not the raw pointer — dragging by
         // the title bar biases the pointer to the top edge otherwise.
         let center = (
-            d.pointer.0 - d.grab.0 + panel.0 / 2.0,
-            d.pointer.1 - d.grab.1 + panel.1 / 2.0,
+            d.pointer.0 - d.grab.0 + tile.0 / 2.0,
+            d.pointer.1 - d.grab.1 + tile.1 / 2.0,
         );
-        d.target = Some(workspace::slot_at(center, panel, DESKTOP_GUTTER));
+        d.target = Some(workspace::slot_at(center, tile, DESKTOP_GUTTER));
         tab.desktop.drag = Some(d);
         cx.notify();
     }
@@ -547,7 +547,7 @@ impl SketchGpuiView {
                 };
                 // Pin the rail to the leaf it was opened from, not whichever
                 // leaf currently has focus. Falls back to the focused leaf
-                // when no pinned_to is set (single-pane case).
+                // when no pinned_to is set (single-tile case).
                 let is_rail_pinned = self
                     .workspace
                     .active_tab()
@@ -559,7 +559,7 @@ impl SketchGpuiView {
                 } else {
                     painted
                 };
-                // Focus indicator: thick border around the whole pane+rail
+                // Focus indicator: thick border around the whole tile+rail
                 // group when there's more than one leaf, plus a small "focused"
                 // tag in the upper-right corner.
                 let multi_leaf = self.active_tab_leaf_count() > 1;
@@ -863,7 +863,7 @@ impl SketchGpuiView {
 
     /// Inject the active tab's rail beside the **focused leaf's** content
     /// (spec-rail.md §8, adjusted: the rail is chrome local to the focused
-    /// pane, not the whole window — so in a split it sits against the focused
+    /// tile, not the whole window — so in a split it sits against the focused
     /// content, not at the window edge). `content_el` is the already-rendered
     /// focused-leaf element. No-op passthrough when no rail is open.
     /// `rail_focusable` is false when an overlay owns focus — the rail still
@@ -910,7 +910,7 @@ impl SketchGpuiView {
     /// Re-derive the outline rail's heading entries from the focused window
     /// (spec §13). No-op when the rail is closed or showing the file browser.
     /// Change-key for the outline: focused window id + that window's content
-    /// version. Re-deriving the outline is O(document) (an Edit pane allocates
+    /// version. Re-deriving the outline is O(document) (an Edit tile allocates
     /// the whole rope via `full_text()` and scans every line), and the render
     /// loop runs every frame — including every keystroke. Keying on this lets
     /// `refresh_outline_rail` skip the work when nothing relevant changed.
@@ -945,7 +945,7 @@ impl SketchGpuiView {
         }
         // Skip the O(document) re-derivation when neither the focused window nor
         // its content changed since the last derive (the common case — cursor
-        // blink, scroll, cross-pane notify, and unrelated keystrokes).
+        // blink, scroll, cross-tile notify, and unrelated keystrokes).
         let key = self.outline_change_key();
         let unchanged = self
             .workspace
@@ -1074,12 +1074,12 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
-            .on_action(cx.listener(Self::move_pane))
-            .on_action(cx.listener(Self::also_show_pane))
+            .on_action(cx.listener(Self::move_tile))
+            .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
-            // Pane focus motion — without these the ctrl-w h/j/k/l chords
+            // Tile focus motion — without these the ctrl-w h/j/k/l chords
             // are swallowed when the rail holds `track_focus`.
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))

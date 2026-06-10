@@ -7,7 +7,7 @@
 ## Builds On
 
 - **`spec-agent-window.md`** — Defines the structural layout (status strip, transcript,
-  chatbox, sidepanes) and the worksheet/chatbox behavioral contracts, plus the Editor
+  chatbox, sidebars) and the worksheet/chatbox behavioral contracts, plus the Editor
   Extensions (`§E1` LineAnchor, `§E2` LineMetadata, `§E3` `append_llm_chunk`). This spec
   does **not** redefine layout or worksheet semantics. It defines the **data-flow
   lifecycle**: how an ACP signal becomes a rendered pixel, and how a transcript is
@@ -151,7 +151,7 @@ turns "user text + turn number" into frozen, tagged transcript lines — used by
 Submit and replay.
 
 **INV-7 (no transcript persistence dependence).** The transcript editor is *not* persisted
-to disk (`acp_sessions.json` holds only id/label/active/mode/pane flags). Therefore the
+to disk (`acp_sessions.json` holds only id/label/active/mode/tile flags). Therefore the
 transcript MUST be fully reconstructible from the replay stream alone. Any content that is
 neither replayed (stage [1]) nor locally regenerated is permanently lost on refresh. This is
 the invariant defect #2 violates.

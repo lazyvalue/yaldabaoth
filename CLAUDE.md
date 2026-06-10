@@ -58,7 +58,7 @@ so items stay crate-visible regardless of file):
   `on_action` wiring.
 - `screens.rs` — the screen render bodies: `render_doc`, `render_edit`
   (Code + WP), `render_agent`, `render_browser`.
-- `agent.rs` — agent-pane data layer: tool-call model, `FlatItem` view model
+- `agent.rs` — agent-tile data layer: tool-call model, `FlatItem` view model
   + S1 cache + `rebuild_agent_view_model`, `TurnPhase`, `AgentState`,
   `AgentRing`.
 - `agent_ui.rs` — agent/session methods on the view: open/attach/create/
@@ -76,7 +76,7 @@ so items stay crate-visible regardless of file):
   `FocusedWindow`, etc.). See `docs/specs/spec-tabs-and-splits.md`.
 - `tests.rs` / `verify_harness.rs` — unit tests + headless render harness.
 
-Keep the split honest: new agent-pane logic goes in `agent.rs`/`agent_ui.rs`,
+Keep the split honest: new agent-tile logic goes in `agent.rs`/`agent_ui.rs`,
 new render helpers in `render_blocks.rs` — don't let `main.rs` re-accrete.
 
 ### GUI screens

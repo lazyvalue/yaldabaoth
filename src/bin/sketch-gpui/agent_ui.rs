@@ -1,4 +1,4 @@
-//! Agent (Claude) pane UI + session-server wiring on SketchGpuiView:
+//! Agent (Claude) tile UI + session-server wiring on SketchGpuiView:
 //! open/attach/create/close session flows, lease heartbeat, server pump
 //! + notification reducer (apply_server_batch / apply_reply_events /
 //! apply_agent_event), submit paths, and the Claude key handler.
@@ -133,7 +133,7 @@ impl SketchGpuiView {
         let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
             return;
         };
-        // Snapshot the server sids already open in any panel so the background
+        // Snapshot the server sids already open in any tile so the background
         // thread can dedup without touching `self`. Taken now, while we're
         // still on the (single-threaded) UI thread, so it can't race a
         // concurrent ring mutation. (Attach — and thus the Owner/Observer mode
@@ -405,11 +405,11 @@ impl SketchGpuiView {
                 }
                 // Drop dead slots via the same path the server's SessionClosed
                 // broadcast uses: `reconcile_session_closed` finds the slot in
-                // any tab/pane, removes it with `close_at` (which fixes the
+                // any tab/tile, removes it with `close_at` (which fixes the
                 // ring's active index and never panics on the last slot), and
                 // restores the underlying screen if the ring empties — so no
-                // panel is ever left holding an empty ring. After removal,
-                // re-save every pane's ring (keyed by the process cwd, exactly
+                // tile is ever left holding an empty ring. After removal,
+                // re-save every tile's ring (keyed by the process cwd, exactly
                 // like close_active_agent_session) so the stale id doesn't
                 // return on the next launch.
                 let mut dropped_any = false;
@@ -424,7 +424,7 @@ impl SketchGpuiView {
                 // Authoritatively scrub the dead ids from the persisted file by
                 // id (across every cwd key). `save_agent_ring` alone misses the
                 // cases that matter most here: a single-slot ring that empties
-                // (the pane no longer holds an Agent ring, so the re-save never
+                // (the tile no longer holds an Agent ring, so the re-save never
                 // touches that cwd) and a stale session in a non-active tab
                 // (save_agent_ring only walks the active tab). Without this the
                 // dead id would be resumed again on the next launch — the exact
@@ -440,7 +440,7 @@ impl SketchGpuiView {
 
     /// Run `f` on the agent ring holding the placeholder slot stamped with
     /// `token` (see `AgentSlot::pending_open_token`), searching every tab and
-    /// pane. Returns whether a match was found. Lets an async server
+    /// tile. Returns whether a match was found. Lets an async server
     /// open/create bind back to its originating slot regardless of which
     /// window happens to be focused when the round-trip returns.
     pub(crate) fn with_open_token_ring(
@@ -534,7 +534,7 @@ impl SketchGpuiView {
     /// brand-new session — never re-attach an existing per-cwd one. This is
     /// the always-fresh counterpart to `open_agent_inner`: `open_agent_inner`
     /// resolves the cwd against the server's existing sessions and resumes a
-    /// match (the "open the agent panel" semantics), whereas the "new session"
+    /// match (the "open the agent tile" semantics), whereas the "new session"
     /// command must always start a fresh conversation. The screen-stash /
     /// placeholder / server-pump setup is identical to `open_agent_inner`'s
     /// server path; the only difference is it calls `spawn_create_agent_session`
@@ -756,7 +756,7 @@ impl SketchGpuiView {
         // parks on a 30s `recv_timeout`, so doing it synchronously froze the
         // window when the server stalled. The server broadcasts `SessionClosed`
         // on success, which `reconcile_session_closed` already folds into every
-        // panel — so the worst case of an off-thread close that ends up not
+        // tile — so the worst case of an off-thread close that ends up not
         // landing is a stale entry that the next open's dedup/reconnect path
         // cleans up, not a frozen UI.
         let server_sid = self
@@ -830,7 +830,7 @@ impl SketchGpuiView {
         let Ok(cwd) = std::env::current_dir() else {
             return;
         };
-        // Save agent rings from ALL panes, not just the focused one.
+        // Save agent rings from ALL tiles, not just the focused one.
         if let Some(tab) = self.workspace.active_tab() {
             tab.layout.for_each_leaf(&mut |window| {
                 if let WindowContent::Agent(ring) = &window.content {
@@ -1322,14 +1322,14 @@ impl SketchGpuiView {
         self._server_pump = Some(task);
     }
 
-    /// Find an agent slot by its server session id across ALL tabs and panes,
+    /// Find an agent slot by its server session id across ALL tabs and tiles,
     /// running `f` on the first match. Returns `true` if a slot was found.
     ///
     /// A single shared `SessionServerClient` multiplexes every session's
     /// notifications onto one pump (`start_server_pump`), so routing must
     /// search the whole workspace — not just the active tab — or a session
     /// living in a background tab silently drops its streamed output. The
-    /// scan is cheap: a handful of tabs × panes × slots.
+    /// scan is cheap: a handful of tabs × tiles × slots.
     pub(crate) fn with_server_session_slot(
         &mut self,
         sid: &str,
@@ -1352,9 +1352,9 @@ impl SketchGpuiView {
         false
     }
 
-    /// Run `f` on the slot for `sid` in *every* panel that has one (unlike
+    /// Run `f` on the slot for `sid` in *every* tile that has one (unlike
     /// [`with_server_session_slot`], which stops at the first match). A session
-    /// observed in multiple panes must fan its events out to all of them.
+    /// observed in multiple tiles must fan its events out to all of them.
     /// Returns the number of slots visited.
     pub(crate) fn for_each_server_session_slot(
         &mut self,
@@ -1376,8 +1376,8 @@ impl SketchGpuiView {
     }
 
     /// Reconcile a server-side close into the local model: drop the slot for
-    /// `sid` from every panel's ring. A ring left empty is replaced in place
-    /// with its stashed underlying screen (or a fresh browser) so no panel is
+    /// `sid` from every tile's ring. A ring left empty is replaced in place
+    /// with its stashed underlying screen (or a fresh browser) so no tile is
     /// ever left holding an empty `AgentRing`, which would panic on render.
     /// Returns whether anything changed.
     pub(crate) fn reconcile_session_closed(&mut self, sid: &str) -> bool {
@@ -1415,7 +1415,7 @@ impl SketchGpuiView {
     }
 
     /// Reconcile a server-side rename: update the label on the matching slot in
-    /// every panel. Returns whether anything changed.
+    /// every tile. Returns whether anything changed.
     pub(crate) fn reconcile_session_renamed(&mut self, sid: &str, label: &str) -> bool {
         let mut changed = false;
         self.for_each_server_session_slot(sid, |slot| {
@@ -1454,7 +1454,7 @@ impl SketchGpuiView {
 
         // A single shared `SessionServerClient` multiplexes every session's
         // notifications onto this one pump, so each note is routed by its
-        // `session_id` across the *whole* workspace (all tabs and panes), not
+        // `session_id` across the *whole* workspace (all tabs and tiles), not
         // just the active tab — otherwise a session living in a background
         // tab silently drops its streamed output.
         let did_work = !batch.is_empty();
@@ -1466,13 +1466,13 @@ impl SketchGpuiView {
         // workspace) wasted work during fast streaming.
         let mut scrolled_sessions: Vec<String> = Vec::new();
         // Perf: a streaming batch is overwhelmingly a run of ReplyEvent chunks
-        // for the SAME session. Previously each chunk re-walked every tab+pane
-        // to find the slot (O(events*panes)) and cloned the event String into a
+        // for the SAME session. Previously each chunk re-walked every tab+tile
+        // to find the slot (O(events*tiles)) and cloned the event String into a
         // throwaway `vec![event.clone()]`. Coalesce consecutive same-session
         // ReplyEvents into one slot lookup + one `apply_reply_events` call,
         // moving the events by value (no per-chunk clone). This keeps ordering
         // relative to other event kinds (we only merge adjacent ReplyEvents)
-        // while collapsing routing to O(distinct_runs*panes) and shortening the
+        // while collapsing routing to O(distinct_runs*tiles) and shortening the
         // model-lock hold time.
         let mut batch = batch.into_iter().peekable();
         while let Some(note) = batch.next() {
@@ -1686,16 +1686,16 @@ impl SketchGpuiView {
                 }
                 ServerNotification::SessionCreated { session } => {
                     // List-level signal that some connection created a session.
-                    // The primary GUI does not auto-add it to unrelated panels
-                    // (a new session belongs to the panel that opened it, which
+                    // The primary GUI does not auto-add it to unrelated tiles
+                    // (a new session belongs to the tile that opened it, which
                     // already has its slot from the create response). Kept as a
                     // no-op hook for a future "available sessions" view / for
                     // mirror GUIs that want to surface every live session.
                     let _ = &session;
                 }
                 ServerNotification::SessionClosed { session_id } => {
-                    // A session closed somewhere (this GUI, another panel, or
-                    // another GUI instance). Drop its slot from every panel so
+                    // A session closed somewhere (this GUI, another tile, or
+                    // another GUI instance). Drop its slot from every tile so
                     // the lists stay consistent.
                     self.reconcile_session_closed(&session_id);
                 }
@@ -1736,7 +1736,7 @@ impl SketchGpuiView {
         // once per chunk event. Uses the stale `list_item_count` exactly as the
         // per-event path did (the authoritative re-scroll with the fresh count
         // happens later in render_agent after the ListState splice); this just
-        // keeps unfocused panes that miss render's scroll roughly pinned.
+        // keeps unfocused tiles that miss render's scroll roughly pinned.
         for sid in &scrolled_sessions {
             self.with_server_session_slot(sid, |slot| {
                 let claude = &mut slot.state;
@@ -1773,12 +1773,12 @@ impl SketchGpuiView {
         // inside this block. Returns (has_events, more_pending, attached_with_id)
         // so post-borrow work (persistence) can proceed.
         //
-        // Search ALL panes (not just the focused one) so that agent sessions
-        // in unfocused split panes keep pumping events.
+        // Search ALL tiles (not just the focused one) so that agent sessions
+        // in unfocused split tiles keep pumping events.
         let (has_events, more_pending, attached_with_id) = {
-            // Find the slot across every pane in EVERY tab (not just the
+            // Find the slot across every tile in EVERY tab (not just the
             // active tab) so agent sessions in background tabs and unfocused
-            // split panes keep pumping events.
+            // split tiles keep pumping events.
             let mut found = None;
             for tab in self.workspace.tabs.iter_mut() {
                 found = tab.layout.find_map_leaf_content_mut(&mut |content| {
@@ -2646,7 +2646,7 @@ impl SketchGpuiView {
     /// only the editable runs between/after frozen Claude turns) as the
     /// next ACP prompt, then lock the turn so that content can't be
     /// retroactively edited.
-    /// Toggle the Tasklist sidepane visibility (§24).
+    /// Toggle the Tasklist sidebar visibility (§24).
     pub(crate) fn toggle_tasklist(&mut self, cx: &mut Context<Self>) {
         if let Some(c) = self.agent_mut() {
             c.tasklist_open = !c.tasklist_open;
@@ -2654,7 +2654,7 @@ impl SketchGpuiView {
         cx.notify();
     }
 
-    /// Toggle the Subagents sidepane visibility (§28).
+    /// Toggle the Subagents sidebar visibility (§28).
     pub(crate) fn toggle_subagents(&mut self, cx: &mut Context<Self>) {
         if let Some(c) = self.agent_mut() {
             c.subagents_open = !c.subagents_open;
@@ -2764,7 +2764,7 @@ impl SketchGpuiView {
         }
     }
 
-    /// Whether any agent slot (across all tabs/panes) is mid-turn. Cheap
+    /// Whether any agent slot (across all tabs/tiles) is mid-turn. Cheap
     /// traversal the pumps use to decide whether an idle animation tick is
     /// worth a re-render.
     pub(crate) fn any_agent_awaiting(&mut self) -> bool {
@@ -3275,8 +3275,8 @@ impl SketchGpuiView {
             .map(|c| c.input_surface.is_chatbox())
             .unwrap_or(false);
 
-        // Bare `m`/`'` in NORMAL mode starts a mark chord — agent panes are
-        // markable/jumpable like any other pane. Insert mode is untouched so
+        // Bare `m`/`'` in NORMAL mode starts a mark chord — agent tiles are
+        // markable/jumpable like any other tile. Insert mode is untouched so
         // typing `m`/`'` into the chatbox/worksheet still works.
         let in_normal = if in_chatbox {
             self.agent_mut()

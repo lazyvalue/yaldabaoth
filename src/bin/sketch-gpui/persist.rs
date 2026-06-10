@@ -325,7 +325,7 @@ pub(crate) struct Preferences {
     /// on load so a hand-edited file can't push the body off-screen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) text_scale: Option<f32>,
-    /// Desktop-mode panel size in mono cells (spec-desktop-mode.md
+    /// Desktop-mode tile size in mono cells (spec-desktop-mode.md
     /// Behavior 6). One global setting; clamped on use, not on load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) desktop_grid_cols: Option<u32>,
@@ -1015,7 +1015,7 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRin
             if i == active_index {
                 obj.insert("active".into(), serde_json::Value::Bool(true));
             }
-            // Spec §35: persist input mode and sidepane state per slot.
+            // Spec §35: persist input mode and sidebar state per slot.
             // Older sketch binaries reading this file ignore the unknown
             // keys (serde's standard behavior); no migration needed.
             let mode_str = match slot.state.input_surface.mode() {

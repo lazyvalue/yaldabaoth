@@ -405,13 +405,13 @@ pub enum Notification {
     SessionCreated { session: SessionInfo },
 
     /// A session was closed/removed server-side. Broadcast to every
-    /// connection so each GUI drops the matching slot from every panel,
+    /// connection so each GUI drops the matching slot from every tile,
     /// regardless of which connection initiated the close.
     #[serde(rename = "session_closed")]
     SessionClosed { session_id: ServerSessionId },
 
     /// A session's label changed. Broadcast to every connection so the new
-    /// label propagates to every panel and every GUI instance.
+    /// label propagates to every tile and every GUI instance.
     #[serde(rename = "session_renamed")]
     SessionRenamed {
         session_id: ServerSessionId,

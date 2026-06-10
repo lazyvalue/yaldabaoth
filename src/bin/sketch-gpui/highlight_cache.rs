@@ -1,6 +1,6 @@
-//! Incremental highlight cache for the agent transcript pane.
+//! Incremental highlight cache for the agent transcript tile.
 //!
-//! The agent pane re-highlights its entire transcript on every `cx.notify()`
+//! The agent tile re-highlights its entire transcript on every `cx.notify()`
 //! (two passes — raw + stripped — over every line), then deep-clones both
 //! results into the `'static` list-render closure. At a few-thousand-line
 //! transcript that is several O(n) string-allocating passes per frame, which
@@ -9,7 +9,7 @@
 //! This cache makes that work `O(changed)`:
 //!   * **Fast skip** — if the document's `edit_seq`, line count, and theme are
 //!     all unchanged since the last snapshot, the previous snapshot is handed
-//!     back untouched (the scroll / cursor-blink / cross-pane-notify case).
+//!     back untouched (the scroll / cursor-blink / cross-tile-notify case).
 //!   * **Per-line reconcile** — otherwise each line is compared by content
 //!     hash *and* by the fenced-code state on entry; only lines that actually
 //!     changed (or whose fence context shifted) are re-highlighted. Unchanged
@@ -97,7 +97,7 @@ impl FenceFp {
     }
 }
 
-/// Per-pane incremental highlight cache. One lives on each `AgentState`.
+/// Per-tile incremental highlight cache. One lives on each `AgentState`.
 pub struct HighlightCache {
     /// Per-line cached highlight, parallel to the source line vector.
     lines: Vec<Rc<LineHl>>,
@@ -447,7 +447,7 @@ mod tests {
             let _ = cache.snapshot(&lines, &theme, 1);
             let cold_ms = ms(t.elapsed());
 
-            // --- CACHE no-change (scroll / cursor blink / cross-pane notify) ---
+            // --- CACHE no-change (scroll / cursor blink / cross-tile notify) ---
             let t = std::time::Instant::now();
             for _ in 0..iters {
                 std::hint::black_box(cache.snapshot(&lines, &theme, 1));

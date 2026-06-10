@@ -247,7 +247,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::equalize))
             // Layout patterns
             .on_action(cx.listener(Self::cycle_layout_mode))
-            .on_action(cx.listener(Self::desktop_panel_size_overlay))
+            .on_action(cx.listener(Self::desktop_tile_size_overlay))
             .on_action(cx.listener(Self::promote_to_master))
             .on_action(cx.listener(Self::increase_master_count))
             .on_action(cx.listener(Self::decrease_master_count))
@@ -261,8 +261,8 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
-            .on_action(cx.listener(Self::move_pane))
-            .on_action(cx.listener(Self::also_show_pane))
+            .on_action(cx.listener(Self::move_tile))
+            .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
@@ -411,8 +411,8 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
-            .on_action(cx.listener(Self::move_pane))
-            .on_action(cx.listener(Self::also_show_pane))
+            .on_action(cx.listener(Self::move_tile))
+            .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
@@ -422,7 +422,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::focus_prev))
             // Layout patterns
             .on_action(cx.listener(Self::cycle_layout_mode))
-            .on_action(cx.listener(Self::desktop_panel_size_overlay))
+            .on_action(cx.listener(Self::desktop_tile_size_overlay))
             .on_action(cx.listener(Self::promote_to_master))
             .on_action(cx.listener(Self::increase_master_count))
             .on_action(cx.listener(Self::decrease_master_count))
@@ -735,9 +735,9 @@ impl SketchGpuiView {
     //   change is the whole point.
     // - `Think` (subagents) / `Other` (MCP tools): full content.
     //
-    // The previous `build_tool_block` / `tool_body_pane` lived here as
+    // The previous `build_tool_block` / `tool_body` lived here as
     // `&self` methods. They've been replaced by the free-function
-    // `build_tool_block_with_weak` / `tool_body_pane_free` further up
+    // `build_tool_block_with_weak` / `tool_body_free` further up
     // in the file — necessary so the per-item closure handed to
     // `gpui::list` can construct tool blocks without holding a borrow
     // of `self`.
@@ -798,7 +798,7 @@ impl SketchGpuiView {
         let t_extract0 = perf.then(std::time::Instant::now);
         let edit_seq = c.editor.document().edit_seq();
         // Perf: only re-extract the per-line transcript text when the document
-        // actually changed. On cursor-blink / cross-pane notifies edit_seq is
+        // actually changed. On cursor-blink / cross-tile notifies edit_seq is
         // unchanged, so reuse the cached Rc verbatim instead of re-allocating a
         // String per line (an O(L) cost that previously ran every frame). The
         // Rc clone below is O(1).
@@ -866,7 +866,7 @@ impl SketchGpuiView {
         // ── View-model memoization (S1) ──────────────────────────────
         // `flat_items` + `gutter_tag_per_line` depend ONLY on these
         // structural inputs — NOT on cursor/selection/theme, which the
-        // render closure reads afterward. On cursor-blink / cross-pane
+        // render closure reads afterward. On cursor-blink / cross-tile
         // notify / the ~1Hz thinking tick these inputs are unchanged, so we
         // reuse the cached `Rc`s and skip the gutter scan, tool-anchor
         // resolution, flat build and blank-collapse pass.
@@ -921,7 +921,7 @@ impl SketchGpuiView {
         // last item's height without adding a row still re-pins the viewport.
         // The pump functions also scroll, but they fire before render so their
         // count is stale; this is the authoritative re-reveal with the fresh
-        // post-reconcile count, and also catches unfocused panes that missed
+        // post-reconcile count, and also catches unfocused tiles that missed
         // the pump's scroll.
         c.reveal_tail_if_following(new_count);
 
@@ -1924,37 +1924,37 @@ impl SketchGpuiView {
             None
         };
 
-        // ---- Right-side sidepanes (Tasklist / Subagents) ----
+        // ---- Right-side sidebars (Tasklist / Subagents) ----
         //
         // Stacked horizontally in fixed order (Tasklist innermost, then
-        // Subagents) per spec §2. Each pane is a fixed 28-char column;
-        // the transcript area's flex-1 shrinks to make room. Panes only
+        // Subagents) per spec §2. Each tile is a fixed 28-char column;
+        // the transcript area's flex-1 shrinks to make room. Tiles only
         // render when their `*_open` flag is true.
-        let pane_width = px(28.0 * 7.0); // ~28 monospace cols at 13px = ~196px
-        let pane_border: Hsla = nc(at.pane_border);
-        let pane_header_fg: Hsla = nc(at.pane_header);
-        let pane_dim_fg: Hsla = nc(at.dim);
-        let pane_bg: Hsla = nc(at.pane_bg);
+        let sidebar_width = px(28.0 * 7.0); // ~28 monospace cols at 13px = ~196px
+        let sidebar_border: Hsla = nc(at.sidebar_border);
+        let sidebar_header_fg: Hsla = nc(at.sidebar_header);
+        let sidebar_dim_fg: Hsla = nc(at.dim);
+        let sidebar_bg: Hsla = nc(at.sidebar_bg);
 
-        let tasklist_pane = if c.tasklist_open {
-            let mut pane = div()
-                .id("tasklist-pane")
+        let tasklist_sidebar = if c.tasklist_open {
+            let mut tile = div()
+                .id("tasklist-sidebar")
                 .flex()
                 .flex_col()
-                .w(pane_width)
-                .min_w(pane_width)
+                .w(sidebar_width)
+                .min_w(sidebar_width)
                 .flex_none()
-                .bg(pane_bg)
+                .bg(sidebar_bg)
                 .border_l_1()
-                .border_color(pane_border)
+                .border_color(sidebar_border)
                 .py_1()
                 .text_size(px(12.0))
                 .font_family(self.code_font.clone());
-            pane = pane.child(
+            tile = tile.child(
                 div()
                     .px_2()
                     .py_1()
-                    .text_color(pane_header_fg)
+                    .text_color(sidebar_header_fg)
                     .font_weight(FontWeight::BOLD)
                     .child(SharedString::new_static("Plan")),
             );
@@ -1977,7 +1977,7 @@ impl SketchGpuiView {
                         } else {
                             format!("{}  {}", glyph, entry.content)
                         };
-                        pane = pane.child(
+                        tile = tile.child(
                             div()
                                 .px_2()
                                 .py(px(1.0))
@@ -1987,49 +1987,49 @@ impl SketchGpuiView {
                     }
                 }
                 _ => {
-                    pane = pane.child(
+                    tile = tile.child(
                         div()
                             .px_2()
                             .py_1()
-                            .text_color(pane_dim_fg)
+                            .text_color(sidebar_dim_fg)
                             .child(SharedString::new_static("(no plan)")),
                     );
                 }
             }
-            Some(pane)
+            Some(tile)
         } else {
             None
         };
 
-        let subagents_pane = if c.subagents_open {
-            let mut pane = div()
-                .id("subagents-pane")
+        let subagents_sidebar = if c.subagents_open {
+            let mut tile = div()
+                .id("subagents-sidebar")
                 .flex()
                 .flex_col()
-                .w(pane_width)
-                .min_w(pane_width)
+                .w(sidebar_width)
+                .min_w(sidebar_width)
                 .flex_none()
-                .bg(pane_bg)
+                .bg(sidebar_bg)
                 .border_l_1()
-                .border_color(pane_border)
+                .border_color(sidebar_border)
                 .py_1()
                 .text_size(px(12.0))
                 .font_family(self.code_font.clone());
-            pane = pane.child(
+            tile = tile.child(
                 div()
                     .px_2()
                     .py_1()
-                    .text_color(pane_header_fg)
+                    .text_color(sidebar_header_fg)
                     .font_weight(FontWeight::BOLD)
                     .child(SharedString::new_static("Subagents")),
             );
             let subagents = c.subagents();
             if subagents.is_empty() {
-                pane = pane.child(
+                tile = tile.child(
                     div()
                         .px_2()
                         .py_1()
-                        .text_color(pane_dim_fg)
+                        .text_color(sidebar_dim_fg)
                         .child(SharedString::new_static("(no subagents)")),
                 );
             } else {
@@ -2081,10 +2081,10 @@ impl SketchGpuiView {
                             },
                         )
                         .child(SharedString::from(row_text));
-                    pane = pane.child(row);
+                    tile = tile.child(row);
                 }
             }
-            Some(pane)
+            Some(tile)
         } else {
             None
         };
@@ -2098,10 +2098,10 @@ impl SketchGpuiView {
                 .min_h_0()
                 .child(body),
         );
-        if let Some(p) = tasklist_pane {
+        if let Some(p) = tasklist_sidebar {
             transcript_row = transcript_row.child(p);
         }
-        if let Some(p) = subagents_pane {
+        if let Some(p) = subagents_sidebar {
             transcript_row = transcript_row.child(p);
         }
 
@@ -2165,8 +2165,8 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
-            .on_action(cx.listener(Self::move_pane))
-            .on_action(cx.listener(Self::also_show_pane))
+            .on_action(cx.listener(Self::move_tile))
+            .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(|this, _: &ToggleTasklist, _w, cx| {
                 this.toggle_tasklist(cx);
@@ -2189,7 +2189,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::flip_rail_side))
             // Layout patterns
             .on_action(cx.listener(Self::cycle_layout_mode))
-            .on_action(cx.listener(Self::desktop_panel_size_overlay))
+            .on_action(cx.listener(Self::desktop_tile_size_overlay))
             .on_action(cx.listener(Self::promote_to_master))
             .on_action(cx.listener(Self::increase_master_count))
             .on_action(cx.listener(Self::decrease_master_count))
@@ -2429,8 +2429,8 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
             .on_action(cx.listener(Self::rename_tab))
-            .on_action(cx.listener(Self::move_pane))
-            .on_action(cx.listener(Self::also_show_pane))
+            .on_action(cx.listener(Self::move_tile))
+            .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
@@ -2443,7 +2443,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::flip_rail_side))
             // Layout patterns
             .on_action(cx.listener(Self::cycle_layout_mode))
-            .on_action(cx.listener(Self::desktop_panel_size_overlay))
+            .on_action(cx.listener(Self::desktop_tile_size_overlay))
             .on_action(cx.listener(Self::promote_to_master))
             .on_action(cx.listener(Self::increase_master_count))
             .on_action(cx.listener(Self::decrease_master_count))

@@ -589,7 +589,7 @@ fn cmd_b_toggles_file_browser_rail(cx: &mut TestAppContext) {
     assert_eq!(
         rail_kind(&view, vcx),
         Some(true),
-        "cmd-b must open a file-browser rail beside the focused pane"
+        "cmd-b must open a file-browser rail beside the focused tile"
     );
 
     // Act again: a second Cmd-B closes the same rail (two-state toggle).

@@ -1,4 +1,4 @@
-# Desktop Mode — Uniform Panels on a Pannable Slot Grid
+# Desktop Mode — Uniform Tiles on a Pannable Slot Grid
 
 **Status:** DRAFT
 **Last updated:** 2026-06-10
@@ -10,20 +10,20 @@
   filtering). Desktop mode is a fifth `LayoutMode` variant and reuses that
   machinery unchanged: the manual tree skeleton is saved on the same
   transitions, the sigil slot gains one entry, and tag filtering applies to
-  panels exactly as it applies to tiled windows.
+  tiles exactly as it applies to tiled windows.
 - `spec-rail.md` — the rail is per-tab chrome that coexists with every layout
   mode. Desktop mode renders inside the same content area the rail leaves
   free; the rail itself is unaffected.
 
 ## Overview
 
-Desktop mode is an alternative to tiling: every window becomes a **panel**,
-placed on an unbounded **desktop** of grid **slots**. Panel size derives from
-a globally-configured **grid** — how many panels fit the viewport per axis
-(default **2 × 2**) — so all panels are uniform and resize with the window
+Desktop mode is an alternative to tiling: every window becomes a **tile**,
+placed on an unbounded **desktop** of grid **slots**. Tile size derives from
+a globally-configured **grid** — how many tiles fit the viewport per axis
+(default **2 × 2**) — so all tiles are uniform and resize with the window
 while their slots never change. The window is a viewport over the desktop:
-growing the window reveals more desktop and grows each panel proportionally;
-it never moves or reflows panels (slot addresses are immutable under resize). Panels are arranged by
+growing the window reveals more desktop and grows each tile proportionally;
+it never moves or reflows tiles (slot addresses are immutable under resize). Tiles are arranged by
 mouse drag-and-drop with **insert-and-shift** sequence semantics.
 
 Named entities introduced here:
@@ -53,7 +53,7 @@ buffer-pool plumbing stays dormant.
 `Ctrl-W Space` after `Columns`. Leaving `Manual` saves the tree skeleton and
 returning restores it, exactly as for the automatic modes.
 
-On first entry (empty slot map) panels are seeded row-major in tree-leaf
+On first entry (empty slot map) tiles are seeded row-major in tree-leaf
 order using the current effective width W. On re-entry the existing slot map
 is kept — a tab's arrangement survives round-trips through other modes and
 across restarts.
@@ -63,67 +63,67 @@ across restarts.
 Invariant: the slot map holds exactly one entry per tree leaf, and no two
 entries share a slot. The desktop layout engine reconciles on every
 structural change and on mode entry: a leaf without a slot is inserted
-after the focused panel (insert-and-shift, Behavior 4); a slot entry whose
+after the focused tile (insert-and-shift, Behavior 4); a slot entry whose
 window no longer exists is dropped, leaving a gap. Gaps are intentional
-structure — closing a panel never moves its neighbors.
+structure — closing a tile never moves its neighbors.
 
 New windows created while in Desktop mode (split actions, `Cmd+O`, agent
-open) are panels like any other; "split" loses its directional meaning and
-simply inserts the new panel after the focused one.
+open) are tiles like any other; "split" loses its directional meaning and
+simply inserts the new tile after the focused one.
 
 ### 3 · Geometry, panning, and rendering [DRAFT]
 
-Panel pixel size derives at render time from the canvas and the grid:
-`panel_px = (canvas − (grid + 1) × gutter) / grid` per axis, with a fixed
+Tile pixel size derives at render time from the canvas and the grid:
+`tile_px = (canvas − (grid + 1) × gutter) / grid` per axis, with a fixed
 gutter (`DESKTOP_GUTTER`, ~12px) between slots and around the origin, and a
-minimum panel size so a tiny window stays usable. Slot origin:
-`gutter + slot ⊗ (panel_px + gutter) − pan`.
+minimum tile size so a tiny window stays usable. Slot origin:
+`gutter + slot ⊗ (tile_px + gutter) − pan`.
 
 The canvas pans on both axes (trackpad/wheel); `pan` is clamped to the
 bounding box of occupied slots plus one slot of margin. Keyboard focus
-changes auto-pan the minimum needed to reveal the focused panel. Empty
+changes auto-pan the minimum needed to reveal the focused tile. Empty
 desktop shows a faint dot grid at slot pitch. Window resize changes the
 viewport only — pan and slots are untouched.
 
-Only panels intersecting the viewport render (frame-level culling), with
-one exemption: **the focused panel always renders** even when panned out of
+Only tiles intersecting the viewport render (frame-level culling), with
+one exemption: **the focused tile always renders** even when panned out of
 view. The focused leaf's element carries the focus handle and the
 per-screen `on_action` wiring (CLAUDE.md "GUI key conventions"); culling it
 would drop the key contexts from the dispatch tree and strand the keyboard
 — including the very focus/auto-pan actions that would recover. Desktop-
 level actions (pan, drag-cancel) are additionally wired on the canvas root
-so they survive any single panel's absence. Each panel renders the same
+so they survive any single tile's absence. Each tile renders the same
 inner content as its tiled form (Doc / Edit / Browser / Agent), in a fixed
 frame with a thin **title bar** (~20px): buffer name or session label, the
 existing mark badge, and the focus accent. The status bar shows sigil `[#]`
 (extends layout-patterns Behavior 16).
 
-Tag filtering (layout-patterns Behavior 5) hides non-matching panels;
-hidden panels keep their slots and reappear in place.
+Tag filtering (layout-patterns Behavior 5) hides non-matching tiles;
+hidden tiles keep their slots and reappear in place.
 
 ### 4 · Drag and drop: insert-and-shift [DRAFT]
 
-The title bar is the drag handle; panel content keeps its normal mouse
+The title bar is the drag handle; tile content keeps its normal mouse
 semantics. Mouse-down on a title bar arms a drag; movement past a small
 threshold (~4px) starts it (below the threshold it's a focus click).
 
-While dragging: the panel follows the pointer as a semi-transparent ghost;
+While dragging: the tile follows the pointer as a semi-transparent ghost;
 its home slot shows an empty outline; the computed drop target slot is
 highlighted. Dragging into a ~30px band at the viewport edge auto-pans.
-`Esc` cancels (panel returns home).
+`Esc` cancels (tile returns home).
 
 Drop resolution, against the grid *as it is at drop time*:
 
-- **Empty target slot** — the panel moves there. Its old slot becomes a gap.
-- **Occupied target slot** — insertion: the dragged panel takes the target
-  slot; the occupant and each subsequent panel in the contiguous occupied
+- **Empty target slot** — the tile moves there. Its old slot becomes a gap.
+- **Occupied target slot** — insertion: the dragged tile takes the target
+  slot; the occupant and each subsequent tile in the contiguous occupied
   run shift forward one slot. The run stops at the first gap, which absorbs
-  the ripple. Shifting is evaluated back-to-front so no two panels collide.
+  the ripple. Shifting is evaluated back-to-front so no two tiles collide.
 
 Run semantics, pinned: the successor function is the **W-wrapped chain** —
 `succ(row, col) = (row, col+1)` if `col + 1 < W`, else `(row+1, 0)` — and
-run contiguity follows that chain, not the unbounded grid order. Panels at
-`col ≥ W` (seeded when the window was wider, or the panel size was raised)
+run contiguity follows that chain, not the unbounded grid order. Tiles at
+`col ≥ W` (seeded when the window was wider, or the tile size was raised)
 are therefore outside every successor chain: ripples never touch them, and
 they move only by direct drop. They remain focusable and pannable-to.
 
@@ -131,10 +131,10 @@ A drop may target any visible empty slot; the pan clamp (Behavior 3) admits
 one slot of margin beyond the occupied bounding box, so the desktop grows
 incrementally — one ring of slots per drag, by design.
 
-`Esc` cancel is handled at the canvas root (the dragged panel may not be
-the focused one), and arming a drag also focuses the grabbed panel. Stored
+`Esc` cancel is handled at the canvas root (the dragged tile may not be
+the focused one), and arming a drag also focuses the grabbed tile. Stored
 slots change only through drops, insertion-reconciliation, and seeding —
-never as a side effect of resize, zoom, or panel-size changes.
+never as a side effect of resize, zoom, or tile-size changes.
 
 ### 5 · Focus and keyboard navigation [DRAFT]
 
@@ -142,23 +142,23 @@ Directional focus (the existing `focus_left/right/up/down` actions) moves to
 the nearest occupied slot in that direction — same row/column preferred,
 then nearest Euclidean slot distance; no candidate = no-op. `focus_next` /
 `focus_prev` follow row-major sequence order. Marks (`'` + key) work
-unchanged and auto-pan to reveal the target panel. All per-screen key
-contexts behave as in tiling — desktop changes where panels sit, not what
+unchanged and auto-pan to reveal the target tile. All per-screen key
+contexts behave as in tiling — desktop changes where tiles sit, not what
 they are.
 
 ### 6 · Desktop grid configuration [DRAFT]
 
 `desktop_grid_cols` / `desktop_grid_rows` live in `Preferences` (persisted,
-default 2 × 2): how many panels fit the viewport per axis, one global
-setting for all tabs. Panel size derives from it (Behavior 3) — a 3×2 grid
-shows six full panels per screen. Runtime configuration uses a small text
+default 2 × 2): how many tiles fit the viewport per axis, one global
+setting for all tabs. Tile size derives from it (Behavior 3) — a 3×2 grid
+shows six full tiles per screen. Runtime configuration uses a small text
 overlay in the existing `ActiveOverlay` family (the `TagInput`/`Rename`
 pattern — sketch-gpui has no `:` command line), accepting `{cols}x{rows}`,
 clamped to `[1, 12]` per axis, reachable via `Ctrl-W p` and the layout
 menu (which also offers direct mode selection without cycling). The grid
 column count is also the effective width W. Changing it re-renders
 immediately; slot addresses are grid-independent, so no migration occurs —
-panels keep their slots and simply resize in place (which can change what
+tiles keep their slots and simply resize in place (which can change what
 overlaps the viewport, never what neighbors what).
 
 ### 7 · Persistence [DRAFT]
@@ -171,7 +171,7 @@ entries degrade to reconciliation instead). Absent field or unmatched ids =
 seed/reconcile on the first render after restore (W needs a measured cell
 size, so restore-time seeding is deferred to first paint). Existing
 `workspace.json` files load unchanged. `pan` is not persisted; on restore
-it reveals the focused panel. The preferences fields persist with the
+it reveals the focused tile. The preferences fields persist with the
 existing `Preferences` round-trip.
 
 **Old-binary blast radius:** `LayoutMode` has no unknown-variant fallback,
@@ -209,12 +209,12 @@ called by the GPUI view layer):
   invariant.
 - `insert_shift(slots, dragged, target, w) -> slots` — Behavior-4 drop.
 - `spatial_neighbor(slots, from, direction) -> Option<WindowId>` — Behavior-5.
-- `slot_rect(slot, panel_px, gutter) -> Bounds` / `drop_target(point, pan,
-  panel_px, gutter) -> Slot` — geometry, *external* to the render path.
+- `slot_rect(slot, tile_px, gutter) -> Bounds` / `drop_target(point, pan,
+  tile_px, gutter) -> Slot` — geometry, *external* to the render path.
 
 Events / messages: none (all interactions are direct view mutations).
 Data ownership: `DesktopState` owns placement; the `Layout<C>` tree owns
-content; `Preferences` owns panel size.
+content; `Preferences` owns tile size.
 
 ## Constraints
 
@@ -228,23 +228,23 @@ content; `Preferences` owns panel size.
 - Engine functions are pure and unit-tested headlessly. Drag gestures and
   panning feel are GPUI-event-driven and need a human runtime check
   (per the dev-system definition of done).
-- Per-frame cost in Desktop mode is O(visible panels), not O(all panels).
+- Per-frame cost in Desktop mode is O(visible tiles), not O(all tiles).
 - Marks, tags, rails, and the buffer pool are integration points, not
   dependencies — desktop mode must not require changes to any of them.
 
 ## Revision History
 
 - 2026-06-09 — Initial draft (clarified with user: ordered-shelf model,
-  stored slots with drop-time-only shifting, 120×40 global panel size,
+  stored slots with drop-time-only shifting, 120×40 global tile size,
   fifth LayoutMode, insert-and-shift drops).
 - 2026-06-09 — Adversarial review folded in (user-authorized): focused
-  panel exempt from culling + canvas-root action wiring; W-wrapped
-  successor chain pinned (col ≥ W panels outside ripples); id-keyed
+  tile exempt from culling + canvas-root action wiring; W-wrapped
+  successor chain pinned (col ≥ W tiles outside ripples); id-keyed
   `desktop_slots` persistence; LayoutMode unknown-variant fallback +
   old-binary blast radius; overlay (not `:` command) for size config;
   engine stays gpui-free; restore-time seeding deferred to first paint;
   drag-arm focuses; Esc at canvas root.
-- 2026-06-10 — Grid revision (user feedback after runtime use): panel size
-  is now derived from a configured viewport grid (`cols × rows` of panels,
+- 2026-06-10 — Grid revision (user feedback after runtime use): tile size
+  is now derived from a configured viewport grid (`cols × rows` of tiles,
   default 2×2) instead of fixed mono-cell dimensions; W = grid cols. Menu
   gains direct layout-mode selection and the grid input.

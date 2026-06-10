@@ -73,7 +73,7 @@ closed).
 
 Alternatively, a simpler two-state model: the toggle always opens-and-
 focuses or closes. The user can return focus to the main content with `Esc`
-or by clicking a content pane. **v1 uses two-state** — simpler to implement
+or by clicking a content tile. **v1 uses two-state** — simpler to implement
 and reason about.
 
 #### 6 · Key context [DRAFT]
@@ -169,7 +169,7 @@ calls `open_file(path)` on the main workspace — the file opens in the
 focused split-tree leaf (replacing its content), and the rail stays open.
 
 Navigating into a directory updates the rail's `FileBrowser` in place
-(same as the existing browser pane). The rail's directory state is
+(same as the existing browser tile). The rail's directory state is
 independent of any `BrowserWindow` that might exist in the split tree.
 
 #### 13 · Outline rail content [DRAFT]

@@ -360,7 +360,7 @@ pub(crate) fn doc_styled_line_element(
     }
 
     // Wrap in InteractiveText so we can attach an on_click handler. Wiki
-    // link clicks navigate the focused pane to the target file via
+    // link clicks navigate the focused tile to the target file via
     // `open_wiki_link` on the view (resolved through the weak handle
     // captured in RenderCtx).
     let weak = match &ctx.weak_view {

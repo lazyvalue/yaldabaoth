@@ -15,17 +15,17 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
 
 - **Desktop mode** — `NEEDS-RUNTIME` (built 2026-06-10, spec
   `spec-desktop-mode.md`, engine `1f7c269^..1f7c269` on master). Fifth
-  per-tab LayoutMode (`Ctrl-W Space` cycle, sigil `[#]`): fixed-size panels
+  per-tab LayoutMode (`Ctrl-W Space` cycle, sigil `[#]`): fixed-size tiles
   (global `{cols}x{rows}` via `Ctrl-W p`, default 120×40) on a pannable slot
-  grid; drag panels by title bar (insert-and-shift, right-click cancels);
+  grid; drag tiles by title bar (insert-and-shift, right-click cancels);
   spatial focus via the usual `Ctrl-W h/j/k/l`. Human checklist: drag feel +
-  drop targeting, scroll-pan + edge auto-pan, typing/keys inside each panel
+  drop targeting, scroll-pan + edge auto-pan, typing/keys inside each tile
   kind (Doc/Edit/Browser/Agent), focus-offscreen recovery (focus a panned-out
-  panel → auto-reveal), mode round-trips (Manual ↔ Desktop preserves both
+  tile → auto-reveal), mode round-trips (Manual ↔ Desktop preserves both
   arrangements), restart persistence. Deferred polish, in spec but not v1:
   Esc-to-cancel drag at canvas root (global escape binding would shadow
   per-screen escape; needs a careful dispatch design); measured mono cell
-  size (currently 0.6em/1.4em approximation in `desktop_panel_px`).
+  size (currently 0.6em/1.4em approximation in `desktop_tile_px`).
 
 ## Bugs
 
@@ -60,7 +60,7 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
   scan per frame (new in 09e266b, small constants).
 - **Theme switch leaves agent transcript caches stale** — `READY` (found
   during the perf fix, pre-existing). `set_theme` re-renders Doc layouts only;
-  the agent pane's S1 fingerprint, highlight cache, and block parses (which
+  the agent tile's S1 fingerprint, highlight cache, and block parses (which
   bake theme colors) are never invalidated, so a live theme switch keeps old
   colors in the transcript until the next edit/chunk — and block parses now
   persist even harder (content-keyed). Fix: clear/reseed agent caches (or
@@ -255,7 +255,7 @@ verified via the resilience+transcript harness. Worklogs:
   the slot + scrubs the persisted id (by id, across all cwd keys) on a permanent
   `no such session` attach error; transient errors keep the recoverable status.
   Compile-verified; runtime check owed (silent drop, no recur next launch,
-  transient survives, last-slot restores underlying, multi-tab/pane).
+  transient survives, last-slot restores underlying, multi-tab/tile).
 - **In-app rebuild + reconnect-badge** — `NEEDS-RUNTIME`. `dev_rebuild_restart_gui`
   (`<space> c g`) and the permission badge after a sid-only reconnect (shows
   default until re-synced) need a human runtime check.
@@ -292,7 +292,7 @@ verified via the resilience+transcript harness. Worklogs:
       splits share a rope with unified undo. Final fix: theme-switch re-render
       (`re_render_one_doc`) sources the live core instead of disk (was silently
       reverting unsaved edits). Headless tests added (pool sharing + unified undo
-      + live-core re-render). ⚠️ cross-pane *paint* owes a GPUI eyeball.
+      + live-core re-render). ⚠️ cross-tile *paint* owes a GPUI eyeball.
     - `8b` delete turn-end inference — ⏸️ **architectural goal already met by the
       phase-8 `AgentEvent` stream** (sourced-once + total reducer + exactly-once
       ledger; agreement pinned by `agent_stream_agrees_*`). The remaining legacy-
@@ -330,7 +330,7 @@ user**; the rest is `NEEDS-RUNTIME`. Follow-ups below are off `integration`,
   wired into the live app: `open_and_retain` dedups by canonical path and
   `gc_buffers` (strong-count liveness) backs every file-backed view, so docs are
   shared by reference across views (Doc/Edit/splits of one file share a rope +
-  unified undo). See ADR-0005 / ADR-0007 and spec §6 step 5c. ⚠️ cross-pane paint
+  unified undo). See ADR-0005 / ADR-0007 and spec §6 step 5c. ⚠️ cross-tile paint
   owes a GPUI runtime eyeball.
 - **`ff-ui-threading`** — `DONE` (`c7b138f`). Move `open_agent`/`attach`/`close`
   socket round-trips off the paint thread (tachyon S4); open is now instant.

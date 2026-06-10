@@ -1179,16 +1179,16 @@ fn gpui_menu_has_required_entries() {
     // The expected leaf actions — change here if gpui_menu changes.
     let expected = [
         // "open file here" returned to the global new-submenu by user
-        // request (2026-06-10) — replaces the focused pane in place, so
+        // request (2026-06-10) — replaces the focused tile in place, so
         // it's workspace-scoped enough to live here.
         "open-browser",
-        "new-browser-pane",
+        "new-browser-tile",
         "buffer-list",
-        "new-agent-pane",
+        "new-agent-tile",
         "split-h",
         "close-window",
         "new-tab",
-        "move-pane",
+        "move-tile",
         "cycle-layout",
         // Direct layout-mode selection (no cycling) + desktop grid size.
         "layout-manual",
@@ -1210,7 +1210,7 @@ fn gpui_menu_has_required_entries() {
             leaf_actions
         );
     }
-    // Pane-scoped + chrome entries removed from the global menu
+    // Tile-scoped + chrome entries removed from the global menu
     // (Phase 2 cleanup + restructure): they live in the `.` local
     // menus / on chords; themes were killed outright.
     for gone in [
@@ -1332,8 +1332,8 @@ fn agent_local_l_resolves_to_claude_list() {
 }
 
 #[test]
-fn menu_n_f_resolves_to_new_browser_pane() {
-    // `n` opens the new submenu; `f` creates a file-browser pane.
+fn menu_n_f_resolves_to_new_browser_tile() {
+    // `n` opens the new submenu; `f` creates a file-browser tile.
     let mut state = MenuState::new();
     state.open();
     let menu = gpui_menu();
@@ -1341,7 +1341,7 @@ fn menu_n_f_resolves_to_new_browser_pane() {
     assert_eq!(after_n, None, "n alone should open the new submenu");
     assert!(state.is_active(), "submenu open keeps menu state active");
     let cmd = state.process_key(KeyPress::new(Key::Char('f'), KMods::NONE), &menu);
-    assert_eq!(cmd, Some("new-browser-pane".to_string()));
+    assert_eq!(cmd, Some("new-browser-tile".to_string()));
 }
 
 #[test]
@@ -1353,7 +1353,7 @@ fn menu_root_submenus_resolve() {
         ('w', 's', "split-h"),
         ('s', 't', "new-tab"),
         ('l', 'l', "cycle-layout"),
-        ('n', 'c', "new-agent-pane"),
+        ('n', 'c', "new-agent-tile"),
     ] {
         let mut state = MenuState::new();
         state.open();
