@@ -46,13 +46,38 @@ feature (debug overlay, viewport wrap math, etc.), assume new work targets
 
 ### GUI layout
 
-- `src/bin/sketch-gpui/main.rs` — single ~7.9k-line file containing the GPUI
-  `Render` impl, every screen builder, action handlers, and key bindings.
-  The render path branches on `WindowContent` (Doc / Edit / Browser /
-  ClaudeSession), each with its own `key_context` (`SketchView`, `EditView`,
-  `BrowserView`, `ClaudeView`) and its own `on_action` wiring.
-- `src/bin/sketch-gpui/workspace.rs` — tab strip + n-ary split tree
-  (`Workspace<C>`, `FocusedWindow`, etc.). See `docs/specs/spec-tabs-and-splits.md`.
+`src/bin/sketch-gpui/` is a module-per-concern split (modules glob-import the
+root via `use super::*;` and the root re-exports them with `pub(crate) use`,
+so items stay crate-visible regardless of file):
+
+- `main.rs` (~6.5k) — `SketchGpuiView` struct, the `Render` impl, app/tab/
+  split/doc methods, marks/layout-modes/tags, menus + overlays + pickers,
+  key bindings + `main()`. The render path branches on `WindowContent`
+  (Doc / Edit / Browser / ClaudeSession), each with its own `key_context`
+  (`SketchView`, `EditView`, `BrowserView`, `ClaudeView`) and its own
+  `on_action` wiring.
+- `screens.rs` — the screen render bodies: `render_doc`, `render_edit`
+  (Code + WP), `render_agent`, `render_browser`.
+- `agent.rs` — agent-pane data layer: tool-call model, `FlatItem` view model
+  + S1 cache + `rebuild_agent_view_model`, `TurnPhase`, `AgentState`,
+  `AgentRing`.
+- `agent_ui.rs` — agent/session methods on the view: open/attach/create/
+  close flows, lease heartbeat, server pump + reducers (`apply_server_batch`
+  / `apply_reply_events` / `apply_agent_event`), submit paths, Claude key
+  handler.
+- `chrome.rs` — focused-window/layout render, tab strip, tag bar, rails.
+- `edit_ui.rs` / `browser_ui.rs` — per-screen methods (edit entry/exit + key
+  dispatch; browser nav + rail).
+- `render_blocks.rs` — free render helpers: colors/fonts, styled-line/block/
+  table elements, wiki links, WP line classifier.
+- `persist.rs` — paths, preferences, workspace + ACP-session persistence,
+  server launch helpers.
+- `workspace.rs` — tab strip + n-ary split tree (`Workspace<C>`,
+  `FocusedWindow`, etc.). See `docs/specs/spec-tabs-and-splits.md`.
+- `tests.rs` / `verify_harness.rs` — unit tests + headless render harness.
+
+Keep the split honest: new agent-pane logic goes in `agent.rs`/`agent_ui.rs`,
+new render helpers in `render_blocks.rs` — don't let `main.rs` re-accrete.
 
 ### GUI screens
 

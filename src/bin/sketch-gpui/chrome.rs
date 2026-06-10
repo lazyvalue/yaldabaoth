@@ -1,0 +1,796 @@
+//! Window chrome on SketchGpuiView: focused-window/layout render, tab
+//! strip, tag bar, rails (render + outline derivation). Extracted
+//! verbatim from main.rs (split-gpui-main, stage 2).
+
+use super::*;
+
+impl SketchGpuiView {
+    /// Build the menu popup as an absolutely-positioned overlay anchored
+    /// to the top of the window. Renders header (breadcrumb), entry list,
+    /// and a footer hint. Has *no* key handlers — the wrapper in
+    /// `Render::render` handles input via `capture_key_down` so the
+    /// underlying screen never sees keystrokes while the menu is open.
+    /// Render the active tab's layout tree. Leaves dispatch to per-kind
+    /// render methods; splits become flex containers (row for V splits,
+    /// col for H splits) with weighted children.
+    pub(crate) fn render_focused_window(
+        &mut self,
+        root: gpui::Div,
+        attach_focus: bool,
+        rail_focusable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tab_idx = self.workspace.active_tab;
+        let focused_id = self.workspace.tabs[tab_idx].focused;
+        // Re-derive the outline rail (if any) once before rendering the tree,
+        // so the focused leaf can render it inline without a second pass.
+        self.refresh_outline_rail();
+        let layout_ptr: *mut workspace::Layout<WindowContent> =
+            &mut self.workspace.tabs[tab_idx].layout as *mut _;
+        // SAFETY: `layout_ptr` is valid for as long as the active tab's
+        // `layout` field isn't structurally mutated (no splits/closes/etc.).
+        // The render pipeline only reads self's other fields (theme/fonts)
+        // and the layout subtree via this pointer; structural mutations
+        // happen in action handlers, never inside render. This sidesteps a
+        // Rust borrowck limitation where the compiler can't prove that
+        // &mut Layout<WindowContent> (a field inside self.workspace.tabs)
+        // is disjoint from &self.render_X's other field accesses.
+        let layout = unsafe { &mut *layout_ptr };
+        self.render_layout(root, layout, focused_id, attach_focus, rail_focusable, cx)
+    }
+
+    /// Recursively render a `Layout<WindowContent>`. The `root` div is used
+    /// only for the leaf case (so leaves can attach focus + key bindings);
+    /// split branches build their own container.
+    ///
+    /// `attach_focus` is true when no overlay is open — in that case the
+    /// focused leaf attaches `track_focus(&self.focus_handle)` so the focus
+    /// handle sits inside that leaf's key context. When an overlay is open,
+    /// focus belongs on the overlay wrapper and no leaf attaches it.
+    pub(crate) fn render_layout(
+        &mut self,
+        root: gpui::Div,
+        layout: &mut workspace::Layout<WindowContent>,
+        focused_id: workspace::WindowId,
+        attach_focus: bool,
+        rail_focusable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match layout {
+            workspace::Layout::Empty => div().size_full().into_any_element(),
+            workspace::Layout::Leaf(window) => {
+                let is_focused = window.id == focused_id;
+                let content_ptr: *mut WindowContent = &mut window.content as *mut _;
+                // SAFETY: same as in render_focused_window — the leaf's
+                // content sits inside a layout tree we won't structurally
+                // mutate during this render call.
+                let content = unsafe { &mut *content_ptr };
+                let leaf_root = if is_focused && attach_focus {
+                    root.track_focus(&self.focus_handle)
+                } else {
+                    root
+                };
+                let painted: AnyElement = match content {
+                    WindowContent::Doc(d) => self.render_doc(leaf_root, d, cx).into_any_element(),
+                    WindowContent::Edit(e) => self.render_edit(leaf_root, e, cx).into_any_element(),
+                    WindowContent::Browser(b) => {
+                        self.render_browser(leaf_root, b, cx).into_any_element()
+                    }
+                    WindowContent::Agent(ring) => {
+                        self.render_agent(leaf_root, ring, cx).into_any_element()
+                    }
+                };
+                // Pin the rail to the leaf it was opened from, not whichever
+                // leaf currently has focus. Falls back to the focused leaf
+                // when no pinned_to is set (single-pane case).
+                let is_rail_pinned = self
+                    .workspace
+                    .active_tab()
+                    .and_then(|t| t.rail.as_ref())
+                    .map(|r| r.pinned_to == window.id)
+                    .unwrap_or(false);
+                let with_rail = if is_rail_pinned {
+                    self.wrap_leaf_with_rail(painted, rail_focusable, cx)
+                } else {
+                    painted
+                };
+                // Focus indicator: thick border around the whole pane+rail
+                // group when there's more than one leaf, plus a small "focused"
+                // tag in the upper-right corner.
+                let multi_leaf = self.active_tab_leaf_count() > 1;
+                let mark_ch = self.workspace.marks.mark_for_window(window.id);
+                if (is_focused && multi_leaf) || mark_ch.is_some() {
+                    let accent: Hsla = rgb(STATUS_FG).into();
+                    let mut wrapper = div().size_full().relative();
+                    if is_focused && multi_leaf {
+                        wrapper = wrapper.border_2().border_color(accent);
+                    }
+                    wrapper = wrapper.child(with_rail);
+                    if is_focused && multi_leaf {
+                        let tag = div()
+                            .absolute()
+                            .top_1()
+                            .right_1()
+                            .px_1p5()
+                            .py_0p5()
+                            .bg(accent)
+                            .text_color(rgb(BG))
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .rounded_sm()
+                            .child("focused");
+                        wrapper = wrapper.child(tag);
+                    }
+                    // Mark badge: small orange label in top-left corner
+                    if let Some(ch) = mark_ch {
+                        let mark_badge = div()
+                            .absolute()
+                            .top_1()
+                            .left_1()
+                            .px_1p5()
+                            .py_0p5()
+                            .bg(gpui::hsla(0.08, 0.9, 0.55, 1.0))
+                            .text_color(gpui::hsla(0.0, 0.0, 0.0, 1.0))
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .rounded_sm()
+                            .child(SharedString::from(format!("[{ch}]")));
+                        wrapper = wrapper.child(mark_badge);
+                    }
+                    wrapper.into_any_element()
+                } else {
+                    with_rail
+                }
+            }
+            workspace::Layout::Split { dir, children } => {
+                // Monocle mode: render only the child subtree containing
+                // the focused leaf, giving it the full area.
+                let is_monocle = self
+                    .workspace
+                    .active_tab()
+                    .map(|t| t.layout_mode == workspace::LayoutMode::Monocle)
+                    .unwrap_or(false);
+                if is_monocle {
+                    // Find the child subtree containing the focused leaf.
+                    let focused_idx = children
+                        .iter()
+                        .position(|(_, child)| child.contains_leaf(focused_id))
+                        .unwrap_or(0);
+                    let (_, child) = &mut children[focused_idx];
+                    let child_root = div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .bg(self.editor_bg())
+                        .text_color(self.editor_fg());
+                    let child_el = self.render_layout(
+                        child_root,
+                        child,
+                        focused_id,
+                        attach_focus,
+                        rail_focusable,
+                        cx,
+                    );
+                    return root.child(child_el).into_any_element();
+                }
+
+                // The `root` div carries `track_focus(&self.focus_handle)`
+                // when no overlay is open, so we must include it in the
+                // tree. Without it the focus handle isn't attached to any
+                // rendered element and global key bindings (e.g. Space →
+                // OpenMenu) have nowhere to dispatch. Wrap the split's
+                // flex container inside `root` rather than discarding it.
+                // Tag view filtering: when active, check which children
+                // have visible leaves and skip the rest.
+                let tag_view = self
+                    .workspace
+                    .active_tab()
+                    .map(|t| &t.tag_view)
+                    .cloned()
+                    .unwrap_or_default();
+                let has_tag_filter = !tag_view.is_empty();
+                let visible_mask: Vec<bool> = if has_tag_filter {
+                    children
+                        .iter()
+                        .map(|(_, child)| {
+                            Self::subtree_has_visible_leaf(
+                                child,
+                                &tag_view,
+                                &self.workspace.file_buffers,
+                            )
+                        })
+                        .collect()
+                } else {
+                    vec![true; children.len()]
+                };
+                // Calculate total visible weight for redistribution.
+                let total_visible_weight: f32 = children
+                    .iter()
+                    .zip(visible_mask.iter())
+                    .filter(|&(_, vis)| *vis)
+                    .map(|((w, _), _)| *w)
+                    .sum();
+
+                let mut container = div().size_full().flex().min_w_0().min_h_0();
+                container = match dir {
+                    workspace::SplitDir::V => container.flex_row(),
+                    workspace::SplitDir::H => container.flex_col(),
+                };
+                let editor_bg = self.editor_bg();
+                let editor_fg = self.editor_fg();
+                for (i, (weight, child)) in children.iter_mut().enumerate() {
+                    if !visible_mask[i] {
+                        continue;
+                    }
+                    let w = if has_tag_filter && total_visible_weight > 0.0 {
+                        *weight / total_visible_weight
+                    } else {
+                        *weight
+                    };
+                    let child_root = div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .bg(editor_bg)
+                        .text_color(editor_fg);
+                    let child_el = self.render_layout(
+                        child_root,
+                        child,
+                        focused_id,
+                        attach_focus,
+                        rail_focusable,
+                        cx,
+                    );
+                    let mut slot = div().min_w_0().min_h_0().overflow_hidden();
+                    {
+                        let style = slot.style();
+                        style.flex_grow = Some(w);
+                        style.flex_shrink = Some(1.0);
+                        style.flex_basis = Some(gpui::relative(0.0).into());
+                    }
+                    slot = slot.child(child_el);
+                    container = container.child(slot);
+                }
+                root.child(container).into_any_element()
+            }
+        }
+    }
+
+    /// How many leaves does the active tab's layout contain?
+    pub(crate) fn active_tab_leaf_count(&self) -> usize {
+        self.workspace
+            .active_tab()
+            .map(|t| t.layout.leaf_count())
+            .unwrap_or(0)
+    }
+
+    /// If the workspace has more than one tab, stack a thin horizontal tab
+    /// strip above the screen view. Single-tab workspaces render the screen
+    /// alone (no strip).
+    pub(crate) fn wrap_with_tab_strip(
+        &self,
+        screen_view: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.workspace.tabs.len() <= 1 {
+            return screen_view;
+        }
+
+        let active_idx = self.workspace.active_tab;
+        // Pull chrome colors from the active theme so the strip matches the
+        // light/dark palette. Active tab inverts to editor_bg (the doc body
+        // colour) so the focused tab visually connects to the work area.
+        let top_bar = self.theme.top_bar;
+        let active_fg: Hsla = fg_or(top_bar, STATUS_FG);
+        let inactive_fg: Hsla = rgb(0x6272a4).into();
+        let strip_bg: Hsla = bg_or(top_bar, STATUS_BG);
+        let active_bg: Hsla = self.editor_bg();
+
+        // Vertical sidebar on the left, fixed-width. Flex default for
+        // align-items is stretch, which is what we want — entries fill the
+        // strip width and truncate via overflow_hidden.
+        let mut strip = div()
+            .flex()
+            .flex_col()
+            .px_1()
+            .py_2()
+            .w(px(160.0))
+            .min_w(px(160.0))
+            .bg(strip_bg)
+            .text_size(px(12.0))
+            .font_family(self.body_font.clone())
+            .gap_1();
+
+        for (i, tab) in self.workspace.tabs.iter().enumerate() {
+            let label = tab_strip_label(tab);
+            let is_active = i == active_idx;
+            let fg = if is_active { active_fg } else { inactive_fg };
+            let bg = if is_active { active_bg } else { strip_bg };
+
+            let entry = div()
+                .id(("tab-strip-entry", i))
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded(px(3.0))
+                .bg(bg)
+                .text_color(fg)
+                .overflow_hidden()
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, ev: &MouseDownEvent, _w, cx| {
+                        // Double-click on a tab entry opens the rename
+                        // overlay for that tab. Single-click just
+                        // switches to it.
+                        if ev.click_count >= 2 {
+                            view.workspace.active_tab = i;
+                            view.open_rename_active_tab_overlay(cx);
+                        } else {
+                            view.select_tab(i, cx);
+                        }
+                    }),
+                );
+            strip = strip.child(entry);
+        }
+
+        div()
+            .size_full()
+            .flex()
+            .flex_row()
+            .child(strip)
+            .child(div().flex_1().min_w_0().min_h_0().child(screen_view))
+            .into_any_element()
+    }
+
+    /// Render a thin tag bar above the content when any buffers in the workspace
+    /// have tags. Tags in the active tab's tag_view get accent background.
+    pub(crate) fn wrap_with_tag_bar(&self, screen_view: AnyElement) -> AnyElement {
+        let all_tags = self.all_tags();
+        if all_tags.is_empty() {
+            return screen_view;
+        }
+        let tag_view = self
+            .workspace
+            .active_tab()
+            .map(|t| &t.tag_view)
+            .cloned()
+            .unwrap_or_default();
+        let accent: Hsla = rgb(STATUS_FG).into();
+        let dimmed: Hsla = rgb(0x666666).into();
+        let strip_bg: Hsla = bg_or(self.theme.top_bar, STATUS_BG);
+
+        let mut bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_4()
+            .h(px(20.0))
+            .bg(strip_bg)
+            .text_size(px(10.0));
+
+        for tag in &all_tags {
+            let is_active = tag_view.contains(tag);
+            let chip = div()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .bg(if is_active { accent } else { strip_bg })
+                .text_color(if is_active { rgb(BG).into() } else { dimmed })
+                .font_weight(if is_active {
+                    FontWeight::BOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .child(SharedString::from(tag.clone()));
+            bar = bar.child(chip);
+        }
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(bar)
+            .child(div().flex_1().min_h_0().child(screen_view))
+            .into_any_element()
+    }
+
+    /// Inject the active tab's rail beside the **focused leaf's** content
+    /// (spec-rail.md §8, adjusted: the rail is chrome local to the focused
+    /// pane, not the whole window — so in a split it sits against the focused
+    /// content, not at the window edge). `content_el` is the already-rendered
+    /// focused-leaf element. No-op passthrough when no rail is open.
+    /// `rail_focusable` is false when an overlay owns focus — the rail still
+    /// renders as background but is not focusable (constraint §4).
+    ///
+    /// The outline entries are re-derived once per frame in
+    /// `render_focused_window` before this runs (spec §13).
+    pub(crate) fn wrap_leaf_with_rail(
+        &mut self,
+        content_el: AnyElement,
+        rail_focusable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self
+            .workspace
+            .active_tab()
+            .map(|t| t.rail.is_none())
+            .unwrap_or(true)
+        {
+            return content_el;
+        }
+
+        let (side, focused) = {
+            let r = self
+                .workspace
+                .active_tab()
+                .and_then(|t| t.rail.as_ref())
+                .expect("rail present");
+            (r.side, r.focused && rail_focusable)
+        };
+
+        let rail = self.render_rail(focused, cx);
+
+        let content_slot = div().flex_1().min_w_0().min_h_0().child(content_el);
+
+        let row = div().size_full().flex().flex_row().min_w_0().min_h_0();
+        let row = match side {
+            workspace::RailSide::Left => row.child(rail).child(content_slot),
+            workspace::RailSide::Right => row.child(content_slot).child(rail),
+        };
+        row.into_any_element()
+    }
+
+    /// Re-derive the outline rail's heading entries from the focused window
+    /// (spec §13). No-op when the rail is closed or showing the file browser.
+    /// Change-key for the outline: focused window id + that window's content
+    /// version. Re-deriving the outline is O(document) (an Edit pane allocates
+    /// the whole rope via `full_text()` and scans every line), and the render
+    /// loop runs every frame — including every keystroke. Keying on this lets
+    /// `refresh_outline_rail` skip the work when nothing relevant changed.
+    pub(crate) fn outline_change_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        if let Some(tab) = self.workspace.active_tab() {
+            tab.focused.hash(&mut h); // focus change → re-derive
+        }
+        match self.workspace.focused_content() {
+            // Edit: edit_seq is the exact monotonic content version.
+            Some(WindowContent::Edit(e)) => e.editor.edit_seq().hash(&mut h),
+            // Doc: blocks only change on load/reload/edit-flush; block count is
+            // a cheap proxy (outline is cosmetic, so a same-count content change
+            // leaving it briefly stale is acceptable).
+            Some(WindowContent::Doc(d)) => d.blocks.len().hash(&mut h),
+            // Agent/Browser have no outline; constant so it derives once (empty).
+            _ => 0u64.hash(&mut h),
+        }
+        h.finish()
+    }
+
+    pub(crate) fn refresh_outline_rail(&mut self) {
+        let is_outline = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.rail.as_ref())
+            .map(|r| r.content.is_outline())
+            .unwrap_or(false);
+        if !is_outline {
+            return;
+        }
+        // Skip the O(document) re-derivation when neither the focused window nor
+        // its content changed since the last derive (the common case — cursor
+        // blink, scroll, cross-pane notify, and unrelated keystrokes).
+        let key = self.outline_change_key();
+        let unchanged = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.rail.as_ref())
+            .and_then(|r| match &r.content {
+                workspace::RailContent::Outline(o) => o.last_key,
+                _ => None,
+            })
+            == Some(key);
+        if unchanged {
+            return;
+        }
+        let entries = self.derive_outline();
+        if let Some(r) = self.rail_mut()
+            && let workspace::RailContent::Outline(o) = &mut r.content
+        {
+            o.entries = entries;
+            o.last_key = Some(key);
+            if o.selected >= o.entries.len() {
+                o.selected = o.entries.len().saturating_sub(1);
+            }
+        }
+    }
+
+    /// Build `(depth, text, block_index_or_line)` heading entries from the
+    /// focused window's content (spec §13).
+    pub(crate) fn derive_outline(&self) -> Vec<(u8, String, usize)> {
+        match self.workspace.focused_content() {
+            Some(WindowContent::Doc(d)) => {
+                let mut out = Vec::new();
+                for (idx, block) in d.blocks.iter().enumerate() {
+                    if let RenderedBlock::Heading { level, content } = block {
+                        out.push((*level, styled_line_plain(content), idx));
+                    }
+                }
+                out
+            }
+            Some(WindowContent::Edit(e)) => {
+                let text = e.editor.full_text();
+                let mut out = Vec::new();
+                for (line_no, line) in text.lines().enumerate() {
+                    if let Some((level, heading)) = atx_heading(line) {
+                        out.push((level, heading, line_no));
+                    }
+                }
+                out
+            }
+            // Agent / Browser have no outline.
+            _ => Vec::new(),
+        }
+    }
+
+    /// Render the rail column for the active tab (spec §9, §11–§13). Chrome
+    /// styling — text is fixed at 12px and does NOT scale with `text_scale`.
+    pub(crate) fn render_rail(&self, focused: bool, cx: &mut Context<Self>) -> gpui::Div {
+        let rail = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.rail.as_ref())
+            .expect("rail present");
+
+        let top_bar = self.theme.top_bar;
+        let rail_bg: Hsla = bg_or(top_bar, STATUS_BG);
+        // Unselected entry text: use the brighter overlay *foreground* rather
+        // than the dim `overlay.label` token — the label color reads too
+        // low-contrast against the rail background. `overlay.fg` is the same
+        // high-contrast body color the command menu uses for its entries.
+        let label_fg: Hsla = nc(self.theme.overlay.fg);
+        // Placeholder text ("(empty)", "(no outline)") stays intentionally dim.
+        let muted_fg: Hsla = nc(self.theme.overlay.label);
+        let accent_fg: Hsla = nc(self.theme.overlay.accent);
+        let selected_bg: Hsla = self.editor_bg();
+        let selected_fg: Hsla = rgb(STATUS_FG).into();
+        let border_color: Hsla = rgb(0x6272a4).into();
+        let side = rail.side;
+        let width = rail.width_px;
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(width))
+            .min_w(px(width))
+            .h_full()
+            .min_h_0()
+            .overflow_hidden()
+            .bg(rail_bg)
+            .text_size(px(12.0))
+            .font_family(self.body_font.clone());
+
+        // Content-facing border (right when Left, left when Right).
+        col = match side {
+            workspace::RailSide::Left => col.border_r_1().border_color(border_color),
+            workspace::RailSide::Right => col.border_l_1().border_color(border_color),
+        };
+
+        // When focused, attach the focus handle inside the RailView key
+        // context so its context-scoped bindings (j/k/enter/…) match.
+        let mut col = col.key_context("RailView");
+        if focused {
+            col = col.track_focus(&self.focus_handle);
+        }
+        col = col
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                this.handle_rail_filter_key(ev, w, cx);
+            }))
+            .on_action(cx.listener(Self::rail_down))
+            .on_action(cx.listener(Self::rail_up))
+            .on_action(cx.listener(Self::rail_select))
+            .on_action(cx.listener(Self::rail_close))
+            .on_action(cx.listener(Self::rail_parent))
+            .on_action(cx.listener(Self::rail_toggle_hidden))
+            .on_action(cx.listener(Self::rail_cycle_sort))
+            .on_action(cx.listener(Self::rail_worktrees))
+            .on_action(cx.listener(Self::rail_filter))
+            // Global actions forwarded so they keep working while the rail is
+            // focused (same pattern as every other screen root).
+            .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::restart))
+            .on_action(cx.listener(Self::open_browser))
+            .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::paste_from_clipboard))
+            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::move_pane))
+            .on_action(cx.listener(Self::also_show_pane))
+            .on_action(cx.listener(Self::toggle_file_browser_rail))
+            .on_action(cx.listener(Self::toggle_outline_rail))
+            .on_action(cx.listener(Self::flip_rail_side))
+            // Pane focus motion — without these the ctrl-w h/j/k/l chords
+            // are swallowed when the rail holds `track_focus`.
+            .on_action(cx.listener(Self::focus_left))
+            .on_action(cx.listener(Self::focus_right))
+            .on_action(cx.listener(Self::focus_up))
+            .on_action(cx.listener(Self::focus_down))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev));
+
+        match &rail.content {
+            workspace::RailContent::FileBrowser(fb) => {
+                if let Some(wm) = &fb.worktree_mode {
+                    // ── Worktree picker overlay ──────────────────────
+                    let header = div()
+                        .px_2()
+                        .py_1()
+                        .flex_none()
+                        .text_color(accent_fg)
+                        .font_weight(FontWeight::BOLD)
+                        .overflow_hidden()
+                        .child(SharedString::new_static("WORKTREES"));
+
+                    let mut list = div().flex().flex_col().flex_1().min_h_0().overflow_hidden();
+
+                    if wm.worktrees.is_empty() {
+                        list = list.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_color(muted_fg)
+                                .child(SharedString::new_static("  (no worktrees)")),
+                        );
+                    } else {
+                        let visible_rows = 40usize;
+                        let scroll =
+                            scroll_to_keep_visible(wm.selected, visible_rows, wm.worktrees.len());
+                        for (i, wt) in wm
+                            .worktrees
+                            .iter()
+                            .enumerate()
+                            .skip(scroll)
+                            .take(visible_rows)
+                        {
+                            let is_sel = i == wm.selected;
+                            let marker = if wt.is_current {
+                                "* "
+                            } else if is_sel {
+                                "▸ "
+                            } else {
+                                "  "
+                            };
+                            let label = format!("{}{}", marker, wt.label);
+                            let (rbg, rfg) = if is_sel {
+                                (selected_bg, selected_fg)
+                            } else {
+                                (rail_bg, accent_fg)
+                            };
+                            list = list.child(
+                                div()
+                                    .w_full()
+                                    .px_2()
+                                    .py_0p5()
+                                    .bg(rbg)
+                                    .text_color(rfg)
+                                    .overflow_hidden()
+                                    .child(SharedString::from(label)),
+                            );
+                        }
+                    }
+                    col.child(header).child(list)
+                } else {
+                    // ── Normal file browser ──────────────────────────
+                    let dir_str = fb.current_dir().display().to_string();
+                    let header_text = if fb.filter_mode {
+                        format!("/{}", fb.filter_text())
+                    } else {
+                        format!("▸ {}", dir_str)
+                    };
+                    let header = div()
+                        .px_2()
+                        .py_1()
+                        .flex_none()
+                        .text_color(accent_fg)
+                        .font_weight(FontWeight::BOLD)
+                        .overflow_hidden()
+                        .child(SharedString::from(header_text));
+
+                    let mut list = div().flex().flex_col().flex_1().min_h_0().overflow_hidden();
+
+                    let entries = fb.visible_entries();
+                    let selected = fb.selected();
+                    if entries.is_empty() {
+                        let msg = if fb.filter_mode {
+                            "  (no matches)"
+                        } else {
+                            "  (empty)"
+                        };
+                        list = list.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_color(muted_fg)
+                                .child(SharedString::new_static(msg)),
+                        );
+                    } else {
+                        let visible_rows = 40usize;
+                        let scroll = scroll_to_keep_visible(selected, visible_rows, entries.len());
+                        for (i, entry) in entries.iter().enumerate().skip(scroll).take(visible_rows)
+                        {
+                            let is_sel = i == selected;
+                            let suffix = if entry.is_dir { "/" } else { "" };
+                            let name = format!("{}{}", entry.name, suffix);
+                            let (rbg, rfg) = if is_sel {
+                                (selected_bg, selected_fg)
+                            } else if entry.is_dir {
+                                (rail_bg, accent_fg)
+                            } else {
+                                (rail_bg, label_fg)
+                            };
+                            list = list.child(
+                                div()
+                                    .w_full()
+                                    .px_2()
+                                    .py_0p5()
+                                    .bg(rbg)
+                                    .text_color(rfg)
+                                    .overflow_hidden()
+                                    .child(SharedString::from(name)),
+                            );
+                        }
+                    }
+                    col.child(header).child(list)
+                }
+            }
+            workspace::RailContent::Outline(o) => {
+                let header = div()
+                    .px_2()
+                    .py_1()
+                    .flex_none()
+                    .text_color(accent_fg)
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::new_static("OUTLINE"));
+
+                let mut list = div().flex().flex_col().flex_1().min_h_0().overflow_hidden();
+
+                if o.entries.is_empty() {
+                    list = list.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_color(muted_fg)
+                            .child(SharedString::new_static("(no outline)")),
+                    );
+                } else {
+                    let visible_rows = 40usize;
+                    let scroll = scroll_to_keep_visible(o.selected, visible_rows, o.entries.len());
+                    for (i, (level, text, _)) in
+                        o.entries.iter().enumerate().skip(scroll).take(visible_rows)
+                    {
+                        let is_sel = i == o.selected;
+                        // Indent by heading depth; depth-1 headings are
+                        // section headers (accent + bold).
+                        let indent = "  ".repeat((*level as usize).saturating_sub(1));
+                        let label_text = format!("{}{}", indent, text);
+                        let mut row = div().w_full().px_2().py_0p5().overflow_hidden();
+                        if is_sel {
+                            row = row.bg(selected_bg).text_color(selected_fg);
+                        } else if *level == 1 {
+                            row = row.text_color(accent_fg).font_weight(FontWeight::BOLD);
+                        } else {
+                            row = row.text_color(label_fg);
+                        }
+                        list = list.child(row.child(SharedString::from(label_text)));
+                    }
+                }
+                col.child(header).child(list)
+            }
+        }
+    }
+}

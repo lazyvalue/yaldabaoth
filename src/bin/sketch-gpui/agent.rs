@@ -510,7 +510,9 @@ pub(crate) fn append_tool_body(
 /// old/new bodies; treats terminal embeds as a one-line placeholder.
 /// Centralised so policy tweaks (e.g., suppressing the old half of a
 /// diff) only need to be made in one spot.
-pub(crate) fn render_tool_content_blocks(content: &[sketch::acp_channel::ToolCallContent]) -> String {
+pub(crate) fn render_tool_content_blocks(
+    content: &[sketch::acp_channel::ToolCallContent],
+) -> String {
     use sketch::acp_channel::ToolCallContent;
     let mut buf = String::new();
     for c in content {
@@ -715,7 +717,11 @@ pub(crate) fn count_turn_headers_before(tags: &[Option<TurnId>], before_line: us
 /// cursor is outside the transcript, so following is purely the sticky-bottom
 /// `follow_output` flag; in Worksheet mode the viewport tracks the cursor and
 /// follows only when the cursor is at EOF.
-pub(crate) fn should_follow_tail(input_mode: InputModeKind, follow_output: bool, cursor_at_eof: bool) -> bool {
+pub(crate) fn should_follow_tail(
+    input_mode: InputModeKind,
+    follow_output: bool,
+    cursor_at_eof: bool,
+) -> bool {
     match input_mode {
         InputModeKind::Chatbox => follow_output,
         InputModeKind::Worksheet => cursor_at_eof,
@@ -736,7 +742,10 @@ pub(crate) fn block_content_hash(lines: &[String]) -> u64 {
     h.finish()
 }
 
-pub(crate) fn detect_block_ranges(lines: &[String], frozen_ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+pub(crate) fn detect_block_ranges(
+    lines: &[String],
+    frozen_ranges: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
     let is_frozen = |i: usize| -> bool { frozen_ranges.iter().any(|&(s, e)| i >= s && i < e) };
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -814,7 +823,12 @@ pub(crate) enum BlockParse {
     FallBackToLines,
 }
 
-pub(crate) fn parse_block_range(lines: &[String], start: usize, end: usize, theme: &Theme) -> BlockParse {
+pub(crate) fn parse_block_range(
+    lines: &[String],
+    start: usize,
+    end: usize,
+    theme: &Theme,
+) -> BlockParse {
     let slice: String = lines[start..end].join("\n");
     let blocks = render_with_wiki(&slice, theme, None);
     // Take the first Table or CodeBlock produced.
@@ -2639,7 +2653,8 @@ pub(crate) enum OpenResolution {
 /// back to exactly the placeholder that started it — even across rings whose
 /// per-ring `index` counters both start at 0 (the collision that dropped a
 /// session's events on restore: `pump: no slot for server session`).
-pub(crate) static NEXT_OPEN_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+pub(crate) static NEXT_OPEN_TOKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 pub(crate) fn alloc_open_token() -> u64 {
     NEXT_OPEN_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

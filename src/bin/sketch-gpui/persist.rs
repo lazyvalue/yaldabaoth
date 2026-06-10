@@ -543,7 +543,10 @@ pub(crate) fn snapshot_rail(rail: &workspace::RailState) -> PersistedRail {
 /// Reconstruct a live rail from its persisted shadow (spec-rail.md §14). The
 /// restored rail is unfocused (focus stays on the content leaf on restore).
 /// `fallback_pin` is used when the snapshot predates the `pinned_to` field.
-pub(crate) fn restore_rail(p: PersistedRail, fallback_pin: workspace::WindowId) -> workspace::RailState {
+pub(crate) fn restore_rail(
+    p: PersistedRail,
+    fallback_pin: workspace::WindowId,
+) -> workspace::RailState {
     let content = match p.kind {
         PersistedRailKind::FileBrowser => {
             let dir = match p.cwd {
@@ -727,7 +730,10 @@ pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<WindowContent>) -> Pe
 
 /// Best-effort write of the workspace snapshot for `cwd`. Silently no-ops
 /// on any I/O / serialization failure (Behavior 23: best-effort + silent).
-pub(crate) fn save_persisted_workspace(cwd: &std::path::Path, ws: &workspace::Workspace<WindowContent>) {
+pub(crate) fn save_persisted_workspace(
+    cwd: &std::path::Path,
+    ws: &workspace::Workspace<WindowContent>,
+) {
     let Some(path) = workspace_persist_path() else {
         return;
     };
