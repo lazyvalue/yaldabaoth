@@ -64,9 +64,8 @@ impl SketchGpuiView {
             // session_id) and stash it on the placeholder so it lives as long
             // as the ring does — events for the soon-to-be-attached sessions
             // need it running before the attach Ack returns.
-            let server_pump = self.start_server_pump(cx);
+            self.start_server_pump(cx);
             if let Some(slot) = ring.slots.first_mut() {
-                slot.state._pump = Some(server_pump);
                 slot.pending_open_token = Some(open_token);
             }
 
@@ -575,9 +574,8 @@ impl SketchGpuiView {
                 AgentState::new_server_managed(Some("connecting to session server…".into()));
             let open_token = alloc_open_token();
             ring.push(label.clone(), placeholder, None, slot_cwd.clone(), None);
-            let server_pump = self.start_server_pump(cx);
+            self.start_server_pump(cx);
             if let Some(slot) = ring.slots.first_mut() {
-                slot.state._pump = Some(server_pump);
                 slot.pending_open_token = Some(open_token);
             }
             self.set_screen(WindowContent::Agent(ring));
@@ -1155,11 +1153,18 @@ impl SketchGpuiView {
         self._lease_heartbeat = Some(beater);
     }
 
-    pub(crate) fn start_server_pump(&mut self, cx: &mut Context<Self>) -> Task<()> {
+    pub(crate) fn start_server_pump(&mut self, cx: &mut Context<Self>) {
+        // Singleton guard, same as the heartbeat: one pump per view, alive
+        // for the view's lifetime. Re-entry (every open/new/restore path
+        // calls this defensively) is a no-op; the receivers stay owned by
+        // the original task.
+        if self._server_pump.is_some() {
+            return;
+        }
         // Phase 4: a single lease-heartbeat beater rides alongside the pump so a
         // live owner's lease never falsely expires.
         self.start_lease_heartbeat(cx);
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             use futures::FutureExt;
             use futures::stream::StreamExt;
 
@@ -1313,7 +1318,8 @@ impl SketchGpuiView {
                     cx.background_executor().timer(yield_delay).await;
                 }
             }
-        })
+        });
+        self._server_pump = Some(task);
     }
 
     /// Find an agent slot by its server session id across ALL tabs and panes,

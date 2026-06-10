@@ -1527,6 +1527,15 @@ struct SketchGpuiView {
     /// out into K redundant Owner re-attaches. Dropped (and thus cancelled)
     /// with the view.
     _lease_heartbeat: Option<Task<()>>,
+    /// The ONE server-notification pump for this view (`start_server_pump`),
+    /// singleton like the heartbeat above. It MUST live on the view, never on
+    /// an agent slot: the pump owns the `SessionServerClient`'s notification
+    /// receiver, so parking it in whichever slot started it meant any flow
+    /// that replaced that slot's state (set_screen over a restored ring, slot
+    /// churn) cancelled the pump, dropped the receiver, and killed the whole
+    /// connection — every later attach failed with "session server
+    /// disconnected".
+    _server_pump: Option<Task<()>>,
 }
 
 impl SketchGpuiView {
@@ -1571,6 +1580,7 @@ impl SketchGpuiView {
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
             syntect_hl: sketch::highlight::Highlighter::new(),
             _lease_heartbeat: None,
+            _server_pump: None,
             pending_mark_chord: None,
             pending_tag_chord: None,
         }
@@ -1601,6 +1611,7 @@ impl SketchGpuiView {
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
             syntect_hl: sketch::highlight::Highlighter::new(),
             _lease_heartbeat: None,
+            _server_pump: None,
             pending_mark_chord: None,
             pending_tag_chord: None,
         }
@@ -1750,9 +1761,8 @@ impl SketchGpuiView {
                     AgentState::new_server_managed(Some("connecting to session server…".into()));
                 let open_token = alloc_open_token();
                 ring.push("claude-1".into(), placeholder, None, proc_cwd.clone(), None);
-                let server_pump = self.start_server_pump(cx);
+                self.start_server_pump(cx);
                 if let Some(slot) = ring.slots.first_mut() {
-                    slot.state._pump = Some(server_pump);
                     slot.pending_open_token = Some(open_token);
                 }
                 // Install the ring, then kick off async attach.
