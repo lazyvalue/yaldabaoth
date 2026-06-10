@@ -123,6 +123,7 @@ impl SketchGpuiView {
         let drag = tab.desktop.drag;
         let slot_list: Vec<(workspace::WindowId, workspace::Slot)> = tab.desktop.slots.clone();
         let base_bg = self.editor_bg();
+        let content_fg = self.editor_fg();
         let dim: Hsla = nc(self.theme.agent.dim);
         let accent: Hsla = rgb(CURSOR_BAR_COLOR).into();
         let panel_bg = tint_bg(base_bg, 0.5, 0.06, 0.02);
@@ -250,15 +251,24 @@ impl SketchGpuiView {
             let title = Self::desktop_panel_title(content);
             let mark = self.workspace.marks.mark_for_window(id);
 
-            // `size_full` is load-bearing: in tiling, the leaf root arrives
-            // pre-sized by the split layout; here the content sits inside the
-            // fixed panel frame, and without a definite size the virtualized
-            // doc/edit bodies collapse to their minimum height (content
-            // huddled at the top, dead space below).
+            // The leaf-root CONTRACT (see `screen_root` in render() and the
+            // split-child roots in render_layout): the per-kind renderers
+            // never set their own root layout — they expect a div that is
+            // already `size_full + flex + flex_col` with the editor colors.
+            // Missing any piece breaks them: without flex_col the header/
+            // body/footer stack in block layout and the flex_1 virtualized
+            // body collapses to its minimum height (content huddled at the
+            // top of the panel, dead space below).
+            let base = div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(base_bg)
+                .text_color(content_fg);
             let leaf_root = if is_focused && attach_focus {
-                div().size_full().track_focus(&self.focus_handle)
+                base.track_focus(&self.focus_handle)
             } else {
-                div().size_full()
+                base
             };
             let inner: AnyElement = match content {
                 WindowContent::Doc(d) => self.render_doc(leaf_root, d, cx).into_any_element(),
