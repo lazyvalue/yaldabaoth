@@ -11,6 +11,22 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
 
 ---
 
+## Features
+
+- **Desktop mode** — `NEEDS-RUNTIME` (built 2026-06-10, spec
+  `spec-desktop-mode.md`, engine `1f7c269^..1f7c269` on master). Fifth
+  per-tab LayoutMode (`Ctrl-W Space` cycle, sigil `[#]`): fixed-size panels
+  (global `{cols}x{rows}` via `Ctrl-W p`, default 120×40) on a pannable slot
+  grid; drag panels by title bar (insert-and-shift, right-click cancels);
+  spatial focus via the usual `Ctrl-W h/j/k/l`. Human checklist: drag feel +
+  drop targeting, scroll-pan + edge auto-pan, typing/keys inside each panel
+  kind (Doc/Edit/Browser/Agent), focus-offscreen recovery (focus a panned-out
+  panel → auto-reveal), mode round-trips (Manual ↔ Desktop preserves both
+  arrangements), restart persistence. Deferred polish, in spec but not v1:
+  Esc-to-cancel drag at canvas root (global escape binding would shadow
+  per-screen escape; needs a careful dispatch design); measured mono cell
+  size (currently 0.6em/1.4em approximation in `desktop_panel_px`).
+
 ## Bugs
 
 - **Mid-turn message drops (lease gate + invisible rejection)** — `FIXED`
