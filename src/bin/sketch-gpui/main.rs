@@ -126,7 +126,7 @@ pub(crate) use sketch::worktree;
 // ----------------------------------------------------------------------------
 
 /// `true` when `SKETCH_PERF` is set to anything other than `0`/empty. Enables
-/// per-frame timing breakdowns from the agent pane render path (extract /
+/// per-frame timing breakdowns from the agent tile render path (extract /
 /// highlight / snapshot / total), printed to stderr. Read once and cached.
 fn perf_enabled() -> bool {
     use std::sync::OnceLock;
@@ -180,15 +180,15 @@ actions!(
         PrevTab,
         NewTab,
         CloseTab,
-        // Move the focused pane to another workspace (Ctrl-W m). Opens the
+        // Move the focused tile to another workspace (Ctrl-W m). Opens the
         // workspace picker; selecting a target relocates the focused leaf
         // (content travels with it). See spec-workspaces-tagging.md Phase 1.
-        MovePane,
-        // Also-show the focused (file-backed) pane in another workspace
+        MoveTile,
+        // Also-show the focused (file-backed) tile in another workspace
         // (Ctrl-W M / shift). Opens the same picker; selecting a target
         // creates a second view onto the same file there, leaving the
-        // original in place. Agent/Browser panes are single-home (rejected).
-        AlsoShowPane,
+        // original in place. Agent/Browser tiles are single-home (rejected).
+        AlsoShowTile,
         // Splits (Ctrl-W chord prefix per spec-tabs-and-splits.md §12)
         SplitH,
         SplitV,
@@ -201,7 +201,7 @@ actions!(
         FocusDown,
         FocusNext,
         FocusPrev,
-        // Resize the focused pane vs. its sibling
+        // Resize the focused tile vs. its sibling
         ResizeShrink,
         ResizeGrow,
         Equalize,
@@ -233,9 +233,9 @@ actions!(
         // Agent window: flip the input mode between Worksheet and
         // Chatbox (§5). Bound to `Ctrl-Alt-Enter`.
         ToggleAgentInputMode,
-        // Agent window: open/close the Tasklist sidepane (§32). Cmd-1.
+        // Agent window: open/close the Tasklist sidebar (§32). Cmd-1.
         ToggleTasklist,
-        // Agent window: open/close the Subagents sidepane (§32). Cmd-2.
+        // Agent window: open/close the Subagents sidebar (§32). Cmd-2.
         ToggleSubagents,
         // Agent window: interrupt the in-flight turn (ACP session/cancel).
         // Bound to Cmd-. and surfaced as a Stop button while a reply is
@@ -259,7 +259,7 @@ actions!(
         // Layout patterns (spec-layout-patterns.md)
         // Phase 2: automatic layouts
         CycleLayoutMode,
-        DesktopPanelSize,
+        DesktopTileSize,
         PromoteToMaster,
         IncreaseMasterCount,
         DecreaseMasterCount,
@@ -452,7 +452,7 @@ struct DocSource {
     core: workspace::SharedCore,
     /// `Document.edit_seq()` the current `blocks` were derived at. The
     /// per-frame `refresh_blocks` re-derives only when the core has advanced
-    /// past this — O(1) when idle, one re-parse per change (the two-pane live
+    /// past this — O(1) when idle, one re-parse per change (the two-tile live
     /// path; memoized exactly like `EditState.lines_cache`).
     rendered_seq: u64,
 }
@@ -481,7 +481,7 @@ impl DocSource {
 }
 
 impl DocState {
-    /// A fresh, empty variable-height `ListState` for a new Doc pane. Mirrors
+    /// A fresh, empty variable-height `ListState` for a new Doc tile. Mirrors
     /// the agent transcript's list construction; `Top` alignment keeps the
     /// document anchored at its first block (unlike the agent's `Bottom`).
     fn new_list_state(count: usize) -> gpui::ListState {
@@ -554,10 +554,10 @@ impl DocState {
 /// State held while the user is browsing the filesystem.
 ///
 /// `underlying`: when the browser was opened *in place* of an existing
-/// Doc/Edit/Claude window (Cmd-O from a focused pane), this holds that
+/// Doc/Edit/Claude window (Cmd-O from a focused tile), this holds that
 /// prior content so Esc/q can restore it. `None` when the browser was
 /// opened standalone (new-tab open, initial cwd browser, splits that
-/// fall back to a browser pane). In-memory only — not persisted with
+/// fall back to a browser tile). In-memory only — not persisted with
 /// the workspace snapshot, since "restore to a browser-with-stashed-
 /// content" doesn't carry meaning across process restarts.
 struct BrowserWindow {
@@ -615,7 +615,7 @@ enum EditView {
 /// A file-backed editor handle whose `EditorCore` lives in the workspace
 /// buffer pool (`Rc<RefCell<EditorCore>>`) and is therefore shared by every
 /// window viewing the same file. The per-window `EditorView` (cursor,
-/// selection, insert flag) is owned here, so each split / also-shown pane
+/// selection, insert flag) is owned here, so each split / also-shown tile
 /// navigates independently while edits + undo land on one shared rope.
 ///
 /// `buffer_id` is the pool key; the owning window must `buffer_release` it on
@@ -693,7 +693,7 @@ impl SharedEditor {
 }
 
 /// The dispatch core (`dispatch_normal_core` / `dispatch_insert_core`) is
-/// shared by every text surface — the pooled Edit pane plus the (non-pooled)
+/// shared by every text surface — the pooled Edit tile plus the (non-pooled)
 /// Chatbox and Agent transcript. This trait lets the dispatch stay one body
 /// while operating over either an owned [`Editor`] or a pool-backed
 /// [`SharedEditor`]. Every method mirrors the matching `Editor` method; the
@@ -997,7 +997,7 @@ impl EditOps for SharedEditor {
     }
 }
 
-// Build the trimmed, tab-expanded per-line text for an Edit pane's body,
+// Build the trimmed, tab-expanded per-line text for an Edit tile's body,
 // reading the pooled core's rope once. Mirrors the prior per-line
 // `document().line_text(i)` loop but takes a single `RefCell` borrow.
 
@@ -1028,7 +1028,7 @@ struct EditState {
     lines_cache_seq: u64,
     /// Last extracted (tab-expanded, newline-trimmed) source lines, reused
     /// verbatim on frames where `edit_seq` is unchanged (cursor blink,
-    /// selection, cross-pane notify) so we don't re-allocate a String per line.
+    /// selection, cross-tile notify) so we don't re-allocate a String per line.
     lines_cache: std::rc::Rc<Vec<String>>,
     /// Virtualized line list — only the visible rows are built/laid-out each
     /// frame instead of one element per document line. Variable height (lines
@@ -1146,22 +1146,22 @@ struct SessionSwitcher {
 
 /// What the workspace picker will do with the chosen target. Drives the
 /// header copy and the commit branch so one picker overlay serves both
-/// "move pane" (Ctrl-W m) and "also-show pane" (Ctrl-W M).
+/// "move tile" (Ctrl-W m) and "also-show tile" (Ctrl-W M).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WorkspacePickerMode {
     /// Relocate the focused leaf into the target workspace (content travels;
-    /// works for every pane kind). Spec-workspaces-tagging.md Phase 1.
+    /// works for every tile kind). Spec-workspaces-tagging.md Phase 1.
     Move,
-    /// Open a second view onto the focused file-backed pane's file in the
-    /// target workspace (file-backed panes only). The original stays put.
+    /// Open a second view onto the focused file-backed tile's file in the
+    /// target workspace (file-backed tiles only). The original stays put.
     AlsoShow,
 }
 
-/// Picker overlay for "move pane to workspace" / "also-show pane in
+/// Picker overlay for "move tile to workspace" / "also-show tile in
 /// workspace". Lists existing workspaces by display label, plus a trailing
 /// "+ new workspace" entry that creates an empty workspace as the target.
 /// The currently-active workspace is shown but selecting it is a no-op
-/// (you can't move a pane to where it already lives).
+/// (you can't move a tile to where it already lives).
 struct WorkspacePicker {
     mode: WorkspacePickerMode,
     /// Index into the entry list: `0..tabs.len()` are existing workspaces,
@@ -1196,10 +1196,10 @@ enum RenameTarget {
     /// cwd (spec-agent-cwd.md §4). Targeted by monotonic
     /// `AgentSlot::index`, matching `AgentSlot`'s rule.
     AgentChangeCwd { index: usize },
-    /// `{cols}x{rows}` input that sets the global desktop-mode panel size
+    /// `{cols}x{rows}` input that sets the global desktop-mode tile size
     /// (spec-desktop-mode.md Behavior 6). Clamped to [20, 400] × [5, 200];
     /// unparseable input cancels with a footer hint.
-    DesktopPanelSize,
+    DesktopTileSize,
 }
 
 /// The single, mutually-exclusive overlay layered over the screen body — at
@@ -1250,20 +1250,30 @@ struct TagInputOverlay {
 /// (search, claude-attach via socket, save-quit, …) that have no GPUI
 /// counterpart yet.
 fn gpui_menu() -> Vec<MenuNode> {
-    // Pane-scoped entries (edit views, reload, claude session management)
+    // Tile-scoped entries (edit views, reload, claude session management)
     // live in the `.` local menus; rails live on their global chords
     // (Cmd-B / Cmd-Shift-O / Cmd-Shift-B). The global menu is workspace-
-    // scoped only: create panels, arrange windows, manage workspaces,
+    // scoped only: create tiles, arrange windows, manage workspaces,
     // layouts, quit.
     vec![
         MenuNode::submenu(
             "n",
             "new",
             vec![
-                MenuNode::entry("o", "open file in this pane (Cmd-O)", "open-browser"),
-                MenuNode::entry("f", "file browser pane", "new-browser-pane"),
+                MenuNode::entry("o", "open file in this tile (Cmd-O)", "open-browser"),
+                MenuNode::entry("f", "file browser tile", "new-browser-tile"),
                 MenuNode::entry("b", "buffer list", "buffer-list"),
-                MenuNode::entry("c", "claude session pane", "new-agent-pane"),
+                MenuNode::entry("c", "claude session tile", "new-agent-tile"),
+            ],
+        ),
+        MenuNode::submenu(
+            "o",
+            "open in place",
+            vec![
+                MenuNode::entry("o", "open file (Cmd-O)", "open-browser"),
+                MenuNode::entry("f", "file browser", "inplace-browser-tile"),
+                MenuNode::entry("b", "buffer list", "buffer-list"),
+                MenuNode::entry("c", "claude session", "inplace-agent-tile"),
             ],
         ),
         MenuNode::submenu(
@@ -1273,8 +1283,8 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::label("Split"),
                 MenuNode::entry("s", "split horizontal (Ctrl-W s)", "split-h"),
                 MenuNode::entry("v", "split vertical (Ctrl-W v)", "split-v"),
-                MenuNode::entry("c", "close pane (Cmd-W / Ctrl-W c)", "close-window"),
-                MenuNode::entry("o", "only this pane (Ctrl-W o)", "only-window"),
+                MenuNode::entry("c", "close tile (Cmd-W / Ctrl-W c)", "close-window"),
+                MenuNode::entry("o", "only this tile (Ctrl-W o)", "only-window"),
                 MenuNode::separator(),
                 MenuNode::label("Focus"),
                 MenuNode::entry("h", "focus left (Ctrl-W h)", "focus-left"),
@@ -1299,11 +1309,11 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("]", "next workspace (Ctrl-Tab)", "next-tab"),
                 MenuNode::entry("[", "prev workspace (Ctrl-Shift-Tab)", "prev-tab"),
                 MenuNode::entry("r", "rename workspace (Cmd-Shift-R)", "rename-tab"),
-                MenuNode::entry("m", "move pane to workspace (Ctrl-W m)", "move-pane"),
+                MenuNode::entry("m", "move tile to workspace (Ctrl-W m)", "move-tile"),
                 MenuNode::entry(
                     "M",
-                    "also-show pane in workspace (Ctrl-W M)",
-                    "also-show-pane",
+                    "also-show tile in workspace (Ctrl-W M)",
+                    "also-show-tile",
                 ),
             ],
         ),
@@ -1416,7 +1426,7 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("a", "attach", "claude-attach"),
         MenuNode::separator(),
         // Build loop (moved here from the global claude submenu — these act
-        // on the focused session, so they're pane-scoped).
+        // on the focused session, so they're tile-scoped).
         MenuNode::entry("p", "promote (build candidate)", "dev-build-candidate"),
         MenuNode::entry("P", "take over sessions (candidate)", "dev-take-over"),
         MenuNode::entry("g", "rebuild & restart gui", "dev-restart-gui"),
@@ -1443,8 +1453,8 @@ struct SketchGpuiView {
     /// the unzoomed default; clamped to [MIN_TEXT_SCALE, MAX_TEXT_SCALE] on
     /// every adjustment.
     text_scale: f32,
-    /// Desktop-mode panel size in mono cells (spec-desktop-mode.md
-    /// Behavior 6) — one global setting for all panels in all tabs,
+    /// Desktop-mode tile size in mono cells (spec-desktop-mode.md
+    /// Behavior 6) — one global setting for all tiles in all tabs,
     /// persisted in `Preferences`, clamped to [20, 400] × [5, 200].
     desktop_grid_cols: u32,
     desktop_grid_rows: u32,
@@ -1515,7 +1525,7 @@ struct SketchGpuiView {
     /// Next keystroke is looked up in tag_shortcuts.
     pending_tag_chord: Option<char>,
     /// Shared syntect highlighter for code block syntax coloring in Edit Mode
-    /// and the agent transcript pane. Loaded once at startup.
+    /// and the agent transcript tile. Loaded once at startup.
     syntect_hl: sketch::highlight::Highlighter,
     /// The lease-heartbeat beater (spec phase 4). A SINGLETON tied to this
     /// view's lifetime: spawned at most once (on the first `start_server_pump`
@@ -1633,7 +1643,7 @@ impl SketchGpuiView {
     fn save_workspace_state(&mut self) {
         // Reap pooled buffers no window references anymore. This is the buffer
         // pool's liveness sweep — called after every structural mutation, so a
-        // closed/relocated Edit pane's clean buffer is dropped promptly while
+        // closed/relocated Edit tile's clean buffer is dropped promptly while
         // dirty ones stay pooled for recovery.
         self.workspace.gc_buffers();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -2105,11 +2115,11 @@ impl SketchGpuiView {
         ) {
             return;
         }
-        // Open the browser IN the focused pane, stashing the prior content
+        // Open the browser IN the focused tile, stashing the prior content
         // on `BrowserWindow.underlying` so Esc/q restores it. Picking a file
         // discards the underlying and replaces the browser with the picked
-        // file in this same pane (see `open_file`'s `replace_in_place`
-        // branch). This keeps the browser pane-scoped instead of tab-
+        // file in this same tile (see `open_file`'s `replace_in_place`
+        // branch). This keeps the browser tile-scoped instead of tab-
         // scoped so splits/tabs aren't disrupted by file picking.
         let placeholder = WindowContent::Browser(BrowserWindow::standalone(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -2813,17 +2823,17 @@ impl SketchGpuiView {
         self.open_rename_active_tab_overlay(cx);
     }
 
-    /// `Ctrl-W m` — open the workspace picker to MOVE the focused pane.
-    fn move_pane(&mut self, _: &MovePane, _w: &mut Window, cx: &mut Context<Self>) {
+    /// `Ctrl-W m` — open the workspace picker to MOVE the focused tile.
+    fn move_tile(&mut self, _: &MoveTile, _w: &mut Window, cx: &mut Context<Self>) {
         self.open_workspace_picker(WorkspacePickerMode::Move, cx);
     }
 
-    /// `Ctrl-W M` — open the workspace picker to ALSO-SHOW the focused pane.
-    fn also_show_pane(&mut self, _: &AlsoShowPane, _w: &mut Window, cx: &mut Context<Self>) {
+    /// `Ctrl-W M` — open the workspace picker to ALSO-SHOW the focused tile.
+    fn also_show_tile(&mut self, _: &AlsoShowTile, _w: &mut Window, cx: &mut Context<Self>) {
         self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx);
     }
 
-    /// `Ctrl-W s` — horizontal split: new pane below the focused one.
+    /// `Ctrl-W s` — horizontal split: new tile below the focused one.
     fn split_h(&mut self, _: &SplitH, _w: &mut Window, cx: &mut Context<Self>) {
         self.split_focused_with_browser(workspace::SplitDir::H);
         self.workspace.retile_active();
@@ -2831,7 +2841,7 @@ impl SketchGpuiView {
         cx.notify();
     }
 
-    /// `Ctrl-W v` — vertical split: new pane to the right of the focused one.
+    /// `Ctrl-W v` — vertical split: new tile to the right of the focused one.
     fn split_v(&mut self, _: &SplitV, _w: &mut Window, cx: &mut Context<Self>) {
         self.split_focused_with_browser(workspace::SplitDir::V);
         self.workspace.retile_active();
@@ -2839,17 +2849,17 @@ impl SketchGpuiView {
         cx.notify();
     }
 
-    /// Shared helper. The new pane mirrors the focused content kind:
+    /// Shared helper. The new tile mirrors the focused content kind:
     ///
     /// - Doc → new Doc over the same file (independent scroll/cursor).
     /// - Edit → new Edit over the same file path; the new editor reads
-    ///   from disk so unsaved changes in the source pane don't carry over
+    ///   from disk so unsaved changes in the source tile don't carry over
     ///   (a shared buffer pool would fix that — separate stage).
     /// - Browser → new Browser at cwd.
     /// - Claude → new Browser at cwd (Claude is exclusive per spec).
     ///
     /// Browser is the universal fallback when the focused content has no
-    /// natural file pane to clone (Claude) or when reading the source
+    /// natural file tile to clone (Claude) or when reading the source
     /// file fails.
     fn split_focused_with_browser(&mut self, dir: workspace::SplitDir) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -2870,7 +2880,7 @@ impl SketchGpuiView {
         };
         let path = PathBuf::from(label.as_ref());
         if is_edit {
-            // Bind the new pane to the SAME pooled core as the source pane:
+            // Bind the new tile to the SAME pooled core as the source tile:
             // open_and_retain returns the existing buffer id, so unsaved text
             // + undo are shared. Only cursor/scroll/selection are independent.
             match self.workspace.open_and_retain(&path) {
@@ -2921,7 +2931,7 @@ impl SketchGpuiView {
             Ok(None) => {
                 // Focused leaf is the only one in its tab. Close the tab
                 // if there are other tabs; otherwise no-op — closing the
-                // absolute last pane would leave the app with nothing to
+                // absolute last tile would leave the app with nothing to
                 // render. Cmd-Q is the only quit path now.
                 if self.workspace.tabs.len() <= 1 {
                     return;
@@ -2982,7 +2992,7 @@ impl SketchGpuiView {
         cx.notify();
     }
 
-    /// `Ctrl-W <` / `Ctrl-W -` — shrink the focused pane by 5% (gives the
+    /// `Ctrl-W <` / `Ctrl-W -` — shrink the focused tile by 5% (gives the
     /// space to its next sibling within the parent split).
     fn resize_shrink(&mut self, _: &ResizeShrink, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.resize_focused(-0.05);
@@ -2990,14 +3000,14 @@ impl SketchGpuiView {
         cx.notify();
     }
 
-    /// `Ctrl-W >` / `Ctrl-W +` — grow the focused pane by 5%.
+    /// `Ctrl-W >` / `Ctrl-W +` — grow the focused tile by 5%.
     fn resize_grow(&mut self, _: &ResizeGrow, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.resize_focused(0.05);
         self.save_workspace_state();
         cx.notify();
     }
 
-    /// `Ctrl-W =` — even out all sibling weights in the focused pane's
+    /// `Ctrl-W =` — even out all sibling weights in the focused tile's
     /// parent split.
     fn equalize(&mut self, _: &Equalize, _w: &mut Window, cx: &mut Context<Self>) {
         let _ = self.workspace.equalize_focused();
@@ -3564,8 +3574,8 @@ impl SketchGpuiView {
     /// menu layout stays spatially stable.
     fn global_menu_disabled(&self) -> HashSet<String> {
         let mut d = HashSet::new();
-        // `back-to-doc` only makes sense from an Edit pane. (The other
-        // pane-scoped entries moved to the `.` local menus — Phase 2.)
+        // `back-to-doc` only makes sense from an Edit tile. (The other
+        // tile-scoped entries moved to the `.` local menus — Phase 2.)
         if !matches!(
             self.workspace.focused_content(),
             Some(WindowContent::Edit(_))
@@ -3839,8 +3849,8 @@ impl SketchGpuiView {
                     cx.notify();
                 }
             }
-            "move-pane" => self.open_workspace_picker(WorkspacePickerMode::Move, cx),
-            "also-show-pane" => self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx),
+            "move-tile" => self.open_workspace_picker(WorkspacePickerMode::Move, cx),
+            "also-show-tile" => self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx),
             // Layout patterns
             "cycle-layout" => {
                 self.workspace.set_layout_mode(
@@ -3928,10 +3938,10 @@ impl SketchGpuiView {
             "tag-also" => self.open_tag_input(TagInputMode::AlsoTag, cx),
             "tag-send" => self.open_tag_input(TagInputMode::SendTag, cx),
             "tag-bind" => self.open_tag_input(TagInputMode::TagBind, cx),
-            // New-panel commands (global `n` submenu): create a NEW pane
+            // New-tile commands (global `n` submenu): create a NEW tile
             // (vertical split of the focused one) instead of replacing
-            // the focused pane's content.
-            "new-browser-pane" => {
+            // the focused tile's content.
+            "new-browser-tile" => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let _ = self.workspace.split_focused(
                     workspace::SplitDir::V,
@@ -3941,9 +3951,9 @@ impl SketchGpuiView {
                 self.save_workspace_state();
                 cx.notify();
             }
-            "new-agent-pane" => {
+            "new-agent-tile" => {
                 // Split with a placeholder browser (focus lands on the new
-                // pane), then let `open_agent_inner` swap the focused pane
+                // tile), then let `open_agent_inner` swap the focused tile
                 // for the agent ring — reusing all the session machinery.
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 if self
@@ -3959,6 +3969,20 @@ impl SketchGpuiView {
                     self.save_workspace_state();
                     cx.notify();
                 }
+            }
+            // Open-in-place commands (global `o` submenu): replace the
+            // focused tile's content instead of creating a new split.
+            "inplace-browser-tile" => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                self.workspace
+                    .replace_focused_content(WindowContent::Browser(BrowserWindow::standalone(cwd)));
+                self.save_workspace_state();
+                cx.notify();
+            }
+            "inplace-agent-tile" => {
+                self.open_agent_inner(cx);
+                self.save_workspace_state();
+                cx.notify();
             }
             // Local menus (spec-menu-scopes.md)
             "doc-goto-top" => {
@@ -4089,13 +4113,13 @@ impl SketchGpuiView {
         self.clear_overlay();
     }
 
-    // ---- Workspace picker (move / also-show pane) -------------------------
+    // ---- Workspace picker (move / also-show tile) -------------------------
 
     /// Count how many distinct **workspaces** show a view of `label` (the
-    /// file path backing a Doc/Edit pane). File path is the canonical buffer-
+    /// file path backing a Doc/Edit tile). File path is the canonical buffer-
     /// pool key (`Workspace::canonical_key`), so counting by path is the exact
-    /// equivalent of counting by `FileBufferId` for pooled Edit panes — and it
-    /// additionally captures Doc panes, which render disk snapshots and aren't
+    /// equivalent of counting by `FileBufferId` for pooled Edit tiles — and it
+    /// additionally captures Doc tiles, which render disk snapshots and aren't
     /// pooled. Hence path, not id, is the right unifying membership key
     /// (spec-workspaces-tagging.md C-derived).
     ///
@@ -4134,7 +4158,7 @@ impl SketchGpuiView {
         }
     }
 
-    /// True when the focused pane is file-backed (Doc or Edit) and so can be
+    /// True when the focused tile is file-backed (Doc or Edit) and so can be
     /// "also-shown" in another workspace (Agent/Browser are single-home).
     fn focused_is_file_backed(&self) -> bool {
         matches!(
@@ -4144,7 +4168,7 @@ impl SketchGpuiView {
     }
 
     /// Open the workspace picker overlay. For `AlsoShow`, reject non-file
-    /// panes up front with a footer message (the picker never opens).
+    /// tiles up front with a footer message (the picker never opens).
     fn open_workspace_picker(&mut self, mode: WorkspacePickerMode, cx: &mut Context<Self>) {
         if self.overlay_is_workspace() {
             return;
@@ -4161,7 +4185,7 @@ impl SketchGpuiView {
             return;
         }
         // Pre-select the first workspace that isn't the active one (you can't
-        // move/also-show into the workspace the pane already lives in); fall
+        // move/also-show into the workspace the tile already lives in); fall
         // back to the "+ new workspace" entry when there's only one.
         let active = self.workspace.active_tab;
         let selected = (0..self.workspace.tabs.len())
@@ -4250,7 +4274,7 @@ impl SketchGpuiView {
 
         // Resolve the target tab index, creating a new workspace if "+ new"
         // was chosen. A new workspace starts Empty; the relocated/also-shown
-        // leaf becomes its first pane.
+        // leaf becomes its first tile.
         let make_new = entry >= n_tabs;
         let target = if make_new {
             self.push_empty_workspace();
@@ -4259,7 +4283,7 @@ impl SketchGpuiView {
             entry
         };
 
-        // Selecting the active workspace is a no-op (the pane is already here).
+        // Selecting the active workspace is a no-op (the tile is already here).
         if !make_new && target == active {
             self.close_workspace_picker();
             cx.notify();
@@ -4302,7 +4326,7 @@ impl SketchGpuiView {
 
     /// MOVE: relocate the focused leaf out of the active workspace into
     /// `target`. If the source workspace is left empty, remove it (unless it's
-    /// the only workspace, which we leave empty). Focus follows the pane to
+    /// the only workspace, which we leave empty). Focus follows the tile to
     /// the target workspace.
     fn move_focused_to_workspace(&mut self, target: usize) {
         let (window, source_empty) = match self.workspace.detach_focused() {
@@ -4310,7 +4334,7 @@ impl SketchGpuiView {
             Err(()) => return,
         };
         // `detach_focused` may shift nothing, but if it removed the active
-        // tab's only pane the target index could still be valid (target was
+        // tab's only tile the target index could still be valid (target was
         // resolved before detach and detach never removes tabs). Insert first,
         // then prune the empty source so indices stay stable during insert.
         let _ = self.workspace.insert_leaf_into_tab(target, window);
@@ -4329,15 +4353,15 @@ impl SketchGpuiView {
                 self.workspace.active_tab = target.min(self.workspace.tabs.len() - 1);
             }
         } else {
-            // Source still has panes; follow the moved pane to the target.
+            // Source still has tiles; follow the moved tile to the target.
             self.workspace.active_tab = target.min(self.workspace.tabs.len() - 1);
         }
     }
 
-    /// ALSO-SHOW: open a second view onto the focused file-backed pane's file
+    /// ALSO-SHOW: open a second view onto the focused file-backed tile's file
     /// in `target`, leaving the original in place. The new view reads the
     /// file from disk (independent cursor/scroll), mirroring how splits clone
-    /// a file pane today. Switches to the target workspace so the user sees
+    /// a file tile today. Switches to the target workspace so the user sees
     /// the new view.
     fn also_show_focused_in_workspace(&mut self, target: usize) {
         if !self.focused_is_file_backed() {
@@ -4611,8 +4635,8 @@ impl SketchGpuiView {
         let popup_border: Hsla = nc(ov.border);
 
         let verb = match picker.mode {
-            WorkspacePickerMode::Move => "MOVE PANE TO WORKSPACE",
-            WorkspacePickerMode::AlsoShow => "ALSO-SHOW PANE IN WORKSPACE",
+            WorkspacePickerMode::Move => "MOVE TILE TO WORKSPACE",
+            WorkspacePickerMode::AlsoShow => "ALSO-SHOW TILE IN WORKSPACE",
         };
         let header_row = div()
             .flex()
@@ -4720,9 +4744,9 @@ impl SketchGpuiView {
     /// if claude isn't focused (the command is gated by the menu but a
     /// stray dispatch shouldn't crash) or if an overlay is already open.
     /// `Ctrl-W p` action shim → [`open_desktop_grid_overlay`].
-    fn desktop_panel_size_overlay(
+    fn desktop_tile_size_overlay(
         &mut self,
-        _: &DesktopPanelSize,
+        _: &DesktopTileSize,
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4730,7 +4754,7 @@ impl SketchGpuiView {
     }
 
     /// `Ctrl-W p` / menu `l g`: open the `{cols}x{rows}` input for the
-    /// desktop GRID — how many panels fit the viewport per axis; panel size
+    /// desktop GRID — how many tiles fit the viewport per axis; tile size
     /// derives from it (spec-desktop-mode.md Behavior 6, grid revision).
     /// Pre-filled with the current value so Enter is a no-op confirm.
     fn open_desktop_grid_overlay(&mut self, cx: &mut Context<Self>) {
@@ -4740,7 +4764,7 @@ impl SketchGpuiView {
         let text = format!("{}x{}", self.desktop_grid_cols, self.desktop_grid_rows);
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
             text,
-            target: RenameTarget::DesktopPanelSize,
+            target: RenameTarget::DesktopTileSize,
         }));
         cx.notify();
     }
@@ -4906,7 +4930,7 @@ impl SketchGpuiView {
                     cx.notify();
                 }
             },
-            RenameTarget::DesktopPanelSize => {
+            RenameTarget::DesktopTileSize => {
                 self.close_rename_overlay();
                 // Accept "120x40" / "120X40" with optional spaces. Slot
                 // addresses are size-independent (spec Behavior 6), so this
@@ -4920,7 +4944,7 @@ impl SketchGpuiView {
                         self.desktop_grid_rows = rows.clamp(1, 12);
                         self.transient_status = Some(
                             format!(
-                                "desktop grid: {}x{} panels per screen",
+                                "desktop grid: {}x{} tiles per screen",
                                 self.desktop_grid_cols, self.desktop_grid_rows
                             )
                             .into(),
@@ -5000,7 +5024,7 @@ impl SketchGpuiView {
                 if self.tag_focused(tag.clone()) {
                     self.transient_status = Some(format!("tagged '{tag}'").into());
                 } else {
-                    self.transient_status = Some("cannot tag this pane".into());
+                    self.transient_status = Some("cannot tag this tile".into());
                 }
             }
             TagInputMode::Untag => {
@@ -5036,7 +5060,7 @@ impl SketchGpuiView {
                 if self.tag_focused(tag.clone()) {
                     self.transient_status = Some(format!("also-tagged '{tag}'").into());
                 } else {
-                    self.transient_status = Some("cannot tag this pane".into());
+                    self.transient_status = Some("cannot tag this tile".into());
                 }
             }
             TagInputMode::TagBind => {
@@ -5598,7 +5622,7 @@ impl SketchGpuiView {
     /// Render the centered single-line input box for renaming a session.
     /// Visual style follows the buffer-switcher's filter row (yellow text
     /// on the popup background) but in a small centered modal rather than
-    /// a full-screen panel. Pre-filled with the current label; trailing
+    /// a full-screen tile. Pre-filled with the current label; trailing
     /// block char serves as a cursor.
     fn render_rename_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let o = match self.rename_ref() {
@@ -5616,7 +5640,7 @@ impl SketchGpuiView {
             RenameTarget::Tab { .. } => "RENAME WORKSPACE",
             RenameTarget::AgentNewSessionCwd => "NEW SESSION AT…",
             RenameTarget::AgentChangeCwd { .. } => "CHANGE SESSION CWD",
-            RenameTarget::DesktopPanelSize => "DESKTOP GRID (COLSxROWS OF PANELS)",
+            RenameTarget::DesktopTileSize => "DESKTOP GRID (COLSxROWS OF TILES)",
         };
         let header = div()
             .px_4()
@@ -5778,8 +5802,8 @@ impl Render for SketchGpuiView {
             return self.render_splash(cx);
         }
 
-        // 5c: re-derive each Doc pane's blocks from its shared core when the
-        // rope has advanced (e.g. an Edit pane of the same file took a
+        // 5c: re-derive each Doc tile's blocks from its shared core when the
+        // rope has advanced (e.g. an Edit tile of the same file took a
         // keystroke). `refresh_blocks` is O(1) per Doc when the core is
         // unchanged and read-only on the core, so this is cheap and panic-safe.
         {
@@ -5834,7 +5858,7 @@ impl Render for SketchGpuiView {
         let rail_focused = !has_overlay && self.rail_is_focused();
         let leaf_attach_focus = !has_overlay && !rail_focused;
         // The rail is now injected beside the focused leaf *inside*
-        // `render_focused_window` (so it's local to the focused pane, not the
+        // `render_focused_window` (so it's local to the focused tile, not the
         // whole window). It's focusable only when no overlay owns focus (§4).
         let screen_view: AnyElement =
             self.render_focused_window(screen_root, leaf_attach_focus, !has_overlay, cx);
@@ -5851,7 +5875,7 @@ impl Render for SketchGpuiView {
         let screen_view = self.wrap_with_tag_bar(screen_view);
 
         // Overlay a one-shot transient status toast (e.g. an also-show
-        // rejection for a non-file pane) in the bottom-right.
+        // rejection for a non-file tile) in the bottom-right.
         let screen_view = if let Some(msg) = self.transient_status.clone() {
             let ov = &self.theme.overlay;
             let toast_bg: Hsla = nc(ov.bg);
@@ -5993,7 +6017,7 @@ impl Render for SketchGpuiView {
                 .into_any_element();
         }
 
-        // Workspace picker (move / also-show pane).
+        // Workspace picker (move / also-show tile).
         if self.overlay_is_workspace() {
             return div()
                 .track_focus(&self.focus_handle)
@@ -6425,7 +6449,7 @@ fn register_keymap(app: &mut App) {
         KeyBinding::new("cmd-shift-ctrl-r", Restart, None),
         KeyBinding::new("cmd-o", OpenBrowser, None),
         KeyBinding::new("cmd-k", OpenAgent, None),
-        // Agent-window sidepane toggles (§32). Scoped to AgentView
+        // Agent-window sidebar toggles (§32). Scoped to AgentView
         // so Cmd-1/Cmd-2 don't shadow anything in other screens.
         KeyBinding::new("cmd-1", ToggleTasklist, Some("AgentView")),
         KeyBinding::new("cmd-2", ToggleSubagents, Some("AgentView")),
@@ -6445,25 +6469,25 @@ fn register_keymap(app: &mut App) {
         KeyBinding::new("ctrl-w s", SplitH, None),
         KeyBinding::new("ctrl-w v", SplitV, None),
         KeyBinding::new("ctrl-w c", CloseWindow, None),
-        // Mac-standard close shortcut. Closes the focused pane; falls
-        // through to closing the tab if the pane was the only one in
+        // Mac-standard close shortcut. Closes the focused tile; falls
+        // through to closing the tab if the tile was the only one in
         // its tab (unless it's also the only tab — then no-op rather
         // than quit, per the "no surprise quits" rule).
         KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("ctrl-w o", OnlyWindow, None),
-        // Move / also-show the focused pane in another workspace
-        // (spec-workspaces-tagging.md Phase 1). `m` moves (pane leaves
-        // here), `M` (shift) also-shows a second view of a file pane.
-        KeyBinding::new("ctrl-w m", MovePane, None),
-        KeyBinding::new("ctrl-w shift-m", AlsoShowPane, None),
-        // Vim-style focus motion across split panes.
+        // Move / also-show the focused tile in another workspace
+        // (spec-workspaces-tagging.md Phase 1). `m` moves (tile leaves
+        // here), `M` (shift) also-shows a second view of a file tile.
+        KeyBinding::new("ctrl-w m", MoveTile, None),
+        KeyBinding::new("ctrl-w shift-m", AlsoShowTile, None),
+        // Vim-style focus motion across split tiles.
         KeyBinding::new("ctrl-w h", FocusLeft, None),
         KeyBinding::new("ctrl-w l", FocusRight, None),
         KeyBinding::new("ctrl-w k", FocusUp, None),
         KeyBinding::new("ctrl-w j", FocusDown, None),
         KeyBinding::new("ctrl-w w", FocusNext, None),
         KeyBinding::new("ctrl-w shift-w", FocusPrev, None),
-        // Resize the focused pane vs. its next sibling.
+        // Resize the focused tile vs. its next sibling.
         KeyBinding::new("ctrl-w <", ResizeShrink, None),
         KeyBinding::new("ctrl-w -", ResizeShrink, None),
         KeyBinding::new("ctrl-w >", ResizeGrow, None),
@@ -6472,7 +6496,7 @@ fn register_keymap(app: &mut App) {
         // Layout patterns (spec-layout-patterns.md)
         // Phase 2: automatic layouts
         KeyBinding::new("ctrl-w space", CycleLayoutMode, None),
-        KeyBinding::new("ctrl-w p", DesktopPanelSize, None),
+        KeyBinding::new("ctrl-w p", DesktopTileSize, None),
         KeyBinding::new("ctrl-w enter", PromoteToMaster, None),
         KeyBinding::new("ctrl-w i", IncreaseMasterCount, None),
         KeyBinding::new("ctrl-w d", DecreaseMasterCount, None),
@@ -6677,7 +6701,7 @@ fn main() {
                         if let Some(scale) = prefs.text_scale {
                             view.text_scale = scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
                         }
-                        // Desktop panel size (clamped per spec Behavior 6).
+                        // Desktop tile size (clamped per spec Behavior 6).
                         if let Some(c) = prefs.desktop_grid_cols {
                             view.desktop_grid_cols = c.clamp(1, 12);
                         }

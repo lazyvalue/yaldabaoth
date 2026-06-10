@@ -4,3 +4,6 @@
 /.claude/worktrees/
 /tmp
 .DS_Store
+
+# insta snapshot pending-review artifacts
+*.snap.new

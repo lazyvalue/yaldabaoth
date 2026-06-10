@@ -333,7 +333,7 @@ pub struct RailState {
     /// content leaf holds focus as usual (two-state model, spec §5).
     pub focused: bool,
     /// The leaf the rail was opened from. The rail stays visually pinned to
-    /// this leaf even when focus moves to another split pane.
+    /// this leaf even when focus moves to another split tile.
     pub pinned_to: WindowId,
 }
 
@@ -518,14 +518,14 @@ impl Slot {
     }
 }
 
-/// Transient drag state while a panel is being dragged. View-layer units are
+/// Transient drag state while a tile is being dragged. View-layer units are
 /// plain `f32` pixels in DESKTOP coordinates (pre-pan); the view converts at
 /// the boundary so this module stays gpui-free. Never persisted.
 #[derive(Debug, Clone, Copy)]
 pub struct DesktopDrag {
-    /// The panel being dragged.
+    /// The tile being dragged.
     pub id: WindowId,
-    /// Pointer offset within the panel at grab time (so the ghost doesn't
+    /// Pointer offset within the tile at grab time (so the ghost doesn't
     /// jump to the pointer corner).
     pub grab: (f32, f32),
     /// Current pointer position in desktop coordinates.
@@ -555,8 +555,8 @@ pub struct DesktopState {
     /// Live drag, if any.
     pub drag: Option<DesktopDrag>,
     /// The window the auto-pan last revealed. The render path pans to the
-    /// focused panel only when focus CHANGED since the last frame, so a
-    /// manual pan away from the focused panel isn't fought every frame.
+    /// focused tile only when focus CHANGED since the last frame, so a
+    /// manual pan away from the focused tile isn't fought every frame.
     pub last_reveal: Option<WindowId>,
 }
 
@@ -599,8 +599,8 @@ impl DesktopState {
 
     /// Restore the Behavior-2 invariant: drop entries whose window is gone
     /// (their slot becomes a gap — neighbors never move); give every slotless
-    /// leaf a placement after the focused panel (insert-and-shift), or at the
-    /// first free slot when the focused panel has no slot yet. Returns true
+    /// leaf a placement after the focused tile (insert-and-shift), or at the
+    /// first free slot when the focused tile has no slot yet. Returns true
     /// if anything changed.
     pub fn reconcile(&mut self, leaves: &[WindowId], focused: WindowId, w: u32) -> bool {
         let mut changed = false;
@@ -624,12 +624,12 @@ impl DesktopState {
 
     /// The Behavior-4 drop: place `id` at `target`. An empty target is a
     /// plain move (the old slot becomes a gap). An occupied target inserts:
-    /// the occupant and each subsequent panel in the contiguous occupied run
+    /// the occupant and each subsequent tile in the contiguous occupied run
     /// along the W-wrapped successor chain shift forward one slot; the run
     /// stops at the first gap, which absorbs the ripple. Shifts are applied
-    /// back-to-front so no two panels ever share a slot mid-flight.
+    /// back-to-front so no two tiles ever share a slot mid-flight.
     pub fn insert_shift(&mut self, id: WindowId, target: Slot, w: u32) {
-        // Vacate the dragged panel first — its old slot is the natural gap
+        // Vacate the dragged tile first — its old slot is the natural gap
         // left behind, and it must not participate in its own run.
         self.slots.retain(|(wid, _)| *wid != id);
 
@@ -722,27 +722,27 @@ pub enum SpatialDir {
 // Pure geometry (spec Interfaces). Desktop coordinates are pre-pan pixels;
 // the view layer applies pan and converts to gpui units at its boundary.
 
-/// Top-left of `slot`, given the panel pixel size and gutter.
-pub fn slot_origin(slot: Slot, panel: (f32, f32), gutter: f32) -> (f32, f32) {
+/// Top-left of `slot`, given the tile pixel size and gutter.
+pub fn slot_origin(slot: Slot, tile: (f32, f32), gutter: f32) -> (f32, f32) {
     (
-        gutter + slot.col as f32 * (panel.0 + gutter),
-        gutter + slot.row as f32 * (panel.1 + gutter),
+        gutter + slot.col as f32 * (tile.0 + gutter),
+        gutter + slot.row as f32 * (tile.1 + gutter),
     )
 }
 
 /// The slot whose cell contains (or is nearest to) a desktop-coordinate
 /// point. Clamps to the non-negative grid.
-pub fn slot_at(point: (f32, f32), panel: (f32, f32), gutter: f32) -> Slot {
-    let cell = (panel.0 + gutter, panel.1 + gutter);
+pub fn slot_at(point: (f32, f32), tile: (f32, f32), gutter: f32) -> Slot {
+    let cell = (tile.0 + gutter, tile.1 + gutter);
     let col = ((point.0 - gutter) / cell.0).floor().max(0.0) as u32;
     let row = ((point.1 - gutter) / cell.1).floor().max(0.0) as u32;
     Slot::new(row, col)
 }
 
-/// Drop-time effective width W (spec Overview): panel columns that fit the
+/// Drop-time effective width W (spec Overview): tile columns that fit the
 /// viewport, minimum 1. Stored slots are never re-derived from it.
-pub fn effective_width(viewport_w: f32, panel_w: f32, gutter: f32) -> u32 {
-    (((viewport_w - gutter) / (panel_w + gutter)).floor() as i64).max(1) as u32
+pub fn effective_width(viewport_w: f32, tile_w: f32, gutter: f32) -> u32 {
+    (((viewport_w - gutter) / (tile_w + gutter)).floor() as i64).max(1) as u32
 }
 
 /// A skeleton of a layout tree — just the shape (window ids, weights, split
@@ -1249,7 +1249,7 @@ impl<C> Workspace<C> {
 
     /// Detach the focused window from the active tab's layout, returning the
     /// owned `Window<C>` (content travels with it — no cloning). Used by the
-    /// "move pane to workspace" verb.
+    /// "move tile to workspace" verb.
     ///
     /// Returns `Ok((window, source_now_empty))`:
     /// - `window` — the relocated leaf, ready to insert elsewhere.
@@ -1322,10 +1322,10 @@ impl<C> Workspace<C> {
     /// there. The window keeps its existing `id` (ids are workspace-unique).
     ///
     /// Placement mirrors `split_focused`'s root case: if the target layout is
-    /// a single leaf, it is wrapped in a vertical `Split` so the arriving pane
+    /// a single leaf, it is wrapped in a vertical `Split` so the arriving tile
     /// sits beside it; if it is already a `Split`, the leaf is appended as a
     /// new child and weights renormalize; an `Empty` target (a tab whose sole
-    /// pane was just moved away) simply adopts the leaf as its root.
+    /// tile was just moved away) simply adopts the leaf as its root.
     ///
     /// Returns `Err(())` if `tab_idx` is out of range.
     pub fn insert_leaf_into_tab(&mut self, tab_idx: usize, window: Window<C>) -> Result<(), ()> {
@@ -1867,7 +1867,7 @@ mod desktop_tests {
         assert_eq!(
             d.slot_of(1),
             Some(Slot::new(0, 0)),
-            "panel before the run never moves"
+            "tile before the run never moves"
         );
     }
 
@@ -1885,13 +1885,13 @@ mod desktop_tests {
         assert_eq!(d.slot_of(1), Some(Slot::new(1, 0)));
     }
 
-    /// Spec Behavior 4: panels at `col >= W` sit outside every successor
+    /// Spec Behavior 4: tiles at `col >= W` sit outside every successor
     /// chain — ripples never touch them.
     #[test]
-    fn panels_beyond_effective_width_never_ripple() {
+    fn tiles_beyond_effective_width_never_ripple() {
         let mut d = DesktopState::default();
         d.seed(&[1, 2, 3], 5); // seeded wide: cols 0, 1, 2
-        // Window narrowed to W = 2; panel 3 at (0,2) is beyond W.
+        // Window narrowed to W = 2; tile 3 at (0,2) is beyond W.
         d.insert_shift(2, Slot::new(0, 0), 2);
         // Run at (0,0) = [1]; succ((0,0), 2) = (0,1), 2's vacated gap.
         assert_eq!(d.slot_of(2), Some(Slot::new(0, 0)));
@@ -1899,7 +1899,7 @@ mod desktop_tests {
         assert_eq!(
             d.slot_of(3),
             Some(Slot::new(0, 2)),
-            "beyond-W panel untouched"
+            "beyond-W tile untouched"
         );
     }
 
@@ -1946,13 +1946,13 @@ mod desktop_tests {
 
     #[test]
     fn geometry_round_trips() {
-        let panel = (960.0, 800.0);
+        let tile = (960.0, 800.0);
         let g = 12.0;
         let s = Slot::new(2, 3);
-        let (x, y) = slot_origin(s, panel, g);
-        assert_eq!(slot_at((x + 5.0, y + 5.0), panel, g), s);
-        assert_eq!(effective_width(2000.0, panel.0, g), 2);
-        assert_eq!(effective_width(100.0, panel.0, g), 1, "minimum 1");
+        let (x, y) = slot_origin(s, tile, g);
+        assert_eq!(slot_at((x + 5.0, y + 5.0), tile, g), s);
+        assert_eq!(effective_width(2000.0, tile.0, g), 2);
+        assert_eq!(effective_width(100.0, tile.0, g), 1, "minimum 1");
     }
 
     /// Old-binary safety (spec Behavior 7): unknown mode strings fall back
@@ -1997,7 +1997,7 @@ mod tests {
     // 5c / ADR-0007: two views of the same file share ONE pooled core, so an
     // edit in one is live in the other and undo is unified. This pins the
     // structural contract (`open_and_retain` dedups by canonical path) that the
-    // GUI's Doc/Edit panes and splits rely on; it is the headlessly-verifiable
+    // GUI's Doc/Edit tiles and splits rely on; it is the headlessly-verifiable
     // half of the "Doc tracks live Edit edits" behavior (the per-frame
     // re-render itself needs a GPUI runtime).
     #[test]
@@ -2480,7 +2480,7 @@ mod tests {
         assert!(ws.buffer(id).is_none(), "once the view drops, gc reaps it");
     }
 
-    // --- Relocate (move pane to workspace) ---------------------------------
+    // --- Relocate (move tile to workspace) ---------------------------------
 
     #[test]
     fn detach_focused_root_leaves_tab_empty() {

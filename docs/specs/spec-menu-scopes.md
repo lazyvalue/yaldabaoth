@@ -7,13 +7,13 @@
 ## Overview
 
 Sketch's current `Space` menu is a flat bag of everything: open a file,
-split a pane, change the theme, send to Claude, toggle a rail. Every
+split a tile, change the theme, send to Claude, toggle a rail. Every
 command is reachable from every screen. This works when the menu is small,
 but it doesn't scale, and it conflates two different questions:
 
-1. **"What can I do to the workspace?"** — open panes, move focus, switch
+1. **"What can I do to the workspace?"** — open tiles, move focus, switch
    tabs, quit. These are the same regardless of what's focused.
-2. **"What can I do to *this* pane?"** — enter edit mode, reload from
+2. **"What can I do to *this* tile?"** — enter edit mode, reload from
    disk, toggle word-processor view, show the outline, navigate headings.
    These depend on what the focused window is showing.
 
@@ -28,7 +28,7 @@ This spec adopts the same split:
 - **`Space`** — **global leader**. Workspace-scope commands: open, close,
   split, focus, tag, mark, layout, theme, quit. Same entries on every
   screen.
-- **`.` (dot)** — **local leader**. Pane-scope commands: entries change
+- **`.` (dot)** — **local leader**. Tile-scope commands: entries change
   based on the focused window's content kind (`Doc`, `Edit`, `Agent`,
   `Browser`). The menu is different in each context because the available
   operations are different.
@@ -79,7 +79,7 @@ workspace-scope commands organized by group:
 |-------|------|------------|
 | **Open** | `f`, `b`, `c` | File browser, buffer list, Claude submenu |
 | **Window** | `W` → ... | Split, close, focus, resize, equalize |
-| **Workspace** | `W` → ... | New/close/next/prev tab, rename, move pane |
+| **Workspace** | `W` → ... | New/close/next/prev tab, rename, move tile |
 | **Tag** | `t` → ... | Tag operations (from `spec-layout-patterns.md`) |
 | **Mark** | `m`, `'` | Set/jump to marks (direct, not via menu) |
 | **Layout** | `L` → ... | Layout mode cycle, master promote/count |
@@ -89,11 +89,11 @@ workspace-scope commands organized by group:
 | **Quit** | `q` | Quit |
 
 The global menu is **identical regardless of focused content kind.** A
-`Space` press in a Doc pane, an Edit pane, an Agent pane, or a Browser
-pane all show the same tree.
+`Space` press in a Doc tile, an Edit tile, an Agent tile, or a Browser
+tile all show the same tree.
 
 Entries that are not applicable in the current context (e.g., `reload
-from disk` when an Agent pane is focused) are either hidden or shown
+from disk` when an Agent tile is focused) are either hidden or shown
 as disabled (greyed out, non-interactive). Behavior 10 specifies the
 rule.
 
@@ -226,7 +226,7 @@ sense. For example, `rail-outline` might appear as `Space O` (global —
 The dispatch is the same; the menu is just an access path.
 
 However, the design intent is: **prefer one canonical location.** If a
-command is naturally pane-scoped, put it in the local menu. If it's
+command is naturally tile-scoped, put it in the local menu. If it's
 naturally workspace-scoped, put it in the global menu. Duplicate only
 when discoverability benefits outweigh the clutter.
 
@@ -255,7 +255,7 @@ in `main.rs`.
 #### 9 · Local menu updates on content swap [DRAFT]
 
 If the user opens a local menu, then somehow the focused content changes
-(e.g., a Claude session finishes and auto-focuses a different pane — not
+(e.g., a Claude session finishes and auto-focuses a different tile — not
 a current behavior but defensive), the menu should close. The menu
 captures the `WindowId` at open time; if the focused window changes while
 the menu is open, the overlay dismisses. This prevents stale entries from
@@ -469,15 +469,15 @@ to `gpui_menu()` in `main.rs`.
   `browser-open-workspace` / `browser-open-split` (selected file → Doc in a
   new tab / vertical split; directories rejected with a toast).
 - 2026-06-09 — Phase 2 cleanup (Behavior 5): Edit group (`enter-edit` /
-  `enter-wp` / `reload-file`) removed from the global menu — pane-scoped,
+  `enter-wp` / `reload-file`) removed from the global menu — tile-scoped,
   lives in the `.` local menus. Rail group and the agent status-bar
   position toggle removed from the menu entirely (rails keep their global
   chords). Menu overlay now lays sections out in 1–3 columns (≤8 rows → 1,
   ≤18 → 2, else 3; separator-delimited sections never split mid-group).
 - 2026-06-09 — Global root restructured into four submenus: `n` new
-  (file-browser pane / buffer list / claude session pane — the pane
-  entries SPLIT and create a new panel via `new-browser-pane` /
-  `new-agent-pane` instead of replacing the focused one), `w` windows
+  (file-browser tile / buffer list / claude session tile — the tile
+  entries SPLIT and create a new tile via `new-browser-tile` /
+  `new-agent-tile` instead of replacing the focused one), `w` windows
   (split/close/focus/size), `s` workspace (tabs/move/also-show), `l`
   layout (layouts/marks/tags, keys lowercased). Theme submenu killed.
   Claude session management (incl. mode-cycle and the build loop) is now

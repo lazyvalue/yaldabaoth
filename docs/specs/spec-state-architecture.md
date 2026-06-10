@@ -147,7 +147,7 @@ most* — the 9 `duplicated-copy` hazards — and their resolution:
 | Duplicated fact | Copies today | Single source of truth (target) |
 |---|---|---|
 | turn number `k` | agent `AtomicUsize`, `session.turns`, pump `last_turns`, `replay_fence`, GUI `last_seen_turns`+`replay_turn` | `acp_channel.turns` is the connection truth; `replay_turns` is the GUI's only `k`; server `turns` set only from the explicit `TurnEnded` event |
-| the transcript | server `event_log`, GUI `editor` rope, (×panes) | server `event_log` is durable truth; GUI editor is a projection rebuilt on attach/replay |
+| the transcript | server `event_log`, GUI `editor` rope, (×tiles) | server `event_log` is durable truth; GUI editor is a projection rebuilt on attach/replay |
 | `subagents` | mirror of `tool_calls` | derived projection (computed) |
 | permission mode | `ManagedSession.permission_mode` + channel `AtomicU8` | channel policy applied by the one swap method |
 | which agent windows exist | `acp_sessions.json` + `session_server.json` (reconciled by cwd) | server sessions by id; GUI persists only "which sids were open where" |
@@ -292,7 +292,7 @@ verifiable.
   `rendered_seq` didn't advance) — now sources the live core via the new
   `re_render_one_doc`. Headless tests: `pool_dedups_by_path_so_two_views_share_one_core`
   (shared rope + unified undo) and `re_render_one_doc_sources_live_core_not_disk`.
-  ⚠️ The per-frame cross-pane *paint* (two simultaneous panes visibly updating)
+  ⚠️ The per-frame cross-tile *paint* (two simultaneous tiles visibly updating)
   is the one piece needing a GPUI runtime eyeball.
 - **8b.** Delete the turn-end inference in all 3 pumps (gated on **D1** + the 8a
   agreement holding). ⏸️ **Architectural goal ACHIEVED by phase-8** (the canonical
@@ -367,7 +367,7 @@ Front-loaded by leverage and verifiability.
    (2026-06-08)** — foundation was live; the remaining fix made theme-switch
    re-render source the live shared core instead of disk (`re_render_one_doc`),
    with headless tests for pooled sharing + unified undo + live-core re-render
-   (⚠️ cross-pane *paint* owes a GPUI eyeball) · `[~]` delete turn-end inference
+   (⚠️ cross-tile *paint* owes a GPUI eyeball) · `[~]` delete turn-end inference
    (8b) — **architectural goal met by phase-8 AgentEvent stream; the remaining
    legacy-inference deletion is the content-application cutover, runtime+soak-
    gated (would also perturb the durable WAL); held by design, not by decision**

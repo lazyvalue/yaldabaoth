@@ -1,6 +1,6 @@
-//! Agent (Claude) pane data layer: tool-call model + renderers, transcript
+//! Agent (Claude) tile data layer: tool-call model + renderers, transcript
 //! flat-item view model (S1 cache + rebuild), turn/phase state machine,
-//! chatbox, per-pane AgentState, and the AgentRing of session slots.
+//! chatbox, per-tile AgentState, and the AgentRing of session slots.
 //! Extracted verbatim from main.rs (split-gpui-main). Render methods on
 //! SketchGpuiView stay in main.rs this pass.
 
@@ -219,7 +219,7 @@ pub(crate) fn build_tool_block_with_weak(
         let diff_header = nc(at.diff_header);
         if let Some(input) = &tc.raw_input {
             let pretty = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
-            block = block.child(tool_body_pane_free(
+            block = block.child(tool_body_free(
                 "input",
                 &pretty,
                 None,
@@ -233,7 +233,7 @@ pub(crate) fn build_tool_block_with_weak(
         }
         let content_text = render_tool_content_blocks(&tc.content);
         if !content_text.trim().is_empty() {
-            block = block.child(tool_body_pane_free(
+            block = block.child(tool_body_free(
                 "content",
                 &content_text,
                 max_lines,
@@ -248,7 +248,7 @@ pub(crate) fn build_tool_block_with_weak(
         if let Some(output) = &tc.raw_output {
             let pretty =
                 serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
-            block = block.child(tool_body_pane_free(
+            block = block.child(tool_body_free(
                 "output",
                 &pretty,
                 max_lines,
@@ -265,12 +265,12 @@ pub(crate) fn build_tool_block_with_weak(
     block.into_any_element()
 }
 
-/// Free-function form of [`SketchGpuiView::tool_body_pane`] for the
+/// Free-function form of [`SketchGpuiView::tool_body`] for the
 /// virtualised render path. Same content layout, accepts a borrowed
 /// `code_font` instead of reaching through `&self`.
 // builder/render fn — arg count is inherent, splitting would obscure
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn tool_body_pane_free(
+pub(crate) fn tool_body_free(
     label: &str,
     body: &str,
     max_lines: Option<usize>,
@@ -336,7 +336,7 @@ pub(crate) enum ToolRenderPolicy {
     /// No body even when expanded — the user only needs to know the
     /// action happened. Read, Grep/Glob, TodoWrite, mode switches.
     HeaderOnly,
-    /// Show at most this many lines per body pane; cap further with a
+    /// Show at most this many lines per body tile; cap further with a
     /// "+N lines hidden" footer.
     Truncated { max_lines: usize },
     /// Show everything. For diffs, MCP tool returns, Task subagents.
@@ -441,7 +441,7 @@ pub(crate) fn tool_kind_label(kind: &sketch::acp_channel::ToolKind) -> String {
     .to_string()
 }
 
-/// Append a tool call's body panes directly to a container div.
+/// Append a tool call's body tiles directly to a container div.
 /// Used for single-tool groups where we skip the nested sub-header.
 pub(crate) fn append_tool_body(
     mut block: gpui::Div,
@@ -462,7 +462,7 @@ pub(crate) fn append_tool_body(
     let diff_header = nc(at.diff_header);
     if let Some(input) = &tc.raw_input {
         let pretty = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
-        block = block.child(tool_body_pane_free(
+        block = block.child(tool_body_free(
             "input",
             &pretty,
             None,
@@ -476,7 +476,7 @@ pub(crate) fn append_tool_body(
     }
     let content_text = render_tool_content_blocks(&tc.content);
     if !content_text.trim().is_empty() {
-        block = block.child(tool_body_pane_free(
+        block = block.child(tool_body_free(
             "content",
             &content_text,
             max_lines,
@@ -490,7 +490,7 @@ pub(crate) fn append_tool_body(
     }
     if let Some(output) = &tc.raw_output {
         let pretty = serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
-        block = block.child(tool_body_pane_free(
+        block = block.child(tool_body_free(
             "output",
             &pretty,
             max_lines,
@@ -1365,7 +1365,7 @@ pub(crate) const SUBAGENT_TOOL_NAMES: &[&str] = &["Task", "Subagent", "Spawn"];
 
 /// Sketch-side classification of a `ToolCall` that represents a sub-agent
 /// transcript (§26). Produced by the heuristic in `classify_subagent`; the
-/// `Subagents` sidepane lists these, and `focused_subagent` keys into the
+/// `Subagents` sidebar lists these, and `focused_subagent` keys into the
 /// derived list (by `tool_call_id`) to swap the main transcript view.
 ///
 /// Not stored: `AgentState::subagents()` derives this list on demand by
@@ -2049,7 +2049,7 @@ pub(crate) struct AgentState {
     pub(crate) view_model: AgentViewModel,
     /// Cached per-line transcript text (trimmed + tab-expanded) used by
     /// `render_agent`. Perf: building this `Vec<String>` allocates a String
-    /// per transcript line on every `cx.notify()` (cursor blink, cross-pane
+    /// per transcript line on every `cx.notify()` (cursor blink, cross-tile
     /// wakeups, every streamed chunk), an O(L) cost regardless of how few
     /// lines changed. Cache it keyed on `edit_seq` so unchanged frames reuse
     /// the prior vec instead of re-extracting + re-allocating the whole doc.
@@ -2068,7 +2068,7 @@ pub(crate) struct AgentState {
     pub(crate) input_surface: InputSurface,
     /// Last-seen full snapshot of the agent's plan. Updated on every ACP
     /// `Plan` notification (which carries a complete plan, not a delta —
-    /// see spec-agent-window.md §21). Consumed by the Tasklist sidepane.
+    /// see spec-agent-window.md §21). Consumed by the Tasklist sidebar.
     pub(crate) current_plan: Option<sketch::acp_channel::Plan>,
     /// Last-seen session mode id from the agent (Claude Code's `default` /
     /// `plan` / `learn`, etc.). Distinct from the permission mode on
@@ -2103,9 +2103,9 @@ pub(crate) struct AgentState {
     /// transcript, re-enabled when they scroll back to the bottom or send
     /// a new message. Shared with the ListState scroll handler via Rc.
     pub(crate) follow_output: std::rc::Rc<std::cell::Cell<bool>>,
-    /// Whether the Tasklist sidepane is open (§24).
+    /// Whether the Tasklist sidebar is open (§24).
     pub(crate) tasklist_open: bool,
-    /// Whether the Subagents sidepane is open (§28).
+    /// Whether the Subagents sidebar is open (§28).
     pub(crate) subagents_open: bool,
     /// True when this session is managed by the session server (client/server
     /// mode). False when the GUI owns the ACP subprocess directly (legacy).
@@ -2267,7 +2267,7 @@ impl AgentState {
 
     /// Build a fresh server-managed `AgentState` in the empty baseline, with
     /// `status` shown in the footer. Used for both the "connecting…"
-    /// placeholder a panel renders the instant it opens (before the
+    /// placeholder a tile renders the instant it opens (before the
     /// `list_sessions` / `create_session` round-trip lands) and for the
     /// reconnected/created slots once a `server_session_id` is known. Replaces
     /// the several copies of this giant struct literal that previously lived

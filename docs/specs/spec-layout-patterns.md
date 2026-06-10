@@ -15,15 +15,15 @@ This spec adds three tiling-WM primitives to sketch's workspace model:
    recommendation in `spec-workspaces-tagging.md`).
 
 2. **Automatic layouts** — per-tab layout algorithms that arrange windows
-   without manual splitting. Three modes: *master/stack* (one primary pane +
-   N secondaries), *monocle* (one pane fullscreen, cycle through the rest),
+   without manual splitting. Three modes: *master/stack* (one primary tile +
+   N secondaries), *monocle* (one tile fullscreen, cycle through the rest),
    and *columns* (equal-width vertical splits). A fourth mode, *manual*,
    preserves the existing hand-built split tree. Switching modes re-tiles
    the tab's windows; switching back to manual restores the prior tree.
 
 3. **Marks** — single-character named bookmarks on windows. `m` + key sets
    a mark; `'` + key jumps to the marked window (across tabs). Marks give
-   stable O(1) access to frequently-used panes regardless of layout churn.
+   stable O(1) access to frequently-used tiles regardless of layout churn.
 
 Together these turn sketch's workspace into a keyboard-driven tiling window
 manager where the "applications" are file buffers, agent sessions, and file
@@ -321,7 +321,7 @@ one workspace).
 #### 20 · Mark indicator [DRAFT]
 
 A marked window shows its mark character in the window's status chrome —
-e.g., a small `[a]` badge in the top-right corner of the pane, rendered
+e.g., a small `[a]` badge in the top-right corner of the tile, rendered
 at chrome font size (does not scale with `text_scale`). The badge is
 visible in all layout modes.
 

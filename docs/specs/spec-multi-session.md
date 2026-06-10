@@ -21,7 +21,7 @@ The feature introduces four named artifacts:
 
 1. **SessionSlot** — a named wrapper around `ClaudeState` that adds a user-facing label and a slot index.
 2. **SessionRing** — an ordered collection of `SessionSlot`s with one active slot, providing ring-style next/prev navigation.
-3. **Session sidebar** — a vertical panel on the left edge of the Claude screen listing all sessions, with the active one highlighted.
+3. **Session sidebar** — a vertical column on the left edge of the Claude screen listing all sessions, with the active one highlighted.
 4. **Session commands** — menu entries and keybindings for creating, switching, closing, and renaming sessions.
 
 ## Behaviors

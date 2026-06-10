@@ -66,7 +66,7 @@ is going to drain in this cycle, not once per sub-batch.
 
 ### 1.4 O(n) Render Path on Every Frame
 
-The render method for the agent/Claude pane does this on every `cx.notify()`:
+The render method for the agent/Claude tile does this on every `cx.notify()`:
 
 1. Extracts ALL lines from the editor into a `Vec<String>` — O(n) allocation + copy
 2. Calls `highlight_markdown_lines()` on ALL lines — O(n) tokenization
@@ -462,7 +462,7 @@ struct CachedLineHighlight {
     gutter_tag: Option<GutterTag>,
 }
 
-/// Full highlight cache for an editor pane.
+/// Full highlight cache for an editor tile.
 struct HighlightCache {
     lines: Vec<Option<CachedLineHighlight>>,
     dirty: DirtyRanges,
@@ -527,7 +527,7 @@ loop {
 }
 ```
 
-#### `render()` — Claude/Agent pane section
+#### `render()` — Claude/Agent tile section
 
 **Before:** Extracts all lines, highlights all, builds virtualised list.
 

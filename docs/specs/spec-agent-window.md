@@ -1,4 +1,4 @@
-# Agent Window — Worksheet + Chatbox + Sidepanes
+# Agent Window — Worksheet + Chatbox + Sidebars
 
 **Status:** ACTIVE — phases 1–4 shipped. Section-level markers below reflect what landed; the rendering polish around sub-agent transcript swap (§27) and a few corner cases still flagged DRAFT.
 
@@ -6,16 +6,16 @@
 
 ## Builds On
 
-- **`spec-multi-session.md`** — Defines the multi-session ring, lifecycle, sidebar, and persistence schema. This spec **inherits the session lifecycle and ring intact** (renamed `SessionRing → AgentRing`, `SessionSlot → AgentSlot`, `ClaudeState → AgentState`), but **supersedes the rendering of an individual session** (§9–§12 of that spec): the per-session chrome and chat-body layout are replaced by the Worksheet / Chatbox / sidepane model defined here.
+- **`spec-multi-session.md`** — Defines the multi-session ring, lifecycle, sidebar, and persistence schema. This spec **inherits the session lifecycle and ring intact** (renamed `SessionRing → AgentRing`, `SessionSlot → AgentSlot`, `ClaudeState → AgentState`), but **supersedes the rendering of an individual session** (§9–§12 of that spec): the per-session chrome and chat-body layout are replaced by the Worksheet / Chatbox / sidebar model defined here.
 - **`spec-textbox-compose.md`** — Specified the existing compose-box overlay. This spec **retires it**: the compose box is replaced by the Chatbox input mode, which is one of two co-equal input modalities (the other being the Worksheet) rather than a transient overlay on top of an editable transcript. The `ComposeBox` field on `ClaudeState`, the `ComposeToggle` / `ComposeSend` actions, and the height/separator rendering all go away. The mechanical pieces (standalone `Editor`, append-on-close splice path, scroll suppression) are reused under different names.
-- **`spec-tabs-and-splits.md`** — Defines `WindowContent::Claude(SessionRing)` as one of four window-kinds inside the workspace tab/split tree. This spec renames the variant to `WindowContent::Agent(AgentRing)` and changes its internal rendering; the workspace tree itself is unaffected. Agent-window sidepanes live **inside** the agent window's screen rect (not inside the workspace pane structure), so splits and tabs continue to work as before. The cross-view edit-broadcast machinery `spec-tabs-and-splits.md` §10 sketches (DRAFT, unshipped) is **partially inlined** here as the Editor Extensions section — anchors and per-line metadata are needed for the Worksheet gutter and tool-call anchoring regardless of whether the broader cross-view broadcast lands. If both specs ship, they share the same `LineAnchor` infrastructure; if only this one ships, the anchors stay scoped to the agent window.
+- **`spec-tabs-and-splits.md`** — Defines `WindowContent::Claude(SessionRing)` as one of four window-kinds inside the workspace tab/split tree. This spec renames the variant to `WindowContent::Agent(AgentRing)` and changes its internal rendering; the workspace tree itself is unaffected. Agent-window sidebars live **inside** the agent window's screen rect (not inside the workspace tile structure), so splits and tabs continue to work as before. The cross-view edit-broadcast machinery `spec-tabs-and-splits.md` §10 sketches (DRAFT, unshipped) is **partially inlined** here as the Editor Extensions section — anchors and per-line metadata are needed for the Worksheet gutter and tool-call anchoring regardless of whether the broader cross-view broadcast lands. If both specs ship, they share the same `LineAnchor` infrastructure; if only this one ships, the anchors stay scoped to the agent window.
 - **`src/acp_channel.rs`** — Provides `AcpChannelClient`, the ACP transport. Today it forwards `Chunk`, `ToolCallStarted`, `ToolCallUpdated` and drops everything else (`Plan`, `CurrentModeUpdate`, `UsageUpdate`, `AgentThoughtChunk`, `AvailableCommandsUpdate`, `SessionInfoUpdate`, `UserMessageChunk`, `ConfigOptionUpdate`). This spec extends `ReplyEvent` with `PlanUpdated`, `ModeChanged`, and (under the `unstable_session_usage` Cargo feature) `UsageUpdated`. The rest stay dropped — they're listed as future parking-lot items in Behaviors §31.
 
 ## Overview
 
 Sketch's agent surface today is a single chat-shaped screen (`ClaudeView`) over an in-memory `Editor` with frozen LLM ranges, a compose-box overlay, and inline tool calls. It works for a single conversation but doesn't scale to the workflow the project is aiming at: sketch as the primary way the user interacts with one or more coding agents (Claude Code today; Codex and other ACP-compatible agents tomorrow), with structured visibility into the agent's plan, sub-agents, model identity, permission mode, and context budget.
 
-This spec defines the **Agent Window**: a unified, agent-agnostic screen that any ACP-attached session renders into. The Agent Window has two co-equal input modes (**Worksheet** and **Chatbox**) the user freely toggles between, two toggleable right-side **sidepanes** (Tasklist, Subagents) sourced from ACP signals, and a compact **Status Strip** along the top surfacing the model / permission / token / context-window state.
+This spec defines the **Agent Window**: a unified, agent-agnostic screen that any ACP-attached session renders into. The Agent Window has two co-equal input modes (**Worksheet** and **Chatbox**) the user freely toggles between, two toggleable right-side **sidebars** (Tasklist, Subagents) sourced from ACP signals, and a compact **Status Strip** along the top surfacing the model / permission / token / context-window state.
 
 The spec introduces eight named artifacts:
 
@@ -23,8 +23,8 @@ The spec introduces eight named artifacts:
 2. **AgentRing / AgentSlot / AgentState** — renamed `SessionRing` / `SessionSlot` / `ClaudeState`. Lifecycle from `spec-multi-session.md` is unchanged.
 3. **Worksheet** — input mode where the user's lines interleave with LLM lines in the transcript, gated by frozen-line invariants and a left-margin **turn gutter**.
 4. **Chatbox** — input mode with a separate `Editor` pinned to the bottom of the window; the transcript above is read-only while in this mode.
-5. **TasklistPane** — right-side sidepane that mirrors the agent's current `Plan` (from ACP).
-6. **SubagentsPane** — right-side sidepane that lists sub-agents extracted from tool calls; selecting one swaps the main transcript view in place.
+5. **TasklistSidebar** — right-side sidebar that mirrors the agent's current `Plan` (from ACP).
+6. **SubagentsSidebar** — right-side sidebar that lists sub-agents extracted from tool calls; selecting one swaps the main transcript view in place.
 7. **StatusStrip** — single-row header above the main transcript area surfacing agent identity, model, permission mode, context-window utilization, cumulative cost, and turn / elapsed.
 8. **SubAgent** — sketch-side classification of a `ToolCall` that represents a sub-agent transcript. Stored on `AgentState`; produced by a heuristic classifier over `ToolCall.kind` and `name`.
 
@@ -47,11 +47,11 @@ The spec introduces eight named artifacts:
     +-----------------------------------------------------------+
     ```
 
-    Status strip and footer span the full window width. Sidepanes sit beside the transcript area but never extend into the status strip or footer. The Chatbox row only exists when the active input mode is Chatbox; in Worksheet mode the transcript IS the editing surface and the row is absent.
+    Status strip and footer span the full window width. Sidebars sit beside the transcript area but never extend into the status strip or footer. The Chatbox row only exists when the active input mode is Chatbox; in Worksheet mode the transcript IS the editing surface and the row is absent.
 
-2. **Sidepane stacking. [DRAFT]** When multiple sidepanes are open they stack horizontally in a fixed order: Tasklist (innermost / closest to the transcript), then Subagents, then any future sidepane. Each occupies a fixed column width (28 chars). The transcript area's width shrinks to accommodate.
+2. **Sidebar stacking. [DRAFT]** When multiple sidebars are open they stack horizontally in a fixed order: Tasklist (innermost / closest to the transcript), then Subagents, then any future sidebar. Each occupies a fixed column width (28 chars). The transcript area's width shrinks to accommodate.
 
-3. **Backwards compatibility with `spec-multi-session.md`'s session sidebar. [DRAFT]** The session sidebar described in `spec-multi-session.md` §9 — the LEFT column listing every session — is retained for the case `ring.slots.len() > 1`. With a single session, the left sidebar is hidden (current behavior). The session sidebar is the *workspace*'s navigation between agent sessions; the right sidepanes are *one session's* internal panes. The two coexist.
+3. **Backwards compatibility with `spec-multi-session.md`'s session sidebar. [DRAFT]** The session sidebar described in `spec-multi-session.md` §9 — the LEFT column listing every session — is retained for the case `ring.slots.len() > 1`. With a single session, the left sidebar is hidden (current behavior). The session sidebar is the *workspace*'s navigation between agent sessions; the right sidebars are *one session's* internal columns. The two coexist.
 
 ### Mode contract
 
@@ -124,11 +124,11 @@ The spec introduces eight named artifacts:
 
 20. **Chatbox height. [DRAFT]** Starts at 3 rows. Grows with content up to `min(viewport_height / 3, 12)` rows. Above the cap, the chatbox scrolls internally. (Inherited from `spec-textbox-compose.md`'s height policy.)
 
-### Tasklist sidepane
+### Tasklist sidebar
 
 21. **Source: `Plan` event. [DRAFT]** ACP's `SessionUpdate::Plan` carries `Plan { entries: Vec<PlanEntry> }`. The protocol contract is that each `Plan` is a **full snapshot** that replaces the previous one. `acp_channel.rs` is extended to forward this as `ReplyEvent::PlanUpdated(Plan)`. `AgentState.current_plan: Option<Plan>` stores the latest snapshot.
 
-22. **Rendering. [DRAFT]** When the Tasklist pane is open and `current_plan` is `Some` with `!entries.is_empty()`:
+22. **Rendering. [DRAFT]** When the Tasklist tile is open and `current_plan` is `Some` with `!entries.is_empty()`:
 
     ```
     +-----------------+
@@ -143,11 +143,11 @@ The spec introduces eight named artifacts:
 
     Indicators by `PlanEntryStatus`: `●` in_progress, `○` pending, `✓` completed. If a future status `failed` is added by the protocol, `✗` is used. `PlanEntryPriority`: `High` gets a leading red bar in the indicator column; `Low` dims the line by one shade; `Medium` is the default. Long entry text truncates with `…`; full content surfaces in a tooltip on hover.
 
-23. **Empty state. [DRAFT]** When the pane is open but `current_plan` is `None` or `entries.is_empty()`, the pane renders the placeholder `(no plan)` in dim text.
+23. **Empty state. [DRAFT]** When the tile is open but `current_plan` is `None` or `entries.is_empty()`, the tile renders the placeholder `(no plan)` in dim text.
 
 24. **Read-only in v1. [DRAFT]** Clicking an entry is a no-op. The user manipulates the plan only by instructing the agent. Marking entries done from the UI is out of scope.
 
-### Subagents sidepane
+### Subagents sidebar
 
 25. **Detection. [DRAFT]** A `SubAgent` is a sketch-side classification of a `ToolCall`. A centralized function `classify_subagent(tc: &ToolCall) -> Option<SubAgent>` runs whenever a `ToolCallStarted` or `ToolCallUpdated` event lands. v1 heuristic: `tc.kind == ToolKind::Other` AND `tc.name` matches any prefix in the const slice `SUBAGENT_TOOL_NAMES = &["Task", "Subagent", "Spawn"]`. The slice is the single point of swap when ACP adds a structured sub-agent type or vendor tools rename. **Classification is flat, not tree-shaped:** when a sub-agent's own tool-call content emits further `ToolCall` events, each one is fed through `classify_subagent` and produces its own top-level entry in `AgentState.subagents`. The sub-agent list is a chronologically-ordered flat list; "sub-sub-agents" are just additional rows.
 
@@ -209,8 +209,8 @@ The spec introduces eight named artifacts:
     |---|---|
     | Submit | `Ctrl-Enter` |
     | Toggle Worksheet ↔ Chatbox | `Ctrl-Alt-Enter` |
-    | Toggle Tasklist sidepane | `Cmd-1` |
-    | Toggle Subagents sidepane | `Cmd-2` |
+    | Toggle Tasklist sidebar | `Cmd-1` |
+    | Toggle Subagents sidebar | `Cmd-2` |
     | Return from sub-agent focus to parent | `Esc` (only fires when focused) |
     | Scroll transcript (in Chatbox mode) | `Ctrl-Up` / `Ctrl-Down` / `PageUp` / `PageDown` |
 
@@ -235,7 +235,7 @@ The spec introduces eight named artifacts:
 
     Defaults for missing fields: `mode: "chatbox"`, `tasklist_open: false`, `subagents_open: false`. Loader treats absence as default. Saver always writes the new shape.
 
-    **Downgrade compatibility.** An older sketch binary loading a newly-written file deserializes the per-slot record with serde's standard "ignore unknown fields" behavior — `id`, `label`, `active` are read; `mode`, `tasklist_open`, `subagents_open` are silently dropped. The downgraded session re-opens at the old defaults (no worksheet mode, no sidepanes). No persisted session is lost. This is the intended downgrade contract.
+    **Downgrade compatibility.** An older sketch binary loading a newly-written file deserializes the per-slot record with serde's standard "ignore unknown fields" behavior — `id`, `label`, `active` are read; `mode`, `tasklist_open`, `subagents_open` are silently dropped. The downgraded session re-opens at the old defaults (no worksheet mode, no sidebars). No persisted session is lost. This is the intended downgrade contract.
 
 36. **Not persisted. [DRAFT]**
 
@@ -378,7 +378,7 @@ Top-level shape is unchanged from `spec-multi-session.md` §15. Three new option
 - `AgentState::set_mode(mode: InputMode)` — performs the data movement per §6–§7.
 - `AgentState::submit(channel: &mut AcpChannelClient)` — runs §12 (Worksheet) or §18 (Chatbox) depending on `mode`.
 - `AgentState::on_reply_event(ev: ReplyEvent)` — drives `current_plan`, `agent_mode`, `usage`, `subagents`, plus existing chunk/tool-call handling.
-- `AgentState::toggle_tasklist()` / `toggle_subagents()` — flip pane visibility, save.
+- `AgentState::toggle_tasklist()` / `toggle_subagents()` — flip tile visibility, save.
 - `AgentState::focus_subagent(idx: usize)` / `unfocus_subagent()` — §27.
 - `AgentState::line_turn_id(line_idx: usize) -> TurnId` — gutter source.
 
@@ -386,9 +386,9 @@ Top-level shape is unchanged from `spec-multi-session.md` §15. Three new option
 
 - `classify_subagent(tc: &ToolCall) -> Option<SubAgent>` — single function, centralizes the v1 heuristic. Called from `on_reply_event` for both `ToolCallStarted` and `ToolCallUpdated`.
 
-### Sidepane pointer events
+### Sidebar pointer events
 
-Pointer handling for both the Tasklist pane (entry hover-tooltip) and the Subagents pane (entry click → focus) uses the existing GPUI click handler shape: `on_mouse_down(MouseButton::Left, cx.listener(move |view, ev, w, cx| …))`, with a `WeakEntity<SketchGpuiView>` captured for any handler that needs to mutate view state outside the immediate listener scope. Same shape as the existing session-sidebar click handler at `src/bin/sketch-gpui/main.rs:7670`. No new GPUI primitives required.
+Pointer handling for both the Tasklist tile (entry hover-tooltip) and the Subagents tile (entry click → focus) uses the existing GPUI click handler shape: `on_mouse_down(MouseButton::Left, cx.listener(move |view, ev, w, cx| …))`, with a `WeakEntity<SketchGpuiView>` captured for any handler that needs to mutate view state outside the immediate listener scope. Same shape as the existing session-sidebar click handler at `src/bin/sketch-gpui/main.rs:7670`. No new GPUI primitives required.
 
 ### Persistence functions (extended, not renamed)
 
@@ -407,7 +407,7 @@ Pointer handling for both the Tasklist pane (entry hover-tooltip) and the Subage
 
 5. **Sub-agent transcripts are read-only.** v1 does not support replying into a sub-agent. Inputs typed while focused on a sub-agent show a footer hint.
 
-6. **Sidepane width is fixed.** 28 chars per pane. No resize handle in v1. The transcript area shrinks to accommodate. The auto-close threshold computes available transcript width as `window_width - workspace_tab_strip_width (160px when present) - sum_of_open_sidepane_widths`; if the result drops below the equivalent of 40 chars at the current font size, the rightmost open sidepane closes with a footer hint. Subsequent re-widening does not auto-reopen — the user re-toggles manually.
+6. **Sidebar width is fixed.** 28 chars per sidebar. No resize handle in v1. The transcript area shrinks to accommodate. The auto-close threshold computes available transcript width as `window_width - workspace_tab_strip_width (160px when present) - sum_of_open_sidebar_widths`; if the result drops below the equivalent of 40 chars at the current font size, the rightmost open sidebar closes with a footer hint. Subsequent re-widening does not auto-reopen — the user re-toggles manually.
 
 7. **TUI scope.** This spec covers the GPUI frontend only. The TUI's agent integration (`src/app/claude.rs`) is unaffected and continues to use today's compose-box / single-screen model. Reconciling the TUI is a future spec.
 
@@ -421,7 +421,7 @@ Pointer handling for both the Tasklist pane (entry hover-tooltip) and the Subage
 
 ## Revision History
 
-- 2026-05-23 — Phases 1–4 landed. Editor extensions (§E1–§E3), Claude→Agent rename, ACP signal forwarding (§31), worksheet/chatbox modes (§4–§20), turn gutter (§11), Tasklist + Subagents sidepanes (§21–§29), Status Strip (§30), persistence schema extension (§35), and cursor-anchored auto-scroll (§19) all shipped. Per-window cwd is parked as a sibling spec for follow-up. Sub-agent transcript swap (§27) is wired up to the focus-state field but the main-area swap rendering hasn't been built yet — clicking a sub-agent today highlights the row and primes the field; the transcript renderer continues to show the parent agent. Spec §27's footer-hint and Cmd-[ return path are also unbuilt.
+- 2026-05-23 — Phases 1–4 landed. Editor extensions (§E1–§E3), Claude→Agent rename, ACP signal forwarding (§31), worksheet/chatbox modes (§4–§20), turn gutter (§11), Tasklist + Subagents sidebars (§21–§29), Status Strip (§30), persistence schema extension (§35), and cursor-anchored auto-scroll (§19) all shipped. Per-window cwd is parked as a sibling spec for follow-up. Sub-agent transcript swap (§27) is wired up to the focus-state field but the main-area swap rendering hasn't been built yet — clicking a sub-agent today highlights the row and primes the field; the transcript renderer continues to show the parent agent. Spec §27's footer-hint and Cmd-[ return path are also unbuilt.
 - 2026-05-22 (3) — Status bumped DRAFT → ACTIVE after the user approved the rev-2 revisions. Section-level markers stay DRAFT until each piece ships.
-- 2026-05-22 (2) — Adversarial review pass. Three blocking concerns from the reviewer addressed by introducing a new **Editor Extensions** section (`§E1`–`§E4`): opaque `LineAnchor` ids replace raw line-index anchors for tool calls (fixes the "anchor doesn't shift when user inserts above" bug); typed `LineMetadata<T>` sparse map replaces the proposed `line_turn_ids: Vec<TurnId>` parallel array (anchor-keyed, auto-shifts with the same machinery as `frozen_lines`); the LLM-chunk splice is replaced with `append_llm_chunk(turn_id, chunk)`, an insert-and-tag that leaves trailing draft AND inter-block annotations untouched. Worksheet submit (§12) now distinguishes prompt-body (skips whitespace-only lines) from freeze-pass (includes them) so blank spacers survive in the transcript without polluting the wire prompt. Worksheet auto-scroll (§19) now anchors to the user's cursor, not to streaming output (sticky-bottom only when cursor is at EOF). Sub-agent classifier (§25) hardens the heuristic to a const slice of name prefixes and specifies flat (not tree) classification for nested tool calls. Sub-agent transcripts (§26) reuse the existing `cap_tool_call_payloads` per-payload cap. `ReplyEvent::UsageUpdated` (§31) is now unconditional in the enum with a feature-gated *emitter* so match-exhaustiveness stays clean across feature settings. Persistence (§35) adds an explicit downgrade-compat note. Constraint §6 expands the auto-close threshold to account for the workspace tab strip's width. Constraint §8 adds a mid-session model-staleness note for agents that change models without emitting `CurrentModeUpdate`. Menu chord for the input-mode toggle (§5) moved from `m` (collides with `claude-mode-cycle` for permission mode) to `i` ("input mode"). Mode-switch undo behavior (§7) and `Tn` gutter source (§11) clarified inline. New Interfaces entry for sidepane pointer events citing the existing session-sidebar handler pattern.
-- 2026-05-22 — Initial DRAFT. Replaces the ad-hoc Claude-only screen with the unified Agent Window model. Worksheet contract (§9–§15), Chatbox contract (§16–§20), Tasklist sidepane (§21–§24), Subagents sidepane (§25–§29), Status Strip (§30), and ACP signal extensions (§31, §35) all DRAFT. Rename pass (Claude → Agent) DRAFT. `spec-textbox-compose.md` to be marked SUPERSEDED once this lands.
+- 2026-05-22 (2) — Adversarial review pass. Three blocking concerns from the reviewer addressed by introducing a new **Editor Extensions** section (`§E1`–`§E4`): opaque `LineAnchor` ids replace raw line-index anchors for tool calls (fixes the "anchor doesn't shift when user inserts above" bug); typed `LineMetadata<T>` sparse map replaces the proposed `line_turn_ids: Vec<TurnId>` parallel array (anchor-keyed, auto-shifts with the same machinery as `frozen_lines`); the LLM-chunk splice is replaced with `append_llm_chunk(turn_id, chunk)`, an insert-and-tag that leaves trailing draft AND inter-block annotations untouched. Worksheet submit (§12) now distinguishes prompt-body (skips whitespace-only lines) from freeze-pass (includes them) so blank spacers survive in the transcript without polluting the wire prompt. Worksheet auto-scroll (§19) now anchors to the user's cursor, not to streaming output (sticky-bottom only when cursor is at EOF). Sub-agent classifier (§25) hardens the heuristic to a const slice of name prefixes and specifies flat (not tree) classification for nested tool calls. Sub-agent transcripts (§26) reuse the existing `cap_tool_call_payloads` per-payload cap. `ReplyEvent::UsageUpdated` (§31) is now unconditional in the enum with a feature-gated *emitter* so match-exhaustiveness stays clean across feature settings. Persistence (§35) adds an explicit downgrade-compat note. Constraint §6 expands the auto-close threshold to account for the workspace tab strip's width. Constraint §8 adds a mid-session model-staleness note for agents that change models without emitting `CurrentModeUpdate`. Menu chord for the input-mode toggle (§5) moved from `m` (collides with `claude-mode-cycle` for permission mode) to `i` ("input mode"). Mode-switch undo behavior (§7) and `Tn` gutter source (§11) clarified inline. New Interfaces entry for sidebar pointer events citing the existing session-sidebar handler pattern.
+- 2026-05-22 — Initial DRAFT. Replaces the ad-hoc Claude-only screen with the unified Agent Window model. Worksheet contract (§9–§15), Chatbox contract (§16–§20), Tasklist sidebar (§21–§24), Subagents sidebar (§25–§29), Status Strip (§30), and ACP signal extensions (§31, §35) all DRAFT. Rename pass (Claude → Agent) DRAFT. `spec-textbox-compose.md` to be marked SUPERSEDED once this lands.

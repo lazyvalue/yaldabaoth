@@ -26,7 +26,7 @@ But it's worse: `cx.notify()` is called *inside* the lock, which schedules a re-
 
 ### 1.2 Render amplification: O(n) highlighting on every notify
 
-The agent pane's render method does this every frame:
+The agent tile's render method does this every frame:
 
 1. `editor.lines()` -> `Vec<String>` of ALL lines (allocation + copy)
 2. `highlight_markdown_lines(&all_lines)` -> full tokenization pass
@@ -343,7 +343,7 @@ This is the highest-impact change. The current O(n) render path must become O(vi
 
 #### 3.3.1 Cached highlight state
 
-Introduce a `HighlightCache` struct on the agent pane:
+Introduce a `HighlightCache` struct on the agent tile:
 
 ```rust
 struct HighlightCache {
@@ -393,7 +393,7 @@ For typing in the chatbox editor, the edit is at the cursor position: `mark_dirt
 #### 3.3.3 Incremental re-highlight in render
 
 ```rust
-fn render_agent_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+fn render_agent_tile(&self, cx: &mut Context<Self>) -> impl IntoElement {
     let editor = &self.agent_editor;
     let cache = &mut self.highlight_cache;
 
@@ -443,11 +443,11 @@ Ordered by impact and independence. Each phase is independently shippable.
 
 ### Phase 1: Render cache (highest impact, zero pump changes)
 
-**Files changed:** `main.rs` (agent pane render methods)
+**Files changed:** `main.rs` (agent tile render methods)
 
 1. Add `HighlightCache` struct (~80 lines).
 2. Add `RefCell<HighlightCache>` field to `SketchGpuiView`.
-3. Modify the agent pane render method to check `dirty_range`, re-highlight only dirty lines, and use cached spans.
+3. Modify the agent tile render method to check `dirty_range`, re-highlight only dirty lines, and use cached spans.
 4. Add `mark_dirty()` calls to all content mutation sites: `apply_server_batch()`, chatbox keystroke handler, `pump_session()` event application, session switch (`mark_all_dirty`).
 
 **Risk:** Low. Read-path optimization, no write-path semantic changes. Fallback: `mark_all_dirty()` degrades to current behavior.
@@ -515,7 +515,7 @@ The render cache is by far the highest-leverage fix.
 | `start_server_pump()` | Extract receiver before spawn; drain outside lock; single notify per cycle |
 | ACP pump (`cx.spawn` in session start) | Same: extract receivers, drain outside lock |
 | `pump_session()` | Split into `drain_session_events()` (outside lock) and `apply_session_events()` (inside lock) |
-| Agent pane render method | Use `HighlightCache`; only re-highlight dirty lines |
+| Agent tile render method | Use `HighlightCache`; only re-highlight dirty lines |
 | `apply_server_batch()` (new) | Notification routing, called inside lock with pre-drained batch |
 | `apply_acp_batch()` (new) | ACP event application, called inside lock with pre-drained batch |
 

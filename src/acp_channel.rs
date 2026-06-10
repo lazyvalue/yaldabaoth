@@ -152,7 +152,7 @@ pub enum ReplyEvent {
     ToolCallUpdated(ToolCallUpdate),
     /// Full-snapshot replacement of the agent's current plan. ACP's `Plan`
     /// notification is always a full plan (not a delta) per the protocol.
-    /// Consumed by the Tasklist sidepane (spec-agent-window.md §21).
+    /// Consumed by the Tasklist sidebar (spec-agent-window.md §21).
     PlanUpdated(Plan),
     /// The agent switched session modes (e.g. between Claude Code's
     /// `default` / `plan` / `learn` modes). Consumed by the Status Strip

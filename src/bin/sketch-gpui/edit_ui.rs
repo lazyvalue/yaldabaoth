@@ -117,7 +117,7 @@ impl SketchGpuiView {
     /// → WP without losing cursor/buffer state is just `cached.view = view`.
     pub(crate) fn enter_edit_with(&mut self, view: EditView, cx: &mut Context<Self>) {
         // 5c: bind the Edit view to the Doc's SHARED pooled core (same text +
-        // undo), so edits show live in any Doc pane of the file and there's no
+        // undo), so edits show live in any Doc tile of the file and there's no
         // stash to shuttle. Snapshot the (id, core) without holding the borrow
         // across the pool mutation below.
         let (shared, label): (
@@ -214,14 +214,14 @@ impl SketchGpuiView {
     }
 
     /// Resolve a wiki link target (e.g. `notes`, `subdir/topic`) against
-    /// the source doc's directory and replace the focused pane with the
+    /// the source doc's directory and replace the focused tile with the
     /// resulting Doc. Lookup order:
     ///   1. `<doc_dir>/<target>.md` — markdown convention; matches what
     ///      Obsidian / Foam / most wiki-aware editors do.
     ///   2. `<doc_dir>/<target>` — literal path, in case the user included
     ///      the extension already (or wants a non-md file).
     ///
-    /// If neither exists, log to stderr and no-op (the pane stays put;
+    /// If neither exists, log to stderr and no-op (the tile stays put;
     /// nothing to navigate to).
     pub(crate) fn open_wiki_link(
         &mut self,
@@ -323,8 +323,8 @@ impl SketchGpuiView {
         };
         match focus_kind {
             // Edit reload resets the SHARED core in place, so every view of
-            // the file (splits, also-shown panes) sees the disk version — not
-            // a fresh, un-shared buffer. The pane keeps its own cursor/scroll
+            // the file (splits, also-shown tiles) sees the disk version — not
+            // a fresh, un-shared buffer. The tile keeps its own cursor/scroll
             // and Code/WP sub-view (we never replace the EditState itself).
             FocusKind::Edit(core, path) => {
                 let text = match std::fs::read_to_string(&path) {

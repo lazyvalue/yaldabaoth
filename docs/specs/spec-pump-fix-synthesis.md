@@ -23,7 +23,7 @@ Two independent specs were written by agents with different expertise. This docu
 
 ### RC1: O(n) render on every frame (PRIMARY CAUSE of typing latency)
 
-The agent pane's render method does this on **every `cx.notify()`**:
+The agent tile's render method does this on **every `cx.notify()`**:
 
 1. Extracts ALL lines from the editor as `Vec<String>` — O(n) copy
 2. `highlight_markdown_lines()` on ALL lines — O(n) tokenization
@@ -34,7 +34,7 @@ The agent pane's render method does this on **every `cx.notify()`**:
 
 **Cost estimate:** ~200ms per frame at 1000 lines. At 30-60 notifies/sec during streaming, the main thread is 100% saturated with render work. Zero budget left for keystroke processing.
 
-**Location:** `main.rs` lines ~9474-9529, the agent pane render path.
+**Location:** `main.rs` lines ~9474-9529, the agent tile render path.
 
 ### RC2: Lock convoy on `this.update(cx, ...)`
 
@@ -119,7 +119,7 @@ cache.update_dirty_lines(&editor, &theme);   // O(changed_lines)
 | Agent streams 10 lines | ~200ms | ~2ms |
 | Scroll (no edit) | ~200ms | ~0ms (cache hit) |
 
-**Files:** `main.rs` (agent pane render method, ~line 9474+). Possibly a new `highlight_cache.rs` module.
+**Files:** `main.rs` (agent tile render method, ~line 9474+). Possibly a new `highlight_cache.rs` module.
 
 **GPUI constraint note:** `render()` takes `&mut self`, so the cache can live directly on `SketchGpuiView` — no `RefCell` needed.
 
