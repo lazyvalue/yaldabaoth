@@ -390,5 +390,6 @@ expression: blocks
             },
         ],
         source_file: false,
+        start_line: 0,
     },
 ]

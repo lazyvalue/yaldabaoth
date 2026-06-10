@@ -822,6 +822,7 @@ expression: blocks
             },
         ],
         source_file: false,
+        start_line: 0,
     },
     CodeBlock {
         language: Some(
@@ -1812,6 +1813,7 @@ expression: blocks
             },
         ],
         source_file: false,
+        start_line: 0,
     },
     CodeBlock {
         language: None,
@@ -1839,6 +1841,7 @@ expression: blocks
             },
         ],
         source_file: false,
+        start_line: 0,
     },
     Heading {
         level: 2,
