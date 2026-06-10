@@ -108,16 +108,16 @@ fn preferences_round_trip_with_text_scale() {
         theme: Some("dracula".into()),
         agent_status_position: Some("top".into()),
         text_scale: Some(1.21),
-        desktop_panel_cols: Some(100),
-        desktop_panel_rows: Some(30),
+        desktop_grid_cols: Some(100),
+        desktop_grid_rows: Some(30),
     };
     let json = serde_json::to_string(&prefs).unwrap();
     let back: Preferences = serde_json::from_str(&json).unwrap();
     assert_eq!(back.theme.as_deref(), Some("dracula"));
     assert_eq!(back.agent_status_position.as_deref(), Some("top"));
     assert_eq!(back.text_scale, Some(1.21));
-    assert_eq!(back.desktop_panel_cols, Some(100));
-    assert_eq!(back.desktop_panel_rows, Some(30));
+    assert_eq!(back.desktop_grid_cols, Some(100));
+    assert_eq!(back.desktop_grid_rows, Some(30));
 
     // Default (no zoom) is omitted from the serialized form.
     let bare = Preferences::default();
@@ -1178,6 +1178,10 @@ fn gpui_menu_has_required_entries() {
     collect_leaves(&menu, &mut leaf_actions);
     // The expected leaf actions — change here if gpui_menu changes.
     let expected = [
+        // "open file here" returned to the global new-submenu by user
+        // request (2026-06-10) — replaces the focused pane in place, so
+        // it's workspace-scoped enough to live here.
+        "open-browser",
         "new-browser-pane",
         "buffer-list",
         "new-agent-pane",
@@ -1186,6 +1190,13 @@ fn gpui_menu_has_required_entries() {
         "new-tab",
         "move-pane",
         "cycle-layout",
+        // Direct layout-mode selection (no cycling) + desktop grid size.
+        "layout-manual",
+        "layout-master-stack",
+        "layout-monocle",
+        "layout-columns",
+        "layout-desktop",
+        "desktop-grid",
         "tag-add",
         "list-marks",
         "back-to-doc",
@@ -1210,7 +1221,6 @@ fn gpui_menu_has_required_entries() {
         "rail-files",
         "rail-outline",
         "rail-flip",
-        "open-browser",
         "claude-new",
         "claude-list",
         "claude-close",

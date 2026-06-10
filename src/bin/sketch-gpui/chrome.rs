@@ -75,7 +75,10 @@ impl SketchGpuiView {
         if canvas_h <= 0.0 {
             canvas_h = self.viewport_height_px.max(1.0);
         }
-        let eff_w = workspace::effective_width(canvas_w, panel.0, g);
+        // Grid semantics: the wrap width IS the configured column count —
+        // no longer derived from the viewport (the viewport now derives the
+        // panel SIZE instead).
+        let eff_w = self.desktop_grid_cols.max(1);
 
         // ── Slot upkeep: seed on first entry, reconcile every frame (cheap,
         // O(n), no-op when the Behavior-2 invariant already holds), reveal
@@ -324,17 +327,25 @@ impl SketchGpuiView {
         .into_any_element()
     }
 
-    /// Panel pixel size from the global cell config. The mono cell is
-    /// approximated from the 14px code font (advance ≈ 0.6em, line height
-    /// ≈ 1.4em) — a measured advance via the text system is a follow-up;
-    /// exactness is not load-bearing because slots, not pixels, are the
-    /// stored unit (spec Behavior 6).
+    /// Panel pixel size derived from the desktop GRID config (spec
+    /// Behavior 6, grid revision): the viewport is divided into
+    /// `desktop_grid_cols × desktop_grid_rows` panels (gutters between and
+    /// around), so changing the grid — or the window — resizes panels while
+    /// slots stay untouched (slots, not pixels, remain the stored unit).
+    /// Floors keep panels usable when the window gets tiny.
     fn desktop_panel_px(&self) -> (f32, f32) {
-        let cell_w = 14.0 * 0.6;
-        let cell_h = 14.0 * 1.4;
+        let (_, _, mut w, mut h) = self.desktop_canvas_bounds.get();
+        if w <= 0.0 {
+            w = self.viewport_width_px.max(1.0);
+        }
+        if h <= 0.0 {
+            h = self.viewport_height_px.max(1.0);
+        }
+        let cols = self.desktop_grid_cols.max(1) as f32;
+        let rows = self.desktop_grid_rows.max(1) as f32;
         (
-            self.desktop_panel_cols as f32 * cell_w,
-            self.desktop_panel_rows as f32 * cell_h + DESKTOP_TITLE_H,
+            ((w - (cols + 1.0) * DESKTOP_GUTTER) / cols).max(160.0),
+            ((h - (rows + 1.0) * DESKTOP_GUTTER) / rows).max(120.0),
         )
     }
 
@@ -439,9 +450,7 @@ impl SketchGpuiView {
     /// Canvas mouse-up: commit the drop (insert-and-shift) or treat as a
     /// click when the threshold was never crossed.
     pub(crate) fn desktop_drop(&mut self, cx: &mut Context<Self>) {
-        let (_, _, cw, _) = self.desktop_canvas_bounds.get();
-        let panel = self.desktop_panel_px();
-        let eff_w = workspace::effective_width(cw.max(1.0), panel.0, DESKTOP_GUTTER);
+        let eff_w = self.desktop_grid_cols.max(1);
         let tab_idx = self.workspace.active_tab;
         let tab = &mut self.workspace.tabs[tab_idx];
         let Some(d) = tab.desktop.drag.take() else {

@@ -1312,7 +1312,13 @@ fn gpui_menu() -> Vec<MenuNode> {
             "layout",
             vec![
                 MenuNode::label("Layout"),
+                MenuNode::entry("m", "manual", "layout-manual"),
+                MenuNode::entry("s", "master/stack", "layout-master-stack"),
+                MenuNode::entry("o", "monocle", "layout-monocle"),
+                MenuNode::entry("c", "columns", "layout-columns"),
+                MenuNode::entry("D", "desktop", "layout-desktop"),
                 MenuNode::entry("l", "cycle layout mode (Ctrl-W Space)", "cycle-layout"),
+                MenuNode::entry("g", "desktop grid colsxrows (Ctrl-W p)", "desktop-grid"),
                 MenuNode::entry("p", "promote to master (Ctrl-W Enter)", "promote-master"),
                 MenuNode::entry("i", "increase master count (Ctrl-W i)", "inc-master"),
                 MenuNode::entry("d", "decrease master count (Ctrl-W d)", "dec-master"),
@@ -1440,8 +1446,8 @@ struct SketchGpuiView {
     /// Desktop-mode panel size in mono cells (spec-desktop-mode.md
     /// Behavior 6) — one global setting for all panels in all tabs,
     /// persisted in `Preferences`, clamped to [20, 400] × [5, 200].
-    desktop_panel_cols: u32,
-    desktop_panel_rows: u32,
+    desktop_grid_cols: u32,
+    desktop_grid_rows: u32,
     /// Desktop canvas bounds `(x, y, w, h)` in window coordinates, captured
     /// during paint (same idiom as `line_layouts`). Mouse listeners use it
     /// to convert window coords → desktop coords; the render pass uses the
@@ -1547,8 +1553,8 @@ impl SketchGpuiView {
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
-            desktop_panel_cols: 120,
-            desktop_panel_rows: 40,
+            desktop_grid_cols: 2,
+            desktop_grid_rows: 2,
             desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
             viewport_height_px: 0.0,
             viewport_width_px: 800.0,
@@ -1577,8 +1583,8 @@ impl SketchGpuiView {
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
-            desktop_panel_cols: 120,
-            desktop_panel_rows: 40,
+            desktop_grid_cols: 2,
+            desktop_grid_rows: 2,
             desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
             viewport_height_px: 0.0,
             viewport_width_px: 800.0,
@@ -2399,8 +2405,8 @@ impl SketchGpuiView {
             theme: Some(self.theme.name.as_kebab().to_string()),
             agent_status_position: Some(self.agent_status_position.as_str().to_string()),
             text_scale: Some(self.text_scale),
-            desktop_panel_cols: Some(self.desktop_panel_cols),
-            desktop_panel_rows: Some(self.desktop_panel_rows),
+            desktop_grid_cols: Some(self.desktop_grid_cols),
+            desktop_grid_rows: Some(self.desktop_grid_rows),
         });
     }
 
@@ -3833,6 +3839,16 @@ impl SketchGpuiView {
                 self.save_workspace_state();
                 cx.notify();
             }
+            // Direct layout-mode selection — same effect as cycling to the
+            // mode, without the round trip.
+            "layout-manual" => self.set_layout_mode_direct(workspace::LayoutMode::Manual, cx),
+            "layout-master-stack" => {
+                self.set_layout_mode_direct(workspace::LayoutMode::MasterStack, cx)
+            }
+            "layout-monocle" => self.set_layout_mode_direct(workspace::LayoutMode::Monocle, cx),
+            "layout-columns" => self.set_layout_mode_direct(workspace::LayoutMode::Columns, cx),
+            "layout-desktop" => self.set_layout_mode_direct(workspace::LayoutMode::Desktop, cx),
+            "desktop-grid" => self.open_desktop_grid_overlay(cx),
             "promote-master" => {
                 let is_ms = self
                     .workspace
@@ -4684,23 +4700,42 @@ impl SketchGpuiView {
     /// Open the rename input overlay for the active claude session. No-op
     /// if claude isn't focused (the command is gated by the menu but a
     /// stray dispatch shouldn't crash) or if an overlay is already open.
-    /// `Ctrl-W p`: open the `{cols}x{rows}` input for the global desktop
-    /// panel size (spec-desktop-mode.md Behavior 6). Pre-filled with the
-    /// current value so Enter is a no-op confirm.
+    /// `Ctrl-W p` action shim → [`open_desktop_grid_overlay`].
     fn desktop_panel_size_overlay(
         &mut self,
         _: &DesktopPanelSize,
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_desktop_grid_overlay(cx);
+    }
+
+    /// `Ctrl-W p` / menu `l g`: open the `{cols}x{rows}` input for the
+    /// desktop GRID — how many panels fit the viewport per axis; panel size
+    /// derives from it (spec-desktop-mode.md Behavior 6, grid revision).
+    /// Pre-filled with the current value so Enter is a no-op confirm.
+    fn open_desktop_grid_overlay(&mut self, cx: &mut Context<Self>) {
         if self.overlay_is_rename() {
             return;
         }
-        let text = format!("{}x{}", self.desktop_panel_cols, self.desktop_panel_rows);
+        let text = format!("{}x{}", self.desktop_grid_cols, self.desktop_grid_rows);
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
             text,
             target: RenameTarget::DesktopPanelSize,
         }));
+        cx.notify();
+    }
+
+    /// Direct layout-mode selection from the menu (no cycling).
+    fn set_layout_mode_direct(&mut self, mode: workspace::LayoutMode, cx: &mut Context<Self>) {
+        self.workspace.set_layout_mode(mode);
+        let sigil = self
+            .workspace
+            .active_tab()
+            .map(|t| t.layout_mode.sigil())
+            .unwrap_or("");
+        self.transient_status = Some(format!("layout: {sigil}").into());
+        self.save_workspace_state();
         cx.notify();
     }
 
@@ -4862,20 +4897,19 @@ impl SketchGpuiView {
                 });
                 match parsed {
                     Some((cols, rows)) => {
-                        self.desktop_panel_cols = cols.clamp(20, 400);
-                        self.desktop_panel_rows = rows.clamp(5, 200);
+                        self.desktop_grid_cols = cols.clamp(1, 12);
+                        self.desktop_grid_rows = rows.clamp(1, 12);
                         self.transient_status = Some(
                             format!(
-                                "desktop panels: {}x{}",
-                                self.desktop_panel_cols, self.desktop_panel_rows
+                                "desktop grid: {}x{} panels per screen",
+                                self.desktop_grid_cols, self.desktop_grid_rows
                             )
                             .into(),
                         );
                         self.save_settings();
                     }
                     None => {
-                        self.transient_status =
-                            Some("desktop panel size: expected {cols}x{rows}".into());
+                        self.transient_status = Some("desktop grid: expected {cols}x{rows}".into());
                     }
                 }
                 cx.notify();
@@ -5563,7 +5597,7 @@ impl SketchGpuiView {
             RenameTarget::Tab { .. } => "RENAME WORKSPACE",
             RenameTarget::AgentNewSessionCwd => "NEW SESSION AT…",
             RenameTarget::AgentChangeCwd { .. } => "CHANGE SESSION CWD",
-            RenameTarget::DesktopPanelSize => "DESKTOP PANEL SIZE (COLSxROWS)",
+            RenameTarget::DesktopPanelSize => "DESKTOP GRID (COLSxROWS OF PANELS)",
         };
         let header = div()
             .px_4()
@@ -6612,11 +6646,11 @@ fn main() {
                             view.text_scale = scale.clamp(MIN_TEXT_SCALE, MAX_TEXT_SCALE);
                         }
                         // Desktop panel size (clamped per spec Behavior 6).
-                        if let Some(c) = prefs.desktop_panel_cols {
-                            view.desktop_panel_cols = c.clamp(20, 400);
+                        if let Some(c) = prefs.desktop_grid_cols {
+                            view.desktop_grid_cols = c.clamp(1, 12);
                         }
-                        if let Some(r) = prefs.desktop_panel_rows {
-                            view.desktop_panel_rows = r.clamp(5, 200);
+                        if let Some(r) = prefs.desktop_grid_rows {
+                            view.desktop_grid_rows = r.clamp(1, 12);
                         }
                         // If we were launched with no explicit file arg, try to
                         // restore the saved workspace for this cwd. With an

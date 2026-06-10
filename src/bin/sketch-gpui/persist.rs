@@ -328,9 +328,9 @@ pub(crate) struct Preferences {
     /// Desktop-mode panel size in mono cells (spec-desktop-mode.md
     /// Behavior 6). One global setting; clamped on use, not on load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) desktop_panel_cols: Option<u32>,
+    pub(crate) desktop_grid_cols: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) desktop_panel_rows: Option<u32>,
+    pub(crate) desktop_grid_rows: Option<u32>,
 }
 
 pub(crate) fn load_preferences() -> Preferences {

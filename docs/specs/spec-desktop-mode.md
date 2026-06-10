@@ -1,7 +1,7 @@
-# Desktop Mode — Fixed-Size Panels on a Pannable Grid
+# Desktop Mode — Uniform Panels on a Pannable Slot Grid
 
 **Status:** DRAFT
-**Last updated:** 2026-06-09
+**Last updated:** 2026-06-10
 
 ## Builds On
 
@@ -17,11 +17,13 @@
 
 ## Overview
 
-Desktop mode is an alternative to tiling: every window becomes a **panel** of
-one fixed, globally-configured size (default **120 columns × 40 rows** of the
-mono cell grid), placed on an unbounded **desktop** of grid **slots**. The
-window is a viewport over the desktop: growing the window reveals more
-desktop; it never moves, rescales, or reflows panels. Panels are arranged by
+Desktop mode is an alternative to tiling: every window becomes a **panel**,
+placed on an unbounded **desktop** of grid **slots**. Panel size derives from
+a globally-configured **grid** — how many panels fit the viewport per axis
+(default **2 × 2**) — so all panels are uniform and resize with the window
+while their slots never change. The window is a viewport over the desktop:
+growing the window reveals more desktop and grows each panel proportionally;
+it never moves or reflows panels (slot addresses are immutable under resize). Panels are arranged by
 mouse drag-and-drop with **insert-and-shift** sequence semantics.
 
 Named entities introduced here:
@@ -31,10 +33,9 @@ Named entities introduced here:
 - **DesktopState** — per-tab state: the sorted slot assignment
   (`Vec<(WindowId, Slot)>`, row-major order — placement *and* sequence in
   one structure), the pan offset, and transient drag state.
-- **Effective width (W)** — the drop-time wrap width: the number of panel
-  columns that fit the current viewport (minimum 1). Used only when a
-  mutation needs row-major "next slot" semantics; stored slots are never
-  re-derived from it.
+- **Effective width (W)** — the wrap width for row-major "next slot"
+  semantics: the configured grid column count (minimum 1). Stored slots are
+  never re-derived from it.
 - **Desktop layout engine** — pure functions over `DesktopState` (insert-
   and-shift, first-free-slot, spatial navigation, reconciliation, slot↔pixel
   geometry) that own all placement decisions.
@@ -72,9 +73,10 @@ simply inserts the new panel after the focused one.
 
 ### 3 · Geometry, panning, and rendering [DRAFT]
 
-Panel pixel size derives at render time from the measured mono cell size:
-`panel_px = (cols × cell_w, rows × cell_h)` with a fixed gutter
-(`DESKTOP_GUTTER`, ~12px) between slots and around the origin. Slot origin:
+Panel pixel size derives at render time from the canvas and the grid:
+`panel_px = (canvas − (grid + 1) × gutter) / grid` per axis, with a fixed
+gutter (`DESKTOP_GUTTER`, ~12px) between slots and around the origin, and a
+minimum panel size so a tiny window stays usable. Slot origin:
 `gutter + slot ⊗ (panel_px + gutter) − pan`.
 
 The canvas pans on both axes (trackpad/wheel); `pan` is clamped to the
@@ -144,17 +146,20 @@ unchanged and auto-pan to reveal the target panel. All per-screen key
 contexts behave as in tiling — desktop changes where panels sit, not what
 they are.
 
-### 6 · Panel size configuration [DRAFT]
+### 6 · Desktop grid configuration [DRAFT]
 
-`desktop_panel_cols` / `desktop_panel_rows` live in `Preferences`
-(persisted, default 120 × 40), one global setting for all panels in all
-tabs. Runtime configuration uses a small text overlay in the existing
-`ActiveOverlay` family (the `TagInput`/`Rename` pattern — sketch-gpui has
-no `:` command line), accepting `{cols}x{rows}`; values clamp to
-`[20, 400]` cols and `[5, 200]` rows. Changing it re-renders
-immediately; slot addresses are size-independent, so no migration occurs —
-panels keep their slots and simply grow/shrink in place (which can change
-what overlaps the viewport, never what neighbors what).
+`desktop_grid_cols` / `desktop_grid_rows` live in `Preferences` (persisted,
+default 2 × 2): how many panels fit the viewport per axis, one global
+setting for all tabs. Panel size derives from it (Behavior 3) — a 3×2 grid
+shows six full panels per screen. Runtime configuration uses a small text
+overlay in the existing `ActiveOverlay` family (the `TagInput`/`Rename`
+pattern — sketch-gpui has no `:` command line), accepting `{cols}x{rows}`,
+clamped to `[1, 12]` per axis, reachable via `Ctrl-W p` and the layout
+menu (which also offers direct mode selection without cycling). The grid
+column count is also the effective width W. Changing it re-renders
+immediately; slot addresses are grid-independent, so no migration occurs —
+panels keep their slots and simply resize in place (which can change what
+overlaps the viewport, never what neighbors what).
 
 ### 7 · Persistence [DRAFT]
 
@@ -190,7 +195,7 @@ accepted, and noted for the `:promote` blue-green loop.
     the boundary.
   - `drag: Option<DragState>` — dragged id, grab offset, pointer position,
     resolved drop target; never persisted.
-- `Preferences { desktop_panel_cols, desktop_panel_rows, .. }`.
+- `Preferences { desktop_grid_cols, desktop_grid_rows, .. }`.
 - `PersistedTab { desktop_slots: Option<Vec<(u64, u32, u32)>>, .. }` —
   `(persisted window id, row, col)`.
 
@@ -213,8 +218,10 @@ content; `Preferences` owns panel size.
 
 ## Constraints
 
-- Window resize, text zoom, and panel-size changes MUST NOT mutate stored
+- Window resize, text zoom, and grid changes MUST NOT mutate stored
   slots. The only slot mutations are seeding, reconciliation, and drops.
+  (Pixel size is viewport-derived by design — grid revision; the original
+  fixed-pixel sizing was superseded by user feedback after runtime use.)
 - The slot map is geometry only. Any code that needs "which windows exist"
   keeps reading tree leaves; the Behavior-2 invariant is maintained at the
   engine boundary, not assumed by callers.
@@ -237,3 +244,7 @@ content; `Preferences` owns panel size.
   old-binary blast radius; overlay (not `:` command) for size config;
   engine stays gpui-free; restore-time seeding deferred to first paint;
   drag-arm focuses; Esc at canvas root.
+- 2026-06-10 — Grid revision (user feedback after runtime use): panel size
+  is now derived from a configured viewport grid (`cols × rows` of panels,
+  default 2×2) instead of fixed mono-cell dimensions; W = grid cols. Menu
+  gains direct layout-mode selection and the grid input.
