@@ -1545,6 +1545,8 @@ impl SketchGpuiView {
         file_label: String,
         focus_handle: FocusHandle,
     ) -> Self {
+        let syntect_hl =
+            sketch::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
         let label: SharedString = file_label.into();
         let initial = WindowContent::Doc(DocState {
             blocks,
@@ -1578,7 +1580,7 @@ impl SketchGpuiView {
             is_candidate: is_candidate_launch(),
             candidate_promote_ready: false,
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
-            syntect_hl: sketch::highlight::Highlighter::new(),
+            syntect_hl,
             _lease_heartbeat: None,
             _server_pump: None,
             pending_mark_chord: None,
@@ -1587,6 +1589,8 @@ impl SketchGpuiView {
     }
 
     fn new_browser(start_dir: PathBuf, theme: Theme, focus_handle: FocusHandle) -> Self {
+        let syntect_hl =
+            sketch::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
         let initial = WindowContent::Browser(BrowserWindow::standalone(start_dir));
         Self {
             theme,
@@ -1609,7 +1613,7 @@ impl SketchGpuiView {
             is_candidate: is_candidate_launch(),
             candidate_promote_ready: false,
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
-            syntect_hl: sketch::highlight::Highlighter::new(),
+            syntect_hl,
             _lease_heartbeat: None,
             _server_pump: None,
             pending_mark_chord: None,
@@ -2444,6 +2448,11 @@ impl SketchGpuiView {
             return;
         }
         self.theme = Theme::from_name(name);
+        // Keep the edit-view syntect highlighter in lockstep with the theme:
+        // light themes need light syntect colors. The highlight cache keys on
+        // theme name, so stale dark-on-light lines are invalidated next paint.
+        self.syntect_hl =
+            sketch::highlight::Highlighter::with_syntect_theme(self.theme.name.syntect_theme());
         for tab in self.workspace.tabs.iter_mut() {
             re_render_layout_docs(&mut tab.layout, &self.theme);
         }
