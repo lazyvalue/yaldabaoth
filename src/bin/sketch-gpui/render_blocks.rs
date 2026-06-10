@@ -742,11 +742,15 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
             lines,
             source_file,
         } => {
+            // Un-highlighted code (no language / unknown language) has no
+            // per-span fg, so the fallback must come from the theme — a
+            // hardcoded white is unreadable on light themes' code-block tint.
+            let code_fg = ncolor_to_u32(ctx.theme.editor_fg, DEFAULT_FG);
             let mut col = div()
                 .flex()
                 .flex_col()
                 .font_family(ctx.code_font.clone())
-                .text_color(rgb(DEFAULT_FG));
+                .text_color(rgb(code_fg));
             if *source_file {
                 // Source file: no container chrome — code IS the document.
             } else {
@@ -772,7 +776,7 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                     ctx,
                     line,
                     row_style,
-                    DEFAULT_FG,
+                    code_fg,
                     &ctx.code_font,
                     &ctx.code_font,
                     li,
