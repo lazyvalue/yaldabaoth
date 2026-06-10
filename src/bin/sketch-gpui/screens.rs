@@ -246,6 +246,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::equalize))
             // Layout patterns
             .on_action(cx.listener(Self::cycle_layout_mode))
+            .on_action(cx.listener(Self::desktop_panel_size_overlay))
             .on_action(cx.listener(Self::promote_to_master))
             .on_action(cx.listener(Self::increase_master_count))
             .on_action(cx.listener(Self::decrease_master_count))
@@ -420,6 +421,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::focus_prev))
             // Layout patterns
             .on_action(cx.listener(Self::cycle_layout_mode))
+            .on_action(cx.listener(Self::desktop_panel_size_overlay))
             .on_action(cx.listener(Self::promote_to_master))
             .on_action(cx.listener(Self::increase_master_count))
             .on_action(cx.listener(Self::decrease_master_count))
@@ -2185,6 +2187,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::flip_rail_side))
             // Layout patterns
             .on_action(cx.listener(Self::cycle_layout_mode))
+            .on_action(cx.listener(Self::desktop_panel_size_overlay))
             .on_action(cx.listener(Self::promote_to_master))
             .on_action(cx.listener(Self::increase_master_count))
             .on_action(cx.listener(Self::decrease_master_count))
@@ -2438,6 +2441,7 @@ impl SketchGpuiView {
             .on_action(cx.listener(Self::flip_rail_side))
             // Layout patterns
             .on_action(cx.listener(Self::cycle_layout_mode))
+            .on_action(cx.listener(Self::desktop_panel_size_overlay))
             .on_action(cx.listener(Self::promote_to_master))
             .on_action(cx.listener(Self::increase_master_count))
             .on_action(cx.listener(Self::decrease_master_count))

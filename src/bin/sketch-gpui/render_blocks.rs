@@ -499,6 +499,77 @@ pub(crate) struct RenderCtx<'a> {
 /// and calls `.bounds()` (which `expect`s prepaint) → panic across the platform
 /// input callback ("cannot unwind" → abort). Registering on paint guarantees
 /// every sink entry has bounds.
+/// Wraps an element and records its painted bounds `(x, y, w, h)` into a
+/// shared cell. The desktop canvas uses it so mouse listeners (which receive
+/// WINDOW coordinates) can convert into desktop coordinates, and so the
+/// render pass knows the real viewport for culling / pan clamping / the
+/// drop-time effective width. Same idiom as [`RegisterOnPaint`].
+pub(crate) struct CaptureBounds {
+    pub(crate) inner: AnyElement,
+    pub(crate) sink: std::rc::Rc<std::cell::Cell<(f32, f32, f32, f32)>>,
+}
+
+impl IntoElement for CaptureBounds {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for CaptureBounds {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.inner.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.inner.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        _prepaint: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.sink.set((
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+        ));
+        self.inner.paint(window, cx);
+    }
+}
+
 pub(crate) struct RegisterOnPaint {
     pub(crate) inner: AnyElement,
     pub(crate) sink: std::rc::Rc<RefCell<HashMap<(usize, usize), TextLayout>>>,

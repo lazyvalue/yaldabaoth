@@ -532,6 +532,9 @@ pub struct DesktopDrag {
     pub pointer: (f32, f32),
     /// Resolved drop target for the current pointer (recomputed on move).
     pub target: Option<Slot>,
+    /// True once the pointer has moved past the click threshold (~4px).
+    /// Below it, mouse-up is a plain focus click — no ghost, no drop.
+    pub active: bool,
 }
 
 /// Per-tab desktop-mode geometry (spec-desktop-mode.md). The layout tree
@@ -551,6 +554,10 @@ pub struct DesktopState {
     pub pan: (f32, f32),
     /// Live drag, if any.
     pub drag: Option<DesktopDrag>,
+    /// The window the auto-pan last revealed. The render path pans to the
+    /// focused panel only when focus CHANGED since the last frame, so a
+    /// manual pan away from the focused panel isn't fought every frame.
+    pub last_reveal: Option<WindowId>,
 }
 
 impl DesktopState {
@@ -681,7 +688,11 @@ impl DesktopState {
         if n < 2 {
             return None;
         }
-        let next = if forward { (idx + 1) % n } else { (idx + n - 1) % n };
+        let next = if forward {
+            (idx + 1) % n
+        } else {
+            (idx + n - 1) % n
+        };
         Some(self.slots[next].0)
     }
 
@@ -1419,6 +1430,14 @@ impl<C> Workspace<C> {
     /// the active tab has fewer than 2 leaves.
     pub fn focus_next(&mut self) -> Result<(), ()> {
         let tab = self.active_tab_mut().ok_or(())?;
+        // Desktop mode: the sequence is the row-major slot order, not tree
+        // order (spec-desktop-mode.md Behavior 5).
+        if tab.layout_mode == LayoutMode::Desktop {
+            if let Some(next) = tab.desktop.sequence_neighbor(tab.focused, true) {
+                tab.focused = next;
+            }
+            return Ok(());
+        }
         let ids = tab.layout.leaf_ids();
         if ids.len() < 2 {
             return Ok(());
@@ -1432,6 +1451,12 @@ impl<C> Workspace<C> {
     /// Cycle focus to the previous leaf in tree order.
     pub fn focus_prev(&mut self) -> Result<(), ()> {
         let tab = self.active_tab_mut().ok_or(())?;
+        if tab.layout_mode == LayoutMode::Desktop {
+            if let Some(prev) = tab.desktop.sequence_neighbor(tab.focused, false) {
+                tab.focused = prev;
+            }
+            return Ok(());
+        }
         let ids = tab.layout.leaf_ids();
         if ids.len() < 2 {
             return Ok(());
@@ -1458,6 +1483,20 @@ impl<C> Workspace<C> {
     /// No-op when there's no sibling in the requested direction.
     pub fn focus_motion(&mut self, dir: FocusDir) -> Result<(), ()> {
         let tab = self.active_tab_mut().ok_or(())?;
+        // Desktop mode: spatial navigation over slots, not tree topology
+        // (spec-desktop-mode.md Behavior 5). No candidate = no-op.
+        if tab.layout_mode == LayoutMode::Desktop {
+            let sdir = match dir {
+                FocusDir::Left => SpatialDir::Left,
+                FocusDir::Right => SpatialDir::Right,
+                FocusDir::Up => SpatialDir::Up,
+                FocusDir::Down => SpatialDir::Down,
+            };
+            if let Some(next) = tab.desktop.spatial_neighbor(tab.focused, sdir) {
+                tab.focused = next;
+            }
+            return Ok(());
+        }
         let focused = tab.focused;
         let path = tab.layout.path_to(focused).ok_or(())?;
         if path.is_empty() {
@@ -1781,7 +1820,10 @@ mod desktop_tests {
     use super::*;
 
     fn slots_of(d: &DesktopState) -> Vec<(WindowId, (u32, u32))> {
-        d.slots.iter().map(|&(id, s)| (id, (s.row, s.col))).collect()
+        d.slots
+            .iter()
+            .map(|&(id, s)| (id, (s.row, s.col)))
+            .collect()
     }
 
     #[test]
@@ -1854,7 +1896,11 @@ mod desktop_tests {
         // Run at (0,0) = [1]; succ((0,0), 2) = (0,1), 2's vacated gap.
         assert_eq!(d.slot_of(2), Some(Slot::new(0, 0)));
         assert_eq!(d.slot_of(1), Some(Slot::new(0, 1)));
-        assert_eq!(d.slot_of(3), Some(Slot::new(0, 2)), "beyond-W panel untouched");
+        assert_eq!(
+            d.slot_of(3),
+            Some(Slot::new(0, 2)),
+            "beyond-W panel untouched"
+        );
     }
 
     #[test]

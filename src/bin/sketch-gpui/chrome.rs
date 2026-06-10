@@ -4,6 +4,13 @@
 
 use super::*;
 
+/// Desktop-mode chrome constants (spec-desktop-mode.md Behavior 3/4).
+const DESKTOP_GUTTER: f32 = 12.0;
+const DESKTOP_TITLE_H: f32 = 20.0;
+const DESKTOP_DRAG_THRESHOLD: f32 = 4.0;
+const DESKTOP_EDGE_PAN_BAND: f32 = 30.0;
+const DESKTOP_EDGE_PAN_STEP: f32 = 12.0;
+
 impl SketchGpuiView {
     /// Build the menu popup as an absolutely-positioned overlay anchored
     /// to the top of the window. Renders header (breadcrumb), entry list,
@@ -36,7 +43,430 @@ impl SketchGpuiView {
         // &mut Layout<WindowContent> (a field inside self.workspace.tabs)
         // is disjoint from &self.render_X's other field accesses.
         let layout = unsafe { &mut *layout_ptr };
+        if self.workspace.tabs[tab_idx].layout_mode == workspace::LayoutMode::Desktop {
+            return self.render_desktop(root, layout, focused_id, attach_focus, cx);
+        }
         self.render_layout(root, layout, focused_id, attach_focus, rail_focusable, cx)
+    }
+
+    /// Desktop mode (spec-desktop-mode.md): fixed-size panels at slot
+    /// positions on a pannable canvas. The layout tree is the CONTENT owner
+    /// (leaves render exactly as in tiling); geometry comes from the tab's
+    /// `DesktopState`. Only viewport-intersecting panels render, except the
+    /// focused panel — it carries the focus handle and the per-screen action
+    /// wiring, and culling it would strand the keyboard (spec Behavior 3).
+    fn render_desktop(
+        &mut self,
+        root: gpui::Div,
+        layout: &mut workspace::Layout<WindowContent>,
+        focused_id: workspace::WindowId,
+        attach_focus: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tab_idx = self.workspace.active_tab;
+        let panel = self.desktop_panel_px();
+        let g = DESKTOP_GUTTER;
+        let (_, _, mut canvas_w, mut canvas_h) = self.desktop_canvas_bounds.get();
+        // First frame: bounds not captured yet — approximate with the window
+        // viewport; the next frame self-corrects.
+        if canvas_w <= 0.0 {
+            canvas_w = self.viewport_width_px.max(1.0);
+        }
+        if canvas_h <= 0.0 {
+            canvas_h = self.viewport_height_px.max(1.0);
+        }
+        let eff_w = workspace::effective_width(canvas_w, panel.0, g);
+
+        // ── Slot upkeep: seed on first entry, reconcile every frame (cheap,
+        // O(n), no-op when the Behavior-2 invariant already holds), reveal
+        // the focused panel when focus changed, clamp pan to the occupied
+        // bounding box + one slot of margin. ──
+        {
+            let tab = &mut self.workspace.tabs[tab_idx];
+            let leaves = tab.layout.leaf_ids();
+            if tab.desktop.slots.is_empty() && !leaves.is_empty() {
+                tab.desktop.seed(&leaves, eff_w);
+            } else {
+                tab.desktop.reconcile(&leaves, focused_id, eff_w);
+            }
+            if tab.desktop.last_reveal != Some(focused_id) {
+                if let Some(slot) = tab.desktop.slot_of(focused_id) {
+                    let (x, y) = workspace::slot_origin(slot, panel, g);
+                    let pan = &mut tab.desktop.pan;
+                    if x - g < pan.0 {
+                        pan.0 = (x - g).max(0.0);
+                    } else if x + panel.0 + g > pan.0 + canvas_w {
+                        pan.0 = x + panel.0 + g - canvas_w;
+                    }
+                    if y - g < pan.1 {
+                        pan.1 = (y - g).max(0.0);
+                    } else if y + panel.1 + g > pan.1 + canvas_h {
+                        pan.1 = y + panel.1 + g - canvas_h;
+                    }
+                }
+                tab.desktop.last_reveal = Some(focused_id);
+            }
+            let (max_r, max_c) = tab.desktop.occupied_extent().unwrap_or((0, 0));
+            // Pannable extent: through one margin slot beyond occupied.
+            let extent =
+                workspace::slot_origin(workspace::Slot::new(max_r + 2, max_c + 2), panel, g);
+            let pan = &mut tab.desktop.pan;
+            pan.0 = pan.0.clamp(0.0, (extent.0 - canvas_w).max(0.0));
+            pan.1 = pan.1.clamp(0.0, (extent.1 - canvas_h).max(0.0));
+        }
+
+        let tab = &self.workspace.tabs[tab_idx];
+        let pan = tab.desktop.pan;
+        let drag = tab.desktop.drag;
+        let slot_list: Vec<(workspace::WindowId, workspace::Slot)> = tab.desktop.slots.clone();
+        let base_bg = self.editor_bg();
+        let dim: Hsla = nc(self.theme.agent.dim);
+        let accent: Hsla = rgb(CURSOR_BAR_COLOR).into();
+        let panel_bg = tint_bg(base_bg, 0.5, 0.06, 0.02);
+        let title_bg = tint_bg(base_bg, 0.5, 0.12, 0.05);
+
+        let mut canvas = root
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .bg(base_bg)
+            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _w, cx| {
+                let d = ev.delta.pixel_delta(px(20.0));
+                this.desktop_pan_by(-f32::from(d.x), -f32::from(d.y));
+                cx.notify();
+            }))
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+                this.desktop_pointer_move((f32::from(ev.position.x), f32::from(ev.position.y)), cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseUpEvent, _w, cx| {
+                    this.desktop_drop(cx);
+                }),
+            )
+            // Right-click cancels an in-flight drag (Esc-at-canvas-root is a
+            // follow-up — a global escape binding would shadow the
+            // per-screen escape semantics; see backlog).
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _ev: &MouseDownEvent, _w, cx| {
+                    this.desktop_cancel_drag(cx);
+                }),
+            );
+
+        // ── Dot grid over the visible area (slot-pitch corners). ──
+        {
+            let pitch = (panel.0 + g, panel.1 + g);
+            let first_col = (pan.0 / pitch.0).floor().max(0.0) as u32;
+            let first_row = (pan.1 / pitch.1).floor().max(0.0) as u32;
+            let ncols = (canvas_w / pitch.0).ceil() as u32 + 1;
+            let nrows = (canvas_h / pitch.1).ceil() as u32 + 1;
+            let dot = dim.opacity(0.35);
+            for r in first_row..first_row + nrows {
+                for c in first_col..first_col + ncols {
+                    let (x, y) = workspace::slot_origin(workspace::Slot::new(r, c), panel, g);
+                    canvas = canvas.child(
+                        div()
+                            .absolute()
+                            .left(px(x - pan.0 - 1.0))
+                            .top(px(y - pan.1 - 1.0))
+                            .w(px(3.0))
+                            .h(px(3.0))
+                            .rounded_full()
+                            .bg(dot),
+                    );
+                }
+            }
+        }
+
+        // ── Drag affordances: home-slot outline + drop-target highlight. ──
+        if let Some(d) = drag.filter(|d| d.active) {
+            if let Some(home) = slot_list
+                .iter()
+                .find(|&&(id, _)| id == d.id)
+                .map(|&(_, s)| s)
+            {
+                let (x, y) = workspace::slot_origin(home, panel, g);
+                canvas = canvas.child(
+                    div()
+                        .absolute()
+                        .left(px(x - pan.0))
+                        .top(px(y - pan.1))
+                        .w(px(panel.0))
+                        .h(px(panel.1))
+                        .border_1()
+                        .border_color(dim.opacity(0.6))
+                        .rounded_md(),
+                );
+            }
+            if let Some(t) = d.target {
+                let (x, y) = workspace::slot_origin(t, panel, g);
+                canvas = canvas.child(
+                    div()
+                        .absolute()
+                        .left(px(x - pan.0))
+                        .top(px(y - pan.1))
+                        .w(px(panel.0))
+                        .h(px(panel.1))
+                        .border_2()
+                        .border_color(accent.opacity(0.8))
+                        .rounded_md(),
+                );
+            }
+        }
+
+        // ── Panels. ──
+        for (id, slot) in slot_list {
+            let dragging = drag.filter(|d| d.active && d.id == id);
+            let (sx, sy) = workspace::slot_origin(slot, panel, g);
+            let (x, y) = match dragging {
+                // The dragged panel itself follows the pointer — the real
+                // content rides along semi-transparent (no separate ghost).
+                Some(d) => (
+                    d.pointer.0 - d.grab.0 - pan.0,
+                    d.pointer.1 - d.grab.1 - pan.1,
+                ),
+                None => (sx - pan.0, sy - pan.1),
+            };
+            let visible = x + panel.0 > 0.0 && x < canvas_w && y + panel.1 > 0.0 && y < canvas_h;
+            let is_focused = id == focused_id;
+            // Focused panel is exempt from culling — its element tree holds
+            // the focus handle + per-screen action wiring (spec Behavior 3).
+            if !visible && !is_focused {
+                continue;
+            }
+
+            let Some(window) = layout.find_leaf_mut(id) else {
+                continue; // stale entry; reconcile drops it next frame
+            };
+            let content_ptr: *mut WindowContent = &mut window.content as *mut _;
+            // SAFETY: same argument as `render_focused_window` — no
+            // structural tree mutation happens during this render pass.
+            let content = unsafe { &mut *content_ptr };
+
+            let title = Self::desktop_panel_title(content);
+            let mark = self.workspace.marks.mark_for_window(id);
+
+            let leaf_root = if is_focused && attach_focus {
+                div().track_focus(&self.focus_handle)
+            } else {
+                div()
+            };
+            let inner: AnyElement = match content {
+                WindowContent::Doc(d) => self.render_doc(leaf_root, d, cx).into_any_element(),
+                WindowContent::Edit(e) => self.render_edit(leaf_root, e, cx).into_any_element(),
+                WindowContent::Browser(b) => {
+                    self.render_browser(leaf_root, b, cx).into_any_element()
+                }
+                WindowContent::Agent(ring) => {
+                    self.render_agent(leaf_root, ring, cx).into_any_element()
+                }
+            };
+
+            let mut title_bar = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .h(px(DESKTOP_TITLE_H))
+                .px_2()
+                .flex_none()
+                .bg(title_bg)
+                .text_size(px(11.0))
+                .text_color(if is_focused { accent } else { dim })
+                .cursor_grab()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                        this.desktop_grab(
+                            id,
+                            (f32::from(ev.position.x), f32::from(ev.position.y)),
+                            cx,
+                        );
+                    }),
+                )
+                .child(title);
+            if let Some(m) = mark {
+                title_bar =
+                    title_bar.child(div().px_1().text_color(accent).child(format!("[{m}]")));
+            }
+
+            let mut frame = div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(panel.0))
+                .h(px(panel.1))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .rounded_md()
+                .bg(panel_bg)
+                .border_1()
+                .border_color(if is_focused { accent } else { dim.opacity(0.4) })
+                .child(title_bar)
+                .child(div().flex_1().min_h_0().overflow_hidden().child(inner));
+            if dragging.is_some() {
+                frame = frame.opacity(0.85);
+            }
+            canvas = canvas.child(frame);
+        }
+
+        CaptureBounds {
+            inner: canvas.into_any_element(),
+            sink: self.desktop_canvas_bounds.clone(),
+        }
+        .into_any_element()
+    }
+
+    /// Panel pixel size from the global cell config. The mono cell is
+    /// approximated from the 14px code font (advance ≈ 0.6em, line height
+    /// ≈ 1.4em) — a measured advance via the text system is a follow-up;
+    /// exactness is not load-bearing because slots, not pixels, are the
+    /// stored unit (spec Behavior 6).
+    fn desktop_panel_px(&self) -> (f32, f32) {
+        let cell_w = 14.0 * 0.6;
+        let cell_h = 14.0 * 1.4;
+        (
+            self.desktop_panel_cols as f32 * cell_w,
+            self.desktop_panel_rows as f32 * cell_h + DESKTOP_TITLE_H,
+        )
+    }
+
+    /// Title-bar label for a panel.
+    fn desktop_panel_title(content: &WindowContent) -> String {
+        match content {
+            WindowContent::Doc(d) => d.file_label.to_string(),
+            WindowContent::Edit(e) => e.file_label.to_string(),
+            WindowContent::Browser(_) => "files".to_string(),
+            WindowContent::Agent(ring) => ring
+                .slots
+                .get(ring.active)
+                .map(|s| s.label.clone())
+                .unwrap_or_else(|| "claude".to_string()),
+        }
+    }
+
+    /// Mouse-down on a panel title bar: focus the panel (spec Behavior 4 —
+    /// arming a drag also focuses) and arm a drag. The drag activates only
+    /// once the pointer crosses the click threshold in
+    /// [`desktop_pointer_move`](Self::desktop_pointer_move).
+    pub(crate) fn desktop_grab(
+        &mut self,
+        id: workspace::WindowId,
+        window_pos: (f32, f32),
+        cx: &mut Context<Self>,
+    ) {
+        let (cx0, cy0, _, _) = self.desktop_canvas_bounds.get();
+        let panel = self.desktop_panel_px();
+        let tab_idx = self.workspace.active_tab;
+        let tab = &mut self.workspace.tabs[tab_idx];
+        tab.focused = id;
+        let Some(slot) = tab.desktop.slot_of(id) else {
+            cx.notify();
+            return;
+        };
+        let pan = tab.desktop.pan;
+        let desktop_pos = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
+        let (ox, oy) = workspace::slot_origin(slot, panel, DESKTOP_GUTTER);
+        tab.desktop.drag = Some(workspace::DesktopDrag {
+            id,
+            grab: (desktop_pos.0 - ox, desktop_pos.1 - oy),
+            pointer: desktop_pos,
+            target: None,
+            active: false,
+        });
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    /// Canvas mouse-move: advance the drag (threshold, pointer, drop target,
+    /// edge auto-pan). No-op when no drag is armed.
+    pub(crate) fn desktop_pointer_move(&mut self, window_pos: (f32, f32), cx: &mut Context<Self>) {
+        let (cx0, cy0, cw, ch) = self.desktop_canvas_bounds.get();
+        let panel = self.desktop_panel_px();
+        let tab_idx = self.workspace.active_tab;
+
+        // Edge auto-pan first (uses window-relative position within canvas).
+        let mut pan_delta = (0.0f32, 0.0f32);
+        let rel = (window_pos.0 - cx0, window_pos.1 - cy0);
+        let tab = &mut self.workspace.tabs[tab_idx];
+        let Some(mut d) = tab.desktop.drag else {
+            return;
+        };
+        if d.active {
+            if rel.0 < DESKTOP_EDGE_PAN_BAND {
+                pan_delta.0 = -DESKTOP_EDGE_PAN_STEP;
+            } else if rel.0 > cw - DESKTOP_EDGE_PAN_BAND {
+                pan_delta.0 = DESKTOP_EDGE_PAN_STEP;
+            }
+            if rel.1 < DESKTOP_EDGE_PAN_BAND {
+                pan_delta.1 = -DESKTOP_EDGE_PAN_STEP;
+            } else if rel.1 > ch - DESKTOP_EDGE_PAN_BAND {
+                pan_delta.1 = DESKTOP_EDGE_PAN_STEP;
+            }
+            tab.desktop.pan.0 = (tab.desktop.pan.0 + pan_delta.0).max(0.0);
+            tab.desktop.pan.1 = (tab.desktop.pan.1 + pan_delta.1).max(0.0);
+        }
+        let pan = tab.desktop.pan;
+        let desktop_pos = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
+
+        if !d.active {
+            let dx = desktop_pos.0 - d.pointer.0;
+            let dy = desktop_pos.1 - d.pointer.1;
+            if (dx * dx + dy * dy).sqrt() < DESKTOP_DRAG_THRESHOLD {
+                return; // still a click, not a drag
+            }
+            d.active = true;
+        }
+        d.pointer = desktop_pos;
+        // Target from the ghost's CENTER, not the raw pointer — dragging by
+        // the title bar biases the pointer to the top edge otherwise.
+        let center = (
+            d.pointer.0 - d.grab.0 + panel.0 / 2.0,
+            d.pointer.1 - d.grab.1 + panel.1 / 2.0,
+        );
+        d.target = Some(workspace::slot_at(center, panel, DESKTOP_GUTTER));
+        tab.desktop.drag = Some(d);
+        cx.notify();
+    }
+
+    /// Canvas mouse-up: commit the drop (insert-and-shift) or treat as a
+    /// click when the threshold was never crossed.
+    pub(crate) fn desktop_drop(&mut self, cx: &mut Context<Self>) {
+        let (_, _, cw, _) = self.desktop_canvas_bounds.get();
+        let panel = self.desktop_panel_px();
+        let eff_w = workspace::effective_width(cw.max(1.0), panel.0, DESKTOP_GUTTER);
+        let tab_idx = self.workspace.active_tab;
+        let tab = &mut self.workspace.tabs[tab_idx];
+        let Some(d) = tab.desktop.drag.take() else {
+            return;
+        };
+        if d.active
+            && let Some(target) = d.target
+            && tab.desktop.slot_of(d.id) != Some(target)
+        {
+            tab.desktop.insert_shift(d.id, target, eff_w);
+            self.save_workspace_state();
+        }
+        cx.notify();
+    }
+
+    /// Cancel an in-flight drag (right-click; Esc is a follow-up).
+    pub(crate) fn desktop_cancel_drag(&mut self, cx: &mut Context<Self>) {
+        let tab_idx = self.workspace.active_tab;
+        if self.workspace.tabs[tab_idx].desktop.drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Scroll-wheel pan; clamping happens in the render pass against the
+    /// current occupied extent.
+    pub(crate) fn desktop_pan_by(&mut self, dx: f32, dy: f32) {
+        let tab_idx = self.workspace.active_tab;
+        let pan = &mut self.workspace.tabs[tab_idx].desktop.pan;
+        pan.0 = (pan.0 + dx).max(0.0);
+        pan.1 = (pan.1 + dy).max(0.0);
     }
 
     /// Recursively render a `Layout<WindowContent>`. The `root` div is used

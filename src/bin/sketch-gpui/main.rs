@@ -259,6 +259,7 @@ actions!(
         // Layout patterns (spec-layout-patterns.md)
         // Phase 2: automatic layouts
         CycleLayoutMode,
+        DesktopPanelSize,
         PromoteToMaster,
         IncreaseMasterCount,
         DecreaseMasterCount,
@@ -1195,6 +1196,10 @@ enum RenameTarget {
     /// cwd (spec-agent-cwd.md §4). Targeted by monotonic
     /// `AgentSlot::index`, matching `AgentSlot`'s rule.
     AgentChangeCwd { index: usize },
+    /// `{cols}x{rows}` input that sets the global desktop-mode panel size
+    /// (spec-desktop-mode.md Behavior 6). Clamped to [20, 400] × [5, 200];
+    /// unparseable input cancels with a footer hint.
+    DesktopPanelSize,
 }
 
 /// The single, mutually-exclusive overlay layered over the screen body — at
@@ -1436,6 +1441,13 @@ struct SketchGpuiView {
     /// persisted in `Preferences`, clamped to [20, 400] × [5, 200].
     desktop_panel_cols: u32,
     desktop_panel_rows: u32,
+    /// Desktop canvas bounds `(x, y, w, h)` in window coordinates, captured
+    /// during paint (same idiom as `line_layouts`). Mouse listeners use it
+    /// to convert window coords → desktop coords; the render pass uses the
+    /// size for culling, pan clamping, and the drop-time effective width.
+    desktop_canvas_bounds: std::rc::Rc<std::cell::Cell<(f32, f32, f32, f32)>>,
+    /// Cached viewport height, sibling of `viewport_width_px` below.
+    viewport_height_px: f32,
     /// Cached viewport width in pixels, updated every render frame from
     /// `Window::viewport_size()`. Used by the chatbox to compute visible
     /// columns for horizontal scroll tracking.
@@ -1536,6 +1548,8 @@ impl SketchGpuiView {
             text_scale: 1.0,
             desktop_panel_cols: 120,
             desktop_panel_rows: 40,
+            desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
+            viewport_height_px: 0.0,
             viewport_width_px: 800.0,
             focus_handle,
             active_overlay: ActiveOverlay::None,
@@ -1564,6 +1578,8 @@ impl SketchGpuiView {
             text_scale: 1.0,
             desktop_panel_cols: 120,
             desktop_panel_rows: 40,
+            desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
+            viewport_height_px: 0.0,
             viewport_width_px: 800.0,
             focus_handle,
             active_overlay: ActiveOverlay::None,
@@ -1645,6 +1661,7 @@ impl SketchGpuiView {
                     },
                     pan: (0.0, 0.0),
                     drag: None,
+                    last_reveal: None,
                 },
             });
             ws.next_tab_index += 1;
@@ -4666,6 +4683,26 @@ impl SketchGpuiView {
     /// Open the rename input overlay for the active claude session. No-op
     /// if claude isn't focused (the command is gated by the menu but a
     /// stray dispatch shouldn't crash) or if an overlay is already open.
+    /// `Ctrl-W p`: open the `{cols}x{rows}` input for the global desktop
+    /// panel size (spec-desktop-mode.md Behavior 6). Pre-filled with the
+    /// current value so Enter is a no-op confirm.
+    fn desktop_panel_size_overlay(
+        &mut self,
+        _: &DesktopPanelSize,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overlay_is_rename() {
+            return;
+        }
+        let text = format!("{}x{}", self.desktop_panel_cols, self.desktop_panel_rows);
+        self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
+            text,
+            target: RenameTarget::DesktopPanelSize,
+        }));
+        cx.notify();
+    }
+
     fn open_rename_overlay(&mut self, cx: &mut Context<Self>) {
         if self.overlay_is_rename() {
             return;
@@ -4814,6 +4851,34 @@ impl SketchGpuiView {
                     cx.notify();
                 }
             },
+            RenameTarget::DesktopPanelSize => {
+                self.close_rename_overlay();
+                // Accept "120x40" / "120X40" with optional spaces. Slot
+                // addresses are size-independent (spec Behavior 6), so this
+                // re-renders in place — no migration, no slot mutation.
+                let parsed = new_label.to_lowercase().split_once('x').and_then(|(c, r)| {
+                    Some((c.trim().parse::<u32>().ok()?, r.trim().parse::<u32>().ok()?))
+                });
+                match parsed {
+                    Some((cols, rows)) => {
+                        self.desktop_panel_cols = cols.clamp(20, 400);
+                        self.desktop_panel_rows = rows.clamp(5, 200);
+                        self.transient_status = Some(
+                            format!(
+                                "desktop panels: {}x{}",
+                                self.desktop_panel_cols, self.desktop_panel_rows
+                            )
+                            .into(),
+                        );
+                        self.save_settings();
+                    }
+                    None => {
+                        self.transient_status =
+                            Some("desktop panel size: expected {cols}x{rows}".into());
+                    }
+                }
+                cx.notify();
+            }
         }
     }
 
@@ -5497,6 +5562,7 @@ impl SketchGpuiView {
             RenameTarget::Tab { .. } => "RENAME WORKSPACE",
             RenameTarget::AgentNewSessionCwd => "NEW SESSION AT…",
             RenameTarget::AgentChangeCwd { .. } => "CHANGE SESSION CWD",
+            RenameTarget::DesktopPanelSize => "DESKTOP PANEL SIZE (COLSxROWS)",
         };
         let header = div()
             .px_4()
@@ -5646,6 +5712,7 @@ impl Focusable for SketchGpuiView {
 impl Render for SketchGpuiView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport_width_px = f32::from(_window.viewport_size().width);
+        self.viewport_height_px = f32::from(_window.viewport_size().height);
 
         // Auto-clear expired splash.
         if let Some(deadline) = self.splash_until
@@ -6351,6 +6418,7 @@ fn register_keymap(app: &mut App) {
         // Layout patterns (spec-layout-patterns.md)
         // Phase 2: automatic layouts
         KeyBinding::new("ctrl-w space", CycleLayoutMode, None),
+        KeyBinding::new("ctrl-w p", DesktopPanelSize, None),
         KeyBinding::new("ctrl-w enter", PromoteToMaster, None),
         KeyBinding::new("ctrl-w i", IncreaseMasterCount, None),
         KeyBinding::new("ctrl-w d", DecreaseMasterCount, None),
