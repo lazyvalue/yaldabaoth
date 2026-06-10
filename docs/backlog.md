@@ -25,21 +25,31 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
   prompt/cancel/mode/restart + `Notification::PromptRejected` to the
   submitter with the text restored into the chatbox. Tests 3b/3c/3d in
   `session_transcript_test.rs` (red on old gate, green now).
-- **Agent chatbox typing lag while a turn streams** — `READY`, mechanism
-  hypothesized, needs SKETCH_PERF confirmation. Transcript render caches
-  (lines/extract, highlight, S1 view-model flat build) all key on the
-  transcript editor's `edit_seq` — chatbox keystrokes don't bump it, but
-  EVERY STREAMED CHUNK does, forcing a full S1 flat rebuild
-  (gutter-tag scan + tools_at_line + blank-collapse, O(whole transcript))
-  per chunk. With post-fence-fix transcripts now actually huge after resume
-  (≈4.8k events), chunk floods saturate the paint thread and concurrent
-  keystrokes queue behind it ("typing slightly slow to appear" — reported
-  while an agent turn was streaming). Suspects ranked by an audit pass:
-  S1 rebuild per chunk (primary); tag-bar `all_tags()` walk + per-leaf
-  `mark_for_window()` scan (new in 09e266b, minor). Confirm with
-  `SKETCH_PERF=1` (consolidated render_agent trace on stderr), then fix
-  direction: make the flat build incremental per appended lines, or batch
-  chunk application per frame. Audit map in session notes 2026-06-09.
+- **Agent transcript typing lag (worksheet + while-streaming)** — `FIXED`
+  (2026-06-09, `8af1d4c` merged to master); `NEEDS-RUNTIME` (worksheet typing
+  feel + typing-while-streaming on the real resumed session). Both shared one
+  hot path: every `edit_seq` bump (worksheet keystroke; every streamed chunk)
+  misses the S1 view-model cache, and the rebuild (a) deep-cloned EVERY
+  parsed `RenderedBlock` into per-rebuild lookup maps, and (b) on streaming,
+  re-parsed (pulldown-cmark + syntect) the WHOLE frozen transcript per chunk
+  because the block cache was keyed by `(start,end)` and chunk inserts shift
+  every range. Fix: S1 rebuild extracted to `rebuild_agent_view_model()`
+  (headlessly testable — first real seam into GPUI render cost, progresses
+  the verification-harness goal); `FlatItem::Block(Rc<RenderedBlock>)` +
+  `resolved_blocks` (Rc bumps, no clones); content-hash block-cache keys
+  (parses survive range shifts); metadata-view hoist in the cursor-reveal
+  loop. Probe: 3,151 lines / 50 code blocks → ~135µs per keystroke rebuild
+  (debug). Identity/INV-10/probe tests in the gpui tests mod.
+  Left open (minor): tag-bar `all_tags()` walk + per-leaf `mark_for_window()`
+  scan per frame (new in 09e266b, small constants).
+- **Theme switch leaves agent transcript caches stale** — `READY` (found
+  during the perf fix, pre-existing). `set_theme` re-renders Doc layouts only;
+  the agent pane's S1 fingerprint, highlight cache, and block parses (which
+  bake theme colors) are never invalidated, so a live theme switch keeps old
+  colors in the transcript until the next edit/chunk — and block parses now
+  persist even harder (content-keyed). Fix: clear/reseed agent caches (or
+  fold a theme id into `view_model_fp` + `block_content_hash`) in
+  `set_theme`.
 
 - **Resume hang (replay fence never cleared)** — `FIXED` (2026-06-09,
   `9112188` on master). After a server restart, a recovered session's pump
