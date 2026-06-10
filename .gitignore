@@ -3,3 +3,4 @@
 # Claude Code worktrees (per CLAUDE.md worktree workflow)
 /.claude/worktrees/
 /tmp
+.DS_Store
