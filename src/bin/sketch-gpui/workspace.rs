@@ -6,7 +6,7 @@
 //! editors live in a pooled `FileBuffer` and may be referenced by multiple
 //! windows simultaneously (shared edits across splits).
 //!
-//! Scope note: the file-buffer pool is wired into the live `App` as of 5c
+//! Scope note: the file-buffer pool is wired into the live `GpuiApp` as of 5c
 //! (`open_and_retain` dedup-by-canonical-path + `gc_buffers` strong-count
 //! liveness back every file-backed Doc/Edit view, so splits share a rope).
 
@@ -835,7 +835,7 @@ pub struct FileBuffer {
 
 /// Top-level container for the GPUI frontend. Owns the tab strip, the file-
 /// buffer pool, and the active-tab pointer. Replaces today's
-/// `App.screen` + `App.open_buffers` + `App.active_buffer_idx` triple.
+/// `GpuiApp.screen` + `GpuiApp.open_buffers` + `GpuiApp.active_buffer_idx` triple.
 pub struct Workspace<C> {
     pub tabs: Vec<Tab<C>>,
     pub active_tab: usize,

@@ -12,7 +12,7 @@ impl SketchGpuiView {
             .focused_content_mut()
             .expect("no focused window")
         {
-            WindowContent::Edit(e) => Some(e),
+            App::Buffer(BufferApp::Editing(e)) => Some(e),
             _ => None,
         }
     }
@@ -34,7 +34,7 @@ impl SketchGpuiView {
         // Skip the boot splash so render() builds the real Edit body, not the
         // splash screen — the harness needs the highlight path to actually run.
         self.splash_until = None;
-        self.set_screen(WindowContent::Edit(e));
+        self.set_screen(App::Buffer(BufferApp::Editing(e)));
     }
 
     /// Test-only: `(last_recomputed, last_was_skip)` of the focused Edit view's
@@ -56,7 +56,7 @@ impl SketchGpuiView {
     #[cfg(test)]
     pub(crate) fn test_open_doc(&mut self, markdown: &str) {
         let blocks = render_with_wiki(markdown, &self.theme, None);
-        self.set_screen(WindowContent::Doc(DocState {
+        self.set_screen(App::Buffer(BufferApp::Viewing(DocState {
             blocks,
             file_label: SharedString::new_static("harness.md"),
             cursor_block: 0,
@@ -66,7 +66,7 @@ impl SketchGpuiView {
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
             source: None,
-        }));
+        })));
         // The real doc body only renders once the splash deadline passes; clear
         // it so the harness exercises the list path immediately.
         self.splash_until = None;
@@ -124,7 +124,7 @@ impl SketchGpuiView {
             Option<(workspace::FileBufferId, workspace::SharedCore)>,
             SharedString,
         ) = match self.workspace.focused_content_mut() {
-            Some(WindowContent::Doc(d)) => (
+            Some(App::Buffer(BufferApp::Viewing(d))) => (
                 d.source.as_ref().map(|s| (s.buffer_id, s.core.clone())),
                 d.file_label.clone(),
             ),
@@ -144,7 +144,7 @@ impl SketchGpuiView {
         };
         let mut edit_state = EditState::new(SharedEditor::new(id, core), label, view);
         edit_state.view = view;
-        self.set_screen(WindowContent::Edit(edit_state));
+        self.set_screen(App::Buffer(BufferApp::Editing(edit_state)));
         cx.notify();
     }
 
@@ -158,7 +158,7 @@ impl SketchGpuiView {
             .workspace
             .replace_focused_content(
                 // Placeholder; overwritten in every match arm below.
-                WindowContent::Doc(DocState {
+                App::Buffer(BufferApp::Viewing(DocState {
                     blocks: Vec::new(),
                     file_label: SharedString::new_static(""),
                     cursor_block: 0,
@@ -168,11 +168,11 @@ impl SketchGpuiView {
                     blocks_snapshot: RefCell::new(None),
                     last_cursor_block: std::cell::Cell::new(None),
                     source: None,
-                }),
+                })),
             )
             .expect("workspace has no focused window");
         match prev {
-            WindowContent::Edit(edit) => {
+            App::Buffer(BufferApp::Editing(edit)) => {
                 let edit_path = PathBuf::from(edit.file_label.as_ref());
                 let blocks =
                     render_with_wiki(&edit.editor.full_text(), &self.theme, Some(&edit_path));
@@ -180,7 +180,7 @@ impl SketchGpuiView {
                 // 5c: the new Doc keeps the SAME pooled core the Edit view held
                 // (shared text + undo). No stash — the core IS the live state.
                 let source = DocSource::new(edit.editor.buffer_id, edit.editor.core.clone());
-                self.set_screen(WindowContent::Doc(DocState {
+                self.set_screen(App::Buffer(BufferApp::Viewing(DocState {
                     blocks,
                     file_label,
                     cursor_block: 0,
@@ -190,20 +190,20 @@ impl SketchGpuiView {
                     blocks_snapshot: RefCell::new(None),
                     last_cursor_block: std::cell::Cell::new(None),
                     source: Some(source),
-                }));
+                })));
             }
-            WindowContent::Agent(ring) => {
-                // Restore whatever screen the user opened Claude from. If
-                // none was stashed, fall back to a fresh Browser at cwd.
-                // AgentRing and all its sessions drop here, taking pump
-                // tasks and ACP channels with them.
-                let new = match ring.underlying {
+            App::Agent(ring) => {
+                // B6: restore the Buffer the user opened Claude from. If none
+                // was stashed, fall back to a fresh Picking at cwd — never
+                // close the tile. AgentRing and all its sessions drop here,
+                // taking pump tasks and ACP channels with them.
+                let buffer = match ring.underlying {
                     Some(boxed) => *boxed,
-                    None => WindowContent::Browser(BrowserWindow::standalone(
+                    None => BufferApp::Picking(BrowserWindow::standalone(
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                     )),
                 };
-                self.set_screen(new);
+                self.set_screen(App::Buffer(buffer));
             }
             other => {
                 self.set_screen(other);
@@ -274,7 +274,7 @@ impl SketchGpuiView {
             &self.theme,
             Some(&path),
         );
-        self.set_screen(WindowContent::Doc(DocState {
+        self.set_screen(App::Buffer(BufferApp::Viewing(DocState {
             blocks,
             file_label: label,
             cursor_block: 0,
@@ -284,7 +284,7 @@ impl SketchGpuiView {
             blocks_snapshot: RefCell::new(None),
             last_cursor_block: std::cell::Cell::new(None),
             source: Some(DocSource::new(buf_id, core)),
-        }));
+        })));
         self.doc_selection = None;
         self.save_workspace_state();
         cx.notify();
@@ -310,12 +310,12 @@ impl SketchGpuiView {
             Edit(workspace::SharedCore, PathBuf),
         }
         let focus_kind = match self.workspace.focused_content() {
-            Some(WindowContent::Doc(d)) => FocusKind::Doc(
+            Some(App::Buffer(BufferApp::Viewing(d))) => FocusKind::Doc(
                 d.source.as_ref().map(|s| (s.buffer_id, s.core.clone())),
                 PathBuf::from(d.file_label.as_ref()),
                 d.file_label.clone(),
             ),
-            Some(WindowContent::Edit(e)) => FocusKind::Edit(
+            Some(App::Buffer(BufferApp::Editing(e))) => FocusKind::Edit(
                 std::rc::Rc::clone(&e.editor.core),
                 PathBuf::from(e.file_label.as_ref()),
             ),
@@ -339,7 +339,7 @@ impl SketchGpuiView {
                 // the top so it can't dangle past the new end (matches the old
                 // reload-replaces-editor behavior). Other shared views keep
                 // their own cursors.
-                if let Some(WindowContent::Edit(e)) = self.workspace.focused_content_mut() {
+                if let Some(App::Buffer(BufferApp::Editing(e))) = self.workspace.focused_content_mut() {
                     e.editor.set_cursor(0, 0);
                     e.editor.clear_selection();
                 }
@@ -371,7 +371,7 @@ impl SketchGpuiView {
                         (blocks, None)
                     }
                 };
-                self.set_screen(WindowContent::Doc(DocState {
+                self.set_screen(App::Buffer(BufferApp::Viewing(DocState {
                     blocks,
                     file_label: label,
                     cursor_block: 0,
@@ -381,7 +381,7 @@ impl SketchGpuiView {
                     blocks_snapshot: RefCell::new(None),
                     last_cursor_block: std::cell::Cell::new(None),
                     source,
-                }));
+                })));
             }
         }
         self.doc_selection = None;

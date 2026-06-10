@@ -22,7 +22,7 @@ impl SketchGpuiView {
         // If already on Claude screen, just add a new session to the ring.
         if matches!(
             self.workspace.focused_content().expect("no focused window"),
-            WindowContent::Agent(_)
+            App::Agent(_)
         ) {
             self.new_agent_session(None, cx);
             return;
@@ -31,7 +31,7 @@ impl SketchGpuiView {
         // Stash the current screen so back_to_doc can restore it.
         let prior = self
             .workspace
-            .replace_focused_content(WindowContent::Doc(DocState {
+            .replace_focused_content(App::Buffer(BufferApp::Viewing(DocState {
                 blocks: Vec::new(),
                 file_label: SharedString::new_static(""),
                 cursor_block: 0,
@@ -41,10 +41,10 @@ impl SketchGpuiView {
                 blocks_snapshot: RefCell::new(None),
                 last_cursor_block: std::cell::Cell::new(None),
                 source: None,
-            }))
+            })))
             .expect("workspace has no focused window");
 
-        let mut ring = AgentRing::new(Some(Box::new(prior)));
+        let mut ring = AgentRing::new(prior.into_buffer_stash());
         let proc_cwd = process_cwd();
 
         if self.session_server.is_some() {
@@ -69,7 +69,7 @@ impl SketchGpuiView {
                 slot.pending_open_token = Some(open_token);
             }
 
-            self.set_screen(WindowContent::Agent(ring));
+            self.set_screen(App::Agent(ring));
             if let Some(c) = self.agent_mut() {
                 c.editor.begin_insert();
             }
@@ -108,7 +108,7 @@ impl SketchGpuiView {
             }
         }
 
-        self.set_screen(WindowContent::Agent(ring));
+        self.set_screen(App::Agent(ring));
 
         if let Some(c) = self.agent_mut() {
             c.editor.begin_insert();
@@ -141,7 +141,7 @@ impl SketchGpuiView {
         let mut open_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for tab in self.workspace.tabs.iter() {
             tab.layout.for_each_leaf(&mut |w| {
-                if let WindowContent::Agent(ring) = &w.content {
+                if let App::Agent(ring) = &w.content {
                     for slot in ring.slots.iter() {
                         if let Some(sid) = &slot.server_session_id {
                             open_sids.insert(sid.clone());
@@ -451,7 +451,7 @@ impl SketchGpuiView {
         let mut f = Some(f);
         for tab in self.workspace.tabs.iter_mut() {
             let found = tab.layout.find_map_leaf_content_mut(&mut |content| {
-                if let WindowContent::Agent(ring) = content
+                if let App::Agent(ring) = content
                     && ring
                         .slots
                         .iter()
@@ -550,7 +550,7 @@ impl SketchGpuiView {
         // open_agent_inner).
         let prior = self
             .workspace
-            .replace_focused_content(WindowContent::Doc(DocState {
+            .replace_focused_content(App::Buffer(BufferApp::Viewing(DocState {
                 blocks: Vec::new(),
                 file_label: SharedString::new_static(""),
                 cursor_block: 0,
@@ -560,10 +560,10 @@ impl SketchGpuiView {
                 blocks_snapshot: RefCell::new(None),
                 last_cursor_block: std::cell::Cell::new(None),
                 source: None,
-            }))
+            })))
             .expect("workspace has no focused window");
 
-        let mut ring = AgentRing::new(Some(Box::new(prior)));
+        let mut ring = AgentRing::new(prior.into_buffer_stash());
         let slot_cwd = cwd.unwrap_or_else(process_cwd);
         let label = "claude-1".to_string();
 
@@ -578,7 +578,7 @@ impl SketchGpuiView {
             if let Some(slot) = ring.slots.first_mut() {
                 slot.pending_open_token = Some(open_token);
             }
-            self.set_screen(WindowContent::Agent(ring));
+            self.set_screen(App::Agent(ring));
             if let Some(c) = self.agent_mut() {
                 c.editor.begin_insert();
             }
@@ -589,7 +589,7 @@ impl SketchGpuiView {
             let session_index = ring.next_index;
             let state = self.create_agent_session(None, slot_cwd.clone(), session_index, cx);
             ring.push(label, state, None, slot_cwd, None);
-            self.set_screen(WindowContent::Agent(ring));
+            self.set_screen(App::Agent(ring));
             if let Some(c) = self.agent_mut() {
                 c.editor.begin_insert();
             }
@@ -833,7 +833,7 @@ impl SketchGpuiView {
         // Save agent rings from ALL tiles, not just the focused one.
         if let Some(tab) = self.workspace.active_tab() {
             tab.layout.for_each_leaf(&mut |window| {
-                if let WindowContent::Agent(ring) = &window.content {
+                if let App::Agent(ring) = &window.content {
                     save_persisted_acp_sessions(&cwd, ring);
                 }
             });
@@ -1013,7 +1013,7 @@ impl SketchGpuiView {
         let mut sids: Vec<String> = Vec::new();
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
-                if let WindowContent::Agent(ring) = content {
+                if let App::Agent(ring) = content {
                     for slot in ring.slots.iter_mut() {
                         if let Some(sid) = slot.server_session_id.clone() {
                             slot.state.reset_for_replay();
@@ -1096,7 +1096,7 @@ impl SketchGpuiView {
                     let mut sids: Vec<String> = Vec::new();
                     for tab in this.workspace.tabs.iter_mut() {
                         tab.layout.for_each_leaf_content_mut(&mut |content| {
-                            if let WindowContent::Agent(ring) = content {
+                            if let App::Agent(ring) = content {
                                 for slot in ring.slots.iter() {
                                     if !slot.is_driver {
                                         continue;
@@ -1337,7 +1337,7 @@ impl SketchGpuiView {
     ) -> bool {
         for tab in self.workspace.tabs.iter_mut() {
             let found = tab.layout.find_map_leaf_content_mut(&mut |content| {
-                if let WindowContent::Agent(ring) = content
+                if let App::Agent(ring) = content
                     && let Some(slot) = ring.slot_by_server_session_id_mut(sid)
                 {
                     f(slot);
@@ -1364,7 +1364,7 @@ impl SketchGpuiView {
         let mut count = 0;
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
-                if let WindowContent::Agent(ring) = content
+                if let App::Agent(ring) = content
                     && let Some(slot) = ring.slot_by_server_session_id_mut(sid)
                 {
                     f(slot);
@@ -1386,8 +1386,8 @@ impl SketchGpuiView {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
                 // Compute the replacement (if the ring empties) *before*
                 // reassigning, so the `ring` borrow ends first.
-                let restore: Option<Option<WindowContent>> =
-                    if let WindowContent::Agent(ring) = content {
+                let restore: Option<Option<BufferApp>> =
+                    if let App::Agent(ring) = content {
                         if let Some(pos) = ring.position_by_server_session_id(sid) {
                             ring.close_at(pos);
                             changed = true;
@@ -1403,11 +1403,14 @@ impl SketchGpuiView {
                         None
                     };
                 if let Some(under) = restore {
-                    *content = under.unwrap_or_else(|| {
-                        WindowContent::Browser(BrowserWindow::standalone(
+                    // B6: a closed session must leave a usable Buffer behind —
+                    // restore the stashed BufferApp, or fall back to a fresh
+                    // Picking. Never close the tile.
+                    *content = App::Buffer(under.unwrap_or_else(|| {
+                        BufferApp::Picking(BrowserWindow::standalone(
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                         ))
-                    });
+                    }));
                 }
             });
         }
@@ -1782,7 +1785,7 @@ impl SketchGpuiView {
             let mut found = None;
             for tab in self.workspace.tabs.iter_mut() {
                 found = tab.layout.find_map_leaf_content_mut(&mut |content| {
-                    if let WindowContent::Agent(ring) = content
+                    if let App::Agent(ring) = content
                         && let Some(slot) = ring.slot_by_index_mut(session_index)
                     {
                         // SAFETY: pointer is valid for the scoped-borrow
@@ -2438,7 +2441,7 @@ impl SketchGpuiView {
         // job of open_agent_inner via the prior-screen swap dance.
         if matches!(
             self.workspace.focused_content().expect("no focused window"),
-            WindowContent::Agent(_)
+            App::Agent(_)
         ) {
             // Restore underlying first so open_agent_inner can capture
             // it as the new "prior" screen. Otherwise we'd lose the
@@ -2771,7 +2774,7 @@ impl SketchGpuiView {
         let mut awaiting = false;
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
-                if let WindowContent::Agent(ring) = content
+                if let App::Agent(ring) = content
                     && ring.slots.iter().any(|s| s.state.turn_phase.is_awaiting())
                 {
                     awaiting = true;
@@ -2792,7 +2795,7 @@ impl SketchGpuiView {
         let mut fp: u64 = 0;
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
-                if let WindowContent::Agent(ring) = content {
+                if let App::Agent(ring) = content {
                     for s in ring.slots.iter() {
                         if s.state.turn_phase.is_awaiting() {
                             any = true;

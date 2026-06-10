@@ -539,7 +539,7 @@ impl Element for CaptureBounds {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut GpuiApp,
     ) -> (LayoutId, ()) {
         (self.inner.request_layout(window, cx), ())
     }
@@ -551,7 +551,7 @@ impl Element for CaptureBounds {
         _bounds: Bounds<Pixels>,
         _request_layout: &mut (),
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut GpuiApp,
     ) {
         self.inner.prepaint(window, cx);
     }
@@ -564,7 +564,7 @@ impl Element for CaptureBounds {
         _request_layout: &mut (),
         _prepaint: &mut (),
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut GpuiApp,
     ) {
         self.sink.set((
             f32::from(bounds.origin.x),
@@ -622,7 +622,7 @@ impl Element for RegisterOnPaint {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut GpuiApp,
     ) -> (LayoutId, ()) {
         (self.inner.request_layout(window, cx), ())
     }
@@ -634,7 +634,7 @@ impl Element for RegisterOnPaint {
         _bounds: Bounds<Pixels>,
         _request_layout: &mut (),
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut GpuiApp,
     ) {
         self.inner.prepaint(window, cx);
     }
@@ -647,7 +647,7 @@ impl Element for RegisterOnPaint {
         _request_layout: &mut (),
         _prepaint: &mut (),
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut GpuiApp,
     ) {
         // prepaint has run → the layout's bounds are set. Registering here means
         // `doc_pos_at` only ever sees prepainted (bounds-Some) layouts.
@@ -1399,19 +1399,18 @@ pub(crate) fn split_wiki_links(span: &StyledSpan, theme: &Theme) -> Vec<StyledSp
 /// `theme`. Called on theme switch. Edit / Browser / Claude windows don't
 /// cache theme-styled output, so they pick up the new palette on next
 /// paint without needing intervention here.
-pub(crate) fn re_render_layout_docs(layout: &mut workspace::Layout<WindowContent>, theme: &Theme) {
+pub(crate) fn re_render_layout_docs(layout: &mut workspace::Layout<App>, theme: &Theme) {
     match layout {
         workspace::Layout::Empty => {}
         workspace::Layout::Leaf(win) => {
-            if let WindowContent::Doc(d) = &mut win.content {
+            if let App::Buffer(BufferApp::Viewing(d)) = &mut win.content {
                 re_render_one_doc(d, theme);
             }
-            // Browser's underlying-stashed content is also restyled if it
-            // happens to be a Doc — otherwise reverting via Esc lands on
+            // The picker's underlying-stashed BufferApp is also restyled if it
+            // happens to be a Viewing Doc — otherwise reverting via Esc lands on
             // stale-themed blocks.
-            if let WindowContent::Browser(b) = &mut win.content
-                && let Some(under) = b.underlying.as_deref_mut()
-                && let WindowContent::Doc(d) = under
+            if let App::Buffer(BufferApp::Picking(b)) = &mut win.content
+                && let Some(BufferApp::Viewing(d)) = b.underlying.as_deref_mut()
             {
                 re_render_one_doc(d, theme);
             }

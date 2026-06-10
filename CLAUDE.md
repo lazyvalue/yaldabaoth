@@ -52,10 +52,12 @@ so items stay crate-visible regardless of file):
 
 - `main.rs` (~6.5k) — `SketchGpuiView` struct, the `Render` impl, app/tab/
   split/doc methods, marks/layout-modes/tags, menus + overlays + pickers,
-  key bindings + `main()`. The render path branches on `WindowContent`
-  (Doc / Edit / Browser / ClaudeSession), each with its own `key_context`
-  (`SketchView`, `EditView`, `BrowserView`, `ClaudeView`) and its own
-  `on_action` wiring.
+  key bindings + `main()`. A Tile (`Window<App>`) holds one `App`
+  (`spec-tiles-and-apps.md`, ADR-0019): `App::Buffer(BufferApp)` —
+  `BufferApp::{Picking(file browser), Viewing(rendered doc), Editing(raw)}`
+  — or `App::Agent(AgentRing)`. The render path branches on that, each
+  screen with its own `key_context` (`SketchView`, `EditView`,
+  `BrowserView`, `AgentView`) and its own `on_action` wiring.
 - `screens.rs` — the screen render bodies: `render_doc`, `render_edit`
   (Code + WP), `render_agent`, `render_browser`.
 - `agent.rs` — agent-tile data layer: tool-call model, `FlatItem` view model
