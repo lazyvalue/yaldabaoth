@@ -157,6 +157,7 @@ impl<'a, 't> Renderer<'a, 't> {
                         language,
                         lines,
                         source_file: false,
+                        start_line: 0,
                     });
                 }
                 Event::Start(Tag::Table(alignments)) => {

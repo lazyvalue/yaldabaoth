@@ -1437,3 +1437,42 @@ fn append_llm_chunk_chains_turns_above_draft() {
     assert!(pos_hi < pos_ok, "Hi before ok ({:?})", text);
     assert!(pos_ok < pos_yes, "ok before Yes! ({:?})", text);
 }
+
+/// Source files must split into one CodeBlock per line: the doc view scrolls
+/// and focuses by block (j/k move `cursor_block`) and `gpui::list`
+/// virtualizes by item, so a whole file as ONE block can neither scroll nor
+/// virtualize. `start_line` carries the absolute line number for the gutter.
+#[test]
+fn source_file_renders_one_block_per_line() {
+    let path = std::path::Path::new("example.rs");
+    let blocks = render_with_wiki(
+        "fn main() {\n    let x = 1;\n}\n",
+        &Theme::default(),
+        Some(path),
+    );
+    assert_eq!(blocks.len(), 3, "one block per source line");
+    for (i, b) in blocks.iter().enumerate() {
+        match b {
+            RenderedBlock::CodeBlock {
+                lines,
+                source_file,
+                start_line,
+                ..
+            } => {
+                assert!(*source_file);
+                assert_eq!(*start_line, i);
+                assert_eq!(lines.len(), 1);
+            }
+            other => panic!("expected CodeBlock, got {:?}", other),
+        }
+    }
+}
+
+/// Empty source files still produce a single (empty) block so cursor and
+/// reveal logic have a target.
+#[test]
+fn empty_source_file_renders_single_block() {
+    let path = std::path::Path::new("empty.rs");
+    let blocks = render_with_wiki("", &Theme::default(), Some(path));
+    assert_eq!(blocks.len(), 1);
+}

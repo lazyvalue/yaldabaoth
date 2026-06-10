@@ -86,6 +86,7 @@ impl SketchGpuiView {
                 current_block: None,
                 weak_view: Some(weak_view.clone()),
                 doc_dir: doc_dir.clone(),
+                block_count: blocks_rc.len(),
             };
             block_element(&ctx, idx, block)
         };
@@ -1290,6 +1291,7 @@ impl SketchGpuiView {
                             // path which we don't track. Skip for v1.
                             weak_view: None,
                             doc_dir: None,
+                            block_count: 0,
                         };
                         let inner = block_inner(&ctx, rendered_block);
                         div()

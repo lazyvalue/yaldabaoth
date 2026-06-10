@@ -38,11 +38,17 @@ pub enum RenderedBlock {
     CodeBlock {
         language: Option<String>,
         lines: Vec<StyledLine>,
-        /// True when this block represents an entire source file opened
+        /// True when this block represents source-file content opened
         /// directly (`.rs`, `.py`, etc.) rather than a fenced code block
         /// inside markdown. Renderers should skip container chrome
         /// (background, padding, rounded corners) for source-file blocks.
+        /// Source files are split into one block per line so block-based
+        /// scrolling and list virtualization work line-by-line.
         source_file: bool,
+        /// 0-based index of `lines[0]` within the originating source file.
+        /// Drives line-number gutters when a file is split across blocks.
+        /// Always 0 for fenced markdown code blocks.
+        start_line: usize,
     },
     BlockQuote {
         blocks: Vec<RenderedBlock>,

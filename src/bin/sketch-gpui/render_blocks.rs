@@ -487,6 +487,12 @@ pub(crate) struct RenderCtx<'a> {
     /// targets (`[[notes]]` → `<doc_dir>/notes.md`). `None` outside the
     /// view-mode render path or when the doc has no parent dir.
     pub(crate) doc_dir: Option<PathBuf>,
+    /// Total top-level block count of the doc being rendered. For source
+    /// files (one block per line) this equals the file's line count, which
+    /// fixes the line-number gutter width so it doesn't jump at digit
+    /// boundaries while scrolling. `0` where unknown (agent chat, nested
+    /// contexts) — the gutter falls back to per-block math.
+    pub(crate) block_count: usize,
 }
 
 /// A transparent element wrapper that registers a doc line's `TextLayout` into
@@ -669,23 +675,32 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
         current_block: Some(idx),
         weak_view: ctx.weak_view.clone(),
         doc_dir: ctx.doc_dir.clone(),
+        block_count: ctx.block_count,
     };
     let base = block_inner(&inner_ctx, block);
 
+    // Source-file lines are one block each — no inter-block margin, or the
+    // file gets an 8px gap between every line of code.
+    let is_source_line = matches!(
+        block,
+        RenderedBlock::CodeBlock {
+            source_file: true,
+            ..
+        }
+    );
+
     // Wrap with a left "cursor bar" indicator when this is the focused block.
-    div()
-        .flex()
-        .flex_row()
-        .items_start()
-        .w_full()
-        .mb_2()
-        .child(div().w(px(3.0)).flex_none().h_full().bg(if highlighted {
-            rgb(CURSOR_BAR_COLOR)
-        } else {
-            rgba(0x00000000)
-        }))
-        .child(div().pl_3().flex_1().min_w_0().child(base))
-        .into_any_element()
+    let mut row = div().flex().flex_row().items_start().w_full();
+    if !is_source_line {
+        row = row.mb_2();
+    }
+    row.child(div().w(px(3.0)).flex_none().h_full().bg(if highlighted {
+        rgb(CURSOR_BAR_COLOR)
+    } else {
+        rgba(0x00000000)
+    }))
+    .child(div().pl_3().flex_1().min_w_0().child(base))
+    .into_any_element()
 }
 
 pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElement {
@@ -741,6 +756,7 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
             language,
             lines,
             source_file,
+            start_line,
         } => {
             // Un-highlighted code (no language / unknown language) has no
             // per-span fg, so the fallback must come from the theme — a
@@ -773,12 +789,19 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
             let row_style = NStyle::default();
             if *source_file {
                 // Source file: line-number gutter, same as the edit view's
-                // Code gutter. Width-stable because every gutter cell is the
-                // same right-padded digit count in the monospace code font.
-                let digits = lines.len().max(1).to_string().len();
+                // Code gutter. Width derives from the doc's total block
+                // count (== file line count under the one-block-per-line
+                // split), so it stays stable across the whole file instead
+                // of jumping at digit boundaries.
+                let digits = ctx
+                    .block_count
+                    .max(start_line + lines.len())
+                    .max(1)
+                    .to_string()
+                    .len();
                 let num_fg = fg_or(ctx.theme.line_number, 0x6272a4);
                 for (li, line) in lines.iter().enumerate() {
-                    let num = format!("{:>width$}", li + 1, width = digits);
+                    let num = format!("{:>width$}", start_line + li + 1, width = digits);
                     col = col.child(
                         div()
                             .flex()
@@ -836,6 +859,7 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                         // selection is scoped top-level.
                         weak_view: ctx.weak_view.clone(),
                         doc_dir: ctx.doc_dir.clone(),
+                        block_count: 0,
                     },
                     b,
                 ));
@@ -923,6 +947,7 @@ pub(crate) fn list_item_element(
                 current_block: None,
                 weak_view: ctx.weak_view.clone(),
                 doc_dir: ctx.doc_dir.clone(),
+                block_count: 0,
             },
             b,
         ));
@@ -1203,17 +1228,31 @@ pub(crate) fn render_with_wiki(
         // Use a transparent base style — source files render against the
         // normal document background, not the code-block tint.
         let base = sketch::style::Style::default();
-        let lines = hl.highlight(lang, text, base).unwrap_or_else(|| {
+        let mut lines = hl.highlight(lang, text, base).unwrap_or_else(|| {
             // Fallback: plain text with default style.
             text.lines()
                 .map(|l| StyledLine::new(vec![StyledSpan::new(l, theme.paragraph)]))
                 .collect()
         });
-        return vec![RenderedBlock::CodeBlock {
-            language: Some(lang.to_string()),
-            lines,
-            source_file: true,
-        }];
+        if lines.is_empty() {
+            // Empty file: keep one block so cursor/reveal logic has a target.
+            lines.push(StyledLine::new(vec![]));
+        }
+        // One block PER LINE: the doc view scrolls and focuses by block
+        // (j/k move `cursor_block`), and `gpui::list` virtualizes by item —
+        // a whole file as one giant block can neither scroll nor virtualize.
+        // Highlighting ran over the full text above, so cross-line state
+        // (block comments, raw strings) is already correct in the split.
+        return lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| RenderedBlock::CodeBlock {
+                language: Some(lang.to_string()),
+                lines: vec![line],
+                source_file: true,
+                start_line: i,
+            })
+            .collect();
     }
     let mut blocks = render::render(text, theme);
     expand_wiki_links_in_blocks(&mut blocks, theme);
