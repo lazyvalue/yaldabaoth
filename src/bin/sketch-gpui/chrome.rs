@@ -247,10 +247,15 @@ impl SketchGpuiView {
             let title = Self::desktop_panel_title(content);
             let mark = self.workspace.marks.mark_for_window(id);
 
+            // `size_full` is load-bearing: in tiling, the leaf root arrives
+            // pre-sized by the split layout; here the content sits inside the
+            // fixed panel frame, and without a definite size the virtualized
+            // doc/edit bodies collapse to their minimum height (content
+            // huddled at the top, dead space below).
             let leaf_root = if is_focused && attach_focus {
-                div().track_focus(&self.focus_handle)
+                div().size_full().track_focus(&self.focus_handle)
             } else {
-                div()
+                div().size_full()
             };
             let inner: AnyElement = match content {
                 WindowContent::Doc(d) => self.render_doc(leaf_root, d, cx).into_any_element(),
