@@ -1182,7 +1182,7 @@ fn gpui_menu_has_required_entries() {
         // request (2026-06-10) — replaces the focused tile in place, so
         // it's workspace-scoped enough to live here.
         "open-browser",
-        "new-browser-tile",
+        "new-buffer-tile",
         "buffer-list",
         "new-agent-tile",
         "split-h",
@@ -1332,8 +1332,8 @@ fn agent_local_l_resolves_to_claude_list() {
 }
 
 #[test]
-fn menu_n_f_resolves_to_new_browser_tile() {
-    // `n` opens the new submenu; `f` creates a file-browser tile.
+fn menu_n_f_resolves_to_new_buffer_tile() {
+    // `n` opens the new submenu; `f` creates a new buffer tile (in Picking).
     let mut state = MenuState::new();
     state.open();
     let menu = gpui_menu();
@@ -1341,7 +1341,7 @@ fn menu_n_f_resolves_to_new_browser_tile() {
     assert_eq!(after_n, None, "n alone should open the new submenu");
     assert!(state.is_active(), "submenu open keeps menu state active");
     let cmd = state.process_key(KeyPress::new(Key::Char('f'), KMods::NONE), &menu);
-    assert_eq!(cmd, Some("new-browser-tile".to_string()));
+    assert_eq!(cmd, Some("new-buffer-tile".to_string()));
 }
 
 #[test]

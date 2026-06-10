@@ -554,16 +554,17 @@ impl DocState {
 
 /// State held while the user is browsing the filesystem.
 ///
-/// `underlying`: when the browser was opened *in place* of an existing
-/// Doc/Edit/Claude window (Cmd-O from a focused tile), this holds that
-/// prior content so Esc/q can restore it. `None` when the browser was
-/// opened standalone (new-tab open, initial cwd browser, splits that
-/// fall back to a browser tile). In-memory only — not persisted with
-/// the workspace snapshot, since "restore to a browser-with-stashed-
-/// content" doesn't carry meaning across process restarts.
+/// `underlying`: when the browser (picker) was opened *in place* of an
+/// existing Buffer view (Cmd-O / inplace-buffer-pick from a focused Buffer
+/// tile), this holds that prior `BufferApp` mode so Esc/q can restore it
+/// (B4). Typed `BufferApp`, never `App` (D3/C4): a picker can only ever
+/// restore a Buffer, never an Agent — browser-over-Agent is unrepresentable.
+/// Invariant: never `Picking`. `None` when the picker was opened standalone
+/// (new-buffer-tile, initial cwd browser, splits that fall back to a picker).
+/// In-memory only — not persisted with the workspace snapshot.
 struct BrowserWindow {
     fb: FileBrowser,
-    underlying: Option<Box<App>>,
+    underlying: Option<Box<BufferApp>>,
 }
 
 impl BrowserWindow {
@@ -1116,6 +1117,19 @@ enum App {
     Agent(AgentRing),
 }
 
+impl App {
+    /// Narrow an `App` into the `BufferApp` stash an Agent/picker can restore
+    /// (D3/C4). A Buffer yields its mode; an Agent yields `None` — an Agent can
+    /// never be stashed behind another Agent or behind a picker, and the
+    /// no-stash case falls back to a fresh `Picking` at restore time (B6).
+    fn into_buffer_stash(self) -> Option<Box<BufferApp>> {
+        match self {
+            App::Buffer(buffer) => Some(Box::new(buffer)),
+            App::Agent(_) => None,
+        }
+    }
+}
+
 /// A view onto the pooled file buffer, always in exactly one mode (B1):
 /// `Picking` (file browser, no file chosen yet), `Viewing` (rendered markdown),
 /// or `Editing` (raw markdown). `Viewing ⇄ Editing` toggle over the same pooled
@@ -1276,7 +1290,7 @@ fn gpui_menu() -> Vec<MenuNode> {
             "new",
             vec![
                 MenuNode::entry("o", "open file in this tile (Cmd-O)", "open-browser"),
-                MenuNode::entry("f", "file browser tile", "new-browser-tile"),
+                MenuNode::entry("f", "new buffer tile", "new-buffer-tile"),
                 MenuNode::entry("b", "buffer list", "buffer-list"),
                 MenuNode::entry("c", "claude session tile", "new-agent-tile"),
             ],
@@ -1286,7 +1300,7 @@ fn gpui_menu() -> Vec<MenuNode> {
             "open in place",
             vec![
                 MenuNode::entry("o", "open file (Cmd-O)", "open-browser"),
-                MenuNode::entry("f", "file browser", "inplace-browser-tile"),
+                MenuNode::entry("f", "pick file here", "inplace-buffer-pick"),
                 MenuNode::entry("b", "buffer list", "buffer-list"),
                 MenuNode::entry("c", "claude session", "inplace-agent-tile"),
             ],
@@ -2123,19 +2137,29 @@ impl SketchGpuiView {
         self.open_browser_inner(cx);
     }
 
+    /// B2: Cmd+O is Buffer-app-scoped. On an `Agent` tile it is inert — a
+    /// transient status hint, no tile mutation (browser-over-Agent is removed).
+    /// On a `Buffer` tile it transitions the focused `BufferApp` to `Picking`,
+    /// stashing the prior mode (`Viewing`/`Editing`) on `BrowserWindow.underlying`
+    /// so Esc/q restores it (B4). Already-`Picking` is a no-op.
     fn open_browser_inner(&mut self, cx: &mut Context<Self>) {
-        if matches!(
-            self.workspace.focused_content().expect("no focused window"),
-            App::Buffer(BufferApp::Picking(_))
-        ) {
-            return;
+        match self.workspace.focused_content().expect("no focused window") {
+            // Already picking — nothing to do.
+            App::Buffer(BufferApp::Picking(_)) => return,
+            // Agent tile: out of scope. No buffer here to pick into.
+            App::Agent(_) => {
+                self.transient_status = Some("no buffer here".into());
+                cx.notify();
+                return;
+            }
+            App::Buffer(_) => {}
         }
-        // Open the browser IN the focused tile, stashing the prior content
-        // on `BrowserWindow.underlying` so Esc/q restores it. Picking a file
-        // discards the underlying and replaces the browser with the picked
-        // file in this same tile (see `open_file`'s `replace_in_place`
-        // branch). This keeps the browser tile-scoped instead of tab-
-        // scoped so splits/tabs aren't disrupted by file picking.
+        // Transition the focused Buffer to Picking IN PLACE, stashing the prior
+        // mode on `BrowserWindow.underlying` so Esc/q restores it (B4). Picking
+        // a file discards the underlying and replaces the picker with the picked
+        // file in this same tile (see `open_file`'s `replace_in_place` branch).
+        // This keeps the picker tile-scoped instead of tab-scoped so
+        // splits/tabs aren't disrupted by file picking.
         let placeholder = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         )));
@@ -2143,9 +2167,13 @@ impl SketchGpuiView {
             .workspace
             .replace_focused_content(placeholder)
             .expect("workspace has no focused window");
+        // Narrow the prior App to its BufferApp mode. The match above
+        // guarantees `prior` is a Buffer (Viewing/Editing), so the stash is
+        // typed `BufferApp` (D3/C4) and an Agent can never end up behind a
+        // picker.
         self.set_screen(App::Buffer(BufferApp::Picking(BrowserWindow {
             fb: FileBrowser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-            underlying: Some(Box::new(prior)),
+            underlying: prior.into_buffer_stash(),
         })));
         self.save_workspace_state();
         cx.notify();
@@ -3597,6 +3625,12 @@ impl SketchGpuiView {
         ) {
             d.insert("back-to-doc".to_string());
         }
+        // B2: Cmd+O / inplace-buffer-pick are Buffer-app-scoped. On an Agent
+        // tile they are inert (no buffer to pick into) — dim them in the menu.
+        if matches!(self.workspace.focused_content(), Some(App::Agent(_))) {
+            d.insert("open-browser".to_string());
+            d.insert("inplace-buffer-pick".to_string());
+        }
         d
     }
 
@@ -3956,7 +3990,10 @@ impl SketchGpuiView {
             // New-tile commands (global `n` submenu): create a NEW tile
             // (vertical split of the focused one) instead of replacing
             // the focused tile's content.
-            "new-browser-tile" => {
+            // B3: new-buffer-tile splits a NEW tile holding App::Buffer(Picking)
+            // with no restore target (a standalone picker). Cancelling it closes
+            // the tile (B4), subject to the sole-tile floor.
+            "new-buffer-tile" => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let _ = self.workspace.split_focused(
                     workspace::SplitDir::V,
@@ -3987,12 +4024,12 @@ impl SketchGpuiView {
             }
             // Open-in-place commands (global `o` submenu): replace the
             // focused tile's content instead of creating a new split.
-            "inplace-browser-tile" => {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                self.workspace
-                    .replace_focused_content(App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))));
-                self.save_workspace_state();
-                cx.notify();
+            // B3: inplace-buffer-pick resets the FOCUSED Buffer to Picking with
+            // the prior mode as restore (B4) — identical to Cmd+O (B2). Inert on
+            // an Agent tile. Routes through `open_browser_inner` so the stash and
+            // the inert-on-Agent behavior live in exactly one place.
+            "inplace-buffer-pick" => {
+                self.open_browser_inner(cx);
             }
             "inplace-agent-tile" => {
                 self.open_agent_inner(cx);

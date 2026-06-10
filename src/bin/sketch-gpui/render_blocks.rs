@@ -1406,12 +1406,11 @@ pub(crate) fn re_render_layout_docs(layout: &mut workspace::Layout<App>, theme: 
             if let App::Buffer(BufferApp::Viewing(d)) = &mut win.content {
                 re_render_one_doc(d, theme);
             }
-            // Browser's underlying-stashed content is also restyled if it
-            // happens to be a Doc — otherwise reverting via Esc lands on
+            // The picker's underlying-stashed BufferApp is also restyled if it
+            // happens to be a Viewing Doc — otherwise reverting via Esc lands on
             // stale-themed blocks.
             if let App::Buffer(BufferApp::Picking(b)) = &mut win.content
-                && let Some(under) = b.underlying.as_deref_mut()
-                && let App::Buffer(BufferApp::Viewing(d)) = under
+                && let Some(BufferApp::Viewing(d)) = b.underlying.as_deref_mut()
             {
                 re_render_one_doc(d, theme);
             }

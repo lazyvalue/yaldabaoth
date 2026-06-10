@@ -193,17 +193,17 @@ impl SketchGpuiView {
                 })));
             }
             App::Agent(ring) => {
-                // Restore whatever screen the user opened Claude from. If
-                // none was stashed, fall back to a fresh Browser at cwd.
-                // AgentRing and all its sessions drop here, taking pump
-                // tasks and ACP channels with them.
-                let new = match ring.underlying {
+                // B6: restore the Buffer the user opened Claude from. If none
+                // was stashed, fall back to a fresh Picking at cwd — never
+                // close the tile. AgentRing and all its sessions drop here,
+                // taking pump tasks and ACP channels with them.
+                let buffer = match ring.underlying {
                     Some(boxed) => *boxed,
-                    None => App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
+                    None => BufferApp::Picking(BrowserWindow::standalone(
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                    ))),
+                    )),
                 };
-                self.set_screen(new);
+                self.set_screen(App::Buffer(buffer));
             }
             other => {
                 self.set_screen(other);

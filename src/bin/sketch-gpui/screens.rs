@@ -2157,6 +2157,9 @@ impl SketchGpuiView {
             .on_key_down(cx.listener(Self::handle_claude_key))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::restart))
+            // B2: Cmd+O is Buffer-scoped. On an Agent tile `open_browser_inner`
+            // is inert — it shows a "no buffer here" hint and never stashes the
+            // agent. Wired here only so the hint fires; it cannot mutate the tile.
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::zoom_in))

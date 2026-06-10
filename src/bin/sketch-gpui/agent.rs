@@ -2707,13 +2707,15 @@ pub(crate) struct AgentRing {
     pub(crate) active: usize,
     /// Monotonic counter for `AgentSlot::index` — never reused.
     pub(crate) next_index: usize,
-    /// App to restore when leaving Claude entirely (Ctrl-V / back_to_doc).
-    /// Belongs to the ring, not any individual session.
-    pub(crate) underlying: Option<Box<App>>,
+    /// Buffer to restore when leaving Claude entirely (Ctrl-V / back_to_doc).
+    /// Belongs to the ring, not any individual session. Typed `BufferApp`,
+    /// never `App` (D3/C4): an Agent can only ever be backed by a Buffer,
+    /// never by another Agent — agent-over-agent is unrepresentable.
+    pub(crate) underlying: Option<Box<BufferApp>>,
 }
 
 impl AgentRing {
-    pub(crate) fn new(underlying: Option<Box<App>>) -> Self {
+    pub(crate) fn new(underlying: Option<Box<BufferApp>>) -> Self {
         Self {
             slots: Vec::new(),
             active: 0,

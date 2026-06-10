@@ -125,11 +125,11 @@ impl SketchGpuiView {
             App::Buffer(BufferApp::Picking(b)) => b.underlying.take(),
             _ => return,
         };
-        // If the browser was opened over an existing tile (Cmd-O from a
-        // Doc/Edit/Claude window), restore that prior content in place —
+        // B4: if the picker was opened over an existing Buffer view (Cmd-O /
+        // inplace-buffer-pick), restore that stashed BufferApp mode in place —
         // user pressed Esc/q to cancel the file pick.
         if let Some(boxed) = underlying {
-            self.set_screen(*boxed);
+            self.set_screen(App::Buffer(*boxed));
             self.save_workspace_state();
             cx.notify();
             return;

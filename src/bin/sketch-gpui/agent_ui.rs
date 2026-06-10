@@ -44,7 +44,7 @@ impl SketchGpuiView {
             })))
             .expect("workspace has no focused window");
 
-        let mut ring = AgentRing::new(Some(Box::new(prior)));
+        let mut ring = AgentRing::new(prior.into_buffer_stash());
         let proc_cwd = process_cwd();
 
         if self.session_server.is_some() {
@@ -563,7 +563,7 @@ impl SketchGpuiView {
             })))
             .expect("workspace has no focused window");
 
-        let mut ring = AgentRing::new(Some(Box::new(prior)));
+        let mut ring = AgentRing::new(prior.into_buffer_stash());
         let slot_cwd = cwd.unwrap_or_else(process_cwd);
         let label = "claude-1".to_string();
 
@@ -1386,7 +1386,7 @@ impl SketchGpuiView {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
                 // Compute the replacement (if the ring empties) *before*
                 // reassigning, so the `ring` borrow ends first.
-                let restore: Option<Option<App>> =
+                let restore: Option<Option<BufferApp>> =
                     if let App::Agent(ring) = content {
                         if let Some(pos) = ring.position_by_server_session_id(sid) {
                             ring.close_at(pos);
@@ -1403,11 +1403,14 @@ impl SketchGpuiView {
                         None
                     };
                 if let Some(under) = restore {
-                    *content = under.unwrap_or_else(|| {
-                        App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
+                    // B6: a closed session must leave a usable Buffer behind —
+                    // restore the stashed BufferApp, or fall back to a fresh
+                    // Picking. Never close the tile.
+                    *content = App::Buffer(under.unwrap_or_else(|| {
+                        BufferApp::Picking(BrowserWindow::standalone(
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                        )))
-                    });
+                        ))
+                    }));
                 }
             });
         }
