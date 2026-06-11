@@ -1,4 +1,4 @@
-use sketch::file_browser::FileBrowser;
+use yalda::file_browser::FileBrowser;
 use std::fs;
 use tempfile::TempDir;
 

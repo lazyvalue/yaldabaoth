@@ -7,3 +7,6 @@
 
 # insta snapshot pending-review artifacts
 *.snap.new
+
+# brainstorm scratch (superpowers tool)
+.superpowers/

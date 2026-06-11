@@ -9,7 +9,7 @@
 The project grew to multiple concurrent workstreams (ACP, rail, perf,
 workspaces) run partly by parallel subagents. Doing this in the main checkout
 meant a muddy working dir and collision risk. Sibling worktrees had already
-sprung up cluttering `~/ws/` (`sketch-agent-beauty`, `sketch-bugfix`), and the
+sprung up cluttering `~/ws/` (`yalda-agent-beauty`, `yalda-bugfix`), and the
 harness already used `.claude/worktrees/` for its own agent isolation.
 
 ## Decision

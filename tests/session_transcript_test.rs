@@ -3,7 +3,7 @@
 //! Sibling to `session_resilience_test.rs`. That file points the server at a
 //! NO-OP agent (`/usr/bin/true`), so it only covers the bare socket/ownership
 //! layer — the session's durable `event_log` stays empty. This file points the
-//! server at `sketch-acp-stub` (a real-protocol stub ACP agent, built as a
+//! server at `yalda-acp-stub` (a real-protocol stub ACP agent, built as a
 //! `[[bin]]`), which streams a controllable transcript. That lets us exercise
 //! the parts that need a real transcript:
 //!
@@ -17,7 +17,7 @@
 //!      isn't corrupted.
 //!
 //! Everything is driven through the real `SessionServerClient` and the real
-//! `sketch-session-server` binary, so these are end-to-end against the same
+//! `yalda-session-server` binary, so these are end-to-end against the same
 //! code the GUI uses.
 
 use std::path::PathBuf;
@@ -25,8 +25,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use sketch::session_client::SessionServerClient;
-use sketch::session_proto::{AttachMode, Notification, socket_path};
+use yalda::session_client::SessionServerClient;
+use yalda::session_proto::{AttachMode, Notification, socket_path};
 
 /// A running server bound to a private socket, pointed at the stub ACP agent.
 /// Per-test env knobs (`STUB_CHUNKS`, `STUB_DELAY_MS`, …) shape the transcript
@@ -40,15 +40,15 @@ struct TestServer {
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
 impl TestServer {
-    /// Start a server whose spawned agents are `sketch-acp-stub`, with the
+    /// Start a server whose spawned agents are `yalda-acp-stub`, with the
     /// given `(VAR, value)` env knobs applied to the server process (and thus
     /// inherited by every agent it spawns).
     fn start_with_env(knobs: &[(&str, &str)]) -> TestServer {
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
         let dir = std::env::temp_dir();
-        let socket = dir.join(format!("sketch-txtest-{pid}-{n}.sock"));
-        let log = dir.join(format!("sketch-txtest-{pid}-{n}.log"));
+        let socket = dir.join(format!("yalda-txtest-{pid}-{n}.sock"));
+        let log = dir.join(format!("yalda-txtest-{pid}-{n}.log"));
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(&log);
         // Clear any durable state colocated with this socket so a prior run
@@ -59,15 +59,15 @@ impl TestServer {
     }
 
     /// Spawn a server process bound to `socket`, stderr → `log`, agents =
-    /// `sketch-acp-stub`, with the given env knobs. Does NOT clear durable
+    /// `yalda-acp-stub`, with the given env knobs. Does NOT clear durable
     /// state — callers that want a fresh start clear it first.
     fn spawn_on(socket: PathBuf, log: PathBuf, knobs: &[(&str, &str)]) -> TestServer {
         let logfile = std::fs::File::create(&log).expect("create server log");
-        let server_bin = env!("CARGO_BIN_EXE_sketch-session-server");
-        let stub_bin = env!("CARGO_BIN_EXE_sketch-acp-stub");
+        let server_bin = env!("CARGO_BIN_EXE_yalda-session-server");
+        let stub_bin = env!("CARGO_BIN_EXE_yalda-acp-stub");
         let mut cmd = Command::new(server_bin);
-        cmd.env("SKETCH_SESSION_SOCKET", &socket)
-            .env("SKETCH_ACP_AGENT", stub_bin);
+        cmd.env("YALDA_SESSION_SOCKET", &socket)
+            .env("YALDA_ACP_AGENT", stub_bin);
         for (k, v) in knobs {
             cmd.env(k, v);
         }
@@ -76,7 +76,7 @@ impl TestServer {
             .stdout(Stdio::null())
             .stderr(Stdio::from(logfile))
             .spawn()
-            .expect("spawn sketch-session-server");
+            .expect("spawn yalda-session-server");
 
         let server = TestServer { child, socket, log };
         server.wait_for_socket();
@@ -118,7 +118,7 @@ impl TestServer {
 
     fn activate_env(&self) {
         // SAFETY: tests in this file run serially (SERIAL mutex below).
-        unsafe { std::env::set_var("SKETCH_SESSION_SOCKET", &self.socket) };
+        unsafe { std::env::set_var("YALDA_SESSION_SOCKET", &self.socket) };
         assert_eq!(socket_path(), self.socket);
     }
 
@@ -140,7 +140,7 @@ impl Drop for TestServer {
     }
 }
 
-/// Tests share process-wide env (`SKETCH_SESSION_SOCKET`), so serialize them.
+/// Tests share process-wide env (`YALDA_SESSION_SOCKET`), so serialize them.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -165,7 +165,7 @@ fn count_agent_chunks(notes: &[Notification]) -> usize {
             matches!(
                 n,
                 Notification::ReplyEvent {
-                    event: sketch::acp_channel::ReplyEvent::Chunk(_),
+                    event: yalda::acp_channel::ReplyEvent::Chunk(_),
                     ..
                 }
             )
@@ -442,7 +442,7 @@ fn mid_turn_reconnect_no_corruption() {
         .iter()
         .filter_map(|n| match n {
             Notification::ReplyEvent {
-                event: sketch::acp_channel::ReplyEvent::Chunk(t),
+                event: yalda::acp_channel::ReplyEvent::Chunk(t),
                 ..
             } => Some(t.clone()),
             _ => None,
@@ -579,7 +579,7 @@ fn prompt_from_expired_same_client_regrants_lease_and_delivers() {
     // (5s cadence) may or may not have cleared it to None — the gate must
     // handle both (expired-same-id renew AND free-claim).
     let server =
-        TestServer::start_with_env(&[("STUB_CHUNKS", "3"), ("SKETCH_LEASE_TTL_MS", "300")]);
+        TestServer::start_with_env(&[("STUB_CHUNKS", "3"), ("YALDA_LEASE_TTL_MS", "300")]);
     server.activate_env();
 
     let client = connect_as("gui-napped");
@@ -1027,7 +1027,7 @@ fn recovered_session_is_drivable_after_resume() {
             matches!(
                 note,
                 Notification::ReplyEvent {
-                    event: sketch::acp_channel::ReplyEvent::ReplayComplete,
+                    event: yalda::acp_channel::ReplyEvent::ReplayComplete,
                     ..
                 }
             )
@@ -1048,7 +1048,7 @@ fn recovered_session_is_drivable_after_resume() {
         !replay.iter().any(|n| matches!(
             n,
             Notification::ReplyEvent {
-                event: sketch::acp_channel::ReplyEvent::UserMessage(_),
+                event: yalda::acp_channel::ReplyEvent::UserMessage(_),
                 ..
             }
         )),
@@ -1094,7 +1094,7 @@ fn recovered_session_is_drivable_after_resume() {
 /// 6. SLOW-SUBSCRIBER DISCONNECT (phase-7 liveness hardening). A subscriber
 ///    whose socket stops draining must NOT be able to park its forwarder task +
 ///    fd forever. The forwarder bounds every socket write by
-///    `SKETCH_SLOW_SUB_TIMEOUT_MS`; when a non-draining peer's OS send buffer
+///    `YALDA_SLOW_SUB_TIMEOUT_MS`; when a non-draining peer's OS send buffer
 ///    fills, the write stalls past the timeout and the server drops that
 ///    subscriber — while the healthy OWNER is completely unaffected.
 ///
@@ -1117,7 +1117,7 @@ fn slow_subscriber_is_disconnected_owner_unaffected() {
     let server = TestServer::start_with_env(&[
         ("STUB_CHUNKS", "2000"),
         ("STUB_CHUNK_TEXT", &long_text),
-        ("SKETCH_SLOW_SUB_TIMEOUT_MS", "500"),
+        ("YALDA_SLOW_SUB_TIMEOUT_MS", "500"),
     ]);
     server.activate_env();
 
@@ -1262,10 +1262,10 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
         // never lags past HIGH_WATER (only the never-draining wedged observer
         // does). Fast enough that the whole turn still finishes promptly.
         ("STUB_DELAY_MS", "3"),
-        ("SKETCH_EVENT_LOG_CAP", &CAP.to_string()),
-        ("SKETCH_EVENT_LOG_HIGH_WATER", &HIGH_WATER.to_string()),
+        ("YALDA_EVENT_LOG_CAP", &CAP.to_string()),
+        ("YALDA_EVENT_LOG_HIGH_WATER", &HIGH_WATER.to_string()),
         // HUGE write timeout: the high-water disconnect must be the ONLY reaper.
-        ("SKETCH_SLOW_SUB_TIMEOUT_MS", "60000"),
+        ("YALDA_SLOW_SUB_TIMEOUT_MS", "60000"),
     ]);
     server.activate_env();
 
@@ -1561,7 +1561,7 @@ fn is_compacted_summary(n: &Notification) -> bool {
         Notification::Agent { event }
             if matches!(
                 event.kind,
-                sketch::agent_event::AgentEventKind::CompactedSummary { .. }
+                yalda::agent_event::AgentEventKind::CompactedSummary { .. }
             )
     )
 }
@@ -1601,7 +1601,7 @@ fn ringbuffer_compaction_trims_and_surfaces_marker() {
     let server = TestServer::start_with_env(&[
         ("STUB_CHUNKS", &CHUNKS.to_string()),
         ("STUB_DELAY_MS", "2"),
-        ("SKETCH_EVENT_LOG_CAP", &CAP.to_string()),
+        ("YALDA_EVENT_LOG_CAP", &CAP.to_string()),
     ]);
     server.activate_env();
 
@@ -1728,7 +1728,7 @@ fn cursor_reconnect_tails_after_compaction_when_in_range() {
     let server = TestServer::start_with_env(&[
         ("STUB_CHUNKS", &CHUNKS.to_string()),
         ("STUB_DELAY_MS", "2"),
-        ("SKETCH_EVENT_LOG_CAP", &CAP.to_string()),
+        ("YALDA_EVENT_LOG_CAP", &CAP.to_string()),
     ]);
     server.activate_env();
 
@@ -1827,7 +1827,7 @@ fn cursor_reconnect_tails_after_compaction_when_in_range() {
 fn stub_chunk_index(n: &Notification) -> Option<usize> {
     let text = match n {
         Notification::ReplyEvent {
-            event: sketch::acp_channel::ReplyEvent::Chunk(t),
+            event: yalda::acp_channel::ReplyEvent::Chunk(t),
             ..
         } => t.as_str(),
         _ => return None,
@@ -1841,7 +1841,7 @@ fn stub_chunk_index(n: &Notification) -> Option<usize> {
 ///     trim, so the corruption window — a LIVE forwarder whose `sent` position is
 ///     invalidated by a front-trim that shortens the published `Vec` — never
 ///     opened. Here an owner attaches BEFORE the turn and streams a long turn
-///     whose event count crosses `SKETCH_EVENT_LOG_CAP`, so a trim fires
+///     whose event count crosses `YALDA_EVENT_LOG_CAP`, so a trim fires
 ///     mid-stream while the owner is live.
 ///
 ///     Two guarantees:
@@ -1864,7 +1864,7 @@ fn live_owner_streams_across_trim_no_gap_or_dup() {
     let server = TestServer::start_with_env(&[
         ("STUB_CHUNKS", &CHUNKS.to_string()),
         ("STUB_DELAY_MS", "2"),
-        ("SKETCH_EVENT_LOG_CAP", &CAP.to_string()),
+        ("YALDA_EVENT_LOG_CAP", &CAP.to_string()),
     ]);
     server.activate_env();
 

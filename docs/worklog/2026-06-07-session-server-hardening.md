@@ -41,7 +41,7 @@ all server-side, all verified headlessly.
   Replaces eprintln-grepping for live-state diagnosis. ✅ test:
   `admin_status_reports_live_sessions`.
 
-Build: `cargo build --bin sketch-session-server --bin sketch-acp-stub --lib` clean
+Build: `cargo build --bin yalda-session-server --bin yalda-acp-stub --lib` clean
 (only pre-existing warnings). Tests: `session_resilience_test` (8) +
 `session_transcript_test` (5) + `acp_channel`/`session_proto` lib tests all green,
 `--test-threads=1`.
@@ -83,7 +83,7 @@ Build: `cargo build --bin sketch-session-server --bin sketch-acp-stub --lib` cle
 
 ## Verification status
 
-- Fully headless-verified server-side (real `sketch-session-server` binary on a
+- Fully headless-verified server-side (real `yalda-session-server` binary on a
   private socket; stub agent for the transcript path). No GPUI runtime check
   performed — the permission-UX item above is the one thing that needs human eyes.
 - launchd `install`/GUI reconnect seam from the prior arc remain `NEEDS-RUNTIME`

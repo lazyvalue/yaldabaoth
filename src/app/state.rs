@@ -1,16 +1,16 @@
 use std::path::PathBuf;
 
-use sketch::acp_channel::AcpChannelClient;
-use sketch::buffer::Buffer;
-use sketch::claude_channel::ChannelClient;
-use sketch::command::CommandRegistry;
-use sketch::config::Config;
-use sketch::editor::Editor;
-use sketch::file_browser::FileBrowser;
-use sketch::keybind::{Action, KeybindManager};
-use sketch::menu::{self, MenuNode, MenuState};
-use sketch::theme::Theme;
-use sketch::view::ViewMode;
+use yalda::acp_channel::AcpChannelClient;
+use yalda::buffer::Buffer;
+use yalda::claude_channel::ChannelClient;
+use yalda::command::CommandRegistry;
+use yalda::config::Config;
+use yalda::editor::Editor;
+use yalda::file_browser::FileBrowser;
+use yalda::keybind::{Action, KeybindManager};
+use yalda::menu::{self, MenuNode, MenuState};
+use yalda::theme::Theme;
+use yalda::view::ViewMode;
 
 use super::merge_menu;
 
@@ -89,7 +89,7 @@ pub struct App {
     /// Set after pressing f/F/t/T — the next keypress is consumed as the
     /// target character and the corresponding find motion is executed.
     pub(super) pending_find_char: Option<Action>,
-    /// SKETCH_DEBUG=1 state: dedupe identical frames so the log only grows
+    /// YALDA_DEBUG=1 state: dedupe identical frames so the log only grows
     /// when something changes (or when off-screen, which is always logged).
     pub(super) debug_last_off_screen: bool,
     pub(super) debug_last_signature: u64,
@@ -100,7 +100,7 @@ pub struct App {
     /// Cached raw-mode wrap width (terminal width minus the gutter and
     /// max_line_width cap). Used by visual-row cursor math.
     pub(super) last_wrap_width: usize,
-    /// Live MCP channel connection to a `sketch-channel` server. When attached,
+    /// Live MCP channel connection to a `yalda-channel` server. When attached,
     /// `:claude-send` and `:claude-send-selection` push payloads to the server,
     /// which forwards them to Claude Code as `notifications/claude/channel`.
     /// Replies come back via the `reply` MCP tool and are appended to a

@@ -1,6 +1,6 @@
 use insta::assert_debug_snapshot;
-use sketch::render::render;
-use sketch::theme::Theme;
+use yalda::render::render;
+use yalda::theme::Theme;
 
 #[test]
 fn snapshot_heading_levels() {

@@ -4,19 +4,19 @@ use std::time::Duration;
 use crossterm::event::{self, Event};
 use ratatui::DefaultTerminal;
 
-use sketch::buffer::NavMode;
-use sketch::keys::KeyPress;
-use sketch::view::{self, ViewMode, ViewState};
+use yalda::buffer::NavMode;
+use yalda::keys::KeyPress;
+use yalda::view::{self, ViewMode, ViewState};
 
 use super::{App, AppMode, AppScreen};
 
 impl App {
-    /// When SKETCH_DEBUG=1, append one line of JSON to ~/.sketch/debug.log
+    /// When YALDA_DEBUG=1, append one line of JSON to ~/.yalda/debug.log
     /// for routine frames (1-in-5) plus EVERY frame where the cursor was off
     /// screen, plus EVERY frame where off-screen status flipped. Use to chase
     /// viewport mismatches:
     ///
-    ///   tail -f ~/.sketch/debug.log | jq .
+    ///   tail -f ~/.yalda/debug.log | jq .
     ///
     /// Compare `cursor_screen_y` (where it was painted, or null = off-screen)
     /// against `expected_cursor_visual_row + content_area_y`.
@@ -25,7 +25,7 @@ impl App {
         report: &view::DrawReport,
         term_size: ratatui::prelude::Size,
     ) {
-        if std::env::var("SKETCH_DEBUG").ok().as_deref() != Some("1") {
+        if std::env::var("YALDA_DEBUG").ok().as_deref() != Some("1") {
             return;
         }
         // Splash mode intentionally doesn't paint a cursor — never treat it
@@ -61,7 +61,7 @@ impl App {
         self.debug_last_signature = sig;
         let expected_visual_row = match buf.view_mode {
             ViewMode::Raw => {
-                sketch::buffer::raw_cursor_visual_row(&buf.editor, self.last_wrap_width.max(1))
+                yalda::buffer::raw_cursor_visual_row(&buf.editor, self.last_wrap_width.max(1))
             }
             ViewMode::Rendered => buf.rendered_cursor_row,
         };
@@ -104,7 +104,7 @@ impl App {
             buf.editor.lockable_through_line(),
         );
         // Best-effort write; never panic during render.
-        let log_path = match sketch::paths::sketch_home() {
+        let log_path = match yalda::paths::yalda_home() {
             Some(d) => d.join("debug.log"),
             None => return,
         };
@@ -237,21 +237,21 @@ impl App {
                 } else {
                     Vec::new()
                 };
-            let raw_highlights: Vec<Vec<(String, sketch::style::Style)>> =
+            let raw_highlights: Vec<Vec<(String, yalda::style::Style)>> =
                 if self.buffers[self.active_buffer].view_mode == ViewMode::Raw {
-                    sketch::md_highlight::highlight_markdown_lines(&raw_lines, &self.theme)
+                    yalda::md_highlight::highlight_markdown_lines(&raw_lines, &self.theme)
                 } else {
                     Vec::new()
                 };
 
             terminal.draw(|frame| {
-                let menu_nodes: Vec<(String, String, sketch::menu::MenuNodeKind)> =
+                let menu_nodes: Vec<(String, String, yalda::menu::MenuNodeKind)> =
                     if self.menu_state.is_active() {
                         self.menu_state
                             .current_nodes(&self.menu_tree)
                             .iter()
                             .map(|n| {
-                                let key_display = sketch::keys::format_key_sequence(&n.key);
+                                let key_display = yalda::keys::format_key_sequence(&n.key);
                                 (key_display, n.label.clone(), n.kind())
                             })
                             .collect()

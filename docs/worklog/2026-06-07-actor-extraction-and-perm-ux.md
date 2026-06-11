@@ -47,7 +47,7 @@ headlessly against the resilience + transcript harness (the dev-system oracle).
   two adversarial reviews SOLID.
 - **Slow-subscriber disconnect (phase-7).** Every server→client write
   (per-session forwarder, manager-level session-list forwarder, response writer)
-  bounded by a timeout (default 60s; `SKETCH_SLOW_SUB_TIMEOUT_MS`). A stuck peer
+  bounded by a timeout (default 60s; `YALDA_SLOW_SUB_TIMEOUT_MS`). A stuck peer
   is dropped → reconnects + replays from the watch snapshot; owner never gapped
   (log is source of truth). ✅ test reaps a non-draining observer while the owner
   completes its turn; green full-harness ×2 + isolated ×3.

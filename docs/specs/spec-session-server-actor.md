@@ -171,7 +171,7 @@ removes the shared-mutable substrate underneath them.
 ### Supervision & single-instance (SHIPPED — launchd LaunchAgent; ADR-0013)
 - SHIPPED (`81ae216`): a socket-probe guard — a second server exits if a live one
   answers (covers GUI/manual duplicates).
-- SHIPPED (launchd): `sketch-session-server install` writes a per-user
+- SHIPPED (launchd): `yalda-session-server install` writes a per-user
   **LaunchAgent** (`RunAtLoad` + `KeepAlive{SuccessfulExit=false}`) so the server
   starts at login and is **restarted on crash** — the always-present host for
   headless agents. `install` hands off any running server via SIGTERM, lossless
@@ -214,7 +214,7 @@ removes the shared-mutable substrate underneath them.
   headlessly on a private socket; invariant *accepts == closes* (no zombie
   connections).
 - DRAFT: the `AgentTransport` trait lets most tests run with an in-process fake
-  agent (no subprocess). The `SKETCH_ACP_AGENT` env injection is the current,
+  agent (no subprocess). The `YALDA_ACP_AGENT` env injection is the current,
   cruder seam.
 
 ### Unidirectional GUI data flow (DRAFT — client corollary)

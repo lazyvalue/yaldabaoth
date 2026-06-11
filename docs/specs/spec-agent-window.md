@@ -8,12 +8,12 @@
 
 - **`spec-multi-session.md`** — Defines the multi-session ring, lifecycle, sidebar, and persistence schema. This spec **inherits the session lifecycle and ring intact** (renamed `SessionRing → AgentRing`, `SessionSlot → AgentSlot`, `ClaudeState → AgentState`), but **supersedes the rendering of an individual session** (§9–§12 of that spec): the per-session chrome and chat-body layout are replaced by the Worksheet / Chatbox / sidebar model defined here.
 - **`spec-textbox-compose.md`** — Specified the existing compose-box overlay. This spec **retires it**: the compose box is replaced by the Chatbox input mode, which is one of two co-equal input modalities (the other being the Worksheet) rather than a transient overlay on top of an editable transcript. The `ComposeBox` field on `ClaudeState`, the `ComposeToggle` / `ComposeSend` actions, and the height/separator rendering all go away. The mechanical pieces (standalone `Editor`, append-on-close splice path, scroll suppression) are reused under different names.
-- **`spec-tabs-and-splits.md`** — Defines `WindowContent::Claude(SessionRing)` as one of four window-kinds inside the workspace tab/split tree. This spec renames the variant to `WindowContent::Agent(AgentRing)` and changes its internal rendering; the workspace tree itself is unaffected. Agent-window sidebars live **inside** the agent window's screen rect (not inside the workspace tile structure), so splits and tabs continue to work as before. The cross-view edit-broadcast machinery `spec-tabs-and-splits.md` §10 sketches (DRAFT, unshipped) is **partially inlined** here as the Editor Extensions section — anchors and per-line metadata are needed for the Worksheet gutter and tool-call anchoring regardless of whether the broader cross-view broadcast lands. If both specs ship, they share the same `LineAnchor` infrastructure; if only this one ships, the anchors stay scoped to the agent window.
+- **`spec-tabs-and-splits.md`** — Defines `WindowContent::Claude(SessionRing)` as one of four window-kinds inside the workspace tab/split tree. This spec renames the variant to `WindowContent::Agent(AgentRing)` and changes its internal rendering; the workspace tree itself is unaffected. Agent-window sidebars live **inside** the agent window's screen rect (not inside the workspace tile structure), so splits and tabs continue to work as before. The cross-view edit-broadcast machinery `spec-tabs-and-splits.md` §10 yaldaes (DRAFT, unshipped) is **partially inlined** here as the Editor Extensions section — anchors and per-line metadata are needed for the Worksheet gutter and tool-call anchoring regardless of whether the broader cross-view broadcast lands. If both specs ship, they share the same `LineAnchor` infrastructure; if only this one ships, the anchors stay scoped to the agent window.
 - **`src/acp_channel.rs`** — Provides `AcpChannelClient`, the ACP transport. Today it forwards `Chunk`, `ToolCallStarted`, `ToolCallUpdated` and drops everything else (`Plan`, `CurrentModeUpdate`, `UsageUpdate`, `AgentThoughtChunk`, `AvailableCommandsUpdate`, `SessionInfoUpdate`, `UserMessageChunk`, `ConfigOptionUpdate`). This spec extends `ReplyEvent` with `PlanUpdated`, `ModeChanged`, and (under the `unstable_session_usage` Cargo feature) `UsageUpdated`. The rest stay dropped — they're listed as future parking-lot items in Behaviors §31.
 
 ## Overview
 
-Sketch's agent surface today is a single chat-shaped screen (`ClaudeView`) over an in-memory `Editor` with frozen LLM ranges, a compose-box overlay, and inline tool calls. It works for a single conversation but doesn't scale to the workflow the project is aiming at: sketch as the primary way the user interacts with one or more coding agents (Claude Code today; Codex and other ACP-compatible agents tomorrow), with structured visibility into the agent's plan, sub-agents, model identity, permission mode, and context budget.
+Yalda's agent surface today is a single chat-shaped screen (`ClaudeView`) over an in-memory `Editor` with frozen LLM ranges, a compose-box overlay, and inline tool calls. It works for a single conversation but doesn't scale to the workflow the project is aiming at: yalda as the primary way the user interacts with one or more coding agents (Claude Code today; Codex and other ACP-compatible agents tomorrow), with structured visibility into the agent's plan, sub-agents, model identity, permission mode, and context budget.
 
 This spec defines the **Agent Window**: a unified, agent-agnostic screen that any ACP-attached session renders into. The Agent Window has two co-equal input modes (**Worksheet** and **Chatbox**) the user freely toggles between, two toggleable right-side **sidebars** (Tasklist, Subagents) sourced from ACP signals, and a compact **Status Strip** along the top surfacing the model / permission / token / context-window state.
 
@@ -26,7 +26,7 @@ The spec introduces eight named artifacts:
 5. **TasklistSidebar** — right-side sidebar that mirrors the agent's current `Plan` (from ACP).
 6. **SubagentsSidebar** — right-side sidebar that lists sub-agents extracted from tool calls; selecting one swaps the main transcript view in place.
 7. **StatusStrip** — single-row header above the main transcript area surfacing agent identity, model, permission mode, context-window utilization, cumulative cost, and turn / elapsed.
-8. **SubAgent** — sketch-side classification of a `ToolCall` that represents a sub-agent transcript. Stored on `AgentState`; produced by a heuristic classifier over `ToolCall.kind` and `name`.
+8. **SubAgent** — yalda-side classification of a `ToolCall` that represents a sub-agent transcript. Stored on `AgentState`; produced by a heuristic classifier over `ToolCall.kind` and `name`.
 
 ## Behaviors
 
@@ -149,7 +149,7 @@ The spec introduces eight named artifacts:
 
 ### Subagents sidebar
 
-25. **Detection. [DRAFT]** A `SubAgent` is a sketch-side classification of a `ToolCall`. A centralized function `classify_subagent(tc: &ToolCall) -> Option<SubAgent>` runs whenever a `ToolCallStarted` or `ToolCallUpdated` event lands. v1 heuristic: `tc.kind == ToolKind::Other` AND `tc.name` matches any prefix in the const slice `SUBAGENT_TOOL_NAMES = &["Task", "Subagent", "Spawn"]`. The slice is the single point of swap when ACP adds a structured sub-agent type or vendor tools rename. **Classification is flat, not tree-shaped:** when a sub-agent's own tool-call content emits further `ToolCall` events, each one is fed through `classify_subagent` and produces its own top-level entry in `AgentState.subagents`. The sub-agent list is a chronologically-ordered flat list; "sub-sub-agents" are just additional rows.
+25. **Detection. [DRAFT]** A `SubAgent` is a yalda-side classification of a `ToolCall`. A centralized function `classify_subagent(tc: &ToolCall) -> Option<SubAgent>` runs whenever a `ToolCallStarted` or `ToolCallUpdated` event lands. v1 heuristic: `tc.kind == ToolKind::Other` AND `tc.name` matches any prefix in the const slice `SUBAGENT_TOOL_NAMES = &["Task", "Subagent", "Spawn"]`. The slice is the single point of swap when ACP adds a structured sub-agent type or vendor tools rename. **Classification is flat, not tree-shaped:** when a sub-agent's own tool-call content emits further `ToolCall` events, each one is fed through `classify_subagent` and produces its own top-level entry in `AgentState.subagents`. The sub-agent list is a chronologically-ordered flat list; "sub-sub-agents" are just additional rows.
 
 26. **Storage. [DRAFT]** `AgentState.subagents: Vec<SubAgent>` collects all classified sub-agents, ordered by first-seen. Each `SubAgent` carries:
 
@@ -235,7 +235,7 @@ The spec introduces eight named artifacts:
 
     Defaults for missing fields: `mode: "chatbox"`, `tasklist_open: false`, `subagents_open: false`. Loader treats absence as default. Saver always writes the new shape.
 
-    **Downgrade compatibility.** An older sketch binary loading a newly-written file deserializes the per-slot record with serde's standard "ignore unknown fields" behavior — `id`, `label`, `active` are read; `mode`, `tasklist_open`, `subagents_open` are silently dropped. The downgraded session re-opens at the old defaults (no worksheet mode, no sidebars). No persisted session is lost. This is the intended downgrade contract.
+    **Downgrade compatibility.** An older yalda binary loading a newly-written file deserializes the per-slot record with serde's standard "ignore unknown fields" behavior — `id`, `label`, `active` are read; `mode`, `tasklist_open`, `subagents_open` are silently dropped. The downgraded session re-opens at the old defaults (no worksheet mode, no sidebars). No persisted session is lost. This is the intended downgrade contract.
 
 36. **Not persisted. [DRAFT]**
 
@@ -284,7 +284,7 @@ E4. **Out of scope here. [DRAFT]** Cross-view broadcast (multiple `EditorView`s 
 | `SessionRing` | `AgentRing` |
 | `SessionSlot` | `AgentSlot` |
 | `ClaudeView` (key context) | `AgentView` |
-| File `bin/sketch-gpui/main.rs` Claude-named items | Agent-named items |
+| File `bin/yalda-gpui/main.rs` Claude-named items | Agent-named items |
 
 Persistence file name, ACP channel module, `AcpChannelClient`, and menu command strings (`claude-new`, `claude-close`, …) stay unchanged so saved `keymap.kdl` and `acp_sessions.json` continue to load without migration.
 
@@ -332,7 +332,7 @@ struct AgentState {
 }
 ```
 
-`TurnId` is a simple `enum { Llm(usize), User(usize), Tool(usize), Unsubmitted }` where the `usize` is the turn number. `UsageSnapshot` is sketch-side flattening of whatever `UsageUpdate` carries (tokens used, tokens total, cost USD). `tool_call_anchor_line` (carried over from `ClaudeState`) changes shape: `HashMap<String, LineAnchor>` instead of `HashMap<String, usize>` — see §E1.
+`TurnId` is a simple `enum { Llm(usize), User(usize), Tool(usize), Unsubmitted }` where the `usize` is the turn number. `UsageSnapshot` is yalda-side flattening of whatever `UsageUpdate` carries (tokens used, tokens total, cost USD). `tool_call_anchor_line` (carried over from `ClaudeState`) changes shape: `HashMap<String, LineAnchor>` instead of `HashMap<String, usize>` — see §E1.
 
 ### ReplyEvent extension
 
@@ -351,7 +351,7 @@ pub enum ReplyEvent {
 
 ```json
 {
-  "/Users/scott/ws/sketch": [
+  "/Users/scott/ws/yalda": [
     {
       "id": "ses_abc123",
       "label": "claude-1",
@@ -388,7 +388,7 @@ Top-level shape is unchanged from `spec-multi-session.md` §15. Three new option
 
 ### Sidebar pointer events
 
-Pointer handling for both the Tasklist tile (entry hover-tooltip) and the Subagents tile (entry click → focus) uses the existing GPUI click handler shape: `on_mouse_down(MouseButton::Left, cx.listener(move |view, ev, w, cx| …))`, with a `WeakEntity<SketchGpuiView>` captured for any handler that needs to mutate view state outside the immediate listener scope. Same shape as the existing session-sidebar click handler at `src/bin/sketch-gpui/main.rs:7670`. No new GPUI primitives required.
+Pointer handling for both the Tasklist tile (entry hover-tooltip) and the Subagents tile (entry click → focus) uses the existing GPUI click handler shape: `on_mouse_down(MouseButton::Left, cx.listener(move |view, ev, w, cx| …))`, with a `WeakEntity<YaldaGpuiView>` captured for any handler that needs to mutate view state outside the immediate listener scope. Same shape as the existing session-sidebar click handler at `src/bin/yalda-gpui/main.rs:7670`. No new GPUI primitives required.
 
 ### Persistence functions (extended, not renamed)
 

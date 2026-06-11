@@ -1,8 +1,8 @@
-use sketch::blocks::RenderedBlock;
-use sketch::buffer::NavMode;
-use sketch::claude_channel::ChannelClient;
-use sketch::keybind::Action;
-use sketch::view::ViewMode;
+use yalda::blocks::RenderedBlock;
+use yalda::buffer::NavMode;
+use yalda::claude_channel::ChannelClient;
+use yalda::keybind::Action;
+use yalda::view::ViewMode;
 
 use super::{App, AppMode, AppScreen};
 
@@ -649,7 +649,7 @@ impl App {
             }
             Action::ClaudeTest => {
                 // Inject a synthetic reply to verify the local *claude*-buffer
-                // path independent of Claude / sketch-channel.
+                // path independent of Claude / yalda-channel.
                 self.append_to_claude_buffer(
                     "Hello from :claude-test.\n\nThis is paragraph two.\n\nThis is paragraph three.",
                 );
@@ -685,7 +685,7 @@ impl App {
                     }
                     None => format!(
                         "No ACP agent. Default cmd: {}",
-                        sketch::acp_channel::DEFAULT_AGENT_COMMAND
+                        yalda::acp_channel::DEFAULT_AGENT_COMMAND
                     ),
                 };
             }
@@ -926,7 +926,7 @@ impl App {
             let h = buf.viewport.block_height(block, content_width);
             if row + h > target_row {
                 // Target is in this block — get rendered lines
-                let lines = sketch::view::render_block_to_lines(block, content_width, &self.theme);
+                let lines = yalda::view::render_block_to_lines(block, content_width, &self.theme);
                 let line_idx = target_row - row;
                 if let Some(line) = lines.get(line_idx) {
                     // Walk spans to find which one the cursor col falls in
@@ -1001,7 +1001,7 @@ impl App {
         // rendered cursor off-screen.
         let rendered_y = match buf.view_mode {
             ViewMode::Raw => {
-                sketch::buffer::raw_cursor_visual_row(&buf.editor, self.last_wrap_width.max(1))
+                yalda::buffer::raw_cursor_visual_row(&buf.editor, self.last_wrap_width.max(1))
             }
             ViewMode::Rendered => buf.rendered_cursor_row,
         };
@@ -1078,7 +1078,7 @@ impl App {
         let mut counter = 0;
         let mut row = 0;
         for block in &buf.rendered_cache {
-            let lines = sketch::view::render_block_to_lines(block, content_width, &self.theme);
+            let lines = yalda::view::render_block_to_lines(block, content_width, &self.theme);
             for line in &lines {
                 let lower: Vec<char> = line.text_content().to_lowercase().chars().collect();
                 let mut ci = 0;

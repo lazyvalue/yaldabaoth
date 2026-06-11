@@ -16,6 +16,10 @@ pub(crate) const STATUS_FG: u32 = 0x8be9fd;
 /// "current line" gray reads as a contiguous swath against the editor bg
 /// without overpowering syntax-highlighted spans.
 pub(crate) const SELECTION_BG: NColor = NColor::Rgb(68, 71, 90);
+/// Background tint for the focused line in source-file doc view. Slightly
+/// lighter than the editor bg so the cursor line stands out without clashing
+/// with syntax highlighting. Dracula "current line" = 0x44475a.
+pub(crate) const CURSOR_LINE_BG: u32 = 0x44475a;
 
 /// Multiplicative step per Cmd+= / Cmd+- press. 1.1 is the same ratio
 /// Chromium uses for browser zoom — small enough that hitting the key twice
@@ -482,7 +486,7 @@ pub(crate) struct RenderCtx<'a> {
     /// free render functions (`doc_styled_line_element`, etc.) can call
     /// back into the view for wiki-link navigation. `None` outside the
     /// view-mode render path.
-    pub(crate) weak_view: Option<gpui::WeakEntity<SketchGpuiView>>,
+    pub(crate) weak_view: Option<gpui::WeakEntity<YaldaGpuiView>>,
     /// Directory of the currently focused Doc, used to resolve wiki link
     /// targets (`[[notes]]` → `<doc_dir>/notes.md`). `None` outside the
     /// view-mode render path or when the doc has no parent dir.
@@ -693,6 +697,11 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
     let mut row = div().flex().flex_row().items_start().w_full();
     if !is_source_line {
         row = row.mb_2();
+    }
+    // Source-file lines: add a full-row background tint so the focused line
+    // is unmistakable (the 3px bar alone is too subtle in a wall of code).
+    if is_source_line && highlighted {
+        row = row.bg(rgb(CURSOR_LINE_BG));
     }
     row.child(div().w(px(3.0)).flex_none().h_full().bg(if highlighted {
         rgb(CURSOR_BAR_COLOR)
@@ -1224,10 +1233,10 @@ pub(crate) fn render_with_wiki(
     path: Option<&std::path::Path>,
 ) -> Vec<RenderedBlock> {
     if let Some(lang) = path.and_then(lang_for_path) {
-        let hl = sketch::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
+        let hl = yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
         // Use a transparent base style — source files render against the
         // normal document background, not the code-block tint.
-        let base = sketch::style::Style::default();
+        let base = yalda::style::Style::default();
         let mut lines = hl.highlight(lang, text, base).unwrap_or_else(|| {
             // Fallback: plain text with default style.
             text.lines()

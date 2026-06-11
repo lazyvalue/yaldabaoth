@@ -21,10 +21,10 @@
 
 use std::rc::Rc;
 
-use sketch::highlight::Highlighter;
-use sketch::md_highlight::{FenceState, Segment, advance_fence, highlight_one_line};
-use sketch::style::Style;
-use sketch::theme::Theme;
+use yalda::highlight::Highlighter;
+use yalda::md_highlight::{FenceState, Segment, advance_fence, highlight_one_line};
+use yalda::style::Style;
+use yalda::theme::Theme;
 
 /// Raw + stripped highlight segments for one source line. Shared via `Rc` so
 /// unchanged lines survive a reconcile without re-allocating their segment
@@ -270,7 +270,7 @@ fn hash_line(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sketch::md_highlight::{highlight_markdown_lines, highlight_markdown_lines_stripped};
+    use yalda::md_highlight::{highlight_markdown_lines, highlight_markdown_lines_stripped};
 
     fn lines(text: &str) -> Vec<String> {
         text.lines().map(|l| l.to_string()).collect()
@@ -423,7 +423,7 @@ mod tests {
     }
 
     /// Not a pass/fail test — a measurement harness. Run with:
-    ///   cargo test --release --bin sketch-gpui -- --ignored --nocapture perf_report
+    ///   cargo test --release --bin yalda-gpui -- --ignored --nocapture perf_report
     #[test]
     #[ignore]
     fn perf_report() {
@@ -501,7 +501,7 @@ mod tests {
         theme: &Theme,
         hl: &Highlighter,
     ) {
-        use sketch::md_highlight::highlight_markdown_lines_syn;
+        use yalda::md_highlight::highlight_markdown_lines_syn;
         let raw = highlight_markdown_lines_syn(lines, theme, hl);
         assert_eq!(cache_snap.len(), lines.len(), "line count");
         for i in 0..lines.len() {

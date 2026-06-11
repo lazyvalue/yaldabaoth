@@ -1,10 +1,10 @@
-//! Screen render bodies on SketchGpuiView: render_doc / render_edit
+//! Screen render bodies on YaldaGpuiView: render_doc / render_edit
 //! (Code + WP) / render_agent / render_browser. Extracted verbatim from
 //! main.rs (split-gpui-main, stage 3).
 
 use super::*;
 
-impl SketchGpuiView {
+impl YaldaGpuiView {
     pub(crate) fn render_doc(
         &self,
         root: gpui::Div,
@@ -150,7 +150,7 @@ impl SketchGpuiView {
             .bg(bg_or(top, STATUS_BG))
             .text_color(fg_or(top, STATUS_FG))
             .font_weight(FontWeight::BOLD)
-            .child(format!("sketch-gpui — {}", d.file_label))
+            .child(format!("yalda-gpui — {}", d.file_label))
             .child(self.multi_home_dot(d.file_label.as_ref()));
 
         let footer = div()
@@ -208,7 +208,7 @@ impl SketchGpuiView {
                 "j/k scroll · h/l block · g/G top/bot · Ctrl-O browse · Space menu",
             ));
 
-        root.key_context("SketchView")
+        root.key_context("YaldaView")
             .on_key_down(cx.listener(Self::handle_doc_key))
             .on_action(cx.listener(Self::scroll_down))
             .on_action(cx.listener(Self::scroll_up))
@@ -312,7 +312,7 @@ impl SketchGpuiView {
             .text_color(fg_or(top, STATUS_FG))
             .font_weight(FontWeight::BOLD)
             .child(format!(
-                "sketch-gpui [{}] — {}",
+                "yalda-gpui [{}] — {}",
                 header_view_label, e.file_label
             ))
             .child(self.multi_home_dot(e.file_label.as_ref()));
@@ -824,7 +824,7 @@ impl SketchGpuiView {
 
         // Per-line highlight, raw + stripped. The incremental cache
         // re-highlights only changed lines and hands back a cheap `Rc`
-        // snapshot; the bypass path (SKETCH_HL_CACHE=0) recomputes both
+        // snapshot; the bypass path (YALDA_HL_CACHE=0) recomputes both
         // passes in full every frame, feeding the identical closure shape so
         // the two paths are directly comparable.
         let t_hl0 = perf.then(std::time::Instant::now);
@@ -864,19 +864,19 @@ impl SketchGpuiView {
         let frozen_line_count: usize = frozen_ranges.iter().map(|(s, e)| e - s).sum();
 
         // ── View-model memoization (S1) ──────────────────────────────
-        // `flat_items` + `gutter_tag_per_line` depend ONLY on these
-        // structural inputs — NOT on cursor/selection/theme, which the
-        // render closure reads afterward. On cursor-blink / cross-tile
-        // notify / the ~1Hz thinking tick these inputs are unchanged, so we
-        // reuse the cached `Rc`s and skip the gutter scan, tool-anchor
-        // resolution, flat build and blank-collapse pass.
+        // `flat_items` + `gutter_tag_per_line` depend ONLY on structural
+        // inputs — NOT on cursor/selection/theme/edit_seq. Mid-line chunk
+        // appends bump `edit_seq` but don't change line count, frozen
+        // ranges, or tool structure, so the cache hits and we skip the
+        // expensive gutter scan, tool-anchor resolution, flat build and
+        // blank-collapse pass. This is what makes streaming smooth.
         //
         // Trap check: `ToolCallUpdated` mutates tool-call *content* in
-        // `c.tools.calls` without touching `tool_call_order` or `edit_seq`.
+        // `c.tools.calls` without touching `tool_call_order` or line count.
         // That content is rendered inside the closure from `tool_calls_snap`,
         // never baked into a `FlatItem` (ToolGroup carries only ids), so it
         // is correctly EXCLUDED from this fingerprint.
-        let view_model_fp: u64 = c.view_model_fingerprint(edit_seq, frozen_line_count);
+        let view_model_fp: u64 = c.view_model_fingerprint(line_count, frozen_line_count);
 
         // S1 cache: on a fingerprint hit `cached` returns the memoized `Rc`s
         // and the rebuild below is skipped entirely; on a miss the rebuild runs
@@ -905,7 +905,7 @@ impl SketchGpuiView {
         // Reconcile (count parity → splice/reset) stays count-keyed, but the
         // `(list_state, list_item_count)` mutation is funneled through one
         // mutator so the two can't drift (Finding 8, INV-12).
-        c.reconcile_list(new_count);
+        c.reconcile_list(new_count, edit_seq);
         // INV-12: after reconcile, the registered count equals what we built.
         debug_assert!(
             c.list_item_count == flat_items_arc.len(),
@@ -937,8 +937,8 @@ impl SketchGpuiView {
         // `gutter_tag_snap` and `flat_items_arc` come from the memoized
         // view-model tuple above (cached `Rc`s reused across frames when the
         // structural fingerprint is unchanged).
-        let tool_calls_snap = c.tools.calls.clone();
-        let expanded_snap = c.tools.expanded.clone();
+        let tool_calls_snap = c.tools.calls_snapshot();
+        let expanded_snap = c.tools.expanded_snapshot();
         let frozen_lines_snap: Vec<(usize, usize)> = c.editor.frozen_lines().to_vec();
         let lockable_through_snap = c.editor.lockable_through_line();
         let sel_snap = c.editor.selection_range();
@@ -1116,7 +1116,7 @@ impl SketchGpuiView {
                     FlatItem::ToolGroup { anchor_line, ids } => {
                         let anchor = *anchor_line;
                         // Collect resolved tool calls for this group.
-                        let calls: Vec<&sketch::acp_channel::ToolCall> = ids
+                        let calls: Vec<&yalda::acp_channel::ToolCall> = ids
                             .iter()
                             .filter_map(|id| tool_calls_snap.get(id))
                             .collect();
@@ -1127,7 +1127,7 @@ impl SketchGpuiView {
                         let count = calls.len();
 
                         // Aggregate status for the group header glyph.
-                        use sketch::acp_channel::ToolCallStatus;
+                        use yalda::acp_channel::ToolCallStatus;
                         let has_failed = calls.iter().any(|tc| tc.status == ToolCallStatus::Failed);
                         let has_in_progress = calls
                             .iter()
@@ -1342,7 +1342,7 @@ impl SketchGpuiView {
                         // Live elapsed (since the prompt was sent) and quiet
                         // time (since the last streamed event). A streaming
                         // turn keeps `quiet` near zero; a stall lets it climb,
-                        // which is the tell that the API — not sketch — is
+                        // which is the tell that the API — not yalda — is
                         // wedged. Past STALL_WARN_S we switch to an explicit
                         // warning so the user knows it's abnormal.
                         const STALL_WARN_S: u64 = 30;
@@ -1531,7 +1531,7 @@ impl SketchGpuiView {
         {
             let mode = c.permission_mode;
             let mode_str = mode.short_label();
-            let is_yolo = matches!(mode, sketch::acp_channel::PermissionMode::Yolo);
+            let is_yolo = matches!(mode, yalda::acp_channel::PermissionMode::Yolo);
             let glyph = if is_yolo { "⚡" } else { "🔒" };
             let badge = div()
                 .pr_2()
@@ -1611,7 +1611,7 @@ impl SketchGpuiView {
         // Dedicated status bar showing context-window size, cwd, and active
         // subagents. Position (top/bottom) is a user preference.
         let info_bar = {
-            use sketch::acp_channel::ToolCallStatus;
+            use yalda::acp_channel::ToolCallStatus;
 
             // Context window segment.
             let ctx_text: String = if let Some(usage) = &c.usage {
@@ -1865,10 +1865,15 @@ impl SketchGpuiView {
             // the cursor in view when the user types past the visible area.
             compose_scroll.scroll_to_item(compose_cursor_line);
 
+            // Minimum height: 1 line (18px) + py padding (8+8) = 34px.
+            // Keeps the box visually stable whether empty or populated.
+            let min_compose_h = 1.0 * 18.0 + 16.0;
+
             let mut compose_body = div()
                 .id("compose-scroll")
                 .w_full()
                 .min_w_0()
+                .min_h(px(min_compose_h))
                 .max_h(px(max_visible_h))
                 .overflow_y_scroll()
                 .overflow_x_hidden()
@@ -1960,7 +1965,7 @@ impl SketchGpuiView {
             );
             match &c.current_plan {
                 Some(plan) if !plan.entries.is_empty() => {
-                    use sketch::acp_channel::PlanEntryStatus;
+                    use yalda::acp_channel::PlanEntryStatus;
                     for entry in &plan.entries {
                         let glyph: &'static str = match entry.status {
                             PlanEntryStatus::Completed => "✓",
@@ -2033,7 +2038,7 @@ impl SketchGpuiView {
                         .child(SharedString::new_static("(no subagents)")),
                 );
             } else {
-                use sketch::acp_channel::ToolCallStatus;
+                use yalda::acp_channel::ToolCallStatus;
                 let focused_key = c.focused_subagent.clone();
                 for (i, sa) in subagents.iter().enumerate() {
                     let glyph: &'static str = match sa.status {

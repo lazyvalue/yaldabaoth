@@ -1,4 +1,4 @@
-use sketch::tree::TreeState;
+use yalda::tree::TreeState;
 
 #[test]
 fn test_parse_markdown() {

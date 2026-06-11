@@ -40,7 +40,7 @@ full parse's. Zero divergence, zero crash. Adversarially verified
 newline/CRLF/multibyte, delete-vs-replace, the single-splice gate all sound.
 
 **Result: 10–20× faster/keystroke** (143µs vs 1443µs @200 lines; 361µs vs 7ms
-@1000). `#[ignore]`d speed + parse-cost measurements kept; `SKETCH_PARSE_TIMING=1`
+@1000). `#[ignore]`d speed + parse-cost measurements kept; `YALDA_PARSE_TIMING=1`
 logs per-reparse kind+time.
 
 ## Aside to follow up

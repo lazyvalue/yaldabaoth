@@ -1,7 +1,7 @@
-use sketch::acp_channel::AcpChannelClient;
-use sketch::buffer::Buffer;
-use sketch::claude_channel::ChannelClient;
-use sketch::view::ViewMode;
+use yalda::acp_channel::AcpChannelClient;
+use yalda::buffer::Buffer;
+use yalda::claude_channel::ChannelClient;
+use yalda::view::ViewMode;
 
 use super::state::ComposeTextbox;
 use super::{App, AppMode, char_to_line_col};
@@ -11,8 +11,8 @@ pub(crate) const CLAUDE_BUFFER_NAME: &str = "*claude*";
 impl App {
     pub(crate) fn attach_claude_channel(&mut self, path_str: &str) {
         // Always drop any existing connection so re-running :claude-attach is
-        // a clean recovery from staleness (e.g. after Claude restart, sketch
-        // is talking to a now-dead sketch-channel that the kernel hasn't
+        // a clean recovery from staleness (e.g. after Claude restart, yalda
+        // is talking to a now-dead yalda-channel that the kernel hasn't
         // bubbled up as broken yet).
         let had_existing = self.claude_channel.take().is_some();
 
@@ -191,12 +191,12 @@ impl App {
     /// on success, and `command_error` is used as a status line.
     ///
     /// `command_str` is shell-parsed; empty means "use the default agent
-    /// (`claude-agent-acp`)". The `SKETCH_ACP_AGENT` env var is honoured if
+    /// (`claude-agent-acp`)". The `YALDA_ACP_AGENT` env var is honoured if
     /// no command is given.
     pub(crate) fn attach_acp_channel(&mut self, command_str: &str) {
         let had_existing = self.acp_channel.take().is_some();
         let resolved = if command_str.is_empty() {
-            std::env::var("SKETCH_ACP_AGENT").unwrap_or_default()
+            std::env::var("YALDA_ACP_AGENT").unwrap_or_default()
         } else {
             command_str.to_string()
         };
@@ -306,7 +306,7 @@ impl App {
         let mut current_turns = self.acp_last_seen_turns;
         if let Some(client) = &self.acp_channel {
             while let Some(ev) = client.try_recv() {
-                if let sketch::acp_channel::ReplyEvent::Chunk(text) = ev {
+                if let yalda::acp_channel::ReplyEvent::Chunk(text) = ev {
                     received.push(text);
                 }
             }
@@ -325,7 +325,7 @@ impl App {
             let mut tail: Vec<String> = Vec::new();
             if let Some(client) = &self.acp_channel {
                 while let Some(ev) = client.try_recv() {
-                    if let sketch::acp_channel::ReplyEvent::Chunk(text) = ev {
+                    if let yalda::acp_channel::ReplyEvent::Chunk(text) = ev {
                         tail.push(text);
                     }
                 }
@@ -375,7 +375,7 @@ impl App {
         let wrap_width = self.last_wrap_width.max(1);
         let buf = &mut self.buffers[buf_idx];
         let rendered_y = match buf.view_mode {
-            ViewMode::Raw => sketch::buffer::raw_cursor_visual_row(&buf.editor, wrap_width),
+            ViewMode::Raw => yalda::buffer::raw_cursor_visual_row(&buf.editor, wrap_width),
             // Skip for Rendered mode — it uses rendered_cursor_row which we
             // don't update for programmatic edits.
             ViewMode::Rendered => return,

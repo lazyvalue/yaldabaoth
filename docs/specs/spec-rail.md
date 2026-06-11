@@ -80,7 +80,7 @@ and reason about.
 
 The rail registers its own key context: `RailView`. When focused, it
 attaches `track_focus(&self.focus_handle)` to the rail's root div, which
-means the main content's context-scoped bindings (`SketchView`, `EditView`,
+means the main content's context-scoped bindings (`YaldaView`, `EditView`,
 etc.) do *not* match — identical to how overlays suppress leaf bindings
 today.
 
@@ -207,7 +207,7 @@ thousands of lines.
       "auto_name": "tab-1",
       "layout": { "..." },
       "focused": 1,
-      "rail": { "kind": "file_browser", "side": "left", "width": 200, "cwd": "/Users/scott/ws/sketch" }
+      "rail": { "kind": "file_browser", "side": "left", "width": 200, "cwd": "/Users/scott/ws/yalda" }
     }
   ]
 }

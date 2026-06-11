@@ -1,4 +1,4 @@
-//! Wire protocol for `sketch-session-server` ↔ `sketch-gpui` communication.
+//! Wire protocol for `yalda-session-server` ↔ `yalda-gpui` communication.
 //!
 //! NDJSON (newline-delimited JSON) over a Unix domain socket. Each line is a
 //! self-contained JSON object with a `"type"` discriminator.
@@ -439,24 +439,24 @@ pub enum Notification {
 
 // ── Socket path helpers ────────────────────────────────────────────
 
-/// Default socket path: `/tmp/sketch-session-$USER.sock`.
+/// Default socket path: `/tmp/yalda-session-$USER.sock`.
 pub fn default_socket_path() -> PathBuf {
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-    PathBuf::from(format!("/tmp/sketch-session-{user}.sock"))
+    PathBuf::from(format!("/tmp/yalda-session-{user}.sock"))
 }
 
-/// Resolved socket path, respecting `SKETCH_SESSION_SOCKET` override.
+/// Resolved socket path, respecting `YALDA_SESSION_SOCKET` override.
 pub fn socket_path() -> PathBuf {
-    std::env::var("SKETCH_SESSION_SOCKET")
+    std::env::var("YALDA_SESSION_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_socket_path())
 }
 
 /// PID file path — colocated with the socket. Derived from [`socket_path`] by
-/// swapping the extension, so it honors `SKETCH_SESSION_SOCKET`: a server on a
+/// swapping the extension, so it honors `YALDA_SESSION_SOCKET`: a server on a
 /// custom socket gets its own PID file (and thus its own single-instance
 /// guard) rather than sharing the default one. For the default socket this
-/// resolves to `/tmp/sketch-session-$USER.pid`, unchanged.
+/// resolves to `/tmp/yalda-session-$USER.pid`, unchanged.
 pub fn pid_file_path() -> PathBuf {
     socket_path().with_extension("pid")
 }
@@ -464,24 +464,24 @@ pub fn pid_file_path() -> PathBuf {
 /// Path to the JSON file where the session server persists session metadata
 /// across restarts. When the socket is overridden (tests, alternate
 /// instances) the state file lives next to that socket so instances never
-/// share persistence; otherwise it lives in the durable sketch home
-/// (`~/.sketch`, ADR-0018) alongside other sketch state.
+/// share persistence; otherwise it lives in the durable yalda home
+/// (`~/.yalda`, ADR-0018) alongside other yalda state.
 pub fn session_server_persist_path() -> Option<PathBuf> {
-    if std::env::var_os("SKETCH_SESSION_SOCKET").is_some() {
+    if std::env::var_os("YALDA_SESSION_SOCKET").is_some() {
         return Some(socket_path().with_extension("state.json"));
     }
-    crate::paths::sketch_home().map(|d| d.join("session_server.json"))
+    crate::paths::yalda_home().map(|d| d.join("session_server.json"))
 }
 
 /// Directory holding the durable per-session write-ahead logs (ADR-0009). Like
-/// [`session_server_persist_path`], it follows `SKETCH_SESSION_SOCKET` so test
+/// [`session_server_persist_path`], it follows `YALDA_SESSION_SOCKET` so test
 /// and alternate instances never share durable state; otherwise it lives in the
-/// durable sketch home (`~/.sketch`, ADR-0018). `None` only if no home dir exists.
+/// durable yalda home (`~/.yalda`, ADR-0018). `None` only if no home dir exists.
 pub fn session_wal_dir() -> Option<PathBuf> {
-    if std::env::var_os("SKETCH_SESSION_SOCKET").is_some() {
+    if std::env::var_os("YALDA_SESSION_SOCKET").is_some() {
         return Some(socket_path().with_extension("wal"));
     }
-    crate::paths::sketch_home().map(|d| d.join("wal"))
+    crate::paths::yalda_home().map(|d| d.join("wal"))
 }
 
 #[cfg(test)]

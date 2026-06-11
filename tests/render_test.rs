@@ -1,8 +1,8 @@
 use pretty_assertions::assert_eq;
-use sketch::blocks::RenderedBlock;
-use sketch::render::render;
-use sketch::style::Modifier;
-use sketch::theme::Theme;
+use yalda::blocks::RenderedBlock;
+use yalda::render::render;
+use yalda::style::Modifier;
+use yalda::theme::Theme;
 
 #[test]
 fn test_render_heading() {

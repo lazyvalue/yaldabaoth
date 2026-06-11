@@ -10,11 +10,11 @@ GUI can restart with zero interruption.**
 |---|---|
 | `81ae216` | **Reconnect-storm root cause + fix.** `SessionServerClient` never `shutdown` its socket on drop → reader thread leaked, server never saw disconnect, never released ownership → re-attach rejected ("another GUI already owns") → 489-reconnect storm. Fixed + single-instance guard + socket-scoped pid/state paths + headless harness `tests/session_resilience_test.rs`. |
 | `bf7cb0e` | **Fire-and-forget flush fix.** `prompt()`/`cancel`/… return before the writer flushes; the drop-shutdown raced it → a prompt sent right before the GUI left was lost. Writer now drains+flushes, *then* shuts down. |
-| stub merge | **Headless ACP stub agent** (`src/bin/sketch-acp-stub.rs`) + `tests/session_transcript_test.rs` (prompt round-trip, 800-chunk large-replay reconnect, mid-turn reconnect, turn-completes-with-no-subscriber). The session server is now fully drivable headlessly. |
+| stub merge | **Headless ACP stub agent** (`src/bin/yalda-acp-stub.rs`) + `tests/session_transcript_test.rs` (prompt round-trip, 800-chunk large-replay reconnect, mid-turn reconnect, turn-completes-with-no-subscriber). The session server is now fully drivable headlessly. |
 | `a4acfd0` | **`docs/specs/spec-session-server-actor.md`** — north-star: actor/single-writer model, lease ownership, durable substrate, hardening, 8-phase rollout. Adversarial-reviewed (REVISE findings folded in). |
 | `2bbc2a1` | **ADR-0012** — surveyed actor frameworks (actix/ractor/kameo/xtra/coerce/riker); decision: **hand-roll** the actor (bare `tokio::mpsc` + `oneshot`). Reach for kameo only if it grows. |
 | `ec3a504` | **Durable WAL (ADR-0009)** — `src/session_wal.rs`. Per-session append-only NDJSON; write-immediately + fsync at turn boundaries; recovery by replay (torn-line tolerant); agent re-adoption via `session/load`. Replaces JSON-snapshot-on-clean-shutdown. Verified by `session_recovered_after_server_crash` (SIGKILL → restart → transcript recovers). |
-| `1051bc4` | **launchd supervision (ADR-0013)** — `sketch-session-server install\|uninstall\|status`. LaunchAgent `RunAtLoad` + `KeepAlive{SuccessfulExit=false}`; start-at-login + restart-on-crash. `install` hands off a running server losslessly via the WAL. |
+| `1051bc4` | **launchd supervision (ADR-0013)** — `yalda-session-server install\|uninstall\|status`. LaunchAgent `RunAtLoad` + `KeepAlive{SuccessfulExit=false}`; start-at-login + restart-on-crash. `install` hands off a running server losslessly via the WAL. |
 
 **"Runs with no GUI" is now functionally complete:** survives GUI exit · completes
 turns unattended · prompt-then-leave is durable · survives a server **crash**
@@ -26,9 +26,9 @@ turns unattended · prompt-then-leave is durable · survives a server **crash**
    and modify the user's launchd domain + start a real daemon — NOT executed in
    dev. Verify once:
    ```
-   sketch-session-server install
-   launchctl list com.sketch.session-server      # loaded
-   sketch-session-server status                  # installed/loaded/listening
+   yalda-session-server install
+   launchctl list com.yalda.session-server      # loaded
+   yalda-session-server status                  # installed/loaded/listening
    # kill the server pid → confirm KeepAlive restarts it
    # create a session before the kill → confirm it recovers (WAL)
    ```
@@ -36,14 +36,14 @@ turns unattended · prompt-then-leave is durable · survives a server **crash**
    the server reader sees EOF — reuses the proven off-thread attach, but GPUI
    isn't headless-drivable. Repro: live session → `kill` the server → confirm the
    session re-attaches with no flapping and no "another GUI already owns" in
-   `~/Library/Caches/sketch/session-server.log`.
+   `~/Library/Caches/yalda/session-server.log`.
 
 ## Remaining work (prioritized)
 
 ### 1. Security hardening — safe-default permission mode (real foot-gun TODAY)
 `create_session` defaults `permission_mode = PermissionMode::Yolo` (auto-approve
 tool calls — file writes, shell; `acp_channel.rs:~542`). Any same-uid process can
-connect to `/tmp/sketch-session-$USER.sock` and drive an auto-approving agent.
+connect to `/tmp/yalda-session-$USER.sock` and drive an auto-approving agent.
 - **Do:** default to a SAFE permission mode; escalate to Yolo only on explicit
   user action. Assert socket mode `0600`.
 - **Skip:** the capability token — it's theater for the single-user threat model
@@ -52,7 +52,7 @@ connect to `/tmp/sketch-session-$USER.sock` and drive an auto-approving agent.
 
 ### 2. Actor extraction (phase 3 — ADR-0012)
 Replace `Mutex<HashMap<ServerSessionId, ManagedSession>>` in
-`src/bin/sketch-session-server/main.rs` with a single Manager task + `Command`
+`src/bin/yalda-session-server/main.rs` with a single Manager task + `Command`
 enum inlet (hand-rolled `tokio::mpsc` + `oneshot`). Mechanical, behavior-
 preserving (keep `conn_id` ownership for now). Kills the shared-mutex race class
 and the poison-tolerant-lock hack. **Watch the sync→async bridge:** the per-
@@ -91,10 +91,10 @@ session would need an admin/CLI verb. Product call — unanswered.
 
 - `src/session_wal.rs` — durable WAL (lib, unit-tested).
 - `src/session_client.rs` — GUI-side client; `Drop`/writer teardown, reconnect, `attach_owner_with_retry`.
-- `src/session_proto.rs` — wire types + path helpers (`socket_path`, `pid_file_path`, `session_server_persist_path`, `session_wal_dir` — all follow `SKETCH_SESSION_SOCKET`).
-- `src/bin/sketch-session-server/main.rs` — the daemon (`ManagedSession`, `record`/`log_only`/`wal_append`, recovery, single-instance guard, clap dispatch).
-- `src/bin/sketch-session-server/launchd.rs` — LaunchAgent install/uninstall/status.
-- `src/bin/sketch-acp-stub.rs` — test-support ACP agent (`STUB_CHUNKS`/`STUB_DELAY_MS`/`STUB_CHUNK_TEXT`/`STUB_REPLAY_USER`).
+- `src/session_proto.rs` — wire types + path helpers (`socket_path`, `pid_file_path`, `session_server_persist_path`, `session_wal_dir` — all follow `YALDA_SESSION_SOCKET`).
+- `src/bin/yalda-session-server/main.rs` — the daemon (`ManagedSession`, `record`/`log_only`/`wal_append`, recovery, single-instance guard, clap dispatch).
+- `src/bin/yalda-session-server/launchd.rs` — LaunchAgent install/uninstall/status.
+- `src/bin/yalda-acp-stub.rs` — test-support ACP agent (`STUB_CHUNKS`/`STUB_DELAY_MS`/`STUB_CHUNK_TEXT`/`STUB_REPLAY_USER`).
 - `tests/session_resilience_test.rs` (no-op agent: socket/ownership/reconnect) · `tests/session_transcript_test.rs` (stub agent: transcript/replay/crash recovery).
 - Specs/decisions: `docs/specs/spec-session-server-actor.md`, `docs/specs/spec-event-stream.md`; ADR-0009 (WAL), ADR-0012 (hand-roll actor), ADR-0013 (launchd).
 - Worklogs: `docs/worklog/2026-06-07-{durable-wal,launchd-supervision}.md`.
@@ -104,7 +104,7 @@ session would need an admin/CLI verb. Product call — unanswered.
 ```
 cargo test --test session_resilience_test --test session_transcript_test -- --test-threads=1
 cargo test --lib session_wal
-cargo test --bin sketch-session-server
+cargo test --bin yalda-session-server
 ```
 Pre-existing unrelated breakage: `tests/tree_test.rs` fails to compile on `master`
 (tree-sitter `TreeState::edit` API drift) — not part of this work.

@@ -1,7 +1,28 @@
-# Sketch
+# Yaldabaoth
 
-A markdown editor built with Rust. Ships as two binaries: a GPUI desktop GUI
-(`sketch-gpui`) and a terminal TUI (`sketch`) built on ratatui + crossterm.
+Agentic operating system for Scott's life. Yaldabaoth is the Demiurge, the blind
+craftsman who spins up a whole hierarchy of archons to run the world beneath him
+while remaining serenely unaware there's a higher pleroma he's not party to.
+
+Built in Rust. Ships as two binaries: a GPUI desktop GUI (`yalda-gpui`, the
+primary surface) and a terminal TUI (`yalda`) built on ratatui + crossterm. It
+began life as a markdown editor; that's now just one App among many.
+
+## Tiles and Apps
+
+The workspace is a tree of **Tiles** (tabs + n-ary splits; see
+`docs/specs/spec-tabs-and-splits.md`). Each Tile holds exactly one **App**
+(`docs/specs/spec-tiles-and-apps.md`, ADR-0019) — the Demiurge arranges the Apps;
+the work happens inside them:
+
+- **`App::Buffer`** — a view onto the shared file-buffer pool, always in exactly
+  one `BufferMode`: `Picking` (file/buffer browser), `Viewing` (rendered
+  markdown), or `Editing` (raw source). `Viewing ⇄ Editing` toggle over the same
+  pooled `SharedCore`; `Picking` is reachable via Cmd+O (Buffer-scoped).
+- **`App::Agent`** — an `AgentRing`: the ACP multi-session panel where Claude
+  agents (the archons) do the actual work. Opening an agent over a Buffer
+  (Ctrl-K) stashes that buffer and restores it on close (Ctrl-V); a closed
+  session always falls back to a usable buffer rather than vanishing the Tile.
 
 ## Dev system (read this for how we work)
 
@@ -39,24 +60,24 @@ features, multi-file changes, and anything you'd run agents on do.
 
 **Work on the GUI by default.** Unless the user says "TUI" or names the TUI by
 feature (debug overlay, viewport wrap math, etc.), assume new work targets
-`sketch-gpui`. Both binaries share the document/editor/render crates under
+`yalda-gpui`. Both binaries share the document/editor/render crates under
 `src/`, but the user-facing surface is the GPUI app.
 
-`cargo run --bin sketch-gpui [path]` launches it.
+`cargo run --bin yalda-gpui [path]` launches it.
 
 ### GUI layout
 
-`src/bin/sketch-gpui/` is a module-per-concern split (modules glob-import the
+`src/bin/yalda-gpui/` is a module-per-concern split (modules glob-import the
 root via `use super::*;` and the root re-exports them with `pub(crate) use`,
 so items stay crate-visible regardless of file):
 
-- `main.rs` (~6.5k) — `SketchGpuiView` struct, the `Render` impl, app/tab/
+- `main.rs` (~6.5k) — `YaldaGpuiView` struct, the `Render` impl, app/tab/
   split/doc methods, marks/layout-modes/tags, menus + overlays + pickers,
   key bindings + `main()`. A Tile (`Window<App>`) holds one `App`
   (`spec-tiles-and-apps.md`, ADR-0019): `App::Buffer(BufferApp)` —
   `BufferApp::{Picking(file browser), Viewing(rendered doc), Editing(raw)}`
   — or `App::Agent(AgentRing)`. The render path branches on that, each
-  screen with its own `key_context` (`SketchView`, `EditView`,
+  screen with its own `key_context` (`YaldaView`, `EditView`,
   `BrowserView`, `AgentView`) and its own `on_action` wiring.
 - `screens.rs` — the screen render bodies: `render_doc`, `render_edit`
   (Code + WP), `render_agent`, `render_browser`.
@@ -83,7 +104,7 @@ new render helpers in `render_blocks.rs` — don't let `main.rs` re-accrete.
 
 ### GUI screens
 
-- **Doc view (`SketchView`)** — rendered markdown, block-by-block. Cursor
+- **Doc view (`YaldaView`)** — rendered markdown, block-by-block. Cursor
   is a left orange bar on the focused block; j/k or arrows move block focus.
   Built from `RenderedBlock`s via `block_element` / `block_inner` /
   `styled_line_element`.
@@ -98,7 +119,7 @@ new render helpers in `render_blocks.rs` — don't let `main.rs` re-accrete.
 
 ### GUI key conventions
 
-Per-screen vim-style bindings live with `Some("SketchView")` etc. contexts.
+Per-screen vim-style bindings live with `Some("YaldaView")` etc. contexts.
 Global Cmd shortcuts (Quit, OpenBrowser, OpenClaude, tab/split management,
 zoom) are registered with `None` context and **must** have a matching
 `on_action(Self::handler)` on every screen's root so the dispatch lands.
@@ -106,7 +127,7 @@ zoom) are registered with `None` context and **must** have a matching
 ### Document text zoom
 
 `Cmd-=` / `Cmd-+` zoom in, `Cmd--` zooms out, `Cmd-0` resets. Implementation
-is a `text_scale: f32` on `SketchGpuiView` (clamped `[MIN_TEXT_SCALE, MAX_TEXT_SCALE]`,
+is a `text_scale: f32` on `YaldaGpuiView` (clamped `[MIN_TEXT_SCALE, MAX_TEXT_SCALE]`,
 step `TEXT_SCALE_STEP = 1.1`) that multiplies the body `text_size(px(14.0))`
 and every heading size. Threaded into `RenderCtx::text_scale` for block
 rendering. **Chrome stays fixed** — status bars, tab strip, browser rows,
@@ -146,12 +167,12 @@ EditView itself has Code/WordProcessor sub-modes that the TUI doesn't have.)
 
 ## Debug Overlay (TUI)
 
-Run with `SKETCH_DEBUG=1` to capture per-frame ground-truth state from the
+Run with `YALDA_DEBUG=1` to capture per-frame ground-truth state from the
 renderer to a JSON-lines log:
 
 ```
-SKETCH_DEBUG=1 sketch <file>
-tail -f ~/.sketch/debug.log | jq .   # all platforms (durable home, ADR-0018)
+YALDA_DEBUG=1 yalda <file>
+tail -f ~/.yalda/debug.log | jq .   # all platforms (durable home, ADR-0018)
 ```
 
 Each line records terminal size, computed vs. actual content-area height,

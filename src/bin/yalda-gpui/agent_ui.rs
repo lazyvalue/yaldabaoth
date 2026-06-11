@@ -1,4 +1,4 @@
-//! Agent (Claude) tile UI + session-server wiring on SketchGpuiView:
+//! Agent (Claude) tile UI + session-server wiring on YaldaGpuiView:
 //! open/attach/create/close session flows, lease heartbeat, server pump
 //! + notification reducer (apply_server_batch / apply_reply_events /
 //! apply_agent_event), submit paths, and the Claude key handler.
@@ -7,12 +7,12 @@
 
 use super::*;
 
-impl SketchGpuiView {
+impl YaldaGpuiView {
     /// Open the Claude screen and attempt to attach to an ACP agent. Bound
     /// to `Ctrl-K` in the Doc and Edit views. Stashes the prior screen so
     /// `Ctrl-V` from Claude returns to it.
     ///
-    /// Attach uses `SKETCH_ACP_AGENT` if set, else the
+    /// Attach uses `YALDA_ACP_AGENT` if set, else the
     /// `claude-agent-acp` default (`AcpChannelClient::DEFAULT_AGENT_COMMAND`).
     pub(crate) fn open_agent(&mut self, _: &OpenAgent, _w: &mut Window, cx: &mut Context<Self>) {
         self.open_agent_inner(cx);
@@ -196,13 +196,8 @@ impl SketchGpuiView {
                         //     deferred `spawn_attach_sessions`.
                         let attached: Vec<AttachedSlot> = matching
                             .iter()
-                            .enumerate()
-                            .map(|(i, info)| AttachedSlot {
-                                label: if matching.len() == 1 {
-                                    "claude-1".to_string()
-                                } else {
-                                    format!("claude-{}", i + 1)
-                                },
+                            .map(|info| AttachedSlot {
+                                label: info.label.clone(),
                                 sid: info.session_id.clone(),
                                 acp_id: info.acp_session_id.clone(),
                                 status: if info.connected {
@@ -375,11 +370,11 @@ impl SketchGpuiView {
                         Ok(false) => (None, false),
                         Err(e) => {
                             eprintln!(
-                                "[sketch-gpui] attach failed for {}: {e}",
+                                "[yalda-gpui] attach failed for {}: {e}",
                                 &sid[..sid.len().min(8)]
                             );
                             // The server answers `no such session: <id>` for a
-                            // lookup miss (sketch-session-server actor) — the
+                            // lookup miss (yalda-session-server actor) — the
                             // persisted id outlived the server's WAL. That's
                             // PERMANENT: drop the dead slot rather than churn a
                             // broken one. Anything else (disconnected, write/
@@ -809,7 +804,7 @@ impl SketchGpuiView {
                         ) =>
                     {
                         eprintln!(
-                            "[sketch-gpui] close_session({}) failed (connection): {e}",
+                            "[yalda-gpui] close_session({}) failed (connection): {e}",
                             &sid[..sid.len().min(8)],
                         );
                     }
@@ -859,16 +854,16 @@ impl SketchGpuiView {
     ) -> AgentState {
         let (attach_tx, attach_rx) =
             std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
-        let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
+        let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
         let spawn_cwd = Some(cwd);
         let _ = std::thread::Builder::new()
-            .name("sketch-acp-attach".into())
+            .name("yalda-acp-attach".into())
             .spawn(move || {
                 let _ = attach_tx.send(AcpChannelClient::spawn_with_resume_in(
                     &cmd,
                     spawn_cwd,
                     resume_id,
-                    sketch::acp_channel::SketchFrontend::Gpui,
+                    yalda::acp_channel::YaldaFrontend::Gpui,
                 ));
             });
 
@@ -952,9 +947,10 @@ impl SketchGpuiView {
             keybinds: KeybindManager::default(),
             list_state: gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0)),
             list_item_count: 0,
+            last_reconciled_edit_seq: 0,
             status: Some("attaching to ACP agent…".into()),
             turn_phase: TurnPhase::Idle,
-            replay_turns: sketch::acp_channel::ReplayTurns::default(),
+            replay_turns: yalda::acp_channel::ReplayTurns::default(),
             last_scrolled_edit_seq: u64::MAX,
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
@@ -965,13 +961,13 @@ impl SketchGpuiView {
             input_surface: InputSurface::Chatbox(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
-            permission_mode: sketch::acp_channel::DEFAULT_PERMISSION_MODE,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
             tasklist_open: false,
             subagents_open: false,
             server_managed: false,
-            reconciler: sketch::agent_transcript::UserTurnReconciler::new(),
+            reconciler: yalda::agent_transcript::UserTurnReconciler::new(),
             user_turn_ks: std::collections::HashSet::new(),
             generation: 0,
             finalized: std::collections::HashSet::new(),
@@ -1003,7 +999,7 @@ impl SketchGpuiView {
         let (note_rx, wake_rx) = match self.session_server.as_mut()?.reconnect() {
             Ok(rx) => rx,
             Err(e) => {
-                eprintln!("[sketch-gpui] session-server reconnect failed: {e}");
+                eprintln!("[yalda-gpui] session-server reconnect failed: {e}");
                 return None;
             }
         };
@@ -1038,7 +1034,7 @@ impl SketchGpuiView {
         if !sids.is_empty() {
             self.spawn_attach_sessions(sids, cx);
         }
-        eprintln!("[sketch-gpui] session-server reconnected; re-attaching {n} session(s)");
+        eprintln!("[yalda-gpui] session-server reconnected; re-attaching {n} session(s)");
         Some((note_rx, wake_rx))
     }
 
@@ -1170,7 +1166,7 @@ impl SketchGpuiView {
 
             // Take exclusive ownership of the notification + wake receivers
             // once (Phase 2 of spec-pump-fix-synthesis.md). Channel reads
-            // need no `&mut SketchGpuiView`, so the old pattern of grabbing
+            // need no `&mut YaldaGpuiView`, so the old pattern of grabbing
             // the model lock just to call `try_recv` was pure contention with
             // keystrokes and render. After this, the loop only takes the lock
             // to *apply* a pre-drained batch.
@@ -1246,7 +1242,7 @@ impl SketchGpuiView {
                         match this.update(cx, |this, cx| this.reconnect_session_server(cx)) {
                             Ok(Some((new_note, new_wake))) => {
                                 eprintln!(
-                                    "[sketch-gpui] reconnected to session server \
+                                    "[yalda-gpui] reconnected to session server \
                                      (re-attaching slots)"
                                 );
                                 note_rx = new_note;
@@ -1449,7 +1445,7 @@ impl SketchGpuiView {
         let warn_unrouted = |routed: bool, sid: &str| {
             if !routed {
                 eprintln!(
-                    "[sketch-gpui] pump: no slot for server session {}",
+                    "[yalda-gpui] pump: no slot for server session {}",
                     &sid[..sid.len().min(8)],
                 );
             }
@@ -1575,7 +1571,7 @@ impl SketchGpuiView {
                             let authoritative_before = claude.agent_stream_authoritative;
                             let is_boundary = matches!(
                                 &event.kind,
-                                sketch::agent_event::AgentEventKind::TurnEnded { .. }
+                                yalda::agent_event::AgentEventKind::TurnEnded { .. }
                             );
                             if authoritative_before || is_boundary {
                                 let effect = Self::apply_agent_event(claude, event);
@@ -1641,7 +1637,7 @@ impl SketchGpuiView {
                         // here — their boundaries arrive as replayed `TurnEnded`.
                         slot.state.insert_user_turn(
                             &text,
-                            sketch::agent_transcript::UserTurnOrigin::Echo,
+                            yalda::agent_transcript::UserTurnOrigin::Echo,
                             false,
                         );
                     });
@@ -1826,7 +1822,7 @@ impl SketchGpuiView {
                     }
                     Ok(Err(e)) => {
                         claude.channel = None;
-                        let msg = format!("attach failed: {e} (set SKETCH_ACP_AGENT=...?)");
+                        let msg = format!("attach failed: {e} (set YALDA_ACP_AGENT=...?)");
                         Self::append_system_notice(claude, &msg);
                         claude.status = Some(msg.into());
                         attach_resolved = true;
@@ -1863,7 +1859,7 @@ impl SketchGpuiView {
             }
 
             // 3) Drain up to PUMP_EVENT_BUDGET reply events.
-            let mut events: Vec<sketch::acp_channel::ReplyEvent> = Vec::new();
+            let mut events: Vec<yalda::acp_channel::ReplyEvent> = Vec::new();
             let mut current_turns = claude.replay_turns.last_seen;
             let mut more_pending = false;
             if let Some(client) = &claude.channel {
@@ -1897,7 +1893,7 @@ impl SketchGpuiView {
                 if turn_ended {
                     // Drain any straggler events that queued after the budget
                     // cut so they're applied before we finalize.
-                    let mut tail: Vec<sketch::acp_channel::ReplyEvent> = Vec::new();
+                    let mut tail: Vec<yalda::acp_channel::ReplyEvent> = Vec::new();
                     if let Some(client) = &claude.channel {
                         while let Some(ev) = client.try_recv() {
                             tail.push(ev);
@@ -1950,7 +1946,7 @@ impl SketchGpuiView {
 
     /// Insert a lifecycle notice into the agent buffer as a frozen line.
     /// The `―` prefix distinguishes system notices from agent prose.
-    /// Splice a sketch-local lifecycle notice into the transcript. Tagged
+    /// Splice a yalda-local lifecycle notice into the transcript. Tagged
     /// `TurnId::System` — NOT `Llm(k)` — so it never masquerades as an agent
     /// turn: it carries no turn number, emits no Claude `TurnHeader`, renders
     /// a blank gutter, and is excluded from agent-turn numbering. Because the
@@ -1983,9 +1979,9 @@ impl SketchGpuiView {
     /// `turn_ended` path.
     pub(crate) fn apply_reply_events(
         claude: &mut AgentState,
-        events: Vec<sketch::acp_channel::ReplyEvent>,
+        events: Vec<yalda::acp_channel::ReplyEvent>,
     ) -> bool {
-        use sketch::acp_channel::ReplyEvent;
+        use yalda::acp_channel::ReplyEvent;
         // Any inbound activity refreshes the quiet-clock the thinking
         // indicator reads, so a streaming turn never looks stalled. A no-op
         // when idle (e.g. replay events arriving outside an awaited turn).
@@ -2037,7 +2033,7 @@ impl SketchGpuiView {
                 }
                 ReplyEvent::ToolCallUpdated(upd) => {
                     let id = ToolCallKey::from_id(&upd.tool_call_id);
-                    if let Some(existing) = claude.tools.calls.get_mut(&id) {
+                    if let Some(existing) = claude.tools.call_mut(&id) {
                         existing.update(upd.fields);
                         cap_tool_call_payloads(existing);
                         // No sub-agent mirror to update: `subagents()`
@@ -2048,7 +2044,7 @@ impl SketchGpuiView {
                         // start for (rare, but possible if the worker
                         // dropped an early notification). Synthesize an
                         // entry so the user still sees it.
-                        let mut tc = sketch::acp_channel::ToolCall::new(
+                        let mut tc = yalda::acp_channel::ToolCall::new(
                             upd.tool_call_id.clone(),
                             String::new(),
                         );
@@ -2097,7 +2093,7 @@ impl SketchGpuiView {
                     let advance = !claude.server_managed;
                     claude.insert_user_turn(
                         &text,
-                        sketch::agent_transcript::UserTurnOrigin::Echo,
+                        yalda::agent_transcript::UserTurnOrigin::Echo,
                         advance,
                     );
                 }
@@ -2118,9 +2114,9 @@ impl SketchGpuiView {
                     // whether the explicit signal agrees with what we inferred
                     // (last_seen), so agreement can be confirmed on real
                     // sessions before the inference is deleted. Only reaches
-                    // here when SKETCH_EMIT_TURN_ENDED=1.
+                    // here when YALDA_EMIT_TURN_ENDED=1.
                     eprintln!(
-                        "[sketch-gpui] explicit TurnEnded count={count}; \
+                        "[yalda-gpui] explicit TurnEnded count={count}; \
                          inferred last_seen={} (agree={})",
                         claude.replay_turns.last_seen,
                         count == claude.replay_turns.last_seen,
@@ -2169,9 +2165,9 @@ impl SketchGpuiView {
     /// gate; this method assumes it owns the stream when called.
     pub(crate) fn apply_agent_event(
         claude: &mut AgentState,
-        event: &sketch::agent_event::AgentEvent,
+        event: &yalda::agent_event::AgentEvent,
     ) -> AgentEventEffect {
-        use sketch::agent_event::{AgentEventKind, ChunkRole, TurnOutcome};
+        use yalda::agent_event::{AgentEventKind, ChunkRole, TurnOutcome};
 
         // ── Uniform rebaseline rule (spec §4) ───────────────────────────────
         // A strictly-newer generation means a respawned channel; rebuild from
@@ -2238,12 +2234,12 @@ impl SketchGpuiView {
             }
             AgentEventKind::ToolCallUpdated(upd) => {
                 let id = ToolCallKey::from_id(&upd.tool_call_id);
-                if let Some(existing) = claude.tools.calls.get_mut(&id) {
+                if let Some(existing) = claude.tools.call_mut(&id) {
                     existing.update(upd.fields.clone());
                     cap_tool_call_payloads(existing);
                 } else {
                     let mut tc =
-                        sketch::acp_channel::ToolCall::new(upd.tool_call_id.clone(), String::new());
+                        yalda::acp_channel::ToolCall::new(upd.tool_call_id.clone(), String::new());
                     tc.update(upd.fields.clone());
                     cap_tool_call_payloads(&mut tc);
                     let anchor = anchor_for_new_tool_call(&mut claude.editor);
@@ -2284,7 +2280,7 @@ impl SketchGpuiView {
                 let advance = !claude.server_managed;
                 claude.insert_user_turn(
                     text,
-                    sketch::agent_transcript::UserTurnOrigin::Echo,
+                    yalda::agent_transcript::UserTurnOrigin::Echo,
                     advance,
                 );
                 AgentEventEffect::None
@@ -2375,7 +2371,7 @@ impl SketchGpuiView {
     /// records (e.g. tool calls written before the tool-kind/event-tag collision
     /// fix). The reducer runs on the GPUI foreground thread, so a thread-local
     /// set needs no lock.
-    pub(crate) fn log_unknown_agent_event_once(tag: &str, event: &sketch::agent_event::AgentEvent) {
+    pub(crate) fn log_unknown_agent_event_once(tag: &str, event: &yalda::agent_event::AgentEvent) {
         thread_local! {
             static SEEN: RefCell<std::collections::HashSet<String>> =
                 RefCell::new(std::collections::HashSet::new());
@@ -2383,7 +2379,7 @@ impl SketchGpuiView {
         let first = SEEN.with(|s| s.borrow_mut().insert(tag.to_string()));
         if first {
             eprintln!(
-                "[sketch-gpui] agent-stream: ignoring unknown event kind {tag:?} \
+                "[yalda-gpui] agent-stream: ignoring unknown event kind {tag:?} \
                  (further ones suppressed; sid={} gen={} turn={} seq={})",
                 &event.session_id[..event.session_id.len().min(8)],
                 event.generation,
@@ -2425,7 +2421,7 @@ impl SketchGpuiView {
     /// the view *and* the agent gets a fresh `session/new` so it isn't
     /// holding on to context from the cleared conversation. Use this
     /// when the model has gone off-track and you want a clean slate
-    /// without restarting sketch.
+    /// without restarting yalda.
     pub(crate) fn clear_agent_session(&mut self, cx: &mut Context<Self>) {
         // Forget every persisted slot BEFORE re-opening so the new spawn
         // hits session/new instead of session/load. Done first so even
@@ -2576,22 +2572,22 @@ impl SketchGpuiView {
 
         // Use the active slot's per-session cwd (spec-agent-cwd.md §3)
         // rather than the process cwd, so a slot that lives at /foo
-        // re-attaches at /foo and not at sketch's launch directory.
+        // re-attaches at /foo and not at yalda's launch directory.
         let slot_cwd = match self.agent_ring() {
             Some(r) => Some(r.active().cwd.clone()),
             None => return,
         };
         let (attach_tx, attach_rx) =
             std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
-        let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
+        let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
         let _ = std::thread::Builder::new()
-            .name("sketch-acp-attach".into())
+            .name("yalda-acp-attach".into())
             .spawn(move || {
                 let _ = attach_tx.send(AcpChannelClient::spawn_with_resume_in(
                     &cmd,
                     slot_cwd,
                     None,
-                    sketch::acp_channel::SketchFrontend::Gpui,
+                    yalda::acp_channel::YaldaFrontend::Gpui,
                 ));
             });
 
@@ -2606,11 +2602,11 @@ impl SketchGpuiView {
         cx.notify();
     }
 
-    /// Quit-and-relaunch sketch with the auto-open-claude flag set, so the
+    /// Quit-and-relaunch yalda with the auto-open-claude flag set, so the
     /// new process boots straight into the claude screen and restores every
     /// session that was in the ring at quit time via
     /// `load_persisted_acp_sessions` plus per-slot `spawn_with_resume`.
-    /// Designed for "I broke something in sketch and want to keep iterating
+    /// Designed for "I broke something in yalda and want to keep iterating
     /// with the same Claude context" — the user's chat history (on the agent
     /// side) is preserved through `session/load`.
     ///
@@ -2623,7 +2619,7 @@ impl SketchGpuiView {
             return;
         };
         let mut cmd = std::process::Command::new(exe);
-        cmd.env("SKETCH_OPEN_CLAUDE", "1");
+        cmd.env("YALDA_OPEN_CLAUDE", "1");
         for arg in std::env::args().skip(1) {
             cmd.arg(arg);
         }
@@ -2925,16 +2921,16 @@ impl SketchGpuiView {
         let slot_cwd = self.agent_ring().map(|r| r.active().cwd.clone());
         let (attach_tx, attach_rx) =
             std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
-        let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
+        let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
         let resume_for_worker = resume_id.clone();
         let _ = std::thread::Builder::new()
-            .name("sketch-acp-force-restart".into())
+            .name("yalda-acp-force-restart".into())
             .spawn(move || {
                 let _ = attach_tx.send(AcpChannelClient::spawn_with_resume_in(
                     &cmd,
                     slot_cwd,
                     resume_for_worker,
-                    sketch::acp_channel::SketchFrontend::Gpui,
+                    yalda::acp_channel::YaldaFrontend::Gpui,
                 ));
             });
         if let Some(ring) = self.agent_ring_mut() {
@@ -3105,7 +3101,7 @@ impl SketchGpuiView {
                 // the replay boundary on a live submit.
                 claude.insert_user_turn(
                     &text,
-                    sketch::agent_transcript::UserTurnOrigin::LocalSubmit,
+                    yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
                     false,
                 );
                 claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
@@ -3179,7 +3175,7 @@ impl SketchGpuiView {
                 // records the text so the stream echo is suppressed.
                 claude.insert_user_turn(
                     &text,
-                    sketch::agent_transcript::UserTurnOrigin::LocalSubmit,
+                    yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
                     false,
                 );
                 claude.turn_phase = TurnPhase::begin(std::time::Instant::now());

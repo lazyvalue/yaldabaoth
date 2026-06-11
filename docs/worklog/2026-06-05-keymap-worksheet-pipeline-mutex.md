@@ -58,7 +58,7 @@ branches (each CI-green, fast-forwarded, worktree removed):
 - **clippy/fmt CI tightening — NOT a quick win (correcting the stale "8
   warnings").** Reality: **164 clippy lints** + **531 `cargo fmt` diffs**.
   Enabling `-D warnings` is a large, behavior-risky cleanup; `cargo fmt --all`
-  churns a massive diff that collides with the live `sketch-*` worktrees. Defer;
+  churns a massive diff that collides with the live `yalda-*` worktrees. Defer;
   if pursued, do fmt and clippy as separate, dedicated passes.
 - **D4 durable-log subsystem** needs its own impl spec. **Full D1 event-stream
   refactor** is a phased effort (design solid).

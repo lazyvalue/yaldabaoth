@@ -195,7 +195,7 @@ default 2 × 2): how many tiles fit the viewport per axis, one global
 setting for all tabs. Tile size derives from it (Behavior 3) — a 3×2 grid
 shows six full tiles per screen. Runtime configuration uses a small text
 overlay in the existing `ActiveOverlay` family (the `TagInput`/`Rename`
-pattern — sketch-gpui has no `:` command line), accepting `{cols}x{rows}`,
+pattern — yalda-gpui has no `:` command line), accepting `{cols}x{rows}`,
 clamped to `[1, 12]` per axis, reachable via `Ctrl-W p` and the layout
 menu (which also offers direct mode selection without cycling). The grid
 column count is also the effective width W. Changing it re-renders

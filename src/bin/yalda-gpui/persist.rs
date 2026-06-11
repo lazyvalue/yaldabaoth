@@ -1,4 +1,4 @@
-//! Durable on-disk state: sketch-home paths, client id, preferences,
+//! Durable on-disk state: yalda-home paths, client id, preferences,
 //! workspace snapshot/restore (tabs/splits/rails), persisted ACP session
 //! slots, and session-server launch/attach helpers. Extracted verbatim
 //! from main.rs (split-gpui-main).
@@ -6,26 +6,26 @@
 use super::*;
 
 /// Path to the JSON file that maps cwd → list of ACP session slots. Lives
-/// next to `debug.log` so all sketch-managed transient state stays in one
+/// next to `debug.log` so all yalda-managed transient state stays in one
 /// place.
 pub(crate) fn acp_session_persist_path() -> Option<PathBuf> {
-    sketch::paths::sketch_home().map(|d| d.join("acp_sessions.json"))
+    yalda::paths::yalda_home().map(|d| d.join("acp_sessions.json"))
 }
 
 /// Path to the one-line UUID file holding this GUI install's STABLE client id
 /// (spec phase 4). Sibling to `acp_session_persist_path` under
-/// `~/.sketch/`. Chosen over `config.kdl` (this is an implementation
+/// `~/.yalda/`. Chosen over `config.kdl` (this is an implementation
 /// detail, not user-facing) and `preferences.json` (no JSON restructure; `rm`
 /// to reset).
 pub(crate) fn client_id_path() -> Option<PathBuf> {
-    sketch::paths::sketch_home().map(|d| d.join("client_id"))
+    yalda::paths::yalda_home().map(|d| d.join("client_id"))
 }
 
 /// Load (or first-time generate) this GUI's stable `client_id`. The lease model
 /// keys ownership on this id so a restart/reconnect resumes with zero
 /// contention.
 ///
-/// A per-process `SKETCH_CLIENT_ID` override WINS, so a blue-green *candidate*
+/// A per-process `YALDA_CLIENT_ID` override WINS, so a blue-green *candidate*
 /// (launched with a fresh per-process UUID) is a DISTINCT client from the
 /// original — it lands as Observer while the original's lease is live, then
 /// Promotes under its own id. This is load-bearing: if the candidate read the
@@ -34,7 +34,7 @@ pub(crate) fn client_id_path() -> Option<PathBuf> {
 /// Production (no env) reads/creates the persistent file, so a normal restart
 /// resumes the lease.
 pub(crate) fn load_or_create_client_id() -> String {
-    if let Ok(env_id) = std::env::var("SKETCH_CLIENT_ID") {
+    if let Ok(env_id) = std::env::var("YALDA_CLIENT_ID") {
         let t = env_id.trim();
         if !t.is_empty() {
             return t.to_string();
@@ -60,7 +60,7 @@ pub(crate) fn load_or_create_client_id() -> String {
     }
 }
 
-/// Sketch's process cwd, with a safe fallback. Used both as the default
+/// Yalda's process cwd, with a safe fallback. Used both as the default
 /// per-session cwd for new agent slots (spec-agent-cwd.md §1) and as the
 /// top-level key in `acp_sessions.json` / `workspace.json`.
 pub(crate) fn process_cwd() -> PathBuf {
@@ -112,7 +112,7 @@ pub(crate) fn persist_cwd_key(cwd: &std::path::Path) -> String {
 /// it is a single deterministic attach whose Owner/Observer outcome the caller
 /// records onto the slot's `is_driver`.
 pub(crate) fn attach_for_role(
-    handle: &sketch::session_client::SessionServerHandle,
+    handle: &yalda::session_client::SessionServerHandle,
     sid: &str,
     want_owner: bool,
 ) -> Result<bool, String> {
@@ -126,18 +126,18 @@ pub(crate) fn attach_for_role(
 
 /// Whether this process was launched as a build-loop candidate.
 pub(crate) fn is_candidate_launch() -> bool {
-    std::env::var("SKETCH_CANDIDATE").as_deref() == Ok("1")
+    std::env::var("YALDA_CANDIDATE").as_deref() == Ok("1")
 }
 
 /// Connect to the session server, the default model: a persistent server owns
 /// the agent subprocesses so sessions survive GUI restarts/crashes, and the
 /// GUI auto-launches a detached one if none is running. Set
-/// `SKETCH_SESSION_SERVER=0` to force the legacy in-process direct-spawn path.
+/// `YALDA_SESSION_SERVER=0` to force the legacy in-process direct-spawn path.
 /// Returns `None` when disabled, or when the connection/launch fails (falls
 /// back to direct spawning so the GUI still starts).
 pub(crate) fn connect_session_server() -> Option<SessionServerClient> {
-    if std::env::var("SKETCH_SESSION_SERVER").as_deref() == Ok("0") {
-        eprintln!("[sketch-gpui] session server disabled (SKETCH_SESSION_SERVER=0); direct spawn");
+    if std::env::var("YALDA_SESSION_SERVER").as_deref() == Ok("0") {
+        eprintln!("[yalda-gpui] session server disabled (YALDA_SESSION_SERVER=0); direct spawn");
         return None;
     }
     match SessionServerClient::connect() {
@@ -145,14 +145,14 @@ pub(crate) fn connect_session_server() -> Option<SessionServerClient> {
             // Install the stable lease identity (phase 4) right after connect so
             // every attach / heartbeat / gated action carries it. Survives
             // in-place reconnect (the client re-applies it onto the rebuilt
-            // struct) AND app restart (persisted to ~/.sketch/client_id).
+            // struct) AND app restart (persisted to ~/.yalda/client_id).
             client.set_client_id(load_or_create_client_id());
-            eprintln!("[sketch-gpui] connected to session server");
+            eprintln!("[yalda-gpui] connected to session server");
             Some(client)
         }
         Err(e) => {
             eprintln!(
-                "[sketch-gpui] session server connect failed: {e}; falling back to direct spawn"
+                "[yalda-gpui] session server connect failed: {e}; falling back to direct spawn"
             );
             None
         }
@@ -171,7 +171,7 @@ pub(crate) fn resolve_agent_cwd_arg(arg: &str) -> Result<PathBuf, String> {
         return Err("missing path argument".into());
     }
     // 1) Tilde expansion. `~` or `~/...` → $HOME/.... `~user/...` is not
-    //    supported in v1 — sketch is single-user.
+    //    supported in v1 — yalda is single-user.
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let expanded: PathBuf = if trimmed == "~" {
         match home {
@@ -265,18 +265,18 @@ pub(crate) fn shorten_cwd_for_display(cwd: &std::path::Path) -> String {
 /// Path to the JSON file that maps cwd → workspace snapshot (tabs + layout
 /// tree). Companion to acp_sessions.json; cleared by clearing cache_dir.
 pub(crate) fn workspace_persist_path() -> Option<PathBuf> {
-    sketch::paths::sketch_home().map(|d| d.join("workspace.json"))
+    yalda::paths::yalda_home().map(|d| d.join("workspace.json"))
 }
 
 /// Path to the JSON file holding app-managed runtime preferences (theme
 /// choice, eventually other "View" menu state). Kept separate from the
-/// user-edited `~/.config/sketch/config.kdl` so the menu-driven theme
+/// user-edited `~/.config/yalda/config.kdl` so the menu-driven theme
 /// switcher doesn't have to rewrite a hand-curated config file. On launch
 /// preferences override the config's theme — if the user picked a theme
 /// from the menu, that's what they expect next time, regardless of what
 /// the kdl says.
 pub(crate) fn preferences_path() -> Option<PathBuf> {
-    sketch::paths::sketch_home().map(|d| d.join("preferences.json"))
+    yalda::paths::yalda_home().map(|d| d.join("preferences.json"))
 }
 
 /// Where the agent info bar sits relative to the transcript.
@@ -836,7 +836,7 @@ pub(crate) fn load_persisted_workspace(cwd: &std::path::Path) -> Option<Persiste
 /// saved ring order; reboot rebuilds the ring in this same order.
 /// `mode`, `tasklist_open`, and `subagents_open` are spec §35 additions;
 /// older files (without these keys) deserialize with defaults
-/// (Chatbox, false, false). Older sketch binaries reading newer files
+/// (Chatbox, false, false). Older yalda binaries reading newer files
 /// silently drop the unknown keys (downgrade contract, §35).
 /// `cwd` is a spec-agent-cwd.md §5 addition; `None` (absence in JSON)
 /// resolves to the process cwd at restore time per §1.
@@ -939,7 +939,7 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
 /// Classify an attach error string as the PERMANENT "session is gone" case.
 /// The session-server actor returns `no such session: <id>` for a lookup miss
 /// (every `.ok_or_else(|| format!("no such session: {session_id}"))` site in
-/// `sketch-session-server/main.rs`). That means the persisted id outlived the
+/// `yalda-session-server/main.rs`). That means the persisted id outlived the
 /// server's WAL — the slot can never reattach and must be dropped, not retried.
 /// Matched case-insensitively via `.contains` so wrapping/prefixing (e.g. the
 /// io::Error round-trip) can't hide it. Transient errors ("disconnected",
@@ -1012,7 +1012,7 @@ pub(crate) fn forget_persisted_acp_session_ids(ids: &[String]) {
     }
 }
 
-/// Persist the ring's slots for `cwd` so the next sketch run can resume
+/// Persist the ring's slots for `cwd` so the next yalda run can resume
 /// every session in the ring, not just the active one. Best-effort writes
 /// — failures (no cache dir, permissions, malformed prior file) silently
 /// bail. Per-slot id resolution honors the resume_id stability rule: if a
@@ -1021,7 +1021,7 @@ pub(crate) fn forget_persisted_acp_session_ids(ids: &[String]) {
 /// `session/new`). Slots without an id (pending attach or attach failed
 /// outright) are skipped.
 ///
-/// Concurrent sketch instances on the same `cwd`: last-writer-wins. Each
+/// Concurrent yalda instances on the same `cwd`: last-writer-wins. Each
 /// call does a read-modify-write of the file, replacing only the cwd
 /// entry; other cwds are preserved.
 pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRing) {
@@ -1054,7 +1054,7 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRin
                 obj.insert("active".into(), serde_json::Value::Bool(true));
             }
             // Spec §35: persist input mode and sidebar state per slot.
-            // Older sketch binaries reading this file ignore the unknown
+            // Older yalda binaries reading this file ignore the unknown
             // keys (serde's standard behavior); no migration needed.
             let mode_str = match slot.state.input_surface.mode() {
                 InputModeKind::Worksheet => "worksheet",

@@ -1,4 +1,4 @@
-# Sketch UX Reference
+# Yalda UX Reference
 
 ## Window & layout taxonomy
 

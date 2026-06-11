@@ -1,6 +1,6 @@
-# Sketch dev system
+# Yalda dev system
 
-How we build sketch with agents. This is the operating manual: the artifacts,
+How we build yalda with agents. This is the operating manual: the artifacts,
 the lifecycle that connects them, the definition of done, and how parallel
 agent work converges. Read this before starting substantial work.
 
@@ -46,8 +46,8 @@ spec ──▶ decision ──▶ scaffold ──▶ implement ──▶ verify 
 
 A branch is **done** when:
 
-1. **Builds** — `cargo build --bin sketch-gpui --bin sketch-session-server`, no new errors.
-2. **Tests pass** — `cargo test --bin sketch-gpui` and `cargo test --lib`, green, with new tests for new behavior.
+1. **Builds** — `cargo build --bin yalda-gpui --bin yalda-session-server`, no new errors.
+2. **Tests pass** — `cargo test --bin yalda-gpui` and `cargo test --lib`, green, with new tests for new behavior.
 3. **Evidence pasted** — the agent shows the actual command output, not a claim. Claims get independently re-verified (agents are confidently wrong sometimes).
 4. **Runtime-checked OR explicitly flagged** — either exercised against the running app, or the report states exactly what a human must run (see harness gap).
 5. **Artifacts updated** — spec/decision touched if design changed; worklog + backlog updated at session end.
@@ -89,8 +89,8 @@ parallelism just defers work to review. Closing this compounds everything else.
 
 What exists to build on:
 - Snapshot tests (`tests/snapshots/`, `cargo test --lib`).
-- `SKETCH_DEBUG=1` → per-frame ground-truth JSON log (TUI; see CLAUDE.md).
-- `SKETCH_PERF=1` / `SKETCH_HL_CACHE` → render/pump timing + the `perf_report` bench.
+- `YALDA_DEBUG=1` → per-frame ground-truth JSON log (TUI; see CLAUDE.md).
+- `YALDA_PERF=1` / `YALDA_HL_CACHE` → render/pump timing + the `perf_report` bench.
 
 What to build (backlog item #1):
 - A headless/scripted render mode + golden screenshots for the GPUI surface.

@@ -2,7 +2,7 @@
 
 - **Status:** Draft for review
 - **Date:** 2026-06-05
-- **Scope:** The whole GPUI app (`sketch-gpui`), the session server, and the
+- **Scope:** The whole GPUI app (`yalda-gpui`), the session server, and the
   shared lib crates — viewed through the single lens of **who owns which state**.
 - **Provenance:** Derived from a full state inventory (162 items across 6
   regions, see [Appendix A](spec-state-architecture-appendix.md)), a state-first
@@ -96,7 +96,7 @@ the primary modules that make up the app?"** — they are the owners of state.
 
 ### Tier 1 — Pure core (no GPUI, unit-testable today)
 
-| Module | Owns (key state) | Public API sketch | Extracted from |
+| Module | Owns (key state) | Public API yalda | Extracted from |
 |---|---|---|---|
 | **`editor_core`** | `Document` (rope, `edit_seq`, undo), `EditorCore` (frozen_lines, lockable_through_line, anchors, `line_turn` map, last_llm_line), `EditorView` (cursor/selection/insert-mode) | `insert/delete` (shift frozen+anchors+llm atomically), `freeze_as_user_turn`, `line_for_anchor`, `line_turn`, `undo/redo`, `edit_seq()` | `document.rs`, `editor.rs` |
 | **`replay_turns`** | the turn number `k` (`last_seen`, `replay_turn`) | `current_turn`, `advance_user_boundary`, `finish_replay`, `on_turn_ended` | `acp_channel.rs:210` (already pure) |
@@ -113,7 +113,7 @@ the primary modules that make up the app?"** — they are the owners of state.
 
 | Module | Owns (key state) | Notes |
 |---|---|---|
-| **`view_shell`** (`SketchGpuiView`) | `focus_handle`, `viewport_width_px` (frame scratch); **physically holds** `workspace` but only `workspace`-module methods mutate it | The thin root: clears frame caches, branches on `WindowContent`, routes actions to owning modules' APIs. Holds nothing authoritative except GPUI-required handles. |
+| **`view_shell`** (`YaldaGpuiView`) | `focus_handle`, `viewport_width_px` (frame scratch); **physically holds** `workspace` but only `workspace`-module methods mutate it | The thin root: clears frame caches, branches on `WindowContent`, routes actions to owning modules' APIs. Holds nothing authoritative except GPUI-required handles. |
 | **`window_content`** (Doc/Edit/Browser) | `DocState` (blocks-derived, `cursor_block`/`last_cursor_block`, `doc_selection`, `line_layouts` hit-test scratch), `EditState`, `BrowserWindow`/`FileBrowser` (`filtered_indices`/`search_results` rebuilt together) | Doc & Edit bind a `buffer_pool` `SharedCore`; view-mode toggle is one buffer, no stashed parallel editor. |
 | **`follow_tail`** | `list_state`, `list_item_count`, `last_scrolled_edit_seq`, `follow_output`, **`block_ranges`** (moved here — see fix below) | `reconcile_list(count)` is the sole mutator of `list_state`+`list_item_count`; owning `block_ranges` removes the cross-module hot-path read. |
 | **`agent_session`** (per slot) | `channel`, `attach_pending`, `_pump`, `server_managed`, `turn_phase`, `InputSurface`, `mode`/`keybinds`, `status`, `current_plan`/`agent_mode`/`usage`, `tasklist_open`/`subagents_open` | Composes the Tier-1 agent slices for one slot. `submit()` is the single chokepoint; `reset_for_replay()` **delegates** to each sub-module's `reset()`. |

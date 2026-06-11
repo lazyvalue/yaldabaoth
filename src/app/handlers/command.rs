@@ -1,4 +1,4 @@
-use sketch::keys::{Key, KeyPress};
+use yalda::keys::{Key, KeyPress};
 
 use crate::app::{App, AppMode};
 

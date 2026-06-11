@@ -713,7 +713,7 @@ impl EditorCore {
     pub fn reparse(&mut self) {
         let edit = self.document.take_pending_edit();
         let text = self.document.full_text();
-        if std::env::var("SKETCH_PARSE_TIMING").as_deref() == Ok("1") {
+        if std::env::var("YALDA_PARSE_TIMING").as_deref() == Ok("1") {
             let kind = if edit.is_some() { "incr" } else { "full" };
             let t0 = std::time::Instant::now();
             self.tree_state.parse(text.as_bytes(), edit);
@@ -1664,7 +1664,7 @@ mod tests {
         Llm(usize),
         User(usize),
         Tool(usize),
-        /// Mirror of `main.rs`'s `TurnId::System`: sketch-local lifecycle
+        /// Mirror of `main.rs`'s `TurnId::System`: yalda-local lifecycle
         /// notices that ride `append_llm_chunk` under a dedicated tag and
         /// must never perturb agent-turn numbering (Finding 5, INV-3).
         System,
@@ -1774,7 +1774,7 @@ mod tests {
 
     #[test]
     fn system_notices_do_not_change_next_agent_chunk_turn() {
-        // Finding 5 / INV-3: injecting N sketch-local system notices between
+        // Finding 5 / INV-3: injecting N yalda-local system notices between
         // an agent chunk and the next one must NOT change the `Llm(k)` the
         // next agent chunk lands under, nor splice agent prose into a notice
         // line. The notices ride a dedicated `TurnId::System` tag, so the

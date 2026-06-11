@@ -3,17 +3,17 @@
 //! Goal: reproduce — without the GPUI app — the property the user actually
 //! wants: *agent sessions keep running on the server across GUI restarts, with
 //! no flapping*. The reconnect logic lives in `SessionServerClient` (the GUI's
-//! half) and `sketch-session-server` (the daemon), both drivable from a plain
+//! half) and `yalda-session-server` (the daemon), both drivable from a plain
 //! test process. So a "GUI restart" here is just dropping one client and
 //! standing up another against the same live server.
 //!
-//! These tests spawn the REAL `sketch-session-server` binary (via
-//! `CARGO_BIN_EXE_sketch-session-server`) on a private socket, so they exercise
+//! These tests spawn the REAL `yalda-session-server` binary (via
+//! `CARGO_BIN_EXE_yalda-session-server`) on a private socket, so they exercise
 //! the same connect/attach/reconnect code paths the app uses. No real ACP agent
 //! is required: `create_session` returns immediately and the session stays in
 //! the manager's map even if the agent never spawns (the agent only fills the
 //! event log; it's not in the connect/reconnect loop). We point
-//! `SKETCH_ACP_AGENT` at a no-op so nothing real is launched.
+//! `YALDA_ACP_AGENT` at a no-op so nothing real is launched.
 //!
 //! The "storm" we're hunting: the GUI client flapping its connection in a tight
 //! loop (one field log had 489 reconnects). If that's a socket-layer bug it
@@ -27,9 +27,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use sketch::acp_channel::PermissionMode;
-use sketch::session_client::SessionServerClient;
-use sketch::session_proto::{AdminSnapshot, AttachMode, Notification, socket_path};
+use yalda::acp_channel::PermissionMode;
+use yalda::session_client::SessionServerClient;
+use yalda::session_proto::{AdminSnapshot, AttachMode, Notification, socket_path};
 
 /// A running server instance bound to a private socket, with its stderr
 /// captured to a file we can scan for connect/disconnect lines.
@@ -53,33 +53,33 @@ impl TestServer {
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
         let dir = std::env::temp_dir();
-        let socket = dir.join(format!("sketch-restest-{pid}-{n}.sock"));
-        let log = dir.join(format!("sketch-restest-{pid}-{n}.log"));
+        let socket = dir.join(format!("yalda-restest-{pid}-{n}.sock"));
+        let log = dir.join(format!("yalda-restest-{pid}-{n}.log"));
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(&log);
 
         let logfile = std::fs::File::create(&log).expect("create server log");
-        let bin = env!("CARGO_BIN_EXE_sketch-session-server");
+        let bin = env!("CARGO_BIN_EXE_yalda-session-server");
         let mut builder = Command::new(bin);
-        builder.env("SKETCH_SESSION_SOCKET", &socket);
+        builder.env("YALDA_SESSION_SOCKET", &socket);
         if let Some(ms) = ttl_ms {
-            builder.env("SKETCH_LEASE_TTL_MS", ms.to_string());
+            builder.env("YALDA_LEASE_TTL_MS", ms.to_string());
         }
         let child = builder
             // Point the agent at a binary that exits immediately. Spawn-fail is
             // fine: the session is created and persists regardless; we are
             // testing the socket/attach/reconnect layer, not the agent.
-            .env("SKETCH_ACP_AGENT", "/usr/bin/true")
+            .env("YALDA_ACP_AGENT", "/usr/bin/true")
             // Hermetic: force the no-config path so default-mode assertions
-            // see the built-in default (Yolo), not whatever ~/.config/sketch/
+            // see the built-in default (Yolo), not whatever ~/.config/yalda/
             // config.kdl the dev box happens to have. config_path() returns
             // this nonexistent path → Config::default().
-            .env("SKETCH_CONFIG", "/nonexistent/sketch-test-config.kdl")
+            .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(logfile))
             .spawn()
-            .expect("spawn sketch-session-server");
+            .expect("spawn yalda-session-server");
 
         let server = TestServer { child, socket, log };
         server.wait_for_socket();
@@ -110,7 +110,7 @@ impl TestServer {
     fn activate_env(&self) {
         // SAFETY: tests in this file run serially (cargo runs each test in its
         // own thread but we guard shared env with the SERIAL mutex below).
-        unsafe { std::env::set_var("SKETCH_SESSION_SOCKET", &self.socket) };
+        unsafe { std::env::set_var("YALDA_SESSION_SOCKET", &self.socket) };
         assert_eq!(socket_path(), self.socket);
     }
 
@@ -179,11 +179,11 @@ fn poll_admin<F: Fn(&AdminSnapshot) -> bool>(
 fn admin_entry<'a>(
     snap: &'a AdminSnapshot,
     sid: &str,
-) -> Option<&'a sketch::session_proto::AdminSessionInfo> {
+) -> Option<&'a yalda::session_proto::AdminSessionInfo> {
     snap.sessions.iter().find(|s| s.session_id == sid)
 }
 
-/// Serialize tests: they share process-wide env (`SKETCH_SESSION_SOCKET`).
+/// Serialize tests: they share process-wide env (`YALDA_SESSION_SOCKET`).
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Lock the serial guard, recovering from a prior test's panic-poisoning so
@@ -355,10 +355,10 @@ fn second_server_does_not_steal_socket() {
 
     // Start a SECOND server on the very same socket. It must detect the live
     // one and exit cleanly rather than rebinding.
-    let bin = env!("CARGO_BIN_EXE_sketch-session-server");
+    let bin = env!("CARGO_BIN_EXE_yalda-session-server");
     let mut intruder = Command::new(bin)
-        .env("SKETCH_SESSION_SOCKET", &server.socket)
-        .env("SKETCH_ACP_AGENT", "/usr/bin/true")
+        .env("YALDA_SESSION_SOCKET", &server.socket)
+        .env("YALDA_ACP_AGENT", "/usr/bin/true")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -405,7 +405,7 @@ fn second_server_does_not_steal_socket() {
 }
 
 /// Default-mode contract at the wire level: with no config file present (tests
-/// run without SKETCH_CONFIG), a freshly created session comes back in the
+/// run without YALDA_CONFIG), a freshly created session comes back in the
 /// no-config default mode, which is now `Yolo` (the default was reverted from
 /// the safe modes pending an inline-approval UI; see ADR-0014 addendum). The
 /// owner can then explicitly change the mode and that change must be reflected
@@ -1078,7 +1078,7 @@ fn v1_wal_discarded_on_server_start() {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
     let dir = std::env::temp_dir();
-    let socket = dir.join(format!("sketch-restest-{pid}-{n}-v1.sock"));
+    let socket = dir.join(format!("yalda-restest-{pid}-{n}-v1.sock"));
     let wal_dir = socket.with_extension("wal");
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_dir_all(&wal_dir);
@@ -1099,14 +1099,14 @@ fn v1_wal_discarded_on_server_start() {
 
     // Start the v2 server against this socket (manually, so the seeded WAL dir
     // is in place first).
-    unsafe { std::env::set_var("SKETCH_SESSION_SOCKET", &socket) };
+    unsafe { std::env::set_var("YALDA_SESSION_SOCKET", &socket) };
     let log = socket.with_extension("log");
     let logfile = std::fs::File::create(&log).expect("server log");
-    let bin = env!("CARGO_BIN_EXE_sketch-session-server");
+    let bin = env!("CARGO_BIN_EXE_yalda-session-server");
     let mut child = Command::new(bin)
-        .env("SKETCH_SESSION_SOCKET", &socket)
-        .env("SKETCH_ACP_AGENT", "/usr/bin/true")
-        .env("SKETCH_CONFIG", "/nonexistent/sketch-test-config.kdl")
+        .env("YALDA_SESSION_SOCKET", &socket)
+        .env("YALDA_ACP_AGENT", "/usr/bin/true")
+        .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(logfile))

@@ -8,11 +8,11 @@ LaunchAgent. Branch: `launchd-supervision`. Decision: ADR-0013.
 
 ## What shipped
 
-- **`src/bin/sketch-session-server/launchd.rs`** (new bin module): per-user
+- **`src/bin/yalda-session-server/launchd.rs`** (new bin module): per-user
   LaunchAgent integration.
   - `launch_agent_plist(exe, log)` — pure plist generator (unit-tested). Label
-    `com.sketch.session-server`; `RunAtLoad=true`; `KeepAlive={SuccessfulExit=false}`;
-    Background ProcessType; std{out,err} → `~/Library/Caches/sketch/session-server.log`;
+    `com.yalda.session-server`; `RunAtLoad=true`; `KeepAlive={SuccessfulExit=false}`;
+    Background ProcessType; std{out,err} → `~/Library/Caches/yalda/session-server.log`;
     a sane `PATH` (the agent-command resolution also falls back through a login
     shell). XML-escapes paths.
   - `install()` — write plist → `launchctl unload -w` (clear any prior) →
@@ -39,7 +39,7 @@ single-instance.
 
 ## Verification
 
-- Unit tests (`cargo test --bin sketch-session-server`): plist contains the
+- Unit tests (`cargo test --bin yalda-session-server`): plist contains the
   required keys (Label, ProgramArguments, RunAtLoad, KeepAlive/SuccessfulExit,
   log path) and XML-escapes special chars in paths. 2 passed.
 - Smoke: `--help` lists the subcommands; `status` correctly reports
@@ -49,7 +49,7 @@ single-instance.
 - **NEEDS-RUNTIME (deliberately not run on the dev machine):** `install` /
   `uninstall` shell out to `launchctl` and modify the user's launchd domain +
   start a real daemon, so they were not executed here. The user runs `install`
-  once and verifies: `launchctl list com.sketch.session-server` is loaded, the
+  once and verifies: `launchctl list com.yalda.session-server` is loaded, the
   socket stays up across `kill`-ing the server (KeepAlive restarts it), and a
   session created before the kill recovers (WAL). Plist/dispatch are unit-tested.
 

@@ -12,7 +12,7 @@ There are three independent failure modes that compound into the observed bugs. 
 
 ### 1.1 Lock convoy on `this.update(cx, ...)`
 
-Both pump paths call `this.update(cx, |this, cx| { ... })` which acquires a mutable borrow on the entire `SketchGpuiView`. This is effectively an exclusive lock. Three producers compete for it:
+Both pump paths call `this.update(cx, |this, cx| { ... })` which acquires a mutable borrow on the entire `YaldaGpuiView`. This is effectively an exclusive lock. Three producers compete for it:
 
 | Producer | Frequency during streaming | Lock hold time |
 |----------|---------------------------|----------------|
@@ -132,7 +132,7 @@ this.update(cx, |this, cx| {
 
 **Step 1: Extract channel receiver from view model.**
 
-Currently `session_server` lives on `SketchGpuiView` and the pump accesses it via `this.update()`. Change `start_server_pump` to:
+Currently `session_server` lives on `YaldaGpuiView` and the pump accesses it via `this.update()`. Change `start_server_pump` to:
 
 ```rust
 fn start_server_pump(&self, cx: &mut Context<Self>) -> Task<()> {
@@ -418,7 +418,7 @@ fn render_agent_tile(&self, cx: &mut Context<Self>) -> impl IntoElement {
 **Handling the mutability problem:** GPUI's `render()` takes `&self`, not `&mut self`. Wrap `HighlightCache` in `RefCell<HighlightCache>`:
 
 ```rust
-struct SketchGpuiView {
+struct YaldaGpuiView {
     // ...
     highlight_cache: RefCell<HighlightCache>,
 }
@@ -446,7 +446,7 @@ Ordered by impact and independence. Each phase is independently shippable.
 **Files changed:** `main.rs` (agent tile render methods)
 
 1. Add `HighlightCache` struct (~80 lines).
-2. Add `RefCell<HighlightCache>` field to `SketchGpuiView`.
+2. Add `RefCell<HighlightCache>` field to `YaldaGpuiView`.
 3. Modify the agent tile render method to check `dirty_range`, re-highlight only dirty lines, and use cached spans.
 4. Add `mark_dirty()` calls to all content mutation sites: `apply_server_batch()`, chatbox keystroke handler, `pump_session()` event application, session switch (`mark_all_dirty`).
 

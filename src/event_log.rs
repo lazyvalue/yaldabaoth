@@ -33,19 +33,19 @@ use crate::session_proto::Notification;
 
 /// Default in-memory `event_log` cap (entries). Generous: a session would need a
 /// great many turns of streamed chunks to reach it; the on-disk WAL is unbounded
-/// regardless. Override at runtime with `SKETCH_EVENT_LOG_CAP` (a `usize`; `0`
+/// regardless. Override at runtime with `YALDA_EVENT_LOG_CAP` (a `usize`; `0`
 /// or unset → this default). A tiny override is what the Stage B tests use to
 /// force a trim deterministically.
 pub const DEFAULT_EVENT_LOG_CAP: usize = 50_000;
 
-/// Resolve `SKETCH_EVENT_LOG_CAP` once (env can't change mid-run). A value `< 2`
+/// Resolve `YALDA_EVENT_LOG_CAP` once (env can't change mid-run). A value `< 2`
 /// is clamped to `2` so there is always room for the prepended `CompactedSummary`
 /// marker plus at least one surviving event.
 pub fn event_log_cap() -> usize {
     use std::sync::OnceLock;
     static CAP: OnceLock<usize> = OnceLock::new();
     *CAP.get_or_init(|| {
-        std::env::var("SKETCH_EVENT_LOG_CAP")
+        std::env::var("YALDA_EVENT_LOG_CAP")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
@@ -65,7 +65,7 @@ pub fn event_log_cap() -> usize {
 pub const DEFAULT_HIGH_WATER_MULTIPLIER: usize = 4;
 
 /// Resolve the high-water backlog bound once (spec §6). Override with
-/// `SKETCH_EVENT_LOG_HIGH_WATER` (a `usize`; `0` or unset → [`event_log_cap`] ×
+/// `YALDA_EVENT_LOG_HIGH_WATER` (a `usize`; `0` or unset → [`event_log_cap`] ×
 /// [`DEFAULT_HIGH_WATER_MULTIPLIER`]). A tiny override is what the high-water
 /// disconnect test uses to force a wedged-forwarder eviction deterministically.
 ///
@@ -78,7 +78,7 @@ pub fn event_log_high_water() -> usize {
     static HW: OnceLock<usize> = OnceLock::new();
     *HW.get_or_init(|| {
         let cap = event_log_cap();
-        std::env::var("SKETCH_EVENT_LOG_HIGH_WATER")
+        std::env::var("YALDA_EVENT_LOG_HIGH_WATER")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)

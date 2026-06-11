@@ -5,7 +5,7 @@ description: Whole-surface, symptom-agnostic audit of the GPUI app for UI-respon
 
 # Responsiveness audit (the "tachyon reviewer")
 
-Audit sketch for violations of UI-responsiveness invariants. You are a
+Audit yalda for violations of UI-responsiveness invariants. You are a
 responsiveness savant: zero-blocking, zero-jank interfaces are the standard.
 **Report only** — the user picks what to implement afterward.
 
@@ -70,6 +70,6 @@ say so.
 
 - Report-only; never edit code in this skill.
 - Every finding cites code; raise only where the real magnitude matters.
-- The **verification harness** (`src/bin/sketch-gpui/verify_harness.rs`) is the
+- The **verification harness** (`src/bin/yalda-gpui/verify_harness.rs`) is the
   framing-proof empirical backstop — prefer turning a confirmed finding into a
   harness latency/recompute-count gate when it's implemented.

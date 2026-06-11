@@ -10,7 +10,7 @@ use super::*;
 /// pins the fix: re-render reflects the live core and stamps `rendered_seq`.
 #[test]
 fn re_render_one_doc_sources_live_core_not_disk() {
-    let dir = std::env::temp_dir().join(format!("sketch_rerender_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("yalda_rerender_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("doc.md");
     // Disk holds a single paragraph → exactly one rendered block.
@@ -74,7 +74,7 @@ fn re_render_one_doc_sources_live_core_not_disk() {
 #[test]
 fn persist_cwd_key_canonicalizes_symlinks() {
     use std::os::unix::fs::symlink;
-    let base = std::env::temp_dir().join(format!("sketch-cwdkey-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("yalda-cwdkey-{}", std::process::id()));
     let real = base.join("real");
     let link = base.join("link");
     let _ = std::fs::remove_dir_all(&base);
@@ -533,7 +533,7 @@ fn view_model_memoization_fast_skip() {
 /// round-trip the maps rely on.
 #[test]
 fn tool_call_key_round_trips_through_the_maps() {
-    use sketch::acp_channel::ToolCallId;
+    use yalda::acp_channel::ToolCallId;
 
     let id: ToolCallId = "tool-abc".into();
     let key_started = ToolCallKey::from_id(&id);
@@ -617,21 +617,21 @@ fn reconcile_list_keeps_count_in_sync_and_reports_growth() {
     assert_eq!(st.list_item_count, 0);
 
     // Growth: count rises, reports grew=true, splices.
-    assert!(st.reconcile_list(5), "0 -> 5 must report growth");
+    assert!(st.reconcile_list_test(5), "0 -> 5 must report growth");
     assert_eq!(st.list_item_count, 5, "count tracks the requested length");
 
     // No change: same count, reports grew=false, count unchanged.
-    assert!(!st.reconcile_list(5), "5 -> 5 is not growth");
+    assert!(!st.reconcile_list_test(5), "5 -> 5 is not growth");
     assert_eq!(st.list_item_count, 5);
 
     // Shrink: count falls, reports grew=false, resets.
-    assert!(!st.reconcile_list(2), "5 -> 2 is not growth");
+    assert!(!st.reconcile_list_test(2), "5 -> 2 is not growth");
     assert_eq!(st.list_item_count, 2, "count tracks a shrink too");
 
     // With block ranges active, even growth resets (height cache can't be
     // spliced) — but parity must still hold.
     st.block_ranges.push((0, 3));
-    assert!(st.reconcile_list(9));
+    assert!(st.reconcile_list_test(9));
     assert_eq!(st.list_item_count, 9);
 }
 
@@ -711,7 +711,7 @@ fn unparsed_detected_range_falls_back_to_one_line_per_source_line() {
 /// `clear` empties every map together.
 #[test]
 fn tool_calls_register_keeps_maps_in_sync() {
-    use sketch::acp_channel::{ToolCall, ToolCallId};
+    use yalda::acp_channel::{ToolCall, ToolCallId};
     let mut st = AgentState::new_for_test();
     let id1: ToolCallId = "t1".into();
     let k1 = ToolCallKey::from_id(&id1);
@@ -1165,8 +1165,8 @@ fn gpui_menu_has_required_entries() {
     fn collect_leaves<'a>(nodes: &'a [MenuNode], out: &mut Vec<&'a str>) {
         for n in nodes {
             match &n.action {
-                sketch::menu::MenuAction::Command(s) => out.push(s.as_str()),
-                sketch::menu::MenuAction::Submenu(children) => {
+                yalda::menu::MenuAction::Command(s) => out.push(s.as_str()),
+                yalda::menu::MenuAction::Submenu(children) => {
                     collect_leaves(children, out);
                 }
                 _ => {}
@@ -1199,6 +1199,9 @@ fn gpui_menu_has_required_entries() {
         "desktop-grid",
         "tag-add",
         "list-marks",
+        "dev-build-candidate",
+        "dev-take-over",
+        "dev-restart-gui",
         "back-to-doc",
         "quit",
     ];
@@ -1227,9 +1230,6 @@ fn gpui_menu_has_required_entries() {
         "claude-rename",
         "agent-input-toggle",
         "claude-mode-cycle",
-        "dev-build-candidate",
-        "dev-take-over",
-        "dev-restart-gui",
         "theme-dracula",
         "theme-folio",
     ] {
@@ -1259,7 +1259,7 @@ fn local_menus_have_no_duplicate_keys_per_level() {
         let mut seen: Vec<&[KeyPress]> = Vec::new();
         for n in nodes {
             match &n.action {
-                sketch::menu::MenuAction::Command(_) | sketch::menu::MenuAction::Submenu(_) => {
+                yalda::menu::MenuAction::Command(_) | yalda::menu::MenuAction::Submenu(_) => {
                     assert!(
                         !seen.contains(&n.key.as_slice()),
                         "duplicate key {:?} at {path}",
@@ -1269,7 +1269,7 @@ fn local_menus_have_no_duplicate_keys_per_level() {
                 }
                 _ => {}
             }
-            if let sketch::menu::MenuAction::Submenu(children) = &n.action {
+            if let yalda::menu::MenuAction::Submenu(children) = &n.action {
                 check_level(children, &format!("{path}/{}", n.label));
             }
         }

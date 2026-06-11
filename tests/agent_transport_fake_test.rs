@@ -21,9 +21,9 @@
 
 use std::sync::Arc;
 
-use sketch::acp_channel::{
+use yalda::acp_channel::{
     AgentSpawner, AgentTransport, DEFAULT_PERMISSION_MODE, FakeAgentSpawner, FakeTransport,
-    PermissionMode, RealAgentSpawner, ReplyEvent, SketchFrontend,
+    PermissionMode, RealAgentSpawner, ReplyEvent, YaldaFrontend,
 };
 
 /// A faithful re-implementation of the session-server pump's CORE drain logic
@@ -59,7 +59,7 @@ fn fake_preserves_event_order_and_turn_boundary() {
 
     // Push a known sequence: 5 chunks then complete the turn. The DEFAULT worker
     // bumps the turn counter only and pushes NO TurnEnded into the reply stream
-    // (that variant is gated behind SKETCH_EMIT_TURN_ENDED=1) — the pump detects
+    // (that variant is gated behind YALDA_EMIT_TURN_ENDED=1) — the pump detects
     // the boundary purely via turn_count() > last_turns.
     for i in 0..5 {
         controls.push_chunk(&format!("chunk-{i}"));
@@ -167,7 +167,7 @@ fn real_spawner_forwards_to_subprocess_path() {
         "definitely-not-an-agent-binary-xyzzy",
         None,
         None,
-        SketchFrontend::Gpui,
+        YaldaFrontend::Gpui,
     );
     // No such binary on PATH → NotFound, surfaced through the trait unchanged.
     // (Map the Ok arm away first — `Box<dyn AgentTransport>` isn't `Debug`, so
@@ -188,7 +188,7 @@ fn fake_spawner_yields_in_process_transport() {
 
     // The factory builds a fresh fake per spawn and stashes its controls so the
     // test can drive events after the (faked) spawn returns.
-    let captured: Arc<Mutex<Option<sketch::acp_channel::FakeAgentControls>>> =
+    let captured: Arc<Mutex<Option<yalda::acp_channel::FakeAgentControls>>> =
         Arc::new(Mutex::new(None));
     let captured_for_factory = Arc::clone(&captured);
 
@@ -199,7 +199,7 @@ fn fake_spawner_yields_in_process_transport() {
     });
 
     let transport = spawner
-        .spawn("", None, None, SketchFrontend::Gpui)
+        .spawn("", None, None, YaldaFrontend::Gpui)
         .expect("fake spawn succeeds");
     assert!(transport.is_connected());
 
@@ -219,7 +219,7 @@ fn fake_spawner_yields_in_process_transport() {
     assert!(turn_ended);
 }
 
-/// Opt-in `SKETCH_EMIT_TURN_ENDED=1` mode: `emit_turn_ended_event()` bumps the
+/// Opt-in `YALDA_EMIT_TURN_ENDED=1` mode: `emit_turn_ended_event()` bumps the
 /// counter AND pushes a `TurnEnded{count}` into the reply stream, so a scenario
 /// exercising the gated forwarded-TurnEnded path sees the record. The deliberate
 /// counterpart to the default counter-only `complete_turn()`.
@@ -247,7 +247,7 @@ fn fake_spawner_can_fail_on_demand() {
         Err(std::io::Error::other("simulated spawn failure"))
     });
     let err = spawner
-        .spawn("", None, None, SketchFrontend::Gpui)
+        .spawn("", None, None, YaldaFrontend::Gpui)
         .map(|_| ())
         .expect_err("fake spawner returns the injected error");
     assert_eq!(err.kind(), std::io::ErrorKind::Other);

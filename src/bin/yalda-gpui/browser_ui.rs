@@ -1,10 +1,10 @@
-//! Browser tile + file-browser/outline rail methods on SketchGpuiView:
+//! Browser tile + file-browser/outline rail methods on YaldaGpuiView:
 //! navigation, filtering, rail focus/resize and selection. Extracted
 //! verbatim from main.rs (split-gpui-main, stage 2).
 
 use super::*;
 
-impl SketchGpuiView {
+impl YaldaGpuiView {
     pub(crate) fn browser_down(
         &mut self,
         _: &BrowserDown,

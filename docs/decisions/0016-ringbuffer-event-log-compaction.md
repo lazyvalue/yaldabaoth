@@ -40,7 +40,7 @@ silent hole.
 
 ## Alternatives rejected
 
-- **Snapshot + tail file compaction** (ADR-0009's original sketch) — heavier;
+- **Snapshot + tail file compaction** (ADR-0009's original yalda) — heavier;
   solves disk growth, which isn't the pressure. Still deferred.
 - **Drop-oldest with no marker** — silent history holes; violates the reducer's
   "no silent gap" contract (§6/§7).

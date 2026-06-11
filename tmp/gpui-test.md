@@ -1,10 +1,10 @@
-# Sketch GPUI Frontend
+# Yalda GPUI Frontend
 
 A *desktop* markdown viewer **rendered with GPUI** — Zed's GPU-accelerated UI framework.
 
 ## Why?
 
-Sketch's core was recently refactored so that `blocks.rs`, `style.rs`, `theme.rs`, and `render.rs` no longer depend on ratatui. That makes it possible to bolt on a native frontend like this one.
+Yalda's core was recently refactored so that `blocks.rs`, `style.rs`, `theme.rs`, and `render.rs` no longer depend on ratatui. That makes it possible to bolt on a native frontend like this one.
 
 ### Features
 

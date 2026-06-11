@@ -38,7 +38,7 @@ The agent tile's render method does this on **every `cx.notify()`**:
 
 ### RC2: Lock convoy on `this.update(cx, ...)`
 
-Both pumps call `this.update(cx, |this, cx| { ... })` which takes a mutable borrow on the entire `SketchGpuiView`. While held, keystroke handlers and render cannot proceed.
+Both pumps call `this.update(cx, |this, cx| { ... })` which takes a mutable borrow on the entire `YaldaGpuiView`. While held, keystroke handlers and render cannot proceed.
 
 The **server pump** is worst: it calls `this.update()` twice per batch — once to drain from the channel (unnecessary, channel is thread-safe), once to route/apply. Processing 256 events inside the lock blocks keystrokes for 2-10ms per batch.
 
@@ -121,7 +121,7 @@ cache.update_dirty_lines(&editor, &theme);   // O(changed_lines)
 
 **Files:** `main.rs` (agent tile render method, ~line 9474+). Possibly a new `highlight_cache.rs` module.
 
-**GPUI constraint note:** `render()` takes `&mut self`, so the cache can live directly on `SketchGpuiView` — no `RefCell` needed.
+**GPUI constraint note:** `render()` takes `&mut self`, so the cache can live directly on `YaldaGpuiView` — no `RefCell` needed.
 
 ### Phase 2: Extract-Then-Apply (Lock Decoupling)
 
@@ -216,7 +216,7 @@ Phase 1 alone should make typing responsive. Phases 2 and 3 improve streaming qu
 
 ## Validation
 
-- `cargo check --bin sketch-gpui` clean after each phase
+- `cargo check --bin yalda-gpui` clean after each phase
 - Type rapidly in agent chatbox during active streaming → characters appear within 1 frame
 - Stream a 2000-line agent response → content appears smoothly, no multi-second gaps
 - Open a 5000-line agent conversation, type a character → frame time < 4ms

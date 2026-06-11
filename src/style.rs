@@ -1,7 +1,7 @@
 //! Frontend-neutral styling primitives.
 //!
 //! `Color`, `Modifier`, and `Style` mirror the subset of `ratatui::style`
-//! the rest of sketch actually uses, but carry no dependency on ratatui.
+//! the rest of yalda actually uses, but carry no dependency on ratatui.
 //! A future native-desktop frontend can consume these directly; the TUI
 //! frontend converts to `ratatui::style::*` at the rendering edge via
 //! the `From` impls at the bottom of this module.
@@ -186,7 +186,7 @@ impl From<Style> for rs::Style {
 // Reverse adapters: ratatui → neutral. Used when view.rs reads a Style
 // back out of a `ratatui::Span` it just built (the search-highlight path
 // is the only spot today). Lossy: ratatui carries `underline_color` and a
-// `sub_modifier` mask that the rest of sketch doesn't use, so dropping
+// `sub_modifier` mask that the rest of yalda doesn't use, so dropping
 // those round-trips correctly for this codebase.
 
 impl From<rs::Color> for Color {

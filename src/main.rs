@@ -6,7 +6,7 @@ use clap::Parser;
 mod app;
 
 #[derive(Parser)]
-#[command(name = "sketch", about = "A beautiful TUI markdown viewer")]
+#[command(name = "yalda", about = "A beautiful TUI markdown viewer")]
 struct Cli {
     /// Markdown file to view
     file: Option<String>,
@@ -31,7 +31,7 @@ fn main() {
 
     let cli = Cli::parse();
 
-    let mut config = match sketch::config::Config::load() {
+    let mut config = match yalda::config::Config::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -40,7 +40,7 @@ fn main() {
     };
 
     if let Some(ref theme_str) = cli.theme {
-        match sketch::theme::ThemeName::parse(theme_str) {
+        match yalda::theme::ThemeName::parse(theme_str) {
             Some(name) => config.theme = name,
             None => {
                 eprintln!("Unknown theme: {}", theme_str);

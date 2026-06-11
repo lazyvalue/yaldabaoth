@@ -241,7 +241,7 @@ pub enum ReplyEvent {
     PlanUpdated(Plan),
     ModeChanged(SessionModeId),
     UsageUpdated(UsageSnapshot),    // feature-gated emitter
-    Notice(String),                 // existing: sketch-local lifecycle notice (attach/detach/…)
+    Notice(String),                 // existing: yalda-local lifecycle notice (attach/detach/…)
     ReplayComplete,                 // NEW: end-of-replay marker, emitted once after session/load
                                     // returns; gates finalize so an empty queue mid-replay can't
                                     // infer turn-end (INV-4). Ordered after the last replayed chunk.

@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn main() {
     // Intentionally NO `cargo:rerun-if-changed` lines — that makes cargo treat
     // every file in the package as a build-script dependency, so the SHA +
-    // timestamp embedded in SKETCH_BUILD_INFO refreshes on any source change.
+    // timestamp embedded in YALDA_BUILD_INFO refreshes on any source change.
 
     let sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -37,13 +37,13 @@ fn main() {
     let version = env!("CARGO_PKG_VERSION");
     let build_info = format!("{} ({}{} {})", version, sha, dirty_suffix, timestamp);
 
-    println!("cargo:rustc-env=SKETCH_BUILD_INFO={}", build_info);
-    println!("cargo:rustc-env=SKETCH_BUILD_SHA={}{}", sha, dirty_suffix);
-    println!("cargo:rustc-env=SKETCH_BUILD_TIME={}", timestamp);
+    println!("cargo:rustc-env=YALDA_BUILD_INFO={}", build_info);
+    println!("cargo:rustc-env=YALDA_BUILD_SHA={}{}", sha, dirty_suffix);
+    println!("cargo:rustc-env=YALDA_BUILD_TIME={}", timestamp);
 
     // cargo:warning= is the only mechanism build scripts have to print
     // messages to the user; cargo always shows it.
-    println!("cargo:warning=sketch build {}", build_info);
+    println!("cargo:warning=yalda build {}", build_info);
 }
 
 /// Render a UNIX timestamp as a UTC ISO-8601 date+time, e.g. "2026-04-30T14:23:09Z".

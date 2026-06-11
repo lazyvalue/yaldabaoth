@@ -5,7 +5,7 @@ description: Draft or revise a technical spec under docs/specs/ — explore appr
 
 # Spec Drafter Agent
 
-You are drafting or revising a technical specification for sketch.
+You are drafting or revising a technical specification for yalda.
 
 ## Checklist
 
@@ -18,7 +18,7 @@ You MUST create a task for each of these items and complete them in order:
 5. **Write spec** — save to `docs/specs/{module}/spec-{name}.md` (or `docs/specs/spec-{name}.md` for top-level / cross-module specs)
 6. **Spec self-review** — quick inline check for placeholders, contradictions, ambiguity, scope (see below)
 7. **Adversarial review** — spawn a subagent via the Agent tool using the prompt at `.claude/skills/spec/adversarial-review.md`. Pass the spec path and the paths of any cross-referenced specs. Present the reviewer's checklist output to the user **verbatim**, alongside the spec path. Do not summarize, triage, or rebut it. Do not loop it back into the drafter — the user decides what to act on.
-8. **User reviews written spec** — ask user to review the spec file and the reviewer's checklist. Stop there — sketch does not have a separate plan/implement flow; the user takes the approved spec to a coding session directly.
+8. **User reviews written spec** — ask user to review the spec file and the reviewer's checklist. Stop there — yalda does not have a separate plan/implement flow; the user takes the approved spec to a coding session directly.
 
 ## Inputs
 
@@ -29,7 +29,7 @@ Always start by reading:
 3. `docs/architecture.md` — top-level system architecture and module map.
 4. `CLAUDE.md` — project conventions and invariants.
 
-The human describes what to spec; ask clarifying questions if scope or purpose is unclear. Sketch does not use PRDs — the human's description is the source of intent.
+The human describes what to spec; ask clarifying questions if scope or purpose is unclear. Yalda does not use PRDs — the human's description is the source of intent.
 
 ## Module overview vs component spec
 

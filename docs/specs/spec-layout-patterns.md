@@ -6,7 +6,7 @@
 
 ## Overview
 
-This spec adds three tiling-WM primitives to sketch's workspace model:
+This spec adds three tiling-WM primitives to yalda's workspace model:
 
 1. **Tags** — buffers carry named tags; tabs filter the buffer pool by tag.
    A buffer tagged `docs` and `ref` appears in any tab viewing either tag.
@@ -25,7 +25,7 @@ This spec adds three tiling-WM primitives to sketch's workspace model:
    a mark; `'` + key jumps to the marked window (across tabs). Marks give
    stable O(1) access to frequently-used tiles regardless of layout churn.
 
-Together these turn sketch's workspace into a keyboard-driven tiling window
+Together these turn yalda's workspace into a keyboard-driven tiling window
 manager where the "applications" are file buffers, agent sessions, and file
 browsers.
 
@@ -292,7 +292,7 @@ The sigil appears at the left end of the status bar, before the file path.
 `m` followed by a single character (`a`–`z`, `A`–`Z`) marks the focused
 window. The mark maps the character to the window's `WindowId`. Setting a
 mark that already exists overwrites it silently (the mark moves to the new
-window). Marks are valid in Doc view (`SketchView` context) and Edit
+window). Marks are valid in Doc view (`YaldaView` context) and Edit
 normal mode — not in Insert mode (where `m` is a text character) or in
 Agent/Browser views.
 
@@ -315,7 +315,7 @@ is reachable from tab 3. This matches vim's uppercase-mark behavior
 
 Lowercase marks (`a`–`z`) and uppercase marks (`A`–`Z`) are in the same
 namespace — 52 possible marks. No distinction in scope (vim distinguishes
-local/global by case; sketch has no compelling reason to, since there's
+local/global by case; yalda has no compelling reason to, since there's
 one workspace).
 
 #### 20 · Mark indicator [DRAFT]
@@ -496,8 +496,8 @@ pub struct Workspace<C> {
 | `Ctrl-W Return` | MasterStack | Promote focused to master |
 | `Ctrl-W i` | MasterStack | Increase master count |
 | `Ctrl-W d` | MasterStack | Decrease master count |
-| `m {key}` | SketchView, EditView (normal) | Set mark |
-| `' {key}` | SketchView, EditView (normal) | Jump to mark |
+| `m {key}` | YaldaView, EditView (normal) | Set mark |
+| `' {key}` | YaldaView, EditView (normal) | Jump to mark |
 
 ### Persistence
 
@@ -505,7 +505,7 @@ pub struct Workspace<C> {
 
 ```json
 {
-  "/Users/scott/ws/sketch": {
+  "/Users/scott/ws/yalda": {
     "tabs": [
       {
         "auto_name": "tab-1",
@@ -521,7 +521,7 @@ pub struct Workspace<C> {
     "marks": { "a": 3, "b": 7 },
     "tag_shortcuts": { "1": "docs", "2": "ref", "3": "agent" },
     "buffers": {
-      "/Users/scott/ws/sketch/README.md": {
+      "/Users/scott/ws/yalda/README.md": {
         "tags": ["docs", "ref"]
       }
     }
@@ -585,7 +585,7 @@ is reopened.
 9. **Backwards compatibility.** All three features are additive. A
    workspace with no tags, in Manual layout mode, and no marks behaves
    identically to today. No existing keybinding conflicts — `m` and `'`
-   are currently unbound in SketchView/EditView normal mode; `Ctrl-W t`,
+   are currently unbound in YaldaView/EditView normal mode; `Ctrl-W t`,
    `Ctrl-W T`, `Ctrl-W Space`, `Ctrl-W Return`, `Ctrl-W i`, `Ctrl-W d`
    are currently unbound.
 
@@ -600,7 +600,7 @@ is reopened.
 
 ### Phase 1 — Marks (smallest, self-contained)
 
-Add `MarkTable` to `Workspace<C>`, wire `m`/`'` key chords in SketchView
+Add `MarkTable` to `Workspace<C>`, wire `m`/`'` key chords in YaldaView
 and EditView normal mode, add `:mark`/`:jump`/`:marks` commands, persist
 in `workspace.json`. No data model changes to `Tab` or `FileBuffer`.
 

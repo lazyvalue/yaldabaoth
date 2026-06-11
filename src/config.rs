@@ -307,16 +307,16 @@ impl Config {
 }
 
 fn config_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SKETCH_CONFIG") {
+    if let Ok(p) = std::env::var("YALDA_CONFIG") {
         return Some(PathBuf::from(p));
     }
 
     if let Some(home) = dirs::home_dir() {
-        let xdg = home.join(".config").join("sketch").join("config.kdl");
+        let xdg = home.join(".config").join("yalda").join("config.kdl");
         if xdg.exists() {
             return Some(xdg);
         }
     }
 
-    dirs::config_dir().map(|d| d.join("sketch").join("config.kdl"))
+    dirs::config_dir().map(|d| d.join("yalda").join("config.kdl"))
 }

@@ -22,7 +22,7 @@ decomposing by file/module ownership, not by concern — see ADR-0004.)
 3. **Create the integration worktree.** `git worktree add .claude/worktrees/integration -b integration <base>`.
 4. **Merge one at a time, building after each.** `git merge --no-edit <branch>`;
    resolve conflicts by hand (never leave markers); then
-   `cargo build --bin sketch-gpui --bin sketch-session-server` + `cargo test`.
+   `cargo build --bin yalda-gpui --bin yalda-session-server` + `cargo test`.
    Don't merge the next branch until the current one is green. A clean text-merge
    does NOT imply it compiles — always build.
 5. **Report** per branch: merged cleanly / conflicts resolved (what), build +

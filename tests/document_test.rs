@@ -1,4 +1,4 @@
-use sketch::document::Document;
+use yalda::document::Document;
 use std::path::PathBuf;
 use tempfile::TempDir;
 

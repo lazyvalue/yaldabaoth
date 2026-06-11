@@ -1,5 +1,5 @@
-use sketch::buffer::Buffer;
-use sketch::keys::{Key, KeyPress};
+use yalda::buffer::Buffer;
+use yalda::keys::{Key, KeyPress};
 
 use super::{App, AppScreen, fuzzy_match};
 

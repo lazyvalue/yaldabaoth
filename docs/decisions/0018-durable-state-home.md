@@ -1,4 +1,4 @@
-# ADR-0018: Durable state lives in `~/.sketch`, not the OS cache dir
+# ADR-0018: Durable state lives in `~/.yalda`, not the OS cache dir
 
 **Status:** Accepted
 **Date:** 2026-06-08
@@ -7,8 +7,8 @@ ADR-0017 (WAL version-discard migration), `src/paths.rs`
 
 ## Context
 
-All of sketch's persisted state lived under `dirs::cache_dir().join("sketch")` —
-`~/Library/Caches/sketch` on macOS, `~/.cache/sketch` on Linux. That includes
+All of yalda's persisted state lived under `dirs::cache_dir().join("yalda")` —
+`~/Library/Caches/yalda` on macOS, `~/.cache/yalda` on Linux. That includes
 **durable, hard-to-regenerate** data:
 
 - `wal/` — per-session write-ahead logs (the agent conversation history; ADR-0009)
@@ -27,44 +27,44 @@ is never deleted by the dev scripts; only a `WAL_VERSION` bump discards it.)
 
 ## Decision
 
-Put all persisted sketch state under a single durable home: **`~/.sketch`**.
-One helper, `paths::sketch_home()` (`dirs::home_dir().join(".sketch")`), is the
+Put all persisted yalda state under a single durable home: **`~/.yalda`**.
+One helper, `paths::yalda_home()` (`dirs::home_dir().join(".yalda")`), is the
 sole source of that base path; every persist site calls it. A one-time,
 idempotent, best-effort `paths::migrate_legacy_cache_dir()` runs at the top of
-both binaries' `main()` and relocates any pre-existing `<cache_dir>/sketch/*`
-into `~/.sketch` (never clobbering a name the new home already owns), so the move
+both binaries' `main()` and relocates any pre-existing `<cache_dir>/yalda/*`
+into `~/.yalda` (never clobbering a name the new home already owns), so the move
 loses nothing.
 
 Unchanged:
-- **Config** stays at `~/.config/sketch/config.kdl` (XDG config dir) — it's
+- **Config** stays at `~/.config/yalda/config.kdl` (XDG config dir) — it's
   user-authored config, not runtime state, and `~/.config` is already durable.
 - **Sockets / pid** stay in `/tmp` (`session_proto::socket_path`) — runtime-only,
   correctly disposable, and `/tmp` is the right place for IPC endpoints.
-- The `SKETCH_SESSION_SOCKET` override branches (isolated/blue-green instances)
+- The `YALDA_SESSION_SOCKET` override branches (isolated/blue-green instances)
   still derive WAL/state paths from the socket path, so test and alternate
   instances never share durable state.
 
 ## Rationale
 
 Durability is a property of *where* the bytes live, and the cache dir is the one
-location the OS is explicitly allowed to delete. `~/.sketch` is a conventional,
+location the OS is explicitly allowed to delete. `~/.yalda` is a conventional,
 user-visible dotfolder under `$HOME`, on the same volume as the cache dir (so the
 migration is a cheap `rename`), and is not subject to cache eviction. A single
-`sketch_home()` chokepoint means the location can't drift across the ~9 sites
-that previously open-coded `cache_dir().join("sketch")`.
+`yalda_home()` chokepoint means the location can't drift across the ~9 sites
+that previously open-coded `cache_dir().join("yalda")`.
 
-Rejected: `~/Library/Application Support/sketch` (macOS-canonical for app data) —
+Rejected: `~/Library/Application Support/yalda` (macOS-canonical for app data) —
 correct on macOS but platform-specific and less discoverable; the user asked for
-a single cross-platform `~/.sketch`, which is simpler and equally durable.
+a single cross-platform `~/.yalda`, which is simpler and equally durable.
 
 ## Consequences
 
 - Agent-session history survives OS cache purges, "Manage Storage", and reboots.
 - Logs move too (consolidated home); the TUI debug-overlay path is now
-  `~/.sketch/debug.log` (CLAUDE.md updated).
+  `~/.yalda/debug.log` (CLAUDE.md updated).
 - Existing users' state is migrated automatically on first run of the new build.
   A `rename` failure across mounts (EXDEV, rare) leaves the file in the legacy dir
   with a log line rather than losing it — that file simply starts fresh.
-- Dev scripts (`dev-all.sh`, `scripts/rebuild-server.sh`) point at `~/.sketch`;
+- Dev scripts (`dev-all.sh`, `scripts/rebuild-server.sh`) point at `~/.yalda`;
   the stale "drops all sessions" note in `dev-all.sh` is corrected (sessions
   survive — only a `WAL_VERSION` bump discards them).

@@ -18,7 +18,7 @@ flagged NEEDS-RUNTIME.
   into an owner-gate check + a shared owner-gate-free `enqueue_prompt` core;
   `Command::AdminPrompt` (ungated), `Request::AdminPrompt` wire verb,
   `SessionServerClient::{admin_prompt,connect_existing}`, and the
-  `sketch-session-server prompt <sid> <text>` CLI subcommand. A headless prompt
+  `yalda-session-server prompt <sid> <text>` CLI subcommand. A headless prompt
   takes no lease — it enqueues onto the WAL-durable input queue (same fsync-at-
   boundary durability as the owner path) and runs under the session's stored
   permission mode. ✅ `admin_prompt_drives_turn_without_owner`; both reviews APPROVE.

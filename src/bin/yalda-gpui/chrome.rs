@@ -1,4 +1,4 @@
-//! Window chrome on SketchGpuiView: focused-window/layout render, tab
+//! Window chrome on YaldaGpuiView: focused-window/layout render, tab
 //! strip, tag bar, rails (render + outline derivation). Extracted
 //! verbatim from main.rs (split-gpui-main, stage 2).
 
@@ -13,7 +13,7 @@ const DESKTOP_EDGE_PAN_STEP: f32 = 12.0;
 /// Width of the east/south edge bands that arm a tile resize (spec 4b).
 const DESKTOP_RESIZE_BAND: f32 = 6.0;
 
-impl SketchGpuiView {
+impl YaldaGpuiView {
     /// Build the menu popup as an absolutely-positioned overlay anchored
     /// to the top of the window. Renders header (breadcrumb), entry list,
     /// and a footer hint. Has *no* key handlers — the wrapper in
@@ -146,11 +146,10 @@ impl SketchGpuiView {
             .size_full()
             .overflow_hidden()
             .bg(base_bg)
-            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _w, cx| {
-                let d = ev.delta.pixel_delta(px(20.0));
-                this.desktop_pan_by(-f32::from(d.x), -f32::from(d.y));
-                cx.notify();
-            }))
+            // Swallow scroll-wheel on the desktop canvas so tile content
+            // scrolls stay contained and the desktop itself never pans from
+            // the mousewheel. Pan is available via drag or keyboard.
+            .on_scroll_wheel(cx.listener(|_this, _ev: &gpui::ScrollWheelEvent, _w, _cx| {}))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
                 this.desktop_pointer_move((f32::from(ev.position.x), f32::from(ev.position.y)), cx);
             }))
@@ -631,15 +630,6 @@ impl SketchGpuiView {
         if d.drag.take().is_some() || d.resize.take().is_some() {
             cx.notify();
         }
-    }
-
-    /// Scroll-wheel pan; clamping happens in the render pass against the
-    /// current occupied extent.
-    pub(crate) fn desktop_pan_by(&mut self, dx: f32, dy: f32) {
-        let tab_idx = self.workspace.active_tab;
-        let pan = &mut self.workspace.tabs[tab_idx].desktop.pan;
-        pan.0 = (pan.0 + dx).max(0.0);
-        pan.1 = (pan.1 + dy).max(0.0);
     }
 
     /// Recursively render a `Layout<App>`. The `root` div is used

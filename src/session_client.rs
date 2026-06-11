@@ -1,4 +1,4 @@
-//! GUI-side client for `sketch-session-server`.
+//! GUI-side client for `yalda-session-server`.
 //!
 //! Connects to the server over a Unix domain socket, sends requests, and
 //! receives notifications. Provides a channel-like API that mirrors
@@ -27,7 +27,7 @@ pub struct SessionServerClient {
     request_tx: std_mpsc::Sender<(Frame, Option<std_mpsc::Sender<Response>>)>,
     /// Inbound notifications from the server. `Option` so the pump task can
     /// `take` it and drain the channel *outside* the GUI model lock — channel
-    /// reads need no `&mut SketchGpuiView`, so taking the lock to call
+    /// reads need no `&mut YaldaGpuiView`, so taking the lock to call
     /// `try_recv` was pure contention.
     notification_rx: Option<std_mpsc::Receiver<Notification>>,
     /// Event-driven wake signal. The reader thread pushes `()` after every
@@ -147,11 +147,11 @@ impl SessionServerClient {
 
     /// Append-mode log file for the detached server's stdout/stderr, so the
     /// daemon's output survives the terminal that launched the GUI. Lives at
-    /// `~/.sketch/session-server.log` (the durable sketch home, ADR-0018).
+    /// `~/.yalda/session-server.log` (the durable yalda home, ADR-0018).
     /// `None` if the home dir or file can't be opened (caller falls back to
     /// discarding output).
     fn server_log_file() -> Option<std::fs::File> {
-        let path = crate::paths::sketch_home()?.join("session-server.log");
+        let path = crate::paths::yalda_home()?.join("session-server.log");
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -165,13 +165,13 @@ impl SessionServerClient {
     fn find_server_binary() -> io::Result<PathBuf> {
         // Try the same directory as the current executable first.
         if let Ok(exe) = std::env::current_exe() {
-            let sibling = exe.with_file_name("sketch-session-server");
+            let sibling = exe.with_file_name("yalda-session-server");
             if sibling.exists() {
                 return Ok(sibling);
             }
         }
         // Fall back to PATH lookup.
-        Ok(PathBuf::from("sketch-session-server"))
+        Ok(PathBuf::from("yalda-session-server"))
     }
 
     fn from_stream(stream: UnixStream) -> io::Result<Self> {
@@ -237,7 +237,7 @@ impl SessionServerClient {
                     }
                 }
                 connected_r.store(false, Ordering::SeqCst);
-                eprintln!("[sketch-gpui] session-client reader exiting — {exit_reason}");
+                eprintln!("[yalda-gpui] session-client reader exiting — {exit_reason}");
                 // Socket closed / EOF: unblock anyone parked in `request`.
                 fail_all_pending(&pending_r);
             })?;
@@ -297,7 +297,7 @@ impl SessionServerClient {
 
     /// Install the stable client identity (spec phase 4). Call once right after
     /// [`connect`](Self::connect) (the GUI loads/creates it from
-    /// `~/.sketch/client_id`). Threaded into every `attach`/`heartbeat`
+    /// `~/.yalda/client_id`). Threaded into every `attach`/`heartbeat`
     /// request and shared with handles so the lease keys on a stable id.
     pub fn set_client_id(&self, id: String) {
         if let Ok(mut g) = self.client_id.lock() {

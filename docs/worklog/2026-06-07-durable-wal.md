@@ -20,7 +20,7 @@ write-ahead log so a crash no longer loses completed work. Branch: `durable-wal`
   - **Recovery** replays the file; a torn final line (interrupted write) is
     skipped, not fatal. `acp_session_id` (to `--resume` the agent) is re-derived
     from the last `SessionAttached`; `turns` from `TurnEnded` count.
-- **Server integration** (`sketch-session-server/main.rs`):
+- **Server integration** (`yalda-session-server/main.rs`):
   - `ManagedSession` gains a `wal` handle; `record()` and the user-prompt path
     (`log_only`) append durably, fsync at boundaries.
   - `create_session` opens the WAL (header fsync'd up front). `close_session`
@@ -29,7 +29,7 @@ write-ahead log so a crash no longer loses completed work. Branch: `durable-wal`
     snapshot + the delete-on-restore hack); re-spawns each agent via
     `session/load`. Graceful shutdown no longer needs a special save — the WAL
     is always current.
-  - WAL dir follows `SKETCH_SESSION_SOCKET` (`session_wal_dir()`), so test and
+  - WAL dir follows `YALDA_SESSION_SOCKET` (`session_wal_dir()`), so test and
     alternate instances never share durable state.
 
 ## Decision recorded first

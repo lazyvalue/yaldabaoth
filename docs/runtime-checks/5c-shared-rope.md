@@ -6,7 +6,7 @@
 `re_render_one_doc_sources_live_core_not_disk`), but GPUI can't be driven
 headlessly, so the **cross-pane paint** (two panes visibly updating) needs eyes.
 
-Launch: `cargo run --bin sketch-gpui <some.md>`
+Launch: `cargo run --bin yalda-gpui <some.md>`
 
 Keys (from `register_keymap`): `Ctrl-W s` split horizontal · `Ctrl-W v` split
 vertical · `Ctrl-W Shift-M` also-show focused content in a new pane · `Ctrl-W h/j/k/l`

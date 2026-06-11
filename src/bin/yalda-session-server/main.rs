@@ -1,12 +1,12 @@
-//! `sketch-session-server` — thin daemon that owns ACP agent subprocesses.
+//! `yalda-session-server` — thin daemon that owns ACP agent subprocesses.
 //!
-//! The GUI (`sketch-gpui`) connects over a Unix domain socket and
+//! The GUI (`yalda-gpui`) connects over a Unix domain socket and
 //! creates/attaches/prompts sessions. When the GUI is rebuilt and
 //! relaunched, it reconnects to the same running server — agent sessions
 //! survive the transition.
 //!
 //! Run:
-//!     cargo run --bin sketch-session-server
+//!     cargo run --bin yalda-session-server
 //!
 //! The GUI auto-launches this binary if not already running.
 
@@ -22,10 +22,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 
-use sketch::acp_channel::{
-    AgentSpawner, AgentTransport, PermissionMode, RealAgentSpawner, SketchFrontend, TransportHandle,
+use yalda::acp_channel::{
+    AgentSpawner, AgentTransport, PermissionMode, RealAgentSpawner, YaldaFrontend, TransportHandle,
 };
-use sketch::session_proto::*;
+use yalda::session_proto::*;
 
 mod launchd;
 
@@ -39,11 +39,11 @@ mod launchd;
 // while two dropped beats / a GC pause tolerate a live owner.
 
 /// How long a lease stays valid without a renewing heartbeat. Overridable for
-/// tests via `SKETCH_LEASE_TTL_MS`.
+/// tests via `YALDA_LEASE_TTL_MS`.
 fn lease_ttl() -> Duration {
     static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *TTL.get_or_init(|| {
-        std::env::var("SKETCH_LEASE_TTL_MS")
+        std::env::var("YALDA_LEASE_TTL_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|&ms| ms > 0)
@@ -124,7 +124,7 @@ fn lease_to_wire(state: &LeaseState, now: Instant) -> Lease {
 //   lease deterministically via same-`client_id` reclaim on reconnect (phase 4).
 #[derive(Clone)]
 struct LogSnapshot {
-    log: sketch::event_log::EventLog,
+    log: yalda::event_log::EventLog,
     /// The session's `channel_generation` at publish time. A live forwarder
     /// shares this epoch (a generation bump forces a fresh attach), so it is the
     /// `current_gen` passed to `resolve_sent`.
@@ -309,7 +309,7 @@ enum Command {
     Record {
         sid: ServerSessionId,
         generation: u64,
-        event: sketch::acp_channel::ReplyEvent,
+        event: yalda::acp_channel::ReplyEvent,
     },
     TurnCount {
         sid: ServerSessionId,
@@ -333,8 +333,8 @@ enum Command {
 /// auto-launches); subcommands manage launchd supervision.
 #[derive(clap::Parser)]
 #[command(
-    name = "sketch-session-server",
-    about = "Sketch ACP session-server daemon"
+    name = "yalda-session-server",
+    about = "Yalda ACP session-server daemon"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -426,12 +426,12 @@ struct ManagedSession {
     /// `Vec` is bounded to [`event_log_cap`], with a logical `log_base` seq
     /// offset so a trim never re-aliases a client's acked `seq`. The on-disk WAL
     /// stays append-only / unbounded.
-    event_log: sketch::event_log::EventLog,
+    event_log: yalda::event_log::EventLog,
     /// Replay-fence arm state, re-derived at every channel publish
     /// (`apply_channel_state`): nonzero (the settled turn count) when the
     /// channel was spawned with a resume id AND `event_log` already holds the
     /// history `session/load` will re-emit. The pump suppresses Records while
-    /// its (marker-based, see `sketch::replay_fence`) fence is up and sends
+    /// its (marker-based, see `yalda::replay_fence`) fence is up and sends
     /// `ReplayDone` when the worker's end-of-replay marker clears it; this
     /// field is the actor's mirror so a later publish never seeds a pump with
     /// a stale fence. Zero for fresh sessions and non-resumed channels.
@@ -440,7 +440,7 @@ struct ManagedSession {
     /// is appended here so a crash (not just a clean shutdown) preserves the
     /// transcript. `None` only if the WAL couldn't be opened (we degrade to
     /// in-memory-only rather than refusing to run).
-    wal: Option<sketch::session_wal::SessionWal>,
+    wal: Option<yalda::session_wal::SessionWal>,
     /// Phase-8 Stage A (spec §2/§3): the authoritative durable `seq` for the
     /// canonical `AgentEvent` envelope — monotonic per `(session, generation)`,
     /// assigned at the server's `record()` chokepoint. During the additive
@@ -522,7 +522,7 @@ impl ManagedSession {
     fn push_event(&mut self, note: Notification) {
         self.wal_append(&note);
         self.event_log.push(note);
-        let cap = sketch::event_log::event_log_cap();
+        let cap = yalda::event_log::event_log_cap();
         // Low-water mark: ¾ of the cap, leaving a slot for the prepended marker
         // and headroom so the next several pushes don't re-trim.
         let target = (cap * 3 / 4).max(1).min(cap.saturating_sub(1));
@@ -542,12 +542,12 @@ impl ManagedSession {
             // the prepend `marker.seq == log_base` and the seq space is contiguous.
             let through_turn = trim.through_turn.unwrap_or(0);
             let marker_seq = trim.new_base.saturating_sub(1);
-            let marker = sketch::agent_event::AgentEvent::new(
+            let marker = yalda::agent_event::AgentEvent::new(
                 self.id.clone(),
                 self.channel_generation,
                 through_turn,
                 marker_seq,
-                sketch::agent_event::AgentEventKind::CompactedSummary {
+                yalda::agent_event::AgentEventKind::CompactedSummary {
                     through_turn,
                     summary: format!(
                         "history compacted: {} earlier event(s) trimmed (through turn {through_turn})",
@@ -620,7 +620,7 @@ impl ManagedSession {
     /// "no live subscribers" — floor = tip).
     fn enforce_high_water(&mut self) {
         use std::sync::atomic::Ordering;
-        let high_water = sketch::event_log::event_log_high_water() as u64;
+        let high_water = yalda::event_log::event_log_high_water() as u64;
         let tip = self.event_log.tip_seq();
         loop {
             // Prune dead handles, then find the slowest live forwarder.
@@ -673,8 +673,8 @@ impl ManagedSession {
     /// sessions. `turn` is the CURRENT (post-increment for TurnEnded) settled
     /// count — callers that record a TurnEnded must bump `self.turns` first so
     /// the boundary's envelope `turn` matches the completed turn number.
-    fn record_agent(&mut self, kind: sketch::agent_event::AgentEventKind) {
-        let event = sketch::agent_event::AgentEvent::new(
+    fn record_agent(&mut self, kind: yalda::agent_event::AgentEventKind) {
+        let event = yalda::agent_event::AgentEvent::new(
             self.id.clone(),
             self.channel_generation,
             self.turns as u64,
@@ -711,7 +711,7 @@ impl ManagedSession {
             let boundary = match note {
                 Notification::UserPrompt { .. } | Notification::TurnEnded { .. } => true,
                 Notification::Agent { event } => {
-                    use sketch::agent_event::AgentEventKind;
+                    use yalda::agent_event::AgentEventKind;
                     matches!(
                         event.kind,
                         AgentEventKind::UserMessage { .. } | AgentEventKind::TurnEnded { .. }
@@ -834,7 +834,7 @@ impl ManagedSession {
         // `acp_session_id.is_some()`, which is true for every successful
         // handshake (session/new also yields an id) and so mislabeled fresh
         // channels as resumed.
-        self.record_agent(sketch::agent_event::channel_opened_kind(resumed));
+        self.record_agent(yalda::agent_event::channel_opened_kind(resumed));
         self.record(Notification::SessionAttached {
             session_id: self.id.clone(),
             acp_session_id,
@@ -850,9 +850,9 @@ fn new_managed_session(
     label: String,
     cwd: PathBuf,
     permission_mode: PermissionMode,
-    wal: Option<sketch::session_wal::SessionWal>,
+    wal: Option<yalda::session_wal::SessionWal>,
 ) -> ManagedSession {
-    let event_log = sketch::event_log::EventLog::new();
+    let event_log = yalda::event_log::EventLog::new();
     let (log_tx, _) = watch::channel(LogSnapshot {
         log: event_log.clone(),
         generation: 0,
@@ -923,9 +923,9 @@ fn open_session_wal(
     label: &str,
     cwd: &std::path::Path,
     permission_mode: PermissionMode,
-) -> Option<sketch::session_wal::SessionWal> {
+) -> Option<yalda::session_wal::SessionWal> {
     let dir = session_wal_dir()?;
-    match sketch::session_wal::SessionWal::create(&dir, id, label, cwd, permission_mode) {
+    match yalda::session_wal::SessionWal::create(&dir, id, label, cwd, permission_mode) {
         Ok(w) => Some(w),
         Err(e) => {
             tracing::error!(
@@ -1137,7 +1137,7 @@ fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<Re
     let Some(dir) = session_wal_dir() else {
         return (sessions, jobs);
     };
-    let recovered = sketch::session_wal::recover_all(&dir);
+    let recovered = yalda::session_wal::recover_all(&dir);
     for rs in recovered {
         let sid = rs.server_session_id.clone();
         let Some(acp_session_id) = rs.acp_session_id.clone() else {
@@ -1149,7 +1149,7 @@ fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<Re
             continue;
         };
 
-        let wal = match sketch::session_wal::SessionWal::reopen(rs.path.clone()) {
+        let wal = match yalda::session_wal::SessionWal::reopen(rs.path.clone()) {
             Ok(w) => Some(w),
             Err(e) => {
                 tracing::error!(
@@ -1179,7 +1179,7 @@ fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<Re
         // is never trimmed, so the restored transcript is a faithful append-
         // ordered prefix from seq 0 (spec §6 / ringbuffer note: on restart
         // log_base resets to the seq of the first recovered event, which is 0).
-        let event_log = sketch::event_log::EventLog::from_recovered(rs.event_log, 0);
+        let event_log = yalda::event_log::EventLog::from_recovered(rs.event_log, 0);
         // Seed the watch with the recovered log so the first tail sees history.
         let (log_tx, _) = watch::channel(LogSnapshot {
             log: event_log.clone(),
@@ -1245,10 +1245,10 @@ fn spawn_resume_worker(
         .spawn(move || {
             // SAFETY: dedicated spawn thread; see create worker.
             unsafe {
-                std::env::set_var("SKETCH_SESSION_MANAGED", "1");
+                std::env::set_var("YALDA_SESSION_MANAGED", "1");
             }
-            let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
-            match spawner.spawn(&cmd, Some(cwd), Some(acp_session_id), SketchFrontend::Gpui) {
+            let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
+            match spawner.spawn(&cmd, Some(cwd), Some(acp_session_id), YaldaFrontend::Gpui) {
                 Ok(client) => {
                     // Resume from disk → is_respawn=false (generation stays 0).
                     //
@@ -1468,13 +1468,13 @@ impl Manager {
                 // agreement check. ReplayComplete / TurnEnded carry their
                 // identity in the envelope, not the payload, so they map to the
                 // ReplayEnd / (handled-below) boundary kinds rather than a Chunk.
-                if let Some(kind) = sketch::agent_event::agent_kind_from_reply(&event) {
+                if let Some(kind) = yalda::agent_event::agent_kind_from_reply(&event) {
                     s.record_agent(kind);
-                } else if matches!(event, sketch::acp_channel::ReplyEvent::ReplayComplete) {
-                    s.record_agent(sketch::agent_event::replay_end_kind());
+                } else if matches!(event, yalda::acp_channel::ReplyEvent::ReplayComplete) {
+                    s.record_agent(yalda::agent_event::replay_end_kind());
                 }
                 // NOTE: a worker `ReplyEvent::TurnEnded { count }` (only emitted
-                // under SKETCH_EMIT_TURN_ENDED=1) is intentionally NOT mapped
+                // under YALDA_EMIT_TURN_ENDED=1) is intentionally NOT mapped
                 // here — the authoritative live boundary is recorded by the
                 // TurnCount handler below, where `self.turns` is already updated
                 // so the envelope `turn` matches the settled count.
@@ -1514,13 +1514,13 @@ impl Manager {
                 let agent_seq = s.agent_seq;
                 s.agent_seq += 1;
                 s.record(Notification::Agent {
-                    event: sketch::agent_event::AgentEvent::new(
+                    event: yalda::agent_event::AgentEvent::new(
                         sid.clone(),
                         channel_generation,
                         completed_turn,
                         agent_seq,
-                        sketch::agent_event::turn_ended_kind(
-                            sketch::agent_event::TurnOutcome::Completed,
+                        yalda::agent_event::turn_ended_kind(
+                            yalda::agent_event::TurnOutcome::Completed,
                         ),
                     ),
                 });
@@ -1584,11 +1584,11 @@ impl Manager {
             .spawn(move || {
                 // SAFETY: dedicated spawn thread; single-purpose server.
                 unsafe {
-                    std::env::set_var("SKETCH_SESSION_MANAGED", "1");
+                    std::env::set_var("YALDA_SESSION_MANAGED", "1");
                 }
-                let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
+                let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
                 let resumed = resume_session_id.is_some();
-                match spawner.spawn(&cmd, Some(cwd), resume_session_id, SketchFrontend::Gpui) {
+                match spawner.spawn(&cmd, Some(cwd), resume_session_id, YaldaFrontend::Gpui) {
                     Ok(client) => {
                         // Fresh spawn → is_respawn = false, generation stays 0.
                         // `resumed` (create-with-resume) arms nothing here —
@@ -1836,7 +1836,7 @@ impl Manager {
         // by identity (session, generation, turn) per spec §2/§5. Recorded
         // alongside the legacy UserPrompt; the GUI reducer ignores the Agent
         // stream this pass.
-        session.record_agent(sketch::agent_event::AgentEventKind::UserMessage {
+        session.record_agent(yalda::agent_event::AgentEventKind::UserMessage {
             text: text.to_string(),
         });
         match session.channel.as_ref() {
@@ -1885,11 +1885,11 @@ impl Manager {
             .spawn(move || {
                 // SAFETY: dedicated spawn thread; see do_create.
                 unsafe {
-                    std::env::set_var("SKETCH_SESSION_MANAGED", "1");
+                    std::env::set_var("YALDA_SESSION_MANAGED", "1");
                 }
-                let cmd = std::env::var("SKETCH_ACP_AGENT").unwrap_or_default();
+                let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
                 let resumed = resume_id.is_some();
-                match spawner.spawn(&cmd, Some(cwd), resume_id, SketchFrontend::Gpui) {
+                match spawner.spawn(&cmd, Some(cwd), resume_id, YaldaFrontend::Gpui) {
                     Ok(client) => {
                         // is_respawn=true bumps generation + gen_watch so the OLD
                         // pump self-terminates and drops its client off-actor.
@@ -2136,11 +2136,11 @@ fn spawn_pump_thread(
             let gen_rx = gen_rx;
 
             let mut last_turns: usize = 0;
-            // Marker-based replay fence (see `sketch::replay_fence`). The
+            // Marker-based replay fence (see `yalda::replay_fence`). The
             // suppression decision stays pump-side (cycle granularity); the
             // actor only sees Records that should be logged, plus one
             // `ReplayDone` when the fence drops.
-            let mut fence = sketch::replay_fence::ReplayFence::new(initial_replay_fence > 0);
+            let mut fence = yalda::replay_fence::ReplayFence::new(initial_replay_fence > 0);
 
             const PUMP_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(16);
 
@@ -2186,7 +2186,7 @@ fn spawn_pump_thread(
                 let current_turns = client.turn_count();
                 let turn_ended = !more_pending && current_turns > last_turns;
 
-                let mut tail_events: Vec<sketch::acp_channel::ReplyEvent> = if turn_ended {
+                let mut tail_events: Vec<yalda::acp_channel::ReplyEvent> = if turn_ended {
                     std::iter::from_fn(|| client.try_recv()).collect()
                 } else {
                     Vec::new()
@@ -2211,7 +2211,7 @@ fn spawn_pump_thread(
                     // Fold any turn-end tail into the batch first so a marker
                     // landing in the tail can't be dropped with it.
                     events.append(&mut tail_events);
-                    use sketch::replay_fence::FenceAction;
+                    use yalda::replay_fence::FenceAction;
                     match fence.on_batch(&events, turn_ended) {
                         None => unreachable!("fence.is_up() checked above"),
                         Some(FenceAction::ClearAtMarker { marker_index }) => {
@@ -2261,8 +2261,8 @@ fn spawn_pump_thread(
 
                 // Forward events first (in order).
                 for ev in events {
-                    if std::env::var("SKETCH_CHUNKLOG").is_ok()
-                        && let sketch::acp_channel::ReplyEvent::Chunk(t) = &ev
+                    if std::env::var("YALDA_CHUNKLOG").is_ok()
+                        && let yalda::acp_channel::ReplyEvent::Chunk(t) = &ev
                     {
                         tracing::info!("[chunklog srv] {t:?}");
                     }
@@ -2719,8 +2719,8 @@ async fn forward_notifications(
             return false;
         }
         let offset = match snap.log.resolve_sent(*sent_seq, snap.generation) {
-            sketch::event_log::CursorResolution::FromBase => 0,
-            sketch::event_log::CursorResolution::Tail { vec_index } => vec_index,
+            yalda::event_log::CursorResolution::FromBase => 0,
+            yalda::event_log::CursorResolution::Tail { vec_index } => vec_index,
         };
         let entries = snap.log.entries();
         if entries.len() > offset {
@@ -2825,7 +2825,7 @@ async fn forward_notifications(
 /// from the watch snapshot, so no events are lost).
 ///
 /// Default is GENEROUS (60s) so a healthy slow-but-progressing client is never
-/// falsely reaped. Override via `SKETCH_SLOW_SUB_TIMEOUT_MS` (u64 ms); `0` or
+/// falsely reaped. Override via `YALDA_SLOW_SUB_TIMEOUT_MS` (u64 ms); `0` or
 /// unset → the 60s default.
 fn slow_sub_write_timeout() -> std::time::Duration {
     // Resolved once per process (env can't change mid-run) so the hot
@@ -2833,7 +2833,7 @@ fn slow_sub_write_timeout() -> std::time::Duration {
     static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
         const DEFAULT_MS: u64 = 60_000;
-        let ms = std::env::var("SKETCH_SLOW_SUB_TIMEOUT_MS")
+        let ms = std::env::var("YALDA_SLOW_SUB_TIMEOUT_MS")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .filter(|&ms| ms > 0)
@@ -2902,10 +2902,10 @@ async fn main() -> io::Result<()> {
         )
         .init();
 
-    // Relocate any state written by older builds under <cache_dir>/sketch into
-    // the durable `~/.sketch` home (ADR-0018), BEFORE the WAL dir is read below.
+    // Relocate any state written by older builds under <cache_dir>/yalda into
+    // the durable `~/.yalda` home (ADR-0018), BEFORE the WAL dir is read below.
     // One-time, idempotent, best-effort.
-    sketch::paths::migrate_legacy_cache_dir();
+    yalda::paths::migrate_legacy_cache_dir();
 
     use clap::Parser;
     // Subcommands manage launchd supervision and exit; no subcommand = run the
@@ -2920,12 +2920,12 @@ async fn main() -> io::Result<()> {
                 // server (never auto-launch a throwaway daemon — a CLI prompt
                 // targets a session in a live server), then enqueue via the
                 // ungated admin path. Print ok/error and exit.
-                let client = match sketch::session_client::SessionServerClient::connect_existing() {
+                let client = match yalda::session_client::SessionServerClient::connect_existing() {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!(
                             "error: could not connect to a running session server ({e}). \
-                             Start one with `sketch-session-server` (or `sketch-session-server install`)."
+                             Start one with `yalda-session-server` (or `yalda-session-server install`)."
                         );
                         std::process::exit(1);
                     }
@@ -2991,7 +2991,7 @@ async fn main() -> io::Result<()> {
     // Default config when no file is present, so this is safe in the headless
     // server. Any parse error degrades to the hard-coded default rather than
     // refusing to start.
-    let config = sketch::config::Config::load().unwrap_or_default();
+    let config = yalda::config::Config::load().unwrap_or_default();
     let default_permission_mode = config.default_permission_mode;
     tracing::info!(
         default_permission_mode = config.default_permission_mode.short_label(),

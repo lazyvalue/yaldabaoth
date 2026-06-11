@@ -76,8 +76,8 @@ high confidence, zero findings** for all three code commits.
   latent restart prompt-loss + perm-mode revert) — behavior-changing, needs the
   app.
 - **11′** `ChannelAttachState` faithful enum — behavior-sensitive reconnect path.
-- One **flaky** test observed: `tests/sketch_channel_test.rs` (legacy
-  sketch-channel, subprocess/timing) failed once under concurrent build load,
+- One **flaky** test observed: `tests/yalda_channel_test.rs` (legacy
+  yalda-channel, subprocess/timing) failed once under concurrent build load,
   passed on every clean re-run. Unrelated to these changes. Candidate for a
   timing-tolerance pass if it recurs.
 

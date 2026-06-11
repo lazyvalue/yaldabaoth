@@ -1,14 +1,14 @@
-//! Client side of the sketch ↔ sketch-channel MCP bridge.
+//! Client side of the yalda ↔ yalda-channel MCP bridge.
 //!
-//! `sketch-channel` is a separate binary that Claude Code spawns as an MCP
-//! server (over stdio). It listens on a Unix domain socket; sketch (this
+//! `yalda-channel` is a separate binary that Claude Code spawns as an MCP
+//! server (over stdio). It listens on a Unix domain socket; yalda (this
 //! editor) connects to that socket and exchanges line-delimited JSON:
 //!
-//! - sketch → server: `{"type":"send","content":"...","meta":{...}}`
-//! - server → sketch: `{"type":"reply","text":"..."}`
+//! - yalda → server: `{"type":"send","content":"...","meta":{...}}`
+//! - server → yalda: `{"type":"reply","text":"..."}`
 //!
 //! The server translates outbound messages into MCP `notifications/claude/channel`
-//! and inbound `reply` tool calls into messages routed back to sketch.
+//! and inbound `reply` tool calls into messages routed back to yalda.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
@@ -36,7 +36,7 @@ struct InMessage {
     text: Option<String>,
 }
 
-/// A live connection to a `sketch-channel` server.
+/// A live connection to a `yalda-channel` server.
 ///
 /// Holds the writer half of the Unix socket plus a receiver fed by a background
 /// reader thread. Drop the client to disconnect.
@@ -45,14 +45,14 @@ pub struct ChannelClient {
     rx: mpsc::Receiver<String>,
     socket_path: PathBuf,
     /// Set to false by the reader thread on EOF/error. The send path checks
-    /// this before writing — a stale connection (e.g. sketch-channel was
+    /// this before writing — a stale connection (e.g. yalda-channel was
     /// replaced by Claude restart) gets detected here even though the local
     /// write fd may still accept data into the kernel buffer.
     connected: Arc<AtomicBool>,
 }
 
 impl ChannelClient {
-    /// Connect to a sketch-channel server listening at `path`. Spawns a reader
+    /// Connect to a yalda-channel server listening at `path`. Spawns a reader
     /// thread that pushes inbound replies into a channel readable via `try_recv`.
     pub fn connect(path: &Path) -> io::Result<Self> {
         let writer = UnixStream::connect(path)?;
@@ -62,7 +62,7 @@ impl ChannelClient {
         let connected = Arc::new(AtomicBool::new(true));
         let connected_for_reader = connected.clone();
         thread::Builder::new()
-            .name("sketch-claude-rx".into())
+            .name("yalda-claude-rx".into())
             .spawn(move || {
                 let reader = BufReader::new(reader_stream);
                 for line in reader.lines() {
@@ -97,14 +97,14 @@ impl ChannelClient {
         self.connected.load(Ordering::SeqCst)
     }
 
-    /// Default socket path. Honours `SKETCH_CHANNEL_SOCKET` if set, otherwise
-    /// `/tmp/sketch-channel-<USER>.sock`.
+    /// Default socket path. Honours `YALDA_CHANNEL_SOCKET` if set, otherwise
+    /// `/tmp/yalda-channel-<USER>.sock`.
     pub fn default_socket_path() -> PathBuf {
-        if let Some(p) = std::env::var_os("SKETCH_CHANNEL_SOCKET") {
+        if let Some(p) = std::env::var_os("YALDA_CHANNEL_SOCKET") {
             return PathBuf::from(p);
         }
         let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-        PathBuf::from(format!("/tmp/sketch-channel-{}.sock", user))
+        PathBuf::from(format!("/tmp/yalda-channel-{}.sock", user))
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -167,7 +167,7 @@ mod tests {
         let n = N.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
-            "sketch-channel-test-{}-{}.sock",
+            "yalda-channel-test-{}-{}.sock",
             std::process::id(),
             n
         ));

@@ -1,9 +1,9 @@
-//! Integration test for the `sketch-channel` MCP server binary.
+//! Integration test for the `yalda-channel` MCP server binary.
 //!
 //! Spawns the binary, drives the MCP protocol over stdin/stdout, opens a Unix
-//! socket connection like sketch would, and verifies:
+//! socket connection like yalda would, and verifies:
 //!  - the `initialize` handshake declares the channel capability
-//!  - sketch sends become `notifications/claude/channel`
+//!  - yalda sends become `notifications/claude/channel`
 //!  - calling the `reply` tool forwards text back to the connected client
 
 use std::io::{BufRead, BufReader, Write};
@@ -20,11 +20,11 @@ fn binary_path() -> std::path::PathBuf {
         .parent()
         .expect("parent")
         .to_path_buf();
-    // ./target/debug/deps/<test-bin>  →  ./target/debug/sketch-channel
+    // ./target/debug/deps/<test-bin>  →  ./target/debug/yalda-channel
     if p.ends_with("deps") {
         p.pop();
     }
-    p.push("sketch-channel");
+    p.push("yalda-channel");
     p
 }
 
@@ -40,24 +40,24 @@ impl Harness {
         let bin = binary_path();
         assert!(
             bin.exists(),
-            "sketch-channel binary not built at {} — run `cargo build --bin sketch-channel`",
+            "yalda-channel binary not built at {} — run `cargo build --bin yalda-channel`",
             bin.display()
         );
 
         let socket_path = std::env::temp_dir().join(format!(
-            "sketch-channel-int-{}-{}.sock",
+            "yalda-channel-int-{}-{}.sock",
             std::process::id(),
             unique()
         ));
         let _ = std::fs::remove_file(&socket_path);
 
         let mut child = Command::new(&bin)
-            .env("SKETCH_CHANNEL_SOCKET", &socket_path)
+            .env("YALDA_CHANNEL_SOCKET", &socket_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn sketch-channel");
+            .expect("spawn yalda-channel");
 
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
@@ -67,7 +67,7 @@ impl Harness {
         while !socket_path.exists() {
             if Instant::now() > deadline {
                 panic!(
-                    "sketch-channel never bound socket {}",
+                    "yalda-channel never bound socket {}",
                     socket_path.display()
                 );
             }
@@ -130,7 +130,7 @@ fn initialize_declares_channel_capability() {
         resp
     );
     assert!(caps["tools"].is_object(), "missing tools capability");
-    assert_eq!(resp["result"]["serverInfo"]["name"], "sketch");
+    assert_eq!(resp["result"]["serverInfo"]["name"], "yalda");
 }
 
 #[test]
@@ -154,7 +154,7 @@ fn tools_list_exposes_reply() {
 }
 
 #[test]
-fn sketch_send_becomes_channel_notification() {
+fn yalda_send_becomes_channel_notification() {
     let mut h = Harness::start();
     // Skip the initialize handshake — the bin starts reading the socket immediately.
     let mut sock = UnixStream::connect(&h.socket_path).expect("connect socket");
@@ -189,7 +189,7 @@ fn invalid_meta_keys_are_dropped() {
 }
 
 #[test]
-fn reply_tool_forwards_to_sketch() {
+fn reply_tool_forwards_to_yalda() {
     let mut h = Harness::start();
     let sock = UnixStream::connect(&h.socket_path).expect("connect socket");
 

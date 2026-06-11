@@ -45,7 +45,7 @@ Our shape is narrow and specific:
 
 ## Decision
 
-**Hand-roll the actor** with the bare tokio pattern the spec already sketches: a
+**Hand-roll the actor** with the bare tokio pattern the spec already yaldaes: a
 `Command` enum, a `tokio::sync::mpsc` inlet, a `tokio::spawn`ed `loop`, and
 `oneshot` for request/response replies. ~150 LoC, no new dependency.
 

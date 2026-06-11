@@ -1,4 +1,4 @@
-//! launchd LaunchAgent integration (macOS): make `sketch-session-server` a
+//! launchd LaunchAgent integration (macOS): make `yalda-session-server` a
 //! **supervised, start-at-login** daemon so agent sessions keep running with no
 //! GUI present — and get restarted automatically if the server crashes.
 //!
@@ -15,16 +15,16 @@
 //! which is the opposite of lazy start. `RunAtLoad` + `KeepAlive` + the existing
 //! single-instance guard is the right shape (see ADR-0013).
 //!
-//! Managed via subcommands: `sketch-session-server install | uninstall | status`.
+//! Managed via subcommands: `yalda-session-server install | uninstall | status`.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// launchd job label. Also the plist filename stem.
-pub const LABEL: &str = "com.sketch.session-server";
+pub const LABEL: &str = "com.yalda.session-server";
 
-/// `~/Library/LaunchAgents/com.sketch.session-server.plist`.
+/// `~/Library/LaunchAgents/com.yalda.session-server.plist`.
 pub fn plist_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| {
         h.join("Library")
@@ -36,9 +36,9 @@ pub fn plist_path() -> Option<PathBuf> {
 /// Where the supervised server's stdout/stderr go — the same log the
 /// GUI-auto-launched server uses, so diagnostics land in one place.
 pub fn log_path() -> PathBuf {
-    sketch::paths::sketch_home()
+    yalda::paths::yalda_home()
         .map(|d| d.join("session-server.log"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/sketch-session-server.log"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/yalda-session-server.log"))
 }
 
 fn xml_escape(s: &str) -> String {
@@ -167,7 +167,7 @@ pub fn status() -> io::Result<()> {
         socket.display()
     );
     if !installed {
-        println!("  → run `sketch-session-server install` to supervise it via launchd.");
+        println!("  → run `yalda-session-server install` to supervise it via launchd.");
     }
     Ok(())
 }
@@ -211,7 +211,7 @@ fn launchctl(args: &[&str]) -> io::Result<()> {
 
 // `socket_path` / `pid_file_path` come from the proto crate; re-import here so
 // the launchd helpers can find the running instance.
-use sketch::session_proto::{pid_file_path, socket_path};
+use yalda::session_proto::{pid_file_path, socket_path};
 
 #[cfg(test)]
 mod tests {
@@ -220,11 +220,11 @@ mod tests {
     #[test]
     fn plist_contains_required_keys() {
         let p = launch_agent_plist(
-            Path::new("/Applications/sketch.app/Contents/MacOS/sketch-session-server"),
-            Path::new("/Users/x/.sketch/session-server.log"),
+            Path::new("/Applications/yalda.app/Contents/MacOS/yalda-session-server"),
+            Path::new("/Users/x/.yalda/session-server.log"),
         );
-        assert!(p.contains("<string>com.sketch.session-server</string>"));
-        assert!(p.contains("/Applications/sketch.app/Contents/MacOS/sketch-session-server"));
+        assert!(p.contains("<string>com.yalda.session-server</string>"));
+        assert!(p.contains("/Applications/yalda.app/Contents/MacOS/yalda-session-server"));
         assert!(p.contains("<key>RunAtLoad</key>"));
         // KeepAlive must be the SuccessfulExit=false dict form, NOT bare <true/>,
         // so the single-instance clean-exit guard can't cause a restart loop.
@@ -240,10 +240,10 @@ mod tests {
     #[test]
     fn plist_escapes_xml_special_chars_in_paths() {
         let p = launch_agent_plist(
-            Path::new("/tmp/weird & <path>/sketch-session-server"),
+            Path::new("/tmp/weird & <path>/yalda-session-server"),
             Path::new("/tmp/log"),
         );
-        assert!(p.contains("/tmp/weird &amp; &lt;path&gt;/sketch-session-server"));
+        assert!(p.contains("/tmp/weird &amp; &lt;path&gt;/yalda-session-server"));
         // The raw, unescaped form must NOT appear.
         assert!(!p.contains("weird & <path>"));
     }

@@ -671,15 +671,15 @@ mod tests {
 
     /// 100%-certainty check against the user's REAL WAL(s): every record tagged
     /// as a tool call must recover (never land in `Unknown`). Opt-in (reads
-    /// `~/.sketch/wal`) so CI / other machines skip it; run with
-    /// `SKETCH_WAL_RECOVER_CHECK=1 cargo test`.
+    /// `~/.yalda/wal`) so CI / other machines skip it; run with
+    /// `YALDA_WAL_RECOVER_CHECK=1 cargo test`.
     #[test]
     fn real_wal_tool_calls_all_recover_when_present() {
-        if std::env::var("SKETCH_WAL_RECOVER_CHECK").as_deref() != Ok("1") {
+        if std::env::var("YALDA_WAL_RECOVER_CHECK").as_deref() != Ok("1") {
             return;
         }
         let Some(home) = dirs::home_dir() else { return };
-        let wal_dir = home.join(".sketch").join("wal");
+        let wal_dir = home.join(".yalda").join("wal");
         let Ok(entries) = std::fs::read_dir(&wal_dir) else {
             return;
         };

@@ -2,7 +2,7 @@
 
 Goal the user stated: *agent sessions keep running on the server even with no GUI,
 and the GUI can restart with zero interruption.* That architecture already exists
-(detached `sketch-session-server` daemon, event-log transcript, re-attach on
+(detached `yalda-session-server` daemon, event-log transcript, re-attach on
 reconnect). What broke the "zero interruption" promise was the open
 **reconnect-storm** bug (`NEEDS-RUNTIME-REPRO`). This session root-caused and
 fixed it. Branch: `session-resilience`.
@@ -43,25 +43,25 @@ cause was the socket never closing.
    tearing down the old one, so a bare attach still loses the race momentarily.
    Retries on ownership contention only (~1s, 20×50ms), then Observer fallback —
    mirrors the open-path helper but in the lib so it's testable.
-3. **`src/bin/sketch-gpui/main.rs` — `reconnect_session_server` re-attaches off
+3. **`src/bin/yalda-gpui/main.rs` — `reconnect_session_server` re-attaches off
    the paint thread** via the existing `spawn_attach_sessions` (which already does
    the Owner-reclaim retry + per-slot status reconcile), replacing raw inline
    blocking `attach()` round-trips that had **no retry** and also **froze
    rendering**. Signature gained `cx`; the one call site updated.
-4. **`src/bin/sketch-session-server/main.rs` — single-instance guard.** If a
+4. **`src/bin/yalda-session-server/main.rs` — single-instance guard.** If a
    server is already listening on the socket, exit cleanly instead of
    `remove_file` + rebind (which silently steals the socket and orphans the live
    server's sessions). The client auto-launches a server on any failed connect,
    so spurious concurrent launches happen; this makes them harmless.
 5. **`src/session_proto.rs` — `pid_file_path` + `session_server_persist_path` now
-   follow `SKETCH_SESSION_SOCKET`.** Default paths unchanged
-   (`/tmp/sketch-session-$USER.{pid}`, cache-dir state). The override enables
+   follow `YALDA_SESSION_SOCKET`.** Default paths unchanged
+   (`/tmp/yalda-session-$USER.{pid}`, cache-dir state). The override enables
    isolated instances (tests) and makes the PID file a real per-socket guard.
 
 ## Verification — new headless harness
 
-`tests/session_resilience_test.rs` drives the **real** `sketch-session-server`
-binary (`CARGO_BIN_EXE_…`) on a private socket, with `SKETCH_ACP_AGENT=/usr/bin/true`
+`tests/session_resilience_test.rs` drives the **real** `yalda-session-server`
+binary (`CARGO_BIN_EXE_…`) on a private socket, with `YALDA_ACP_AGENT=/usr/bin/true`
 so **no real ACP agent is needed** — `create_session` returns before the handshake
 and the session persists in the manager even if the agent fails to spawn, so the
 whole connect/attach/reconnect/ownership layer is exercised without Claude.
@@ -89,7 +89,7 @@ The GPUI app's reconnect path (#3) compiles and reuses proven off-thread attach
 code, but the end-to-end "GUI reconnects seamlessly after the server reader sees
 EOF" needs a human runtime check. Repro: launch GUI with a live session, `kill`
 the server (or trigger a server restart), confirm the session re-attaches with no
-flapping and no "another GUI already owns" in `~/Library/Caches/sketch/session-server.log`.
+flapping and no "another GUI already owns" in `~/Library/Caches/yalda/session-server.log`.
 
 ## Follow-ups
 

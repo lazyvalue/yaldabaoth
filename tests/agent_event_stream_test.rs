@@ -17,8 +17,8 @@
 //!
 //! Requires `--features test-support`.
 
-use sketch::acp_channel::{AgentTransport, FakeTransport, ReplyEvent};
-use sketch::agent_event::{
+use yalda::acp_channel::{AgentTransport, FakeTransport, ReplyEvent};
+use yalda::agent_event::{
     AgentEvent, AgentEventKind, ChunkRole, TurnOutcome, agent_kind_from_reply, replay_end_kind,
     turn_ended_kind,
 };
@@ -248,7 +248,7 @@ fn replay_complete_folds_into_replay_end() {
 /// forwarding node never corrupts the durable WAL.
 #[test]
 fn unknown_agent_event_round_trips_through_notification() {
-    use sketch::session_proto::Notification;
+    use yalda::session_proto::Notification;
 
     // A future server wrote this `Notification::Agent` with a kind this build
     // doesn't know.

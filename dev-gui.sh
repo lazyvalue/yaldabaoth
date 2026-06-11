@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Dev iteration loop for sketch — rebuild + restart JUST the gui.
+# Dev iteration loop for yalda — rebuild + restart JUST the gui.
 #
-# Builds ONLY sketch-gpui and restarts it, leaving the running session server
+# Builds ONLY yalda-gpui and restarts it, leaving the running session server
 # (and every live agent session it holds) UNTOUCHED. We deliberately do NOT
 # kill the server and do NOT clear the socket: the fresh GUI reconnects to the
 # existing server and re-attaches its sessions via the proven GUI-restart /
@@ -21,12 +21,12 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo "▸ building sketch-gpui…"
-cargo build --bin sketch-gpui
+echo "▸ building yalda-gpui…"
+cargo build --bin yalda-gpui
 
-echo "▸ stopping any running sketch gui (server left alone — agents survive)…"
-pkill -f 'target/debug/sketch-gpui' 2>/dev/null || true
+echo "▸ stopping any running yalda gui (server left alone — agents survive)…"
+pkill -f 'target/debug/yalda-gpui' 2>/dev/null || true
 sleep 0.3   # let the old window's teardown settle before the new one attaches
 
 echo "▸ launching fresh gui (reconnecting to the existing server)…"
-exec ./target/debug/sketch-gpui "$@"
+exec ./target/debug/yalda-gpui "$@"

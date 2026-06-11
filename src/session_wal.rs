@@ -323,7 +323,7 @@ mod tests {
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "sketch-wal-test-{}-{}-{tag}",
+            "yalda-wal-test-{}-{}-{tag}",
             std::process::id(),
             // a per-call counter avoids collisions without needing a clock
             COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst),

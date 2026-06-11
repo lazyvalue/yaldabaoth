@@ -1,5 +1,5 @@
-use sketch::blocks::*;
-use sketch::viewport::Viewport;
+use yalda::blocks::*;
+use yalda::viewport::Viewport;
 
 fn make_heading(level: u8) -> RenderedBlock {
     RenderedBlock::Heading {
@@ -74,7 +74,7 @@ fn test_jump_top_and_bottom() {
 
 #[test]
 fn ensure_cursor_visible_keeps_cursor_within_scrolloff_at_bottom() {
-    use sketch::viewport::SCROLLOFF;
+    use yalda::viewport::SCROLLOFF;
     let mut vp = Viewport::new(80);
     vp.total_lines = 1000;
     let viewport_height = 30;
@@ -100,7 +100,7 @@ fn ensure_cursor_visible_keeps_cursor_within_scrolloff_at_bottom() {
 
 #[test]
 fn ensure_cursor_visible_keeps_cursor_within_scrolloff_at_top() {
-    use sketch::viewport::SCROLLOFF;
+    use yalda::viewport::SCROLLOFF;
     let mut vp = Viewport::new(80);
     vp.total_lines = 1000;
     vp.scroll_offset = 50;

@@ -9,11 +9,11 @@
 - **`spec-agent-window.md`** — Defines `AgentWindow`, `AgentRing`, `AgentSlot`, and `AgentState`. Its revision history parks "per-window cwd" as a sibling spec; this is that spec. The `AgentSlot` data model gains one field; the Status Strip layout (§30) gains one field; the persisted slot JSON shape (§35) gains one field. Nothing about the worksheet/chatbox contract, sidebars, or input modes is affected.
 - **`spec-multi-session.md`** — Defines the session lifecycle (`session/new`, `session/load`, detach, attach). This spec relies on detach + fresh-attach as the mechanism for changing a live session's cwd, since a running ACP subprocess cannot move cwd. The "re-attach starts fresh" contract from §4 of that spec carries straight over.
 - **`spec-tabs-and-splits.md`** — Path canonicalization rule (Constraint §11) is reused: per-slot cwds canonicalize with `std::fs::canonicalize` when the directory exists, falling back to `cwd.join(path)` with `.`/`..` collapsed when it doesn't. Persistence of the workspace tree (Behaviors 23–24) is unaffected — `workspace.json` keeps storing only session ids in its `Claude` leaves; per-slot cwds live in `acp_sessions.json` next to the session id.
-- **`src/acp_channel.rs`** — `AcpChannelClient::spawn_with_resume_in` already takes `cwd: Option<PathBuf>`, but today that value is **only** forwarded to the agent over the wire as `NewSessionRequest::new(cwd)` (`acp_channel.rs:1098, 1117`); it is **not** applied to the spawned OS process. `tokio::process::Command::new(&parts[0])` at `acp_channel.rs:733` never calls `.current_dir(...)`, so the agent subprocess inherits sketch's process cwd regardless of the argument. This spec **fixes that**: the worker must call `cmd.current_dir(&cwd)` on the `tokio::process::Command` builder before spawn so the OS-level cwd matches the protocol-level cwd. Without that, any agent tool call that reads the OS cwd (Bash `pwd` / `ls .` / a subprocess spawned with a relative path) keeps resolving against sketch's process cwd, which would make `:claude-new <path>` and `:claude-cd <path>` misleading half-features.
+- **`src/acp_channel.rs`** — `AcpChannelClient::spawn_with_resume_in` already takes `cwd: Option<PathBuf>`, but today that value is **only** forwarded to the agent over the wire as `NewSessionRequest::new(cwd)` (`acp_channel.rs:1098, 1117`); it is **not** applied to the spawned OS process. `tokio::process::Command::new(&parts[0])` at `acp_channel.rs:733` never calls `.current_dir(...)`, so the agent subprocess inherits yalda's process cwd regardless of the argument. This spec **fixes that**: the worker must call `cmd.current_dir(&cwd)` on the `tokio::process::Command` builder before spawn so the OS-level cwd matches the protocol-level cwd. Without that, any agent tool call that reads the OS cwd (Bash `pwd` / `ls .` / a subprocess spawned with a relative path) keeps resolving against yalda's process cwd, which would make `:claude-new <path>` and `:claude-cd <path>` misleading half-features.
 
 ## Overview
 
-Today every agent session sketch spawns runs at the process's `cwd` — whatever directory the user launched sketch from. Sessions that were created before the user ran `cd` (or that resume from a persisted state where the project layout has shifted) still inherit today's process cwd. There is no per-session control.
+Today every agent session yalda spawns runs at the process's `cwd` — whatever directory the user launched yalda from. Sessions that were created before the user ran `cd` (or that resume from a persisted state where the project layout has shifted) still inherit today's process cwd. There is no per-session control.
 
 This spec gives each `AgentSlot` its own `cwd: PathBuf`. The slot's `cwd` is the directory the subprocess runs in and the directory the agent's tool calls resolve relative to. The user picks it when creating a session (`:claude-new <path>`) and can change it later (`:claude-cd <path>`, which detaches and respawns). Defaults preserve today's behavior — `:claude-new` with no argument uses the process cwd.
 
@@ -28,10 +28,10 @@ The spec introduces no new artifacts. It extends three existing ones and fixes o
 
 ### Lifecycle
 
-1. **Creation default. [DRAFT]** When a slot is created without an explicit cwd — bootstrap (the first slot when sketch opens Claude), bare `:claude-new`, restoring a persisted slot that has no `cwd` field — the slot's `cwd` is `std::env::current_dir()` resolved at the moment of creation. If `current_dir()` itself fails (rare; pwd gone), the fallback is `PathBuf::from("/")` — the same fallback `AcpChannelClient::try_spawn` already uses (`src/acp_channel.rs:411`).
+1. **Creation default. [DRAFT]** When a slot is created without an explicit cwd — bootstrap (the first slot when yalda opens Claude), bare `:claude-new`, restoring a persisted slot that has no `cwd` field — the slot's `cwd` is `std::env::current_dir()` resolved at the moment of creation. If `current_dir()` itself fails (rare; pwd gone), the fallback is `PathBuf::from("/")` — the same fallback `AcpChannelClient::try_spawn` already uses (`src/acp_channel.rs:411`).
 
 2. **Creation with explicit cwd. [DRAFT]** `:claude-new <path>` parses `<path>` and uses it as the new slot's cwd. The path may be absolute or relative; relative paths resolve against the process cwd (not against any other slot's cwd). Resolution sequence:
-    1. **Tilde expansion.** A leading `~` or `~/` is expanded to `$HOME` (read from the environment). A literal `~` followed by a username (`~alice/...`) is **not** supported and is left unchanged — sketch is single-user and the userdir-lookup path would add a dependency for one degenerate case.
+    1. **Tilde expansion.** A leading `~` or `~/` is expanded to `$HOME` (read from the environment). A literal `~` followed by a username (`~alice/...`) is **not** supported and is left unchanged — yalda is single-user and the userdir-lookup path would add a dependency for one degenerate case.
     2. **Canonicalization** per `spec-tabs-and-splits.md` Constraint §11: `std::fs::canonicalize` when the path exists, fall back to `process_cwd.join(path)` with `.`/`..` collapsed when it doesn't.
     3. **Validation:** the resolved path must exist and be a directory; otherwise the command no-ops with footer hint `not a directory: <path>` and no slot is created. A nonexistent argument is a typo, not a feature.
 
@@ -54,7 +54,7 @@ The spec introduces no new artifacts. It extends three existing ones and fixes o
 6. **Status Strip cwd field. [DRAFT]** The Status Strip (`spec-agent-window.md` §30) gains a cwd field. **Field order** (left to right): agent label → sub-agent breadcrumb (when focused, per `spec-agent-window.md` §27) → **cwd** → model id → permission mode → context-window usage → cumulative cost → turn/elapsed. The cwd sits between any sub-agent breadcrumb and the model id so it always reads as "where this agent operates" — adjacent to the agent's identity, not to its tokens.
 
     ```
-     claude-1   ~/ws/sketch   sonnet-4-7   auto-edit   12.3k / 200k (6%)   $0.18   turn 4 · 0:14
+     claude-1   ~/ws/yalda   sonnet-4-7   auto-edit   12.3k / 200k (6%)   $0.18   turn 4 · 0:14
     ```
 
     The displayed string is the shortened form of `slot.cwd`:
@@ -73,7 +73,7 @@ The spec introduces no new artifacts. It extends three existing ones and fixes o
 
 9. **cwd missing at restore. [DRAFT]** If the persisted cwd no longer exists at restore time (directory deleted, drive unmounted, project moved), the spawn itself fails: with `cmd.current_dir(&cwd)` set per §3, POSIX raises `ENOENT` at fork time. That error flows through the existing failed-attach path — `try_spawn` returns `Err`, the attach-thread sends it through the `attach_pending` channel, and the pump translates it to `slot.channel = None` with footer hint `claude-1: cwd no longer exists: <path>` (using the same status-line mechanism that today surfaces "no ACP agent on PATH"). The slot remains in the ring with the transcript visible and `channel: None`; the user can `:claude-cd <other-path>` to recover. The persisted `cwd` field is **not** rewritten on disk — the user may have temporarily detached the drive; preserving the original path means the next restore in the right environment works.
 
-10. **Downgrade compatibility. [DRAFT]** Older sketch binaries reading a newly-written `acp_sessions.json` deserialize each slot record with serde's "ignore unknown fields" behavior. `cwd` is silently dropped; the downgraded slot spawns at process cwd. No persisted session is lost — same downgrade shape as `spec-agent-window.md` §35.
+10. **Downgrade compatibility. [DRAFT]** Older yalda binaries reading a newly-written `acp_sessions.json` deserialize each slot record with serde's "ignore unknown fields" behavior. `cwd` is silently dropped; the downgraded slot spawns at process cwd. No persisted session is lost — same downgrade shape as `spec-agent-window.md` §35.
 
 ## Data Model
 
@@ -96,7 +96,7 @@ struct AgentSlot {
 
 ```json
 {
-  "/Users/scott/ws/sketch": [
+  "/Users/scott/ws/yalda": [
     {
       "id": "ses_abc123",
       "label": "claude-1",
@@ -104,7 +104,7 @@ struct AgentSlot {
       "mode": "worksheet",
       "tasklist_open": true,
       "subagents_open": false,
-      "cwd": "/Users/scott/ws/sketch"
+      "cwd": "/Users/scott/ws/yalda"
     },
     {
       "id": "ses_def456",
@@ -173,13 +173,13 @@ The cwd field renders per the field-order rule in §6 (after any sub-agent bread
 
 1. **One cwd per slot, fixed for the slot's lifetime by default.** `:claude-cd` is the only way to change it, and it costs the conversation (fresh `session/new`). No mid-conversation cwd drift. This matches the subprocess model — the agent process literally has one cwd.
 
-2. **Resolution at command time, not display time.** `:claude-new ./foo` resolves `./foo` against the process cwd **at the moment the command runs**. If the user later runs `cd` in their shell (which doesn't reach sketch anyway) or sketch's own process cwd changes, the slot's absolute cwd is unaffected. Sketch never reinterprets a stored cwd as relative.
+2. **Resolution at command time, not display time.** `:claude-new ./foo` resolves `./foo` against the process cwd **at the moment the command runs**. If the user later runs `cd` in their shell (which doesn't reach yalda anyway) or yalda's own process cwd changes, the slot's absolute cwd is unaffected. Yalda never reinterprets a stored cwd as relative.
 
-3. **No cwd validation on restore.** A persisted cwd whose directory no longer exists is loaded as-is and passed to the subprocess. With `cmd.current_dir(&cwd)` set, the spawn fails at fork time with `ENOENT`; the failed-attach path surfaces a footer hint per §9. Sketch does not crash, does not rewrite the persisted file, and does not silently swap to process cwd. The user diagnoses and either fixes the directory or runs `:claude-cd`.
+3. **No cwd validation on restore.** A persisted cwd whose directory no longer exists is loaded as-is and passed to the subprocess. With `cmd.current_dir(&cwd)` set, the spawn fails at fork time with `ENOENT`; the failed-attach path surfaces a footer hint per §9. Yalda does not crash, does not rewrite the persisted file, and does not silently swap to process cwd. The user diagnoses and either fixes the directory or runs `:claude-cd`.
 
 4. **`workspace.json` is not extended.** The workspace persistence file stores Claude leaves by `session_id` only (`spec-tabs-and-splits.md` Behavior 23). The cwd lives next to the session id in `acp_sessions.json`, not in `workspace.json`. Two files-of-truth would risk drift. The loader resolves the cwd at `session/load` time by reading `acp_sessions.json`.
 
-5. **Persistence is keyed by sketch's process cwd, not by the slot's cwd.** `save_persisted_acp_sessions(cwd, ring)` at `main.rs:1878` keys the JSON object by `std::env::current_dir()` at save time. A slot whose `cwd = /Users/scott/ws/foo` created while sketch ran from `/Users/scott/ws/sketch` is saved under the top-level `/Users/scott/ws/sketch` key. Launching sketch from `/Users/scott/ws/foo` does **not** restore that slot — the key is the workspace, the slot's `cwd` is its tool-execution root, and the two are independent. This matches the mental model "a sketch workspace is one project; its agents may operate on adjacent directories." Cross-workspace agent restore is out of scope.
+5. **Persistence is keyed by yalda's process cwd, not by the slot's cwd.** `save_persisted_acp_sessions(cwd, ring)` at `main.rs:1878` keys the JSON object by `std::env::current_dir()` at save time. A slot whose `cwd = /Users/scott/ws/foo` created while yalda ran from `/Users/scott/ws/yalda` is saved under the top-level `/Users/scott/ws/yalda` key. Launching yalda from `/Users/scott/ws/foo` does **not** restore that slot — the key is the workspace, the slot's `cwd` is its tool-execution root, and the two are independent. This matches the mental model "a yalda workspace is one project; its agents may operate on adjacent directories." Cross-workspace agent restore is out of scope.
 
 6. **Browser-window cwd is unrelated.** `BrowserWindow.fb.current_dir()` is the file browser's working directory, not the agent's. They may diverge — a user can browse `/foo` in one tile while their active agent operates on `/bar`. There is no link between the two in v1; a future "spawn agent at browser dir" affordance can land later without changing this spec.
 
@@ -195,5 +195,5 @@ The cwd field renders per the field-order rule in §6 (after any sub-agent bread
 
 ## Revision History
 
-- 2026-05-22 (2) — Adversarial review pass. Blocking fix: §"Builds On" and §3 corrected — today's `acp_channel.rs` worker never calls `cmd.current_dir(...)` on the `tokio::process::Command` builder, so the `cwd` argument was only flowing as a NewSessionRequest hint while the OS-level subprocess inherited sketch's process cwd; spec now mandates the missing line. §2 path resolution gained an explicit tilde-expansion step (input form matches the §6 display form). §4 (`:claude-cd`) gained a session-divider transcript marker so the user sees where old subprocess knowledge ends; also documented the pump's `wake_rx` re-acquisition path as no-new-code. §9 (cwd missing at restore) rewritten to flow through the spawn-error path (`ENOENT` at fork time) rather than vaguely through tool-call errors. §6 (Status Strip) field order pinned down relative to the sub-agent breadcrumb. `AgentRing::push` signature change spelled out (`push` gains a `cwd: PathBuf` argument). New Constraint §5 making process-cwd-keyed persistence explicit. New Constraint §11 noting `display().to_string()` lossiness on non-UTF8 paths.
+- 2026-05-22 (2) — Adversarial review pass. Blocking fix: §"Builds On" and §3 corrected — today's `acp_channel.rs` worker never calls `cmd.current_dir(...)` on the `tokio::process::Command` builder, so the `cwd` argument was only flowing as a NewSessionRequest hint while the OS-level subprocess inherited yalda's process cwd; spec now mandates the missing line. §2 path resolution gained an explicit tilde-expansion step (input form matches the §6 display form). §4 (`:claude-cd`) gained a session-divider transcript marker so the user sees where old subprocess knowledge ends; also documented the pump's `wake_rx` re-acquisition path as no-new-code. §9 (cwd missing at restore) rewritten to flow through the spawn-error path (`ENOENT` at fork time) rather than vaguely through tool-call errors. §6 (Status Strip) field order pinned down relative to the sub-agent breadcrumb. `AgentRing::push` signature change spelled out (`push` gains a `cwd: PathBuf` argument). New Constraint §5 making process-cwd-keyed persistence explicit. New Constraint §11 noting `display().to_string()` lossiness on non-UTF8 paths.
 - 2026-05-22 — Initial DRAFT. Sibling spec to `spec-agent-window.md`. One field on `AgentSlot`, one field in the persisted JSON, one field in the Status Strip, two commands (`:claude-new <path>` extension and new `:claude-cd <path>`).

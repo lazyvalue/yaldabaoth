@@ -8,7 +8,7 @@ expression: blocks
         content: StyledLine {
             spans: [
                 StyledSpan {
-                    text: "Sketch Showcase",
+                    text: "Yalda Showcase",
                     style: Style {
                         fg: Some(
                             Rgb(
@@ -2923,7 +2923,7 @@ expression: blocks
             StyledLine {
                 spans: [
                     StyledSpan {
-                        text: "Sketch Logo",
+                        text: "Yalda Logo",
                         style: Style {
                             fg: Some(
                                 Rgb(

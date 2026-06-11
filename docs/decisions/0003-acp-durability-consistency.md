@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-06-02
-**Related:** session_client.rs, session_proto.rs, sketch-session-server/main.rs
+**Related:** session_client.rs, session_proto.rs, yalda-session-server/main.rs
 
 ## Context
 

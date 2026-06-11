@@ -30,9 +30,9 @@ perform the restart and the at-login start.
 
 ## Decision
 
-Ship a per-user **LaunchAgent** (`com.sketch.session-server`) with
+Ship a per-user **LaunchAgent** (`com.yalda.session-server`) with
 `RunAtLoad=true` and `KeepAlive={SuccessfulExit=false}`, managed by
-`sketch-session-server install | uninstall | status`.
+`yalda-session-server install | uninstall | status`.
 
 - `RunAtLoad` → starts at login. `KeepAlive{SuccessfulExit=false}` → restarts on
   a **crash** (non-zero/signal) but NOT on a clean exit. The clean-exit

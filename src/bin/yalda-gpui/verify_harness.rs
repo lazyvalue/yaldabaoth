@@ -4,7 +4,7 @@
 //! driven headlessly, so a human is the verification oracle for every change.
 //! GPUI ships a real test harness (`#[gpui::test]` + `TestAppContext`, which
 //! simulates platform input and runs the async executor via `run_until_parked`)
-//! — this module builds on it to drive `SketchGpuiView` (open agent, simulate
+//! — this module builds on it to drive `YaldaGpuiView` (open agent, simulate
 //! keystrokes, stream synthetic events, assert state) without a display.
 //!
 //! `test-support` is enabled via the `gpui` dev-dependency, so this compiles
@@ -17,14 +17,14 @@
 
 use gpui::{AppContext, TestAppContext, point, px};
 
-use crate::SketchGpuiView;
-use sketch::theme::Theme;
+use crate::YaldaGpuiView;
+use yalda::theme::Theme;
 use std::path::PathBuf;
 
 /// Stone 1: prove GPUI's `test-support` harness wires up in this crate — boot a
 /// `TestAppContext` and round-trip an entity through `update`/`read`. If this
 /// runs, the headless-driver path is open and we can build up to constructing a
-/// real window + `SketchGpuiView` and simulating input.
+/// real window + `YaldaGpuiView` and simulating input.
 #[gpui::test]
 fn harness_boots(cx: &mut TestAppContext) {
     let value = cx.update(|cx| {
@@ -34,7 +34,7 @@ fn harness_boots(cx: &mut TestAppContext) {
     assert_eq!(value, 41, "TestAppContext entity round-trip");
 }
 
-/// Stone 2: construct the REAL `SketchGpuiView` in a headless test window and
+/// Stone 2: construct the REAL `YaldaGpuiView` in a headless test window and
 /// render a frame (`run_until_parked` drives layout/paint via the test
 /// platform). This is a *capability* proof — the production view is headlessly
 /// constructable, renderable, and its state is readable — not a verification of
@@ -45,7 +45,7 @@ fn constructs_and_renders_real_view(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        SketchGpuiView::new_browser(
+        YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -59,7 +59,7 @@ fn constructs_and_renders_real_view(cx: &mut TestAppContext) {
     let readable = view.read_with(vcx, |_v, _cx| true);
     assert!(
         readable,
-        "real SketchGpuiView constructs + renders headlessly"
+        "real YaldaGpuiView constructs + renders headlessly"
     );
 }
 
@@ -76,7 +76,7 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        let mut v = SketchGpuiView::new_browser(
+        let mut v = YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -161,7 +161,7 @@ fn doc_view_render_is_o_visible(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        let mut v = SketchGpuiView::new_browser(
+        let mut v = YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -180,10 +180,10 @@ fn doc_view_render_is_o_visible(cx: &mut TestAppContext) {
     //     counter was zeroed by `test_open_doc`; a `notify` + `run_until_parked`
     //     drives exactly one virtualized render. Virtualization must build only
     //     the visible window, not all N blocks. ---
-    SketchGpuiView::test_reset_doc_block_builds();
+    YaldaGpuiView::test_reset_doc_block_builds();
     view.update(vcx, |_v, cx| cx.notify());
     vcx.run_until_parked();
-    let cold = SketchGpuiView::test_doc_block_builds();
+    let cold = YaldaGpuiView::test_doc_block_builds();
     assert!(
         cold > 0,
         "doc list must build the visible window (got 0 — splash not cleared / list not rendering)"
@@ -199,7 +199,7 @@ fn doc_view_render_is_o_visible(cx: &mut TestAppContext) {
 
     // --- Move the focused block and re-render. The build count must stay
     //     bounded (still just the visible window), never O(document). ---
-    SketchGpuiView::test_reset_doc_block_builds();
+    YaldaGpuiView::test_reset_doc_block_builds();
     view.update(vcx, |v, cx| {
         if let Some(d) = v.doc_mut() {
             d.cursor_block = 1500; // jump into the middle of the doc
@@ -207,7 +207,7 @@ fn doc_view_render_is_o_visible(cx: &mut TestAppContext) {
         cx.notify();
     });
     vcx.run_until_parked();
-    let after_move = SketchGpuiView::test_doc_block_builds();
+    let after_move = YaldaGpuiView::test_doc_block_builds();
     assert!(
         after_move <= VISIBLE_CEILING,
         "doc render after a cursor-block move must stay O(visible) (<= {VISIBLE_CEILING}), got {after_move}"
@@ -228,7 +228,7 @@ fn doc_hit_test_never_touches_unpainted_layout(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        let mut v = SketchGpuiView::new_browser(
+        let mut v = YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -291,7 +291,7 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        let mut v = SketchGpuiView::new_browser(
+        let mut v = YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -343,10 +343,10 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
     );
 
     // Decision tap: render one clean frame and inspect what was highlighted.
-    SketchGpuiView::test_reset_doc_render_tap();
+    YaldaGpuiView::test_reset_doc_render_tap();
     view.update(vcx, |_v, cx| cx.notify());
     vcx.run_until_parked();
-    let tap = SketchGpuiView::test_doc_render_tap();
+    let tap = YaldaGpuiView::test_doc_render_tap();
 
     assert!(
         !tap.selection.is_empty(),
@@ -391,7 +391,7 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
 /// bound to `server_sid`. Returns nothing; the active slot is the new one.
 #[cfg(test)]
 fn install_agent_slot(
-    view: &gpui::Entity<SketchGpuiView>,
+    view: &gpui::Entity<YaldaGpuiView>,
     vcx: &mut gpui::VisualTestContext,
     server_sid: Option<&str>,
 ) {
@@ -407,7 +407,7 @@ fn install_agent_slot(
 
 #[cfg(test)]
 fn active_transcript_text(
-    view: &gpui::Entity<SketchGpuiView>,
+    view: &gpui::Entity<YaldaGpuiView>,
     vcx: &mut gpui::VisualTestContext,
 ) -> String {
     view.update(vcx, |v, _cx| {
@@ -423,14 +423,14 @@ fn active_transcript_text(
 /// appear exactly once.
 #[gpui::test]
 fn agent_seam_suppresses_double_render_when_chunk_precedes_echo(cx: &mut TestAppContext) {
-    use sketch::acp_channel::ReplyEvent;
-    use sketch::agent_transcript::UserTurnOrigin;
-    use sketch::session_proto::Notification as ServerNotification;
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::agent_transcript::UserTurnOrigin;
+    use yalda::session_proto::Notification as ServerNotification;
 
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        SketchGpuiView::new_browser(
+        YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -476,13 +476,13 @@ fn agent_seam_suppresses_double_render_when_chunk_precedes_echo(cx: &mut TestApp
 /// the bind-before-attach restructure relies on.
 #[gpui::test]
 fn agent_seam_routes_reply_only_after_session_is_bound(cx: &mut TestAppContext) {
-    use sketch::acp_channel::ReplyEvent;
-    use sketch::session_proto::Notification as ServerNotification;
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
 
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        SketchGpuiView::new_browser(
+        YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -549,7 +549,7 @@ fn cmd_b_toggles_file_browser_rail(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        SketchGpuiView::new_browser(
+        YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -559,7 +559,7 @@ fn cmd_b_toggles_file_browser_rail(cx: &mut TestAppContext) {
 
     // Read the rail kind on the active tab: None = no rail, Some(true) = a
     // file-browser rail, Some(false) = some other rail kind.
-    let rail_kind = |view: &gpui::Entity<SketchGpuiView>, vcx: &mut gpui::VisualTestContext| {
+    let rail_kind = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         view.update(vcx, |v, _cx| {
             v.workspace
                 .active_tab()
@@ -623,7 +623,7 @@ fn cmd_b_toggles_file_browser_rail(cx: &mut TestAppContext) {
 /// worksheet submit would freeze.
 #[cfg(test)]
 fn seed_worksheet_line(
-    view: &gpui::Entity<SketchGpuiView>,
+    view: &gpui::Entity<YaldaGpuiView>,
     vcx: &mut gpui::VisualTestContext,
     token: &str,
 ) {
@@ -642,13 +642,13 @@ fn seed_worksheet_line(
 /// order the old suffix heuristic mishandled).
 #[gpui::test]
 fn agent_seam_worksheet_submit_suppresses_double_render(cx: &mut TestAppContext) {
-    use sketch::acp_channel::ReplyEvent;
-    use sketch::session_proto::Notification as ServerNotification;
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
 
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        SketchGpuiView::new_browser(
+        YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -716,13 +716,13 @@ fn agent_seam_worksheet_submit_suppresses_double_render(cx: &mut TestAppContext)
 /// trustworthy — here the echo is treated as a brand-new turn and appended.
 #[gpui::test]
 fn agent_seam_worksheet_unregistered_line_double_renders(cx: &mut TestAppContext) {
-    use sketch::acp_channel::ReplyEvent;
-    use sketch::session_proto::Notification as ServerNotification;
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
 
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        SketchGpuiView::new_browser(
+        YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -770,7 +770,7 @@ fn agent_seam_pipelined_worksheet_submits_get_distinct_turns(cx: &mut TestAppCon
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        SketchGpuiView::new_browser(
+        YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -813,12 +813,12 @@ fn agent_seam_pipelined_worksheet_submits_get_distinct_turns(cx: &mut TestAppCon
 /// instead of `LocalSubmit`. Pins the guard to the whole non-replay branch.
 #[gpui::test]
 fn agent_seam_unsuppressed_echo_during_inflight_turn_gets_distinct_k(cx: &mut TestAppContext) {
-    use sketch::agent_transcript::UserTurnOrigin;
+    use yalda::agent_transcript::UserTurnOrigin;
 
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        SketchGpuiView::new_browser(
+        YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -867,7 +867,7 @@ fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        SketchGpuiView::new_browser(
+        YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -920,7 +920,7 @@ fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        SketchGpuiView::new_browser(
+        YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -974,10 +974,10 @@ fn agent_note(
     generation: u64,
     turn: u64,
     seq: u64,
-    kind: sketch::agent_event::AgentEventKind,
-) -> sketch::session_proto::Notification {
-    sketch::session_proto::Notification::Agent {
-        event: sketch::agent_event::AgentEvent::new(sid.into(), generation, turn, seq, kind),
+    kind: yalda::agent_event::AgentEventKind,
+) -> yalda::session_proto::Notification {
+    yalda::session_proto::Notification::Agent {
+        event: yalda::agent_event::AgentEvent::new(sid.into(), generation, turn, seq, kind),
     }
 }
 
@@ -988,13 +988,13 @@ fn boot_with_bound_slot<'a>(
     cx: &'a mut TestAppContext,
     sid: &str,
 ) -> (
-    gpui::Entity<SketchGpuiView>,
+    gpui::Entity<YaldaGpuiView>,
     &'a mut gpui::VisualTestContext,
 ) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
-        SketchGpuiView::new_browser(
+        YaldaGpuiView::new_browser(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             Theme::default(),
             focus_handle,
@@ -1014,7 +1014,7 @@ fn boot_with_bound_slot<'a>(
 /// `event.turn`, (c) finalize ran (phase Idle) after `TurnEnded`.
 #[gpui::test]
 fn agent_reducer_drives_transcript_after_gate_flips(cx: &mut TestAppContext) {
-    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use yalda::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
 
     let (view, vcx) = boot_with_bound_slot(cx, "S1");
 
@@ -1126,7 +1126,7 @@ fn agent_reducer_drives_transcript_after_gate_flips(cx: &mut TestAppContext) {
 /// plus a lingering inference during additive rollout.)
 #[gpui::test]
 fn agent_reducer_finalize_is_idempotent_on_generation_turn(cx: &mut TestAppContext) {
-    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use yalda::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
 
     let (view, vcx) = boot_with_bound_slot(cx, "S1");
 
@@ -1213,7 +1213,7 @@ fn agent_reducer_finalize_is_idempotent_on_generation_turn(cx: &mut TestAppConte
 /// the bump is ignored.
 #[gpui::test]
 fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
-    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use yalda::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
 
     let (view, vcx) = boot_with_bound_slot(cx, "S1");
 
@@ -1320,7 +1320,7 @@ fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
 /// is not an error), CompactedSummary inserts a deterministic placeholder.
 #[gpui::test]
 fn agent_reducer_unknown_and_compacted_summary_arms(cx: &mut TestAppContext) {
-    use sketch::agent_event::{AgentEventKind as K, TurnOutcome};
+    use yalda::agent_event::{AgentEventKind as K, TurnOutcome};
 
     let (view, vcx) = boot_with_bound_slot(cx, "S1");
 
@@ -1376,9 +1376,9 @@ fn agent_reducer_unknown_and_compacted_summary_arms(cx: &mut TestAppContext) {
 /// chunk through exactly ONE driver — it must appear EXACTLY ONCE.
 #[gpui::test]
 fn agent_reducer_no_double_apply_across_streams(cx: &mut TestAppContext) {
-    use sketch::acp_channel::ReplyEvent;
-    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
-    use sketch::session_proto::Notification as ServerNotification;
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use yalda::session_proto::Notification as ServerNotification;
 
     let (view, vcx) = boot_with_bound_slot(cx, "S1");
 
@@ -1457,8 +1457,8 @@ fn agent_reducer_no_double_apply_across_streams(cx: &mut TestAppContext) {
 /// `(1,1)` and the second finalize is a no-op).
 #[gpui::test]
 fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContext) {
-    use sketch::agent_event::{AgentEventKind as K, TurnOutcome};
-    use sketch::session_proto::Notification as ServerNotification;
+    use yalda::agent_event::{AgentEventKind as K, TurnOutcome};
+    use yalda::session_proto::Notification as ServerNotification;
 
     let (view, vcx) = boot_with_bound_slot(cx, "S1");
 
@@ -1580,9 +1580,9 @@ fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContex
 /// live `(generation, turn)` lands in the finalize ledger exactly once.
 #[gpui::test]
 fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
-    use sketch::acp_channel::ReplyEvent;
-    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
-    use sketch::session_proto::Notification as ServerNotification;
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use yalda::session_proto::Notification as ServerNotification;
 
     let (view, vcx) = boot_with_bound_slot(cx, "S1");
 
@@ -1734,7 +1734,7 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
 /// never collides, so the test would pass even against the bug.
 #[gpui::test]
 fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppContext) {
-    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use yalda::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
 
     let (view, vcx) = boot_with_bound_slot(cx, "S1");
 
@@ -1884,7 +1884,7 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
 /// finalizes its OWN envelope turn, leaving the live turn's key free).
 #[gpui::test]
 fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppContext) {
-    use sketch::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use yalda::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
 
     let (view, vcx) = boot_with_bound_slot(cx, "S1");
 

@@ -1,6 +1,6 @@
-use sketch::buffer::NavMode;
-use sketch::keys::{Key, KeyPress, Modifiers};
-use sketch::view::ViewMode;
+use yalda::buffer::NavMode;
+use yalda::keys::{Key, KeyPress, Modifiers};
+use yalda::view::ViewMode;
 
 use crate::app::App;
 

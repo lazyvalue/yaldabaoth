@@ -1,5 +1,5 @@
-use sketch::keybind::KeybindManager;
-use sketch::keys::{Key, KeyPress, Modifiers};
+use yalda::keybind::KeybindManager;
+use yalda::keys::{Key, KeyPress, Modifiers};
 
 fn k(c: char) -> KeyPress {
     KeyPress::new(Key::Char(c), Modifiers::NONE)

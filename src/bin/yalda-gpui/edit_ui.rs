@@ -1,10 +1,10 @@
-//! Edit-view methods on SketchGpuiView: entering/leaving edit + WP modes,
+//! Edit-view methods on YaldaGpuiView: entering/leaving edit + WP modes,
 //! wiki-link open, reload-from-disk, key dispatch (insert/normal cores).
 //! Extracted verbatim from main.rs (split-gpui-main, stage 2).
 
 use super::*;
 
-impl SketchGpuiView {
+impl YaldaGpuiView {
     /// `Some(edit)` if currently editing, else `None`.
     pub(crate) fn edit_mut(&mut self) -> Option<&mut EditState> {
         match self
@@ -23,7 +23,7 @@ impl SketchGpuiView {
     #[cfg(test)]
     pub(crate) fn test_open_edit(&mut self, text: &str) {
         let core: workspace::SharedCore = std::rc::Rc::new(std::cell::RefCell::new(
-            sketch::editor::EditorCore::new(text.to_string(), PathBuf::from("/tmp/harness.md")),
+            yalda::editor::EditorCore::new(text.to_string(), PathBuf::from("/tmp/harness.md")),
         ));
         let mut e = EditState::new(
             SharedEditor::new(1, core),
@@ -106,7 +106,7 @@ impl SketchGpuiView {
     }
 
     /// Swap from Doc view into Edit screen with the Word-Processor (live
-    /// preview) view. Bound to `Ctrl-W` in the SketchView key context.
+    /// preview) view. Bound to `Ctrl-W` in the YaldaView key context.
     pub(crate) fn enter_wp(&mut self, _: &EnterWp, _w: &mut Window, cx: &mut Context<Self>) {
         self.enter_edit_with(EditView::WordProcessor, cx);
     }

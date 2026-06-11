@@ -7,13 +7,13 @@
 ## Builds On
 
 - **ACP channel** (`src/acp_channel.rs`): Provides `AcpChannelClient`, which owns a subprocess, prompt/reply channels, turn counter, and permission mode. This spec relies on the fact that multiple `AcpChannelClient` instances can coexist — each owns isolated state and an independent subprocess. The multi-session model creates one `AcpChannelClient` per session.
-- **ClaudeState** (`src/bin/sketch-gpui.rs`): The current single-session state holder (editor, channel, tool calls, compose box, turn timer). This spec factors `ClaudeState` into a per-session object and adds a session-list layer above it.
+- **ClaudeState** (`src/bin/yalda-gpui.rs`): The current single-session state holder (editor, channel, tool calls, compose box, turn timer). This spec factors `ClaudeState` into a per-session object and adds a session-list layer above it.
 - **Session persistence** (`save_persisted_acp_session` / `load_persisted_acp_session`): Currently stores one session ID per cwd. This spec extends persistence to a list of session IDs keyed by cwd, each tagged with a label.
 - **Compose textbox** (`spec-textbox-compose.md`): The compose box lives inside `ClaudeState`. Multi-session inherits this — each session has its own compose box state. Only the active session's compose box is rendered.
 
 ## Overview
 
-Sketch currently supports one Claude agent session at a time. Opening a second session requires clearing the first (`claude-clear`) or rebooting (`claude-reboot`). This limits workflows where the user wants to run parallel agents — one for a refactor, another for tests, a third for research — without losing conversational context.
+Yalda currently supports one Claude agent session at a time. Opening a second session requires clearing the first (`claude-clear`) or rebooting (`claude-reboot`). This limits workflows where the user wants to run parallel agents — one for a refactor, another for tests, a third for research — without losing conversational context.
 
 This spec describes how multiple concurrent ACP sessions coexist in the GPUI frontend, how the user creates, switches between, and manages them, and how the screen and rendering adapt.
 
@@ -34,7 +34,7 @@ The feature introduces four named artifacts:
 
 3. **Close.** [SHIPPED] `claude-close` (menu: `Space c x`) closes the active session. The `AcpChannelClient` is dropped (subprocess killed via `kill_on_drop`), the `SessionSlot` is removed from the ring, and the next session in the ring becomes active. If the last session is closed, the screen returns to the underlying doc/browser screen (same as `back_to_doc` today). Closing does not persist the session — it is gone.
 
-4. **Detach.** [SHIPPED] `claude-detach` on a session drops its `AcpChannelClient` (killing the subprocess) but keeps the `SessionSlot` alive with `channel: None`. The session's chat history remains scrollable. Any in-flight attach is cancelled (`attach_pending` cleared). `awaiting_reply` and `turn_started` are reset so the footer doesn't show a stale "…" indicator. The user can re-attach later with `claude-attach`, which spawns a new `AcpChannelClient` with `session/new` (fresh context) and clears `resume_id` so persistence captures the new id once it binds. Re-attaching to a detached session does NOT resume the previous conversation — the subprocess is gone. For true resume, the session must never have been detached (the persisted session ID is used on sketch restart).
+4. **Detach.** [SHIPPED] `claude-detach` on a session drops its `AcpChannelClient` (killing the subprocess) but keeps the `SessionSlot` alive with `channel: None`. The session's chat history remains scrollable. Any in-flight attach is cancelled (`attach_pending` cleared). `awaiting_reply` and `turn_started` are reset so the footer doesn't show a stale "…" indicator. The user can re-attach later with `claude-attach`, which spawns a new `AcpChannelClient` with `session/new` (fresh context) and clears `resume_id` so persistence captures the new id once it binds. Re-attaching to a detached session does NOT resume the previous conversation — the subprocess is gone. For true resume, the session must never have been detached (the persisted session ID is used on yalda restart).
 
 5. **Rename.** [SHIPPED] `claude-rename` opens a centered single-line input overlay pre-filled with the current label. Enter commits, Esc cancels. The overlay targets the slot by its monotonic `SessionSlot::index`, so a concurrent `claude-close` on another slot doesn't rename the wrong one. An empty/whitespace-only input cancels (acts like Esc) so the user can't accidentally erase the label by hammering Enter. Labels are cosmetic — they affect only the sidebar display.
 
@@ -79,7 +79,7 @@ The feature introduces four named artifacts:
 
 10. **Chat body.** [SHIPPED] Renders as today, but reads from `ring.active_mut().state` instead of a bare `ClaudeState`. The list state, flat items, tool call store, compose box — all belong to the active session. The chat body's width is reduced by the sidebar width when the sidebar is visible.
 
-11. **Header.** [SHIPPED] The header shows the active session's attach status and turn timer. The active session's label is shown alongside the attach label (e.g., `sketch-gpui [claude: refactor] — ACP: …`).
+11. **Header.** [SHIPPED] The header shows the active session's attach status and turn timer. The active session's label is shown alongside the attach label (e.g., `yalda-gpui [claude: refactor] — ACP: …`).
 
 12. **Footer.** [SHIPPED] Unchanged. Shows mode, cursor position, and hints for the active session.
 
@@ -111,27 +111,27 @@ The feature introduces four named artifacts:
 
     Save trigger: **every time the ring changes** — whenever a session id is first assigned (current single-session save point), whenever a slot is added/removed/renamed, and whenever the active index changes. Writes remain best-effort: failures are silent. Per-slot writes always write the **whole ring snapshot**, so a stale pump from a slot that was just removed contributes nothing (its slot isn't in the snapshot).
 
-    Restore: on launch with `SKETCH_OPEN_CLAUDE=1` (or on the first `open-claude` after launch), `load_persisted_acp_sessions(cwd)` returns the saved list. Sketch builds a `SessionRing`, pushes one `SessionSlot` per entry with its saved label and `resume_id`, and each slot spawns an `AcpChannelClient` with `session/load` using its saved id. The slot marked `active: true` becomes the active slot (or the first slot if none is marked). Slots whose `session/load` fails fall back to `session/new` (per `acp_channel.rs` resume logic) and remain in the ring with a fresh subprocess; their `resume_id` stays set so the next reboot retries the original load. After restore, `next_index` is set to `slots.len()` so the next `claude-new` produces a label that doesn't collide with restored slot labels.
+    Restore: on launch with `YALDA_OPEN_CLAUDE=1` (or on the first `open-claude` after launch), `load_persisted_acp_sessions(cwd)` returns the saved list. Yalda builds a `SessionRing`, pushes one `SessionSlot` per entry with its saved label and `resume_id`, and each slot spawns an `AcpChannelClient` with `session/load` using its saved id. The slot marked `active: true` becomes the active slot (or the first slot if none is marked). Slots whose `session/load` fails fall back to `session/new` (per `acp_channel.rs` resume logic) and remain in the ring with a fresh subprocess; their `resume_id` stays set so the next reboot retries the original load. After restore, `next_index` is set to `slots.len()` so the next `claude-new` produces a label that doesn't collide with restored slot labels.
 
     Pending-attach slots (channel not yet resolved, no id available) are not persisted. A reboot invoked in the same tick as a fresh `claude-new` will drop the new slot — acceptable because the conversation has zero content.
 
-    **Concurrent sketch instances on the same `cwd`: last-writer-wins.** Each save is a read-modify-write of the file (read JSON, replace the `cwd` entry, write back). Other `cwd` entries are preserved. There is no file locking. Two sketch processes on the same project will overwrite each other's rings as they save; the single-user-one-instance-per-cwd scenario (the realistic case) is unaffected.
+    **Concurrent yalda instances on the same `cwd`: last-writer-wins.** Each save is a read-modify-write of the file (read JSON, replace the `cwd` entry, write back). Other `cwd` entries are preserved. There is no file locking. Two yalda processes on the same project will overwrite each other's rings as they save; the single-user-one-instance-per-cwd scenario (the realistic case) is unaffected.
 
     Old-format migration: if the loader sees a bare string for the `cwd` entry instead of a list, it treats it as a single-element list `[{id, label: "claude-1", active: true}]`. The next save rewrites the file in the new format.
 
-16. **Reboot.** [SHIPPED] `claude-reboot` spawns a child process with `SKETCH_OPEN_CLAUDE=1` and quits. The child restores the full ring as it was at the moment reboot was invoked (eager writes mean no extra save step in `reboot_into_claude` is needed).
+16. **Reboot.** [SHIPPED] `claude-reboot` spawns a child process with `YALDA_OPEN_CLAUDE=1` and quits. The child restores the full ring as it was at the moment reboot was invoked (eager writes mean no extra save step in `reboot_into_claude` is needed).
 
 17. **Clear.** [SHIPPED] `claude-clear` is the "nuclear reset." It removes the entire `cwd` entry from `acp_sessions.json` via `forget_persisted_acp_sessions(cwd)`, then drops the current claude screen and re-opens with a single fresh session. Per-session clear (clear only the active session, keep the rest) is out of scope; the user can `claude-close` the unwanted session and `claude-new` a replacement.
 
 ### Resource limits
 
-18. **Soft cap.** [SHIPPED] Sketch does not enforce a hard limit on session count, but `claude-new` writes an advisory footer status when the ring reaches 6+ sessions: "N sessions active — each uses ~100MB." The user can ignore this. The cap is advisory because the user may have legitimate reasons for many sessions (e.g., testing prompt variations). The status is one-shot — cleared on the next non-shortcut keystroke (same lifetime as other transient claude statuses).
+18. **Soft cap.** [SHIPPED] Yalda does not enforce a hard limit on session count, but `claude-new` writes an advisory footer status when the ring reaches 6+ sessions: "N sessions active — each uses ~100MB." The user can ignore this. The cap is advisory because the user may have legitimate reasons for many sessions (e.g., testing prompt variations). The status is one-shot — cleared on the next non-shortcut keystroke (same lifetime as other transient claude statuses).
 
 ## Data Model
 
 ### SessionSlot
 
-[SHIPPED] all fields (`src/bin/sketch-gpui/main.rs:2392-2407`):
+[SHIPPED] all fields (`src/bin/yalda-gpui/main.rs:2392-2407`):
 
 ```rust
 struct SessionSlot {
@@ -144,7 +144,7 @@ struct SessionSlot {
 }
 ```
 
-### SessionRing [SHIPPED] (`src/bin/sketch-gpui/main.rs:2411-2514`)
+### SessionRing [SHIPPED] (`src/bin/yalda-gpui/main.rs:2411-2514`)
 
 ```rust
 struct SessionRing {
@@ -165,14 +165,14 @@ Methods (all SHIPPED): `active`, `active_mut`, `next`, `prev`, `push`, `close_ac
 
 ```json
 {
-  "/Users/scott/ws/sketch": [
+  "/Users/scott/ws/yalda": [
     { "id": "ses_abc123", "label": "claude-1", "active": true },
     { "id": "ses_def456", "label": "refactor" }
   ]
 }
 ```
 
-- Path: `~/.sketch/acp_sessions.json` (unchanged).
+- Path: `~/.yalda/acp_sessions.json` (unchanged).
 - Order: list order is the ring slot order; preserved across reboot.
 - `active` is a single optional flag on one entry. If no entry has `active: true`, the loader picks slot 0; if multiple entries have it, the loader picks the first one with the flag set (manual editing artifact — saver only ever writes one).
 - Slots without a session id (e.g., detached, never-attached) are not written. Persistence captures resumable sessions only.
@@ -180,7 +180,7 @@ Methods (all SHIPPED): `active`, `active_mut`, `next`, `prev`, `push`, `close_ac
 
 ## Interfaces
 
-Ring API (all SHIPPED, `src/bin/sketch-gpui/main.rs:2422-2514`):
+Ring API (all SHIPPED, `src/bin/yalda-gpui/main.rs:2422-2514`):
 - `SessionRing::new(underlying: Option<Box<WindowContent>>) -> Self`
 - `SessionRing::push(&mut self, label: String, state: ClaudeState, resume_id: Option<String>) -> usize` — append and activate; returns the new slot's monotonic index.
 - `SessionRing::close_active(&mut self) -> Option<ClaudeState>` — remove and return active state (drops subprocess via `kill_on_drop`).
@@ -189,7 +189,7 @@ Ring API (all SHIPPED, `src/bin/sketch-gpui/main.rs:2422-2514`):
 - `SessionRing::iter(&self) -> impl Iterator<Item = &SessionSlot>`
 - `SessionRing::slot_by_index(&self, index: usize) -> Option<usize>` / `slot_by_index_mut`
 
-App methods (all SHIPPED, `src/bin/sketch-gpui/main.rs`):
+App methods (all SHIPPED, `src/bin/yalda-gpui/main.rs`):
 - `open_claude_inner()` (4605) — bootstraps the ring on first open; delegates to `new_claude_session` if already open. On restore, walks `load_persisted_acp_sessions()` and pushes one slot per entry, each with `session/load` against its saved id.
 - `new_claude_session()` (4660) — push a fresh `session/new` slot. Surfaces the §18 advisory at 6+ slots.
 - `close_active_claude_session()` (4701) — close active; `back_to_doc()` if ring empty (also `forget_persisted_acp_sessions(cwd)` so a stale entry doesn't resurrect on reboot).
@@ -200,7 +200,7 @@ App methods (all SHIPPED, `src/bin/sketch-gpui/main.rs`):
 - `open_rename_overlay()` (3868) — see §5.
 - `reboot_into_claude()` (5177) — see §16.
 
-Persistence functions (all SHIPPED, `src/bin/sketch-gpui/main.rs`):
+Persistence functions (all SHIPPED, `src/bin/yalda-gpui/main.rs`):
 - `save_persisted_acp_sessions(cwd, ring: &SessionRing)` (1240) — write all slots with session ids, preserving order, with the active slot flagged. Best-effort.
 - `load_persisted_acp_sessions(cwd) -> Vec<PersistedSlot>` (1164) — read the list; migrate from old string format on the fly.
 - `forget_persisted_acp_sessions(cwd)` (1210) — drop the whole `cwd` entry (used by `claude-clear` and the close-last-slot path).
@@ -217,7 +217,7 @@ The single-session names (`save_persisted_acp_session`, `load_persisted_acp_sess
 
 4. **Sidebar width.** The sidebar is fixed at 20 chars wide. Labels are truncated with `…` if they exceed the available space. The sidebar scrolls vertically when sessions exceed the viewport height. Clicking a session label switches to it; `Ctrl-]`/`Ctrl-[` remain the keyboard-first navigation.
 
-5. **Persistence migration.** The loader handles both old format (bare string) and new format (list of `{id, label, active?}`). The saver always writes the new format. Old sketch versions that read the new format will see a parse error and start a fresh session. With multi-session this means a downgrade silently abandons *all* persisted sessions for that cwd (not just one). Documented downgrade path: manually edit `~/.sketch/acp_sessions.json` to replace the array with a single bare string id for the slot the user wants to keep.
+5. **Persistence migration.** The loader handles both old format (bare string) and new format (list of `{id, label, active?}`). The saver always writes the new format. Old yalda versions that read the new format will see a parse error and start a fresh session. With multi-session this means a downgrade silently abandons *all* persisted sessions for that cwd (not just one). Documented downgrade path: manually edit `~/.yalda/acp_sessions.json` to replace the array with a single bare string id for the slot the user wants to keep.
 
 6. **Restore concurrency.** Each restored slot spawns its `AcpChannelClient` on its own background thread (matches today's per-session attach behavior). With N restored slots, restore produces N concurrent agent subprocess spawns — ~100MB RSS per slot during the restore window. No serialization; the agent SDK handles independent concurrent `session/load` calls already because each subprocess has its own stdio pipe.
 
@@ -227,7 +227,7 @@ The single-session names (`save_persisted_acp_session`, `load_persisted_acp_sess
 
 ## Revision History
 
-- 2026-05-14 — Status now SHIPPED across the board. Detach/attach (§4), rename (§5), and the §18 soft cap landed. Persistence (§15-17) and Ctrl-]/Ctrl-[ (§13) were already shipped — spec markers updated to reflect that. App-method line refs migrated from the old monolithic `src/bin/sketch-gpui.rs` to the new `src/bin/sketch-gpui/main.rs` after the directory split. Removed the standalone "DRAFT persistence fields" block on `SessionSlot` since `resume_id` is now a permanent field; same edit clarified that `resume_id` is preserved across detach (not just `session/load` fallback). Per-slot `[detached]` indicator surfaces as ` [d]` suffix in the sidebar (was already wired before detach landed).
-- 2026-05-11 (2) — Adversarial review pass. §15 now specifies `resume_id` stability across `session/load` fallback (transient failures no longer overwrite the persisted id); explicit last-writer-wins contract for concurrent sketch instances on the same cwd; whole-ring snapshot writes (no stale-pump corruption); pending-attach slots dropped on reboot; `next_index = slots.len()` post-restore. New Constraints §6 (restore concurrency) and §7 (compose-box drafts out of scope). Constraint §5 updated with downgrade blast radius and manual-edit recovery path.
+- 2026-05-14 — Status now SHIPPED across the board. Detach/attach (§4), rename (§5), and the §18 soft cap landed. Persistence (§15-17) and Ctrl-]/Ctrl-[ (§13) were already shipped — spec markers updated to reflect that. App-method line refs migrated from the old monolithic `src/bin/yalda-gpui.rs` to the new `src/bin/yalda-gpui/main.rs` after the directory split. Removed the standalone "DRAFT persistence fields" block on `SessionSlot` since `resume_id` is now a permanent field; same edit clarified that `resume_id` is preserved across detach (not just `session/load` fallback). Per-slot `[detached]` indicator surfaces as ` [d]` suffix in the sidebar (was already wired before detach landed).
+- 2026-05-11 (2) — Adversarial review pass. §15 now specifies `resume_id` stability across `session/load` fallback (transient failures no longer overwrite the persisted id); explicit last-writer-wins contract for concurrent yalda instances on the same cwd; whole-ring snapshot writes (no stale-pump corruption); pending-attach slots dropped on reboot; `next_index = slots.len()` post-restore. New Constraints §6 (restore concurrency) and §7 (compose-box drafts out of scope). Constraint §5 updated with downgrade blast radius and manual-edit recovery path.
 - 2026-05-11 — Marked ring, sidebar, lifecycle (create/switch/close), background pumping, header/footer/chat-body rendering, and the single-cwd save+load+forget functions as SHIPPED. Refined §15–17 persistence design: list-of-slots format with an `active` flag, eager writes on every ring change, per-slot fallback to `session/new` when load fails. Renamed planned persistence functions to plural (`save_persisted_acp_sessions` etc.). Detach/attach (§4), rename (§5), direct `Ctrl-]`/`Ctrl-[` bindings (§13), and the soft cap (§18) remain DRAFT.
 - Initial draft — single document covering the full multi-session feature.

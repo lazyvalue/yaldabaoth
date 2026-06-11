@@ -2,7 +2,7 @@
 
 **Status:** Draft
 **Date:** 2026-05-28
-**Scope:** `src/bin/sketch-gpui/main.rs` — server pump, ACP pump, render path
+**Scope:** `src/bin/yalda-gpui/main.rs` — server pump, ACP pump, render path
 **Bugs addressed:** Typing latency regression, server pump dropping/delaying agent content
 
 ---
@@ -14,7 +14,7 @@ There are four independent failure modes that compound into the observed behavio
 ### 1.1 Lock Convoy on `this.update(cx, ...)`
 
 Both pumps call `this.update(cx, |this, cx| { ... })`. This acquires a mutable
-borrow on the entire `SketchGpuiView` model. While held:
+borrow on the entire `YaldaGpuiView` model. While held:
 
 - **Keystroke handlers cannot run.** GPUI dispatches input actions by calling
   `this.update()` on the same model. If the pump holds the lock processing a
@@ -628,7 +628,7 @@ time. Before: tens of ms. After: <2ms.
 
 ## 6. Invariants to Maintain
 
-1. **Single-writer on model state.** All mutations to `SketchGpuiView` still
+1. **Single-writer on model state.** All mutations to `YaldaGpuiView` still
    go through `this.update()`. We are not introducing interior mutability or
    concurrent writes. We are only moving *reads from external channels*
    outside the lock.

@@ -1,5 +1,5 @@
-use sketch::cursor::CursorPos;
-use sketch::document::Document;
+use yalda::cursor::CursorPos;
+use yalda::document::Document;
 use std::path::PathBuf;
 
 fn doc(text: &str) -> Document {

@@ -32,6 +32,6 @@ pub mod worktree;
 
 /// Human-readable build identifier produced by build.rs:
 /// `"<crate-version> (<git-sha>[-dirty] <utc-timestamp>)"`.
-pub const BUILD_INFO: &str = env!("SKETCH_BUILD_INFO");
-pub const BUILD_SHA: &str = env!("SKETCH_BUILD_SHA");
-pub const BUILD_TIME: &str = env!("SKETCH_BUILD_TIME");
+pub const BUILD_INFO: &str = env!("YALDA_BUILD_INFO");
+pub const BUILD_SHA: &str = env!("YALDA_BUILD_SHA");
+pub const BUILD_TIME: &str = env!("YALDA_BUILD_TIME");

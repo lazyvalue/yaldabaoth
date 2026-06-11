@@ -6,7 +6,7 @@
 
 ## Overview
 
-Sketch's current `Space` menu is a flat bag of everything: open a file,
+Yalda's current `Space` menu is a flat bag of everything: open a file,
 split a tile, change the theme, send to Claude, toggle a rail. Every
 command is reachable from every screen. This works when the menu is small,
 but it doesn't scale, and it conflates two different questions:
@@ -40,11 +40,11 @@ identical.
 
 ### Relationship to which-key
 
-Sketch's menu and neovim's which-key solve the same problem — progressive
+Yalda's menu and neovim's which-key solve the same problem — progressive
 disclosure of key hierarchies — but the mechanisms differ in important
 ways:
 
-| | which-key.nvim | sketch menu |
+| | which-key.nvim | yalda menu |
 |---|---|---|
 | **When it appears** | After a timeout (200ms default); only shows if you pause mid-chord | Immediately on leader press; the overlay *is* the chord |
 | **Key source** | Reads from neovim's live keymap table; any plugin can register bindings | Static `Vec<MenuNode>` built at compile time per leader/context |
@@ -55,12 +55,12 @@ ways:
 | **Backend** | Lua plugin riding on neovim's keymap API; the popup is a floating window | Built into the binary; the overlay is a GPUI element; `MenuState` is shared with the TUI |
 
 The key design difference: which-key is a *viewer* over an existing
-keymap system — it discovers bindings that already exist. Sketch's menu is
+keymap system — it discovers bindings that already exist. Yalda's menu is
 the *primary* binding surface for leader-key commands — the menu tree
 *defines* what's available, and the dispatch table in
 `dispatch_menu_command()` is the canonical mapping from name to action.
 
-This means sketch doesn't need which-key's dynamic discovery machinery
+This means yalda doesn't need which-key's dynamic discovery machinery
 (keymap scanning, auto-triggers, timeout-vs-nowait ambiguity). But it
 should adopt which-key's best UX ideas: progressive disclosure,
 breadcrumb navigation, context-dependent entries, and the two-leader
@@ -103,7 +103,7 @@ rule.
 the focused window's content kind.** Four content kinds, four different
 local menus:
 
-**Doc local menu (`SketchView`):**
+**Doc local menu (`YaldaView`):**
 
 | Key | Label | Command |
 |-----|-------|---------|
@@ -168,7 +168,7 @@ In Edit insert mode, `.` is a text character and must not open the menu.
 The local leader only activates in contexts where `.` is not a text
 input key:
 
-- **SketchView** (Doc view) — `.` opens local menu.
+- **YaldaView** (Doc view) — `.` opens local menu.
 - **EditView Normal mode** — `.` opens local menu.
 - **EditView Insert mode** — `.` inserts a literal dot.
 - **ClaudeView** — `.` opens local menu (outside the compose box);
@@ -318,7 +318,7 @@ structural change to `MenuState`.
 #### 13 · Dynamic entries [DRAFT]
 
 which-key supports `expand` nodes that generate children at display time.
-Sketch equivalents:
+Yalda equivalents:
 
 - **Buffer list:** `Space b` could expand to show open buffers inline
   rather than opening a separate overlay.
@@ -402,8 +402,8 @@ to `gpui_menu()` in `main.rs`.
 
 | Binding | Context | Action |
 |---|---|---|
-| `Space` | SketchView, EditView (normal), ClaudeView, BrowserView | Open global menu |
-| `.` | SketchView, EditView (normal), BrowserView | Open local menu |
+| `Space` | YaldaView, EditView (normal), ClaudeView, BrowserView | Open global menu |
+| `.` | YaldaView, EditView (normal), BrowserView | Open local menu |
 | `.` | ClaudeView (outside compose box) | Open local menu |
 | `.` | EditView (insert) | Insert literal dot (no menu) |
 
@@ -434,7 +434,7 @@ to `gpui_menu()` in `main.rs`.
    change based on focused content. Entries may be disabled (Behavior 10)
    but never hidden or rearranged.
 
-5. **No timeout.** Unlike which-key (200ms delay before popup), sketch's
+5. **No timeout.** Unlike which-key (200ms delay before popup), yalda's
    menu appears immediately on leader press. There is no ambiguity to
    resolve — `Space` and `.` have no other bindings in the relevant
    contexts, so there's no reason to wait.
@@ -457,7 +457,7 @@ to `gpui_menu()` in `main.rs`.
 ## Revision history
 
 - 2026-06-06 — Initial draft.
-- 2026-06-09 — v1 (Phase 1) implemented in `sketch-gpui`: `.` local leader
+- 2026-06-09 — v1 (Phase 1) implemented in `yalda-gpui`: `.` local leader
   with per-content menus (Behaviors 1–4, 6–10), scope-aware headers, stale
   dismissal, disabled global entries. Global menu kept intact (Phase 2
   cleanup not done). Browser `.` rebound from toggle-hidden to local

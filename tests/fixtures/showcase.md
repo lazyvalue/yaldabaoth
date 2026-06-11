@@ -1,4 +1,4 @@
-# Sketch Showcase
+# Yalda Showcase
 
 A demonstration of **all** supported *markdown* features with ~~some~~ style.
 
@@ -61,7 +61,7 @@ Some `inline code` mixed with regular text and **bold `code`** too.
 
 ## Images
 
-![Sketch Logo](logo.png)
+![Yalda Logo](logo.png)
 
 ---
 

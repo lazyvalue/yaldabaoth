@@ -17,8 +17,8 @@ use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
-use sketch::editor::EditorCore;
-use sketch::file_browser::FileBrowser;
+use yalda::editor::EditorCore;
+use yalda::file_browser::FileBrowser;
 
 /// Shared handle to a pooled `EditorCore`. Multiple `EditorView`s (one per
 /// window) clone this `Rc` so they all mutate the same rope + undo stack;
@@ -2298,7 +2298,7 @@ mod tests {
     #[test]
     fn pool_dedups_by_path_so_two_views_share_one_core() {
         let dir = std::env::temp_dir().join(format!(
-            "sketch_pool_share_{}_{}",
+            "yalda_pool_share_{}_{}",
             std::process::id(),
             line!()
         ));
@@ -2405,7 +2405,7 @@ mod tests {
         let mut ws: Workspace<TestContent> = Workspace::new();
         // Use a path that probably doesn't exist on the FS so we exercise the
         // empty-buffer branch.
-        let p = std::env::temp_dir().join("sketch-workspace-test-buffer.md");
+        let p = std::env::temp_dir().join("yalda-workspace-test-buffer.md");
         let _ = std::fs::remove_file(&p);
         let id1 = ws.open_buffer(&p).unwrap();
         let id2 = ws.open_buffer(&p).unwrap();
@@ -2687,7 +2687,7 @@ mod tests {
     #[test]
     fn buffer_retain_release_lifecycle() {
         let mut ws: Workspace<TestContent> = Workspace::new();
-        let p = std::env::temp_dir().join("sketch-workspace-test-refcount.md");
+        let p = std::env::temp_dir().join("yalda-workspace-test-refcount.md");
         let _ = std::fs::remove_file(&p);
         let id = ws.open_buffer(&p).unwrap();
 
@@ -2713,7 +2713,7 @@ mod tests {
         // through one is visible through the other, and the document's
         // `edit_seq` (the perf-cache key) advances for both since it's one doc.
         let mut ws: Workspace<TestContent> = Workspace::new();
-        let p = std::env::temp_dir().join("sketch-shared-edit-test.md");
+        let p = std::env::temp_dir().join("yalda-shared-edit-test.md");
         let _ = std::fs::remove_file(&p);
 
         let (id_a, core_a) = ws.open_and_retain(&p).unwrap();
@@ -2733,8 +2733,8 @@ mod tests {
     #[test]
     fn gc_reaps_unreferenced_clean_buffers_keeps_dirty() {
         let mut ws: Workspace<TestContent> = Workspace::new();
-        let clean = std::env::temp_dir().join("sketch-gc-clean.md");
-        let dirty = std::env::temp_dir().join("sketch-gc-dirty.md");
+        let clean = std::env::temp_dir().join("yalda-gc-clean.md");
+        let dirty = std::env::temp_dir().join("yalda-gc-dirty.md");
         let _ = std::fs::remove_file(&clean);
         let _ = std::fs::remove_file(&dirty);
 
@@ -2762,7 +2762,7 @@ mod tests {
     #[test]
     fn gc_keeps_buffers_a_view_still_holds() {
         let mut ws: Workspace<TestContent> = Workspace::new();
-        let p = std::env::temp_dir().join("sketch-gc-live.md");
+        let p = std::env::temp_dir().join("yalda-gc-live.md");
         let _ = std::fs::remove_file(&p);
         let (id, core) = ws.open_and_retain(&p).unwrap();
         ws.gc_buffers();

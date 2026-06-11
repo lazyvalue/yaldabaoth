@@ -1,4 +1,4 @@
-use sketch::menu::MenuNode;
+use yalda::menu::MenuNode;
 
 mod claude;
 mod dispatch;
@@ -13,14 +13,14 @@ use state::{AppMode, AppScreen};
 
 // Re-imports for tests (picked up via `use super::*`).
 #[cfg(test)]
-use sketch::buffer::{Buffer, NavMode};
+use yalda::buffer::{Buffer, NavMode};
 #[cfg(test)]
-use sketch::keybind::Action;
+use yalda::keybind::Action;
 #[cfg(test)]
-use sketch::view::ViewMode;
+use yalda::view::ViewMode;
 
 /// Convert a rope char index to (line, col).
-fn char_to_line_col(doc: &sketch::document::Document, char_idx: usize) -> (usize, usize) {
+fn char_to_line_col(doc: &yalda::document::Document, char_idx: usize) -> (usize, usize) {
     let rope = doc.rope();
     let len = rope.len_chars();
     let i = char_idx.min(len);
@@ -65,7 +65,7 @@ fn merge_menu(mut defaults: Vec<MenuNode>, user_nodes: &[MenuNode]) -> Vec<MenuN
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sketch::config::Config;
+    use yalda::config::Config;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -75,7 +75,7 @@ mod tests {
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!(
-            "sketch-attach-test-{}-{}.sock",
+            "yalda-attach-test-{}-{}.sock",
             std::process::id(),
             n
         ));

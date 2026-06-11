@@ -168,7 +168,7 @@ that pass exists to prevent.
 
 ## Interfaces
 
-Accessor helpers on `SketchGpuiView` adapt to the nesting (names indicative):
+Accessor helpers on `YaldaGpuiView` adapt to the nesting (names indicative):
 
 - **`buffer_mut() -> Option<&mut BufferApp>`** / **`agent_mut() -> Option<&mut
   AgentRing>`** — replace ad-hoc `doc_mut()` / matches that reached a single old

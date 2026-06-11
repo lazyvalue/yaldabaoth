@@ -1,5 +1,5 @@
-use sketch::file_browser::FileBrowser;
-use sketch::keys::{Key, KeyPress};
+use yalda::file_browser::FileBrowser;
+use yalda::keys::{Key, KeyPress};
 
 use crate::app::{App, AppMode, AppScreen};
 

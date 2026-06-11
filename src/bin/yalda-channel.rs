@@ -1,16 +1,16 @@
-//! sketch-channel — a Claude Code Channels MCP server that bridges the
-//! `sketch` markdown editor to a running `claude` CLI session.
+//! yalda-channel — a Claude Code Channels MCP server that bridges the
+//! `yalda` markdown editor to a running `claude` CLI session.
 //!
 //! ## What it does
 //!
 //! 1. Speaks JSON-RPC over stdio to Claude Code (per the Channels API),
 //!    declaring `experimental.claude/channel` and a `reply` tool.
-//! 2. Listens on a Unix domain socket (default: `/tmp/sketch-channel-$USER.sock`,
-//!    overridable via `SKETCH_CHANNEL_SOCKET`).
-//! 3. When sketch sends `{"type":"send","content":"...","meta":{...}}`, we emit
+//! 2. Listens on a Unix domain socket (default: `/tmp/yalda-channel-$USER.sock`,
+//!    overridable via `YALDA_CHANNEL_SOCKET`).
+//! 3. When yalda sends `{"type":"send","content":"...","meta":{...}}`, we emit
 //!    `notifications/claude/channel` to Claude Code.
 //! 4. When Claude calls the `reply` tool, we forward the text back to the
-//!    connected sketch client as `{"type":"reply","text":"..."}`.
+//!    connected yalda client as `{"type":"reply","text":"..."}`.
 //!
 //! ## Setup
 //!
@@ -19,8 +19,8 @@
 //! ```json
 //! {
 //!   "mcpServers": {
-//!     "sketch": {
-//!       "command": "/absolute/path/to/sketch-channel"
+//!     "yalda": {
+//!       "command": "/absolute/path/to/yalda-channel"
 //!     }
 //!   }
 //! }
@@ -29,10 +29,10 @@
 //! Then launch claude with the channels flag:
 //!
 //! ```
-//! claude --dangerously-load-development-channels server:sketch
+//! claude --dangerously-load-development-channels server:yalda
 //! ```
 //!
-//! In sketch, `:claude-attach` (no path = use default socket) connects.
+//! In yalda, `:claude-attach` (no path = use default socket) connects.
 //! `:claude-send` ships the current buffer; `:claude-send-selection` ships
 //! the active selection. Replies land in a `*claude*` buffer.
 
@@ -47,7 +47,7 @@ use std::thread;
 use serde_json::{Value, json};
 
 /// (client_id, write-side of the socket). The id distinguishes generations of
-/// sketch connections so a stale handler can't wipe out the slot of a fresher
+/// yalda connections so a stale handler can't wipe out the slot of a fresher
 /// one when it exits.
 type ActiveClient = Arc<Mutex<Option<(u64, UnixStream)>>>;
 
@@ -58,39 +58,39 @@ fn next_client_id() -> u64 {
 }
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
-const SERVER_NAME: &str = "sketch";
+const SERVER_NAME: &str = "yalda";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const INSTRUCTIONS: &str = "\
-The 'sketch' channel relays content from the user's sketch markdown editor.
+The 'yalda' channel relays content from the user's yalda markdown editor.
 
-Sketch-sourced messages arrive as `<channel source=\"sketch\" label=\"buffer|selection\" \
+Yalda-sourced messages arrive as `<channel source=\"yalda\" label=\"buffer|selection\" \
 file=\"...\">BODY</channel>`. Treat the body as a user message — they shared it from \
 their editor.
 
-CRITICAL: When responding to a sketch-sourced message, ALWAYS call the `reply` tool with \
+CRITICAL: When responding to a yalda-sourced message, ALWAYS call the `reply` tool with \
 your full response text (in addition to whatever you'd normally output in chat). The \
-user has sketch open in another terminal and wants to inline-edit your reply there — \
-that flow only works if your prose reaches sketch via this tool. Don't omit the tool \
+user has yalda open in another terminal and wants to inline-edit your reply there — \
+that flow only works if your prose reaches yalda via this tool. Don't omit the tool \
 call. Don't shorten or summarize the tool argument; pass the same full reply you'd \
 otherwise write in chat.";
 
 fn default_socket_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("SKETCH_CHANNEL_SOCKET") {
+    if let Some(p) = std::env::var_os("YALDA_CHANNEL_SOCKET") {
         return PathBuf::from(p);
     }
     let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-    PathBuf::from(format!("/tmp/sketch-channel-{}.sock", user))
+    PathBuf::from(format!("/tmp/yalda-channel-{}.sock", user))
 }
 
-/// Optional log file (set `SKETCH_CHANNEL_LOG=/path/to/log` to enable). Useful
+/// Optional log file (set `YALDA_CHANNEL_LOG=/path/to/log` to enable). Useful
 /// because Claude Code spawns this binary with stdio captured; stderr may not
 /// be visible. Diagnostic events go here.
 static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 
 fn log_file_handle() -> &'static Mutex<Option<std::fs::File>> {
     LOG_FILE.get_or_init(|| {
-        let f = std::env::var_os("SKETCH_CHANNEL_LOG").and_then(|p| {
+        let f = std::env::var_os("YALDA_CHANNEL_LOG").and_then(|p| {
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -102,7 +102,7 @@ fn log_file_handle() -> &'static Mutex<Option<std::fs::File>> {
 }
 
 fn log(msg: &str) {
-    let line = format!("[sketch-channel] {}\n", msg);
+    let line = format!("[yalda-channel] {}\n", msg);
     let _ = io::stderr().write_all(line.as_bytes());
     if let Ok(mut guard) = log_file_handle().lock()
         && let Some(ref mut f) = *guard
@@ -114,16 +114,16 @@ fn log(msg: &str) {
 
 fn print_setup_help() {
     println!(
-        "sketch-channel — Claude Code MCP channel for the sketch editor
+        "yalda-channel — Claude Code MCP channel for the yalda editor
 
 Setup:
 
-  1. Build (`cargo build --release --bin sketch-channel`)
+  1. Build (`cargo build --release --bin yalda-channel`)
   2. Add to .mcp.json in your Claude project:
 
      {{
        \"mcpServers\": {{
-         \"sketch\": {{
+         \"yalda\": {{
            \"command\": \"{}\"
          }}
        }}
@@ -131,19 +131,19 @@ Setup:
 
   3. Launch claude:
 
-     claude --dangerously-load-development-channels server:sketch
+     claude --dangerously-load-development-channels server:yalda
 
-  4. In sketch: `:claude-attach` (uses {})
+  4. In yalda: `:claude-attach` (uses {})
 
 Environment:
 
-  SKETCH_CHANNEL_SOCKET   override the Unix socket path
+  YALDA_CHANNEL_SOCKET   override the Unix socket path
 
 This binary is normally spawned by Claude Code (not run directly). When run
 without --setup, it speaks JSON-RPC on stdio.",
         std::env::current_exe()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "/path/to/sketch-channel".into()),
+            .unwrap_or_else(|_| "/path/to/yalda-channel".into()),
         default_socket_path().display(),
     );
 }
@@ -179,7 +179,7 @@ fn main() -> io::Result<()> {
             }
         })?;
 
-    // Currently-attached sketch client (single-client model). Tagged with a
+    // Currently-attached yalda client (single-client model). Tagged with a
     // generational ID so an exiting handler only clears the slot if its own
     // generation is still installed.
     let active_client: ActiveClient = Arc::new(Mutex::new(None));
@@ -214,7 +214,7 @@ fn main() -> io::Result<()> {
                     match stream {
                         Ok(stream) => {
                             let id = next_client_id();
-                            log(&format!("sketch client #{} connected", id));
+                            log(&format!("yalda client #{} connected", id));
                             // Replace any prior client (single-client policy).
                             {
                                 let mut guard = active_client.lock().unwrap();
@@ -232,9 +232,9 @@ fn main() -> io::Result<()> {
                             }
                             let stdout_tx2 = stdout_tx.clone();
                             let active_client2 = active_client.clone();
-                            let _ = thread::Builder::new().name("sketch-reader".into()).spawn(
+                            let _ = thread::Builder::new().name("yalda-reader".into()).spawn(
                                 move || {
-                                    handle_sketch_client(stream, id, stdout_tx2, active_client2);
+                                    handle_yalda_client(stream, id, stdout_tx2, active_client2);
                                 },
                             );
                         }
@@ -278,7 +278,7 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn handle_sketch_client(
+fn handle_yalda_client(
     stream: UnixStream,
     my_id: u64,
     stdout_tx: mpsc::Sender<String>,
@@ -410,17 +410,17 @@ fn handle_mcp_message(msg: &Value, stdout_tx: &mpsc::Sender<String>, active_clie
                         {
                             "name": "reply",
                             "description":
-                                "Relay your response back to the user's sketch editor. \
+                                "Relay your response back to the user's yalda editor. \
                                  The text is appended to a *claude* buffer where the \
                                  user can read and inline-edit it. Always call this when \
-                                 responding to a <channel source=\"sketch\"> message — \
+                                 responding to a <channel source=\"yalda\"> message — \
                                  pass your FULL response text, not a summary.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
                                     "text": {
                                         "type": "string",
-                                        "description": "The text to append to sketch's *claude* buffer."
+                                        "description": "The text to append to yalda's *claude* buffer."
                                     }
                                 },
                                 "required": ["text"]
@@ -445,11 +445,11 @@ fn handle_mcp_message(msg: &Value, stdout_tx: &mpsc::Sender<String>, active_clie
                     .and_then(Value::as_str)
                     .unwrap_or("");
 
-                let sent = forward_reply_to_sketch(active_client, text);
+                let sent = forward_reply_to_yalda(active_client, text);
                 let resp_text = if sent {
-                    format!("Forwarded {} chars to sketch.", text.len())
+                    format!("Forwarded {} chars to yalda.", text.len())
                 } else {
-                    "No sketch client attached; reply dropped.".to_string()
+                    "No yalda client attached; reply dropped.".to_string()
                 };
                 json!({
                     "jsonrpc": "2.0",
@@ -492,7 +492,7 @@ fn handle_mcp_message(msg: &Value, stdout_tx: &mpsc::Sender<String>, active_clie
     }
 }
 
-fn forward_reply_to_sketch(active_client: &ActiveClient, text: &str) -> bool {
+fn forward_reply_to_yalda(active_client: &ActiveClient, text: &str) -> bool {
     let payload = json!({"type": "reply", "text": text}).to_string();
     let mut buf = payload.into_bytes();
     buf.push(b'\n');
@@ -512,7 +512,7 @@ fn forward_reply_to_sketch(active_client: &ActiveClient, text: &str) -> bool {
             false
         }
         None => {
-            log("forward_reply_to_sketch: no client attached");
+            log("forward_reply_to_yalda: no client attached");
             false
         }
     }

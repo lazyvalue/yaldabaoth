@@ -1,10 +1,10 @@
-//! `sketch-acp-stub` — a **test-support** stub ACP agent.
+//! `yalda-acp-stub` — a **test-support** stub ACP agent.
 //!
 //! This binary is NOT a product surface. It exists so the headless session-
 //! server harness (`tests/session_resilience_test.rs`,
 //! `tests/session_transcript_test.rs`) can drive a *real* ACP transcript
 //! through the real `AcpChannelClient` (the client half, in
-//! `src/acp_channel.rs`) and the real `sketch-session-server`, without
+//! `src/acp_channel.rs`) and the real `yalda-session-server`, without
 //! depending on a live Claude agent.
 //!
 //! It speaks the **agent** side of the Agent Client Protocol over stdio. The
@@ -13,7 +13,7 @@
 //! and the same framing the existing hand-rolled Python fake agent in
 //! `acp_channel.rs`'s unit tests relies on.
 //!
-//! Only the subset of methods the sketch client actually sends is handled:
+//! Only the subset of methods the yalda client actually sends is handled:
 //!   - `initialize`     → `{protocolVersion, agentCapabilities:{loadSession:true}}`
 //!   - `session/new`    → `{sessionId}`
 //!   - `session/load`   → replays the prior transcript as `session/update`

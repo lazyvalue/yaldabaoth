@@ -1,4 +1,4 @@
-use sketch::keys::{Key, Modifiers, format_key_sequence, parse_key_sequence};
+use yalda::keys::{Key, Modifiers, format_key_sequence, parse_key_sequence};
 
 #[test]
 fn test_parse_single_char() {
@@ -197,7 +197,7 @@ fn test_from_crossterm_keyevent() {
     use crossterm::event::{
         KeyCode as CtKeyCode, KeyEvent as CtKeyEvent, KeyModifiers as CtKeyModifiers,
     };
-    use sketch::keys::KeyPress;
+    use yalda::keys::KeyPress;
 
     let press = KeyPress::from(CtKeyEvent::new(
         CtKeyCode::Char('d'),

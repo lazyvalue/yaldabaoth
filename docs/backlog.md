@@ -83,7 +83,7 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
   notifications can record as live events (bounded duplication, not a wedge).
 - **Leaked `claude-code-acp` adapter processes** — `READY`. ~70 idle adapter
   processes observed (2026-06-09) dating back 2 weeks, surviving their parent
-  sketch/server exits. Something on the teardown path (GUI direct-spawn drops?
+  yalda/server exits. Something on the teardown path (GUI direct-spawn drops?
   server crash-kills?) doesn't kill the child. Inventory: `pgrep -fl
   claude-code-acp`. Needs a teardown audit + maybe a startup reaper.
 - **Reconnect bursts at GUI launch** — `NEEDS-RUNTIME` (probable root cause
@@ -125,7 +125,7 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
   client lib for the residual teardown-vs-reattach race; (4) single-instance
   guard — a 2nd server on a live socket exits instead of stealing it and
   orphaning sessions; (5) `pid_file_path`/persist path now follow
-  `SKETCH_SESSION_SOCKET` (enables isolated instances + the guard). **Verified:**
+  `YALDA_SESSION_SOCKET` (enables isolated instances + the guard). **Verified:**
   new headless harness `tests/session_resilience_test.rs` drives the REAL server
   binary (no agent needed) — reproduces the storm without the fix; with it, 30
   sequential restarts + in-place reconnect + duplicate-server guard all pass,
@@ -158,10 +158,10 @@ verified via the resilience+transcript harness. Worklogs:
   test files unchanged, two adversarial reviews SOLID. Kills the shared-mutex race
   class + poison-tolerant lock.
 - **Slow-subscriber disconnect** — `DONE` (`a70ef74`). All server→client writes
-  bounded by a timeout (60s default; `SKETCH_SLOW_SUB_TIMEOUT_MS`); stuck peer
+  bounded by a timeout (60s default; `YALDA_SLOW_SUB_TIMEOUT_MS`); stuck peer
   dropped → reconnects + replays; owner never gapped.
 - **Headless start-work verb** — `DONE` (`f3585b0`, ADR-0015). `Request::AdminPrompt`
-  + `sketch-session-server prompt <sid> <text>` CLI + `SessionServerClient::
+  + `yalda-session-server prompt <sid> <text>` CLI + `SessionServerClient::
   {admin_prompt,connect_existing}`; ungated `enqueue_prompt` core shared with the
   owner-gated `do_prompt`. Headless prompt takes no lease; WAL-durable; runs under
   the session's stored permission mode. Test: `admin_prompt_drives_turn_without_owner`.
@@ -175,7 +175,7 @@ verified via the resilience+transcript harness. Worklogs:
   (branch `phase4-lease` → `ba12d5d`, 2026-06-08). `owner: conn_id` → `Lease{
   client_id, expires_at: Instant}` + 5s client heartbeat / 15s TTL; dual-clock
   (actor owns monotonic `Instant`, wire carries display-only millis); stable
-  per-install `client_id` (`~/.cache/sketch/client_id`, `SKETCH_CLIENT_ID` override
+  per-install `client_id` (`~/.cache/yalda/client_id`, `YALDA_CLIENT_ID` override
   for blue-green candidates); `attach_owner_with_retry`→`attach_for_role`
   (deterministic same-`client_id` reclaim, retry/observer-fallback retired); wire
   `OwnerChanged→LeaseChanged`; WAL 1→2 with **discard** of v1. STAGED, not bundled
@@ -205,7 +205,7 @@ verified via the resilience+transcript harness. Worklogs:
   subprocess-backed. Workflow `wf_6ead8955-d04` → review `MINOR` (fake's
   `complete_turn` wrongly emitted a `TurnEnded` record the default worker doesn't)
   → fixed: `complete_turn` is counter-only, opt-in `emit_turn_ended_event` covers
-  `SKETCH_EMIT_TURN_ENDED=1`. Build + full suite + 8/8 fake tests green.
+  `YALDA_EMIT_TURN_ENDED=1`. Build + full suite + 8/8 fake tests green.
   Behavior-preserving → foldable after build-check. Overlaps
   `tests/session_resilience_test.rs` with phase 4 at integrate (kept additive).
   Unblocks the phase-8 eventlog reducer/forwarder headless tests.
@@ -345,7 +345,7 @@ user**; the rest is `NEEDS-RUNTIME`. Follow-ups below are off `integration`,
 - **Fold the perf/cleanup follow-ups into `integration`** after build-check:
   `ff-server-perf` (done), `ff-editor-perf` (when done). Hold the behavior-
   changing ones (`ff-buffer-pool`, `ff-ui-threading`) for runtime review.
-- **Retarget `/refactor` to sketch** — `READY`. Its `workflow.js` PHILOSOPHY
+- **Retarget `/refactor` to yalda** — `READY`. Its `workflow.js` PHILOSOPHY
   preamble is Fulcrum-specific (Python/PyO3/pytest/EARS). Replace with a Rust /
   GPUI philosophy (Result-typed errors, newtypes for invariants, `#[test]` /
   `debug_assert!` as enforcement hooks, no migration framing).

@@ -1,19 +1,19 @@
-//! ACP (Agent Client Protocol) channel for sketch.
+//! ACP (Agent Client Protocol) channel for yalda.
 //!
 //! This module is an alternative path to the existing
 //! [`claude_channel`](crate::claude_channel) UNIX-socket integration. Where the
-//! sketch-channel route requires Claude Code to be running and to have spawned
-//! sketch-channel as an MCP server, the ACP route lets sketch *itself* spawn a
+//! yalda-channel route requires Claude Code to be running and to have spawned
+//! yalda-channel as an MCP server, the ACP route lets yalda *itself* spawn a
 //! local agent subprocess and talk to it directly over JSON-RPC stdio (the
 //! [Agent Client Protocol](https://agentclientprotocol.com/)). That means
-//! sketch can ride the user's Claude Max subscription via the
+//! yalda can ride the user's Claude Max subscription via the
 //! `claude-agent-acp` (formerly `@zed-industries/claude-code-acp`) adapter
 //! without ever touching an API key — Claude Code handles auth itself.
 //!
 //! ## Architecture
 //!
 //! The official `agent-client-protocol` crate is async/Tokio-based, but the
-//! rest of sketch is sync (single-threaded `App::run` loop with
+//! rest of yalda is sync (single-threaded `App::run` loop with
 //! `crossterm::event::poll`). To bridge this without rewriting `app.rs`, this
 //! module follows the same pattern as `claude_channel.rs`:
 //!
@@ -21,10 +21,10 @@
 //!    Tokio runtime.
 //! 2. Inside that runtime, spawn the agent subprocess and run the ACP
 //!    `Client.builder().connect_with(...)` driver loop. The closure stays
-//!    alive for the lifetime of the connection — when sketch's drop signal
+//!    alive for the lifetime of the connection — when yalda's drop signal
 //!    fires, the closure returns and the worker thread tears the runtime
 //!    down.
-//! 3. Communicate between sketch (sync) and the worker (async) via two
+//! 3. Communicate between yalda (sync) and the worker (async) via two
 //!    `std::sync::mpsc` channels:
 //!       - **outbound**: `(prompt: String) -> ()` — `App` pushes prompts here
 //!         on `:claude-acp-send`. The worker async-loop drains this channel
@@ -44,7 +44,7 @@
 //! - **Permission requests**: the agent may ask the client to approve tool
 //!   use (`session/request_permission`). For now we auto-decline so the agent
 //!   can't surprise-write files; future work could surface a prompt in the
-//!   sketch UI. The agent can still respond with text (its own commentary)
+//!   yalda UI. The agent can still respond with text (its own commentary)
 //!   even without tool permission.
 //! - **Tool calls / thoughts / plans**: ignored at this layer — only
 //!   `agent_message_chunk` text is plumbed back to the buffer. Extending this
@@ -75,13 +75,13 @@ pub use agent_client_protocol::schema::{
 use agent_client_protocol::{Agent, Client, ConnectionTo};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-/// Emit a diagnostic line to stderr when SKETCH_ACP_DEBUG is set in the env.
-/// Gated this way so the chatter doesn't corrupt sketch's TUI in normal use
+/// Emit a diagnostic line to stderr when YALDA_ACP_DEBUG is set in the env.
+/// Gated this way so the chatter doesn't corrupt yalda's TUI in normal use
 /// but is one env-var away when something looks wrong.
 macro_rules! acp_debug {
     ($($arg:tt)*) => {
-        if std::env::var("SKETCH_ACP_DEBUG").is_ok() {
-            eprintln!("[sketch-acp] {}", format_args!($($arg)*));
+        if std::env::var("YALDA_ACP_DEBUG").is_ok() {
+            eprintln!("[yalda-acp] {}", format_args!($($arg)*));
         }
     };
 }
@@ -91,34 +91,34 @@ macro_rules! acp_debug {
 /// [`DEFAULT_AGENT_FALLBACKS`] so users on either binary name still work.
 pub const DEFAULT_AGENT_COMMAND: &str = "claude-code-acp";
 
-/// Which sketch frontend is hosting this ACP session. Threaded into the
+/// Which yalda frontend is hosting this ACP session. Threaded into the
 /// system-prompt append so Claude knows whether it's running inside the
 /// terminal TUI or the GPUI desktop app — affects nothing protocol-side,
 /// only the host-description sentence at the top of the prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SketchFrontend {
+pub enum YaldaFrontend {
     /// Terminal frontend (ratatui + crossterm). The default — preserves
     /// existing behaviour for any caller that didn't opt in to the
     /// frontend-aware spawn variants.
     #[default]
     Tui,
-    /// Desktop frontend (GPUI). Selected by `sketch-gpui`.
+    /// Desktop frontend (GPUI). Selected by `yalda-gpui`.
     Gpui,
 }
 
-impl SketchFrontend {
+impl YaldaFrontend {
     /// Sentence describing the host — interpolated into the system-prompt
     /// append so the model can adapt phrasing if it cares (most behaviour
     /// is identical between the two).
     fn host_description(self) -> &'static str {
         match self {
-            Self::Tui => "the ratatui/crossterm terminal frontend (`sketch` binary)",
-            Self::Gpui => "the GPUI desktop frontend (`sketch-gpui` binary)",
+            Self::Tui => "the ratatui/crossterm terminal frontend (`yalda` binary)",
+            Self::Gpui => "the GPUI desktop frontend (`yalda-gpui` binary)",
         }
     }
 }
 
-/// Sketch-side flattening of ACP's `UsageUpdate` (which is feature-gated
+/// Yalda-side flattening of ACP's `UsageUpdate` (which is feature-gated
 /// behind `unstable_session_usage`). Carrying our own struct means the
 /// `ReplyEvent::UsageUpdated` variant stays unconditional regardless of
 /// whether the upstream feature is enabled — only the emitter in the
@@ -194,7 +194,7 @@ pub enum ReplyEvent {
     /// `count` is the post-increment turn count.
     ///
     /// **Additive rollout (this stage):** emitted only when
-    /// `SKETCH_EMIT_TURN_ENDED=1`, and consumers treat it as inert — the three
+    /// `YALDA_EMIT_TURN_ENDED=1`, and consumers treat it as inert — the three
     /// pumps still INFER turn-end ("queue empty + counter climbed") and that
     /// inference still drives `finalize`. The consuming arm only logs whether
     /// the explicit signal agrees with the inferred boundary, so agreement can
@@ -262,7 +262,7 @@ impl ReplayTurns {
     }
 }
 
-/// How sketch responds to `session/request_permission` from the agent.
+/// How yalda responds to `session/request_permission` from the agent.
 ///
 /// The Claude Agent SDK already auto-approves read-only tools (Read, Grep,
 /// Glob, LS) without firing a permission request — those work in every
@@ -384,7 +384,7 @@ const SESSION_LOAD_TIMEOUT_SECS: u64 = 300;
 /// §Rollout). The pump thread never builds the client — the session-server's
 /// three spawn workers (create / restart / resume) do. Abstracting *spawning*
 /// behind this object-safe factory lets a test inject an in-process fake without
-/// touching the `SKETCH_ACP_AGENT` env or forking the real binary, while the
+/// touching the `YALDA_ACP_AGENT` env or forking the real binary, while the
 /// production path stays byte-for-byte identical via [`RealAgentSpawner`].
 ///
 /// `Send + Sync` so it can live behind an `Arc<dyn AgentSpawner>` shared by the
@@ -399,7 +399,7 @@ pub trait AgentSpawner: Send + Sync {
         command: &str,
         cwd: Option<PathBuf>,
         resume: Option<String>,
-        frontend: SketchFrontend,
+        frontend: YaldaFrontend,
     ) -> io::Result<Box<dyn AgentTransport>>;
 }
 
@@ -414,7 +414,7 @@ impl AgentSpawner for RealAgentSpawner {
         command: &str,
         cwd: Option<PathBuf>,
         resume: Option<String>,
-        frontend: SketchFrontend,
+        frontend: YaldaFrontend,
     ) -> io::Result<Box<dyn AgentTransport>> {
         AcpChannelClient::spawn_with_resume_in(command, cwd, resume, frontend)
             .map(|c| Box::new(c) as Box<dyn AgentTransport>)
@@ -549,18 +549,18 @@ mod fake {
 
         /// Mirror the real DEFAULT worker turn boundary: bump the turn counter
         /// ONLY. The default worker does NOT push `ReplyEvent::TurnEnded` into the
-        /// reply stream — that variant is gated behind `SKETCH_EMIT_TURN_ENDED=1`
+        /// reply stream — that variant is gated behind `YALDA_EMIT_TURN_ENDED=1`
         /// and is inert by default; the pump detects the boundary purely via
         /// `turn_count() > last_turns`. Emitting a TurnEnded here would make a
         /// fake-driven turn produce an extra eventlog record the production path
         /// never emits (false confidence for reducer/forwarder tests). Use
         /// [`emit_turn_ended_event`](Self::emit_turn_ended_event) to exercise the
-        /// opt-in `SKETCH_EMIT_TURN_ENDED=1` mode.
+        /// opt-in `YALDA_EMIT_TURN_ENDED=1` mode.
         pub fn complete_turn(&self) {
             self.turns.fetch_add(1, Ordering::SeqCst);
         }
 
-        /// Opt-in: reproduce the `SKETCH_EMIT_TURN_ENDED=1` worker mode — bump the
+        /// Opt-in: reproduce the `YALDA_EMIT_TURN_ENDED=1` worker mode — bump the
         /// turn counter AND push a `TurnEnded{count}` event into the reply stream.
         /// Only for scenarios deliberately exercising that gated path; the default
         /// boundary is [`complete_turn`](Self::complete_turn) (counter-only).
@@ -634,7 +634,7 @@ mod fake {
             command: &str,
             cwd: Option<PathBuf>,
             resume: Option<String>,
-            _frontend: SketchFrontend,
+            _frontend: YaldaFrontend,
         ) -> io::Result<Box<dyn AgentTransport>> {
             let mut f = self
                 .factory
@@ -675,7 +675,7 @@ pub struct AcpChannelClient {
     turns: Arc<AtomicUsize>,
     /// Live session id, populated by the worker after `session/new` (or
     /// `session/load`) completes. Persisted to disk so the next run of
-    /// sketch can resume the same Claude session via `session/load`.
+    /// yalda can resume the same Claude session via `session/load`.
     session_id: Arc<std::sync::Mutex<Option<String>>>,
     /// Wake-channel receiver. The worker pushes a `()` here after every
     /// reply event; the App side consumes it on first use (via
@@ -689,7 +689,7 @@ pub struct AcpChannelClient {
     /// the App side via [`set_permission_mode`].
     permission_mode: Arc<AtomicU8>,
     /// Joined on Drop so the worker has a chance to clean up the runtime
-    /// (kill the child, drop streams) before sketch exits.
+    /// (kill the child, drop streams) before yalda exits.
     worker: Option<JoinHandle<()>>,
     /// Cosmetic: surfaced via `:claude-acp-status` so the user can see what
     /// command was spawned.
@@ -708,7 +708,7 @@ impl AcpChannelClient {
     /// fallback chain ([`DEFAULT_AGENT_FALLBACKS`]) is tried in order;
     /// the first that successfully spawns wins. This lets users on either
     /// the new (`claude-agent-acp`) or old (`claude-code-acp`) npm package
-    /// name "just work" without setting `SKETCH_ACP_AGENT`.
+    /// name "just work" without setting `YALDA_ACP_AGENT`.
     ///
     /// Each candidate is also resolved through a login shell (`$SHELL -lc
     /// 'command -v <name>'`) when direct PATH lookup fails. GUI processes
@@ -733,12 +733,12 @@ impl AcpChannelClient {
         cwd: Option<PathBuf>,
         resume_session_id: Option<String>,
     ) -> io::Result<Self> {
-        Self::spawn_with_resume_in(command_str, cwd, resume_session_id, SketchFrontend::Tui)
+        Self::spawn_with_resume_in(command_str, cwd, resume_session_id, YaldaFrontend::Tui)
     }
 
     /// Frontend-aware variant of [`spawn_with_resume`]. The `frontend`
     /// argument is woven into the system-prompt append so Claude knows
-    /// which sketch host is driving it — used by `sketch-gpui` to
+    /// which yalda host is driving it — used by `yalda-gpui` to
     /// announce itself as the GPUI desktop frontend rather than the
     /// default TUI. All other behaviour is identical to
     /// [`spawn_with_resume`].
@@ -746,7 +746,7 @@ impl AcpChannelClient {
         command_str: &str,
         cwd: Option<PathBuf>,
         resume_session_id: Option<String>,
-        frontend: SketchFrontend,
+        frontend: YaldaFrontend,
     ) -> io::Result<Self> {
         let candidates: Vec<String> = if command_str.trim().is_empty() {
             DEFAULT_AGENT_FALLBACKS
@@ -793,7 +793,7 @@ impl AcpChannelClient {
         Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "no ACP agent on PATH (tried {}). Install with `npm i -g @zed-industries/claude-code-acp`, or set SKETCH_ACP_AGENT=/path/to/agent. Last error: {}",
+                "no ACP agent on PATH (tried {}). Install with `npm i -g @zed-industries/claude-code-acp`, or set YALDA_ACP_AGENT=/path/to/agent. Last error: {}",
                 tried.join(", "),
                 last_err
                     .as_ref()
@@ -810,7 +810,7 @@ impl AcpChannelClient {
         command: &str,
         cwd: Option<PathBuf>,
         resume_session_id: Option<String>,
-        frontend: SketchFrontend,
+        frontend: YaldaFrontend,
     ) -> io::Result<Self> {
         let cwd =
             cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
@@ -863,7 +863,7 @@ impl AcpChannelClient {
 
         let worker_cwd = cwd.clone();
         let worker = thread::Builder::new()
-            .name("sketch-acp-worker".into())
+            .name("yalda-acp-worker".into())
             .spawn(move || {
                 run_worker(
                     parts,
@@ -940,7 +940,7 @@ impl AcpChannelClient {
 
     /// The agent-assigned session id, populated once the initialize +
     /// `session/new` (or `session/load`) handshake completes. Persist this
-    /// across sketch runs so a future invocation can pick up the same
+    /// across yalda runs so a future invocation can pick up the same
     /// Claude session via `loadSession`.
     pub fn session_id(&self) -> Option<String> {
         self.session_id.lock().ok().and_then(|g| g.clone())
@@ -1290,7 +1290,7 @@ fn run_worker(
     permission_mode: Arc<AtomicU8>,
     wake_tx: futures::channel::mpsc::UnboundedSender<()>,
     cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
-    frontend: SketchFrontend,
+    frontend: YaldaFrontend,
 ) {
     // Build a small multi-thread runtime — the ACP crate spawns several
     // tasks internally (read loop, write loop, response router) and a
@@ -1330,10 +1330,10 @@ fn run_worker(
     });
     if let Err(e) = result {
         // Errors after the readiness handshake bubble out here — log to
-        // stderr (sketch is in alt-screen, so this is mostly diagnostic for
+        // stderr (yalda is in alt-screen, so this is mostly diagnostic for
         // people running with `2>log`).
         connected.store(false, Ordering::SeqCst);
-        eprintln!("[sketch-acp] worker exited with error: {e}");
+        eprintln!("[yalda-acp] worker exited with error: {e}");
     }
     // Runtime drops here, killing any straggling tokio tasks (and the child
     // process via Drop on tokio::process::Child).
@@ -1354,7 +1354,7 @@ async fn worker_async(
     permission_mode: Arc<AtomicU8>,
     wake_tx: futures::channel::mpsc::UnboundedSender<()>,
     mut cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
-    frontend: SketchFrontend,
+    frontend: YaldaFrontend,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1) Spawn the agent process.
     let mut cmd = tokio::process::Command::new(&parts[0]);
@@ -1362,15 +1362,15 @@ async fn worker_async(
     // The `cwd` argument has long been forwarded to the agent over the wire
     // as `NewSessionRequest::new(cwd)` below — a project-root hint the agent
     // is supposed to respect. But until this line, the OS-level cwd of the
-    // spawned subprocess was whatever sketch's own process cwd happened to
+    // spawned subprocess was whatever yalda's own process cwd happened to
     // be: `tokio::process::Command::new` does not inherit any specific
     // working directory. The two paths could silently diverge, so any agent
     // affordance that reads the OS cwd (Bash `pwd`, a subprocess spawned
-    // with a relative path) was resolving against sketch's process cwd,
+    // with a relative path) was resolving against yalda's process cwd,
     // not the per-session cwd. `spec-agent-cwd.md` §3 fixes that.
     cmd.current_dir(&cwd);
-    // Scrub the Claude Code nesting-detector env var. When sketch is
-    // launched from inside a Claude Code session (very common — sketch
+    // Scrub the Claude Code nesting-detector env var. When yalda is
+    // launched from inside a Claude Code session (very common — yalda
     // users tend to use claude-code as their editor), CLAUDECODE=1 is
     // inherited and the spawned `claude-agent-acp` aborts with "Claude
     // Code cannot be launched inside another Claude Code session." The
@@ -1383,10 +1383,10 @@ async fn worker_async(
         .stdout(std::process::Stdio::piped())
         // Pipe-and-discard the agent's stderr by default. Agents (including
         // claude-agent-acp) may log diagnostics there; keeping it inherit
-        // would corrupt sketch's TUI. Set SKETCH_ACP_AGENT_STDERR=inherit to
+        // would corrupt yalda's TUI. Set YALDA_ACP_AGENT_STDERR=inherit to
         // surface it for debugging.
         .stderr(
-            if std::env::var("SKETCH_ACP_AGENT_STDERR").as_deref() == Ok("inherit") {
+            if std::env::var("YALDA_ACP_AGENT_STDERR").as_deref() == Ok("inherit") {
                 std::process::Stdio::inherit()
             } else {
                 std::process::Stdio::null()
@@ -1476,7 +1476,7 @@ async fn worker_async(
     let event_tx_for_driver = event_tx.clone();
     let connect_result = Client
         .builder()
-        .name("sketch")
+        .name("yalda")
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
                 acp_debug!("notification: {:?}", notification.update);
@@ -1647,11 +1647,11 @@ async fn worker_async(
                     //    verbatim from `cli.js` (functions xwz, mwz, Qwz,
                     //    Iwz, Fwz) with placeholder tool refs filled in
                     //    with their canonical Claude Code names. The
-                    //    sketch-specific verify-after-edit clause stays
+                    //    yalda-specific verify-after-edit clause stays
                     //    on the front so it's the first thing the model
                     //    sees in the append.
                     // Body of the system-prompt append. The first sentence
-                    // is built separately so it can name the active sketch
+                    // is built separately so it can name the active yalda
                     // frontend (TUI vs GPUI) — everything below is shared.
                     const CLAUDE_CODE_APPEND_BODY: &str = r#"Treat this as an interactive coding session, not a one-shot agent run.
 
@@ -1661,7 +1661,7 @@ The user has explicitly asked for this voice; it overrides any earlier tone guid
 - Be succinct. Summarize what happened — don't narrate every step you took to get there.
 - Status updates while you're working should be one short line ("Reading X.", "Running tests.", "Editing Y."). The user wants to know what you're doing in flight, but in headline form.
 - Reserve full prose for the moment you actually reach a solid conclusion or finish the task. That's when the user wants the writeup — not before.
-- Don't think out loud in the message channel. Internal reasoning, exploration, and intermediate thoughts belong inside tool calls and your own reasoning, not in the user-facing response. The user is looking at sketch's chat, not a transcript of your inner monologue.
+- Don't think out loud in the message channel. Internal reasoning, exploration, and intermediate thoughts belong inside tool calls and your own reasoning, not in the user-facing response. The user is looking at yalda's chat, not a transcript of your inner monologue.
 - Default response length is 1–3 sentences. Expand only when the task genuinely requires more (e.g., explaining a complex tradeoff or summarizing many files at once).
 - Skip preambles like "I'll go ahead and", "Let me", or restating the question. Skip postambles like "Let me know if you'd like me to" or "I hope this helps". Get to the answer.
 - After completing work, report only: what changed, where, and any caveats. Don't recap the journey.
@@ -1709,13 +1709,13 @@ Prioritize technical accuracy and truthfulness over validating the user's belief
 Never give time estimates or predictions for how long tasks will take, whether for your own work or for users planning their projects. Avoid phrases like "this will take me a few minutes," "should be done in about 5 minutes," "this is a quick fix," "this will take 2-3 weeks," or "we can do this later." Focus on what needs to be done, not how long it might take. Break work into actionable steps and let users judge timing for themselves.
 
 IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the conversation."#;
-                    let session_mode = if std::env::var("SKETCH_SESSION_MANAGED").as_deref() == Ok("1") {
-                        " Session mode: client/server (session survives GUI restarts; managed by sketch-session-server)."
+                    let session_mode = if std::env::var("YALDA_SESSION_MANAGED").as_deref() == Ok("1") {
+                        " Session mode: client/server (session survives GUI restarts; managed by yalda-session-server)."
                     } else {
                         " Session mode: direct (GUI owns the agent subprocess)."
                     };
                     let claude_code_append = format!(
-                        "You are running inside the sketch editor's Claude Code surface — host: {host}.{session_mode} {body}",
+                        "You are running inside the yalda editor's Claude Code surface — host: {host}.{session_mode} {body}",
                         host = frontend.host_description(),
                         session_mode = session_mode,
                         body = CLAUDE_CODE_APPEND_BODY,
@@ -1922,7 +1922,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                         let backoff_ms =
                                             (500u64 << (attempt - 1)).min(8_000);
                                         eprintln!(
-                                            "[sketch-acp] prompt failed (retry {attempt}/{MAX_RETRIES} in {backoff_ms}ms): {e}"
+                                            "[yalda-acp] prompt failed (retry {attempt}/{MAX_RETRIES} in {backoff_ms}ms): {e}"
                                         );
                                         let _ = event_tx_for_driver.send(WorkerEvent::Reply(
                                             ReplyEvent::Notice(format!(
@@ -1937,7 +1937,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                         .await;
                                         continue; // resend the same prompt
                                     }
-                                    eprintln!("[sketch-acp] prompt failed: {e}");
+                                    eprintln!("[yalda-acp] prompt failed: {e}");
                                     let _ = event_tx_for_driver.send(WorkerEvent::Reply(
                                         ReplyEvent::Notice(format!(
                                             "agent error: {}",
@@ -1956,9 +1956,9 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         // boundary HERE, where the worker stands on the resolved
                         // `session/prompt`. Gated off by default so the durable
                         // event stream (and the in-flight reconnect/replay work)
-                        // is unperturbed; set `SKETCH_EMIT_TURN_ENDED=1` to gather
+                        // is unperturbed; set `YALDA_EMIT_TURN_ENDED=1` to gather
                         // agreement data before the inference is deleted.
-                        if std::env::var("SKETCH_EMIT_TURN_ENDED").as_deref() == Ok("1") {
+                        if std::env::var("YALDA_EMIT_TURN_ENDED").as_deref() == Ok("1") {
                             let _ = event_tx_for_driver
                                 .send(WorkerEvent::Reply(ReplyEvent::TurnEnded { count }));
                         }

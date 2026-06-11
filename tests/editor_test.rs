@@ -1,4 +1,4 @@
-use sketch::editor::Editor;
+use yalda::editor::Editor;
 use std::path::PathBuf;
 
 fn editor(text: &str) -> Editor {

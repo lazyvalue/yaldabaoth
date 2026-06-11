@@ -1,6 +1,6 @@
 > **Editor's note (added when landing):** This `/refactor` review ran against base commit `f282130`, *before* the `perf` synthesis branch (`9a41bfc`) landed. Several findings are therefore **already fixed on `perf`** and should be skipped: **#3** (highlight-cache fence re-highlight → fixed via `advance_fence`), **#5** (`shift_for_insert` rebuild → fixed, now O(shifted)), **#8** (`apply_server_batch` per-event → fixed, contiguous same-session events coalesced), **#10** (`full_text()` tail checks → fixed via O(1) rope probes). The **net-new** findings worth acting on are **#1/#2** (render_agent view-model rebuild + deep clones — partially addressed on `perf`, fully addressed by the tachyon `perf-tachyon` branch's S1), **#4** (undo full-rope snapshot), **#6/#7** (server `event_log` unbounded + global lock), and **#9** (insertion-point scan). Lenses ran with the Fulcrum philosophy preamble (Python/PyO3/EARS) which does not apply to this Rust app — treat "enforcement hook" as a Rust type/test/`debug_assert!`.
 
-# Refactor review — sketch-gpui agent/transcript performance hot path
+# Refactor review — yalda-gpui agent/transcript performance hot path
 
 _Scope: 10 file(s). Lenses: algorithms, concurrency_resources, liveness_termination, effects_purity._
 
@@ -10,19 +10,19 @@ The architectural through-line is a broken "O(changed)" contract: a perf pass in
 ## Findings (ranked)
 
 ### 1. render_agent re-derives the entire transcript view-model every frame; only highlighting is gated on edit_seq  ·  algorithms + concurrency_resources + liveness_termination + effects_purity  ·  effort L  ·  confidence high
-- **Location:** src/bin/sketch-gpui/main.rs:11194-11418 (edit_seq read at 11194 but consumed only by highlight snapshot at 11213); lines extract 11195-11203; gutter_tag_per_line 11241-11247; block_at_start scan 11296-11307; flat_items build 11313-11365; blank-collapse pass 11372-11418; animation notify 8976-8983
+- **Location:** src/bin/yalda-gpui/main.rs:11194-11418 (edit_seq read at 11194 but consumed only by highlight snapshot at 11213); lines extract 11195-11203; gutter_tag_per_line 11241-11247; block_at_start scan 11296-11307; flat_items build 11313-11365; blank-collapse pass 11372-11418; animation notify 8976-8983
 - **Evidence:** `edit_seq` is read at 11194 but only `highlight_cache.snapshot_syn` (11213) uses it. Everything else runs unconditionally per call: `lines: Vec<String>` built per line, `gutter_tag_per_line` resolving an `anchor_for_line_opt` BTreeMap lookup plus a `metadata::<TurnId>()` lookup per line, the block-range scan, the flat_items construction, and the O(n) blank-collapse. Cursor blink, cross-pane `cx.notify()`, and the 120ms awaiting animation tick each trigger a full render with zero document change. During a streaming turn the transcript grows while one render fires per pump cycle, so the summed cost is O(n²) over the turn.
 - **Refactor move:** Lift the flat_items / blank-collapse / block-range / gutter derivation into a pure function and memoize its output (`Rc<Vec<String>>`, gutter tags, `flat_items: Rc<Vec<FlatItem>>`, block_at_start map) on `AgentState` behind a fingerprint of `(edit_seq, frozen_line_count, tool_call_order.len(), awaiting_reply, theme_fp)`, mirroring `HighlightCache`'s fast-skip. **(Implemented on `perf-tachyon` as S1.)**
 - **Enforcement hook:** A fingerprint newtype on `AgentState` plus a `#[test]` asserting a second render with unchanged fingerprint returns the same `Rc` and recomputes 0 lines.
 
 ### 2. Closure-captured snapshots (lines, gutter_tags, tool_calls) are deep-cloned every frame instead of shared by Rc  ·  concurrency_resources + liveness_termination + effects_purity  ·  effort M  ·  confidence high
-- **Location:** src/bin/sketch-gpui/main.rs:11459 (`lines_snap = lines.clone()`), 11463 (`gutter_tag_snap`), 11464 (`tool_calls_snap = c.tool_calls.clone()`), 11465 (`expanded_snap`); contrast hl_snap Rc clone at 11460-11462
+- **Location:** src/bin/yalda-gpui/main.rs:11459 (`lines_snap = lines.clone()`), 11463 (`gutter_tag_snap`), 11464 (`tool_calls_snap = c.tool_calls.clone()`), 11465 (`expanded_snap`); contrast hl_snap Rc clone at 11460-11462
 - **Evidence:** `lines_snap`/`gutter_tag_snap` deep-copy freshly-built Vecs; `tool_calls_snap` deep-copies `HashMap<String, ToolCall>` where each carries content/diff/raw_input/raw_output strings capped at 64K chars each, never pruned. All runs on every notify including idle frames. `hl_snap` already does the right thing (Rc pointer clone).
 - **Refactor move:** Make the cached fields `Rc<…>` and hand the closure Rc clones; store `tool_calls` as `Rc<HashMap<…>>`, mutate via `Rc::make_mut`. `TurnId` is `Copy`. **(Implemented on `perf-tachyon` as part of S1.)**
 - **Enforcement hook:** Type-level — `Rc<…>` makes a deep `.clone()` a refcount bump by construction.
 
 ### 3. HighlightCache re-runs the full highlighter on every line each snapshot solely to advance fence state  ·  algorithms + liveness_termination  ·  effort S–M  ·  confidence high  ·  ⚠ ALREADY FIXED on `perf`
-- **Location:** src/bin/sketch-gpui/highlight_cache.rs:211-226 (line 224)
+- **Location:** src/bin/yalda-gpui/highlight_cache.rs:211-226 (line 224)
 - **Note:** The `perf` branch landed exactly the recommended `advance_fence()` byte-scan. Skip.
 
 ### 4. Undo snapshots the entire rope to a String on every insert-group and every undo/redo  ·  algorithms  ·  effort M  ·  confidence high  ·  NET-NEW
@@ -35,13 +35,13 @@ The architectural through-line is a broken "O(changed)" contract: a perf pass in
 - **Note:** The `perf` branch took render's in-place suffix re-key (true O(shifted)). Skip.
 
 ### 6. Server per-session event_log grows unbounded and is deep-cloned under the global lock on attach/persist  ·  algorithms + concurrency_resources + liveness_termination + effects_purity  ·  effort L  ·  confidence med  ·  NET-NEW
-- **Location:** src/bin/sketch-session-server/main.rs:51-53 (event_log), pushes throughout, save_to_disk clone at 143, attach clone at 440 (under lock); replay tail protocol at 1016-1079
+- **Location:** src/bin/yalda-session-server/main.rs:51-53 (event_log), pushes throughout, save_to_disk clone at 143, attach clone at 440 (under lock); replay tail protocol at 1016-1079
 - **Evidence:** `event_log` is only ever pushed, never trimmed; `save_to_disk` and `attach` clone the whole log under the global `sessions` lock. The self-host loop reconnects on every candidate relaunch, paying the full-log clone+replay repeatedly and unbounded with session age.
 - **Refactor move:** (a) low-risk: store as `Arc<[Notification]>` so attach/save clone a pointer; remove `event_log` from `list_sessions` payload. (b) higher-risk: cap/compact resolved turns, preserving the resumable-tail `sent`-index protocol (1016-1079).
 - **Enforcement hook:** `Arc<[Notification]>` makes the under-lock deep clone unrepresentable; a `MAX_EVENT_LOG_LEN` + equivalence test for compaction.
 
 ### 7. Pump and forwarders serialize every session and subscriber through one global sessions Mutex, per streamed event  ·  concurrency_resources  ·  effort L  ·  confidence med  ·  NET-NEW
-- **Location:** src/bin/sketch-session-server/main.rs:653 + 737-773 (pump holds global lock through drain+log+broadcast), 1019-1044 (forward loop re-locks per wake), 748 (broadcast per ReplyEvent)
+- **Location:** src/bin/yalda-session-server/main.rs:653 + 737-773 (pump holds global lock through drain+log+broadcast), 1019-1044 (forward loop re-locks per wake), 748 (broadcast per ReplyEvent)
 - **Refactor move:** Shard the lock per session (`HashMap<Id, Arc<Mutex<ManagedSession>>>` or `DashMap`); better, have the forwarder consume the broadcast payload directly for logged events and use `event_log` only for cold attach/replay.
 - **Enforcement hook:** Integration test driving two sessions, asserting forward progress on one while the other is saturated.
 

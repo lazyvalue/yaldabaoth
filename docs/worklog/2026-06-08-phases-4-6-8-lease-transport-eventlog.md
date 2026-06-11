@@ -16,7 +16,7 @@ bugs the tests structurally missed.
 - **Phase 4 — lease ownership** — ✅ MERGED `master` (`4beebe6`, base `ba12d5d`).
   `owner: conn_id` → `Lease{client_id, expires_at: Instant}` + 5s client heartbeat /
   15s TTL (dual-clock: actor owns monotonic `Instant`, wire carries display millis);
-  stable per-install `client_id` (`~/.cache/sketch/client_id`, `SKETCH_CLIENT_ID`
+  stable per-install `client_id` (`~/.cache/yalda/client_id`, `YALDA_CLIENT_ID`
   override for blue-green); `attach_owner_with_retry`→`attach_for_role` (deterministic
   same-`client_id` reclaim); wire `OwnerChanged→LeaseChanged`; WAL 1→2, **discard** v1.
   Workflow `wf_c45c440b-aac` → review `BLOCKING` (2 client races: owner-gap-after-promote;
@@ -31,7 +31,7 @@ bugs the tests structurally missed.
   `tests/agent_transport_fake_test.rs`. Real subprocess path byte-identical;
   crash/WAL/socket/back-pressure tests kept subprocess-backed. Workflow `wf_6ead8955-d04`
   → review `MINOR` (fake's `complete_turn` emitted a `TurnEnded` record the *default* worker
-  doesn't — gated behind `SKETCH_EMIT_TURN_ENDED=1`) → fixed (`complete_turn` counter-only;
+  doesn't — gated behind `YALDA_EMIT_TURN_ENDED=1`) → fixed (`complete_turn` counter-only;
   opt-in `emit_turn_ended_event`). `1f80296` is an incidental pre-existing `tree_test` API-drift
   fix surfaced by running the full suite. Behavior-preserving. Substrate for phase-8 headless
   reducer tests.
@@ -53,14 +53,14 @@ bugs the tests structurally missed.
 
 - **`scripts/rebuild-server.sh`** — ✅ dev tool, verified working. Rebuilds + relaunches the
   daemon; GUI-aware (a running GUI respawns the binary next to *it*, so the script builds the
-  running GUI's checkout and lets it respawn — avoids the v2/v3 mismatch). Modes: `$SKETCH_REPO`
+  running GUI's checkout and lets it respawn — avoids the v2/v3 mismatch). Modes: `$YALDA_REPO`
   override / auto-detect running GUI / standalone.
 
 ## Open / unresolved (see `docs/backlog.md`)
 
 - **Phase 8 merge = the v2→v3 WAL cutover** — `NEEDS-DECISION` (timing). It discards v2 sessions
   (same as the v1→v2 wipe); do at a quiet moment. WAL is socket-scoped (`session_wal_dir()`
-  follows `SKETCH_SESSION_SOCKET`), which is what let the runtime check run isolated.
+  follows `YALDA_SESSION_SOCKET`), which is what let the runtime check run isolated.
 - **Phase 8 owed runtime checks** — `NEEDS-RUNTIME`: (1) GPUI paint confirm — the now-`Idle`
   spinner visibly clears on screen after a resume+live-prompt (fold/`turn_phase` proven correct
   headlessly; only the paint is unverifiable); (2) App-Nap-paused-owner high-water eviction →

@@ -2,12 +2,12 @@
 //! flat-item view model (S1 cache + rebuild), turn/phase state machine,
 //! chatbox, per-tile AgentState, and the AgentRing of session slots.
 //! Extracted verbatim from main.rs (split-gpui-main). Render methods on
-//! SketchGpuiView stay in main.rs this pass.
+//! YaldaGpuiView stay in main.rs this pass.
 
 use super::*;
 
 /// Domain newtype for a tool-call identity (Finding 7, parse-don't-validate).
-/// The protocol hands us a typed [`ToolCallId`](sketch::acp_channel::ToolCallId)
+/// The protocol hands us a typed [`ToolCallId`](yalda::acp_channel::ToolCallId)
 /// (`Arc<str>` under the hood); we parse it into this key ONCE at the boundary
 /// (`apply_reply_events`) and key every tool map on it — `tool_calls`,
 /// `tool_call_order`, `tool_call_anchor_line`, and `FlatItem::ToolGroup.ids`.
@@ -18,7 +18,7 @@ use super::*;
 /// lookup. Stringification happens only at the render edge (`as_str` /
 /// `to_string`) where a DOM id or display label is needed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct ToolCallKey(pub(crate) sketch::acp_channel::ToolCallId);
+pub(crate) struct ToolCallKey(pub(crate) yalda::acp_channel::ToolCallId);
 
 /// The live tool-call state cluster, extracted from `AgentState` so the four
 /// maps that must move together have ONE owner instead of four sibling fields
@@ -30,7 +30,7 @@ pub(crate) struct ToolCallKey(pub(crate) sketch::acp_channel::ToolCallId);
 pub(crate) struct ToolCalls {
     /// Live tool calls keyed by `tool_call_id`. Updated in place as the agent
     /// emits `ToolCallUpdate` notifications (status, incremental content).
-    pub(crate) calls: std::collections::HashMap<ToolCallKey, sketch::acp_channel::ToolCall>,
+    pub(crate) calls: std::collections::HashMap<ToolCallKey, yalda::acp_channel::ToolCall>,
     /// Display order — ids in the chronological order first announced. Drives
     /// render order and "render after which line" via `anchor`.
     pub(crate) order: Vec<ToolCallKey>,
@@ -39,6 +39,15 @@ pub(crate) struct ToolCalls {
     pub(crate) anchor: std::collections::HashMap<ToolCallKey, LineAnchor>,
     /// Ids the user expanded inline (default-collapsed).
     pub(crate) expanded: std::collections::HashSet<String>,
+    /// Generation counter bumped on every mutation to `calls` or `expanded`.
+    /// The render-side snapshot caches below use this to avoid deep-cloning
+    /// the HashMap/HashSet on frames where nothing changed (chatbox keystrokes,
+    /// cursor blink, cross-tile notify).
+    snap_gen: u64,
+    /// Cached `Rc` snapshot of `calls`, rebuilt lazily when `gen` advances.
+    calls_snap: std::cell::RefCell<(u64, std::rc::Rc<std::collections::HashMap<ToolCallKey, yalda::acp_channel::ToolCall>>)>,
+    /// Cached `Rc` snapshot of `expanded`, rebuilt lazily when `gen` advances.
+    expanded_snap: std::cell::RefCell<(u64, std::rc::Rc<std::collections::HashSet<String>>)>,
 }
 
 impl ToolCalls {
@@ -48,7 +57,7 @@ impl ToolCalls {
     pub(crate) fn register(
         &mut self,
         key: ToolCallKey,
-        call: sketch::acp_channel::ToolCall,
+        call: yalda::acp_channel::ToolCall,
         anchor: LineAnchor,
     ) {
         if !self.calls.contains_key(&key) {
@@ -56,6 +65,7 @@ impl ToolCalls {
         }
         self.anchor.insert(key.clone(), anchor);
         self.calls.insert(key, call);
+        self.snap_gen += 1;
     }
 
     /// Toggle a tool call's inline-expanded state (keyed by raw id string).
@@ -63,6 +73,7 @@ impl ToolCalls {
         if !self.expanded.remove(id) {
             self.expanded.insert(id.to_string());
         }
+        self.snap_gen += 1;
     }
 
     /// Clear every map at a transcript reset (`reset_for_replay`).
@@ -71,13 +82,45 @@ impl ToolCalls {
         self.order.clear();
         self.anchor.clear();
         self.expanded.clear();
+        self.snap_gen += 1;
+    }
+
+    /// Mutable access to a tool call by key, bumping the generation counter
+    /// so the next `calls_snapshot` will rebuild.
+    pub(crate) fn call_mut(&mut self, key: &ToolCallKey) -> Option<&mut yalda::acp_channel::ToolCall> {
+        let v = self.calls.get_mut(key);
+        if v.is_some() {
+            self.snap_gen += 1;
+        }
+        v
+    }
+
+    /// O(1) `Rc` clone when `calls` hasn't changed since the last snapshot.
+    /// Deep-clones only when the generation counter has advanced.
+    pub(crate) fn calls_snapshot(
+        &self,
+    ) -> std::rc::Rc<std::collections::HashMap<ToolCallKey, yalda::acp_channel::ToolCall>> {
+        let mut snap = self.calls_snap.borrow_mut();
+        if snap.0 != self.snap_gen {
+            *snap = (self.snap_gen, std::rc::Rc::new(self.calls.clone()));
+        }
+        snap.1.clone()
+    }
+
+    /// O(1) `Rc` clone when `expanded` hasn't changed since the last snapshot.
+    pub(crate) fn expanded_snapshot(&self) -> std::rc::Rc<std::collections::HashSet<String>> {
+        let mut snap = self.expanded_snap.borrow_mut();
+        if snap.0 != self.snap_gen {
+            *snap = (self.snap_gen, std::rc::Rc::new(self.expanded.clone()));
+        }
+        snap.1.clone()
     }
 }
 
 impl ToolCallKey {
     /// Parse a protocol `ToolCallId` into the domain key. Cheap: clones an
     /// `Arc<str>`, no string allocation.
-    pub(crate) fn from_id(id: &sketch::acp_channel::ToolCallId) -> Self {
+    pub(crate) fn from_id(id: &yalda::acp_channel::ToolCallId) -> Self {
         ToolCallKey(id.clone())
     }
 
@@ -127,20 +170,20 @@ pub(crate) enum TurnRole {
     User,
 }
 
-/// Free-function variant of `SketchGpuiView::build_tool_block` that
+/// Free-function variant of `YaldaGpuiView::build_tool_block` that
 /// works without an active `&Context<Self>`. Used inside `gpui::list`'s
 /// per-item render closure (which only gets `&mut Window, &mut GpuiApp`).
-/// Click handlers are wired through a `WeakEntity<SketchGpuiView>`
+/// Click handlers are wired through a `WeakEntity<YaldaGpuiView>`
 /// captured at render-build time so toggling `expanded_tool_calls`
 /// still goes through the same entity update path.
 pub(crate) fn build_tool_block_with_weak(
-    tc: &sketch::acp_channel::ToolCall,
+    tc: &yalda::acp_channel::ToolCall,
     expanded: bool,
     code_font: &SharedString,
-    weak_view: gpui::WeakEntity<SketchGpuiView>,
-    at: &sketch::theme::AgentTheme,
+    weak_view: gpui::WeakEntity<YaldaGpuiView>,
+    at: &yalda::theme::AgentTheme,
 ) -> AnyElement {
-    use sketch::acp_channel::ToolCallStatus;
+    use yalda::acp_channel::ToolCallStatus;
     let (status_glyph, status_color): (&str, Hsla) = match tc.status {
         ToolCallStatus::Pending => ("○", nc(at.tool_pending)),
         ToolCallStatus::InProgress => ("◐", nc(at.tool_in_progress)),
@@ -265,7 +308,7 @@ pub(crate) fn build_tool_block_with_weak(
     block.into_any_element()
 }
 
-/// Free-function form of [`SketchGpuiView::tool_body`] for the
+/// Free-function form of [`YaldaGpuiView::tool_body`] for the
 /// virtualised render path. Same content layout, accepts a borrowed
 /// `code_font` instead of reaching through `&self`.
 // builder/render fn — arg count is inherent, splitting would obscure
@@ -348,8 +391,8 @@ pub(crate) enum ToolRenderPolicy {
 /// raw_input sniffs for tools the kind alone doesn't disambiguate
 /// (TodoWrite is `Think`, same as Task — but the user wants its body
 /// hidden, so we detect it by an `input.todos` field).
-pub(crate) fn tool_render_policy(tc: &sketch::acp_channel::ToolCall) -> ToolRenderPolicy {
-    use sketch::acp_channel::ToolKind;
+pub(crate) fn tool_render_policy(tc: &yalda::acp_channel::ToolCall) -> ToolRenderPolicy {
+    use yalda::acp_channel::ToolKind;
     // TodoWrite shows up as `kind=Think` (same as the Task subagent),
     // and its body is the running todo list — too noisy to render. Sniff
     // for the distinctive `todos` array on the input to tell them apart.
@@ -373,7 +416,7 @@ pub(crate) fn tool_render_policy(tc: &sketch::acp_channel::ToolCall) -> ToolRend
 /// Extract a short detail string from a tool call's input for inline
 /// display in the group header. Returns the file path for Read/Edit/Write,
 /// truncated command for Execute, query for Search, etc.
-pub(crate) fn tool_inline_detail(tc: &sketch::acp_channel::ToolCall) -> Option<String> {
+pub(crate) fn tool_inline_detail(tc: &yalda::acp_channel::ToolCall) -> Option<String> {
     let input = tc.raw_input.as_ref()?;
     // Try file_path first (Read, Edit, Write, Glob).
     if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
@@ -410,7 +453,7 @@ pub(crate) fn tool_inline_detail(tc: &sketch::acp_channel::ToolCall) -> Option<S
 /// (e.g. "grep", "edit", "read"). Prefers the leading word of the title — for
 /// claude-code-acp this is the tool name (Grep / Read / Bash / Edit / …) — and
 /// falls back to the ACP `kind` when the title isn't a clean single token.
-pub(crate) fn tool_type_label(tc: &sketch::acp_channel::ToolCall) -> String {
+pub(crate) fn tool_type_label(tc: &yalda::acp_channel::ToolCall) -> String {
     tc.title
         .split_whitespace()
         .next()
@@ -423,8 +466,8 @@ pub(crate) fn tool_type_label(tc: &sketch::acp_channel::ToolCall) -> String {
 }
 
 /// Fallback label derived from the ACP tool kind when the title isn't usable.
-pub(crate) fn tool_kind_label(kind: &sketch::acp_channel::ToolKind) -> String {
-    use sketch::acp_channel::ToolKind;
+pub(crate) fn tool_kind_label(kind: &yalda::acp_channel::ToolKind) -> String {
+    use yalda::acp_channel::ToolKind;
     match kind {
         ToolKind::Read => "read",
         ToolKind::Edit => "edit",
@@ -445,10 +488,10 @@ pub(crate) fn tool_kind_label(kind: &sketch::acp_channel::ToolKind) -> String {
 /// Used for single-tool groups where we skip the nested sub-header.
 pub(crate) fn append_tool_body(
     mut block: gpui::Div,
-    tc: &sketch::acp_channel::ToolCall,
+    tc: &yalda::acp_channel::ToolCall,
     policy: ToolRenderPolicy,
     code_font: &SharedString,
-    at: &sketch::theme::AgentTheme,
+    at: &yalda::theme::AgentTheme,
 ) -> gpui::Div {
     let max_lines = match policy {
         ToolRenderPolicy::Truncated { max_lines } => Some(max_lines),
@@ -511,9 +554,9 @@ pub(crate) fn append_tool_body(
 /// Centralised so policy tweaks (e.g., suppressing the old half of a
 /// diff) only need to be made in one spot.
 pub(crate) fn render_tool_content_blocks(
-    content: &[sketch::acp_channel::ToolCallContent],
+    content: &[yalda::acp_channel::ToolCallContent],
 ) -> String {
-    use sketch::acp_channel::ToolCallContent;
+    use yalda::acp_channel::ToolCallContent;
     let mut buf = String::new();
     for c in content {
         match c {
@@ -856,8 +899,8 @@ pub(crate) const TOOL_PAYLOAD_MAX_CHARS: usize = 65_536;
 /// Trim oversized strings on a tool call's content/raw_input/raw_output
 /// to [`TOOL_PAYLOAD_MAX_CHARS`]. Idempotent: re-running on a tool that
 /// got further updated only re-trims new growth.
-pub(crate) fn cap_tool_call_payloads(tc: &mut sketch::acp_channel::ToolCall) {
-    use sketch::acp_channel::ToolCallContent;
+pub(crate) fn cap_tool_call_payloads(tc: &mut yalda::acp_channel::ToolCall) {
+    use yalda::acp_channel::ToolCallContent;
     for c in tc.content.iter_mut() {
         match c {
             ToolCallContent::Content(content) => {
@@ -1255,7 +1298,7 @@ pub(crate) fn setup_list_follow_handler(
 /// it (the worksheet is cursor-anchored, not auto-following the agent —
 /// spec-agent-window.md §19).
 /// The pump-side decision an [`AgentEventKind`] fold surfaces (spec §7). The
-/// reducer ([`SketchGpuiView::apply_agent_event`]) is a pure state-fold and
+/// reducer ([`YaldaGpuiView::apply_agent_event`]) is a pure state-fold and
 /// does NOT finalize or flip `turn_phase` inside itself; instead it returns one
 /// of these so the CALLER routes a boundary through the idempotent
 /// `finalize_agent_turn_idem` ledger and owns the `turn_phase = Idle` flip.
@@ -1363,7 +1406,7 @@ impl InputSurface {
 /// supporting a renamed vendor tool — is a one-slice change (§25).
 pub(crate) const SUBAGENT_TOOL_NAMES: &[&str] = &["Task", "Subagent", "Spawn"];
 
-/// Sketch-side classification of a `ToolCall` that represents a sub-agent
+/// Yalda-side classification of a `ToolCall` that represents a sub-agent
 /// transcript (§26). Produced by the heuristic in `classify_subagent`; the
 /// `Subagents` sidebar lists these, and `focused_subagent` keys into the
 /// derived list (by `tool_call_id`) to swap the main transcript view.
@@ -1381,7 +1424,7 @@ pub(crate) struct SubAgent {
     /// otherwise its `name`, with `subagent-N` as the ultimate fallback.
     pub(crate) label: String,
     /// Mirrors the underlying tool call's status.
-    pub(crate) status: sketch::acp_channel::ToolCallStatus,
+    pub(crate) status: yalda::acp_channel::ToolCallStatus,
 }
 
 /// Heuristic classifier (§25). v1: anything with `kind == ToolKind::Other`
@@ -1390,8 +1433,8 @@ pub(crate) struct SubAgent {
 /// `title` — same meaning, the user-facing label for the tool call.)
 /// Returns the freshly-constructed `SubAgent`, or `None` if the tool call
 /// doesn't match.
-pub(crate) fn classify_subagent(tc: &sketch::acp_channel::ToolCall) -> Option<SubAgent> {
-    use sketch::acp_channel::ToolKind;
+pub(crate) fn classify_subagent(tc: &yalda::acp_channel::ToolCall) -> Option<SubAgent> {
+    use yalda::acp_channel::ToolKind;
     if tc.kind != ToolKind::Other {
         return None;
     }
@@ -1427,7 +1470,7 @@ pub(crate) enum TurnId {
     /// Tool-call block originating from turn N. Gutter prints `Tn`.
     /// Lives on the anchor line of a `ToolGroup` flat-item.
     Tool(usize),
-    /// Sketch-local lifecycle notice (attach/detach/disconnect/permission/
+    /// Yalda-local lifecycle notice (attach/detach/disconnect/permission/
     /// force-restart, retry `Notice`s). NOT agent-authored: it carries no
     /// turn number, never emits a Claude `TurnHeader`, renders with a blank
     /// gutter, and is excluded from agent-turn numbering and the live≡replay
@@ -1823,7 +1866,7 @@ pub(crate) fn rebuild_agent_view_model(
     for line_idx in 0..lines.len() {
         // Insert a TurnHeader whenever the dominant turn changes.
         let cur_turn = gutter_tag_per_line.get(line_idx).copied().flatten();
-        // Tools and sketch-local System notices don't get their own header
+        // Tools and yalda-local System notices don't get their own header
         // and don't break the current turn run — a notice landing mid-turn
         // must not re-emit a Claude header (Finding 5, INV-3). The
         // total `HeaderRole::from_turn` returns `None` for those, so the
@@ -2001,6 +2044,10 @@ pub(crate) struct AgentState {
     /// track it separately so we can splice in new items as the
     /// buffer grows without paying for a full reset.
     pub(crate) list_item_count: usize,
+    /// `edit_seq` at the last `reconcile_list` call that actually touched
+    /// the list. Used to detect mid-line appends (count unchanged but
+    /// content grew) so we can invalidate the tail item's cached height.
+    pub(crate) last_reconciled_edit_seq: u64,
     /// Footer status line — attach result, send result, error. Cleared on
     /// the next non-Ctrl keystroke so it persists for at least one frame.
     pub(crate) status: Option<SharedString>,
@@ -2026,7 +2073,7 @@ pub(crate) struct AgentState {
     /// `ReplayComplete` folds the cursor back into `last_seen` and zeroes it.
     /// (Was two loose `usize` fields reconstructed into a temporary `ReplayTurns`
     /// on every read and copied back out on every mutation — now owned directly.)
-    pub(crate) replay_turns: sketch::acp_channel::ReplayTurns,
+    pub(crate) replay_turns: yalda::acp_channel::ReplayTurns,
     /// `edit_seq` at which the tail was last revealed by the follow-scroll
     /// (F4, INV-13). The render-time re-reveal historically fired only when
     /// the flat-item COUNT changed, so a chunk that grows the last line/block
@@ -2058,7 +2105,7 @@ pub(crate) struct AgentState {
     pub(crate) lines_cache_seq: u64,
     /// Incremental highlight cache for the transcript. Re-highlights only the
     /// lines that changed between renders instead of the whole buffer every
-    /// `cx.notify()`. Bypassed when `SKETCH_HL_CACHE=0`.
+    /// `cx.notify()`. Bypassed when `YALDA_HL_CACHE=0`.
     pub(crate) highlight_cache: HighlightCache,
     /// The active input surface (§4). The `Chatbox` draft editor lives INSIDE
     /// the `Chatbox` variant — make-illegal-states-unrepresentable, so the old
@@ -2069,11 +2116,11 @@ pub(crate) struct AgentState {
     /// Last-seen full snapshot of the agent's plan. Updated on every ACP
     /// `Plan` notification (which carries a complete plan, not a delta —
     /// see spec-agent-window.md §21). Consumed by the Tasklist sidebar.
-    pub(crate) current_plan: Option<sketch::acp_channel::Plan>,
+    pub(crate) current_plan: Option<yalda::acp_channel::Plan>,
     /// Last-seen session mode id from the agent (Claude Code's `default` /
     /// `plan` / `learn`, etc.). Distinct from the permission mode on
     /// `AcpChannelClient`. Surfaced by the Status Strip.
-    pub(crate) agent_mode: Option<sketch::acp_channel::SessionModeId>,
+    pub(crate) agent_mode: Option<yalda::acp_channel::SessionModeId>,
     /// The session's permission mode, as session state sourced from the
     /// server. In session-server mode the agent/channel live in the server
     /// (not the GUI), so `channel` is `None` and the live `AcpChannelClient`
@@ -2084,11 +2131,11 @@ pub(crate) struct AgentState {
     /// to `DEFAULT_PERMISSION_MODE` and overwritten the moment the server
     /// reports the real value. For the legacy direct-spawn path the channel is
     /// still the live authority; this field is kept in sync alongside it.
-    pub(crate) permission_mode: sketch::acp_channel::PermissionMode,
+    pub(crate) permission_mode: yalda::acp_channel::PermissionMode,
     /// Last-seen usage snapshot (tokens used/total, cost). Populated only
     /// when the upstream `unstable_session_usage` feature is on; otherwise
     /// stays `None` and the Status Strip omits these fields per §30.
-    pub(crate) usage: Option<sketch::acp_channel::UsageSnapshot>,
+    pub(crate) usage: Option<yalda::acp_channel::UsageSnapshot>,
     /// `tool_call_id` of the currently focused sub-agent. When `Some`, the
     /// main transcript area swaps to show that sub-agent's content instead
     /// of the root agent's (§27). Keyed by a stable `ToolCallKey` rather
@@ -2118,7 +2165,7 @@ pub(crate) struct AgentState {
     /// Replaces the position-dependent `document_trimmed_end_ends_with`
     /// heuristic that double-rendered input whenever content streamed in
     /// between the optimistic echo and its stream copy. See `agent_transcript`.
-    pub(crate) reconciler: sketch::agent_transcript::UserTurnReconciler,
+    pub(crate) reconciler: yalda::agent_transcript::UserTurnReconciler,
     /// User-turn `k`s inserted since the last `reset_for_replay` generation.
     /// The M3 runtime tripwire asserts a `k` is never inserted twice — a
     /// double-render reuses a `k`, so this turns a silent visual regression
@@ -2187,10 +2234,18 @@ impl AgentState {
     /// selection, theme, and tool-call *content* — none of those affect
     /// the flat build (they're read later, inside the render closure).
     /// See the call site in `render_agent` (S1) for the trap analysis.
-    pub(crate) fn view_model_fingerprint(&self, edit_seq: u64, frozen_line_count: usize) -> u64 {
+    ///
+    /// NOTE: `edit_seq` is intentionally EXCLUDED. Most streaming chunks
+    /// append text to an existing line without changing line count, frozen
+    /// ranges, or tool structure — the only inputs the flat build reads.
+    /// Including `edit_seq` forced a full O(transcript) rebuild on every
+    /// mid-line chunk, making streaming visually jarring. `line_count`
+    /// covers the structural case (new lines added); frozen/tool/expanded
+    /// changes cover the rest.
+    pub(crate) fn view_model_fingerprint(&self, line_count: usize, frozen_line_count: usize) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        edit_seq.hash(&mut h);
+        line_count.hash(&mut h);
         frozen_line_count.hash(&mut h);
         self.tools.order.len().hash(&mut h);
         self.tools.order.last().hash(&mut h);
@@ -2235,9 +2290,10 @@ impl AgentState {
             keybinds: KeybindManager::default(),
             list_state: gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0)),
             list_item_count: 0,
+            last_reconciled_edit_seq: 0,
             status: None,
             turn_phase: TurnPhase::Idle,
-            replay_turns: sketch::acp_channel::ReplayTurns::default(),
+            replay_turns: yalda::acp_channel::ReplayTurns::default(),
             last_scrolled_edit_seq: u64::MAX,
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
@@ -2248,13 +2304,13 @@ impl AgentState {
             input_surface: InputSurface::Chatbox(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
-            permission_mode: sketch::acp_channel::DEFAULT_PERMISSION_MODE,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
             tasklist_open: false,
             subagents_open: false,
             server_managed: true,
-            reconciler: sketch::agent_transcript::UserTurnReconciler::new(),
+            reconciler: yalda::agent_transcript::UserTurnReconciler::new(),
             user_turn_ks: std::collections::HashSet::new(),
             generation: 0,
             finalized: std::collections::HashSet::new(),
@@ -2282,9 +2338,10 @@ impl AgentState {
             keybinds: KeybindManager::default(),
             list_state: gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0)),
             list_item_count: 0,
+            last_reconciled_edit_seq: 0,
             status,
             turn_phase: TurnPhase::Idle,
-            replay_turns: sketch::acp_channel::ReplayTurns::default(),
+            replay_turns: yalda::acp_channel::ReplayTurns::default(),
             last_scrolled_edit_seq: u64::MAX,
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
@@ -2295,13 +2352,13 @@ impl AgentState {
             input_surface: InputSurface::Chatbox(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
-            permission_mode: sketch::acp_channel::DEFAULT_PERMISSION_MODE,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
             tasklist_open: false,
             subagents_open: false,
             server_managed: true,
-            reconciler: sketch::agent_transcript::UserTurnReconciler::new(),
+            reconciler: yalda::agent_transcript::UserTurnReconciler::new(),
             user_turn_ks: std::collections::HashSet::new(),
             generation: 0,
             finalized: std::collections::HashSet::new(),
@@ -2365,10 +2422,10 @@ impl AgentState {
     pub(crate) fn register_user_turn(
         &mut self,
         text: &str,
-        origin: sketch::agent_transcript::UserTurnOrigin,
+        origin: yalda::agent_transcript::UserTurnOrigin,
         advance_boundary: bool,
     ) -> Option<usize> {
-        use sketch::agent_transcript::UserTurnAction;
+        use yalda::agent_transcript::UserTurnAction;
         match self.reconciler.reconcile(origin, text, advance_boundary) {
             UserTurnAction::Skip => None,
             UserTurnAction::Insert { advance_boundary } => {
@@ -2398,7 +2455,7 @@ impl AgentState {
                          (text={text:?}) — reconciler dedup regression"
                     );
                     eprintln!(
-                        "[sketch-gpui] INVARIANT: TurnId::User({k}) already present; \
+                        "[yalda-gpui] INVARIANT: TurnId::User({k}) already present; \
                          dropping duplicate user turn (text={text:?})"
                     );
                     return None;
@@ -2417,7 +2474,7 @@ impl AgentState {
     pub(crate) fn insert_user_turn(
         &mut self,
         text: &str,
-        origin: sketch::agent_transcript::UserTurnOrigin,
+        origin: yalda::agent_transcript::UserTurnOrigin,
         advance_boundary: bool,
     ) {
         if let Some(k) = self.register_user_turn(text, origin, advance_boundary) {
@@ -2450,7 +2507,7 @@ impl AgentState {
     ) -> Option<usize> {
         let k = self.register_user_turn(
             prompt_body,
-            sketch::agent_transcript::UserTurnOrigin::LocalSubmit,
+            yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
             false,
         )?;
         for (l, _) in collected {
@@ -2507,7 +2564,7 @@ impl AgentState {
     /// follow path can key on growth without re-deriving it). This is the only
     /// mutator that touches `list_item_count`, so parity is a property of the
     /// method rather than discipline at each render surface.
-    pub(crate) fn reconcile_list(&mut self, new_count: usize) -> bool {
+    pub(crate) fn reconcile_list(&mut self, new_count: usize, edit_seq: u64) -> bool {
         let old_count = self.list_item_count;
         if new_count != old_count {
             if !self.block_ranges.is_empty() || new_count < old_count {
@@ -2517,8 +2574,24 @@ impl AgentState {
                     .splice(old_count..old_count, new_count - old_count);
             }
             self.list_item_count = new_count;
+            self.last_reconciled_edit_seq = edit_seq;
+        } else if new_count > 0 && edit_seq != self.last_reconciled_edit_seq {
+            // Mid-line append: item count unchanged but text grew inside the
+            // last item (streaming agent prose before a `\n`). Invalidate
+            // just the tail item's cached height so GPUI re-measures it
+            // instead of painting new content at the old height.
+            let last = new_count - 1;
+            self.list_state.splice(last..last + 1, 1);
+            self.last_reconciled_edit_seq = edit_seq;
         }
         new_count > old_count
+    }
+
+    /// Test-only wrapper that passes a dummy `edit_seq` (the tests don't
+    /// exercise the mid-line-append height invalidation).
+    #[cfg(test)]
+    pub(crate) fn reconcile_list_test(&mut self, new_count: usize) -> bool {
+        self.reconcile_list(new_count, 0)
     }
 
     /// Fold the replay cursor back into the live counter at end-of-replay
@@ -2584,7 +2657,7 @@ impl AgentState {
         // watermark so the first replayed chunk re-reveals the tail (F4).
         self.last_scrolled_edit_seq = u64::MAX;
         self.turn_phase = TurnPhase::Idle;
-        self.replay_turns = sketch::acp_channel::ReplayTurns::default();
+        self.replay_turns = yalda::acp_channel::ReplayTurns::default();
         // The transcript is being rebuilt from the authoritative event_log:
         // nothing is "pending local" any more, and this starts a fresh
         // tripwire generation (the replay re-numbers `k` from 1). This clear
@@ -2628,7 +2701,7 @@ pub(crate) struct AttachedSlot {
     pub(crate) status: String,
     /// Server-reported permission mode for this session, mirrored into
     /// `AgentState.permission_mode` when the slot binds.
-    pub(crate) permission_mode: sketch::acp_channel::PermissionMode,
+    pub(crate) permission_mode: yalda::acp_channel::PermissionMode,
 }
 
 /// Outcome of the background session-server round-trips kicked off by
@@ -2642,7 +2715,7 @@ pub(crate) enum OpenResolution {
         sid: String,
         acp_id: Option<String>,
         /// Server-reported permission mode for the freshly created session.
-        permission_mode: sketch::acp_channel::PermissionMode,
+        permission_mode: yalda::acp_channel::PermissionMode,
     },
     /// The list or create round-trip failed; surface it on the placeholder.
     Failed(String),

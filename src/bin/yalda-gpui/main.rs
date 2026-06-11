@@ -1,4 +1,4 @@
-//! `sketch-gpui` — GPU-accelerated desktop frontend for sketch.
+//! `yalda-gpui` — GPU-accelerated desktop frontend for yalda.
 //!
 //! Rendered-markdown viewer + file browser using Zed's GPUI framework. The
 //! TUI frontend (`src/main.rs` + `src/app.rs`) is left untouched; this binary
@@ -6,8 +6,8 @@
 //! `blocks`, `style`, `file_browser`).
 //!
 //! Run:
-//!     cargo run --bin sketch-gpui                       # opens browser at cwd
-//!     cargo run --bin sketch-gpui -- <path/to/file.md>  # opens file directly
+//!     cargo run --bin yalda-gpui                       # opens browser at cwd
+//!     cargo run --bin yalda-gpui -- <path/to/file.md>  # opens file directly
 //!
 //! Document view keys:
 //!   j / Down / Ctrl-N    scroll down one block
@@ -32,7 +32,7 @@
 //!     itself is the GPUI-specific subset (`gpui_menu()`).
 //!
 //! Claude (ACP) chat screen:
-//!   * Spawns a local `claude-agent-acp` (or $SKETCH_ACP_AGENT) process and
+//!   * Spawns a local `claude-agent-acp` (or $YALDA_ACP_AGENT) process and
 //!     talks to it via the Agent Client Protocol.
 //!   * Claude's prior turns are frozen (read-only) and marked with a left
 //!     bar; you can keep typing in the editable region below the last turn,
@@ -101,41 +101,41 @@ pub(crate) use gpui::{
     UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, point, px, rgb, rgba, size,
 };
 
-pub(crate) use sketch::acp_channel::AcpChannelClient;
-pub(crate) use sketch::blocks::{ColumnAlignment, ListItem, RenderedBlock, StyledLine, StyledSpan};
-pub(crate) use sketch::cursor::CursorPos;
-pub(crate) use sketch::document::Document;
-pub(crate) use sketch::editor::{Editor, EditorCore, EditorView, LineAnchor};
-pub(crate) use sketch::file_browser::{BrowserEntry, FileBrowser};
-pub(crate) use sketch::keybind::KeybindManager;
-pub(crate) use sketch::keys::{Key, KeyPress, Modifiers as KMods};
-pub(crate) use sketch::md_highlight::{
+pub(crate) use yalda::acp_channel::AcpChannelClient;
+pub(crate) use yalda::blocks::{ColumnAlignment, ListItem, RenderedBlock, StyledLine, StyledSpan};
+pub(crate) use yalda::cursor::CursorPos;
+pub(crate) use yalda::document::Document;
+pub(crate) use yalda::editor::{Editor, EditorCore, EditorView, LineAnchor};
+pub(crate) use yalda::file_browser::{BrowserEntry, FileBrowser};
+pub(crate) use yalda::keybind::KeybindManager;
+pub(crate) use yalda::keys::{Key, KeyPress, Modifiers as KMods};
+pub(crate) use yalda::md_highlight::{
     Segment, highlight_markdown_lines_stripped_syn, highlight_markdown_lines_syn,
 };
-pub(crate) use sketch::menu::{MenuAction, MenuNode, MenuNodeKind, MenuState};
-pub(crate) use sketch::render;
-pub(crate) use sketch::session_client::SessionServerClient;
-pub(crate) use sketch::session_proto::AttachMode;
-pub(crate) use sketch::session_proto::Notification as ServerNotification;
-pub(crate) use sketch::session_proto::SessionInfo;
-pub(crate) use sketch::style::{Color as NColor, Modifier, Style as NStyle};
-pub(crate) use sketch::theme::{OverlayTheme, Theme, ThemeName};
-pub(crate) use sketch::worktree;
+pub(crate) use yalda::menu::{MenuAction, MenuNode, MenuNodeKind, MenuState};
+pub(crate) use yalda::render;
+pub(crate) use yalda::session_client::SessionServerClient;
+pub(crate) use yalda::session_proto::AttachMode;
+pub(crate) use yalda::session_proto::Notification as ServerNotification;
+pub(crate) use yalda::session_proto::SessionInfo;
+pub(crate) use yalda::style::{Color as NColor, Modifier, Style as NStyle};
+pub(crate) use yalda::theme::{OverlayTheme, Theme, ThemeName};
+pub(crate) use yalda::worktree;
 
 // ----------------------------------------------------------------------------
 // Render performance knobs (env-gated, read once)
 // ----------------------------------------------------------------------------
 
-/// `true` when `SKETCH_PERF` is set to anything other than `0`/empty. Enables
+/// `true` when `YALDA_PERF` is set to anything other than `0`/empty. Enables
 /// per-frame timing breakdowns from the agent tile render path (extract /
 /// highlight / snapshot / total), printed to stderr. Read once and cached.
 fn perf_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("SKETCH_PERF"), Ok(v) if v != "0" && !v.is_empty()))
+    *ON.get_or_init(|| matches!(std::env::var("YALDA_PERF"), Ok(v) if v != "0" && !v.is_empty()))
 }
 
-/// `false` only when `SKETCH_HL_CACHE` is explicitly `0`/`off`/`false`. The
+/// `false` only when `YALDA_HL_CACHE` is explicitly `0`/`off`/`false`. The
 /// incremental highlight cache is ON by default; this lets us A/B it against
 /// the old full-recompute path at runtime without a rebuild.
 fn hl_cache_enabled() -> bool {
@@ -143,7 +143,7 @@ fn hl_cache_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         !matches!(
-            std::env::var("SKETCH_HL_CACHE").as_deref(),
+            std::env::var("YALDA_HL_CACHE").as_deref(),
             Ok("0") | Ok("off") | Ok("false")
         )
     })
@@ -154,7 +154,7 @@ fn hl_cache_enabled() -> bool {
 // ----------------------------------------------------------------------------
 
 actions!(
-    sketch,
+    yalda,
     [
         // Document view
         ScrollDown,
@@ -272,7 +272,7 @@ actions!(
 );
 
 // ----------------------------------------------------------------------------
-// gpui::Keystroke → sketch::keys::KeyPress bridge
+// gpui::Keystroke → yalda::keys::KeyPress bridge
 // ----------------------------------------------------------------------------
 
 /// Convert a GPUI keystroke to our framework-neutral `KeyPress` so the same
@@ -1074,7 +1074,7 @@ impl EditState {
     fn highlight_snapshot(
         &mut self,
         theme: &Theme,
-        hl: &sketch::highlight::Highlighter,
+        hl: &yalda::highlight::Highlighter,
     ) -> (
         std::rc::Rc<Vec<String>>,
         std::rc::Rc<Vec<std::rc::Rc<LineHl>>>,
@@ -1144,7 +1144,7 @@ enum BufferApp {
 
 /// Overlay popup that lets the user pick a top-level command by single
 /// keypress (TUI-style — see `src/menu.rs` for the underlying tree model).
-/// When `Some` on `SketchGpuiView`, `Render::render` swaps the screen body
+/// When `Some` on `YaldaGpuiView`, `Render::render` swaps the screen body
 /// for `render_menu`; key dispatch routes to `handle_menu_key`. The menu
 /// items here are GPUI-specific (a subset of the TUI default that maps to
 /// actions the GPUI frontend implements).
@@ -1374,6 +1374,15 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("k", "bind tag shortcut", "tag-bind"),
             ],
         ),
+        MenuNode::submenu(
+            "d",
+            "dev",
+            vec![
+                MenuNode::entry("p", "promote (build candidate)", "dev-build-candidate"),
+                MenuNode::entry("P", "take over sessions (candidate)", "dev-take-over"),
+                MenuNode::entry("g", "rebuild & restart gui", "dev-restart-gui"),
+            ],
+        ),
         MenuNode::separator(),
         MenuNode::entry("v", "back to doc", "back-to-doc"),
         MenuNode::separator(),
@@ -1453,12 +1462,6 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
         MenuNode::entry("d", "detach", "claude-detach"),
         MenuNode::entry("a", "attach", "claude-attach"),
-        MenuNode::separator(),
-        // Build loop (moved here from the global claude submenu — these act
-        // on the focused session, so they're tile-scoped).
-        MenuNode::entry("p", "promote (build candidate)", "dev-build-candidate"),
-        MenuNode::entry("P", "take over sessions (candidate)", "dev-take-over"),
-        MenuNode::entry("g", "rebuild & restart gui", "dev-restart-gui"),
     ]
 }
 
@@ -1473,7 +1476,7 @@ fn browser_local_menu() -> Vec<MenuNode> {
     ]
 }
 
-struct SketchGpuiView {
+struct YaldaGpuiView {
     theme: Theme,
     body_font: SharedString,
     code_font: SharedString,
@@ -1525,13 +1528,13 @@ struct SketchGpuiView {
     line_layouts: Rc<RefCell<HashMap<(usize, usize), TextLayout>>>,
     /// Session server client. When `Some`, agent sessions are created and
     /// managed through the session server (owned subprocesses survive GUI
-    /// restarts). Activated by `SKETCH_SESSION_SERVER=1`. When `None`, the
+    /// restarts). Activated by `YALDA_SESSION_SERVER=1`. When `None`, the
     /// GUI spawns `AcpChannelClient` directly (legacy path).
     session_server: Option<SessionServerClient>,
     /// Where the agent info bar renders: above or below the transcript.
     agent_status_position: AgentStatusPosition,
     /// True when this instance was launched as a build-loop *candidate*
-    /// (`SKETCH_CANDIDATE=1`). A candidate attaches to live sessions as a
+    /// (`YALDA_CANDIDATE=1`). A candidate attaches to live sessions as a
     /// read-only `Observer` (mirrors the transcript, can't drive), shows a
     /// banner, and refuses to submit prompts until it takes over — which it
     /// can do only once the original owner window closes. See
@@ -1555,7 +1558,7 @@ struct SketchGpuiView {
     pending_tag_chord: Option<char>,
     /// Shared syntect highlighter for code block syntax coloring in Edit Mode
     /// and the agent transcript tile. Loaded once at startup.
-    syntect_hl: sketch::highlight::Highlighter,
+    syntect_hl: yalda::highlight::Highlighter,
     /// The lease-heartbeat beater (spec phase 4). A SINGLETON tied to this
     /// view's lifetime: spawned at most once (on the first `start_server_pump`
     /// that finds this `None`) and self-gates per-tick on `slot.is_driver`, so
@@ -1577,7 +1580,7 @@ struct SketchGpuiView {
     _server_pump: Option<Task<()>>,
 }
 
-impl SketchGpuiView {
+impl YaldaGpuiView {
     fn new_doc(
         blocks: Vec<RenderedBlock>,
         theme: Theme,
@@ -1585,7 +1588,7 @@ impl SketchGpuiView {
         focus_handle: FocusHandle,
     ) -> Self {
         let syntect_hl =
-            sketch::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
+            yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
         let label: SharedString = file_label.into();
         let initial = App::Buffer(BufferApp::Viewing(DocState {
             blocks,
@@ -1629,7 +1632,7 @@ impl SketchGpuiView {
 
     fn new_browser(start_dir: PathBuf, theme: Theme, focus_handle: FocusHandle) -> Self {
         let syntect_hl =
-            sketch::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
+            yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
         let initial = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(start_dir)));
         Self {
             theme,
@@ -1806,10 +1809,20 @@ impl SketchGpuiView {
 
             if self.session_server.is_some() {
                 // Session-server path: placeholder + async attach.
+                // Load persisted slots so the placeholder carries the saved
+                // label instead of a hardcoded "claude-1" — the user sees
+                // the right name immediately, even before the server responds.
+                let persisted = load_persisted_acp_sessions(&proc_cwd);
+                let placeholder_label = persisted
+                    .iter()
+                    .find(|s| s.active)
+                    .or(persisted.first())
+                    .map(|s| s.label.clone())
+                    .unwrap_or_else(|| "claude-1".into());
                 let placeholder =
                     AgentState::new_server_managed(Some("connecting to session server…".into()));
                 let open_token = alloc_open_token();
-                ring.push("claude-1".into(), placeholder, None, proc_cwd.clone(), None);
+                ring.push(placeholder_label, placeholder, None, proc_cwd.clone(), None);
                 self.start_server_pump(cx);
                 if let Some(slot) = ring.slots.first_mut() {
                     slot.pending_open_token = Some(open_token);
@@ -2216,16 +2229,16 @@ impl SketchGpuiView {
     /// if the focused window isn't an agent screen, but always logs so the
     /// message isn't lost when triggered from a doc/edit view.
     fn set_agent_status(&mut self, msg: &str, cx: &mut Context<Self>) {
-        eprintln!("[sketch-gpui] {msg}");
+        eprintln!("[yalda-gpui] {msg}");
         if let Some(c) = self.agent_mut() {
             c.status = Some(msg.to_string().into());
         }
         cx.notify();
     }
 
-    /// Build-loop step 1 (the `promote` command). Compile `sketch-gpui`, and
+    /// Build-loop step 1 (the `promote` command). Compile `yalda-gpui`, and
     /// on success spawn the freshly built binary as a read-only *candidate*
-    /// (`SKETCH_CANDIDATE=1`) **without quitting** this instance. Both
+    /// (`YALDA_CANDIDATE=1`) **without quitting** this instance. Both
     /// processes share the running session server, so the candidate mirrors
     /// every live ACP session. Verify the candidate, then close this window
     /// to hand off ownership; the candidate takes over with full transcripts
@@ -2238,12 +2251,12 @@ impl SketchGpuiView {
         }
         if self.session_server.is_none() {
             self.set_agent_status(
-                "session server not active — relaunch with SKETCH_SESSION_SERVER=1",
+                "session server not active — relaunch with YALDA_SESSION_SERVER=1",
                 cx,
             );
             return;
         }
-        self.set_agent_status("building candidate: cargo build --bin sketch-gpui…", cx);
+        self.set_agent_status("building candidate: cargo build --bin yalda-gpui…", cx);
 
         let manifest_dir = env!("CARGO_MANIFEST_DIR").to_string();
         let exe = std::env::current_exe().ok();
@@ -2255,7 +2268,7 @@ impl SketchGpuiView {
                 .background_executor()
                 .spawn(async move {
                     std::process::Command::new("cargo")
-                        .args(["build", "--bin", "sketch-gpui"])
+                        .args(["build", "--bin", "yalda-gpui"])
                         .current_dir(&manifest_dir)
                         .output()
                 })
@@ -2266,7 +2279,7 @@ impl SketchGpuiView {
                     Some(exe) => {
                         let mut cmd = std::process::Command::new(exe);
                         cmd.args(&args);
-                        cmd.env("SKETCH_CANDIDATE", "1");
+                        cmd.env("YALDA_CANDIDATE", "1");
                         // Phase-4 blue-green: give the candidate a DISTINCT
                         // per-launch client_id so it is a different lease client
                         // from the original. It lands as Observer while the
@@ -2274,7 +2287,7 @@ impl SketchGpuiView {
                         // fresh id once the original cleanly exits. (If it read
                         // the on-disk id it would impersonate the original and
                         // steal the lease.)
-                        cmd.env("SKETCH_CLIENT_ID", uuid::Uuid::new_v4().to_string());
+                        cmd.env("YALDA_CLIENT_ID", uuid::Uuid::new_v4().to_string());
                         cmd.stdin(std::process::Stdio::null());
                         cmd.stdout(std::process::Stdio::null());
                         cmd.stderr(std::process::Stdio::inherit());
@@ -2303,11 +2316,11 @@ impl SketchGpuiView {
         .detach();
     }
 
-    /// Dev hot-restart: rebuild `sketch-gpui` and replace THIS instance with a
+    /// Dev hot-restart: rebuild `yalda-gpui` and replace THIS instance with a
     /// fresh NORMAL one. Distinct from `build_and_launch_candidate`: that spawns
-    /// a read-only candidate (SKETCH_CANDIDATE=1) that co-attaches and waits for
+    /// a read-only candidate (YALDA_CANDIDATE=1) that co-attaches and waits for
     /// the user to hand off; this is a full self-restart — build, spawn a fresh
-    /// normal instance (no SKETCH_CANDIDATE), then quit so the new process
+    /// normal instance (no YALDA_CANDIDATE), then quit so the new process
     /// reclaims ownership of every server-managed session via the deterministic
     /// same-`client_id` `attach_for_role` path (the new instance presents the
     /// SAME stable client_id, so the server resumes its lease on the first
@@ -2318,7 +2331,7 @@ impl SketchGpuiView {
     /// verified only — the actual rebuild/relaunch/owner-reclaim must be
     /// checked by a human.
     fn dev_rebuild_restart_gui(&mut self, cx: &mut Context<Self>) {
-        self.set_agent_status("rebuilding gui: cargo build --bin sketch-gpui…", cx);
+        self.set_agent_status("rebuilding gui: cargo build --bin yalda-gpui…", cx);
 
         let manifest_dir = env!("CARGO_MANIFEST_DIR").to_string();
         let exe = std::env::current_exe().ok();
@@ -2330,7 +2343,7 @@ impl SketchGpuiView {
                 .background_executor()
                 .spawn(async move {
                     std::process::Command::new("cargo")
-                        .args(["build", "--bin", "sketch-gpui"])
+                        .args(["build", "--bin", "yalda-gpui"])
                         .current_dir(&manifest_dir)
                         .output()
                 })
@@ -2339,7 +2352,7 @@ impl SketchGpuiView {
             let _ = this.update(cx, |this, cx| match built {
                 Ok(out) if out.status.success() => match exe {
                     Some(exe) => {
-                        // Fresh NORMAL instance: same args, NO SKETCH_CANDIDATE —
+                        // Fresh NORMAL instance: same args, NO YALDA_CANDIDATE —
                         // this is an ordinary relaunch, not a read-only candidate.
                         // Command inherits the full parent env, so we must
                         // explicitly REMOVE the candidate marker (if this very
@@ -2348,7 +2361,7 @@ impl SketchGpuiView {
                         // read-only.
                         let mut cmd = std::process::Command::new(exe);
                         cmd.args(&args);
-                        cmd.env_remove("SKETCH_CANDIDATE");
+                        cmd.env_remove("YALDA_CANDIDATE");
                         cmd.stdin(std::process::Stdio::null());
                         cmd.stdout(std::process::Stdio::null());
                         // stderr inherited so post-restart logs reach the dev
@@ -2511,7 +2524,7 @@ impl SketchGpuiView {
         // light themes need light syntect colors. The highlight cache keys on
         // theme name, so stale dark-on-light lines are invalidated next paint.
         self.syntect_hl =
-            sketch::highlight::Highlighter::with_syntect_theme(self.theme.name.syntect_theme());
+            yalda::highlight::Highlighter::with_syntect_theme(self.theme.name.syntect_theme());
         for tab in self.workspace.tabs.iter_mut() {
             re_render_layout_docs(&mut tab.layout, &self.theme);
         }
@@ -3098,6 +3111,26 @@ impl SketchGpuiView {
     /// start a mark chord.
     fn handle_doc_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
         let press = keystroke_to_keypress(&ev.keystroke);
+
+        // Ctrl-S: save the backing buffer from doc view (same as edit view).
+        if press.modifiers.contains(KMods::CONTROL)
+            && matches!(press.key, Key::Char('s') | Key::Char('S'))
+        {
+            if let Some(d) = self.doc_mut() {
+                if let Some(source) = d.source.as_ref() {
+                    let msg: SharedString = match source.core.borrow_mut().save() {
+                        Ok(()) => "saved".into(),
+                        Err(e) => format!("save failed: {}", e).into(),
+                    };
+                    self.transient_status = Some(msg);
+                } else {
+                    self.transient_status = Some("no file to save".into());
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         if self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
             cx.stop_propagation();
         }
@@ -5773,7 +5806,7 @@ impl SketchGpuiView {
     // ---- Claude (ACP) screen ----------------------------------------------
 }
 
-impl SketchGpuiView {
+impl YaldaGpuiView {
     fn render_splash(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let bg = self.editor_bg();
         let fg = self.editor_fg();
@@ -5820,7 +5853,7 @@ impl SketchGpuiView {
                             .text_size(px(48.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(fg)
-                            .child("sketch"),
+                            .child("yalda"),
                     )
                     .child(
                         div()
@@ -5839,13 +5872,13 @@ impl SketchGpuiView {
     }
 }
 
-impl Focusable for SketchGpuiView {
+impl Focusable for YaldaGpuiView {
     fn focus_handle(&self, _cx: &GpuiApp) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for SketchGpuiView {
+impl Render for YaldaGpuiView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport_width_px = f32::from(_window.viewport_size().width);
         self.viewport_height_px = f32::from(_window.viewport_size().height);
@@ -5887,7 +5920,7 @@ impl Render for SketchGpuiView {
         let has_overlay = self.has_overlay();
 
         // Build the screen content. When an overlay is OPEN, focus moves up
-        // to the wrapper so the screen's `SketchView`/`BrowserView` action
+        // to the wrapper so the screen's `YaldaView`/`BrowserView` action
         // bindings don't match (they would otherwise fire BEFORE our key
         // listener — for example, `k` in Doc context is bound to
         // `ScrollUp` and `k` in Browser context is bound to `BrowserUp`,
@@ -5895,7 +5928,7 @@ impl Render for SketchGpuiView {
         // handler runs and stop propagation as the default action behavior).
         // When no overlay is open, the focused leaf inside `render_layout`
         // attaches `track_focus(&self.focus_handle)` — that way the focus
-        // handle sits INSIDE the SketchView/EditView/etc. key context, so
+        // handle sits INSIDE the YaldaView/EditView/etc. key context, so
         // context-scoped bindings actually match on dispatch. (Putting the
         // focus on an outer wrapper means bubble-up from focus skips the
         // context-bearing leaf, and Space → OpenMenu silently no-ops in
@@ -5911,7 +5944,7 @@ impl Render for SketchGpuiView {
 
         // When the rail holds focus, the content leaf must NOT attach the
         // shared focus handle — otherwise both the rail and the leaf would
-        // claim it, and the leaf's context-scoped bindings (SketchView, …)
+        // claim it, and the leaf's context-scoped bindings (YaldaView, …)
         // would shadow the rail's (spec §6, two-state model §5).
         let rail_focused = !has_overlay && self.rail_is_focused();
         let leaf_attach_focus = !has_overlay && !rail_focused;
@@ -6460,41 +6493,41 @@ fn fuzzy_match_gpui(text: &str, query: &str) -> bool {
 fn register_keymap(app: &mut GpuiApp) {
     // Document-view bindings.
     app.bind_keys([
-        KeyBinding::new("j", ScrollDown, Some("SketchView")),
-        KeyBinding::new("down", ScrollDown, Some("SketchView")),
-        KeyBinding::new("ctrl-n", ScrollDown, Some("SketchView")),
-        KeyBinding::new("k", ScrollUp, Some("SketchView")),
-        KeyBinding::new("up", ScrollUp, Some("SketchView")),
-        KeyBinding::new("ctrl-p", ScrollUp, Some("SketchView")),
-        KeyBinding::new("ctrl-d", ScrollPageDown, Some("SketchView")),
-        KeyBinding::new("pagedown", ScrollPageDown, Some("SketchView")),
-        KeyBinding::new("ctrl-u", ScrollPageUp, Some("SketchView")),
-        KeyBinding::new("pageup", ScrollPageUp, Some("SketchView")),
-        KeyBinding::new("l", CursorNextBlock, Some("SketchView")),
-        KeyBinding::new("right", CursorNextBlock, Some("SketchView")),
-        KeyBinding::new("h", CursorPrevBlock, Some("SketchView")),
-        KeyBinding::new("left", CursorPrevBlock, Some("SketchView")),
-        KeyBinding::new("g", CursorTop, Some("SketchView")),
-        KeyBinding::new("shift-g", CursorBottom, Some("SketchView")),
-        KeyBinding::new("ctrl-o", OpenBrowser, Some("SketchView")),
-        KeyBinding::new("ctrl-e", EnterEdit, Some("SketchView")),
+        KeyBinding::new("j", ScrollDown, Some("YaldaView")),
+        KeyBinding::new("down", ScrollDown, Some("YaldaView")),
+        KeyBinding::new("ctrl-n", ScrollDown, Some("YaldaView")),
+        KeyBinding::new("k", ScrollUp, Some("YaldaView")),
+        KeyBinding::new("up", ScrollUp, Some("YaldaView")),
+        KeyBinding::new("ctrl-p", ScrollUp, Some("YaldaView")),
+        KeyBinding::new("ctrl-d", ScrollPageDown, Some("YaldaView")),
+        KeyBinding::new("pagedown", ScrollPageDown, Some("YaldaView")),
+        KeyBinding::new("ctrl-u", ScrollPageUp, Some("YaldaView")),
+        KeyBinding::new("pageup", ScrollPageUp, Some("YaldaView")),
+        KeyBinding::new("l", CursorNextBlock, Some("YaldaView")),
+        KeyBinding::new("right", CursorNextBlock, Some("YaldaView")),
+        KeyBinding::new("h", CursorPrevBlock, Some("YaldaView")),
+        KeyBinding::new("left", CursorPrevBlock, Some("YaldaView")),
+        KeyBinding::new("g", CursorTop, Some("YaldaView")),
+        KeyBinding::new("shift-g", CursorBottom, Some("YaldaView")),
+        KeyBinding::new("ctrl-o", OpenBrowser, Some("YaldaView")),
+        KeyBinding::new("ctrl-e", EnterEdit, Some("YaldaView")),
         // Ctrl-W is the split chord prefix (see global bindings below).
         // Word-processor entry rebinds to Ctrl-Shift-E.
-        KeyBinding::new("ctrl-shift-e", EnterWp, Some("SketchView")),
-        KeyBinding::new("ctrl-k", OpenAgent, Some("SketchView")),
-        KeyBinding::new("space", OpenMenu, Some("SketchView")),
+        KeyBinding::new("ctrl-shift-e", EnterWp, Some("YaldaView")),
+        KeyBinding::new("ctrl-k", OpenAgent, Some("YaldaView")),
+        KeyBinding::new("space", OpenMenu, Some("YaldaView")),
         // Local leader (spec-menu-scopes.md): `.` opens the content-kind
         // local menu. Edit/Agent views intercept `.` in their key handlers
         // instead (insert mode must keep `.` as a text character).
-        KeyBinding::new(".", OpenLocalMenu, Some("SketchView")),
+        KeyBinding::new(".", OpenLocalMenu, Some("YaldaView")),
         // Doc-view Esc and bare `q` used to dispatch `Quit` — that
         // made it too easy to lose the app by mashing keys. Quit now
         // lives only on Cmd-Q (the macOS-standard chord). Esc in the
         // doc view is a no-op so users in normal-mode just stay where
         // they are; the menu still dismisses on Esc via its own
         // capture-phase handler.
-        KeyBinding::new("tab", NextBuffer, Some("SketchView")),
-        KeyBinding::new("shift-tab", PrevBuffer, Some("SketchView")),
+        KeyBinding::new("tab", NextBuffer, Some("YaldaView")),
+        KeyBinding::new("shift-tab", PrevBuffer, Some("YaldaView")),
     ]);
 
     // Global Cmd-shortcut bindings — work in every key context, so the
@@ -6569,9 +6602,9 @@ fn register_keymap(app: &mut GpuiApp) {
         KeyBinding::new("cmd-+", ZoomIn, None),
         KeyBinding::new("cmd--", ZoomOut, None),
         KeyBinding::new("cmd-0", ZoomReset, None),
-        // Copy the view-mode mouse selection. Scoped to SketchView so it
+        // Copy the view-mode mouse selection. Scoped to YaldaView so it
         // doesn't shadow edit-mode yank or other surfaces' copy paths.
-        KeyBinding::new("cmd-c", CopyDocSelection, Some("SketchView")),
+        KeyBinding::new("cmd-c", CopyDocSelection, Some("YaldaView")),
         // Copy active selection to system clipboard (all screens).
         KeyBinding::new("cmd-c", CopySelection, None),
         // Paste from system clipboard into active editor.
@@ -6632,11 +6665,11 @@ fn register_keymap(app: &mut GpuiApp) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    // Relocate state written by older builds under <cache_dir>/sketch into the
-    // durable `~/.sketch` home (ADR-0018), BEFORE any persisted state (prefs,
+    // Relocate state written by older builds under <cache_dir>/yalda into the
+    // durable `~/.yalda` home (ADR-0018), BEFORE any persisted state (prefs,
     // workspace, client_id, acp_sessions) is read. One-time, idempotent.
-    sketch::paths::migrate_legacy_cache_dir();
-    let config = sketch::config::Config::load().unwrap_or_default();
+    yalda::paths::migrate_legacy_cache_dir();
+    let config = yalda::config::Config::load().unwrap_or_default();
     // GpuiApp-managed preferences override config.kdl's theme — that's where
     // the menu-driven "View → Theme" picks land. Falls back to the kdl
     // theme (or built-in default) when the user hasn't switched themes via
@@ -6667,11 +6700,11 @@ fn main() {
                 .to_string();
             let doc = Document::from_text(text, path.clone());
             let blocks = render_with_wiki(&doc.full_text(), &theme, Some(&path));
-            println!("sketch-gpui: loaded {} ({} blocks)", canon, blocks.len());
+            println!("yalda-gpui: loaded {} ({} blocks)", canon, blocks.len());
             Some((blocks, canon, path))
         }
         None => {
-            println!("sketch-gpui: no file given, opening browser");
+            println!("yalda-gpui: no file given, opening browser");
             None
         }
     };
@@ -6681,7 +6714,7 @@ fn main() {
 
         // Quit when the last window closes. macOS apps typically stay
         // alive in the menu bar after every window is dismissed, but
-        // sketch has no menu-bar-only mode — without this hook, closing
+        // yalda has no menu-bar-only mode — without this hook, closing
         // the red dot leaves a headless process running that can only
         // be killed from Activity Monitor. `detach` keeps the
         // subscription alive for the app's lifetime.
@@ -6702,7 +6735,7 @@ fn main() {
                     // that comes with it) is rendered. Previously `None` →
                     // chromeless window that couldn't be resized.
                     titlebar: Some(TitlebarOptions {
-                        title: Some("sketch".into()),
+                        title: Some("Yaldabaoth".into()),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -6713,7 +6746,7 @@ fn main() {
                         focus_handle.focus(window);
                         let mut view = match initial_doc.clone() {
                             Some((blocks, canon, path)) => {
-                                let mut v = SketchGpuiView::new_doc(
+                                let mut v = YaldaGpuiView::new_doc(
                                     blocks,
                                     theme.clone(),
                                     canon,
@@ -6731,7 +6764,7 @@ fn main() {
                                 }
                                 v
                             }
-                            None => SketchGpuiView::new_browser(
+                            None => YaldaGpuiView::new_browser(
                                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                                 theme.clone(),
                                 focus_handle,
@@ -6773,13 +6806,13 @@ fn main() {
                         if initial_doc.is_none() {
                             view.restore_workspace_from_disk(cx);
                         }
-                        // Reboot handoff: the previous sketch process set this
+                        // Reboot handoff: the previous yalda process set this
                         // env var via `reboot_into_claude` to mean "boot
                         // straight into the claude screen and resume every
                         // saved session." The downstream `open_agent_inner`
                         // consults `load_persisted_acp_sessions`, so
                         // session/load fires once per persisted slot.
-                        if std::env::var("SKETCH_OPEN_CLAUDE").is_ok() {
+                        if std::env::var("YALDA_OPEN_CLAUDE").is_ok() {
                             view.open_agent_inner(cx);
                         }
                         // Set splash deadline AFTER all init (workspace
@@ -6827,8 +6860,8 @@ fn main() {
         // make Cmd-Q / Cmd-O / Cmd-K render as proper accelerators.
         app.set_menus(vec![
             Menu {
-                name: "sketch".into(),
-                items: vec![MenuItem::action("Quit sketch", Quit)],
+                name: "yalda".into(),
+                items: vec![MenuItem::action("Quit yalda", Quit)],
             },
             Menu {
                 name: "File".into(),
@@ -6839,7 +6872,7 @@ fn main() {
             },
         ]);
 
-        // Bring sketch to the foreground on launch. Without this the
+        // Bring yalda to the foreground on launch. Without this the
         // process opens a window but stays behind whatever app the user
         // had focused (terminal, editor, etc.) — particularly noticeable
         // on a `cargo run` or a `reboot_into_claude` re-launch. `true`

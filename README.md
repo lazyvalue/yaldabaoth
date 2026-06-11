@@ -1,4 +1,4 @@
-# sketch
+# Yaldabaoth
 
 A terminal markdown editor with Helix-style selections, an outline browser, and
 a Claude Code MCP channel for piping buffers and inline replies into a running
@@ -12,21 +12,21 @@ cargo build --release
 
 Produces two binaries:
 
-- `target/release/sketch` — the editor
-- `target/release/sketch-channel` — the Claude Code MCP channel server (only
+- `target/release/yalda` — the editor
+- `target/release/yalda-channel` — the Claude Code MCP channel server (only
   needed if you want the Claude integration)
 
 Optionally symlink them onto `$PATH`:
 
 ```sh
-ln -sf "$(pwd)/target/release/sketch"         ~/.local/bin/sketch
-ln -sf "$(pwd)/target/release/sketch-channel" ~/.local/bin/sketch-channel
+ln -sf "$(pwd)/target/release/yalda"         ~/.local/bin/yalda
+ln -sf "$(pwd)/target/release/yalda-channel" ~/.local/bin/yalda-channel
 ```
 
 ## Run
 
 ```sh
-sketch path/to/file.md
+yalda path/to/file.md
 ```
 
 Top-level modes:
@@ -73,11 +73,11 @@ instead.
 
 ## Claude Code channel
 
-`sketch` can ship buffers (or just your selection) into a `claude` session in
+`yalda` can ship buffers (or just your selection) into a `claude` session in
 another terminal, and Claude can reply back into a special `*claude*` buffer.
 
-The transport is the official Claude Code Channels API: `sketch-channel` is an
-MCP server that Claude Code spawns over stdio; `sketch` connects to it via a
+The transport is the official Claude Code Channels API: `yalda-channel` is an
+MCP server that Claude Code spawns over stdio; `yalda` connects to it via a
 Unix domain socket.
 
 ### Setup
@@ -89,8 +89,8 @@ Unix domain socket.
    ```json
    {
      "mcpServers": {
-       "sketch": {
-         "command": "/absolute/path/to/sketch-channel"
+       "yalda": {
+         "command": "/absolute/path/to/yalda-channel"
        }
      }
    }
@@ -99,24 +99,24 @@ Unix domain socket.
    Claude Code reads `.mcp.json` from its working directory at launch, so this
    file lives next to whatever you `cd` into before running `claude`.
 
-   Tip: run `sketch-channel --help` and it prints this snippet pre-filled with
+   Tip: run `yalda-channel --help` and it prints this snippet pre-filled with
    the path to the binary you just built.
 
 2. **Launch claude with the channel enabled:**
 
    ```sh
-   claude --dangerously-load-development-channels server:sketch
+   claude --dangerously-load-development-channels server:yalda
    ```
 
-3. **In another terminal, attach sketch to the channel:**
+3. **In another terminal, attach yalda to the channel:**
 
    ```sh
-   sketch some-notes.md
+   yalda some-notes.md
    :claude-attach
    ```
 
-   With no argument, `:claude-attach` connects to `/tmp/sketch-channel-$USER.sock`
-   (override via the `SKETCH_CHANNEL_SOCKET` environment variable). Pass an
+   With no argument, `:claude-attach` connects to `/tmp/yalda-channel-$USER.sock`
+   (override via the `YALDA_CHANNEL_SOCKET` environment variable). Pass an
    explicit path to use a non-default socket.
 
 ### Sending
@@ -151,31 +151,31 @@ as a fresh active region.
 
 ```
 ┌─────────┐   unix socket   ┌──────────────────┐  stdio MCP   ┌───────────┐
-│ sketch  │ ───────────────▶│  sketch-channel  │ ────────────▶│   claude  │
+│ yalda  │ ───────────────▶│  yalda-channel  │ ────────────▶│   claude  │
 │         │ ◀───────────────│  (mcp server)    │ ◀────────────│           │
 └─────────┘   JSON lines    └──────────────────┘  JSON-RPC    └───────────┘
    :claude-send    →    {"type":"send",content,meta}
                                     ↓
                         notifications/claude/channel
                                     ↓
-                    <channel source="sketch" label="buffer">…</channel>
+                    <channel source="yalda" label="buffer">…</channel>
 
    *claude* buffer  ←  {"type":"reply",text}  ←  reply tool  ←  Claude
 ```
 
 Constraints worth knowing:
 
-- **Single sketch ↔ single channel.** A new `:claude-attach` replaces any
+- **Single yalda ↔ single channel.** A new `:claude-attach` replaces any
   previous connection.
-- **Channel reload requires restarting `claude`.** `sketch-channel` is spawned
+- **Channel reload requires restarting `claude`.** `yalda-channel` is spawned
   by Claude Code at session start; the Unix socket is bound at that point.
 - **Meta keys must be alphanumeric or underscore** (a Claude Code constraint).
-  `sketch-channel` silently drops anything else from the `meta` object before
+  `yalda-channel` silently drops anything else from the `meta` object before
   forwarding.
 
 ## Configuration
 
-Sketch reads `~/.config/sketch/config.kdl` (if present) for theme, max line
+Yalda reads `~/.config/yalda/config.kdl` (if present) for theme, max line
 width, custom keybindings, and a custom menu tree. See `src/config.rs` for the
 schema.
 
@@ -186,4 +186,4 @@ cargo test
 ```
 
 Covers ~170 unit + integration tests, including the MCP handshake against the
-real `sketch-channel` binary and the inline-reply data model.
+real `yalda-channel` binary and the inline-reply data model.

@@ -1,5 +1,5 @@
 [package]
-name = "sketch"
+name = "yalda"
 version = "0.1.0"
 edition = "2024"
 
@@ -52,29 +52,29 @@ tempfile = "3"
 gpui = { version = "0.2", features = ["test-support"] }
 
 [[bin]]
-name = "sketch"
+name = "yalda"
 path = "src/main.rs"
 
 [[bin]]
-name = "sketch-channel"
-path = "src/bin/sketch-channel.rs"
+name = "yalda-channel"
+path = "src/bin/yalda-channel.rs"
 
 [[bin]]
-name = "sketch-gpui"
-path = "src/bin/sketch-gpui/main.rs"
+name = "yalda-gpui"
+path = "src/bin/yalda-gpui/main.rs"
 required-features = []
 
 [[bin]]
-name = "sketch-session-server"
-path = "src/bin/sketch-session-server/main.rs"
+name = "yalda-session-server"
+path = "src/bin/yalda-session-server/main.rs"
 
 # Test-support stub ACP agent. Speaks the agent side of the Agent Client
-# Protocol over stdio (NDJSON) just enough to satisfy sketch's client, so the
+# Protocol over stdio (NDJSON) just enough to satisfy yalda's client, so the
 # headless session-server harness can drive a real transcript without a live
-# Claude agent. Integration tests find it via env!("CARGO_BIN_EXE_sketch-acp-stub").
+# Claude agent. Integration tests find it via env!("CARGO_BIN_EXE_yalda-acp-stub").
 [[bin]]
-name = "sketch-acp-stub"
-path = "src/bin/sketch-acp-stub.rs"
+name = "yalda-acp-stub"
+path = "src/bin/yalda-acp-stub.rs"
 
 # Phase 6: in-process AgentTransport-fake tests. Gated on `test-support` so the
 # fake substrate (FakeTransport / FakeAgentControls / FakeAgentSpawner) is

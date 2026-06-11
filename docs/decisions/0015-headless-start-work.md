@@ -24,7 +24,7 @@ GUI ever attaching.
 ## Consequences / implied work (follow-up spec, not yet built)
 
 - **An admin/CLI "enqueue prompt" path** distinct from the owner-only `Prompt`
-  verb. Likely shapes: a `sketch-session-server prompt <session_id> <text>`
+  verb. Likely shapes: a `yalda-session-server prompt <session_id> <text>`
   subcommand and/or an `admin_prompt` socket verb. Reuses the existing
   pending-prompt queue + WAL durability (the prompt must be persisted before
   ack, per ADR-0009's "never lose a sent prompt").
@@ -57,13 +57,13 @@ GUI ever attaching.
   `pending_prompts` if the agent is still spawning). The owner path is
   behaviorally identical; `AdminPrompt` reuses the exact same core, so the
   prompt is just as durable (ADR-0009's "never lose a sent prompt" holds).
-- **CLI:** `sketch-session-server prompt <session_id> <text>` connects to an
+- **CLI:** `yalda-session-server prompt <session_id> <text>` connects to an
   ALREADY-RUNNING server (via the new `SessionServerClient::connect_existing`,
   which never auto-launches a throwaway daemon — unlike the GUI's `connect`),
   calls `admin_prompt` (a round-trip so the CLI gets a definitive Ack/Error,
   since it has no notification stream to infer delivery from), and prints
   `ok` / `error: …`. If no server is listening it prints an error suggesting
-  the server be started (`sketch-session-server` or `… install`) and exits 1.
+  the server be started (`yalda-session-server` or `… install`) and exits 1.
 - **Client method:** `SessionServerClient::admin_prompt(session_id, text)`
   mirrors `prompt` but uses the round-trip `request` rather than fire-and-
   forget.

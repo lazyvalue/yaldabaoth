@@ -3,7 +3,7 @@ use pulldown_cmark::{Event, Tag, TagEnd};
 #[test]
 fn test_parse_heading() {
     let md = "# Hello World";
-    let events: Vec<_> = sketch::parse::parse(md).collect();
+    let events: Vec<_> = yalda::parse::parse(md).collect();
 
     assert!(matches!(
         events[0],
@@ -22,7 +22,7 @@ fn test_parse_heading() {
 #[test]
 fn test_parse_code_block() {
     let md = "```rust\nfn main() {}\n```";
-    let events: Vec<_> = sketch::parse::parse(md).collect();
+    let events: Vec<_> = yalda::parse::parse(md).collect();
 
     assert!(matches!(events[0], Event::Start(Tag::CodeBlock(_))));
 }
@@ -30,7 +30,7 @@ fn test_parse_code_block() {
 #[test]
 fn test_parse_task_list() {
     let md = "- [x] done\n- [ ] todo";
-    let events: Vec<_> = sketch::parse::parse(md).collect();
+    let events: Vec<_> = yalda::parse::parse(md).collect();
 
     assert!(
         events

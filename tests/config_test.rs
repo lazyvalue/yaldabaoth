@@ -1,8 +1,8 @@
-use sketch::acp_channel::{DEFAULT_PERMISSION_MODE, PermissionMode};
-use sketch::config::Config;
-use sketch::keybind::KeybindManager;
-use sketch::keys::{Key, KeyPress, Modifiers};
-use sketch::theme::ThemeName;
+use yalda::acp_channel::{DEFAULT_PERMISSION_MODE, PermissionMode};
+use yalda::config::Config;
+use yalda::keybind::KeybindManager;
+use yalda::keys::{Key, KeyPress, Modifiers};
+use yalda::theme::ThemeName;
 
 fn parse_config(content: &str) -> Config {
     Config::load_from_str(content).unwrap()
