@@ -1,7 +1,7 @@
 # 001 — Refactor the agent session/tile ownership model
 
 **Project:** agent-model-refactor
-**Status:** 🔄 in progress (subtask 1 building)
+**Status:** ✅ core complete — #1/#3/#4/#5 done & merged to `main`; #2 + #6 are tracked follow-ups
 **Opened:** 2026-06-10
 **Branch:** `agent-session-owner` (worktree `.claude/worktrees/agent-session-owner`)
 **Spec:** `docs/specs/spec-agent-session-ownership.md` (lives on the branch; lands on `main` at merge)
@@ -78,10 +78,10 @@ App::Agent(AgentTile)          App::Buffer(BufferApp)
   sessions + "create new". Session-close / unbind / rebind all leave the tile as
   `App::Agent` with `bound: None` showing the selector; a tile never vanishes or
   silently becomes a Buffer.
-- **No `underlying` buffer.** Agent and Buffer are fully orthogonal App variants;
-  an Agent never nests/stashes a Buffer. Flipping a tile loses nothing (both are
-  views onto pools). Ctrl-V ("leave agent") converts the tile to a fresh Buffer
-  picker at cwd — not a restore of a stashed doc.
+- **No `underlying` buffer, and no "leave agent" gesture.** Agent and Buffer are
+  fully orthogonal App variants; an Agent never nests/stashes a Buffer. Flipping a
+  tile loses nothing (both are views onto pools). (Ctrl-V was removed — an agent
+  tile stays an agent tile; close it or open a Buffer tile normally.)
 
 ### Canonical agent-tile commands (in the `.` local menu)
 
@@ -97,8 +97,8 @@ App::Agent(AgentTile)          App::Buffer(BufferApp)
 
 ## Subtasks
 
-- [~] **1. Ownership inversion (strict 1:1).** Code landed (build green, 153
-  tests). **5-lens adversarial review done** (21 findings → 3 must-fix +
+- [x] **1. Ownership inversion (strict 1:1).** Done & merged. Code landed,
+  5-lens adversarial review done** (21 findings → 3 must-fix +
   8 should-fix); **fixes in progress** (impl agent). ⏳ then re-check + runtime
   verify (#4). Review verdict: the store layer is correct (1:1 genuinely
   enforced, fan-out gone) — but the live view code *discarded the store's
