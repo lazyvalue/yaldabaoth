@@ -131,7 +131,6 @@ impl YaldaGpuiView {
                             label: s.label,
                             turns: s.turns,
                             connected: s.connected,
-                            has_owner: s.has_owner,
                             permission_mode: s.permission_mode,
                         })
                         .collect())
@@ -510,24 +509,23 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Attach (with Owner-reclaim retry) to sessions whose slots were just
-    /// bound by `apply_open_agent_resolution`, off the paint thread. Attaching
-    /// here — AFTER the bind — is what closes the replay-drop race: the pump
-    /// can route every replayed notification because its slot already exists.
-    /// Per-session ownership outcome is reconciled back into the slot status so
-    /// a read-only / failed attach is visible instead of a silently-dead session.
+    /// Attach (strict 1:1) to sessions whose slots were just bound by
+    /// `apply_open_agent_resolution`, off the paint thread. Attaching here —
+    /// AFTER the bind — is what closes the replay-drop race: the pump can route
+    /// every replayed notification because its slot already exists. A failed
+    /// attach is reconciled back into the slot status so a dead session is
+    /// visible instead of silently broken.
     pub(crate) fn spawn_attach_sessions(&self, sids: Vec<String>, cx: &mut Context<Self>) {
         let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
             return;
         };
-        let want_owner = !self.is_candidate;
         cx.spawn(async move |this, cx| {
-            let results: Vec<(String, Result<bool, String>)> = cx
+            let results: Vec<(String, Result<(), String>)> = cx
                 .background_executor()
                 .spawn(async move {
                     sids.into_iter()
                         .map(|sid| {
-                            let r = attach_for_role(&handle, &sid, want_owner);
+                            let r = attach_session(&handle, &sid);
                             (sid, r)
                         })
                         .collect()
@@ -540,17 +538,11 @@ impl YaldaGpuiView {
                 // launch (see below). Transient failures keep today's behavior.
                 let mut dead_sids: Vec<String> = Vec::new();
                 for (sid, r) in results {
-                    // Per-session outcome: the status string to surface (if
-                    // any). Lease/driver tracking is gone under the 1:1 model.
+                    // Per-session outcome: the status string to surface (if any).
                     let status: Option<SharedString> = match r {
-                        // Granted drive rights (Owner): leave the optimistic
-                        // status to be overwritten by the first real event.
-                        Ok(true) => None,
-                        // Downgraded to Observer despite wanting Owner.
-                        Ok(false) if want_owner => {
-                            Some("read-only — another window owns this session".into())
-                        }
-                        Ok(false) => None,
+                        // Attached: leave the optimistic status to be overwritten
+                        // by the first real event.
+                        Ok(()) => None,
                         Err(e) => {
                             eprintln!(
                                 "[yalda-gpui] attach failed for {}: {e}",
@@ -1169,14 +1161,13 @@ impl YaldaGpuiView {
             sids.push(sid);
         }
 
-        // Re-attach off the paint thread, with the same Owner-reclaim retry the
-        // open path uses. The PREVIOUS connection's server-side teardown races
-        // this fresh one: the new socket can re-attach before the server has
-        // processed the old socket's close and released ownership, so a bare
-        // attach momentarily loses to a not-yet-cleared owner ("another GUI
-        // already owns this session"). `spawn_attach_sessions` retries past
-        // that window and reconciles per-slot status. (Doing blocking attach
-        // round-trips inline here, as before, also froze rendering.)
+        // Re-attach off the paint thread (strict 1:1: attach is unconditional —
+        // there is no owner to reclaim or contend with). The PREVIOUS
+        // connection's server-side teardown races this fresh one, but a bare
+        // attach simply succeeds: the server replays the full event_log on
+        // attach and tears down any stale forwarder when this one registers.
+        // `spawn_attach_sessions` reconciles per-slot status. (Doing blocking
+        // attach round-trips inline here, as before, also froze rendering.)
         let n = sids.len();
         if !sids.is_empty() {
             self.spawn_attach_sessions(sids, cx);
@@ -1457,13 +1448,6 @@ impl YaldaGpuiView {
         batch: Vec<ServerNotification>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let is_candidate = self.is_candidate;
-        // This GUI's stable lease client_id, for the LeaseChanged check below
-        // (released == unleased OR held by us). Captured up front so the
-        // per-note loop doesn't re-borrow `session_server`.
-        let my_client_id: Option<String> = self.session_server.as_ref().map(|s| s.client_id());
-        let mut ready_change: Option<bool> = None;
-
         let warn_unrouted = |routed: bool, sid: &str| {
             if !routed {
                 eprintln!(
@@ -1685,26 +1669,6 @@ impl YaldaGpuiView {
                     });
                     warn_unrouted(routed, &session_id);
                 }
-                ServerNotification::LeaseChanged { session_id, lease } => {
-                    if is_candidate {
-                        // Released == unleased (None) OR (defensively) already
-                        // held by our OWN client_id. Either way a Promote will
-                        // succeed, so the candidate may take over.
-                        let released = lease
-                            .as_ref()
-                            .is_none_or(|l| Some(&l.client_id) == my_client_id.as_ref());
-                        ready_change = Some(released);
-                        self.with_server_session_slot(&session_id, |slot| {
-                            let msg = if released {
-                                "original released — menu → claude → take over"
-                            } else {
-                                "mirroring (original active) — read-only"
-                            };
-                            Self::append_system_notice(&mut slot.state, msg);
-                            slot.state.status = Some(msg.into());
-                        });
-                    }
-                }
                 ServerNotification::SessionCreated { session } => {
                     // List-level signal that some connection created a session.
                     // The primary GUI does not auto-add it to unrelated tiles
@@ -1728,9 +1692,9 @@ impl YaldaGpuiView {
                     reason,
                     text,
                 } => {
-                    // The server refused the prompt (another window holds the
-                    // lease). The optimistic echo is already frozen in the
-                    // transcript, so without this notice the message would
+                    // The server refused the prompt (e.g. a send failure or a
+                    // missing session). The optimistic echo is already frozen in
+                    // the transcript, so without this notice the message would
                     // LOOK sent while the agent never received it. Say so in
                     // the transcript + status line, and put the text back in
                     // the chatbox (only if the user hasn't typed something
@@ -1772,10 +1736,6 @@ impl YaldaGpuiView {
                         .scroll_to_reveal_item(claude.list_item_count - 1);
                 }
             });
-        }
-        // Deferred apply outside the layout borrow.
-        if let Some(ready) = ready_change {
-            self.candidate_promote_ready = ready;
         }
         if did_work {
             cx.notify();
@@ -2751,13 +2711,6 @@ impl YaldaGpuiView {
     /// Chatbox submit (§18) takes the chatbox text, appends + freezes it
     /// at EOF of the transcript, then sends and clears the chatbox.
     pub(crate) fn submit_agent(&mut self, cx: &mut Context<Self>) {
-        if self.is_candidate {
-            self.set_agent_status(
-                "read-only mirror — close the original window, then menu → claude → take over",
-                cx,
-            );
-            return;
-        }
         let is_chatbox = match self.agent_mut() {
             Some(c) => {
                 // Re-enable auto-scroll when the user sends a message.
@@ -2824,10 +2777,6 @@ impl YaldaGpuiView {
 
     /// `cx`-only stop, callable from the menu dispatch (which has no `Window`).
     pub(crate) fn stop_agent_inner(&mut self, cx: &mut Context<Self>) {
-        // Read-only mirrors can't drive the session.
-        if self.is_candidate {
-            return;
-        }
         // Only meaningful mid-turn.
         let awaiting = self
             .agent_mut()
@@ -3127,13 +3076,6 @@ impl YaldaGpuiView {
     /// send-first-then-echo order, but takes the text from the worksheet
     /// selection and leaves the input surface untouched.
     pub(crate) fn send_agent_selection(&mut self, cx: &mut Context<Self>) {
-        if self.is_candidate {
-            self.set_agent_status(
-                "read-only mirror — close the original window, then menu → claude → take over",
-                cx,
-            );
-            return;
-        }
         let server_sid = self.active_server_session_id();
 
         let text = match self.agent_mut().and_then(|c| c.editor.selection_text()) {

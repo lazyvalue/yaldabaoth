@@ -2145,42 +2145,7 @@ impl YaldaGpuiView {
         }
         let content_area: gpui::AnyElement = col.into_any_element();
 
-        // Build-loop candidate banner. Sits above the status strip so a
-        // read-only mirror is unmistakable. Amber while the original owner
-        // still holds the sessions; green once it has closed and take-over
-        // will succeed.
-        let candidate_banner = if self.is_candidate {
-            let (bar_bg, text): (Hsla, &'static str) = if self.candidate_promote_ready {
-                (
-                    rgb(0x50fa7b).into(),
-                    "✓ CANDIDATE · original closed — menu → claude → take over (P) to go live",
-                )
-            } else {
-                (
-                    rgb(0xffb86c).into(),
-                    "🔭 CANDIDATE · read-only mirror — close the original window, then menu → claude → take over (P)",
-                )
-            };
-            Some(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .w_full()
-                    .px_4()
-                    .py_1()
-                    .h(px(24.0))
-                    .bg(bar_bg)
-                    .text_color(rgb(0x1e1e2e))
-                    .text_size(px(12.0))
-                    .font_weight(FontWeight::BOLD)
-                    .child(SharedString::new_static(text)),
-            )
-        } else {
-            None
-        };
-
-        let mut root = root
+        let root = root
             .key_context("AgentView")
             .on_key_down(cx.listener(Self::handle_claude_key))
             .on_action(cx.listener(Self::quit))
@@ -2227,9 +2192,6 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::tag_view_chord))
             .on_action(cx.listener(Self::tag_toggle_chord))
             .on_action(cx.listener(Self::clear_tag_view));
-        if let Some(banner) = candidate_banner {
-            root = root.child(banner);
-        }
         let out = match self.agent_status_position {
             AgentStatusPosition::Top => root
                 .child(header)
@@ -2334,17 +2296,11 @@ impl YaldaGpuiView {
                 for (i, s) in sessions.iter().enumerate() {
                     let row = i + 1;
                     let liveness = if s.connected { "live" } else { "idle" };
-                    let owned = if s.has_owner {
-                        " · open elsewhere"
-                    } else {
-                        ""
-                    };
                     let sub = format!(
-                        "{} turn{} · {}{}",
+                        "{} turn{} · {}",
                         s.turns,
                         if s.turns == 1 { "" } else { "s" },
                         liveness,
-                        owned,
                     );
                     rows = rows.child(self.picker_row(
                         row,

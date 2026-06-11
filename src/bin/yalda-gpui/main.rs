@@ -115,7 +115,6 @@ pub(crate) use yalda::md_highlight::{
 pub(crate) use yalda::menu::{MenuAction, MenuNode, MenuNodeKind, MenuState};
 pub(crate) use yalda::render;
 pub(crate) use yalda::session_client::SessionServerClient;
-pub(crate) use yalda::session_proto::AttachMode;
 pub(crate) use yalda::session_proto::Notification as ServerNotification;
 pub(crate) use yalda::style::{Color as NColor, Modifier, Style as NStyle};
 pub(crate) use yalda::theme::{OverlayTheme, Theme, ThemeName};
@@ -1374,11 +1373,11 @@ fn gpui_menu() -> Vec<MenuNode> {
         MenuNode::submenu(
             "d",
             "dev",
-            vec![
-                MenuNode::entry("p", "promote (build candidate)", "dev-build-candidate"),
-                MenuNode::entry("P", "take over sessions (candidate)", "dev-take-over"),
-                MenuNode::entry("g", "rebuild & restart gui", "dev-restart-gui"),
-            ],
+            vec![MenuNode::entry(
+                "g",
+                "rebuild & restart gui",
+                "dev-restart-gui",
+            )],
         ),
         MenuNode::separator(),
         MenuNode::entry("v", "back to doc", "back-to-doc"),
@@ -1532,19 +1531,6 @@ struct YaldaGpuiView {
     session_server: Option<SessionServerClient>,
     /// Where the agent info bar renders: above or below the transcript.
     agent_status_position: AgentStatusPosition,
-    /// True when this instance was launched as a build-loop *candidate*
-    /// (`YALDA_CANDIDATE=1`). A candidate attaches to live sessions as a
-    /// read-only `Observer` (mirrors the transcript, can't drive), shows a
-    /// banner, and refuses to submit prompts until it takes over — which it
-    /// can do only once the original owner window closes. See
-    /// `build_and_launch_candidate` / `candidate_take_over`.
-    is_candidate: bool,
-    /// For a candidate: whether the mirrored sessions have been released by
-    /// the original holder (i.e. a `LeaseChanged{lease:None}` arrived, or the
-    /// lease is now held by our own client_id), meaning take-over will now
-    /// succeed. Drives the banner color. Purely a display hint —
-    /// `candidate_take_over` re-checks authoritatively.
-    candidate_promote_ready: bool,
     /// Splash screen shown at startup. `Some(deadline)` while visible;
     /// `None` after dismissal (auto-timeout or keypress).
     splash_until: Option<std::time::Instant>,
@@ -1558,16 +1544,6 @@ struct YaldaGpuiView {
     /// Shared syntect highlighter for code block syntax coloring in Edit Mode
     /// and the agent transcript tile. Loaded once at startup.
     syntect_hl: yalda::highlight::Highlighter,
-    /// The lease-heartbeat beater (spec phase 4). A SINGLETON tied to this
-    /// view's lifetime: spawned at most once (on the first `start_server_pump`
-    /// that finds this `None`) and self-gates per-tick on `slot.is_driver`, so
-    /// one beater covers every driven session in this window for the window's
-    /// life. Subsequent `start_server_pump` calls (re-opening the Claude
-    /// screen) find this `Some` and DON'T spawn another — fixing the leak where
-    /// each open spawned a fresh detached beater, so a lease-loss event fanned
-    /// out into K redundant Owner re-attaches. Dropped (and thus cancelled)
-    /// with the view.
-    _lease_heartbeat: Option<Task<()>>,
     /// The ONE server-notification pump for this view (`start_server_pump`),
     /// singleton like the heartbeat above. It MUST live on the view, never on
     /// an agent slot: the pump owns the `SessionServerClient`'s notification
@@ -1623,11 +1599,8 @@ impl YaldaGpuiView {
             line_layouts: Rc::new(RefCell::new(HashMap::new())),
             session_server: connect_session_server(),
             agent_status_position: AgentStatusPosition::default(),
-            is_candidate: is_candidate_launch(),
-            candidate_promote_ready: false,
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
             syntect_hl,
-            _lease_heartbeat: None,
             _server_pump: None,
             pending_mark_chord: None,
             pending_tag_chord: None,
@@ -1657,11 +1630,8 @@ impl YaldaGpuiView {
             line_layouts: Rc::new(RefCell::new(HashMap::new())),
             session_server: connect_session_server(),
             agent_status_position: AgentStatusPosition::default(),
-            is_candidate: is_candidate_launch(),
-            candidate_promote_ready: false,
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
             syntect_hl,
-            _lease_heartbeat: None,
             _server_pump: None,
             pending_mark_chord: None,
             pending_tag_chord: None,
@@ -2360,100 +2330,15 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Build-loop step 1 (the `promote` command). Compile `yalda-gpui`, and
-    /// on success spawn the freshly built binary as a read-only *candidate*
-    /// (`YALDA_CANDIDATE=1`) **without quitting** this instance. Both
-    /// processes share the running session server, so the candidate mirrors
-    /// every live ACP session. Verify the candidate, then close this window
-    /// to hand off ownership; the candidate takes over with full transcripts
-    /// intact. The session server binary is intentionally left untouched —
-    /// only the GUI is hot-swapped, so agents never restart.
-    fn build_and_launch_candidate(&mut self, cx: &mut Context<Self>) {
-        if self.is_candidate {
-            self.set_agent_status("already running as a candidate", cx);
-            return;
-        }
-        if self.session_server.is_none() {
-            self.set_agent_status(
-                "session server not active — relaunch with YALDA_SESSION_SERVER=1",
-                cx,
-            );
-            return;
-        }
-        self.set_agent_status("building candidate: cargo build --bin yalda-gpui…", cx);
-
-        let manifest_dir = env!("CARGO_MANIFEST_DIR").to_string();
-        let exe = std::env::current_exe().ok();
-        let args: Vec<String> = std::env::args().skip(1).collect();
-
-        cx.spawn(async move |this, cx| {
-            // Run the (slow, blocking) build on a background thread.
-            let built = cx
-                .background_executor()
-                .spawn(async move {
-                    std::process::Command::new("cargo")
-                        .args(["build", "--bin", "yalda-gpui"])
-                        .current_dir(&manifest_dir)
-                        .output()
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| match built {
-                Ok(out) if out.status.success() => match exe {
-                    Some(exe) => {
-                        let mut cmd = std::process::Command::new(exe);
-                        cmd.args(&args);
-                        cmd.env("YALDA_CANDIDATE", "1");
-                        // Phase-4 blue-green: give the candidate a DISTINCT
-                        // per-launch client_id so it is a different lease client
-                        // from the original. It lands as Observer while the
-                        // original's lease is live, then Promotes under this
-                        // fresh id once the original cleanly exits. (If it read
-                        // the on-disk id it would impersonate the original and
-                        // steal the lease.)
-                        cmd.env("YALDA_CLIENT_ID", uuid::Uuid::new_v4().to_string());
-                        cmd.stdin(std::process::Stdio::null());
-                        cmd.stdout(std::process::Stdio::null());
-                        cmd.stderr(std::process::Stdio::inherit());
-                        match cmd.spawn() {
-                            Ok(_) => this.set_agent_status(
-                                "candidate launched — verify it, then close this window to hand off",
-                                cx,
-                            ),
-                            Err(e) => {
-                                this.set_agent_status(&format!("candidate spawn failed: {e}"), cx)
-                            }
-                        }
-                    }
-                    None => this.set_agent_status("cannot locate current executable", cx),
-                },
-                Ok(out) => {
-                    // Surface the tail of stderr so the failure is actionable.
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
-                    let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join(" | ");
-                    this.set_agent_status(&format!("build failed: {tail}"), cx);
-                }
-                Err(e) => this.set_agent_status(&format!("build error: {e}"), cx),
-            });
-        })
-        .detach();
-    }
-
     /// Dev hot-restart: rebuild `yalda-gpui` and replace THIS instance with a
-    /// fresh NORMAL one. Distinct from `build_and_launch_candidate`: that spawns
-    /// a read-only candidate (YALDA_CANDIDATE=1) that co-attaches and waits for
-    /// the user to hand off; this is a full self-restart — build, spawn a fresh
-    /// normal instance (no YALDA_CANDIDATE), then quit so the new process
-    /// reclaims ownership of every server-managed session via the deterministic
-    /// same-`client_id` `attach_for_role` path (the new instance presents the
-    /// SAME stable client_id, so the server resumes its lease on the first
-    /// attach). The session server (and its live agent sessions) is left
-    /// running, so agents survive the bounce.
+    /// fresh one. A full self-restart — build, spawn a fresh instance, then
+    /// quit so the new process re-attaches to every server-managed session. The
+    /// session server (and its live agent sessions) is left running, so agents
+    /// survive the bounce.
     ///
     /// NEEDS-RUNTIME: GPUI can't be driven headlessly, so this is compile-
-    /// verified only — the actual rebuild/relaunch/owner-reclaim must be
-    /// checked by a human.
+    /// verified only — the actual rebuild/relaunch/re-attach must be checked by
+    /// a human.
     fn dev_rebuild_restart_gui(&mut self, cx: &mut Context<Self>) {
         self.set_agent_status("rebuilding gui: cargo build --bin yalda-gpui…", cx);
 
@@ -2476,16 +2361,9 @@ impl YaldaGpuiView {
             let _ = this.update(cx, |this, cx| match built {
                 Ok(out) if out.status.success() => match exe {
                     Some(exe) => {
-                        // Fresh NORMAL instance: same args, NO YALDA_CANDIDATE —
-                        // this is an ordinary relaunch, not a read-only candidate.
-                        // Command inherits the full parent env, so we must
-                        // explicitly REMOVE the candidate marker (if this very
-                        // process was itself launched as a candidate) — otherwise
-                        // the "fresh normal instance" would inherit and come up
-                        // read-only.
+                        // Fresh instance: same args. A plain relaunch.
                         let mut cmd = std::process::Command::new(exe);
                         cmd.args(&args);
-                        cmd.env_remove("YALDA_CANDIDATE");
                         cmd.stdin(std::process::Stdio::null());
                         cmd.stdout(std::process::Stdio::null());
                         // stderr inherited so post-restart logs reach the dev
@@ -2498,9 +2376,9 @@ impl YaldaGpuiView {
                                     "rebuilt — relaunching gui, this window will close",
                                     cx,
                                 );
-                                // Quit promptly: the new instance's deterministic
-                                // same-client_id attach_for_role reclaim handles
-                                // the teardown race, so we don't need to linger.
+                                // Quit promptly: the new instance re-attaches to
+                                // every server session on startup (strict 1:1),
+                                // so we don't need to linger.
                                 cx.quit();
                             }
                             Err(e) => {
@@ -2521,57 +2399,6 @@ impl YaldaGpuiView {
             });
         })
         .detach();
-    }
-
-    /// Build-loop step 2 (the candidate's "take over"). Claim ownership of
-    /// every session this candidate is mirroring. Succeeds only once the
-    /// original owner window has closed (the server reports the sessions as
-    /// ownerless); otherwise reports which sessions are still held so the
-    /// user knows to close the original first. On success the candidate
-    /// sheds its read-only state and becomes the live driver.
-    fn candidate_take_over(&mut self, cx: &mut Context<Self>) {
-        if self.session_server.is_none() {
-            self.set_agent_status("session server not active", cx);
-            return;
-        }
-        // Collect every server sid in the store (candidate/promote is dormant
-        // under the 1:1 model; lease/driver tracking is gone — spec-agent-
-        // session-ownership.md §"dormant promote").
-        let sids: Vec<String> = self
-            .sessions
-            .ids()
-            .filter_map(|id| self.sessions.sid_of(id).map(|s| s.to_string()))
-            .collect();
-        if sids.is_empty() {
-            self.set_agent_status("no mirrored sessions to take over", cx);
-            return;
-        }
-
-        let mut failures = Vec::new();
-        if let Some(server) = self.session_server.as_ref() {
-            for sid in &sids {
-                if let Err(e) = server.promote(sid) {
-                    failures.push(format!("{}: {e}", &sid[..8.min(sid.len())]));
-                }
-            }
-        }
-
-        if failures.is_empty() {
-            self.is_candidate = false;
-            self.candidate_promote_ready = false;
-            self.set_agent_status(
-                &format!("took over {} session(s) — you now own them", sids.len()),
-                cx,
-            );
-        } else {
-            self.set_agent_status(
-                &format!(
-                    "close the original window first — still owned: {}",
-                    failures.join(", ")
-                ),
-                cx,
-            );
-        }
     }
 
     fn zoom_in(&mut self, _: &ZoomIn, _w: &mut Window, cx: &mut Context<Self>) {
@@ -3927,9 +3754,7 @@ impl YaldaGpuiView {
             "claude-rename" => self.open_rename_overlay(cx),
             "claude-new-here" => self.open_new_agent_session_cwd_overlay(cx),
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
-            "dev-build-candidate" => self.build_and_launch_candidate(cx),
             "dev-restart-gui" => self.dev_rebuild_restart_gui(cx),
-            "dev-take-over" => self.candidate_take_over(cx),
             "rail-files" => self.toggle_file_browser_rail_impl(cx),
             "rail-outline" => self.toggle_outline_rail_impl(cx),
             "rail-flip" => self.flip_rail_side_impl(cx),

@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use yalda::session_client::SessionServerClient;
-use yalda::session_proto::{AttachMode, Notification, socket_path};
+use yalda::session_proto::{Notification, socket_path};
 
 /// A running server bound to a private socket, pointed at the stub ACP agent.
 /// Per-test env knobs (`STUB_CHUNKS`, `STUB_DELAY_MS`, …) shape the transcript
@@ -147,13 +147,11 @@ fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Connect a client carrying a stable lease `client_id` (phase 4). A client
-/// that wants drive rights (Owner attach + prompt) MUST present one. Owner
-/// clients across a "GUI restart" reuse the SAME id so the lease resumes.
-fn connect_as(client_id: &str) -> SessionServerClient {
-    let c = SessionServerClient::connect().expect("connect");
-    c.set_client_id(client_id.to_string());
-    c
+/// Connect a client. Under the strict 1:1 model there is no client_id / lease;
+/// this is a thin wrapper over `connect()`. The `_label` arg is ignored (kept so
+/// call sites that documented "which GUI" don't have to change).
+fn connect_as(_label: &str) -> SessionServerClient {
+    SessionServerClient::connect().expect("connect")
 }
 
 /// Count `ReplyEvent(Chunk)` notifications carrying agent text in a drained
@@ -216,9 +214,7 @@ fn prompt_turn_round_trip() {
     let info = client
         .create_session(std::env::temp_dir(), "round-trip".into(), None)
         .expect("create_session");
-    client
-        .attach(&info.session_id, AttachMode::Owner)
-        .expect("attach owner");
+    client.attach(&info.session_id).expect("attach");
 
     // Prompt. The stub streams CHUNKS agent_message_chunks then ends the turn.
     client.prompt(&info.session_id, "hello").expect("prompt");
@@ -247,12 +243,15 @@ fn prompt_turn_round_trip() {
         server.read_log()
     );
 
-    // Durability: a FRESH client (simulating a second GUI / a reopened panel)
-    // attaches and must receive the full transcript replayed from event_log.
+    // Durability: a FRESH client (simulating a reopened panel) attaches and must
+    // receive the full transcript replayed from event_log. Drop the first client
+    // first — strict 1:1 means one attached client per session.
+    drop(client);
+    std::thread::sleep(Duration::from_millis(100));
     let client2 = SessionServerClient::connect().expect("connect #2");
     client2
-        .attach(&info.session_id, AttachMode::Observer)
-        .expect("attach observer #2");
+        .attach(&info.session_id)
+        .expect("attach #2 for replay");
     let replay = drain_until(&client2, Duration::from_secs(10), |n| {
         n.iter().any(|note| {
             matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == info.session_id)
@@ -293,9 +292,7 @@ fn large_replay_reconnect() {
         let info = client
             .create_session(std::env::temp_dir(), "large".into(), None)
             .expect("create_session");
-        client
-            .attach(&info.session_id, AttachMode::Owner)
-            .expect("attach owner #1");
+        client.attach(&info.session_id).expect("attach #1");
         client.prompt(&info.session_id, "go big").expect("prompt");
 
         // Wait until the whole big turn has landed (TurnEnded) AND we've seen
@@ -324,14 +321,7 @@ fn large_replay_reconnect() {
     // GUI #2: fresh client re-attaches. The server replays the full event_log
     // (all 800 chunks + the user prompt + the turn boundary) on attach.
     let client2 = connect_as("gui-large");
-    let became_owner = client2
-        .attach(&sid, AttachMode::Owner)
-        .expect("re-attach after restart");
-    assert!(
-        became_owner,
-        "fresh same-id attach should resume the lease on the first try\nlog:\n{}",
-        server.read_log()
-    );
+    client2.attach(&sid).expect("re-attach after restart");
 
     let replay = drain_until(&client2, Duration::from_secs(30), |n| {
         count_agent_chunks(n) >= CHUNKS
@@ -396,9 +386,7 @@ fn mid_turn_reconnect_no_corruption() {
         let info = client
             .create_session(std::env::temp_dir(), "midturn".into(), None)
             .expect("create_session");
-        client
-            .attach(&info.session_id, AttachMode::Owner)
-            .expect("attach owner #1");
+        client.attach(&info.session_id).expect("attach #1");
         client
             .prompt(&info.session_id, "stream slowly")
             .expect("prompt");
@@ -422,9 +410,7 @@ fn mid_turn_reconnect_no_corruption() {
     // Fresh client re-attaches while the turn may still be streaming on the
     // server. The server keeps pumping the agent regardless of attach state.
     let client2 = connect_as("gui-midturn");
-    client2
-        .attach(&sid, AttachMode::Owner)
-        .expect("re-attach mid-turn");
+    client2.attach(&sid).expect("re-attach mid-turn");
 
     // The forwarder tails event_log from index 0 on attach, so this fresh
     // client gets the WHOLE turn (everything streamed before AND after the
@@ -504,9 +490,7 @@ fn midturn_prompt_queues_and_runs_next_turn() {
         .create_session(std::env::temp_dir(), "midturn-queue".into(), None)
         .expect("create_session");
     let sid = info.session_id.clone();
-    client
-        .attach(&sid, AttachMode::Owner)
-        .expect("attach owner");
+    client.attach(&sid).expect("attach");
 
     client.prompt(&sid, "turn A").expect("prompt A");
     // Wait until turn A is verifiably mid-stream (some chunks, not all).
@@ -565,120 +549,6 @@ fn midturn_prompt_queues_and_runs_next_turn() {
     }
 }
 
-/// 3c. ACTION-AS-LIVENESS: a prompt from the lease holder whose lease has
-///     EXPIRED (no heartbeats — e.g. an App-Napped window) must re-grant the
-///     lease and deliver, not be refused. Pre-fix, `do_prompt` used the strict
-///     `holds_lease` gate, so the first post-wake prompt raced the 5s
-///     heartbeat reclaim and lost — silently, because `prompt()` is
-///     fire-and-forget (the other half of the "messages sent mid-turn are
-///     dropped" report).
-#[test]
-fn prompt_from_expired_same_client_regrants_lease_and_delivers() {
-    let _g = serial_lock();
-    // 300ms TTL so the lease verifiably lapses between turns; the sweep
-    // (5s cadence) may or may not have cleared it to None — the gate must
-    // handle both (expired-same-id renew AND free-claim).
-    let server = TestServer::start_with_env(&[("STUB_CHUNKS", "3"), ("YALDA_LEASE_TTL_MS", "300")]);
-    server.activate_env();
-
-    let client = connect_as("gui-napped");
-    let info = client
-        .create_session(std::env::temp_dir(), "naptest".into(), None)
-        .expect("create_session");
-    let sid = info.session_id.clone();
-    client
-        .attach(&sid, AttachMode::Owner)
-        .expect("attach owner");
-
-    client.prompt(&sid, "turn 1").expect("prompt 1");
-    drain_until(&client, Duration::from_secs(15), |n| {
-        n.iter().any(
-            |note| matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == sid),
-        )
-    });
-
-    // Let the lease lapse with NO heartbeat (the napped-window simulation).
-    std::thread::sleep(Duration::from_millis(700));
-
-    // The post-wake prompt itself must reclaim the lease and drive a turn.
-    client.prompt(&sid, "turn 2 after nap").expect("prompt 2");
-    let after = drain_until(&client, Duration::from_secs(15), |n| {
-        n.iter().any(|note| {
-            matches!(note, Notification::TurnEnded { session_id, turn_count, .. }
-                if *session_id == sid && *turn_count >= 2)
-        })
-    });
-    assert!(
-        after.iter().any(|n| matches!(
-            n,
-            Notification::TurnEnded { session_id, turn_count, .. }
-                if *session_id == sid && *turn_count == 2
-        )),
-        "a prompt from the same client with a lapsed lease must re-grant and \
-         deliver (action-as-liveness), not be silently refused; log:\n{}",
-        server.read_log()
-    );
-}
-
-/// 3d. REJECTED PROMPTS ARE VISIBLE: a prompt refused because ANOTHER window
-///     holds a live lease must come back as a `PromptRejected` notification on
-///     the submitter's own stream (carrying the text so the GUI can restore
-///     it). `prompt()` is fire-and-forget, so without this the rejection had
-///     no observable effect anywhere.
-#[test]
-fn rejected_prompt_surfaces_prompt_rejected_notification() {
-    let _g = serial_lock();
-    let server = TestServer::start_with_env(&[("STUB_CHUNKS", "2")]);
-    server.activate_env();
-
-    // A: the live lease holder (default 15s TTL — stays live for the test).
-    let owner = connect_as("gui-owner");
-    let info = owner
-        .create_session(std::env::temp_dir(), "rejecttest".into(), None)
-        .expect("create_session");
-    let sid = info.session_id.clone();
-    owner.attach(&sid, AttachMode::Owner).expect("attach owner");
-
-    // B: different client_id; Owner attach silently downgrades to observer
-    // while A's lease is live.
-    let interloper = connect_as("gui-interloper");
-    interloper
-        .attach(&sid, AttachMode::Owner)
-        .expect("attach interloper");
-
-    interloper
-        .prompt(&sid, "should be refused")
-        .expect("prompt write");
-    let notes = drain_until(&interloper, Duration::from_secs(10), |n| {
-        n.iter().any(|note| {
-            matches!(note, Notification::PromptRejected { session_id, .. } if *session_id == sid)
-        })
-    });
-    let rejected = notes.iter().find_map(|n| match n {
-        Notification::PromptRejected {
-            session_id,
-            reason,
-            text,
-        } if *session_id == sid => Some((reason.clone(), text.clone())),
-        _ => None,
-    });
-    let (reason, text) = rejected.unwrap_or_else(|| {
-        panic!(
-            "a refused prompt must surface PromptRejected on the submitter's stream; \
-             got: {notes:#?}\nlog:\n{}",
-            server.read_log()
-        )
-    });
-    assert!(
-        reason.contains("lease"),
-        "rejection reason should name the lease: {reason}"
-    );
-    assert_eq!(
-        text, "should be refused",
-        "the rejected text rides the notification so the GUI can restore it"
-    );
-}
-
 /// 4. The literal feature: an agent turn RUNS TO COMPLETION with NO GUI attached.
 ///    The owner prompts and immediately leaves; for the entire turn there are
 ///    zero connections to the server. The turn must still complete and the full
@@ -699,9 +569,7 @@ fn turn_completes_with_no_subscriber_attached() {
         let info = client
             .create_session(std::env::temp_dir(), "headless".into(), None)
             .expect("create_session");
-        client
-            .attach(&info.session_id, AttachMode::Owner)
-            .expect("attach owner");
+        client.attach(&info.session_id).expect("attach");
         // Send the prompt, then leave IMMEDIATELY — before the turn can finish.
         // `prompt` is a round-trip, so on return the agent already has the work.
         client
@@ -726,8 +594,7 @@ fn turn_completes_with_no_subscriber_attached() {
         "session vanished while no GUI was attached; log:\n{}",
         server.read_log()
     );
-    gui.attach(&sid, AttachMode::Owner)
-        .expect("attach after the fact");
+    gui.attach(&sid).expect("attach after the fact");
 
     let replay = drain_until(&gui, Duration::from_secs(10), |n| {
         count_agent_chunks(n) >= CHUNKS
@@ -768,27 +635,26 @@ fn admin_prompt_drives_turn_without_owner() {
     let server = TestServer::start_with_env(&[("STUB_CHUNKS", &CHUNKS.to_string())]);
     server.activate_env();
 
-    // Create the session but do NOT attach as owner — it stays unowned.
+    // Create the session but do NOT attach — it stays unattached.
     let client = SessionServerClient::connect().expect("connect");
     let info = client
         .create_session(std::env::temp_dir(), "headless-start".into(), None)
         .expect("create_session");
 
-    // Sanity: nobody holds the lease (admin_status reports lease_holder=None).
+    // Sanity: no client is attached (admin_status reports zero subscribers).
     let snap = client.admin_status().expect("admin_status");
     let s = snap
         .sessions
         .iter()
         .find(|s| s.session_id == info.session_id)
         .expect("session in admin snapshot");
-    assert!(
-        !s.has_owner && s.lease_holder.is_none(),
-        "precondition: session must be UNLEASED before the headless prompt; snapshot={snap:#?}"
+    assert_eq!(
+        s.subscriber_count, 0,
+        "precondition: session must be UNATTACHED before the headless prompt; snapshot={snap:#?}"
     );
 
-    // The ungated enqueue. A normal `prompt` here would be rejected ("only the
-    // session owner can send prompts") because this client never attached as
-    // owner — `admin_prompt` skips that gate.
+    // The ungated enqueue: `admin_prompt` drives the session with no client
+    // attached.
     client
         .admin_prompt(&info.session_id, "hello")
         .expect("admin_prompt drives an unowned session");
@@ -797,9 +663,7 @@ fn admin_prompt_drives_turn_without_owner() {
     // ownership) and drain the replayed durable transcript for the user prompt
     // we enqueued plus the agent reply and the turn boundary.
     let observer = SessionServerClient::connect().expect("connect observer");
-    observer
-        .attach(&info.session_id, AttachMode::Observer)
-        .expect("attach observer");
+    observer.attach(&info.session_id).expect("attach observer");
     let notes = drain_until(&observer, Duration::from_secs(15), |n| {
         n.iter().any(|note| {
             matches!(note, Notification::TurnEnded { session_id, .. } if *session_id == info.session_id)
@@ -862,9 +726,7 @@ fn session_recovered_after_server_crash() {
         let info = client
             .create_session(std::env::temp_dir(), "crashtest".into(), None)
             .expect("create_session");
-        client
-            .attach(&info.session_id, AttachMode::Owner)
-            .expect("attach");
+        client.attach(&info.session_id).expect("attach");
         client
             .prompt(&info.session_id, "survive a crash")
             .expect("prompt");
@@ -914,9 +776,7 @@ fn session_recovered_after_server_crash() {
     // Attach and confirm the FULL pre-crash transcript replays from the WAL.
     // After a crash every lease is dead (no heartbeats reached the dead server),
     // so this same-id Owner attach first-claims a free lease.
-    client2
-        .attach(&sid, AttachMode::Owner)
-        .expect("re-attach recovered session");
+    client2.attach(&sid).expect("re-attach recovered session");
     let replay = drain_until(&client2, Duration::from_secs(10), |n| {
         count_agent_chunks(n) >= CHUNKS
             && n.iter().any(|note| {
@@ -981,9 +841,7 @@ fn recovered_session_is_drivable_after_resume() {
         let info = client
             .create_session(std::env::temp_dir(), "resumetest".into(), None)
             .expect("create_session");
-        client
-            .attach(&info.session_id, AttachMode::Owner)
-            .expect("attach");
+        client.attach(&info.session_id).expect("attach");
         client
             .prompt(&info.session_id, "pre-crash prompt")
             .expect("prompt");
@@ -1018,9 +876,7 @@ fn recovered_session_is_drivable_after_resume() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    client2
-        .attach(&sid, AttachMode::Owner)
-        .expect("re-attach recovered session");
+    client2.attach(&sid).expect("re-attach recovered session");
     let replay = drain_until(&client2, Duration::from_secs(15), |n| {
         n.iter().any(|note| {
             matches!(
@@ -1125,16 +981,14 @@ fn slow_subscriber_is_disconnected_owner_unaffected() {
     let info = owner
         .create_session(std::env::temp_dir(), "slow-sub".into(), None)
         .expect("create_session");
-    owner
-        .attach(&info.session_id, AttachMode::Owner)
-        .expect("attach owner");
+    owner.attach(&info.session_id).expect("attach owner");
 
     // Stuck subscriber: a RAW UnixStream that attaches as Observer over the wire
     // (mirroring `Request::Attach` / `Frame::Request`), then NEVER reads. Its
     // forwarder's writes will pile up in the kernel send buffer until full.
     let mut stuck = StdUnixStream::connect(&server.socket).expect("raw connect");
     let attach_frame = format!(
-        "{{\"kind\":\"request\",\"id\":1,\"req\":{{\"method\":\"attach\",\"session_id\":{sid},\"mode\":\"observer\"}}}}\n",
+        "{{\"kind\":\"request\",\"id\":1,\"req\":{{\"method\":\"attach\",\"session_id\":{sid}}}}}\n",
         sid = serde_json::to_string(&info.session_id).unwrap()
     );
     stuck
@@ -1205,38 +1059,45 @@ fn slow_subscriber_is_disconnected_owner_unaffected() {
 
 /// 6b. HIGH-WATER BACKLOG BOUND (spec §6, MAJOR — disconnect-before-gap).
 ///
-///     The owner hard-ceiling (`floor = min(sent_seq)` over live forwarders,
+///     The forwarder hard-ceiling (`floor = the single forwarder's sent_seq`,
 ///     never compact past it) means a slow/PAUSED forwarder — concretely a
 ///     backgrounded GUI under macOS App Nap that stops draining its socket —
-///     pins `min(sent_seq)`, blocks the trim, and grows the in-memory `event_log`
+///     pins the floor, blocks the trim, and grows the in-memory `event_log`
 ///     `Vec`. The 60s slow-sub write timeout is the only other reaper, so a
 ///     reader that pauses can pin growth for up to 60s (or unbounded if it drains
 ///     just enough to keep resetting the write timer). Spec §6 requires a
 ///     subscriber past the high-water backlog threshold to be DISCONNECTED
-///     (forced clean from-0 reconnect) and thereby dropped from the `min`, so the
+///     (forced clean from-0 reconnect) and thereby dropped from the floor, so the
 ///     trim resumes — high-water disconnect fires BEFORE any gap-marker.
 ///
-///     Setup mirrors the slow-subscriber test but isolates the HIGH-WATER reaper
-///     from the WRITE-TIMEOUT reaper: the write timeout is set HUGE (60s) so it
-///     can NEVER fire within the test, leaving the high-water disconnect as the
-///     ONLY mechanism that can reap the wedged consumer. A tiny CAP (16) and a
-///     low HIGH_WATER (= cap×2 = 32) make a long turn (CHUNKS=600) blow past the
-///     bound quickly. A healthy draining owner drives the turn; a raw observer
-///     attaches and then NEVER reads, pinning the floor.
+///     STRICT 1:1 NOTE: there is exactly ONE forwarder per session. Earlier this
+///     test attached a "healthy owner" client AND a wedged observer to one
+///     session — but under 1:1 a second attach OVERWRITES `session.forwarder`, so
+///     two live forwarders on one session is non-representable. The honest setup
+///     is therefore a SINGLE wedged forwarder (the raw never-reading client) plus
+///     a LEASELESS `admin_prompt` (ADR-0015) to drive the turn server-side with
+///     no second forwarder. The driver takes no forwarder, so the wedged client
+///     is the sole floor-holder — exactly the App-Nap case the bound defends.
+///
+///     Setup isolates the HIGH-WATER reaper from the WRITE-TIMEOUT reaper: the
+///     write timeout is set HUGE (60s) so it can NEVER fire within the test,
+///     leaving the high-water disconnect as the ONLY mechanism that can reap the
+///     wedged consumer. A tiny CAP (16) and a low HIGH_WATER make a long turn
+///     (CHUNKS=600) blow past the bound quickly.
 ///
 ///     Assertions:
-///       (1) the wedged observer is DISCONNECTED — the server logs the
+///       (1) the wedged forwarder is DISCONNECTED — the server logs the
 ///           "high-water disconnect" warning AND the raw stream sees EOF;
 ///       (2) the in-memory log is BOUNDED — `event_log_len` settles far below the
 ///           full CHUNKS transcript (near the cap), and `log_base` advanced past
 ///           HIGH_WATER, proving the trim RESUMED after the disconnect.
 ///
-///     FAIL-BEFORE (without the high-water bound): the wedged observer is never
+///     FAIL-BEFORE (without the high-water bound): the wedged forwarder is never
 ///     disconnected (the 60s write timeout can't fire in-test), so the floor
-///     stays pinned at the wedged observer's `sent_seq ≈ 0`, the trim never
+///     stays pinned at the wedged forwarder's `sent_seq ≈ 0`, the trim never
 ///     advances `log_base`, and `event_log_len` grows to the full transcript.
 #[test]
-fn slow_owner_past_high_water_is_disconnected_log_bounded() {
+fn wedged_forwarder_past_high_water_is_disconnected_log_bounded() {
     use std::io::Read as _;
     use std::io::Write as _;
     use std::os::unix::net::UnixStream as StdUnixStream;
@@ -1244,22 +1105,18 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     let _g = serial_lock();
     const CHUNKS: usize = 600;
     const CAP: usize = 16;
-    // HIGH_WATER must be (a) comfortably ABOVE any transient lag a HEALTHY
-    // draining owner exhibits (so the owner is never falsely reaped), and (b)
-    // well BELOW the full transcript (~2×CHUNKS events, since each chunk is
-    // logged twice — legacy ReplyEvent + additive Agent) so a WEDGED consumer
-    // pinned near seq 0 crosses it long before the turn ends. 150 sits in that
-    // window for CHUNKS=600 (full ≈ 1200).
+    // HIGH_WATER must be well BELOW the full transcript (~2×CHUNKS events, since
+    // each chunk is logged twice — legacy ReplyEvent + additive Agent) so the
+    // WEDGED forwarder pinned near seq 0 crosses it long before the turn ends.
+    // 150 sits in that window for CHUNKS=600 (full ≈ 1200).
     const HIGH_WATER: usize = 150;
-    // A modest per-chunk text so the wedged observer's send buffer fills (pinning
+    // A modest per-chunk text so the wedged forwarder's send buffer fills (pinning
     // the floor).
     let chunk_text = "y".repeat(64);
     let server = TestServer::start_with_env(&[
         ("STUB_CHUNKS", &CHUNKS.to_string()),
         ("STUB_CHUNK_TEXT", &chunk_text),
-        // Pace the stream so the HEALTHY owner's reader keeps up and its forwarder
-        // never lags past HIGH_WATER (only the never-draining wedged observer
-        // does). Fast enough that the whole turn still finishes promptly.
+        // Pace the stream so the turn still finishes promptly.
         ("STUB_DELAY_MS", "3"),
         ("YALDA_EVENT_LOG_CAP", &CAP.to_string()),
         ("YALDA_EVENT_LOG_HIGH_WATER", &HIGH_WATER.to_string()),
@@ -1268,22 +1125,23 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     ]);
     server.activate_env();
 
-    // Healthy owner: a normal client that reads continuously and drives the turn.
-    let owner = connect_as("gui-highwater");
-    let info = owner
+    // Create the session via a normal client (which then drops — it never
+    // attaches, so it holds no forwarder).
+    let creator = connect_as("gui-highwater");
+    let info = creator
         .create_session(std::env::temp_dir(), "high-water".into(), None)
         .expect("create_session");
-    owner
-        .attach(&info.session_id, AttachMode::Owner)
-        .expect("attach owner");
+    let sid = info.session_id.clone();
 
-    // Wedged observer: a RAW UnixStream that attaches as Observer over the wire,
-    // then NEVER reads. Its forwarder's writes pile up in the kernel send buffer
-    // and its `sent_seq` stays pinned near 0, holding the trim floor down.
+    // The SOLE forwarder: a RAW UnixStream that attaches over the wire, then
+    // NEVER reads. Its forwarder's writes pile up in the kernel send buffer and
+    // its `sent_seq` stays pinned near 0, holding the trim floor down — the App-
+    // Nap case. (Attaching it BEFORE the prompt makes it the live forwarder for
+    // the whole turn.)
     let mut wedged = StdUnixStream::connect(&server.socket).expect("raw connect");
     let attach_frame = format!(
-        "{{\"kind\":\"request\",\"id\":1,\"req\":{{\"method\":\"attach\",\"session_id\":{sid},\"mode\":\"observer\"}}}}\n",
-        sid = serde_json::to_string(&info.session_id).unwrap()
+        "{{\"kind\":\"request\",\"id\":1,\"req\":{{\"method\":\"attach\",\"session_id\":{sid_json}}}}}\n",
+        sid_json = serde_json::to_string(&sid).unwrap()
     );
     wedged
         .write_all(attach_frame.as_bytes())
@@ -1291,14 +1149,17 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     wedged.flush().expect("flush raw attach");
     // Deliberately do NOT read from `wedged` from here on (paused-reader sim).
 
-    // Drive a long turn. The stub streams 600 chunks; the wedged observer's send
-    // buffer fills and pins the floor; the backlog crosses HIGH_WATER → the
-    // server force-disconnects the wedged observer and the trim resumes.
-    owner
-        .prompt(&info.session_id, "flood past the high-water mark")
-        .expect("prompt");
+    // Drive a long turn via a LEASELESS admin_prompt (ADR-0015): it takes no
+    // forwarder, so the wedged raw client stays the SOLE floor-holder. The stub
+    // streams 600 chunks; the wedged forwarder's send buffer fills and pins the
+    // floor; the backlog crosses HIGH_WATER → the server force-disconnects the
+    // wedged forwarder and the trim resumes.
+    let driver = SessionServerClient::connect_existing().expect("connect_existing");
+    driver
+        .admin_prompt(&sid, "flood past the high-water mark")
+        .expect("admin_prompt");
 
-    // (1a) The server logs a high-water disconnect for the wedged observer —
+    // (1a) The server logs a high-water disconnect for the wedged forwarder —
     // and NOT a write-timeout disconnect (the 60s timeout can't fire in-test).
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut saw_high_water = false;
@@ -1313,16 +1174,16 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     let log = server.read_log();
     assert!(
         saw_high_water,
-        "expected a 'high-water disconnect' for the wedged observer (CAP={CAP}, \
+        "expected a 'high-water disconnect' for the wedged forwarder (CAP={CAP}, \
          HIGH_WATER={HIGH_WATER}, CHUNKS={CHUNKS}); the high-water bound never fired.\nlog:\n{log}"
     );
     assert!(
         !log.contains("write stalled"),
         "the high-water disconnect — NOT the 60s write timeout — must reap the wedged \
-         observer; the write-timeout path fired unexpectedly.\nlog:\n{log}"
+         forwarder; the write-timeout path fired unexpectedly.\nlog:\n{log}"
     );
 
-    // (1b) The wedged observer's connection is closed: a read returns EOF (0
+    // (1b) The wedged forwarder's connection is closed: a read returns EOF (0
     // bytes) or an error once the server drops the forwarder and closes the
     // write half. (Its OS buffer may hold queued frames we never read; we read
     // until EOF/error, bounded.)
@@ -1353,18 +1214,19 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     }
     assert!(
         saw_eof,
-        "the wedged observer's connection must be CLOSED by the high-water disconnect \
+        "the wedged forwarder's connection must be CLOSED by the high-water disconnect \
          (read should hit EOF), but it stayed open.\nlog:\n{}",
         server.read_log()
     );
 
     // (2) The in-memory log is BOUNDED. Probe via admin_status from a FRESH
-    // client (decoupled from the owner's liveness). Poll until the trim has
-    // RESUMED — `log_base` advanced past HIGH_WATER, which it could NOT have done
-    // had the wedged observer kept pinning the floor near seq 0. Throughout, the
-    // resident `Vec` must stay BOUNDED: far below the full transcript (~2×CHUNKS
-    // entries — each chunk is logged twice), settling near the high-water + cap
-    // window. A wedged consumer pinning unbounded growth is the bug under test.
+    // client (it only polls; it never attaches, so it holds no forwarder). Poll
+    // until the trim has RESUMED — `log_base` advanced past HIGH_WATER, which it
+    // could NOT have done had the wedged forwarder kept pinning the floor near
+    // seq 0. Throughout, the resident `Vec` must stay BOUNDED: far below the full
+    // transcript (~2×CHUNKS entries — each chunk is logged twice), settling near
+    // the high-water + cap window. A wedged consumer pinning unbounded growth is
+    // the bug under test.
     let admin = connect_as("admin-probe");
     let bound = HIGH_WATER + CAP + 8;
     let probe_deadline = Instant::now() + Duration::from_secs(60);
@@ -1372,11 +1234,7 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     let mut last = None;
     while Instant::now() < probe_deadline {
         let snap = admin.admin_status().expect("admin_status");
-        if let Some(s) = snap
-            .sessions
-            .iter()
-            .find(|s| s.session_id == info.session_id)
-        {
+        if let Some(s) = snap.sessions.iter().find(|s| s.session_id == sid) {
             // The in-memory Vec must NEVER blow past the bound — assert on every
             // poll so a transient overshoot is caught, not just the final state.
             assert!(
@@ -1405,12 +1263,13 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     drop(wedged);
 }
 
-/// Is this a TRANSCRIPT note — i.e. an `event_log` entry the forwarder tails —
-/// as opposed to a per-connection control note (`LeaseChanged`) synthesized by
-/// the forwarder and never stored in the log? Used to compare what a cursor
-/// reconnect streams against the durable log's tail.
-fn is_transcript_note(n: &Notification) -> bool {
-    !matches!(n, Notification::LeaseChanged { .. })
+/// Is this a TRANSCRIPT note — i.e. an `event_log` entry the forwarder tails?
+/// Under the strict 1:1 model there are no per-connection control notes
+/// (`LeaseChanged` is gone), so every notification is a transcript note; this is
+/// now effectively a no-op filter, kept so the cursor-tail comparisons below
+/// read unchanged.
+fn is_transcript_note(_n: &Notification) -> bool {
+    true
 }
 
 /// 7. CURSOR-BASED INCREMENTAL RECONNECT (spec phase 5, additive).
@@ -1432,9 +1291,7 @@ fn cursor_reconnect_streams_only_tail() {
     let info = owner
         .create_session(std::env::temp_dir(), "cursor".into(), None)
         .expect("create_session");
-    owner
-        .attach(&info.session_id, AttachMode::Owner)
-        .expect("attach owner");
+    owner.attach(&info.session_id).expect("attach owner");
     owner
         .prompt(&info.session_id, "hello cursor")
         .expect("prompt");
@@ -1469,8 +1326,7 @@ fn cursor_reconnect_streams_only_tail() {
     // notes. We also use its transcript as ground truth for the log's contents,
     // so we can assert the cursor tail is an exact suffix.
     let full = SessionServerClient::connect().expect("connect full-replay observer");
-    full.attach(&info.session_id, AttachMode::Observer)
-        .expect("attach full observer");
+    full.attach(&info.session_id).expect("attach full observer");
     let full_notes = drain_until(&full, Duration::from_secs(10), |n| {
         n.iter()
             .filter(|x| is_transcript_note(x))
@@ -1495,7 +1351,7 @@ fn cursor_reconnect_streams_only_tail() {
     let k = m / 2;
     assert!(k > 0 && k < m, "K={k} must be strictly inside (0, {m})");
     let tail = SessionServerClient::connect().expect("connect tail observer");
-    tail.attach_with_cursor(&info.session_id, AttachMode::Observer, Some((0, k as u64)))
+    tail.attach_with_cursor(&info.session_id, Some((0, k as u64)))
         .expect("attach tail observer with cursor");
     // Drain until we've seen the turn boundary (the last logged note for this
     // turn), then filter to transcript notes.
@@ -1532,7 +1388,7 @@ fn cursor_reconnect_streams_only_tail() {
     // the safe behavior for an epoch mismatch (force-restart / server restart).
     let stale = SessionServerClient::connect().expect("connect stale-cursor observer");
     stale
-        .attach_with_cursor(&info.session_id, AttachMode::Observer, Some((999, 0)))
+        .attach_with_cursor(&info.session_id, Some((999, 0)))
         .expect("attach stale-cursor observer");
     let stale_notes = drain_until(&stale, Duration::from_secs(10), |n| {
         n.iter()
@@ -1608,9 +1464,7 @@ fn ringbuffer_compaction_trims_and_surfaces_marker() {
     let info = owner
         .create_session(std::env::temp_dir(), "compact".into(), None)
         .expect("create_session");
-    owner
-        .attach(&info.session_id, AttachMode::Owner)
-        .expect("attach owner");
+    owner.attach(&info.session_id).expect("attach owner");
     owner
         .prompt(&info.session_id, "stream a lot")
         .expect("prompt");
@@ -1663,7 +1517,7 @@ fn ringbuffer_compaction_trims_and_surfaces_marker() {
     // marker as its FIRST transcript note — the trim is surfaced, not silent.
     let from_base = SessionServerClient::connect().expect("connect from-base observer");
     from_base
-        .attach(&info.session_id, AttachMode::Observer)
+        .attach(&info.session_id)
         .expect("attach from-base observer");
     let notes = drain_until(&from_base, Duration::from_secs(10), |n| {
         n.iter().filter(|x| is_transcript_note(x)).count() >= 1
@@ -1691,7 +1545,7 @@ fn ringbuffer_compaction_trims_and_surfaces_marker() {
     );
     let fell_off = SessionServerClient::connect().expect("connect fell-off observer");
     fell_off
-        .attach_with_cursor(&info.session_id, AttachMode::Observer, Some((0, stale_seq)))
+        .attach_with_cursor(&info.session_id, Some((0, stale_seq)))
         .expect("attach fell-off observer");
     let fo_notes = drain_until(&fell_off, Duration::from_secs(10), |n| {
         n.iter().filter(|x| is_transcript_note(x)).count() >= 1
@@ -1735,9 +1589,7 @@ fn cursor_reconnect_tails_after_compaction_when_in_range() {
     let info = owner
         .create_session(std::env::temp_dir(), "compact-tail".into(), None)
         .expect("create_session");
-    owner
-        .attach(&info.session_id, AttachMode::Owner)
-        .expect("attach owner");
+    owner.attach(&info.session_id).expect("attach owner");
     owner
         .prompt(&info.session_id, "stream a lot")
         .expect("prompt");
@@ -1764,8 +1616,7 @@ fn cursor_reconnect_tails_after_compaction_when_in_range() {
     // CONTROL: a from-base observer's transcript IS the resident log, in order —
     // ground truth for the suffix comparison.
     let full = SessionServerClient::connect().expect("connect full observer");
-    full.attach(&info.session_id, AttachMode::Observer)
-        .expect("attach full observer");
+    full.attach(&info.session_id).expect("attach full observer");
     let full_notes = drain_until(&full, Duration::from_secs(10), |n| {
         n.iter().filter(|x| is_transcript_note(x)).count() >= len as usize
     });
@@ -1789,7 +1640,7 @@ fn cursor_reconnect_tails_after_compaction_when_in_range() {
         "K={k} must be inside (base {base}, tip {tip})"
     );
     let tail = SessionServerClient::connect().expect("connect tail observer");
-    tail.attach_with_cursor(&info.session_id, AttachMode::Observer, Some((0, k)))
+    tail.attach_with_cursor(&info.session_id, Some((0, k)))
         .expect("attach tail observer with cursor");
     let expected_tail_len = (tip - k) as usize;
     let tail_notes = drain_until(&tail, Duration::from_secs(10), |n| {
@@ -1874,7 +1725,7 @@ fn live_owner_streams_across_trim_no_gap_or_dup() {
         .create_session(std::env::temp_dir(), "live-trim".into(), None)
         .expect("create_session");
     owner
-        .attach(&info.session_id, AttachMode::Owner)
+        .attach(&info.session_id)
         .expect("attach owner before turn");
     owner
         .prompt(&info.session_id, "stream a lot")

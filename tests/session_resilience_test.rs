@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use yalda::acp_channel::PermissionMode;
 use yalda::session_client::SessionServerClient;
-use yalda::session_proto::{AdminSnapshot, AttachMode, Notification, socket_path};
+use yalda::session_proto::{AdminSnapshot, Notification, socket_path};
 
 /// A running server instance bound to a private socket, with its stderr
 /// captured to a file we can scan for connect/disconnect lines.
@@ -43,11 +43,22 @@ static SEQ: AtomicU32 = AtomicU32::new(0);
 
 impl TestServer {
     fn start() -> TestServer {
-        Self::start_with_ttl_ms(None)
+        // Default agent is a no-op (`/usr/bin/true`): most tests here exercise
+        // the socket/attach/reconnect layer, where the agent never spawns a
+        // real transcript.
+        Self::spawn_with_agent("/usr/bin/true", &[])
     }
 
-    /// Start with a low lease TTL (phase 4) so expiry-driven tests run fast.
-    fn start_with_ttl_ms(ttl_ms: Option<u64>) -> TestServer {
+    /// Start a server whose spawned agents are the real `yalda-acp-stub`, with
+    /// the given `(VAR, value)` env knobs (e.g. `STUB_CHUNKS`) applied to the
+    /// server process and inherited by every agent it spawns. Used by the one
+    /// test that needs a real streamed transcript to assert reconnect REPLAY,
+    /// not just reconnect success.
+    fn start_with_stub_agent(knobs: &[(&str, &str)]) -> TestServer {
+        Self::spawn_with_agent(env!("CARGO_BIN_EXE_yalda-acp-stub"), knobs)
+    }
+
+    fn spawn_with_agent(agent: &str, knobs: &[(&str, &str)]) -> TestServer {
         // Unique socket + log per test instance. pid is stable per process;
         // SEQ disambiguates multiple servers within one test.
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
@@ -61,20 +72,18 @@ impl TestServer {
         let logfile = std::fs::File::create(&log).expect("create server log");
         let bin = env!("CARGO_BIN_EXE_yalda-session-server");
         let mut builder = Command::new(bin);
-        builder.env("YALDA_SESSION_SOCKET", &socket);
-        if let Some(ms) = ttl_ms {
-            builder.env("YALDA_LEASE_TTL_MS", ms.to_string());
-        }
-        let child = builder
-            // Point the agent at a binary that exits immediately. Spawn-fail is
-            // fine: the session is created and persists regardless; we are
-            // testing the socket/attach/reconnect layer, not the agent.
-            .env("YALDA_ACP_AGENT", "/usr/bin/true")
+        builder
+            .env("YALDA_SESSION_SOCKET", &socket)
+            .env("YALDA_ACP_AGENT", agent)
             // Hermetic: force the no-config path so default-mode assertions
             // see the built-in default (Yolo), not whatever ~/.config/yalda/
             // config.kdl the dev box happens to have. config_path() returns
             // this nonexistent path → Config::default().
-            .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
+            .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl");
+        for (k, v) in knobs {
+            builder.env(k, v);
+        }
+        let child = builder
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(logfile))
@@ -148,39 +157,11 @@ impl Drop for TestServer {
     }
 }
 
-/// Connect a client and stamp it with a stable lease `client_id` (phase 4).
-/// The lease keys ownership on this id, so a test that wants drive rights MUST
-/// present one (an empty client_id never acquires a lease). Modelling "the same
-/// GUI restarting" = reusing ONE id across reconnects.
-fn connect_as(client_id: &str) -> SessionServerClient {
-    let c = SessionServerClient::connect().expect("connect");
-    c.set_client_id(client_id.to_string());
-    c
-}
-
-/// Poll `admin_status` until `pred(snapshot)` holds or the deadline passes.
-/// Returns the last snapshot seen.
-fn poll_admin<F: Fn(&AdminSnapshot) -> bool>(
-    client: &SessionServerClient,
-    timeout: Duration,
-    pred: F,
-) -> AdminSnapshot {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let snap = client.admin_status().expect("admin_status");
-        if pred(&snap) || Instant::now() > deadline {
-            return snap;
-        }
-        std::thread::sleep(Duration::from_millis(40));
-    }
-}
-
-/// Find a session's admin entry by id.
-fn admin_entry<'a>(
-    snap: &'a AdminSnapshot,
-    sid: &str,
-) -> Option<&'a yalda::session_proto::AdminSessionInfo> {
-    snap.sessions.iter().find(|s| s.session_id == sid)
+/// Connect a client. Under the strict 1:1 model there is no client_id / lease,
+/// so this is just a thin wrapper over `connect()`. The `_label` arg is ignored
+/// (kept so call sites that documented "which GUI" don't have to change).
+fn connect_as(_label: &str) -> SessionServerClient {
+    SessionServerClient::connect().expect("connect")
 }
 
 /// Serialize tests: they share process-wide env (`YALDA_SESSION_SOCKET`).
@@ -194,6 +175,76 @@ fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
 
 fn drain_log_lines(log: &str) -> Vec<String> {
     log.lines().map(|l| l.to_string()).collect()
+}
+
+/// Drain server notifications into a `Vec` until `done(accumulated)` holds or
+/// the deadline passes. Returns everything drained. Mirrors the transcript
+/// harness so reconnect-replay can be content-asserted here too.
+fn drain_until<F>(client: &SessionServerClient, timeout: Duration, mut done: F) -> Vec<Notification>
+where
+    F: FnMut(&[Notification]) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    let mut out: Vec<Notification> = Vec::new();
+    loop {
+        while let Some(n) = client.try_recv() {
+            out.push(n);
+        }
+        if done(&out) || Instant::now() > deadline {
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Like [`drain_until`] but over a raw notification receiver handed back by
+/// `SessionServerClient::reconnect()` (which TAKES the client's internal
+/// receiver and returns it to the caller — the GUI's pump re-installs it; a test
+/// must read from this returned handle, since `client.try_recv()` no longer has
+/// a receiver after reconnect).
+fn drain_rx_until<F>(
+    rx: &std::sync::mpsc::Receiver<Notification>,
+    timeout: Duration,
+    mut done: F,
+) -> Vec<Notification>
+where
+    F: FnMut(&[Notification]) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    let mut out: Vec<Notification> = Vec::new();
+    loop {
+        while let Ok(n) = rx.try_recv() {
+            out.push(n);
+        }
+        if done(&out) || Instant::now() > deadline {
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Count `ReplyEvent(Chunk)` notifications carrying agent text in a drained
+/// batch — the per-turn transcript payload the stub produces.
+fn count_agent_chunks(notes: &[Notification]) -> usize {
+    notes
+        .iter()
+        .filter(|n| {
+            matches!(
+                n,
+                Notification::ReplyEvent {
+                    event: yalda::acp_channel::ReplyEvent::Chunk(_),
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+/// Whether a drained batch contains a `TurnEnded` for `sid`.
+fn saw_turn_ended(notes: &[Notification], sid: &str) -> bool {
+    notes
+        .iter()
+        .any(|n| matches!(n, Notification::TurnEnded { session_id, .. } if session_id == sid))
 }
 
 /// Baseline: a session created on the server survives the client going away
@@ -210,9 +261,7 @@ fn session_survives_client_restart() {
         let info = client
             .create_session(std::env::temp_dir(), "restest".into(), None)
             .expect("create_session");
-        client
-            .attach(&info.session_id, AttachMode::Owner)
-            .expect("attach #1");
+        client.attach(&info.session_id).expect("attach #1");
         info.session_id
         // client dropped here → simulates GUI #1 exiting.
     };
@@ -228,9 +277,7 @@ fn session_survives_client_restart() {
         "session {sid} vanished after client restart; server log:\n{}",
         server.read_log()
     );
-    client2
-        .attach(&sid, AttachMode::Owner)
-        .expect("re-attach after restart");
+    client2.attach(&sid).expect("re-attach after restart");
 
     // No storm: a small bounded number of accepts, and crucially every
     // connection that opened also CLOSED (no zombie connections holding stale
@@ -273,10 +320,9 @@ fn repeated_restarts_no_storm() {
     };
 
     const RESTARTS: usize = 30;
-    // ONE stable client_id across all restarts: this models a SINGLE GUI
-    // restarting, not N distinct GUIs. The lease keys on this id, so every
-    // restart's same-client_id Owner attach RESUMES on the FIRST try — no retry
-    // loop, no "already own" race. (Phase 4 retired attach_owner_with_retry.)
+    // Each restart models a SINGLE GUI reconnecting: connect → attach → drop.
+    // Under the strict 1:1 model a successful attach is just `()`; the property
+    // under test is the absence of a reconnect storm, not lease semantics.
     for i in 0..RESTARTS {
         let client = connect_as("gui-A");
         // A close/create-style round-trip is what failed in the field when it
@@ -289,27 +335,12 @@ fn repeated_restarts_no_storm() {
             "session lost on restart {i}; log:\n{}",
             server.read_log()
         );
-        // Deterministic single-shot Owner attach — exactly what the GUI now
-        // does on restart. The response carries `driver:true` on the FIRST try.
-        let driver = client
-            .attach(&sid, AttachMode::Owner)
+        // Deterministic single-shot attach — exactly what the GUI now does on
+        // restart.
+        client
+            .attach(&sid)
             .unwrap_or_else(|e| panic!("attach on restart {i} failed: {e}"));
-        assert!(
-            driver,
-            "restart {i} did not resume the lease on the first try (no retry); log:\n{}",
-            server.read_log()
-        );
-        // The admin snapshot must show the lease held by our stable id.
-        let snap = client.admin_status().expect("admin_status");
-        let entry = admin_entry(&snap, &sid).expect("session present");
-        assert_eq!(
-            entry.lease_holder.as_ref().map(|l| l.client_id.as_str()),
-            Some("gui-A"),
-            "restart {i}: lease_holder must be gui-A; log:\n{}",
-            server.read_log()
-        );
-        // client drops → socket EOF. EOF does NOT release the lease (starts the
-        // TTL clock); the same-id reconnect next iteration resumes it.
+        // client drops → socket EOF; the next iteration re-attaches cleanly.
     }
 
     std::thread::sleep(Duration::from_millis(100));
@@ -408,10 +439,9 @@ fn second_server_does_not_steal_socket() {
 /// run without YALDA_CONFIG), a freshly created session comes back in the
 /// no-config default mode, which is now `Yolo` (the default was reverted from
 /// the safe modes pending an inline-approval UI; see ADR-0014 addendum). The
-/// owner can then explicitly change the mode and that change must be reflected
-/// in the session's reported mode — pinning the owner-driven mode contract end
-/// to end. (Mode changes remain owner-gated; see
-/// `non_owner_cannot_change_permission_mode`.)
+/// attached client can then explicitly change the mode and that change must be
+/// reflected in the session's reported mode — pinning the mode contract end to
+/// end.
 #[test]
 fn new_session_defaults_to_safe_permission_mode() {
     let _g = serial_lock();
@@ -429,12 +459,8 @@ fn new_session_defaults_to_safe_permission_mode() {
         server.read_log()
     );
 
-    // A mode change is a lease-holder action. Attach as Owner first (acquires
-    // the lease), then flip to a safe mode.
-    let drove = client
-        .attach(&info.session_id, AttachMode::Owner)
-        .expect("attach owner");
-    assert!(drove, "Owner attach must acquire the lease");
+    // Attach, then flip to a safe mode.
+    client.attach(&info.session_id).expect("attach");
     client
         .set_permission_mode(&info.session_id, PermissionMode::ReadOnly)
         .expect("set_permission_mode ReadOnly");
@@ -474,46 +500,10 @@ fn server_socket_is_owner_only() {
     );
 }
 
-/// The escalation gate is owner-only: a connection that does NOT own the
-/// session cannot flip its permission mode. Pins the other half of the
-/// "safe by default, only the owner escalates" contract.
-#[test]
-fn non_owner_cannot_change_permission_mode() {
-    let _g = serial_lock();
-    let server = TestServer::start();
-    server.activate_env();
-
-    let client = SessionServerClient::connect().expect("connect");
-    let info = client
-        .create_session(std::env::temp_dir(), "perms-gate".into(), None)
-        .expect("create_session");
-
-    // No Owner attach → not the owner → the mode change must be rejected, and
-    // the mode must stay at the no-config default (Yolo). Aim at a *different*
-    // mode so the rejection is observable rather than a no-op.
-    let res = client.set_permission_mode(&info.session_id, PermissionMode::ReadOnly);
-    assert!(
-        res.is_err(),
-        "non-owner was allowed to change permission mode; log:\n{}",
-        server.read_log()
-    );
-    let sessions = client.list_sessions().expect("list");
-    let s = sessions
-        .iter()
-        .find(|s| s.session_id == info.session_id)
-        .expect("session present");
-    assert_eq!(
-        s.permission_mode,
-        PermissionMode::Yolo,
-        "rejected change must leave the no-config default intact; log:\n{}",
-        server.read_log()
-    );
-}
-
 /// The diagnostic `admin_status` verb: a read-only snapshot of every managed
 /// session's live server-side state. Asserts the snapshot is empty before any
 /// session exists, tracks created sessions (with the safe default permission
-/// mode), and reflects ownership + subscriber count once an Owner attaches.
+/// mode), and reflects the subscriber count once a client attaches.
 #[test]
 fn admin_status_reports_live_sessions() {
     let _g = serial_lock();
@@ -578,81 +568,102 @@ fn admin_status_reports_live_sessions() {
         );
     }
 
-    // Attach as Owner to one session, then re-snapshot: that entry must report
-    // ownership and at least one active broadcast subscriber.
-    client
-        .attach(&s1.session_id, AttachMode::Owner)
-        .expect("attach owner");
+    // Attach to one session, then re-snapshot: that entry must report the
+    // single attached client's forwarder as a subscriber.
+    client.attach(&s1.session_id).expect("attach");
     // Give the server a beat to register the subscriber/forwarder.
     std::thread::sleep(Duration::from_millis(100));
 
     let snap = client.admin_status().expect("admin_status (after attach)");
-    let owned = snap
+    let attached = snap
         .sessions
         .iter()
         .find(|e| e.session_id == s1.session_id)
-        .expect("owned session present after attach");
+        .expect("attached session present after attach");
     assert!(
-        owned.has_owner,
-        "owned session must report has_owner == true; log:\n{}",
-        server.read_log()
-    );
-    assert!(
-        owned.subscriber_count >= 1,
-        "owned session must report >= 1 subscriber after Owner attach, got {}; log:\n{}",
-        owned.subscriber_count,
+        attached.subscriber_count >= 1,
+        "attached session must report >= 1 subscriber after attach, got {}; log:\n{}",
+        attached.subscriber_count,
         server.read_log()
     );
 }
 
 /// The in-place `reconnect()` path the GUI pump uses (not a brand-new client).
 /// This is the exact code that runs when the server reader thread sees EOF and
-/// the pump rebuilds the connection. It must succeed against a live server and
-/// leave the session attachable.
+/// the pump rebuilds the connection — the LIVE GUI's actual reconnect mechanism.
+///
+/// It must not only succeed: after the reconnect + re-attach it must REPLAY the
+/// full durable transcript without gap or duplication (the property a GUI
+/// depends on to rebuild its panel after a flap). So we drive a real streamed
+/// turn first, then reconnect-in-place and assert the entire event_log replays
+/// — mirroring what `large_replay_reconnect` / `prompt_turn_round_trip` assert
+/// for the drop-and-fresh-connect path.
 #[test]
 fn in_place_reconnect_reattaches() {
     let _g = serial_lock();
-    let server = TestServer::start();
+    const CHUNKS: usize = 6;
+    let server = TestServer::start_with_stub_agent(&[("STUB_CHUNKS", "6")]);
     server.activate_env();
 
     let mut client = connect_as("gui-reconn");
     let info = client
         .create_session(std::env::temp_dir(), "reconn".into(), None)
         .expect("create_session");
-    let drove = client
-        .attach(&info.session_id, AttachMode::Owner)
-        .expect("attach");
-    assert!(drove, "initial Owner attach must acquire the lease");
+    let sid = info.session_id.clone();
+    client.attach(&sid).expect("attach");
 
-    // Drive the in-place reconnect the pump uses. Against a live server this
-    // must rebuild cleanly and hand back fresh receivers. The stable client_id
-    // is re-applied onto the rebuilt struct (phase 4).
-    let result = client.reconnect();
-    assert!(
-        result.is_ok(),
-        "in-place reconnect failed: {:?}; log:\n{}",
-        result.err(),
+    // Drive a real turn: the stub streams CHUNKS chunks then ends the turn.
+    client.prompt(&sid, "hello").expect("prompt");
+    let live = drain_until(&client, Duration::from_secs(15), |n| {
+        saw_turn_ended(n, &sid)
+    });
+    let live_chunks = count_agent_chunks(&live);
+    assert_eq!(
+        live_chunks,
+        CHUNKS,
+        "live turn must stream all {CHUNKS} chunks before reconnect, got {live_chunks}; log:\n{}",
         server.read_log()
     );
+
+    // Drive the in-place reconnect the pump uses. Against a live server this
+    // must rebuild cleanly and HAND BACK the fresh notification receiver — the
+    // GUI's pump re-takes it; here the test drains it directly (the client's
+    // internal `try_recv` receiver is the one handed out by `reconnect`, so we
+    // must read from the returned `note_rx`, exactly like the pump does).
+    let (note_rx, _wake_rx) = client.reconnect().unwrap_or_else(|e| {
+        panic!(
+            "in-place reconnect failed: {e}; log:\n{}",
+            server.read_log()
+        )
+    });
     assert!(
         client.is_connected(),
         "client not connected after reconnect"
     );
-    assert_eq!(
-        client.client_id(),
-        "gui-reconn",
-        "client_id must survive in-place reconnect"
-    );
 
-    // Re-attach as Owner on the rebuilt connection. The old connection's
-    // teardown races this, but the stable client_id makes the same-id branch
-    // RESUME on the first attempt — no retry, no "already own" error.
-    let drove_again = client
-        .attach(&info.session_id, AttachMode::Owner)
+    // Re-attach on the rebuilt connection. The server replays the full event_log
+    // from index 0, so the rebuilt pump rebuilds the whole transcript.
+    client
+        .attach(&sid)
         .expect("re-attach after in-place reconnect");
+
+    // The replay must reproduce the ENTIRE transcript: exactly CHUNKS chunks
+    // (no gap, no duplication) plus the turn boundary. Drain the receiver the
+    // reconnect handed back.
+    let replay = drain_rx_until(&note_rx, Duration::from_secs(15), |n| {
+        saw_turn_ended(n, &sid)
+    });
+    let replay_chunks = count_agent_chunks(&replay);
+    assert_eq!(
+        replay_chunks,
+        CHUNKS,
+        "in-place reconnect replay must reproduce the full transcript ({CHUNKS} chunks, \
+         no gap/dup), got {replay_chunks}; replay={replay:#?}\nlog:\n{}",
+        server.read_log()
+    );
     assert!(
-        drove_again,
-        "reconnect re-attach did not resume the lease on the first try; log:\n{}",
+        saw_turn_ended(&replay, &sid),
+        "replay must include the turn boundary; log:\n{}",
         server.read_log()
     );
 
@@ -664,406 +675,31 @@ fn in_place_reconnect_reattaches() {
     }
 }
 
-// ── Phase 4: lease ownership ───────────────────────────────────────
-
-/// SAME-client_id reconnect reclaims drive rights with ZERO retries (the core
-/// retirement of attach_owner_with_retry). Owner-attach under a fixed id, drop
-/// the socket, stand up a NEW client with the SAME id, attach Owner in a SINGLE
-/// call — assert driver==true on the first attempt and lease_holder == that id.
+/// Headless AdminPrompt works with NO client attached (ADR-0015). A non-GUI
+/// caller (`connect_existing`, never attaches) drives a session via
+/// `admin_prompt` both before AND after a normal client attaches — the headless
+/// enqueue path has no attach/ownership precondition under the strict 1:1 model.
 #[test]
-fn same_client_id_reclaims_lease_without_retry() {
+fn admin_prompt_works_with_no_client_attached() {
     let _g = serial_lock();
     let server = TestServer::start();
     server.activate_env();
 
-    let sid = {
-        let client = connect_as("gui-A");
-        let info = client
-            .create_session(std::env::temp_dir(), "reclaim".into(), None)
-            .expect("create_session");
-        let drove = client
-            .attach(&info.session_id, AttachMode::Owner)
-            .expect("attach");
-        assert!(drove, "first Owner attach must acquire the lease");
-        client.prompt(&info.session_id, "hi").expect("prompt ok");
-        info.session_id
-        // drop → socket EOF; EOF does NOT release the lease.
-    };
-
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Fresh client, SAME id, single attach → resumes on the first try.
-    let client2 = connect_as("gui-A");
-    let drove = client2
-        .attach(&sid, AttachMode::Owner)
-        .expect("re-attach same id");
-    assert!(
-        drove,
-        "same-client_id re-attach must resume the lease on the FIRST try; log:\n{}",
-        server.read_log()
-    );
-    let snap = client2.admin_status().expect("admin_status");
-    assert_eq!(
-        admin_entry(&snap, &sid)
-            .and_then(|e| e.lease_holder.as_ref())
-            .map(|l| l.client_id.as_str()),
-        Some("gui-A"),
-        "lease_holder must be gui-A; log:\n{}",
-        server.read_log()
-    );
-}
-
-/// A second DISTINCT client becomes Observer, not an error. With A holding a
-/// live lease (kept fresh by heartbeat), B attaches Owner → driver==false (a
-/// silent downgrade, NOT "already own"). B's gated verbs are rejected while A's
-/// succeed; lease_holder stays A.
-#[test]
-fn second_client_downgrades_to_observer() {
-    let _g = serial_lock();
-    let server = TestServer::start();
-    server.activate_env();
-
-    let client_a = connect_as("gui-A");
-    let info = client_a
-        .create_session(std::env::temp_dir(), "downgrade".into(), None)
-        .expect("create_session");
-    let sid = info.session_id.clone();
-    assert!(client_a.attach(&sid, AttachMode::Owner).expect("A attach"));
-
-    let client_b = connect_as("gui-B");
-    let drove_b = client_b
-        .attach(&sid, AttachMode::Owner)
-        .expect("B attach must NOT error on contention");
-    assert!(
-        !drove_b,
-        "B must downgrade to Observer (driver==false), not error; log:\n{}",
-        server.read_log()
-    );
-
-    // B's gated action is rejected; A's succeeds.
-    assert!(
-        client_b
-            .set_permission_mode(&sid, PermissionMode::ReadOnly)
-            .is_err(),
-        "non-holder B must be rejected; log:\n{}",
-        server.read_log()
-    );
-    client_a
-        .set_permission_mode(&sid, PermissionMode::ReadOnly)
-        .expect("holder A may change mode");
-
-    let snap = client_a.admin_status().expect("admin_status");
-    assert_eq!(
-        admin_entry(&snap, &sid)
-            .and_then(|e| e.lease_holder.as_ref())
-            .map(|l| l.client_id.as_str()),
-        Some("gui-A"),
-        "lease_holder must stay A; log:\n{}",
-        server.read_log()
-    );
-}
-
-/// Lease expiry frees ownership — proven time-driven, not socket-driven: A
-/// attaches Owner then STOPS heartbeating with its SOCKET STILL OPEN. With a low
-/// TTL the lease must free (lazy + sweep), an idle Observer must receive the
-/// freeing notification path (admin reports None), and a DIFFERENT client B then
-/// first-claims it.
-#[test]
-fn lease_expires_when_heartbeat_stops() {
-    let _g = serial_lock();
-    let server = TestServer::start_with_ttl_ms(Some(1200));
-    server.activate_env();
-
-    // A holds the lease but its socket stays OPEN (no heartbeat).
-    let client_a = connect_as("gui-A");
-    let info = client_a
-        .create_session(std::env::temp_dir(), "expire".into(), None)
-        .expect("create_session");
-    let sid = info.session_id.clone();
-    assert!(client_a.attach(&sid, AttachMode::Owner).expect("A attach"));
-
-    // Poll until the lease frees within TTL + sweep budget.
-    let snap = poll_admin(&client_a, Duration::from_secs(10), |s| {
-        admin_entry(s, &sid).is_some_and(|e| e.lease_holder.is_none())
-    });
-    assert!(
-        admin_entry(&snap, &sid).is_some_and(|e| e.lease_holder.is_none() && !e.has_owner),
-        "lease must expire while A's socket is still open (time-driven); log:\n{}",
-        server.read_log()
-    );
-
-    // A DIFFERENT client first-claims the now-free lease.
-    let client_b = connect_as("gui-B");
-    let drove_b = client_b.attach(&sid, AttachMode::Owner).expect("B attach");
-    assert!(
-        drove_b,
-        "B must first-claim the freed lease; log:\n{}",
-        server.read_log()
-    );
-}
-
-/// Headless AdminPrompt stays LEASELESS (ADR-0015) under lease enforcement.
-/// connect_existing (no attach, no client_id, no lease) → admin_prompt succeeds
-/// and lease_holder stays None. Then with A holding the lease, a leaseless
-/// admin_prompt STILL succeeds and A still holds the lease afterward.
-#[test]
-fn admin_prompt_stays_leaseless() {
-    let _g = serial_lock();
-    let server = TestServer::start();
-    server.activate_env();
-
-    let owner = connect_as("gui-A");
-    let info = owner
+    let client = connect_as("gui-A");
+    let info = client
         .create_session(std::env::temp_dir(), "headless".into(), None)
         .expect("create_session");
     let sid = info.session_id.clone();
 
-    // Leaseless caller: connect_existing never attaches / never sets client_id.
+    // Headless caller: connect_existing never attaches.
     let cli = SessionServerClient::connect_existing().expect("connect_existing");
-    cli.admin_prompt(&sid, "go").expect("admin_prompt unowned");
-    let snap = cli.admin_status().expect("admin_status");
-    assert!(
-        admin_entry(&snap, &sid).is_some_and(|e| e.lease_holder.is_none()),
-        "admin_prompt must NOT take a lease; log:\n{}",
-        server.read_log()
-    );
+    cli.admin_prompt(&sid, "go")
+        .expect("admin_prompt with nobody attached");
 
-    // Now A takes the lease; a leaseless admin_prompt still bypasses the gate.
-    assert!(owner.attach(&sid, AttachMode::Owner).expect("A attach"));
+    // Now a normal client attaches; a headless admin_prompt still succeeds.
+    client.attach(&sid).expect("attach");
     cli.admin_prompt(&sid, "again")
-        .expect("admin_prompt bypasses the lease gate even when leased");
-    let snap = owner.admin_status().expect("admin_status");
-    assert_eq!(
-        admin_entry(&snap, &sid)
-            .and_then(|e| e.lease_holder.as_ref())
-            .map(|l| l.client_id.as_str()),
-        Some("gui-A"),
-        "A must still hold the lease after a headless prompt; log:\n{}",
-        server.read_log()
-    );
-}
-
-/// Clean Detach releases immediately; socket EOF does NOT (the load-bearing
-/// distinction). (a) explicit Detach → lease_holder None promptly. (b) socket
-/// EOF → lease_holder stays A until TTL, and a same-id reconnect within TTL
-/// resumes on the first try.
-#[test]
-fn detach_releases_now_eof_starts_the_clock() {
-    let _g = serial_lock();
-    let server = TestServer::start_with_ttl_ms(Some(2000));
-    server.activate_env();
-
-    // (a) Explicit clean detach releases the lease immediately.
-    let client_a = connect_as("gui-A");
-    let info = client_a
-        .create_session(std::env::temp_dir(), "detach".into(), None)
-        .expect("create_session");
-    let sid = info.session_id.clone();
-    assert!(client_a.attach(&sid, AttachMode::Owner).expect("A attach"));
-    client_a.detach(&sid).expect("clean detach");
-    let snap = poll_admin(&client_a, Duration::from_secs(2), |s| {
-        admin_entry(s, &sid).is_some_and(|e| e.lease_holder.is_none())
-    });
-    assert!(
-        admin_entry(&snap, &sid).is_some_and(|e| e.lease_holder.is_none()),
-        "explicit Detach must release the lease promptly (no TTL wait); log:\n{}",
-        server.read_log()
-    );
-
-    // (b) Re-take, then drop the SOCKET (EOF). The lease must persist until TTL.
-    assert!(
-        client_a
-            .attach(&sid, AttachMode::Owner)
-            .expect("A re-attach")
-    );
-    drop(client_a);
-    std::thread::sleep(Duration::from_millis(150));
-    // A monitor client confirms the lease is STILL held shortly after EOF.
-    let monitor = connect_as("gui-monitor-observer");
-    let snap = monitor.admin_status().expect("admin_status");
-    assert!(
-        admin_entry(&snap, &sid)
-            .and_then(|e| e.lease_holder.as_ref())
-            .map(|l| l.client_id.as_str())
-            == Some("gui-A"),
-        "socket EOF must NOT release the lease (starts the TTL clock); log:\n{}",
-        server.read_log()
-    );
-
-    // A same-id reconnect within the TTL resumes drive rights on the first try.
-    let client_a2 = connect_as("gui-A");
-    let drove = client_a2
-        .attach(&sid, AttachMode::Owner)
-        .expect("A2 attach");
-    assert!(
-        drove,
-        "same-id reconnect within TTL must resume on the first try; log:\n{}",
-        server.read_log()
-    );
-}
-
-/// Promote / blue-green under lease. A owns. B observes (distinct id). B Promote
-/// → Err (A still leased). A cleanly Detaches → B Promote → Ok and lease_holder
-/// == B.
-#[test]
-fn promote_blocked_until_holder_releases() {
-    let _g = serial_lock();
-    let server = TestServer::start();
-    server.activate_env();
-
-    let client_a = connect_as("gui-A");
-    let info = client_a
-        .create_session(std::env::temp_dir(), "promote".into(), None)
-        .expect("create_session");
-    let sid = info.session_id.clone();
-    assert!(client_a.attach(&sid, AttachMode::Owner).expect("A attach"));
-
-    let client_b = connect_as("gui-B");
-    assert!(
-        !client_b
-            .attach(&sid, AttachMode::Observer)
-            .expect("B observe")
-    );
-    assert!(
-        client_b.promote(&sid).is_err(),
-        "B must not promote while A holds a live lease; log:\n{}",
-        server.read_log()
-    );
-
-    // A cleanly hands off.
-    client_a.detach(&sid).expect("A clean detach");
-    std::thread::sleep(Duration::from_millis(100));
-    client_b.promote(&sid).expect("B promote after A released");
-    let snap = client_b.admin_status().expect("admin_status");
-    assert_eq!(
-        admin_entry(&snap, &sid)
-            .and_then(|e| e.lease_holder.as_ref())
-            .map(|l| l.client_id.as_str()),
-        Some("gui-B"),
-        "lease_holder must be B after promote; log:\n{}",
-        server.read_log()
-    );
-}
-
-/// Drain `try_recv()` on `client` until a `LeaseChanged` for `sid` whose
-/// `lease` matches `want_holder` arrives (`None` → freed; `Some(id)` → held by
-/// id), or the deadline passes. Returns whether the matching frame was seen.
-/// Polls because notifications land on a background reader thread.
-fn await_lease_changed(
-    client: &SessionServerClient,
-    sid: &str,
-    want_holder: Option<&str>,
-    timeout: Duration,
-) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        while let Some(note) = client.try_recv() {
-            if let Notification::LeaseChanged { session_id, lease } = &note
-                && session_id == sid
-            {
-                let holder = lease.as_ref().map(|l| l.client_id.as_str());
-                if holder == want_holder {
-                    return true;
-                }
-            }
-        }
-        if Instant::now() > deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// END-TO-END notification edge (sweep → forwarder → client frame), not just an
-/// admin poll: an attached Observer must actually RECEIVE a `LeaseChanged{None}`
-/// frame when the holder's lease frees. A (gui-A) takes the lease then stops
-/// heartbeating with its socket OPEN; B (gui-B) attaches as Observer and drains
-/// its notification stream. Under a low TTL the sweep frees the lease and the
-/// server pushes `LeaseChanged{lease:None}` to B. This is the exact signal the
-/// candidate-promote path keys on; an admin_status poll would NOT have caught a
-/// forwarder that failed to emit the frame.
-#[test]
-fn observer_receives_lease_freed_notification() {
-    let _g = serial_lock();
-    let server = TestServer::start_with_ttl_ms(Some(1200));
-    server.activate_env();
-
-    // A holds the lease, socket stays OPEN, never heartbeats → it will expire.
-    let client_a = connect_as("gui-A");
-    let info = client_a
-        .create_session(std::env::temp_dir(), "freed-note".into(), None)
-        .expect("create_session");
-    let sid = info.session_id.clone();
-    assert!(client_a.attach(&sid, AttachMode::Owner).expect("A attach"));
-
-    // B observes the SAME session and listens on its notification stream.
-    let client_b = connect_as("gui-B");
-    assert!(
-        !client_b
-            .attach(&sid, AttachMode::Observer)
-            .expect("B observe"),
-        "Observer attach must not acquire the lease"
-    );
-
-    // The sweep must push LeaseChanged{None} to B within TTL + sweep budget.
-    assert!(
-        await_lease_changed(&client_b, &sid, None, Duration::from_secs(10)),
-        "Observer must RECEIVE a LeaseChanged{{None}} frame when the holder's \
-         lease frees (sweep→forwarder→client), not just see it via admin; log:\n{}",
-        server.read_log()
-    );
-}
-
-/// A live, still-beating holder is NOT displaced by a second Owner-attach across
-/// several heartbeat intervals. With a low TTL, A holds the lease and keeps
-/// heartbeating faster than the TTL. B repeatedly attaches as Owner over several
-/// TTL-spans; every B attach must downgrade to Observer (driver==false) and the
-/// lease_holder must stay A throughout. This is the server-side guarantee behind
-/// the client-side "observer never beats / never steals" fix: while the true
-/// holder beats, a contending Owner attach can never win the lease.
-#[test]
-fn beating_holder_not_displaced_by_owner_attach() {
-    let _g = serial_lock();
-    let ttl_ms = 600u64;
-    let server = TestServer::start_with_ttl_ms(Some(ttl_ms));
-    server.activate_env();
-
-    let client_a = connect_as("gui-A");
-    let info = client_a
-        .create_session(std::env::temp_dir(), "no-steal".into(), None)
-        .expect("create_session");
-    let sid = info.session_id.clone();
-    assert!(client_a.attach(&sid, AttachMode::Owner).expect("A attach"));
-
-    let client_b = connect_as("gui-B");
-
-    // Cover several heartbeat intervals: A beats well inside the TTL, B keeps
-    // trying to attach Owner. Beat at ~TTL/3 so the lease never lapses between
-    // beats; probe B once per beat. ~9 iterations spans ~5 TTL windows.
-    let beat = Duration::from_millis(ttl_ms / 3);
-    for i in 0..9 {
-        client_a
-            .heartbeat(&sid)
-            .expect("A heartbeat keeps the lease live");
-        let drove_b = client_b
-            .attach(&sid, AttachMode::Owner)
-            .expect("B attach must not error on contention");
-        assert!(
-            !drove_b,
-            "iter {i}: B must stay Observer while A beats (no steal); log:\n{}",
-            server.read_log()
-        );
-        let snap = client_a.admin_status().expect("admin_status");
-        assert_eq!(
-            admin_entry(&snap, &sid)
-                .and_then(|e| e.lease_holder.as_ref())
-                .map(|l| l.client_id.as_str()),
-            Some("gui-A"),
-            "iter {i}: lease_holder must stay A while A beats; log:\n{}",
-            server.read_log()
-        );
-        std::thread::sleep(beat);
-    }
+        .expect("admin_prompt still works after a client attaches");
 }
 
 /// WAL v1 discard on startup: pre-seed the WAL dir with a hand-written v1 log

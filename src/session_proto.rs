@@ -17,42 +17,6 @@ use crate::agent_event::AgentEvent;
 /// Server-assigned stable session handle (UUID string).
 pub type ServerSessionId = String;
 
-/// How a GUI connection attaches to a session.
-///
-/// At most one `Owner` may be attached at a time (the connection allowed to
-/// send prompts / change permission mode / close the session). Any number of
-/// `Observer`s may attach concurrently — they receive the full replayed
-/// transcript and the live event stream but cannot drive the session. This is
-/// the basis for the blue-green build loop: a freshly built "candidate" GUI
-/// attaches as an `Observer` to mirror live sessions, then `Promote`s to
-/// `Owner` once the previous owner disconnects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachMode {
-    Owner,
-    Observer,
-}
-
-/// A write-ownership lease on a session (spec-session-server-actor §Phase 4).
-///
-/// Replaces the old per-connection `owner: conn_id` model. A lease grants drive
-/// rights (prompt / cancel / restart / set-permission / close / promote) to a
-/// *stable* `client_id` — a GUI install id that survives socket reconnect and
-/// app restart — so a returning client resumes its lease with zero contention
-/// (no `attach_owner_with_retry` race).
-///
-/// `expires_at_unix_ms` is **display/diagnostic only** on the wire: the server
-/// drives expiry off a monotonic `tokio::time::Instant` (immune to NTP steps /
-/// sleep-wake skew) and computes this wall-clock millis stamp purely so a GUI
-/// can show "leased until …". It is NEVER fed back into an expiry comparison.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Lease {
-    /// Stable GUI install id (UUID v4 string). The lease holder.
-    pub client_id: String,
-    /// Server wall-clock millis at which the lease expires. DISPLAY ONLY.
-    pub expires_at_unix_ms: u64,
-}
-
 // ── Envelope types ─────────────────────────────────────────────────
 
 /// A framed message on the wire. Every line is one of these.
@@ -88,119 +52,59 @@ pub enum Request {
         resume_session_id: Option<String>,
     },
 
+    /// Attach the single client to a session (strict 1:1: one tile per session,
+    /// no mirroring). The server spawns exactly one forwarder per session to
+    /// stream events to this client; a session shown in no tile is simply
+    /// unattached (no forwarder), never "owned by someone else".
     #[serde(rename = "attach")]
     Attach {
         session_id: ServerSessionId,
-        /// Owner (drives the session) or Observer (read-only mirror).
-        mode: AttachMode,
-        /// Stable client identity (spec phase 4). The server uses this to
-        /// acquire / resume a lease: a same-`client_id` Owner attach always
-        /// resumes (live → renew, expired → re-grant) with zero contention; a
-        /// different live-leased `client_id` silently downgrades to Observer.
-        /// Headless callers (ADR-0015) and pre-phase-4 clients send `""` /
-        /// omit it — `#[serde(default)]` keeps the field purely additive and an
-        /// empty `client_id` never acquires a lease.
-        #[serde(default)]
-        client_id: String,
-        /// Cursor-based incremental reconnect (spec phase 5): the client's
-        /// last-seen transcript position as `(generation, index)`, where
-        /// `index` is the number of `event_log` entries already received on
-        /// channel `generation`. When the cursor's generation matches the
-        /// session's current `channel_generation` and the index is in range,
-        /// the server streams ONLY the tail `[index..]` rather than the full
-        /// log. Otherwise (None, generation mismatch, or out-of-range index)
-        /// it falls back to today's behavior: a full replay from index 0.
+        /// Cursor-based incremental reconnect: the client's last-seen transcript
+        /// position as `(generation, index)`, where `index` is the number of
+        /// `event_log` entries already received on channel `generation`. When
+        /// the cursor's generation matches the session's current
+        /// `channel_generation` and the index is in range, the server streams
+        /// ONLY the tail `[index..]` rather than the full log. Otherwise (None,
+        /// generation mismatch, or out-of-range index) it falls back to a full
+        /// replay from index 0.
         ///
-        /// `#[serde(default)]` is what makes this purely additive — every
-        /// existing client (incl. the GUI) and every pre-cursor persisted
-        /// message deserializes with `cursor == None`, i.e. unchanged full
-        /// replay.
+        /// `#[serde(default)]` keeps it additive — every pre-cursor persisted
+        /// message deserializes with `cursor == None`, i.e. full replay.
         #[serde(default)]
         cursor: Option<(u64, u64)>,
     },
 
-    /// Cleanly release a session (phase 4). When `client_id` matches the lease
-    /// holder the lease is released IMMEDIATELY (clean blue-green handoff — no
-    /// 15s TTL wait); a socket EOF, by contrast, leaves the lease to expire on
-    /// its TTL so a fast same-`client_id` reconnect resumes with zero
-    /// contention. Empty `client_id` only tears down the forwarder.
+    /// Cleanly detach the single client from a session — tears down its
+    /// forwarder. The session and its agent keep running with no client
+    /// attached; a later `Attach` resumes from the durable `event_log`.
     #[serde(rename = "detach")]
-    Detach {
-        session_id: ServerSessionId,
-        #[serde(default)]
-        client_id: String,
-    },
-
-    /// Renew a held lease (spec phase 4). The GUI beats this every
-    /// `HEARTBEAT_INTERVAL` for each session it drives; the server pushes the
-    /// lease expiry forward by `LEASE_TTL`. The client drives the heartbeat
-    /// because the socket is the server's only liveness signal — a lease with
-    /// no client renewal would either never expire (breaking blue-green
-    /// promote) or expire under a live owner (breaking ownership). A Heartbeat
-    /// for a lease the caller no longer holds returns an error so the GUI
-    /// re-attaches (resumes-or-observes).
-    #[serde(rename = "heartbeat")]
-    Heartbeat {
-        session_id: ServerSessionId,
-        client_id: String,
-    },
-
-    /// An attached `Observer` claims the lease on a session. Succeeds only when
-    /// the session is currently unleased / expired (the previous holder cleanly
-    /// detached or its lease lapsed). Used by a candidate GUI to take over after
-    /// the old instance closes. Carries the promoter's `client_id` so the new
-    /// lease records a stable holder (phase 4).
-    #[serde(rename = "promote")]
-    Promote {
-        session_id: ServerSessionId,
-        #[serde(default)]
-        client_id: String,
-    },
+    Detach { session_id: ServerSessionId },
 
     #[serde(rename = "prompt")]
     Prompt {
         session_id: ServerSessionId,
         text: String,
-        /// Lease holder identity (phase 4) — gated: only the lease holder may
-        /// prompt. `#[serde(default)]` keeps it additive.
-        #[serde(default)]
-        client_id: String,
     },
 
-    /// Interrupt the in-flight turn (ACP `session/cancel`). Lease-holder-only,
-    /// like `Prompt`. The session stays alive; the current turn resolves
-    /// with `StopReason::Cancelled`.
+    /// Interrupt the in-flight turn (ACP `session/cancel`). The session stays
+    /// alive; the current turn resolves with `StopReason::Cancelled`.
     #[serde(rename = "cancel")]
-    Cancel {
-        session_id: ServerSessionId,
-        #[serde(default)]
-        client_id: String,
-    },
+    Cancel { session_id: ServerSessionId },
 
     /// Hard recovery: kill + respawn the agent subprocess, resuming the same
-    /// ACP session. Lease-holder-only. The escalation when a graceful `Cancel`
-    /// won't unstick a turn wedged on a hung upstream request.
+    /// ACP session. The escalation when a graceful `Cancel` won't unstick a
+    /// turn wedged on a hung upstream request.
     #[serde(rename = "restart_session")]
-    RestartSession {
-        session_id: ServerSessionId,
-        #[serde(default)]
-        client_id: String,
-    },
+    RestartSession { session_id: ServerSessionId },
 
     #[serde(rename = "set_permission_mode")]
     SetPermissionMode {
         session_id: ServerSessionId,
         mode: PermissionMode,
-        #[serde(default)]
-        client_id: String,
     },
 
     #[serde(rename = "close_session")]
-    CloseSession {
-        session_id: ServerSessionId,
-        #[serde(default)]
-        client_id: String,
-    },
+    CloseSession { session_id: ServerSessionId },
 
     #[serde(rename = "rename_session")]
     RenameSession {
@@ -250,15 +154,12 @@ pub enum ResponseData {
     Session { session: SessionInfo },
     #[serde(rename = "ack")]
     Ack,
-    /// Reply to a successful [`Request::Attach`] (spec phase 4). `driver` is
-    /// `true` when this attach acquired/resumed the lease (full drive rights),
-    /// `false` when it silently downgraded to Observer because a different live
-    /// `client_id` holds the lease. The GUI sets its local role from this flag
-    /// instead of inferring it from an "already own" error string (which the
-    /// retired retry loop matched). Additive: it's a new `ResponseData`
-    /// variant, so the older `Ack` reply for every other verb is unchanged.
+    /// Reply to a successful [`Request::Attach`]. Strict 1:1: the single client
+    /// is now attached and its forwarder is streaming the transcript. Carries
+    /// no driver/owner flag — there is no ownership negotiation under the
+    /// single-subscriber model.
     #[serde(rename = "attached")]
-    Attached { driver: bool },
+    Attached,
     #[serde(rename = "admin_status")]
     AdminStatus { snapshot: AdminSnapshot },
 }
@@ -273,9 +174,6 @@ pub struct SessionInfo {
     pub turns: usize,
     pub connected: bool,
     pub permission_mode: PermissionMode,
-    /// Whether some connection currently owns (can drive) this session.
-    /// A candidate GUI uses this to decide whether it can `Promote`.
-    pub has_owner: bool,
 }
 
 /// Diagnostic snapshot of the server's live session state (response to
@@ -287,33 +185,25 @@ pub struct AdminSnapshot {
 }
 
 /// Per-session live server-side state, richer than [`SessionInfo`] — exposes
-/// internals (owner conn id, subscriber/receiver count, channel generation)
-/// useful for diagnosing reconnect/ownership issues.
+/// internals (subscriber count, channel generation) useful for diagnosing
+/// reconnect issues.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminSessionInfo {
     pub session_id: ServerSessionId,
     pub label: String,
     /// Agent subprocess live (channel is Some).
     pub connected: bool,
-    /// True when a non-expired lease is held (phase 4: `lease_holder` present
-    /// and live). Convenience for callers that only care whether *someone*
-    /// drives the session, mirroring the old `has_owner`.
-    pub has_owner: bool,
-    /// The current lease holder (spec phase 4), or `None` if unleased / expired.
-    /// Replaces the old `owner_conn_id: Option<u64>` diagnostic — a stable
-    /// `client_id` plus the (display-only) expiry is far more useful than an
-    /// ephemeral connection id for monitoring blue-green handoff.
-    pub lease_holder: Option<Lease>,
     pub turns: usize,
     pub event_log_len: usize,
     /// Lowest logical `seq` still resident in the in-memory `event_log`
-    /// ringbuffer (spec-event-stream §6, phase-8 Stage B). `0` until a
-    /// compaction trim advances it; a non-zero value means earlier events have
-    /// been trimmed from memory (a `CompactedSummary` marker fronts the log).
-    /// `#[serde(default)]` keeps it additive for pre-Stage-B admin clients.
+    /// ringbuffer (spec-event-stream §6). `0` until a compaction trim advances
+    /// it; a non-zero value means earlier events have been trimmed from memory
+    /// (a `CompactedSummary` marker fronts the log). `#[serde(default)]` keeps
+    /// it additive for pre-trim admin clients.
     #[serde(default)]
     pub log_base: u64,
-    /// Active broadcast receivers = attached connections (owner + observers).
+    /// Active broadcast receivers — `0` or `1` under strict 1:1 (the single
+    /// attached client's forwarder, if any).
     pub subscriber_count: usize,
     pub channel_generation: u64,
     pub permission_mode: PermissionMode,
@@ -381,21 +271,6 @@ pub enum Notification {
     SessionDetached {
         session_id: ServerSessionId,
         reason: String,
-    },
-
-    /// The write-ownership lease of a session changed (spec phase 4 — the
-    /// breaking rename of the old `OwnerChanged`/`owner_changed`). Broadcast to
-    /// all attached connections (lease holder + observers). `None` == unleased:
-    /// an observer/candidate may `Promote`. `Some(lease)` == `lease.client_id`
-    /// holds drive rights until `expires_at_unix_ms`. This is the signal a
-    /// candidate GUI waits for after the previous holder cleanly exits or its
-    /// lease expires. BREAKING: old `"owner_changed"` logs/clients cannot
-    /// deserialize `"lease_changed"` and vice-versa — handled by the WAL v1→v2
-    /// discard (no converter, per locked decision).
-    #[serde(rename = "lease_changed")]
-    LeaseChanged {
-        session_id: ServerSessionId,
-        lease: Option<Lease>,
     },
 
     /// A session was created. Broadcast to **every** connection (not just
@@ -526,51 +401,17 @@ mod tests {
         }
     }
 
-    /// Phase 4: `LeaseChanged` carries `Option<Lease>` and uses the
-    /// `"lease_changed"` tag. Round-trip both the `None` (unleased) and
-    /// `Some` (held) shapes.
+    /// Single-subscriber model: the retired lease/owner control notifications
+    /// (`lease_changed`, the older `owner_changed`) are gone — neither tag
+    /// deserializes. A persisted WAL carrying one is discarded on recovery.
     #[test]
-    fn lease_changed_round_trips() {
-        let none = Notification::LeaseChanged {
-            session_id: "s1".into(),
-            lease: None,
-        };
-        let json = serde_json::to_string(&none).unwrap();
-        assert!(
-            json.contains("\"lease_changed\""),
-            "tag must be lease_changed: {json}"
-        );
-        assert!(matches!(
-            serde_json::from_str::<Notification>(&json).unwrap(),
-            Notification::LeaseChanged { lease: None, .. }
-        ));
-
-        let held = Notification::LeaseChanged {
-            session_id: "s1".into(),
-            lease: Some(Lease {
-                client_id: "client-A".into(),
-                expires_at_unix_ms: 123_456,
-            }),
-        };
-        let json = serde_json::to_string(&held).unwrap();
-        let back: Notification = serde_json::from_str(&json).unwrap();
-        match back {
-            Notification::LeaseChanged { lease: Some(l), .. } => {
-                assert_eq!(l.client_id, "client-A");
-                assert_eq!(l.expires_at_unix_ms, 123_456);
-            }
-            other => panic!("expected LeaseChanged Some, got {other:?}"),
+    fn retired_lease_tags_no_longer_deserialize() {
+        for tag in ["lease_changed", "owner_changed"] {
+            let old = format!(r#"{{"type":"{tag}","session_id":"s1"}}"#);
+            assert!(
+                serde_json::from_str::<Notification>(&old).is_err(),
+                "the retired {tag} tag must fail to deserialize"
+            );
         }
-    }
-
-    /// The breaking rename is documented by a failing deserialize: the old
-    /// `"owner_changed"` discriminator no longer parses (no converter).
-    #[test]
-    fn old_owner_changed_tag_no_longer_deserializes() {
-        let old = r#"{"type":"owner_changed","session_id":"s1","has_owner":true}"#;
-        assert!(
-            serde_json::from_str::<Notification>(old).is_err(),
-            "the retired owner_changed tag must fail to deserialize on v2"
-        );
     }
 }

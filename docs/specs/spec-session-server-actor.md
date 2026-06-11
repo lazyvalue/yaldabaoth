@@ -1,10 +1,59 @@
 # Spec: Session-server actor architecture
 
-- **Status:** DRAFT — north-star. Frames the concurrency, ownership, lifecycle,
-  and hardening model the session server should converge on; complements the
-  already-specified event-stream and durable-log layers. Individually-verifiable
-  migration phases in § Rollout.
-- **Date:** 2026-06-07
+- **Status:** DRAFT — north-star, **amended to single-subscriber (2026-06-11).**
+  Frames the concurrency, lifecycle, and hardening model the session server
+  converges on; complements the event-stream and durable-log layers.
+- **Date:** 2026-06-07 (single-subscriber amendment 2026-06-11)
+
+> **AMENDMENT — single-subscriber model (2026-06-11, branch
+> `agent-server-cleanup`, project `agent-model-refactor` ticket 001 subtask #3).**
+> The client is now **strict 1:1**: a server session is shown in at most one
+> tile, with no mirroring (spec-agent-session-ownership.md). The `:promote`
+> self-hosting blue-green loop — the ONLY feature that ever needed many clients
+> on one session — was dropped. So the **lease / owner / observer / candidate /
+> promote machinery below is GONE** from the implementation: there is no lease
+> (`Lease`, `LeaseState`, `lease_ttl`, heartbeat, sweep, expiry), no
+> owner/observer/driver distinction, no `Promote`/`Heartbeat` verbs, no
+> `LeaseChanged` notification, and no `has_owner`/`lease_holder` fields. The
+> sections on "Lease-based ownership", the Lease state machine, and the lease
+> Command/Data-Model variants are RETAINED BELOW AS HISTORICAL DESIGN RATIONALE
+> only — read them as "why we once needed leases", not as current behavior.
+>
+> **What the server actually does now (single-subscriber):**
+> - The Manager actor + single-writer `Command` inlet, the durable WAL, the
+>   per-session `event_log` (source of truth) + cursor-based incremental
+>   reconnect, agent re-adoption on restart, and the detached daemon are all
+>   UNCHANGED and KEPT.
+> - **`attach` is unconditional**: it spawns **exactly ONE forwarder** per
+>   session to stream the transcript to the ONE attached client. There is no
+>   ownership negotiation — `attach` replies `Attached` (no `driver` flag).
+> - `prompt` / `cancel` / `restart` / `set_permission_mode` / `close` are
+>   **ungated** (no owner check) — the single attached client (or a headless
+>   `admin_prompt`, ADR-0015) may drive the session. A session shown in no tile
+>   is simply **unattached** (no forwarder), never "owned by someone else".
+> - `detach` (or socket EOF) tears down that one forwarder; the session and its
+>   agent keep running with no client attached, and a later `attach` resumes
+>   from the durable `event_log`.
+> - The **trim floor** is just the single forwarder's `sent_seq` (or `u64::MAX`
+>   when unattached) instead of `min` over a forwarder set; the high-water
+>   disconnect still bounds a wedged subscriber. Compaction/trimming is KEPT.
+> - `AdminSessionInfo` keeps `subscriber_count` (now `0` or `1`),
+>   `event_log_len`, `log_base`, `channel_generation`, etc.; it dropped
+>   `has_owner` and `lease_holder`.
+>
+> **⚠ UPGRADE HAZARD (no wire-version handshake yet).** The single-subscriber
+> cleanup made `Request::Attach` drop its `mode` and `client_id` fields, and
+> those were NOT `#[serde(default)]`. There is no `initialize` protocol-version
+> negotiation today, so a **NEW GUI talking to an OLD still-running server** (the
+> realistic case: a `yalda-session-server` LaunchAgent kept alive across a GUI
+> rebuild) sends the new, field-stripped `attach` frame, which the old server
+> fails to deserialize and rejects as a "bad frame" — every attach silently
+> fails and the GUI shows empty/unattached sessions. **Mitigation today:** kill
+> the running `yalda-session-server` before launching a rebuilt GUI
+> (`dev-all.sh` already does this). **Proper fix:** the deferred `initialize`
+> protocol-version + capability handshake (§Interfaces, "Protocol versioning")
+> so client and server can evolve independently — out of scope for this cleanup,
+> tracked as a follow-up.
 - **Provenance:** Design review prompted by the reconnect-storm incident (root-
   caused + fixed, `81ae216`, branch `session-resilience` merged to `master`). The
   fix closed the immediate bug (client never `shutdown` its socket → server never
@@ -425,6 +474,23 @@ requires the GPUI app to verify the server-side change.
   vocabulary/stream) and ADR-0009 (durable log); contributes the actor/single-
   writer model, lease-based ownership, the `AgentTransport` seam, and the
   hardening + phased-rollout plan.
+- **2026-06-11** — **Single-subscriber amendment** (branch `agent-server-cleanup`,
+  project `agent-model-refactor` ticket 001 subtask #3). The client became strict
+  1:1 (one tile per session, no mirroring) and `:promote` was dropped, so the
+  multi-subscriber / lease / owner / observer / candidate / promote apparatus was
+  REMOVED from the server, protocol, and GPUI client: deleted the `Lease` wire
+  struct + `LeaseState`/`lease_ttl`/sweep/heartbeat/expiry, the `Heartbeat` /
+  `Promote` request verbs, the `LeaseChanged` notification, the
+  `has_owner`/`lease_holder` fields, the `AttachMode` (Owner/Observer) +
+  `Attached{driver}` reply, and the multi-forwarder set + `min(sent_seq)` floor
+  (collapsed to a single optional forwarder + single-cursor trim floor). KEPT
+  intact: the Manager actor + single-writer inlet, the WAL durability/replay,
+  attach/detach/list/create/close, single-forwarder event delivery, the
+  per-session `event_log` + `sent_seq` cursor, cursor-based incremental reconnect,
+  and the high-water disconnect + compaction. `attach` is now unconditional and
+  all driving verbs are ungated (single attached client, or headless
+  `admin_prompt` per ADR-0015). The lease sections above are retained as
+  historical design rationale only. See the banner at the top of this spec.
 - **2026-06-07** — Folded in adversarial-review findings (verdict REVISE):
   named the sync↔async **transport bridge** (actor holds a `Send` handle; a
   per-session reader forwards `Record`), made **turn-boundary fsync in-actor

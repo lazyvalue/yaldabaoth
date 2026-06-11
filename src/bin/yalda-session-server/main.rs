@@ -15,12 +15,10 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch};
-use tokio::time::Instant;
 
 use yalda::acp_channel::{
     AgentSpawner, AgentTransport, PermissionMode, RealAgentSpawner, TransportHandle, YaldaFrontend,
@@ -28,64 +26,6 @@ use yalda::acp_channel::{
 use yalda::session_proto::*;
 
 mod launchd;
-
-// ── Lease (write-ownership) constants ──────────────────────────────
-//
-// A lease grants drive rights to a stable `client_id`. Expiry is driven by a
-// monotonic `tokio::time::Instant` (immune to wall-clock steps); the wire
-// `Lease.expires_at_unix_ms` is a display-only SystemTime stamp computed at
-// emit time. The client beats `Heartbeat` every `HEARTBEAT_INTERVAL`; three
-// missed beats (~`LEASE_TTL`) free a crashed owner so a candidate can promote,
-// while two dropped beats / a GC pause tolerate a live owner.
-
-/// How long a lease stays valid without a renewing heartbeat. Overridable for
-/// tests via `YALDA_LEASE_TTL_MS`.
-fn lease_ttl() -> Duration {
-    static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *TTL.get_or_init(|| {
-        std::env::var("YALDA_LEASE_TTL_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&ms| ms > 0)
-            .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_secs(15))
-    })
-}
-
-/// Actor idle-sweep cadence: how often the run_manager loop proactively clears
-/// expired leases and emits `LeaseChanged{None}` so an idle observing candidate
-/// learns a crashed owner's lease freed (lazy eval already gates who-may-act).
-const LEASE_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Actor-local lease state. Holds a MONOTONIC `Instant` for expiry math (never
-/// the wire millis). The wire [`Lease`] is built from this via SystemTime only
-/// at broadcast time, for display.
-struct LeaseState {
-    client_id: String,
-    expires_at: Instant,
-}
-
-impl LeaseState {
-    /// Whether this lease is held by `client_id` and not yet expired at `now`.
-    fn is_live_for(&self, client_id: &str, now: Instant) -> bool {
-        self.client_id == client_id && self.expires_at > now
-    }
-}
-
-/// Build the wire [`Lease`] (display-only millis) from an actor-local
-/// [`LeaseState`] (monotonic Instant). The expiry millis is derived by adding
-/// the Instant's remaining duration to the current wall clock.
-fn lease_to_wire(state: &LeaseState, now: Instant) -> Lease {
-    let remaining = state.expires_at.saturating_duration_since(now);
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    Lease {
-        client_id: state.client_id.clone(),
-        expires_at_unix_ms: now_ms.saturating_add(remaining.as_millis() as u64),
-    }
-}
 
 // ── Forwarder progress + published log snapshot (Bug 1) ─────────────
 //
@@ -179,57 +119,29 @@ enum Command {
     },
     Attach {
         sid: ServerSessionId,
-        mode: AttachMode,
-        /// Stable client identity (phase 4). Used to acquire/resume the lease;
-        /// replaces the old per-connection `conn_id` ownership key.
-        client_id: String,
         /// Optional reconnect cursor `(generation, index)`. Resolved by
         /// `do_attach` against the session's `channel_generation` +
         /// `event_log.len()` into the forwarder's initial `sent` value (the
-        /// `usize` in the reply): the tail starts there. `None` / stale /
+        /// `u64` in the reply): the tail starts there. `None` / stale /
         /// out-of-range ⇒ `0` ⇒ full replay (unchanged behavior).
         cursor: Option<(u64, u64)>,
-        // On success: (lease watch, log watch, initial forwarder cursor,
-        // forwarder progress handle, granted_drive). The forwarder cursor is a
-        // LOGICAL `sent_seq` (Bug 1a), NOT a `Vec` index, so a later trim can't
-        // re-alias it; the progress handle is the shared `AtomicU64` the actor
-        // reads for the trim floor (Bug 1b).
+        // On success: (log watch, initial forwarder cursor, forwarder progress
+        // handle). The forwarder cursor is a LOGICAL `sent_seq` (Bug 1a), NOT a
+        // `Vec` index, so a later trim can't re-alias it; the progress handle is
+        // the shared `AtomicU64` the actor reads for the trim floor (Bug 1b).
         // type alias would hurt readability here more than help
         #[allow(clippy::type_complexity)]
         reply: tokio::sync::oneshot::Sender<
-            Result<
-                (
-                    watch::Receiver<Option<Lease>>,
-                    watch::Receiver<LogSnapshot>,
-                    u64,
-                    ForwarderProgress,
-                    bool,
-                ),
-                String,
-            >,
+            Result<(watch::Receiver<LogSnapshot>, u64, ForwarderProgress), String>,
         >,
     },
     Detach {
         sid: ServerSessionId,
-        client_id: String,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
-    },
-    /// Renew a held lease (phase 4). No `event_log` side effect; renews the
-    /// expiry in place. Errors if the caller no longer holds the lease.
-    Heartbeat {
-        sid: ServerSessionId,
-        client_id: String,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
-    },
-    Promote {
-        sid: ServerSessionId,
-        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Prompt {
         sid: ServerSessionId,
         text: String,
-        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     /// Headless "start-work" enqueue (ADR-0015): same as `Prompt` but with NO
@@ -242,17 +154,14 @@ enum Command {
     },
     Cancel {
         sid: ServerSessionId,
-        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Close {
         sid: ServerSessionId,
-        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Restart {
         sid: ServerSessionId,
-        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Rename {
@@ -263,7 +172,6 @@ enum Command {
     SetPermissionMode {
         sid: ServerSessionId,
         mode: PermissionMode,
-        client_id: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     ListSessions {
@@ -390,26 +298,13 @@ struct ManagedSession {
     /// the latest snapshot lock-free — watch coalescing self-heals exactly like
     /// the old broadcast `Lagged` path.
     log_tx: watch::Sender<LogSnapshot>,
-    /// Live forwarders' progress handles (Bug 1b). Each entry is a shared
-    /// `AtomicU64` holding that forwarder's last forwarded logical `sent_seq`.
-    /// `push_event` reads the MINIMUM over the still-live entries (pruning any
-    /// whose `Arc::strong_count == 1` — the forwarder task dropped its clone) to
-    /// compute the trim floor, so a trim never gaps the slowest live forwarder,
-    /// the owner included (spec §6 owner hard-ceiling).
-    forwarders: Vec<ForwarderProgress>,
-    /// Per-session lease control channel (phase 4). Holds the current wire
-    /// [`Lease`] (or `None`). The forwarder selects on this and emits a single
-    /// `LeaseChanged` control note on holder change — replaces the old
-    /// `owner_tx: watch<bool>` ownership path. Carries the wire form so the
-    /// forwarder does zero conversion.
-    lease_tx: watch::Sender<Option<Lease>>,
-    /// The current write-ownership lease (phase 4) — the stable `client_id`
-    /// allowed to drive the session (prompt / cancel / restart / set permission
-    /// / close) plus its monotonic expiry. `None` when unleased, in which case
-    /// an observer may `Promote` to claim it. Replaces the old `owner: conn_id`.
-    /// In-memory only: never persisted (a crash stops all heartbeats, so every
-    /// lease is dead by construction on restart).
-    lease: Option<LeaseState>,
+    /// The single attached client's forwarder progress handle (Bug 1b), or
+    /// `None` when no client is attached (strict 1:1). A shared `AtomicU64`
+    /// holding that forwarder's last forwarded logical `sent_seq`; `push_event`
+    /// uses it as the trim floor so a trim never gaps the live forwarder. The
+    /// handle is pruned when the forwarder task drops its clone
+    /// (`Arc::strong_count == 1`).
+    forwarder: Option<ForwarderProgress>,
     /// Prompts that arrived before the ACP subprocess finished spawning.
     /// Drained in submission order once `channel` becomes `Some`.
     pending_prompts: Vec<String>,
@@ -463,15 +358,7 @@ impl ManagedSession {
             turns: self.turns,
             connected: self.channel.as_ref().is_some_and(|c| c.is_connected()),
             permission_mode: self.permission_mode,
-            // Lazy expiry: a held-but-expired lease reports as no owner.
-            has_owner: self.is_leased(Instant::now()),
         }
-    }
-
-    /// Whether a non-expired lease is currently held (lazy expiry: an expired
-    /// lease counts as unleased even before a sweep clears it).
-    fn is_leased(&self, now: Instant) -> bool {
-        matches!(&self.lease, Some(l) if l.expires_at > now)
     }
 
     /// Record that an event happened: append it to the durable `event_log`
@@ -479,10 +366,6 @@ impl ManagedSession {
     /// the single mutator for "a logged event happened" — every log+broadcast
     /// site routes through here so the two writes can never skew (one appended
     /// without waking subscribers, or one broadcast without being logged).
-    ///
-    /// The `LeaseChanged` broadcast-only path (`broadcast_lease_changed`) is
-    /// deliberately NOT routed through here: it is transient lease state,
-    /// not transcript, and must never land in `event_log`.
     fn record(&mut self, note: Notification) {
         self.push_event(note);
     }
@@ -507,18 +390,16 @@ impl ManagedSession {
     /// [`compaction_floor`]; with no live forwarders it is `u64::MAX` (nothing to
     /// protect → cap-only).
     ///
-    /// HIGH-WATER DISCONNECT (spec §6, MAJOR): the owner hard-ceiling means a
-    /// slow/paused forwarder (e.g. a backgrounded GUI owner under App Nap that
-    /// stops draining its socket) pins the floor — the trim can't fire and the
-    /// `Vec` grows. The 60s slow-sub write timeout is the only other reaper, and
-    /// a forwarder that drains just enough to keep resetting that timer could pin
+    /// HIGH-WATER DISCONNECT (spec §6, MAJOR): the forwarder hard-ceiling means a
+    /// slow/paused subscriber (e.g. a backgrounded GUI under App Nap that stops
+    /// draining its socket) pins the floor — the trim can't fire and the `Vec`
+    /// grows. The 60s slow-sub write timeout is the only other reaper, and a
+    /// forwarder that drains just enough to keep resetting that timer could pin
     /// growth EFFECTIVELY unbounded. So BEFORE computing the floor we
     /// [`enforce_high_water`](Self::enforce_high_water): when the backlog
-    /// (`tip_seq - floor`) crosses [`event_log_high_water`], the slowest
-    /// forwarder is force-DISCONNECTED (a clean from-base reconnect, NOT a silent
-    /// gap) and dropped from the floor `min`, so the trim resumes and growth is
-    /// bounded. The owner is NOT exempt (the App Nap case) — a wedged owner is
-    /// cleanly bounced and reclaims its lease via same-`client_id` reclaim.
+    /// (`tip_seq - floor`) crosses [`event_log_high_water`], the forwarder is
+    /// force-DISCONNECTED (a clean from-base reconnect, NOT a silent gap) and
+    /// dropped from the floor, so the trim resumes and growth is bounded.
     fn push_event(&mut self, note: Notification) {
         self.wal_append(&note);
         self.event_log.push(note);
@@ -562,9 +443,9 @@ impl ManagedSession {
     }
 
     /// Publish the current `event_log` (plus the live `channel_generation`) on the
-    /// `log_tx` watch, waking every forwarder. The forwarder re-resolves its
-    /// logical `sent_seq` against the published `log_base` (Bug 1a), so a trim
-    /// that shortened the `Vec` can never make it slice a stale offset.
+    /// `log_tx` watch, waking the forwarder. The forwarder re-resolves its logical
+    /// `sent_seq` against the published `log_base` (Bug 1a), so a trim that
+    /// shortened the `Vec` can never make it slice a stale offset.
     fn publish_snapshot(&self) {
         let _ = self.log_tx.send_replace(LogSnapshot {
             log: self.event_log.clone(),
@@ -572,89 +453,71 @@ impl ManagedSession {
         });
     }
 
-    /// The trim floor (spec §6 owner hard-ceiling, Bug 1b): the minimum logical
-    /// `sent_seq` over all still-live forwarders. A dead forwarder dropped its
-    /// progress `Arc`, so it is the SOLE remaining ref (`strong_count == 1`) and
-    /// is pruned here; `u64::MAX` (no floor) when no live forwarder remains.
-    ///
-    /// `&mut self` because it prunes dead handles as a side effect. The owner is
-    /// always a live forwarder, so it is implicitly included in the `min` — the
-    /// trim can never drop below the owner's forwarded position.
+    /// The trim floor (Bug 1b): the single attached forwarder's last-forwarded
+    /// logical `sent_seq`, or `u64::MAX` (no floor — cap-only) when no client is
+    /// attached. A dead forwarder dropped its progress `Arc`, so it is the SOLE
+    /// remaining ref (`strong_count == 1`) and is pruned here. The trim never
+    /// drops below the live forwarder's forwarded position, so the subscriber is
+    /// never gapped mid-stream.
     fn compaction_floor(&mut self) -> u64 {
         use std::sync::atomic::Ordering;
-        self.forwarders.retain(|p| Arc::strong_count(p) > 1);
-        self.forwarders
-            .iter()
+        self.prune_dead_forwarder();
+        self.forwarder
+            .as_ref()
             .map(|p| p.sent_seq.load(Ordering::Acquire))
-            .min()
             .unwrap_or(u64::MAX)
+    }
+
+    /// Drop the forwarder handle if the forwarder task has exited (it was the
+    /// sole remaining ref to the `Arc`).
+    fn prune_dead_forwarder(&mut self) {
+        if matches!(&self.forwarder, Some(p) if Arc::strong_count(p) == 1) {
+            self.forwarder = None;
+        }
     }
 
     /// High-water backlog bound (spec §6, MAJOR — disconnect-before-gap).
     ///
     /// The floor ([`compaction_floor`]) is a HARD ceiling, so a slow/paused
-    /// forwarder (e.g. a backgrounded GUI owner under macOS App Nap that stops
-    /// draining its socket) pins `min(sent_seq)` and prevents the trim from
-    /// firing, letting the in-memory `Vec` grow without bound. When the backlog
-    /// `tip_seq - floor` crosses [`event_log_high_water`], force-DISCONNECT the
-    /// SLOWEST live forwarder (the one whose `sent_seq == floor`): set its
+    /// forwarder (e.g. a backgrounded GUI under macOS App Nap that stops draining
+    /// its socket) pins `sent_seq` and prevents the trim from firing, letting the
+    /// in-memory `Vec` grow without bound. When the backlog `tip_seq - sent_seq`
+    /// crosses [`event_log_high_water`], force-DISCONNECT the forwarder: set its
     /// `evicted` flag (the forwarder task observes it on its next wake — the
     /// `publish_snapshot` at the end of `push_event` provides that wake — and
-    /// returns, closing its write half) and prune its handle from `forwarders`
-    /// HERE so it immediately drops out of the floor `min`. The trim then
-    /// proceeds and growth is bounded.
+    /// returns, closing its write half) and drop its handle HERE so it
+    /// immediately drops out of the floor. The trim then proceeds and growth is
+    /// bounded.
     ///
-    /// This is NOT a silent in-place gap (which §6 forbids for the owner): the
-    /// disconnected client gets a clean EOF, reconnects, and rebuilds from base
-    /// via `resolve_cursor` → `FromBase` (surfacing the `CompactedSummary`
-    /// marker). The owner is therefore NOT exempt — a wedged owner that crosses
-    /// the mark is bounced and reclaims its lease deterministically on reconnect
-    /// (phase-4 same-`client_id` resume). The lease lives in `ManagedSession`
-    /// keyed by `client_id`, independent of the forwarder task, so evicting a
-    /// forwarder does NOT touch or free the lease.
-    ///
-    /// Loops so multiple forwarders past the mark are all evicted in one pass:
-    /// after dropping the slowest, the floor rises to the next-slowest, which may
-    /// itself still be past the bound. No live forwarders → floor is `u64::MAX`,
-    /// the backlog is `0` (saturating), nothing to evict (cap-only mode, spec §6
-    /// "no live subscribers" — floor = tip).
+    /// This is NOT a silent in-place gap (which §6 forbids): the disconnected
+    /// client gets a clean EOF, reconnects, and rebuilds from base via
+    /// `resolve_cursor` → `FromBase` (surfacing the `CompactedSummary` marker).
     fn enforce_high_water(&mut self) {
         use std::sync::atomic::Ordering;
+        self.prune_dead_forwarder();
         let high_water = yalda::event_log::event_log_high_water() as u64;
         let tip = self.event_log.tip_seq();
-        loop {
-            // Prune dead handles, then find the slowest live forwarder.
-            self.forwarders.retain(|p| Arc::strong_count(p) > 1);
-            let Some((slowest_idx, floor)) = self
-                .forwarders
-                .iter()
-                .enumerate()
-                .map(|(i, p)| (i, p.sent_seq.load(Ordering::Acquire)))
-                .min_by_key(|&(_, seq)| seq)
-            else {
-                return; // no live forwarders → cap-only mode, nothing to evict
-            };
-            // Backlog is tip minus the slowest forwarded position. Saturating so a
-            // forwarder somehow ahead of tip can't underflow.
-            let backlog = tip.saturating_sub(floor);
-            if backlog <= high_water {
-                return; // slowest forwarder is within the bound — done
-            }
-            // Force-disconnect the slowest forwarder: flag it (the forwarder task
-            // exits at its next wake) and drop the actor's handle now so the floor
-            // `min` no longer includes it and the trim can proceed.
-            let handle = self.forwarders.swap_remove(slowest_idx);
-            handle.evicted.store(true, Ordering::Release);
-            tracing::warn!(
-                session_id = %&self.id[..8.min(self.id.len())],
-                backlog,
-                high_water,
-                "high-water disconnect: evicting slowest forwarder (sent_seq {floor}) — \
-                 in-memory backlog past threshold (wedged/paused consumer)"
-            );
-            // Loop: the floor rises to the next-slowest, which may still be past
-            // the bound.
+        let Some(handle) = self.forwarder.as_ref() else {
+            return; // no forwarder → cap-only mode, nothing to evict
+        };
+        let floor = handle.sent_seq.load(Ordering::Acquire);
+        // Saturating so a forwarder somehow ahead of tip can't underflow.
+        let backlog = tip.saturating_sub(floor);
+        if backlog <= high_water {
+            return; // forwarder is within the bound — done
         }
+        // Force-disconnect: flag it (the forwarder task exits at its next wake)
+        // and drop the actor's handle now so the floor no longer includes it and
+        // the trim can proceed.
+        handle.evicted.store(true, Ordering::Release);
+        tracing::warn!(
+            session_id = %&self.id[..8.min(self.id.len())],
+            backlog,
+            high_water,
+            "high-water disconnect: evicting forwarder (sent_seq {floor}) — \
+             in-memory backlog past threshold (wedged/paused consumer)"
+        );
+        self.forwarder = None;
     }
 
     /// Phase-8 Stage A (spec §1/§2/§3, ADDITIVE): record the canonical
@@ -727,16 +590,6 @@ impl ManagedSession {
                 );
             }
         }
-    }
-
-    /// Broadcast a `LeaseChanged` to all attached connections by publishing the
-    /// current lease (as the wire [`Lease`]) on the lease watch. Not appended to
-    /// `event_log` — lease state is transient, not transcript. Call ONLY on a
-    /// holder change (acquire / release / promote / sweep), never on a pure
-    /// heartbeat renew, so each transition fires exactly one notification.
-    fn broadcast_lease_changed(&self, now: Instant) {
-        let wire = self.lease.as_ref().map(|l| lease_to_wire(l, now));
-        let _ = self.lease_tx.send_replace(wire);
     }
 
     /// Publish a freshly-spawned channel's `TransportHandle` as this session's
@@ -857,7 +710,6 @@ fn new_managed_session(
         log: event_log.clone(),
         generation: 0,
     });
-    let (lease_tx, _) = watch::channel(None);
     let (gen_watch, _) = watch::channel(0u64);
     ManagedSession {
         id,
@@ -869,9 +721,7 @@ fn new_managed_session(
         turns: 0,
         permission_mode,
         log_tx,
-        forwarders: Vec::new(),
-        lease_tx,
-        lease: None,
+        forwarder: None,
         pending_prompts: Vec::new(),
         event_log,
         replay_fence: 0,
@@ -973,66 +823,31 @@ impl SessionManager {
     async fn send_attach(
         &self,
         sid: &str,
-        mode: AttachMode,
-        client_id: String,
         cursor: Option<(u64, u64)>,
-    ) -> Result<
-        (
-            watch::Receiver<Option<Lease>>,
-            watch::Receiver<LogSnapshot>,
-            u64,
-            ForwarderProgress,
-            bool,
-        ),
-        String,
-    > {
+    ) -> Result<(watch::Receiver<LogSnapshot>, u64, ForwarderProgress), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Attach {
             sid: sid.to_string(),
-            mode,
-            client_id,
             cursor,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
-    async fn send_detach(&self, sid: &str, client_id: String) -> Result<(), String> {
+    async fn send_detach(&self, sid: &str) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Detach {
             sid: sid.to_string(),
-            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
-    async fn send_heartbeat(&self, sid: &str, client_id: String) -> Result<(), String> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        let _ = self.cmd_tx.send(Command::Heartbeat {
-            sid: sid.to_string(),
-            client_id,
-            reply,
-        });
-        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
-    }
-
-    async fn send_promote(&self, sid: &str, client_id: String) -> Result<(), String> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        let _ = self.cmd_tx.send(Command::Promote {
-            sid: sid.to_string(),
-            client_id,
-            reply,
-        });
-        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
-    }
-
-    async fn send_prompt(&self, sid: &str, text: &str, client_id: String) -> Result<(), String> {
+    async fn send_prompt(&self, sid: &str, text: &str) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Prompt {
             sid: sid.to_string(),
             text: text.to_string(),
-            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
@@ -1049,31 +864,28 @@ impl SessionManager {
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
-    async fn send_cancel(&self, sid: &str, client_id: String) -> Result<(), String> {
+    async fn send_cancel(&self, sid: &str) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Cancel {
             sid: sid.to_string(),
-            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
-    async fn send_close(&self, sid: &str, client_id: String) -> Result<(), String> {
+    async fn send_close(&self, sid: &str) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Close {
             sid: sid.to_string(),
-            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
-    async fn send_restart(&self, sid: &str, client_id: String) -> Result<(), String> {
+    async fn send_restart(&self, sid: &str) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Restart {
             sid: sid.to_string(),
-            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
@@ -1093,13 +905,11 @@ impl SessionManager {
         &self,
         sid: &str,
         mode: PermissionMode,
-        client_id: String,
     ) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::SetPermissionMode {
             sid: sid.to_string(),
             mode,
-            client_id,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
@@ -1185,7 +995,6 @@ fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<Re
             log: event_log.clone(),
             generation: 0,
         });
-        let (lease_tx, _) = watch::channel(None);
         let (gen_watch, _) = watch::channel(0u64);
         let session = ManagedSession {
             id: sid.clone(),
@@ -1197,9 +1006,7 @@ fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<Re
             turns: rs.turns,
             permission_mode: rs.permission_mode,
             log_tx,
-            forwarders: Vec::new(),
-            lease_tx,
-            lease: None,
+            forwarder: None,
             pending_prompts: Vec::new(),
             event_log,
             replay_fence: rs.turns,
@@ -1298,28 +1105,10 @@ async fn run_manager(
         cmd_tx,
         spawner,
     };
-    // Phase 4: the loop also drives a periodic lease sweep. The sweep is a
-    // PROACTIVE side-effect only (lazy expiry in every gate/attach already
-    // governs who-may-act); its job is to emit `LeaseChanged{None}` within
-    // ~`LEASE_SWEEP_INTERVAL` so an idle observing candidate learns a crashed
-    // owner's lease freed. Keeping it INSIDE this select preserves the
-    // single-writer invariant (ADR-0012): `apply`/`sweep` are the only mutators
-    // and they never run concurrently. (Do NOT spawn a second task touching the
-    // map.)
-    let mut sweep = tokio::time::interval(LEASE_SWEEP_INTERVAL);
-    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            maybe_cmd = rx.recv() => {
-                match maybe_cmd {
-                    Some(cmd) => mgr.apply(cmd),
-                    None => break, // inlet closed: shutdown
-                }
-            }
-            _ = sweep.tick() => {
-                mgr.sweep_expired_leases();
-            }
-        }
+    // Single-writer actor (ADR-0012): drain the inlet one command at a time;
+    // `apply` is the only mutator of the session map.
+    while let Some(cmd) = rx.recv().await {
+        mgr.apply(cmd);
     }
 }
 
@@ -1335,43 +1124,14 @@ impl Manager {
                 let info = self.do_create(cwd, label, resume_session_id);
                 let _ = reply.send(info);
             }
-            Command::Attach {
-                sid,
-                mode,
-                client_id,
-                cursor,
-                reply,
-            } => {
-                let _ = reply.send(self.do_attach(&sid, mode, &client_id, cursor));
+            Command::Attach { sid, cursor, reply } => {
+                let _ = reply.send(self.do_attach(&sid, cursor));
             }
-            Command::Detach {
-                sid,
-                client_id,
-                reply,
-            } => {
-                let _ = reply.send(self.do_detach(&sid, &client_id));
+            Command::Detach { sid, reply } => {
+                let _ = reply.send(self.do_detach(&sid));
             }
-            Command::Heartbeat {
-                sid,
-                client_id,
-                reply,
-            } => {
-                let _ = reply.send(self.do_heartbeat(&sid, &client_id));
-            }
-            Command::Promote {
-                sid,
-                client_id,
-                reply,
-            } => {
-                let _ = reply.send(self.do_promote(&sid, &client_id));
-            }
-            Command::Prompt {
-                sid,
-                text,
-                client_id,
-                reply,
-            } => {
-                let _ = reply.send(self.do_prompt(&sid, &text, &client_id));
+            Command::Prompt { sid, text, reply } => {
+                let _ = reply.send(self.do_prompt(&sid, &text));
             }
             Command::AdminPrompt {
                 session_id,
@@ -1381,37 +1141,20 @@ impl Manager {
                 // Ungated: enqueue directly, no owner check (ADR-0015).
                 let _ = reply.send(self.enqueue_prompt(&session_id, &text));
             }
-            Command::Cancel {
-                sid,
-                client_id,
-                reply,
-            } => {
-                let _ = reply.send(self.do_cancel(&sid, &client_id));
+            Command::Cancel { sid, reply } => {
+                let _ = reply.send(self.do_cancel(&sid));
             }
-            Command::Close {
-                sid,
-                client_id,
-                reply,
-            } => {
-                let _ = reply.send(self.do_close(&sid, &client_id));
+            Command::Close { sid, reply } => {
+                let _ = reply.send(self.do_close(&sid));
             }
-            Command::Restart {
-                sid,
-                client_id,
-                reply,
-            } => {
-                let _ = reply.send(self.do_restart(&sid, &client_id));
+            Command::Restart { sid, reply } => {
+                let _ = reply.send(self.do_restart(&sid));
             }
             Command::Rename { sid, label, reply } => {
                 let _ = reply.send(self.do_rename(&sid, label));
             }
-            Command::SetPermissionMode {
-                sid,
-                mode,
-                client_id,
-                reply,
-            } => {
-                let _ = reply.send(self.do_set_permission_mode(&sid, mode, &client_id));
+            Command::SetPermissionMode { sid, mode, reply } => {
+                let _ = reply.send(self.do_set_permission_mode(&sid, mode));
             }
             Command::ListSessions { reply } => {
                 let _ = reply.send(self.sessions.values().map(|s| s.info()).collect());
@@ -1609,10 +1352,9 @@ impl Manager {
         info
     }
 
-    fn do_close(&mut self, session_id: &str, client_id: &str) -> Result<(), String> {
-        let now = Instant::now();
+    fn do_close(&mut self, session_id: &str) -> Result<(), String> {
         match self.sessions.get(session_id) {
-            Some(s) if holds_lease(s, client_id, now) => {
+            Some(_) => {
                 // Removing the session drops its TransportHandle (prompt_tx
                 // clone). The owning pump observes the close (inlet still open
                 // but no map entry → its generation check / disconnect breaks it)
@@ -1634,7 +1376,6 @@ impl Manager {
                 });
                 Ok(())
             }
-            Some(_) => Err("only the lease holder can close the session".into()),
             None => Err(format!("no such session: {session_id}")),
         }
     }
@@ -1644,43 +1385,13 @@ impl Manager {
     fn do_attach(
         &mut self,
         session_id: &str,
-        mode: AttachMode,
-        client_id: &str,
         cursor: Option<(u64, u64)>,
-    ) -> Result<
-        (
-            watch::Receiver<Option<Lease>>,
-            watch::Receiver<LogSnapshot>,
-            u64,
-            ForwarderProgress,
-            bool,
-        ),
-        String,
-    > {
-        let now = Instant::now();
+    ) -> Result<(watch::Receiver<LogSnapshot>, u64, ForwarderProgress), String> {
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
 
-        // Lease acquire/resume (phase 4). Deterministic — no retry, no error on
-        // contention. Owner mode with a NON-empty client_id may take the lease:
-        //   - free (None)                       -> first-claim
-        //   - same client_id (live OR expired)  -> RESUME (renew / re-grant)
-        //   - different LIVE client_id          -> silent downgrade to Observer
-        // An empty client_id (headless / pre-phase-4) never acquires a lease.
-        // Observer mode never touches the lease. The whole decision is one
-        // synchronous critical section on the single-writer actor: read, the
-        // Instant comparison, and the write share `now` with no await between —
-        // the actor IS the mutual exclusion (no TOCTOU, first-claim-wins).
-        let mut granted_drive = false;
-        if mode == AttachMode::Owner {
-            granted_drive = acquire_or_renew_lease(session, client_id, now);
-            // On refusal: silent downgrade to Observer. Attach still Ok with
-            // full replay; granted_drive stays false.
-        }
-
-        let lease_rx = session.lease_tx.subscribe();
         let log_rx = session.log_tx.subscribe();
 
         // Resolve the reconnect cursor into the forwarder's initial `sent` (a
@@ -1712,113 +1423,37 @@ impl Manager {
         // seq of the FIRST not-yet-sent entry == `log_base + initial_vec_index`.
         let initial_sent_seq = session.event_log.seq_of(initial_vec_index);
 
-        // Register this forwarder's progress handle (Bug 1b): one clone goes to
-        // the forwarder task (returned), one is retained on the session so the
-        // trim floor `min`s over it. Seed it at the initial `sent_seq`. Prune any
-        // dead handles while we're here.
-        session.forwarders.retain(|p| Arc::strong_count(p) > 1);
+        // Register the single forwarder's progress handle (Bug 1b): one clone
+        // goes to the forwarder task (returned), one is retained on the session
+        // so the trim floor sees it. Seed it at the initial `sent_seq`. Strict
+        // 1:1: a fresh attach replaces any prior forwarder handle (a reconnect
+        // before the old forwarder task noticed EOF) — the old task drains and
+        // exits on its own.
         let progress: ForwarderProgress = Arc::new(ForwarderHandle::new(initial_sent_seq));
-        session.forwarders.push(Arc::clone(&progress));
+        session.forwarder = Some(Arc::clone(&progress));
 
-        Ok((lease_rx, log_rx, initial_sent_seq, progress, granted_drive))
+        Ok((log_rx, initial_sent_seq, progress))
     }
 
-    /// Renew a held lease (phase 4). Same-`client_id` live → push expiry (no
-    /// LeaseChanged, holder unchanged); same-`client_id` but expired/free →
-    /// lazy re-grant; otherwise the caller no longer holds the lease → Err so
-    /// the GUI re-attaches (resumes-or-observes).
-    fn do_heartbeat(&mut self, session_id: &str, client_id: &str) -> Result<(), String> {
-        let now = Instant::now();
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or_else(|| format!("no such session: {session_id}"))?;
-        match &session.lease {
-            Some(l) if l.client_id == client_id => {
-                // Live OR expired but same id: renew/re-grant in place. The
-                // holder is unchanged (a lazy re-grant of an expired-but-same
-                // lease is still the same holder), so NO LeaseChanged is emitted.
-                session.lease = Some(LeaseState {
-                    client_id: client_id.to_string(),
-                    expires_at: now + lease_ttl(),
-                });
-                Ok(())
-            }
-            _ => Err("lease lost".into()),
-        }
-    }
-
-    fn do_promote(&mut self, session_id: &str, client_id: &str) -> Result<(), String> {
-        if client_id.is_empty() {
-            return Err("promote requires a client identity".into());
-        }
-        let now = Instant::now();
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or_else(|| format!("no such session: {session_id}"))?;
-        // Claim if free, expired, or already ours (idempotent). A different
-        // LIVE holder blocks promote (blue-green invariant: a candidate may
-        // only take over once the original releases / its lease lapses).
-        let claim = match &session.lease {
-            None => true,
-            Some(l) if l.client_id == client_id => true,
-            Some(l) if l.expires_at <= now => true,
-            Some(_) => false,
-        };
-        if claim {
-            let changed_holder =
-                session.lease.as_ref().map(|l| l.client_id.as_str()) != Some(client_id);
-            session.lease = Some(LeaseState {
-                client_id: client_id.to_string(),
-                expires_at: now + lease_ttl(),
-            });
-            if changed_holder {
-                session.broadcast_lease_changed(now);
-            }
-            Ok(())
-        } else {
-            Err("session still leased by another GUI".into())
-        }
-    }
-
-    fn do_detach(&mut self, session_id: &str, client_id: &str) -> Result<(), String> {
-        let now = Instant::now();
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or_else(|| format!("no such session: {session_id}"))?;
-        // EXPLICIT detach = clean handoff: release the lease immediately so a
-        // deliberate blue-green handoff doesn't wait the full TTL. (Socket-EOF
-        // detach does NOT clear the lease — see `detach_on_disconnect`.) Only
-        // the holder may release.
-        if matches!(&session.lease, Some(l) if l.client_id == client_id) {
-            session.lease = None;
-            session.broadcast_lease_changed(now);
+    fn do_detach(&mut self, session_id: &str) -> Result<(), String> {
+        // Detaching the single client tears down its forwarder (the connection
+        // handler aborts the task); the session and agent keep running. Drop the
+        // actor's forwarder handle so the trim is no longer floored by a
+        // departing subscriber.
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.forwarder = None;
         }
         Ok(())
     }
 
-    fn do_prompt(&mut self, session_id: &str, text: &str, client_id: &str) -> Result<(), String> {
-        {
-            let now = Instant::now();
-            let session = self
-                .sessions
-                .get_mut(session_id)
-                .ok_or_else(|| format!("no such session: {session_id}"))?;
-            if !acquire_or_renew_lease(session, client_id, now) {
-                return Err("another window holds this session's lease".into());
-            }
-        }
+    fn do_prompt(&mut self, session_id: &str, text: &str) -> Result<(), String> {
         self.enqueue_prompt(session_id, text)
     }
 
-    /// Owner-gate-free core of the prompt path: log the user's prompt durably,
-    /// then hand it to the live channel (or queue it if the agent is still
-    /// spawning). Used by both the owner-gated [`do_prompt`] and the ungated
-    /// headless [`Command::AdminPrompt`] path (ADR-0015). The ONLY difference
-    /// between the two is the owner check; everything that makes a prompt
-    /// durable + drives the turn lives here.
+    /// Log the user's prompt durably, then hand it to the live channel (or queue
+    /// it if the agent is still spawning). Shared by the GUI [`do_prompt`] path
+    /// and the headless [`Command::AdminPrompt`] path (ADR-0015) — under strict
+    /// 1:1 there is no owner gate, so the two are identical.
     fn enqueue_prompt(&mut self, session_id: &str, text: &str) -> Result<(), String> {
         let session = self
             .sessions
@@ -1848,31 +1483,23 @@ impl Manager {
         }
     }
 
-    fn do_cancel(&mut self, session_id: &str, client_id: &str) -> Result<(), String> {
-        let now = Instant::now();
+    fn do_cancel(&mut self, session_id: &str) -> Result<(), String> {
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if !acquire_or_renew_lease(session, client_id, now) {
-            return Err("another window holds this session's lease; cancel refused".into());
-        }
         if let Some(channel) = session.channel.as_ref() {
             channel.cancel();
         }
         Ok(())
     }
 
-    fn do_restart(&mut self, session_id: &str, client_id: &str) -> Result<(), String> {
+    fn do_restart(&mut self, session_id: &str) -> Result<(), String> {
         let (cwd, resume_id) = {
-            let now = Instant::now();
             let session = self
                 .sessions
                 .get_mut(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
-            if !acquire_or_renew_lease(session, client_id, now) {
-                return Err("another window holds this session's lease; restart refused".into());
-            }
             let resume = session.channel.as_ref().and_then(|c| c.session_id());
             (session.cwd.clone(), resume)
         };
@@ -1929,16 +1556,11 @@ impl Manager {
         &mut self,
         session_id: &str,
         mode: PermissionMode,
-        client_id: &str,
     ) -> Result<(), String> {
-        let now = Instant::now();
         let session = self
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("no such session: {session_id}"))?;
-        if !acquire_or_renew_lease(session, client_id, now) {
-            return Err("another window holds this session's lease; mode change refused".into());
-        }
         session.permission_mode = mode;
         if let Some(channel) = &session.channel {
             channel.set_permission_mode(mode);
@@ -1947,7 +1569,6 @@ impl Manager {
     }
 
     fn do_admin_status(&self) -> AdminSnapshot {
-        let now = Instant::now();
         let infos = self
             .sessions
             .values()
@@ -1955,14 +1576,6 @@ impl Manager {
                 session_id: s.id.clone(),
                 label: s.label.clone(),
                 connected: s.channel.is_some(),
-                has_owner: s.is_leased(now),
-                // Only report a LIVE lease as the holder; a held-but-expired
-                // lease reads as unleased (lazy expiry), matching has_owner.
-                lease_holder: s
-                    .lease
-                    .as_ref()
-                    .filter(|l| l.expires_at > now)
-                    .map(|l| lease_to_wire(l, now)),
                 turns: s.turns,
                 event_log_len: s.event_log.len(),
                 log_base: s.event_log.log_base(),
@@ -1976,77 +1589,6 @@ impl Manager {
             sessions: infos,
         }
     }
-
-    /// Periodic sweep (phase 4): clear every expired lease and emit
-    /// `LeaseChanged{None}` so an idle observing candidate learns a crashed
-    /// owner's lease freed within ~`LEASE_SWEEP_INTERVAL`. This is a PROACTIVE
-    /// side-effect only — lazy expiry in the gates already governs who-may-act,
-    /// so correctness does not depend on this running on time. Stays on the
-    /// single-writer actor task (called from the run_manager select), so it
-    /// never races `apply` (ADR-0012).
-    fn sweep_expired_leases(&mut self) {
-        let now = Instant::now();
-        for s in self.sessions.values_mut() {
-            if matches!(&s.lease, Some(l) if l.expires_at <= now) {
-                s.lease = None;
-                s.broadcast_lease_changed(now);
-            }
-        }
-    }
-}
-
-/// Whether `session` is currently leased to `client_id` and that lease has not
-/// expired at `now`. The single gate predicate applied identically at every
-/// write verb (prompt / cancel / restart / set-permission / close). An empty
-/// `client_id` never holds a lease. Lazy expiry: an expired lease fails the
-/// gate even before a sweep clears it.
-fn holds_lease(session: &ManagedSession, client_id: &str, now: Instant) -> bool {
-    !client_id.is_empty() && matches!(&session.lease, Some(l) if l.is_live_for(client_id, now))
-}
-
-/// Deterministic lease acquire-or-renew, shared by Owner attach and the
-/// user-action gates (prompt / cancel / permission-mode / restart):
-///
-///   - free (`None`)                       → first-claim
-///   - same `client_id` (live OR expired)  → resume (renew in place)
-///   - different EXPIRED `client_id`       → claim (holder is gone)
-///   - different LIVE `client_id`          → refuse
-///
-/// A user action is at least as good a liveness proof as a heartbeat
-/// ("ownership follows action", the same way attach makes ownership follow
-/// focus). The strict [`holds_lease`] gate made an App-Napped owner's first
-/// post-wake action race the 5s heartbeat reclaim: the lease had expired (and
-/// usually been swept to `None`), so the action was refused — silently, for
-/// fire-and-forget requests like prompt. That was the "messages sent mid-turn
-/// are dropped" bug; with this gate the action itself reclaims the lease.
-///
-/// On success renews the TTL; broadcasts `LeaseChanged` ONLY on a holder
-/// change (never a pure same-id renew), so each transition fires exactly one
-/// notification. An empty `client_id` always refuses (headless callers hold
-/// no lease — they use the ungated admin paths). Runs on the single-writer
-/// actor, so read + decide + write share `now` with no await between.
-fn acquire_or_renew_lease(session: &mut ManagedSession, client_id: &str, now: Instant) -> bool {
-    if client_id.is_empty() {
-        return false;
-    }
-    let acquire = match &session.lease {
-        None => true,                                // free
-        Some(l) if l.client_id == client_id => true, // same id -> resume
-        Some(l) if l.expires_at <= now => true,      // prior holder expired
-        Some(_) => false,                            // different live id
-    };
-    if acquire {
-        let changed_holder =
-            session.lease.as_ref().map(|l| l.client_id.as_str()) != Some(client_id);
-        session.lease = Some(LeaseState {
-            client_id: client_id.to_string(),
-            expires_at: now + lease_ttl(),
-        });
-        if changed_holder {
-            session.broadcast_lease_changed(now);
-        }
-    }
-    acquire
 }
 
 // ── Session pump task ──────────────────────────────────────────────
@@ -2416,17 +1958,9 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 }
             }
 
-            Request::Attach {
-                session_id,
-                mode,
-                client_id,
-                cursor,
-            } => {
-                match manager
-                    .send_attach(&session_id, mode, client_id, cursor)
-                    .await
-                {
-                    Ok((lease_rx, log_rx, initial_sent_seq, progress, granted_drive)) => {
+            Request::Attach { session_id, cursor } => {
+                match manager.send_attach(&session_id, cursor).await {
+                    Ok((log_rx, initial_sent_seq, progress)) => {
                         // `initial_sent_seq` is the actor-resolved tail start as a
                         // LOGICAL seq (Bug 1a): the seq of the first not-yet-sent
                         // entry. `log_base` for a from-replay attach (so the first
@@ -2443,38 +1977,26 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                         );
                         let w = Arc::clone(&writer);
                         let handle = tokio::spawn(forward_notifications(
-                            Arc::clone(&manager),
                             session_id.clone(),
                             w,
-                            lease_rx,
                             log_rx,
                             initial_sent_seq,
                             progress,
                         ));
                         subscribed.insert(session_id, handle);
-                        // Phase 4: tell the client its role explicitly so it
-                        // never has to infer ownership from an error string.
                         Response::Ok {
-                            data: ResponseData::Attached {
-                                driver: granted_drive,
-                            },
+                            data: ResponseData::Attached,
                         }
                     }
                     Err(e) => Response::Error { message: e },
                 }
             }
 
-            Request::Detach {
-                session_id,
-                client_id,
-            } => {
+            Request::Detach { session_id } => {
                 if let Some(handle) = subscribed.remove(&session_id) {
                     handle.abort();
                 }
-                // Explicit Detach with the holder's client_id releases the lease
-                // immediately (clean handoff). An empty id just tears down the
-                // forwarder without touching the lease.
-                match manager.send_detach(&session_id, client_id).await {
+                match manager.send_detach(&session_id).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },
@@ -2482,61 +2004,41 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 }
             }
 
-            Request::Heartbeat {
-                session_id,
-                client_id,
-            } => match manager.send_heartbeat(&session_id, client_id).await {
-                Ok(()) => Response::Ok {
-                    data: ResponseData::Ack,
-                },
-                Err(e) => Response::Error { message: e },
-            },
-
-            Request::Promote {
-                session_id,
-                client_id,
-            } => match manager.send_promote(&session_id, client_id).await {
-                Ok(()) => Response::Ok {
-                    data: ResponseData::Ack,
-                },
-                Err(e) => Response::Error { message: e },
-            },
-
-            Request::Prompt {
-                session_id,
-                text,
-                client_id,
-            } => match manager.send_prompt(&session_id, &text, client_id).await {
-                Ok(()) => Response::Ok {
-                    data: ResponseData::Ack,
-                },
-                Err(e) => {
-                    // The client's `prompt()` is fire-and-forget, so this
-                    // `Response::Error` has no waiter — without more, a
-                    // refused prompt is INVISIBLE while the GUI renders its
-                    // optimistic echo. Surface the rejection on this
-                    // connection's notification stream (transient, never
-                    // recorded — same channel discipline as LeaseChanged) so
-                    // the GUI can tell the user and offer the text back.
-                    tracing::warn!(
-                        session_id = %&session_id[..8.min(session_id.len())],
-                        reason = %e,
-                        "prompt rejected — notifying submitter"
-                    );
-                    let frame = Frame::Notification {
-                        note: Notification::PromptRejected {
-                            session_id: session_id.clone(),
-                            reason: e.clone(),
-                            text,
-                        },
-                    };
-                    if let Ok(mut line) = serde_json::to_string(&frame) {
-                        line.push('\n');
-                        let _ = writer.lock().await.write_all(line.as_bytes()).await;
+            Request::Prompt { session_id, text } => {
+                match manager.send_prompt(&session_id, &text).await {
+                    Ok(()) => Response::Ok {
+                        data: ResponseData::Ack,
+                    },
+                    Err(e) => {
+                        // The client's `prompt()` is fire-and-forget, so this
+                        // `Response::Error` has no waiter — without more, a
+                        // refused prompt is INVISIBLE while the GUI renders its
+                        // optimistic echo. Surface the rejection on this
+                        // connection's notification stream (transient, never
+                        // recorded) so the GUI can tell the user and offer the
+                        // text back. (Under strict 1:1 a prompt is no longer
+                        // owner-gated, so this path now only fires on a genuine
+                        // send failure / missing session, not on contention.)
+                        tracing::warn!(
+                            session_id = %&session_id[..8.min(session_id.len())],
+                            reason = %e,
+                            "prompt rejected — notifying submitter"
+                        );
+                        let frame = Frame::Notification {
+                            note: Notification::PromptRejected {
+                                session_id: session_id.clone(),
+                                reason: e.clone(),
+                                text,
+                            },
+                        };
+                        if let Ok(mut line) = serde_json::to_string(&frame) {
+                            line.push('\n');
+                            let _ = writer.lock().await.write_all(line.as_bytes()).await;
+                        }
+                        Response::Error { message: e }
                     }
-                    Response::Error { message: e }
                 }
-            },
+            }
 
             Request::AdminPrompt { session_id, text } => {
                 match manager.send_admin_prompt(&session_id, &text).await {
@@ -2547,48 +2049,36 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 }
             }
 
-            Request::Cancel {
-                session_id,
-                client_id,
-            } => match manager.send_cancel(&session_id, client_id).await {
+            Request::Cancel { session_id } => match manager.send_cancel(&session_id).await {
                 Ok(()) => Response::Ok {
                     data: ResponseData::Ack,
                 },
                 Err(e) => Response::Error { message: e },
             },
 
-            Request::RestartSession {
-                session_id,
-                client_id,
-            } => match manager.send_restart(&session_id, client_id).await {
-                Ok(()) => Response::Ok {
-                    data: ResponseData::Ack,
-                },
-                Err(e) => Response::Error { message: e },
-            },
+            Request::RestartSession { session_id } => {
+                match manager.send_restart(&session_id).await {
+                    Ok(()) => Response::Ok {
+                        data: ResponseData::Ack,
+                    },
+                    Err(e) => Response::Error { message: e },
+                }
+            }
 
-            Request::SetPermissionMode {
-                session_id,
-                mode,
-                client_id,
-            } => match manager
-                .send_set_permission_mode(&session_id, mode, client_id)
-                .await
-            {
-                Ok(()) => Response::Ok {
-                    data: ResponseData::Ack,
-                },
-                Err(e) => Response::Error { message: e },
-            },
+            Request::SetPermissionMode { session_id, mode } => {
+                match manager.send_set_permission_mode(&session_id, mode).await {
+                    Ok(()) => Response::Ok {
+                        data: ResponseData::Ack,
+                    },
+                    Err(e) => Response::Error { message: e },
+                }
+            }
 
-            Request::CloseSession {
-                session_id,
-                client_id,
-            } => {
+            Request::CloseSession { session_id } => {
                 if let Some(handle) = subscribed.remove(&session_id) {
                     handle.abort();
                 }
-                match manager.send_close(&session_id, client_id).await {
+                match manager.send_close(&session_id).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },
@@ -2636,39 +2126,30 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
         subscribed.len(),
     );
 
-    // Connection closed (socket EOF) — tear down the forwarders, but do NOT
-    // release any lease. Under the phase-4 lease model the lease keys on the
-    // STABLE client_id, not this ephemeral connection, and EOF deliberately
-    // "starts the clock": the lease is left to expire on its TTL so a fast
-    // same-client_id reconnect resumes with zero contention (the race the old
-    // attach_owner_with_retry masked). A *clean* handoff uses an explicit
-    // Request::Detach carrying the holder's client_id (do_detach releases now);
-    // a crash/close frees the lease only when the TTL lapses (then the sweep
-    // broadcasts LeaseChanged{None} so a candidate can promote). Passing the
-    // empty client_id here makes send_detach a lease no-op.
+    // Connection closed (socket EOF) — tear down this client's forwarder. The
+    // session and its agent keep running with no client attached (strict 1:1);
+    // a later Attach resumes from the durable `event_log`. `send_detach` drops
+    // the actor's forwarder handle so the trim is no longer floored by a gone
+    // subscriber.
     for (sid, handle) in &subscribed {
         handle.abort();
-        let _ = manager.send_detach(sid, String::new()).await;
+        let _ = manager.send_detach(sid).await;
     }
     manager_events.abort();
 }
 
-/// Forward a session's notifications to one GUI connection's writer.
+/// Forward a session's notifications to the single attached GUI connection's
+/// writer (strict 1:1).
 ///
-/// **Source of truth is `event_log`, not the broadcast.** The broadcast
-/// channel is used only as a wake signal: on any wake (including a `Lagged`
-/// overflow) we re-read `event_log[sent..]` and forward whatever the client
-/// hasn't seen. This makes a slow/lagging subscriber *self-healing* — it can
-/// never permanently lose transcript content the way the old "forward the
-/// broadcast payload and drop on Lagged" path did (that was the source of the
-/// `fingerLet`-style merge artifacts). The first tail pass (`sent == 0`) also
-/// subsumes the attach-time replay, so history and live stream share one
-/// ordered path with no replay/live seam.
+/// **Source of truth is `event_log`, not the broadcast.** The watch channel is
+/// used only as a wake signal: on any wake we re-read `event_log[sent..]` and
+/// forward whatever the client hasn't seen. This makes a slow/lagging
+/// subscriber *self-healing* — it can never permanently lose transcript content.
+/// The first tail pass (`sent == 0`) also subsumes the attach-time replay, so
+/// history and live stream share one ordered path with no replay/live seam.
 async fn forward_notifications(
-    _manager: Arc<SessionManager>,
     session_id: ServerSessionId,
     writer: Arc<tokio::sync::Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    mut lease_rx: watch::Receiver<Option<Lease>>,
     mut log_rx: watch::Receiver<LogSnapshot>,
     initial_sent_seq: u64,
     progress: ForwarderProgress,
@@ -2702,13 +2183,12 @@ async fn forward_notifications(
         progress: &ForwarderProgress,
     ) -> bool {
         // High-water disconnect (spec §6): the actor set `evicted` because this
-        // forwarder is the slowest and its backlog crossed the high-water bound.
-        // Shut down the write half so the CLIENT sees a clean EOF and does a
-        // from-base reconnect (NOT a silent gap) — merely returning would only
-        // stop this forwarder task while the connection's read loop kept the
-        // socket open (a wedged owner under App Nap would never notice). The
-        // progress handle drops on return, falling out of the trim-floor `min`
-        // (the actor already pruned it from `forwarders`, so the trim resumed).
+        // forwarder's backlog crossed the high-water bound. Shut down the write
+        // half so the CLIENT sees a clean EOF and does a from-base reconnect
+        // (NOT a silent gap) — merely returning would only stop this forwarder
+        // task while the connection's read loop kept the socket open (a wedged
+        // GUI under App Nap would never notice). The progress handle drops on
+        // return (the actor already cleared `forwarder`, so the trim resumed).
         if progress.evicted.load(Ordering::Acquire) {
             tracing::warn!(
                 session_id = %&session_id[..8.min(session_id.len())],
@@ -2746,72 +2226,24 @@ async fn forward_notifications(
         }
     }
 
-    // Once the control (LeaseChanged) channel closes, stop selecting on it so
-    // a closed broadcast doesn't busy-loop; keep serving the transcript log.
-    let mut lease_open = true;
-
     loop {
-        tokio::select! {
-            // Transcript log channel: a new snapshot was published. Tail the
-            // latest snapshot lock-free from the cloned snapshot — no manager
-            // lock in the hot path. Coalesced wakes self-heal: we always
-            // re-resolve `sent_seq` against the latest published `log_base`.
-            changed = log_rx.changed() => {
-                match changed {
-                    Ok(()) => {
-                        let snap = log_rx.borrow_and_update().clone();
-                        if !tail_snapshot(&snap, &writer, &session_id, &mut sent_seq, &progress).await {
-                            return;
-                        }
-                    }
-                    Err(_) => {
-                        // Sender dropped (session closing). One final tail of
-                        // the last snapshot, then exit.
-                        let snap = log_rx.borrow().clone();
-                        let _ = tail_snapshot(&snap, &writer, &session_id, &mut sent_seq, &progress).await;
-                        return;
-                    }
+        // Transcript log channel: a new snapshot was published. Tail the latest
+        // snapshot lock-free from the cloned snapshot — no manager lock in the
+        // hot path. Coalesced wakes self-heal: we always re-resolve `sent_seq`
+        // against the latest published `log_base`.
+        match log_rx.changed().await {
+            Ok(()) => {
+                let snap = log_rx.borrow_and_update().clone();
+                if !tail_snapshot(&snap, &writer, &session_id, &mut sent_seq, &progress).await {
+                    return;
                 }
             }
-
-            // Control channel: lease state (watch<Option<Lease>>). On change,
-            // synthesize a single `LeaseChanged` control note and forward it —
-            // the only control note, never logged. The watch already holds the
-            // WIRE Lease form, so no conversion happens here.
-            changed = lease_rx.changed(), if lease_open => {
-                match changed {
-                    Ok(()) => {
-                        let lease = lease_rx.borrow_and_update().clone();
-                        let frame = Frame::Notification {
-                            note: Notification::LeaseChanged {
-                                session_id: session_id.clone(),
-                                lease,
-                            },
-                        };
-                        if let Ok(mut line) = serde_json::to_string(&frame) {
-                            line.push('\n');
-                            let dur = slow_sub_write_timeout();
-                            let mut w = writer.lock().await;
-                            match tokio::time::timeout(dur, w.write_all(line.as_bytes())).await {
-                                Ok(Ok(())) => {}
-                                Ok(Err(_)) => return,
-                                Err(_) => {
-                                    tracing::warn!(
-                                        session_id = %&session_id[..8.min(session_id.len())],
-                                        "slow subscriber: LeaseChanged write stalled >{}ms — disconnecting",
-                                        dur.as_millis()
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Control channel closed: keep serving the transcript
-                        // log channel until IT closes.
-                        lease_open = false;
-                    }
-                }
+            Err(_) => {
+                // Sender dropped (session closing). One final tail of the last
+                // snapshot, then exit.
+                let snap = log_rx.borrow().clone();
+                let _ = tail_snapshot(&snap, &writer, &session_id, &mut sent_seq, &progress).await;
+                return;
             }
         }
     }
