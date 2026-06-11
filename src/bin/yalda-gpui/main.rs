@@ -66,6 +66,7 @@
 //!     q / Esc              close browser (returns to doc, or quits)
 
 mod agent;
+mod agent_sessions;
 mod agent_ui;
 mod browser_ui;
 mod chrome;
@@ -77,6 +78,7 @@ mod screens;
 #[cfg(test)]
 mod verify_harness;
 pub(crate) use agent::*;
+pub(crate) use agent_sessions::*;
 pub(crate) use persist::*;
 pub(crate) use render_blocks::*;
 mod workspace;
