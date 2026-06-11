@@ -36,27 +36,26 @@ work discipline, and the verification-harness plan. Key artifacts:
 - `docs/projects/` — **multi-session project tickets** (see below).
 - `/integrate` — converge parallel branches into one buildable branch.
 
-### Project tickets (`docs/projects/`)
+### Project planning (`docs/projects/`) — skill: `/plan`
 
 Work that spans multiple sessions (a refactor done in stages, a feature with a
-tail of follow-ups) gets a **durable ticket** so it survives context loss. The
-in-session task list (TaskCreate) is the live mirror; the ticket is the record
-that outlives it.
+tail of follow-ups) gets a **durable project record** so it survives context
+loss. The in-session task list (TaskCreate) is the live mirror; these files are
+the record that outlives it. Scaffold and extend them with `/plan`.
 
 ```
-docs/projects/<project-slug>/NNN-ticket-<slug>.md
+docs/projects/<project-slug>/
+  project.md             # standing context: problem/why, goals, scope, the model, tickets table
+  NNN-ticket-<slug>.md   # one actionable task: goal, subtask `- [ ]` checkboxes, verification, links
 ```
 
-A ticket carries: **status** + branch/spec links at the top; **problem** (the
-real root cause, not just symptoms); **decision**; **the model** (diagrams /
-field allocation); **subtasks as `- [ ]` checkboxes** with per-task status and
-blockers; **invariants**; and any cross-session context a fresh agent needs to
-resume cold. Tick the boxes as subtasks land; open `NNN+1` tickets for new
-threads in the same project. Live on `main` (durable regardless of feature
-branches). Example: `docs/projects/agent-model-refactor/001-ticket-refactor-model.md`.
-
-When you start a multi-stage effort, create the ticket first and mirror its
-subtasks into the session task list; keep them in sync as work lands.
+`project.md` is **context, not a task** — the shared understanding every ticket
+assumes (root cause, the model, links, a tickets status table). A ticket is one
+coherent deliverable with subtasks as checkboxes. Litmus: writing "why / the
+model" → `project.md`; writing "do X, then Y" → a ticket. Tick boxes as subtasks
+land and keep the session task list in sync; new threads get a new ticket
+(`NNN+1`), not scope creep. Live on `main`. Example:
+`docs/projects/agent-model-refactor/`.
 
 **Definition of done:** builds + tests + pasted evidence + runtime-checked-or-
 flagged + artifacts updated. "Compiles" is not done. The GPUI app can't be
