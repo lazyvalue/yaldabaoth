@@ -1617,6 +1617,46 @@ pub(crate) fn classify_wp_line(text: &str, in_fence: bool) -> WpLineKind {
     WpLineKind::Paragraph
 }
 
+/// Apply the visual-selection background to one line's segments, handling the
+/// blank / whitespace-only case the raw [`apply_selection_bg`] can't: the
+/// syntax highlighter yields no segments for a whitespace-only line, and a
+/// blank line that sits *inside* a multi-line selection projects to a
+/// zero-width range — so `apply_selection_bg` would paint nothing and the line
+/// reads as an un-highlighted gap. Here we emit an explicit highlighted
+/// placeholder whenever the line is blank and either part of it or its trailing
+/// newline (the selection continuing onto a later line) is selected. Returns
+/// the segments unchanged when the line is outside the selection.
+pub(crate) fn apply_line_selection(
+    segs: &[Segment],
+    line_str: &str,
+    sel: ((usize, usize), (usize, usize)),
+    line_idx: usize,
+    base_style: NStyle,
+    selection_bg: NColor,
+) -> Vec<Segment> {
+    let line_chars = line_str.chars().count();
+    let Some((s, e_col)) = line_selection_range(sel, line_idx, line_chars) else {
+        return segs.to_vec();
+    };
+    if line_str.trim().is_empty() {
+        // Blank / whitespace-only line. Highlight it when any column is
+        // selected (`e_col > s`) or when its newline is — i.e. the selection
+        // continues past this line (`line_idx < end_line`). A blank line that
+        // is merely the zero-width *end* of a selection stays un-highlighted,
+        // matching vim.
+        let newline_selected = line_idx < sel.1.0;
+        if e_col > s || newline_selected {
+            return vec![(" ".to_string(), base_style.bg(selection_bg))];
+        }
+        return segs.to_vec();
+    }
+    if e_col > s {
+        apply_selection_bg(segs, s, e_col, selection_bg)
+    } else {
+        segs.to_vec()
+    }
+}
+
 /// Walk segments char by char, applying `bg` to chars whose column falls in
 /// `[start_col, end_col)`. Output may have more segments than input (a single
 /// styled run can split across the selection boundary). Direct port of

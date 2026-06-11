@@ -1555,3 +1555,47 @@ fn empty_source_file_renders_single_block() {
     let blocks = render_with_wiki("", &Theme::default(), Some(path));
     assert_eq!(blocks.len(), 1);
 }
+
+// --- Visual-selection highlight on blank / whitespace-only lines
+//     (apply_line_selection). A blank line whose newline is inside a
+//     multi-line selection must still render a highlighted placeholder so the
+//     selection reads as continuous; the syntax highlighter yields no segments
+//     for such lines, so apply_selection_bg alone would paint nothing. ---
+
+#[test]
+fn blank_line_inside_selection_gets_highlight_placeholder() {
+    let style = NStyle::default();
+    let bg = NColor::Rgb(1, 2, 3);
+    // Selection covers line 0..=2; line 1 is blank and fully interior.
+    let out = apply_line_selection(&[], "", ((0, 0), (2, 1)), 1, style, bg);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].0, " ");
+    assert_eq!(out[0].1, style.bg(bg), "placeholder carries selection bg");
+}
+
+#[test]
+fn whitespace_only_line_fully_selected_gets_highlight_placeholder() {
+    let style = NStyle::default();
+    let bg = NColor::Rgb(1, 2, 3);
+    // A line of spaces, fully inside the selection (newline also selected).
+    let out = apply_line_selection(&[], "   ", ((0, 0), (2, 0)), 1, style, bg);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].0, " ");
+    assert_eq!(out[0].1, style.bg(bg));
+}
+
+#[test]
+fn blank_line_at_selection_end_is_not_highlighted() {
+    // Selection ends at the start of the blank line (col 0) — its newline is
+    // NOT selected, so it stays un-highlighted (matches vim).
+    let out = apply_line_selection(&[], "", ((0, 0), (1, 0)), 1, NStyle::default(), NColor::Rgb(1, 2, 3));
+    assert!(out.is_empty(), "unchanged empty input → no placeholder");
+}
+
+#[test]
+fn line_outside_selection_is_unchanged() {
+    let style = NStyle::default();
+    let segs = vec![("text".to_string(), style)];
+    let out = apply_line_selection(&segs, "text", ((0, 0), (0, 4)), 3, style, NColor::Rgb(1, 2, 3));
+    assert_eq!(out, segs, "line 3 is outside a line-0 selection");
+}

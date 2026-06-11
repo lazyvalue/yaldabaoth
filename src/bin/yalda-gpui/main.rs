@@ -658,6 +658,12 @@ impl SharedEditor {
         c.line = line;
         c.col = col;
     }
+    /// Replace the character under the cursor (vim `r`). See
+    /// [`EditorView::replace_char_at_cursor`].
+    fn replace_char_at_cursor(&mut self, ch: char) {
+        self.view
+            .replace_char_at_cursor(&mut self.core.borrow_mut(), ch);
+    }
     fn is_modified(&self) -> bool {
         self.core.borrow().document().is_modified()
     }
@@ -1063,6 +1069,10 @@ struct EditState {
     /// caret on-screen) without fighting the user's manual scroll on idle
     /// frames.
     last_cursor_anchor: Option<(u64, usize)>,
+    /// Set after `r` in normal mode: the *next* keypress is consumed as the
+    /// replacement character (vim `r{char}`) rather than a normal-mode action.
+    /// Cleared after that next key (Esc / non-char cancels).
+    pending_replace: bool,
 }
 
 impl EditState {
@@ -1082,6 +1092,7 @@ impl EditState {
             list_state: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(256.0)),
             list_item_count: 0,
             last_cursor_anchor: None,
+            pending_replace: false,
         }
     }
 
