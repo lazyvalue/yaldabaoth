@@ -1,6 +1,6 @@
+use std::path::PathBuf;
 use yalda::cursor::CursorPos;
 use yalda::document::Document;
-use std::path::PathBuf;
 
 fn doc(text: &str) -> Document {
     Document::from_text(text.to_string(), PathBuf::from("test.md"))

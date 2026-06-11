@@ -1,6 +1,6 @@
-use yalda::file_browser::FileBrowser;
 use std::fs;
 use tempfile::TempDir;
+use yalda::file_browser::FileBrowser;
 
 #[test]
 fn test_entries_have_metadata() {

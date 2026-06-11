@@ -1323,12 +1323,14 @@ fn agent_local_n_resolves_to_claude_new() {
 }
 
 #[test]
-fn agent_local_l_resolves_to_claude_list() {
+fn agent_local_c_resolves_to_session_picker() {
+    // The session selector (free-session picker / rebind) lives at `c` in the
+    // Agent local menu (spec-agent-session-ownership.md).
     let mut state = MenuState::new();
     state.open();
     let menu = agent_local_menu();
-    let cmd = state.process_key(KeyPress::new(Key::Char('l'), KMods::NONE), &menu);
-    assert_eq!(cmd, Some("claude-list".to_string()));
+    let cmd = state.process_key(KeyPress::new(Key::Char('c'), KMods::NONE), &menu);
+    assert_eq!(cmd, Some("claude-session-picker".to_string()));
 }
 
 #[test]

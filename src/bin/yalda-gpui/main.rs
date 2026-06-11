@@ -93,8 +93,7 @@ pub(crate) use std::time::Duration;
 
 pub(crate) use gpui::{
     AnyElement, App as GpuiApp, AppContext, Application, Bounds, Context, Element, ElementId,
-    FocusHandle,
-    Focusable, Font, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hsla,
+    FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hsla,
     InspectorElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
     LayoutId, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
@@ -1114,7 +1113,7 @@ impl EditState {
 #[allow(clippy::large_enum_variant)]
 enum App {
     Buffer(BufferApp),
-    Agent(AgentRing),
+    Agent(AgentTile),
 }
 
 impl App {
@@ -1125,6 +1124,7 @@ impl App {
     fn into_buffer_stash(self) -> Option<Box<BufferApp>> {
         match self {
             App::Buffer(buffer) => Some(Box::new(buffer)),
+            // Agent and Buffer are orthogonal — an Agent stashes no buffer.
             App::Agent(_) => None,
         }
     }
@@ -1208,10 +1208,9 @@ struct RenameOverlay {
 
 #[derive(Clone, Copy)]
 enum RenameTarget {
-    /// Claude session — targeted by monotonic `AgentSlot::index` so a
-    /// concurrent `claude-close` on another slot doesn't rename the
-    /// wrong one.
-    AgentSlot { index: usize },
+    /// Claude session — targeted by its stable `SessionId` so a concurrent
+    /// close on another tile can't rename the wrong one.
+    AgentSession { id: SessionId },
     /// Workspace tab — targeted by current tab position. Tab indices
     /// don't shift during the rename's lifetime since the overlay
     /// captures key dispatch (no structural mutations possible mid-
@@ -1221,10 +1220,9 @@ enum RenameTarget {
     /// rooted at the typed path. Empty input cancels (spec-agent-cwd.md
     /// §2 — bare `:claude-new` already exists and uses the process cwd).
     AgentNewSessionCwd,
-    /// Path-input overlay that, on commit, changes the active slot's
-    /// cwd (spec-agent-cwd.md §4). Targeted by monotonic
-    /// `AgentSlot::index`, matching `AgentSlot`'s rule.
-    AgentChangeCwd { index: usize },
+    /// Path-input overlay that, on commit, changes the bound session's
+    /// cwd (spec-agent-cwd.md §4). Targeted by stable `SessionId`.
+    AgentChangeCwd { id: SessionId },
     /// `{cols}x{rows}` input that sets the global desktop-mode tile size
     /// (spec-desktop-mode.md Behavior 6). Clamped to [20, 400] × [5, 200];
     /// unparseable input cancels with a footer hint.
@@ -1451,13 +1449,15 @@ fn edit_local_menu() -> Vec<MenuNode> {
 
 fn agent_local_menu() -> Vec<MenuNode> {
     vec![
+        // The four core agent commands (spec-agent-session-ownership.md).
+        MenuNode::entry("c", "select session", "claude-session-picker"),
+        MenuNode::entry("e", "send message", "claude-send"),
+        MenuNode::entry(".", "stop", "claude-stop"),
+        MenuNode::entry("w", "switch worksheet ⇄ message box", "agent-input-toggle"),
+        MenuNode::separator(),
         MenuNode::entry("n", "new session", "claude-new"),
-        MenuNode::entry("l", "list sessions", "claude-list"),
         MenuNode::entry("x", "close session", "claude-close"),
         MenuNode::entry("r", "rename session", "claude-rename"),
-        MenuNode::separator(),
-        MenuNode::entry("w", "toggle worksheet/chatbox", "agent-input-toggle"),
-        MenuNode::entry("s", "send buffer", "claude-send"),
         MenuNode::entry("S", "send selection", "claude-send-selection"),
         MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
         MenuNode::entry("d", "detach", "claude-detach"),
@@ -1578,6 +1578,11 @@ struct YaldaGpuiView {
     /// connection — every later attach failed with "session server
     /// disconnected".
     _server_pump: Option<Task<()>>,
+    /// THE owner of all agent-session state (spec-agent-session-ownership.md).
+    /// Tiles (`App::Agent(AgentTile)`) hold only a `SessionId` key into this
+    /// store; the store enforces strict 1:1 session↔sid and is the single
+    /// source of truth for session existence (placement is the tiles).
+    sessions: AgentSessions,
 }
 
 impl YaldaGpuiView {
@@ -1627,6 +1632,7 @@ impl YaldaGpuiView {
             _server_pump: None,
             pending_mark_chord: None,
             pending_tag_chord: None,
+            sessions: AgentSessions::new(),
         }
     }
 
@@ -1660,6 +1666,7 @@ impl YaldaGpuiView {
             _server_pump: None,
             pending_mark_chord: None,
             pending_tag_chord: None,
+            sessions: AgentSessions::new(),
         }
     }
 
@@ -1768,8 +1775,7 @@ impl YaldaGpuiView {
                 workspace::LayoutMode::Manual | workspace::LayoutMode::Desktop
             ) {
                 // Retile in-place for automatic-mode tabs.
-                let windows: Vec<workspace::Window<App>> =
-                    workspace::drain_leaves(&mut t.layout);
+                let windows: Vec<workspace::Window<App>> = workspace::drain_leaves(&mut t.layout);
                 if !windows.is_empty() {
                     let focused = t.focused;
                     t.layout = match t.layout_mode {
@@ -1805,13 +1811,16 @@ impl YaldaGpuiView {
         let proc_cwd = process_cwd();
 
         for &leaf_id in leaf_ids {
-            let mut ring = AgentRing::new(None);
+            // Install a fresh (unbound) Agent tile at the leaf first, so the
+            // bind-choke methods (`show_local_session`) target it.
+            self.install_agent_tile(leaf_id, AgentTile::new());
+            self.focus_window_for_restore(leaf_id);
 
             if self.session_server.is_some() {
-                // Session-server path: placeholder + async attach.
-                // Load persisted slots so the placeholder carries the saved
-                // label instead of a hardcoded "claude-1" — the user sees
-                // the right name immediately, even before the server responds.
+                // Session-server path: a local placeholder bound to this tile,
+                // then async list+attach. The persisted label is shown so the
+                // user sees the right name before the server responds. Strict
+                // 1:1: restore only ONE session per tile (the active one).
                 let persisted = load_persisted_acp_sessions(&proc_cwd);
                 let placeholder_label = persisted
                     .iter()
@@ -1819,60 +1828,83 @@ impl YaldaGpuiView {
                     .or(persisted.first())
                     .map(|s| s.label.clone())
                     .unwrap_or_else(|| "claude-1".into());
-                let placeholder =
-                    AgentState::new_server_managed(Some("connecting to session server…".into()));
+                let placeholder = AgentSession {
+                    state: AgentState::new_server_managed(Some(
+                        "connecting to session server…".into(),
+                    )),
+                    label: placeholder_label,
+                    cwd: proc_cwd.clone(),
+                    resume_id: None,
+                };
                 let open_token = alloc_open_token();
-                ring.push(placeholder_label, placeholder, None, proc_cwd.clone(), None);
+                self.show_local_session(placeholder);
                 self.start_server_pump(cx);
-                if let Some(slot) = ring.slots.first_mut() {
-                    slot.pending_open_token = Some(open_token);
-                }
-                // Install the ring, then kick off async attach.
-                for tab in &mut self.workspace.tabs {
-                    if let Some(win) = tab.layout.find_leaf_mut(leaf_id) {
-                        win.content = App::Agent(ring);
-                        break;
-                    }
+                if let Some(tile) = self.agent_tile_mut() {
+                    tile.pending_open_token = Some(open_token);
                 }
                 self.spawn_open_agent_server(open_token, proc_cwd.clone(), cx);
             } else {
-                // Legacy direct-spawn path.
+                // Legacy direct-spawn path. One tile shows one session: restore
+                // the active persisted session (or a fresh claude-1).
                 let persisted = load_persisted_acp_sessions(&proc_cwd);
-                if persisted.is_empty() {
-                    let slot_cwd = proc_cwd.clone();
-                    let session_index = ring.next_index;
-                    let state =
-                        self.create_agent_session(None, slot_cwd.clone(), session_index, cx);
-                    ring.push("claude-1".into(), state, None, slot_cwd, None);
-                } else {
-                    let active_pos = persisted.iter().position(|s| s.active).unwrap_or(0);
-                    for slot in persisted {
+                let chosen = persisted
+                    .iter()
+                    .find(|s| s.active)
+                    .or(persisted.first())
+                    .cloned();
+                let id = match chosen {
+                    None => {
+                        let state = self.create_agent_session(None, proc_cwd.clone(), cx);
+                        self.show_local_session(AgentSession {
+                            state,
+                            label: "claude-1".into(),
+                            cwd: proc_cwd.clone(),
+                            resume_id: None,
+                        })
+                    }
+                    Some(slot) => {
                         let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
-                        let session_index = ring.next_index;
-                        let mut state = self.create_agent_session(
-                            Some(slot.id.clone()),
-                            slot_cwd.clone(),
-                            session_index,
-                            cx,
-                        );
+                        let mut state =
+                            self.create_agent_session(Some(slot.id.clone()), slot_cwd.clone(), cx);
                         if slot.mode == InputModeKind::Worksheet {
                             state.input_surface = InputSurface::Worksheet;
                         }
                         state.tasklist_open = slot.tasklist_open;
                         state.subagents_open = slot.subagents_open;
-                        ring.push(slot.label, state, Some(slot.id), slot_cwd, None);
+                        self.show_local_session(AgentSession {
+                            state,
+                            label: slot.label,
+                            cwd: slot_cwd,
+                            resume_id: Some(slot.id),
+                        })
                     }
-                    ring.active = active_pos.min(ring.slots.len().saturating_sub(1));
-                }
-                for tab in &mut self.workspace.tabs {
-                    if let Some(win) = tab.layout.find_leaf_mut(leaf_id) {
-                        win.content = App::Agent(ring);
-                        break;
-                    }
-                }
+                };
+                self.start_session_pump(id, cx);
             }
         }
         cx.notify();
+    }
+
+    /// Replace the content at `leaf_id` (any tab) with `tile`.
+    fn install_agent_tile(&mut self, leaf_id: workspace::WindowId, tile: AgentTile) {
+        for tab in &mut self.workspace.tabs {
+            if let Some(win) = tab.layout.find_leaf_mut(leaf_id) {
+                win.content = App::Agent(tile);
+                return;
+            }
+        }
+    }
+
+    /// Point the workspace focus at `leaf_id` so the bind-choke methods (which
+    /// act on the FOCUSED tile) target the leaf being restored.
+    fn focus_window_for_restore(&mut self, leaf_id: workspace::WindowId) {
+        for (i, tab) in self.workspace.tabs.iter_mut().enumerate() {
+            if tab.layout.find_leaf(leaf_id).is_some() {
+                tab.focused = leaf_id;
+                self.workspace.active_tab = i;
+                return;
+            }
+        }
     }
 
     /// `Some(doc)` if currently viewing a document, else `None`.
@@ -1898,40 +1930,110 @@ impl YaldaGpuiView {
         }
     }
 
+    /// Mutable `AgentState` for the focused tile's bound session. Reads the
+    /// tile's `bound` (a `Copy` SessionId) FIRST so the workspace borrow ends,
+    /// then routes through the store (spec-agent-session-ownership.md).
     fn agent_mut(&mut self) -> Option<&mut AgentState> {
-        match self
-            .workspace
-            .focused_content_mut()
-            .expect("no focused window")
-        {
-            App::Agent(ring) if !ring.is_empty() => Some(&mut ring.active_mut().state),
-            _ => None,
-        }
+        let id = self.focused_bound_session()?;
+        self.sessions.get_mut(id).map(|s| &mut s.state)
     }
 
-    /// Return the active slot's server session id (cloned), or `None`.
-    fn active_server_session_id(&self) -> Option<String> {
-        self.agent_ring()
-            .and_then(|r| r.slots.get(r.active))
-            .and_then(|s| s.server_session_id.clone())
-    }
-
-    fn agent_ring(&self) -> Option<&AgentRing> {
+    /// The `SessionId` bound to the focused Agent tile, if any. `Copy`, so the
+    /// caller can drop the workspace borrow before touching `self.sessions`.
+    fn focused_bound_session(&self) -> Option<SessionId> {
         match self.workspace.focused_content().expect("no focused window") {
-            App::Agent(ring) => Some(ring),
+            App::Agent(tile) => tile.bound,
             _ => None,
         }
     }
 
-    fn agent_ring_mut(&mut self) -> Option<&mut AgentRing> {
+    /// Return the focused session's server session id (cloned), or `None`.
+    fn active_server_session_id(&self) -> Option<String> {
+        let id = self.focused_bound_session()?;
+        self.sessions.sid_of(id).map(|s| s.to_string())
+    }
+
+    fn agent_tile(&self) -> Option<&AgentTile> {
+        match self.workspace.focused_content().expect("no focused window") {
+            App::Agent(tile) => Some(tile),
+            _ => None,
+        }
+    }
+
+    fn agent_tile_mut(&mut self) -> Option<&mut AgentTile> {
         match self
             .workspace
             .focused_content_mut()
             .expect("no focused window")
         {
-            App::Agent(ring) => Some(ring),
+            App::Agent(tile) => Some(tile),
             _ => None,
         }
+    }
+
+    /// Compute the set of FREE sessions: those in the store that no tile binds
+    /// (spec-agent-session-ownership.md). Cheap scan — tiles are few.
+    fn free_session_ids(&self) -> Vec<SessionId> {
+        let mut bound: HashSet<SessionId> = HashSet::new();
+        for tab in self.workspace.tabs.iter() {
+            tab.layout.for_each_leaf(&mut |w| {
+                if let App::Agent(tile) = &w.content
+                    && let Some(id) = tile.bound
+                {
+                    bound.insert(id);
+                }
+            });
+        }
+        self.sessions
+            .ids()
+            .filter(|id| !bound.contains(id))
+            .collect()
+    }
+
+    /// THE single bind choke (spec-agent-session-ownership.md). Show the
+    /// session for `sid` in the focused tile, creating it via `make` if no
+    /// session already carries that sid. If a session already exists for the
+    /// sid it is FOCUSED (its `bound` reused), never bound twice (INV-1/INV-2).
+    /// Returns the `SessionId` now bound to the focused tile.
+    ///
+    /// This is the choke for paths that know the sid UP FRONT. Paths whose sid
+    /// resolves later (the bind-before-attach flow that the replay routing
+    /// requires) instead go through [`show_local_session`] + [`bind_session_sid`]
+    /// (the store's `bind_sid`), which enforces the same 1:1 invariants.
+    #[allow(dead_code)]
+    fn show_session(
+        &mut self,
+        sid: &str,
+        label: String,
+        cwd: PathBuf,
+        resume_id: Option<String>,
+        make_state: impl FnOnce() -> AgentState,
+    ) -> SessionId {
+        let bind = self.sessions.open_or_focus(sid, |_id| AgentSession {
+            state: make_state(),
+            label,
+            cwd,
+            resume_id,
+        });
+        let id = bind.id();
+        if let Some(tile) = self.agent_tile_mut() {
+            tile.bound = Some(id);
+            tile.picker = None;
+            tile.pending_open_token = None;
+        }
+        id
+    }
+
+    /// Bind a fresh LOCAL (pre-attach) session to the focused tile and return
+    /// its id. Used by the placeholder / direct-spawn paths that don't yet have
+    /// a server sid; `bind_sid_to` later attaches the sid once it resolves.
+    fn show_local_session(&mut self, session: AgentSession) -> SessionId {
+        let id = self.sessions.create_local(|_id| session);
+        if let Some(tile) = self.agent_tile_mut() {
+            tile.bound = Some(id);
+            tile.picker = None;
+        }
+        id
     }
 
     /// Open `path` as a doc. If it's already in a tab, switch to that tab.
@@ -2012,8 +2114,12 @@ impl YaldaGpuiView {
         for (i, tab) in self.workspace.tabs.iter().enumerate() {
             if let workspace::Layout::Leaf(w) = &tab.layout {
                 match &w.content {
-                    App::Buffer(BufferApp::Viewing(d)) if d.file_label.as_ref() == label => return Some(i),
-                    App::Buffer(BufferApp::Editing(e)) if e.file_label.as_ref() == label => return Some(i),
+                    App::Buffer(BufferApp::Viewing(d)) if d.file_label.as_ref() == label => {
+                        return Some(i);
+                    }
+                    App::Buffer(BufferApp::Editing(e)) if e.file_label.as_ref() == label => {
+                        return Some(i);
+                    }
                     _ => {}
                 }
             }
@@ -2410,14 +2516,14 @@ impl YaldaGpuiView {
             self.set_agent_status("session server not active", cx);
             return;
         }
-        let sids: Vec<String> = match self.agent_ring() {
-            Some(r) => r
-                .slots
-                .iter()
-                .filter_map(|s| s.server_session_id.clone())
-                .collect(),
-            None => Vec::new(),
-        };
+        // Collect every server sid in the store (candidate/promote is dormant
+        // under the 1:1 model; lease/driver tracking is gone — spec-agent-
+        // session-ownership.md §"dormant promote").
+        let sids: Vec<String> = self
+            .sessions
+            .ids()
+            .filter_map(|id| self.sessions.sid_of(id).map(|s| s.to_string()))
+            .collect();
         if sids.is_empty() {
             self.set_agent_status("no mirrored sessions to take over", cx);
             return;
@@ -2435,16 +2541,6 @@ impl YaldaGpuiView {
         if failures.is_empty() {
             self.is_candidate = false;
             self.candidate_promote_ready = false;
-            // We now hold the lease on every promoted session. Mark each slot a
-            // driver so the (already-running, unconditionally-spawned) lease
-            // heartbeat begins beating them on its next tick — without this the
-            // freshly-promoted owner would hold the lease but never heartbeat
-            // it, and the server would sweep it ~15s later (owner-gap bug).
-            for sid in &sids {
-                self.for_each_server_session_slot(sid, |slot| {
-                    slot.is_driver = true;
-                });
-            }
             self.set_agent_status(
                 &format!("took over {} session(s) — you now own them", sids.len()),
                 cx,
@@ -2708,22 +2804,13 @@ impl YaldaGpuiView {
             return;
         }
         // Find the active editor + mode. Chatbox takes priority in chatbox mode.
-        let pasted = match self.workspace.focused_content_mut() {
-            Some(App::Buffer(BufferApp::Editing(e))) => {
-                if e.mode == EditMode::Insert {
-                    for ch in text.chars() {
-                        e.editor.insert_char(ch);
-                    }
-                    true
-                } else {
-                    false
-                }
-            }
-            // `get_mut` (not `active_mut`) so an empty ring — the session
-            // picker — is a no-op rather than an out-of-bounds panic.
-            Some(App::Agent(ring)) => match ring.slots.get_mut(ring.active) {
-                Some(slot) => {
-                    let c = &mut slot.state;
+        // Agent tiles route through `self.sessions`, so read the bound id first
+        // and drop the workspace borrow before touching the store.
+        let agent_bound = self.focused_bound_session();
+        let pasted = if let Some(id) = agent_bound {
+            match self.sessions.get_mut(id) {
+                Some(session) => {
+                    let c = &mut session.state;
                     if c.input_surface.is_chatbox() {
                         if let Some(cb) = c.input_surface.chatbox_mut() {
                             if cb.mode == EditMode::Insert {
@@ -2747,8 +2834,21 @@ impl YaldaGpuiView {
                     }
                 }
                 None => false,
-            },
-            _ => false,
+            }
+        } else {
+            match self.workspace.focused_content_mut() {
+                Some(App::Buffer(BufferApp::Editing(e))) => {
+                    if e.mode == EditMode::Insert {
+                        for ch in text.chars() {
+                            e.editor.insert_char(ch);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
         };
         if pasted {
             cx.notify();
@@ -2767,13 +2867,11 @@ impl YaldaGpuiView {
             Self::yank_to_clipboard(&text);
             return;
         }
-        // Edit / Agent views: copy editor selection.
-        let text = match self.workspace.focused_content() {
-            Some(App::Buffer(BufferApp::Editing(e))) => e.editor.selection_text(),
-            // `get` (not `active()`) so the empty-ring session picker yields
-            // no selection rather than panicking.
-            Some(App::Agent(ring)) => ring.slots.get(ring.active).and_then(|slot| {
-                let c = &slot.state;
+        // Edit / Agent views: copy editor selection. Agent sessions live in
+        // the store, so resolve the bound id first.
+        let text = if let Some(id) = self.focused_bound_session() {
+            self.sessions.get(id).and_then(|session| {
+                let c = &session.state;
                 if c.input_surface.is_chatbox() {
                     c.input_surface
                         .chatbox()
@@ -2781,8 +2879,12 @@ impl YaldaGpuiView {
                 } else {
                     c.editor.selection_text()
                 }
-            }),
-            _ => None,
+            })
+        } else {
+            match self.workspace.focused_content() {
+                Some(App::Buffer(BufferApp::Editing(e))) => e.editor.selection_text(),
+                _ => None,
+            }
         };
         if let Some(t) = text
             && !t.is_empty()
@@ -2800,17 +2902,14 @@ impl YaldaGpuiView {
     /// lingering child agents have been observed at exit. Called from
     /// `on_app_quit` in `main`.
     fn shutdown_acp(&mut self) {
-        // Walk every Claude window in every tab and drop its channel so the
-        // worker thread shuts down its child agent before GPUI's window
-        // teardown races with us.
-        for tab in self.workspace.tabs.iter_mut() {
-            tab.layout.for_each_leaf_content_mut(&mut |content| {
-                if let App::Agent(ring) = content {
-                    for slot in &mut ring.slots {
-                        let _dropped = slot.state.channel.take();
-                    }
-                }
-            });
+        // Drop every session's channel so the worker thread shuts down its
+        // child agent before GPUI's window teardown races with us. Sessions
+        // are now owned centrally, so this is a single store walk.
+        let ids: Vec<SessionId> = self.sessions.ids().collect();
+        for id in ids {
+            if let Some(session) = self.sessions.get_mut(id) {
+                let _dropped = session.state.channel.take();
+            }
         }
     }
 
@@ -2942,8 +3041,11 @@ impl YaldaGpuiView {
             Some(App::Buffer(BufferApp::Editing(e))) => (Some(e.file_label.clone()), true),
             _ => (None, false),
         };
-        let browser_fallback =
-            || App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.to_path_buf())));
+        let browser_fallback = || {
+            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
+                cwd.to_path_buf(),
+            )))
+        };
         let Some(label) = label else {
             return browser_fallback();
         };
@@ -3789,10 +3891,16 @@ impl YaldaGpuiView {
                 }
             }
             "claude-new" => self.new_agent_session(None, cx),
-            "claude-list" => self.open_session_switcher(cx),
+            "claude-session-picker" => self.open_session_picker_rebind(cx),
+            "claude-stop" => {
+                if matches!(
+                    self.workspace.focused_content().expect("no focused window"),
+                    App::Agent(_)
+                ) {
+                    self.stop_agent_inner(cx);
+                }
+            }
             "claude-close" => self.close_active_agent_session(cx),
-            "claude-next" => self.switch_agent_session(1, cx),
-            "claude-prev" => self.switch_agent_session(-1, cx),
             "claude-reboot" => self.reboot_into_claude(cx),
             "claude-mode-cycle" => self.cycle_claude_permission_mode(cx),
             "claude-clear" => self.clear_agent_session(cx),
@@ -4115,10 +4223,7 @@ impl YaldaGpuiView {
             ),
             "nav-links" => self.doc_jump_next_matching("link", block_contains_link, cx),
             "claude-send-selection" => {
-                if matches!(
-                    self.workspace.focused_content(),
-                    Some(App::Agent(_))
-                ) {
+                if matches!(self.workspace.focused_content(), Some(App::Agent(_))) {
                     self.send_agent_selection(cx);
                 }
             }
@@ -4477,36 +4582,36 @@ impl YaldaGpuiView {
 
     // ---- Session switcher overlay -----------------------------------------
 
-    fn open_session_switcher(&mut self, cx: &mut Context<Self>) {
+    /// Open the free-session switcher / rebind flow on the focused agent tile
+    /// (spec-agent-session-ownership.md "free sessions + rebind"). Lists the
+    /// FREE sessions (no tile binds them) plus a "new session" row; Enter
+    /// rebinds this tile to the chosen free session (freeing, not killing, its
+    /// previous one).
+    fn open_session_picker_rebind(&mut self, cx: &mut Context<Self>) {
         if self.overlay_is_session() {
             return;
         }
-        // Must be on the agent screen with at least one session.
-        let ring = match self.agent_ring() {
-            Some(r) if !r.is_empty() => r,
-            _ => {
-                // Not on Claude screen — open Claude first, then show the list.
-                self.open_agent_inner(cx);
-                if let Some(r) = self.agent_ring() {
-                    if r.is_empty() {
-                        return;
-                    }
-                } else {
-                    return;
-                }
-                // Fall through — ring is now valid.
-                self.agent_ring().unwrap()
+        // Must be on an agent tile. (If not, open one first.)
+        if self.agent_tile().is_none() {
+            self.open_agent_inner(cx);
+            if self.agent_tile().is_none() {
+                return;
             }
-        };
-        // Hoist `ring.active` to an owned local so the `ring` (&self) borrow
-        // ends before `open_overlay` takes `&mut self`.
-        let selected = ring.active;
-        self.open_overlay(ActiveOverlay::SessionSwitcher(SessionSwitcher { selected }));
+        }
+        self.open_overlay(ActiveOverlay::SessionSwitcher(SessionSwitcher {
+            selected: 0,
+        }));
         cx.notify();
     }
 
     fn close_session_switcher(&mut self) {
         self.clear_overlay();
+    }
+
+    /// Row count of the switcher: a "new session" row plus one per free
+    /// session (those the store holds that no tile binds).
+    fn switcher_row_count(&self) -> usize {
+        1 + self.free_session_ids().len()
     }
 
     fn handle_session_switcher_key(
@@ -4520,13 +4625,13 @@ impl YaldaGpuiView {
             Some(ss) => ss.selected,
             None => return,
         };
+        let count = self.switcher_row_count();
 
         match press.key {
             Key::Esc | Key::Char('q') => {
                 self.close_session_switcher();
             }
             Key::Char('j') | Key::Down => {
-                let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
                 if let Some(ss) = self.session_mut()
                     && count > 0
                 {
@@ -4534,7 +4639,6 @@ impl YaldaGpuiView {
                 }
             }
             Key::Char('k') | Key::Up => {
-                let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
                 if let Some(ss) = self.session_mut()
                     && count > 0
                 {
@@ -4551,7 +4655,6 @@ impl YaldaGpuiView {
                 }
             }
             Key::Char('G') => {
-                let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
                 if let Some(ss) = self.session_mut()
                     && count > 0
                 {
@@ -4559,44 +4662,42 @@ impl YaldaGpuiView {
                 }
             }
             Key::Enter | Key::Char('l') => {
-                // Switch to the selected session.
-                if let Some(ring) = self.agent_ring_mut() {
-                    ring.active = selected;
-                }
                 self.close_session_switcher();
-                self.save_agent_ring();
+                if selected == 0 {
+                    // "new session" row: free this tile and start fresh.
+                    if let Some(tile) = self.agent_tile_mut() {
+                        tile.bound = None;
+                    }
+                    self.new_agent_session(None, cx);
+                } else {
+                    // Rebind to the chosen free session.
+                    let free = self.free_session_ids();
+                    if let Some(&id) = free.get(selected - 1) {
+                        if let Some(tile) = self.agent_tile_mut() {
+                            tile.bound = Some(id);
+                            tile.picker = None;
+                        }
+                        self.save_agent_ring();
+                    }
+                }
             }
             Key::Char('x') => {
-                // Close the selected session (without switching to it first).
-                let count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
-                if count > 0 {
-                    // Optimistic close (same as `close_active_agent_session`,
-                    // S4): drop the slot locally and fire the server close
-                    // off-thread so a stalled server can't freeze the switcher.
-                    let server_sid = self
-                        .agent_ring()
-                        .and_then(|r| r.slots.get(selected))
-                        .and_then(|s| s.server_session_id.clone());
-                    if let Some(sid) = server_sid {
-                        self.spawn_close_session(sid, cx);
+                // Kill the selected free session (store close + server close).
+                if selected >= 1 {
+                    let free = self.free_session_ids();
+                    if let Some(&id) = free.get(selected - 1) {
+                        let sid = self.sessions.sid_of(id).map(|s| s.to_string());
+                        if let Some(sid) = sid {
+                            self.spawn_close_session(sid, cx);
+                        }
+                        self.sessions.close(id);
                     }
-                    if let Some(ring) = self.agent_ring_mut() {
-                        ring.close_at(selected);
-                    }
-                    let new_count = self.agent_ring().map(|r| r.len()).unwrap_or(0);
-                    if new_count == 0 {
-                        self.close_session_switcher();
-                        self.back_to_doc(cx);
-                        self.save_agent_ring();
-                        cx.notify();
-                        return;
-                    }
+                    let new_count = self.switcher_row_count();
                     if let Some(ss) = self.session_mut()
                         && ss.selected >= new_count
                     {
-                        ss.selected = new_count - 1;
+                        ss.selected = new_count.saturating_sub(1);
                     }
-                    self.save_agent_ring();
                 }
             }
             _ => {}
@@ -4609,7 +4710,7 @@ impl YaldaGpuiView {
             Some(ss) => ss,
             None => unreachable!(),
         };
-        let ring = self.agent_ring().unwrap();
+        let free = self.free_session_ids();
 
         let ov = &self.theme.overlay;
         let menu_bg: Hsla = nc(ov.bg);
@@ -4620,7 +4721,7 @@ impl YaldaGpuiView {
         let popup_border: Hsla = nc(ov.border);
         let busy_fg: Hsla = nc(ov.modified);
 
-        let header_text = format!("SESSIONS ({})", ring.len());
+        let header_text = format!("FREE SESSIONS ({})", free.len());
         let header_row = div()
             .flex()
             .flex_row()
@@ -4640,27 +4741,44 @@ impl YaldaGpuiView {
             .text_size(px(14.0))
             .font_family(self.code_font.clone());
 
-        for (i, slot) in ring.slots.iter().enumerate() {
-            let is_selected = i == ss.selected;
-            let is_active = i == ring.active;
-            let is_busy = slot.state.turn_phase.is_awaiting();
+        // Row 0: start a new session.
+        {
+            let is_selected = ss.selected == 0;
+            let marker = if is_selected { "\u{25b8} " } else { "  " };
+            let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
+            if is_selected {
+                row = row.bg(selected_bg);
+            }
+            row = row
+                .child(
+                    div()
+                        .text_color(label_fg)
+                        .child(SharedString::from(marker.to_string())),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_color(active_fg)
+                        .child(SharedString::from("+ start a new session".to_string())),
+                );
+            entries_col = entries_col.child(row);
+        }
+
+        for (i, &id) in free.iter().enumerate() {
+            let Some(session) = self.sessions.get(id) else {
+                continue;
+            };
+            let is_selected = i + 1 == ss.selected;
+            let is_busy = session.state.turn_phase.is_awaiting();
 
             let marker = if is_selected { "\u{25b8} " } else { "  " };
-            let active_dot = if is_active { "\u{25cf} " } else { "  " };
             let busy_mark = if is_busy { " \u{2026}" } else { "" };
-            let cwd_display = shorten_cwd_for_display(&slot.cwd);
-            let label_text = format!("{}{}", slot.label, busy_mark);
+            let cwd_display = shorten_cwd_for_display(&session.cwd);
+            let label_text = format!("{}{}", session.label, busy_mark);
 
-            let name_color = if is_active {
-                active_fg
-            } else if is_busy {
-                busy_fg
-            } else {
-                normal_fg
-            };
+            let name_color = if is_busy { busy_fg } else { normal_fg };
 
             let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
-
             if is_selected {
                 row = row.bg(selected_bg);
             }
@@ -4670,11 +4788,6 @@ impl YaldaGpuiView {
                     div()
                         .text_color(label_fg)
                         .child(SharedString::from(marker.to_string())),
-                )
-                .child(
-                    div()
-                        .text_color(active_fg)
-                        .child(SharedString::from(active_dot.to_string())),
                 )
                 .child(
                     div()
@@ -4698,7 +4811,7 @@ impl YaldaGpuiView {
             .py_1()
             .text_size(px(11.0))
             .text_color(label_fg)
-            .child("j/k move · enter select · x close · q/esc cancel");
+            .child("j/k move · enter bind · x kill · q/esc cancel");
 
         div()
             .id("session-switcher")
@@ -4884,21 +4997,17 @@ impl YaldaGpuiView {
         if self.overlay_is_rename() {
             return;
         }
-        let Some(ring) = self.agent_ring() else {
+        // No bound session (the picker) ⇒ nothing to rename.
+        let Some(id) = self.focused_bound_session() else {
             return;
         };
-        // `.get` so the empty-ring session picker (no slot to rename) is a
-        // no-op rather than an out-of-bounds panic.
-        let Some(slot) = ring.slots.get(ring.active) else {
+        let Some(session) = self.sessions.get(id) else {
             return;
         };
-        // Own the reads so the `ring`/`slot` (&self) borrow ends before
-        // `open_overlay` takes `&mut self`.
-        let text = slot.label.clone();
-        let index = slot.index;
+        let text = session.label.clone();
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
             text,
-            target: RenameTarget::AgentSlot { index },
+            target: RenameTarget::AgentSession { id },
         }));
         cx.notify();
     }
@@ -4927,15 +5036,16 @@ impl YaldaGpuiView {
         if self.overlay_is_rename() {
             return;
         }
-        let Some(ring) = self.agent_ring() else {
+        let Some(id) = self.focused_bound_session() else {
             return;
         };
-        let slot = &ring.slots[ring.active];
-        let text = slot.cwd.display().to_string();
-        let index = slot.index;
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        let text = session.cwd.display().to_string();
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
             text,
-            target: RenameTarget::AgentChangeCwd { index },
+            target: RenameTarget::AgentChangeCwd { id },
         }));
         cx.notify();
     }
@@ -4977,15 +5087,14 @@ impl YaldaGpuiView {
             return;
         }
         match target {
-            RenameTarget::AgentSlot { index } => {
-                // Update the label in the local ring and, if this session
-                // is managed by the session server, push the new label
-                // there so it persists across GUI restarts.
-                let server_sid = self.agent_ring_mut().and_then(|ring| {
-                    let slot = ring.slot_by_index_mut(index)?;
-                    slot.label = new_label.clone();
-                    slot.server_session_id.clone()
-                });
+            RenameTarget::AgentSession { id } => {
+                // Update the label in the store and, if this session is managed
+                // by the session server, push the new label there so it
+                // persists across GUI restarts.
+                if let Some(session) = self.sessions.get_mut(id) {
+                    session.label = new_label.clone();
+                }
+                let server_sid = self.sessions.sid_of(id).map(|s| s.to_string());
                 if let (Some(server), Some(sid)) = (&self.session_server, server_sid) {
                     let _ = server.rename_session(&sid, &new_label);
                 }
@@ -5019,10 +5128,10 @@ impl YaldaGpuiView {
                     }
                 }
             }
-            RenameTarget::AgentChangeCwd { index } => match resolve_agent_cwd_arg(&new_label) {
+            RenameTarget::AgentChangeCwd { id } => match resolve_agent_cwd_arg(&new_label) {
                 Ok(resolved) => {
                     self.close_rename_overlay();
-                    self.change_agent_cwd(index, resolved, cx);
+                    self.change_agent_cwd(id, resolved, cx);
                 }
                 Err(msg) => {
                     self.close_rename_overlay();
@@ -5738,7 +5847,7 @@ impl YaldaGpuiView {
         let input_fg: Hsla = nc(ov.input);
 
         let header_label = match o.target {
-            RenameTarget::AgentSlot { .. } => "RENAME SESSION",
+            RenameTarget::AgentSession { .. } => "RENAME SESSION",
             RenameTarget::Tab { .. } => "RENAME WORKSPACE",
             RenameTarget::AgentNewSessionCwd => "NEW SESSION AT…",
             RenameTarget::AgentChangeCwd { .. } => "CHANGE SESSION CWD",
@@ -6417,7 +6526,9 @@ fn tab_strip_label(tab: &workspace::Tab<App>) -> String {
     if let workspace::Layout::Leaf(w) = &tab.layout {
         match &w.content {
             App::Buffer(BufferApp::Viewing(d)) => basename_or_full(d.file_label.as_ref()),
-            App::Buffer(BufferApp::Editing(e)) => format!("E {}", basename_or_full(e.file_label.as_ref())),
+            App::Buffer(BufferApp::Editing(e)) => {
+                format!("E {}", basename_or_full(e.file_label.as_ref()))
+            }
             App::Buffer(BufferApp::Picking(_)) => format!("Browser ({})", tab.display_label()),
             App::Agent(_) => format!("Claude ({})", tab.display_label()),
         }

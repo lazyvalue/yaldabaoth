@@ -18,8 +18,8 @@
 use gpui::{AppContext, TestAppContext, point, px};
 
 use crate::YaldaGpuiView;
-use yalda::theme::Theme;
 use std::path::PathBuf;
+use yalda::theme::Theme;
 
 /// Stone 1: prove GPUI's `test-support` harness wires up in this crate — boot a
 /// `TestAppContext` and round-trip an entity through `update`/`read`. If this
@@ -387,21 +387,29 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
 // the REAL pump path through a headless view so a regression in the wiring —
 // not just the pure logic — is caught here.
 
-/// Install an agent screen on `view` with one server-managed slot, optionally
-/// bound to `server_sid`. Returns nothing; the active slot is the new one.
+/// Install an agent tile on `view` bound to one server-managed session,
+/// optionally carrying `server_sid`. The focused tile shows the new session.
 #[cfg(test)]
 fn install_agent_slot(
     view: &gpui::Entity<YaldaGpuiView>,
     vcx: &mut gpui::VisualTestContext,
     server_sid: Option<&str>,
 ) {
-    use crate::{AgentRing, AgentState, App};
+    use crate::{AgentSession, AgentState, AgentTile, App};
     let sid = server_sid.map(|s| s.to_string());
     view.update(vcx, |v, _cx| {
-        let mut ring = AgentRing::new(None);
-        let state = AgentState::new_server_managed(None);
-        ring.push("claude-1".into(), state, None, PathBuf::from("."), sid);
-        v.set_screen(App::Agent(ring));
+        v.set_screen(App::Agent(AgentTile::new()));
+        let session = AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: "claude-1".into(),
+            cwd: PathBuf::from("."),
+            resume_id: None,
+        };
+        let id = v.show_local_session(session);
+        if let Some(sid) = sid {
+            v.sessions.bind_sid(id, sid).expect("fresh sid binds");
+        }
+        let _ = id;
     });
 }
 
@@ -508,9 +516,12 @@ fn agent_seam_routes_reply_only_after_session_is_bound(cx: &mut TestAppContext) 
          bind-before-attach restructure exists to avoid)"
     );
 
-    // Bind the slot (what apply_open_agent_resolution does), then re-feed.
+    // Bind the sid (what apply_open_agent_resolution does), then re-feed.
     view.update(vcx, |v, _cx| {
-        v.agent_ring_mut().unwrap().slots[0].server_session_id = Some("S1".into());
+        let id = v.focused_bound_session().expect("a session is bound");
+        v.sessions
+            .bind_sid(id, "S1".into())
+            .expect("fresh sid binds");
     });
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
@@ -987,10 +998,7 @@ fn agent_note(
 fn boot_with_bound_slot<'a>(
     cx: &'a mut TestAppContext,
     sid: &str,
-) -> (
-    gpui::Entity<YaldaGpuiView>,
-    &'a mut gpui::VisualTestContext,
-) {
+) -> (gpui::Entity<YaldaGpuiView>, &'a mut gpui::VisualTestContext) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
@@ -2006,7 +2014,7 @@ fn install_agent_picker(
     vcx: &mut gpui::VisualTestContext,
     sessions: &[(&str, &str)],
 ) {
-    use crate::{AgentRing, App, PickerSession, SessionPicker};
+    use crate::{AgentTile, App, PickerSession, SessionPicker};
     let sessions: Vec<PickerSession> = sessions
         .iter()
         .map(|(sid, label)| PickerSession {
@@ -2020,13 +2028,13 @@ fn install_agent_picker(
         })
         .collect();
     view.update(vcx, |v, _cx| {
-        let mut ring = AgentRing::new(None);
+        let mut tile = AgentTile::new();
         let mut picker = SessionPicker::loading(PathBuf::from("."));
         if !sessions.is_empty() {
             picker.sessions = Some(sessions);
         }
-        ring.picker = Some(picker);
-        v.set_screen(App::Agent(ring));
+        tile.picker = Some(picker);
+        v.set_screen(App::Agent(tile));
     });
 }
 
@@ -2050,9 +2058,9 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     install_agent_picker(&view, &mut *vcx, &[]);
     vcx.run_until_parked();
     view.read_with(vcx, |v, _cx| {
-        let ring = v.agent_ring().expect("agent ring");
-        assert!(ring.is_empty(), "picker ring stays empty until a row binds");
-        let p = ring.picker.as_ref().expect("picker present");
+        let tile = v.agent_tile().expect("agent tile");
+        assert!(tile.bound.is_none(), "tile stays unbound until a row binds");
+        let p = tile.picker.as_ref().expect("picker present");
         assert!(p.sessions.is_none(), "still loading");
         assert_eq!(p.row_count(), 1, "only the 'new session' row while loading");
     });
@@ -2086,7 +2094,7 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
     view.read_with(vcx, |v, _cx| {
-        let p = v.agent_ring().unwrap().picker.as_ref().unwrap();
+        let p = v.agent_tile().unwrap().picker.as_ref().unwrap();
         assert_eq!(
             p.row_count(),
             3,
@@ -2113,7 +2121,7 @@ fn session_picker_navigation_wraps(cx: &mut TestAppContext) {
 
     let selected = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         view.read_with(vcx, |v, _cx| {
-            v.agent_ring().unwrap().picker.as_ref().unwrap().selected
+            v.agent_tile().unwrap().picker.as_ref().unwrap().selected
         })
     };
 
@@ -2122,10 +2130,18 @@ fn session_picker_navigation_wraps(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.agent_picker_move(1, cx));
     assert_eq!(selected(&view, &mut *vcx), 2);
     view.update(vcx, |v, cx| v.agent_picker_move(1, cx));
-    assert_eq!(selected(&view, &mut *vcx), 0, "down past the end wraps to top");
+    assert_eq!(
+        selected(&view, &mut *vcx),
+        0,
+        "down past the end wraps to top"
+    );
     // Up from 0 wraps to the last row.
     view.update(vcx, |v, cx| v.agent_picker_move(-1, cx));
-    assert_eq!(selected(&view, &mut *vcx), 2, "up past the top wraps to bottom");
+    assert_eq!(
+        selected(&view, &mut *vcx),
+        2,
+        "up past the top wraps to bottom"
+    );
 }
 
 /// Activating a listed row binds the ring's first slot (with the chosen
@@ -2146,18 +2162,22 @@ fn session_picker_activation_binds_slot(cx: &mut TestAppContext) {
     install_agent_picker(&view, &mut *vcx, &[("S1", "claude-1"), ("S2", "claude-2")]);
     vcx.run_until_parked();
 
-    // Activate row 2 (the second listed session, sid "S2").
+    // Activate row 2 (the second listed session, sid "S2"). The bind is
+    // synchronous (show_local_session + apply_open_agent_resolution); the
+    // subsequent attach is async and, with no real "S2" on the test server,
+    // would later drop the session — so we assert the bind BEFORE parking the
+    // executor (this test verifies activation binds, not attach survival).
     view.update(vcx, |v, cx| v.agent_picker_activate(2, cx));
-    vcx.run_until_parked();
     view.read_with(vcx, |v, _cx| {
-        let ring = v.agent_ring().expect("agent ring");
-        assert!(!ring.is_empty(), "a slot is bound after activation");
-        assert!(ring.picker.is_none(), "picker cleared once a slot binds");
-        assert_eq!(ring.slots.len(), 1, "exactly one slot bound");
+        let tile = v.agent_tile().expect("agent tile");
+        assert!(tile.bound.is_some(), "a session is bound after activation");
+        assert!(tile.picker.is_none(), "picker cleared once a session binds");
+        assert_eq!(v.sessions.len(), 1, "exactly one session in the store");
+        let id = tile.bound.unwrap();
         assert_eq!(
-            ring.slots[0].server_session_id.as_deref(),
+            v.sessions.sid_of(id),
             Some("S2"),
-            "the bound slot carries the chosen session id"
+            "the bound session carries the chosen session id"
         );
     });
 }

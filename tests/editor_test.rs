@@ -1,5 +1,5 @@
-use yalda::editor::Editor;
 use std::path::PathBuf;
+use yalda::editor::Editor;
 
 fn editor(text: &str) -> Editor {
     Editor::new(text.to_string(), PathBuf::from("test.md"))

@@ -373,15 +373,11 @@ pub(crate) fn save_preferences(prefs: &Preferences) {
 #[serde(rename_all = "snake_case", tag = "kind", content = "data")]
 pub(crate) enum PersistedKind {
     /// A Buffer tile in one of its three modes.
-    Buffer {
-        mode: PersistedBufferMode,
-    },
+    Buffer { mode: PersistedBufferMode },
     /// JSON tag stays as "claude" so the ACP-session side-channel keys line up;
     /// the in-memory variant is `Agent` to match the rename pass.
     #[serde(rename = "claude")]
-    Agent {
-        session_id: Option<String>,
-    },
+    Agent { session_id: Option<String> },
 }
 
 /// Persisted shadow of `BufferApp`'s mode (B1). `viewing`/`editing` carry the
@@ -519,17 +515,14 @@ pub(crate) fn snapshot_content(content: &App) -> PersistedKind {
                 dir: b.fb.current_dir().to_path_buf(),
             },
         },
-        App::Agent(ring) => {
-            // Use the active session's id if any. Multi-session restore is
-            // handled by the existing ACP persistence path; this is just
-            // enough to know "this slot had a Claude session" so on restore
-            // we can spawn the ring shell.
-            let session_id = ring
-                .slots
-                .first()
-                .and_then(|s| s.state.channel.as_ref())
-                .and_then(|c| c.session_id().map(|s| s.to_string()));
-            PersistedKind::Agent { session_id }
+        App::Agent(_tile) => {
+            // The layout snapshot only records "this tile is an Agent" so the
+            // tab survives restore; the session id itself is restored from the
+            // ACP-session side-channel (acp_sessions.json), not from here. The
+            // channel/sid live in the store now, which `snapshot_content` does
+            // not have access to — so we always persist `None` and let
+            // `restore_agent_leaves` rebind via the side-channel.
+            PersistedKind::Agent { session_id: None }
         }
     }
 }
@@ -787,10 +780,7 @@ pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<App>) -> PersistedWor
 
 /// Best-effort write of the workspace snapshot for `cwd`. Silently no-ops
 /// on any I/O / serialization failure (Behavior 23: best-effort + silent).
-pub(crate) fn save_persisted_workspace(
-    cwd: &std::path::Path,
-    ws: &workspace::Workspace<App>,
-) {
+pub(crate) fn save_persisted_workspace(cwd: &std::path::Path, ws: &workspace::Workspace<App>) {
     let Some(path) = workspace_persist_path() else {
         return;
     };
@@ -1024,7 +1014,20 @@ pub(crate) fn forget_persisted_acp_session_ids(ids: &[String]) {
 /// Concurrent yalda instances on the same `cwd`: last-writer-wins. Each
 /// call does a read-modify-write of the file, replacing only the cwd
 /// entry; other cwds are preserved.
-pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRing) {
+/// A persistable snapshot of one bound agent session (spec-agent-session-
+/// ownership.md). Gathered by `YaldaGpuiView::save_agent_ring` from the tiles'
+/// bound sessions in the store, then written by `save_persisted_acp_sessions`.
+pub(crate) struct SessionSnapshot {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) active: bool,
+    pub(crate) mode: InputModeKind,
+    pub(crate) tasklist_open: bool,
+    pub(crate) subagents_open: bool,
+    pub(crate) cwd: PathBuf,
+}
+
+pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[SessionSnapshot]) {
     let Some(path) = acp_session_persist_path() else {
         return;
     };
@@ -1032,31 +1035,20 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRin
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let active_index = ring.active;
-    let entries: Vec<serde_json::Value> = ring
-        .slots
+    let entries: Vec<serde_json::Value> = snaps
         .iter()
-        .enumerate()
-        .filter_map(|(i, slot)| {
-            // resume_id wins over channel id: if we were trying to resume,
-            // keep retrying the original id even when load fell back.
-            let id = slot
-                .resume_id
-                .clone()
-                .or_else(|| slot.state.channel.as_ref().and_then(|c| c.session_id()))?;
+        .map(|snap| {
             let mut obj = serde_json::Map::new();
-            obj.insert("id".into(), serde_json::Value::String(id));
+            obj.insert("id".into(), serde_json::Value::String(snap.id.clone()));
             obj.insert(
                 "label".into(),
-                serde_json::Value::String(slot.label.clone()),
+                serde_json::Value::String(snap.label.clone()),
             );
-            if i == active_index {
+            if snap.active {
                 obj.insert("active".into(), serde_json::Value::Bool(true));
             }
-            // Spec §35: persist input mode and sidebar state per slot.
-            // Older yalda binaries reading this file ignore the unknown
-            // keys (serde's standard behavior); no migration needed.
-            let mode_str = match slot.state.input_surface.mode() {
+            // Spec §35: persist input mode and sidebar state per session.
+            let mode_str = match snap.mode {
                 InputModeKind::Worksheet => "worksheet",
                 InputModeKind::Chatbox => "chatbox",
             };
@@ -1066,21 +1058,18 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRin
             );
             obj.insert(
                 "tasklist_open".into(),
-                serde_json::Value::Bool(slot.state.tasklist_open),
+                serde_json::Value::Bool(snap.tasklist_open),
             );
             obj.insert(
                 "subagents_open".into(),
-                serde_json::Value::Bool(slot.state.subagents_open),
+                serde_json::Value::Bool(snap.subagents_open),
             );
-            // spec-agent-cwd.md §5: persist the slot's working directory.
-            // Lossy on non-UTF8 paths (Constraint §11) — same as the
-            // top-level `cwd` key in this file. Acceptable on macOS where
-            // APFS enforces UTF8-encodable names.
+            // spec-agent-cwd.md §5: persist the session's working directory.
             obj.insert(
                 "cwd".into(),
-                serde_json::Value::String(slot.cwd.display().to_string()),
+                serde_json::Value::String(snap.cwd.display().to_string()),
             );
-            Some(serde_json::Value::Object(obj))
+            serde_json::Value::Object(obj)
         })
         .collect();
 

@@ -83,11 +83,7 @@ impl<P> SessionStore<P> {
     /// If a session already carries `sid`, returns `AlreadyOpen(id)` and mutates
     /// nothing. Otherwise mints a session (payload built by `make`) bound to
     /// `sid` and returns `Created(id)`.
-    pub(crate) fn open_or_focus(
-        &mut self,
-        sid: &str,
-        make: impl FnOnce(SessionId) -> P,
-    ) -> Bind {
+    pub(crate) fn open_or_focus(&mut self, sid: &str, make: impl FnOnce(SessionId) -> P) -> Bind {
         if let Some(&id) = self.by_sid.get(sid) {
             return Bind::AlreadyOpen(id);
         }
@@ -210,7 +206,11 @@ mod tests {
         assert!(matches!(first, Bind::Created(_)));
         assert_eq!(second, Bind::AlreadyOpen(first.id()));
         assert_eq!(s.len(), 1, "one sid → exactly one session (INV-1)");
-        assert_eq!(s.get(first.id()), Some(&10), "second open did not overwrite");
+        assert_eq!(
+            s.get(first.id()),
+            Some(&10),
+            "second open did not overwrite"
+        );
     }
 
     #[test]

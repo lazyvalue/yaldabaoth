@@ -132,8 +132,10 @@ impl YaldaGpuiView {
             .collect();
         // Live edge-resize preview (spec Behavior 4b): the clamped span the
         // resized tile renders at this frame, which is also what commits.
-        let resize_preview: Option<(workspace::WindowId, workspace::Span)> =
-            tab.desktop.resize.map(|r| (r.id, self.desktop_resize_target_span(r)));
+        let resize_preview: Option<(workspace::WindowId, workspace::Span)> = tab
+            .desktop
+            .resize
+            .map(|r| (r.id, self.desktop_resize_target_span(r)));
         let base_bg = self.editor_bg();
         let content_fg = self.editor_fg();
         let dim: Hsla = nc(self.theme.agent.dim);
@@ -272,7 +274,7 @@ impl YaldaGpuiView {
             // structural tree mutation happens during this render pass.
             let content = unsafe { &mut *content_ptr };
 
-            let title = Self::desktop_tile_title(content);
+            let title = self.desktop_tile_title(content);
             let mark = self.workspace.marks.mark_for_window(id);
 
             // The leaf-root CONTRACT (see `screen_root` in render() and the
@@ -295,14 +297,16 @@ impl YaldaGpuiView {
                 base
             };
             let inner: AnyElement = match content {
-                App::Buffer(BufferApp::Viewing(d)) => self.render_doc(leaf_root, d, cx).into_any_element(),
-                App::Buffer(BufferApp::Editing(e)) => self.render_edit(leaf_root, e, cx).into_any_element(),
+                App::Buffer(BufferApp::Viewing(d)) => {
+                    self.render_doc(leaf_root, d, cx).into_any_element()
+                }
+                App::Buffer(BufferApp::Editing(e)) => {
+                    self.render_edit(leaf_root, e, cx).into_any_element()
+                }
                 App::Buffer(BufferApp::Picking(b)) => {
                     self.render_browser(leaf_root, b, cx).into_any_element()
                 }
-                App::Agent(ring) => {
-                    self.render_agent(leaf_root, ring, cx).into_any_element()
-                }
+                App::Agent(tile) => self.render_agent(leaf_root, tile, cx).into_any_element(),
             };
 
             let mut title_bar = div()
@@ -434,15 +438,16 @@ impl YaldaGpuiView {
         )
     }
 
-    /// Title-bar label for a tile.
-    fn desktop_tile_title(content: &App) -> String {
+    /// Title-bar label for a tile. Agent labels live in the session store, so
+    /// this takes `&self` to resolve the bound session's label.
+    fn desktop_tile_title(&self, content: &App) -> String {
         match content {
             App::Buffer(BufferApp::Viewing(d)) => d.file_label.to_string(),
             App::Buffer(BufferApp::Editing(e)) => e.file_label.to_string(),
             App::Buffer(BufferApp::Picking(_)) => "files".to_string(),
-            App::Agent(ring) => ring
-                .slots
-                .get(ring.active)
+            App::Agent(tile) => tile
+                .bound
+                .and_then(|id| self.sessions.get(id))
                 .map(|s| s.label.clone())
                 .unwrap_or_else(|| "claude".to_string()),
         }
@@ -664,14 +669,16 @@ impl YaldaGpuiView {
                     root
                 };
                 let painted: AnyElement = match content {
-                    App::Buffer(BufferApp::Viewing(d)) => self.render_doc(leaf_root, d, cx).into_any_element(),
-                    App::Buffer(BufferApp::Editing(e)) => self.render_edit(leaf_root, e, cx).into_any_element(),
+                    App::Buffer(BufferApp::Viewing(d)) => {
+                        self.render_doc(leaf_root, d, cx).into_any_element()
+                    }
+                    App::Buffer(BufferApp::Editing(e)) => {
+                        self.render_edit(leaf_root, e, cx).into_any_element()
+                    }
                     App::Buffer(BufferApp::Picking(b)) => {
                         self.render_browser(leaf_root, b, cx).into_any_element()
                     }
-                    App::Agent(ring) => {
-                        self.render_agent(leaf_root, ring, cx).into_any_element()
-                    }
+                    App::Agent(tile) => self.render_agent(leaf_root, tile, cx).into_any_element(),
                 };
                 // Pin the rail to the leaf it was opened from, not whichever
                 // leaf currently has focus. Falls back to the focused leaf

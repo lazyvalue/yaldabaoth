@@ -192,18 +192,16 @@ impl YaldaGpuiView {
                     source: Some(source),
                 })));
             }
-            App::Agent(ring) => {
-                // B6: restore the Buffer the user opened Claude from. If none
-                // was stashed, fall back to a fresh Picking at cwd — never
-                // close the tile. AgentRing and all its sessions drop here,
-                // taking pump tasks and ACP channels with them.
-                let buffer = match ring.underlying {
-                    Some(boxed) => *boxed,
-                    None => BufferApp::Picking(BrowserWindow::standalone(
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                    )),
-                };
-                self.set_screen(App::Buffer(buffer));
+            App::Agent(_tile) => {
+                // Leaving an agent (Ctrl-V) is the ONLY path that converts a
+                // tile from Agent to Buffer (spec-agent-session-ownership.md).
+                // Agent and Buffer are orthogonal — there is no stashed buffer
+                // to restore, so we open a fresh file picker at cwd. The bound
+                // session is NOT killed: it stays in the store as a free
+                // session, re-bindable via the selector or another tile.
+                self.set_screen(App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                ))));
             }
             other => {
                 self.set_screen(other);
@@ -339,7 +337,9 @@ impl YaldaGpuiView {
                 // the top so it can't dangle past the new end (matches the old
                 // reload-replaces-editor behavior). Other shared views keep
                 // their own cursors.
-                if let Some(App::Buffer(BufferApp::Editing(e))) = self.workspace.focused_content_mut() {
+                if let Some(App::Buffer(BufferApp::Editing(e))) =
+                    self.workspace.focused_content_mut()
+                {
                     e.editor.set_cursor(0, 0);
                     e.editor.clear_selection();
                 }

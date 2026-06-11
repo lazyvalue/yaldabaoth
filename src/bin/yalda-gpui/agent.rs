@@ -1,6 +1,6 @@
 //! Agent (Claude) tile data layer: tool-call model + renderers, transcript
 //! flat-item view model (S1 cache + rebuild), turn/phase state machine,
-//! chatbox, per-tile AgentState, and the AgentRing of session slots.
+//! chatbox, per-tile AgentState, the AgentSession payload + AgentTile view.
 //! Extracted verbatim from main.rs (split-gpui-main). Render methods on
 //! YaldaGpuiView stay in main.rs this pass.
 
@@ -45,7 +45,10 @@ pub(crate) struct ToolCalls {
     /// cursor blink, cross-tile notify).
     snap_gen: u64,
     /// Cached `Rc` snapshot of `calls`, rebuilt lazily when `gen` advances.
-    calls_snap: std::cell::RefCell<(u64, std::rc::Rc<std::collections::HashMap<ToolCallKey, yalda::acp_channel::ToolCall>>)>,
+    calls_snap: std::cell::RefCell<(
+        u64,
+        std::rc::Rc<std::collections::HashMap<ToolCallKey, yalda::acp_channel::ToolCall>>,
+    )>,
     /// Cached `Rc` snapshot of `expanded`, rebuilt lazily when `gen` advances.
     expanded_snap: std::cell::RefCell<(u64, std::rc::Rc<std::collections::HashSet<String>>)>,
 }
@@ -87,7 +90,10 @@ impl ToolCalls {
 
     /// Mutable access to a tool call by key, bumping the generation counter
     /// so the next `calls_snapshot` will rebuild.
-    pub(crate) fn call_mut(&mut self, key: &ToolCallKey) -> Option<&mut yalda::acp_channel::ToolCall> {
+    pub(crate) fn call_mut(
+        &mut self,
+        key: &ToolCallKey,
+    ) -> Option<&mut yalda::acp_channel::ToolCall> {
         let v = self.calls.get_mut(key);
         if v.is_some() {
             self.snap_gen += 1;
@@ -2242,7 +2248,11 @@ impl AgentState {
     /// mid-line chunk, making streaming visually jarring. `line_count`
     /// covers the structural case (new lines added); frozen/tool/expanded
     /// changes cover the rest.
-    pub(crate) fn view_model_fingerprint(&self, line_count: usize, frozen_line_count: usize) -> u64 {
+    pub(crate) fn view_model_fingerprint(
+        &self,
+        line_count: usize,
+        frozen_line_count: usize,
+    ) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         line_count.hash(&mut h);
@@ -2721,11 +2731,9 @@ pub(crate) enum OpenResolution {
     Failed(String),
 }
 
-/// Process-wide monotonic allocator for `AgentSlot::pending_open_token`.
+/// Process-wide monotonic allocator for `AgentTile::pending_open_token`.
 /// Tokens are never reused, so an in-flight async server open always binds
-/// back to exactly the placeholder that started it — even across rings whose
-/// per-ring `index` counters both start at 0 (the collision that dropped a
-/// session's events on restore: `pump: no slot for server session`).
+/// back to exactly the placeholder that started it.
 pub(crate) static NEXT_OPEN_TOKEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
@@ -2733,44 +2741,42 @@ pub(crate) fn alloc_open_token() -> u64 {
     NEXT_OPEN_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A named wrapper around `AgentState` for multi-session support.
-pub(crate) struct AgentSlot {
-    /// User-facing label shown in the sidebar.
-    pub(crate) label: String,
-    /// Monotonic index for stable identification (not reused after close).
-    pub(crate) index: usize,
+/// One agent conversation, owned centrally by [`AgentSessions`] (spec-agent-
+/// session-ownership.md). State that used to live in `AgentSlot.state` + the
+/// slot's binding fields now lives here, keyed by a stable [`SessionId`]; the
+/// `server_session_id` is owned by the store (not this struct), so there is one
+/// source of truth for the binding. Derefs to its inner [`AgentState`] so the
+/// many `slot.state.foo` bodies become `session.foo` with minimal churn.
+pub(crate) struct AgentSession {
     /// The session state. Contains editor, channel, tool calls, etc.
     pub(crate) state: AgentState,
-    /// The id this slot was created from on persistence restore. The slot's
-    /// persisted id stays this value even if `session/load` failed and the
-    /// channel fell back to `session/new` with a different id — so the next
-    /// reboot retries the original load. `None` for slots created fresh by
-    /// `claude-new` (then the channel's session/new id is persisted).
-    pub(crate) resume_id: Option<String>,
-    /// Absolute working directory the agent subprocess runs in and the
-    /// directory its tool calls resolve relative to (spec-agent-cwd.md §1).
-    /// Defaults to `std::env::current_dir()` at slot creation; set
-    /// explicitly via `:claude-new <path>` or `:claude-cd <path>`.
+    /// User-facing label shown in tab strips / pickers.
+    pub(crate) label: String,
+    /// Absolute working directory the agent subprocess runs in (spec-agent-
+    /// cwd.md §1).
     pub(crate) cwd: PathBuf,
-    /// When using the session server, this is the server-assigned session id.
-    /// `None` when using direct AcpChannelClient spawning.
-    pub(crate) server_session_id: Option<String>,
-    /// Whether THIS window currently holds the lease (drives) this session,
-    /// from the `driver` flag in the attach response (phase 4). `true` only
-    /// while we are the live Owner; an attach that downgraded us to Observer
-    /// (a different live client holds the lease) leaves this `false`. The
-    /// lease heartbeat beats ONLY driver slots, and an observer never
-    /// poll-acquires Owner on a heartbeat error — it waits for an explicit
-    /// `LeaseChanged{None}` promote. Reset to `false` on (re)bind; set to the
-    /// attach outcome by `spawn_attach_sessions`.
-    pub(crate) is_driver: bool,
-    /// Set while an async server open/create round-trip for this slot is in
-    /// flight; the resolution binds back to this slot by matching the token
-    /// across the whole workspace. Globally unique (see `alloc_open_token`) so
-    /// it disambiguates two placeholders that share a per-ring `index` of 0.
-    /// Cleared once the round-trip resolves. `None` for settled slots.
-    pub(crate) pending_open_token: Option<u64>,
+    /// The id this session was created from on persistence restore. Stays this
+    /// value even if `session/load` fell back to `session/new`, so the next
+    /// reboot retries the original load. `None` for fresh `claude-new` sessions.
+    pub(crate) resume_id: Option<String>,
 }
+
+impl std::ops::Deref for AgentSession {
+    type Target = AgentState;
+    fn deref(&self) -> &AgentState {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for AgentSession {
+    fn deref_mut(&mut self) -> &mut AgentState {
+        &mut self.state
+    }
+}
+
+/// THE owner of agent-session state (spec-agent-session-ownership.md). Strict
+/// 1:1 session↔sid enforced by [`SessionStore`].
+pub(crate) type AgentSessions = SessionStore<AgentSession>;
 
 /// One existing server session offered in the in-tile [`SessionPicker`].
 /// Built from a [`SessionInfo`] returned by `list_sessions`; carries
@@ -2788,12 +2794,11 @@ pub(crate) struct PickerSession {
     pub(crate) permission_mode: yalda::acp_channel::PermissionMode,
 }
 
-/// In-tile session chooser shown when a fresh Agent app opens over the
-/// session server: it lists the existing sessions for the cwd plus a
-/// "start a new session" row, so the user picks instead of the old behaviour
-/// of silently resuming/creating. Lives on an otherwise-empty [`AgentRing`]
-/// (zero slots); selecting a row binds the ring's first slot and clears the
-/// picker, after which `render_agent` renders the normal transcript.
+/// In-tile session chooser shown when an Agent tile has no `bound` session:
+/// it lists the FREE sessions (those no tile binds) plus a "start a new
+/// session" row, so the user picks/rebinds instead of silently resuming.
+/// `bound == None` ⇒ the tile renders this picker; selecting a row binds the
+/// tile, after which `render_agent` renders the normal transcript.
 pub(crate) struct SessionPicker {
     /// `None` while the background `list_sessions` round-trip is in flight;
     /// `Some` once it lands (possibly empty — only the "new session" row).
@@ -2832,155 +2837,38 @@ impl SessionPicker {
     }
 }
 
-/// An ordered collection of `AgentSlot`s with one active slot.
-/// Ring-style next/prev navigation wraps around.
-pub(crate) struct AgentRing {
-    pub(crate) slots: Vec<AgentSlot>,
-    /// Index into `slots` for the currently-active session.
-    pub(crate) active: usize,
-    /// Monotonic counter for `AgentSlot::index` — never reused.
-    pub(crate) next_index: usize,
-    /// Buffer to restore when leaving Claude entirely (Ctrl-V / back_to_doc).
-    /// Belongs to the ring, not any individual session. Typed `BufferApp`,
-    /// never `App` (D3/C4): an Agent can only ever be backed by a Buffer,
-    /// never by another Agent — agent-over-agent is unrepresentable.
-    pub(crate) underlying: Option<Box<BufferApp>>,
-    /// When `Some` AND `slots` is empty, this Agent tile shows the in-tile
-    /// session picker instead of a transcript. Cleared the moment a slot is
-    /// bound (a session is chosen or a new one started).
+/// One Agent tile — a VIEW onto a single session, not a store
+/// (spec-agent-session-ownership.md). The session STATE lives in
+/// `YaldaGpuiView::sessions`; the tile holds only a lightweight key. Agent and
+/// Buffer are ORTHOGONAL `App` variants — a tile is one or the other; an Agent
+/// tile has zero knowledge of buffers (no stash). Leaving an agent (Ctrl-V)
+/// converts the tile to a fresh `BufferApp::Picking`; the pooled file buffers
+/// stay reachable via Cmd+O regardless.
+///
+/// A tile shows EXACTLY ONE session (`bound`). `bound == None` ⇒ the tile
+/// renders the `picker` (free-session chooser / rebind / "new"). Strict 1:1: a
+/// given `SessionId` is bound by at most one tile (INV-2); rebinding points the
+/// tile at a free session and frees (does not kill) the previous one. Session
+/// close / unbind / rebind all keep the tile `App::Agent` with `bound = None`.
+pub(crate) struct AgentTile {
+    /// The session shown here; `None` ⇒ render the picker (the selector).
+    pub(crate) bound: Option<SessionId>,
+    /// Set while an async server open/create round-trip for this tile is in
+    /// flight; the resolution binds back to this tile by matching the token
+    /// across the whole workspace. Globally unique (see `alloc_open_token`).
+    /// Cleared once the round-trip resolves.
+    pub(crate) pending_open_token: Option<u64>,
+    /// When `Some` (and `bound == None`), this tile shows the in-tile session
+    /// picker instead of a transcript. Cleared the moment a session is bound.
     pub(crate) picker: Option<SessionPicker>,
 }
 
-impl AgentRing {
-    pub(crate) fn new(underlying: Option<Box<BufferApp>>) -> Self {
+impl AgentTile {
+    pub(crate) fn new() -> Self {
         Self {
-            slots: Vec::new(),
-            active: 0,
-            next_index: 0,
-            underlying,
+            bound: None,
+            pending_open_token: None,
             picker: None,
         }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn active(&self) -> &AgentSlot {
-        &self.slots[self.active]
-    }
-
-    pub(crate) fn active_mut(&mut self) -> &mut AgentSlot {
-        &mut self.slots[self.active]
-    }
-
-    pub(crate) fn push(
-        &mut self,
-        label: String,
-        state: AgentState,
-        resume_id: Option<String>,
-        cwd: PathBuf,
-        server_session_id: Option<String>,
-    ) -> usize {
-        let index = self.next_index;
-        self.next_index += 1;
-        self.slots.push(AgentSlot {
-            label,
-            index,
-            state,
-            resume_id,
-            cwd,
-            server_session_id,
-            // Role is unknown until the attach response lands; default to
-            // non-driver so a freshly-pushed slot never beats before
-            // spawn_attach_sessions records the real outcome.
-            is_driver: false,
-            pending_open_token: None,
-        });
-        self.active = self.slots.len() - 1;
-        index
-    }
-
-    pub(crate) fn next(&mut self) {
-        if self.slots.len() <= 1 {
-            return;
-        }
-        self.active = (self.active + 1) % self.slots.len();
-    }
-
-    pub(crate) fn prev(&mut self) {
-        if self.slots.len() <= 1 {
-            return;
-        }
-        self.active = if self.active == 0 {
-            self.slots.len() - 1
-        } else {
-            self.active - 1
-        };
-    }
-
-    /// Remove the active slot and return its state. Advances to the next
-    /// slot (or previous if at the end). Returns `None` if the ring is
-    /// now empty.
-    pub(crate) fn close_active(&mut self) -> Option<AgentSlot> {
-        if self.slots.is_empty() {
-            return None;
-        }
-        let removed = self.slots.remove(self.active);
-        if self.slots.is_empty() {
-            self.active = 0;
-        } else if self.active >= self.slots.len() {
-            self.active = self.slots.len() - 1;
-        }
-        Some(removed)
-    }
-
-    pub(crate) fn close_at(&mut self, idx: usize) -> Option<AgentSlot> {
-        if idx >= self.slots.len() {
-            return None;
-        }
-        let removed = self.slots.remove(idx);
-        if self.slots.is_empty() {
-            self.active = 0;
-        } else if self.active >= self.slots.len() {
-            self.active = self.slots.len() - 1;
-        } else if self.active > idx {
-            self.active -= 1;
-        }
-        Some(removed)
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.slots.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.slots.is_empty()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &AgentSlot> {
-        self.slots.iter()
-    }
-
-    /// Find slot position by monotonic index.
-    pub(crate) fn slot_by_index(&self, index: usize) -> Option<usize> {
-        self.slots.iter().position(|s| s.index == index)
-    }
-
-    pub(crate) fn slot_by_index_mut(&mut self, index: usize) -> Option<&mut AgentSlot> {
-        self.slots.iter_mut().find(|s| s.index == index)
-    }
-
-    /// Find a slot by its server-assigned session id.
-    pub(crate) fn slot_by_server_session_id_mut(&mut self, sid: &str) -> Option<&mut AgentSlot> {
-        self.slots
-            .iter_mut()
-            .find(|s| s.server_session_id.as_deref() == Some(sid))
-    }
-
-    /// Position of the slot for `sid`, if any. Used to remove it via
-    /// [`close_at`] when the server broadcasts that the session closed.
-    pub(crate) fn position_by_server_session_id(&self, sid: &str) -> Option<usize> {
-        self.slots
-            .iter()
-            .position(|s| s.server_session_id.as_deref() == Some(sid))
     }
 }
