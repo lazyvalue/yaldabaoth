@@ -10,6 +10,8 @@ const DESKTOP_TITLE_H: f32 = 20.0;
 const DESKTOP_DRAG_THRESHOLD: f32 = 4.0;
 const DESKTOP_EDGE_PAN_BAND: f32 = 30.0;
 const DESKTOP_EDGE_PAN_STEP: f32 = 12.0;
+/// Width of the east/south edge bands that arm a tile resize (spec 4b).
+const DESKTOP_RESIZE_BAND: f32 = 6.0;
 
 impl SketchGpuiView {
     /// Build the menu popup as an absolutely-positioned overlay anchored
@@ -122,7 +124,16 @@ impl SketchGpuiView {
         let tab = &self.workspace.tabs[tab_idx];
         let pan = tab.desktop.pan;
         let drag = tab.desktop.drag;
-        let slot_list: Vec<(workspace::WindowId, workspace::Slot)> = tab.desktop.slots.clone();
+        let slot_list: Vec<(workspace::WindowId, workspace::Slot, workspace::Span)> = tab
+            .desktop
+            .slots
+            .iter()
+            .map(|&(id, s)| (id, s, tab.desktop.span_of(id)))
+            .collect();
+        // Live edge-resize preview (spec Behavior 4b): the clamped span the
+        // resized tile renders at this frame, which is also what commits.
+        let resize_preview: Option<(workspace::WindowId, workspace::Span)> =
+            tab.desktop.resize.map(|r| (r.id, self.desktop_resize_target_span(r)));
         let base_bg = self.editor_bg();
         let content_fg = self.editor_fg();
         let dim: Hsla = nc(self.theme.agent.dim);
@@ -186,33 +197,38 @@ impl SketchGpuiView {
 
         // ── Drag affordances: home-slot outline + drop-target highlight. ──
         if let Some(d) = drag.filter(|d| d.active) {
+            let dspan = slot_list
+                .iter()
+                .find(|&&(id, _, _)| id == d.id)
+                .map(|&(_, _, sp)| sp)
+                .unwrap_or(workspace::Span::ONE);
             if let Some(home) = slot_list
                 .iter()
-                .find(|&&(id, _)| id == d.id)
-                .map(|&(_, s)| s)
+                .find(|&&(id, _, _)| id == d.id)
+                .map(|&(_, s, _)| s)
             {
-                let (x, y) = workspace::slot_origin(home, tile, g);
+                let (x, y, w, h) = workspace::tile_rect(home, dspan, tile, g);
                 canvas = canvas.child(
                     div()
                         .absolute()
                         .left(px(x - pan.0))
                         .top(px(y - pan.1))
-                        .w(px(tile.0))
-                        .h(px(tile.1))
+                        .w(px(w))
+                        .h(px(h))
                         .border_1()
                         .border_color(dim.opacity(0.6))
                         .rounded_md(),
                 );
             }
             if let Some(t) = d.target {
-                let (x, y) = workspace::slot_origin(t, tile, g);
+                let (x, y, w, h) = workspace::tile_rect(t, dspan, tile, g);
                 canvas = canvas.child(
                     div()
                         .absolute()
                         .left(px(x - pan.0))
                         .top(px(y - pan.1))
-                        .w(px(tile.0))
-                        .h(px(tile.1))
+                        .w(px(w))
+                        .h(px(h))
                         .border_2()
                         .border_color(accent.opacity(0.8))
                         .rounded_md(),
@@ -221,7 +237,15 @@ impl SketchGpuiView {
         }
 
         // ── Tiles. ──
-        for (id, slot) in slot_list {
+        for (id, slot, mut span) in slot_list {
+            // The tile being resized renders at its live clamped span so the
+            // grow/shrink is visible under the cursor (spec Behavior 4b).
+            if let Some((rid, rspan)) = resize_preview {
+                if rid == id {
+                    span = rspan;
+                }
+            }
+            let (_, _, tw, th) = workspace::tile_rect(slot, span, tile, g);
             let dragging = drag.filter(|d| d.active && d.id == id);
             let (sx, sy) = workspace::slot_origin(slot, tile, g);
             let (x, y) = match dragging {
@@ -233,7 +257,7 @@ impl SketchGpuiView {
                 ),
                 None => (sx - pan.0, sy - pan.1),
             };
-            let visible = x + tile.0 > 0.0 && x < canvas_w && y + tile.1 > 0.0 && y < canvas_h;
+            let visible = x + tw > 0.0 && x < canvas_w && y + th > 0.0 && y < canvas_h;
             let is_focused = id == focused_id;
             // Focused tile is exempt from culling — its element tree holds
             // the focus handle + per-screen action wiring (spec Behavior 3).
@@ -310,12 +334,51 @@ impl SketchGpuiView {
                     title_bar.child(div().px_1().text_color(accent).child(format!("[{m}]")));
             }
 
+            // East / south resize bands (spec Behavior 4b): thin overlays at
+            // the grow edges; the title bar (move) and content keep theirs.
+            let east_band = div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right_0()
+                .w(px(DESKTOP_RESIZE_BAND))
+                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                        this.desktop_resize_grab(
+                            id,
+                            workspace::ResizeEdge::East,
+                            (f32::from(ev.position.x), f32::from(ev.position.y)),
+                            cx,
+                        );
+                    }),
+                );
+            let south_band = div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .h(px(DESKTOP_RESIZE_BAND))
+                .cursor(gpui::CursorStyle::ResizeUpDown)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                        this.desktop_resize_grab(
+                            id,
+                            workspace::ResizeEdge::South,
+                            (f32::from(ev.position.x), f32::from(ev.position.y)),
+                            cx,
+                        );
+                    }),
+                );
+
             let mut frame = div()
                 .absolute()
                 .left(px(x))
                 .top(px(y))
-                .w(px(tile.0))
-                .h(px(tile.1))
+                .w(px(tw))
+                .h(px(th))
                 .flex()
                 .flex_col()
                 .overflow_hidden()
@@ -324,7 +387,9 @@ impl SketchGpuiView {
                 .border_1()
                 .border_color(if is_focused { accent } else { dim.opacity(0.4) })
                 .child(title_bar)
-                .child(div().flex_1().min_h_0().overflow_hidden().child(inner));
+                .child(div().flex_1().min_h_0().overflow_hidden().child(inner))
+                .child(east_band)
+                .child(south_band);
             if dragging.is_some() {
                 frame = frame.opacity(0.85);
             }
@@ -417,12 +482,73 @@ impl SketchGpuiView {
         cx.notify();
     }
 
+    /// Mouse-down on a tile's east/south resize band (spec Behavior 4b):
+    /// focus the tile and arm an edge resize. Live span is previewed in the
+    /// render pass; the clamped span commits on mouse-up.
+    pub(crate) fn desktop_resize_grab(
+        &mut self,
+        id: workspace::WindowId,
+        edge: workspace::ResizeEdge,
+        window_pos: (f32, f32),
+        cx: &mut Context<Self>,
+    ) {
+        let (cx0, cy0, _, _) = self.desktop_canvas_bounds.get();
+        let tab_idx = self.workspace.active_tab;
+        let tab = &mut self.workspace.tabs[tab_idx];
+        tab.focused = id;
+        let pan = tab.desktop.pan;
+        let desktop_pos = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
+        tab.desktop.resize = Some(workspace::DesktopResize {
+            id,
+            edge,
+            pointer: desktop_pos,
+        });
+        cx.notify();
+    }
+
+    /// The Block-clamped span a live resize would commit, given its pointer
+    /// (spec Behavior 4b). Used both for the render preview and the commit, so
+    /// what you see is exactly what lands.
+    fn desktop_resize_target_span(&self, r: workspace::DesktopResize) -> workspace::Span {
+        let tile = self.desktop_tile_px();
+        let g = DESKTOP_GUTTER;
+        let tab = &self.workspace.tabs[self.workspace.active_tab];
+        let Some(anchor) = tab.desktop.slot_of(r.id) else {
+            return tab.desktop.span_of(r.id);
+        };
+        let (ox, oy) = workspace::slot_origin(anchor, tile, g);
+        // Invert tile_rect: the far edge of `n` cells sits at
+        // origin + n*(tile+g) - g, so n = (edge_pos - origin + g) / (tile+g).
+        let desired = match r.edge {
+            workspace::ResizeEdge::East => {
+                ((r.pointer.0 - ox + g) / (tile.0 + g)).round().max(1.0) as u32
+            }
+            workspace::ResizeEdge::South => {
+                ((r.pointer.1 - oy + g) / (tile.1 + g)).round().max(1.0) as u32
+            }
+        };
+        tab.desktop.clamp_span(r.id, r.edge, desired)
+    }
+
     /// Canvas mouse-move: advance the drag (threshold, pointer, drop target,
-    /// edge auto-pan). No-op when no drag is armed.
+    /// edge auto-pan), or a live resize. No-op when neither is armed.
     pub(crate) fn desktop_pointer_move(&mut self, window_pos: (f32, f32), cx: &mut Context<Self>) {
         let (cx0, cy0, cw, ch) = self.desktop_canvas_bounds.get();
         let tile = self.desktop_tile_px();
         let tab_idx = self.workspace.active_tab;
+
+        // A live resize takes precedence over (and is mutually exclusive with)
+        // a drag: just track the pointer; the render pass clamps the span.
+        {
+            let tab = &mut self.workspace.tabs[tab_idx];
+            if let Some(mut r) = tab.desktop.resize {
+                let pan = tab.desktop.pan;
+                r.pointer = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
+                tab.desktop.resize = Some(r);
+                cx.notify();
+                return;
+            }
+        }
 
         // Edge auto-pan first (uses window-relative position within canvas).
         let mut pan_delta = (0.0f32, 0.0f32);
@@ -473,6 +599,17 @@ impl SketchGpuiView {
     pub(crate) fn desktop_drop(&mut self, cx: &mut Context<Self>) {
         let eff_w = self.desktop_grid_cols.max(1);
         let tab_idx = self.workspace.active_tab;
+
+        // Commit a live edge resize (spec Behavior 4b) — the clamped span the
+        // preview showed becomes the stored span.
+        if let Some(r) = self.workspace.tabs[tab_idx].desktop.resize.take() {
+            let span = self.desktop_resize_target_span(r);
+            self.workspace.tabs[tab_idx].desktop.set_span(r.id, span);
+            self.save_workspace_state();
+            cx.notify();
+            return;
+        }
+
         let tab = &mut self.workspace.tabs[tab_idx];
         let Some(d) = tab.desktop.drag.take() else {
             return;
@@ -487,10 +624,11 @@ impl SketchGpuiView {
         cx.notify();
     }
 
-    /// Cancel an in-flight drag (right-click; Esc is a follow-up).
+    /// Cancel an in-flight drag or resize (right-click; Esc is a follow-up).
     pub(crate) fn desktop_cancel_drag(&mut self, cx: &mut Context<Self>) {
         let tab_idx = self.workspace.active_tab;
-        if self.workspace.tabs[tab_idx].desktop.drag.take().is_some() {
+        let d = &mut self.workspace.tabs[tab_idx].desktop;
+        if d.drag.take().is_some() || d.resize.take().is_some() {
             cx.notify();
         }
     }

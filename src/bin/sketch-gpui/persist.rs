@@ -470,6 +470,12 @@ pub(crate) struct PersistedTab {
     /// snapshots → seed on the first desktop render.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) desktop_slots: Vec<(workspace::WindowId, u32, u32)>,
+    /// Desktop tile spans (spec-desktop-mode.md Behavior 4b), keyed by the
+    /// same `WindowId`. Parallel to `desktop_slots` and holds only non-default
+    /// (≠ 1 × 1) tiles, so older snapshots (no field) load every tile at
+    /// 1 × 1 and span-free arrangements omit it entirely. `(id, rows, cols)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) desktop_spans: Vec<(workspace::WindowId, u32, u32)>,
 }
 
 pub(crate) fn default_master_ratio() -> f32 {
@@ -752,6 +758,12 @@ pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<App>) -> PersistedWor
                     .slots
                     .iter()
                     .map(|&(id, s)| (id, s.row, s.col))
+                    .collect(),
+                desktop_spans: t
+                    .desktop
+                    .spans
+                    .iter()
+                    .map(|(&id, sp)| (id, sp.rows, sp.cols))
                     .collect(),
             })
             .collect(),

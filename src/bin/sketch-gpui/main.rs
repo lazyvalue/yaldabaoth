@@ -1720,8 +1720,14 @@ impl SketchGpuiView {
                         v.sort_by_key(|&(_, s)| s);
                         v
                     },
+                    spans: ptab
+                        .desktop_spans
+                        .into_iter()
+                        .map(|(id, rows, cols)| (id, workspace::Span::new(rows, cols)))
+                        .collect(),
                     pan: (0.0, 0.0),
                     drag: None,
+                    resize: None,
                     last_reveal: None,
                 },
             });
