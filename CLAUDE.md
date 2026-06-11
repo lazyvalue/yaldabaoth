@@ -29,9 +29,10 @@ the work happens inside them:
   (`bound: None`) renders the **selector** (free sessions + "create new"); close
   / unbind / rebind keep the tile `App::Agent` showing the selector — it never
   vanishes and never silently becomes a Buffer (Agent and Buffer are orthogonal;
-  there is no nested `underlying` buffer). Ctrl-V converts the tile to a fresh
-  Buffer picker. Agent commands (`.` menu): select session · stop · send
-  message · switch Worksheet⇄Message Box.
+  there is no nested `underlying` buffer, and no "leave agent" gesture — an
+  agent tile stays an agent tile; you close it or open a Buffer tile normally).
+  Agent commands (`.` menu): select session · stop · send message · switch
+  Worksheet⇄Message Box.
 
 ## Dev system (read this for how we work)
 

@@ -18,8 +18,8 @@ enum BindOutcome {
 
 impl YaldaGpuiView {
     /// Open the Claude screen and attempt to attach to an ACP agent. Bound
-    /// to `Ctrl-K` in the Doc and Edit views. Stashes the prior screen so
-    /// `Ctrl-V` from Claude returns to it.
+    /// to `Ctrl-K` in the Doc and Edit views. Replaces the focused tile with an
+    /// Agent tile; the prior buffer stays in the pool (reachable via Cmd+O).
     ///
     /// Attach uses `YALDA_ACP_AGENT` if set, else the
     /// `claude-agent-acp` default (`AcpChannelClient::DEFAULT_AGENT_COMMAND`).
@@ -39,7 +39,7 @@ impl YaldaGpuiView {
 
         // Replace the focused tile with an Agent tile (no buffer stash —
         // Agent and Buffer are orthogonal; the pooled file buffers stay
-        // reachable via Cmd+O). Ctrl-V later converts back to a fresh picker.
+        // reachable via Cmd+O).
         let mut tile = AgentTile::new();
         let proc_cwd = process_cwd();
 
@@ -320,8 +320,7 @@ impl YaldaGpuiView {
     }
 
     /// Key handler for the in-tile session picker (`AgentPickerView`):
-    /// j/k or ↑/↓ to move, Enter to activate, Ctrl-V to back out to the
-    /// underlying buffer so a mis-opened agent tile is never a dead end.
+    /// j/k or ↑/↓ to move, Enter to activate.
     pub(crate) fn handle_picker_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -329,12 +328,6 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
-        if press.modifiers.contains(KMods::CONTROL)
-            && matches!(press.key, Key::Char('v') | Key::Char('V'))
-        {
-            self.back_to_doc(cx);
-            return;
-        }
         match press.key {
             Key::Up | Key::Char('k') => self.agent_picker_move(-1, cx),
             Key::Down | Key::Char('j') => self.agent_picker_move(1, cx),
@@ -880,7 +873,7 @@ impl YaldaGpuiView {
     /// Unbind the focused tile and land it in a LIVE free-session selector:
     /// install a loading `SessionPicker` and kick off the server list (server
     /// mode), so Enter/j/k are immediately usable — NOT a dead `picker == None`
-    /// state that only Ctrl-V can escape. Used by close / reconcile.
+    /// state with no usable keys. Used by close / reconcile.
     pub(crate) fn show_selector_on_focused_tile(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
         if let Some(tile) = self.agent_tile_mut() {
             tile.bound = None;
@@ -893,8 +886,7 @@ impl YaldaGpuiView {
     }
 
     /// Close the focused session. The tile stays an Agent tile, transitioning
-    /// to a LIVE unbound selector (it does NOT fall back to a buffer — only an
-    /// explicit Ctrl-V / back_to_doc does that).
+    /// to a LIVE unbound selector — an agent tile never falls back to a buffer.
     pub(crate) fn close_active_agent_session(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.focused_bound_session() else {
             return;
@@ -1392,8 +1384,8 @@ impl YaldaGpuiView {
 
     /// Reconcile a server-side close: drop the session for `sid` from the store
     /// and land whichever tile showed it in a LIVE free-session selector. The
-    /// tile stays an Agent tile (it does NOT fall back to a buffer — only an
-    /// explicit Ctrl-V does that). Returns whether anything changed.
+    /// tile stays an Agent tile — an agent tile never falls back to a buffer.
+    /// Returns whether anything changed.
     ///
     /// A tile carrying a `pending_open_token` is mid-respawn (change_agent_cwd
     /// closed the OLD sid and is creating a new one); its in-flight
@@ -3202,10 +3194,9 @@ impl YaldaGpuiView {
     }
 
     /// Key dispatch for the agent window. Recognises the agent-window-
-    /// scoped shortcuts (`Ctrl-Enter` submit, `Ctrl-Alt-Enter` mode toggle,
-    /// `Ctrl-V` leave, session-cycle `Ctrl-]`/`Ctrl-[`) before routing
-    /// remaining keys to either the chatbox (in Chatbox mode) or the
-    /// transcript editor (in Worksheet mode). See spec-agent-window.md §32.
+    /// scoped shortcuts (`Ctrl-Enter` submit, `Ctrl-Alt-Enter` mode toggle)
+    /// before routing remaining keys to either the chatbox (in Chatbox mode)
+    /// or the transcript editor (in Worksheet mode). See spec-agent-window.md §32.
     pub(crate) fn handle_claude_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -3249,21 +3240,6 @@ impl YaldaGpuiView {
         // gated by the frozen-line invariants.
         if press.modifiers.contains(KMods::CONTROL) && press.key == Key::Enter {
             self.submit_agent(cx);
-            return;
-        }
-
-        // Leave the agent window with Ctrl-V; the chatbox (if any) is
-        // dropped without sending — its content is recoverable by toggling
-        // back into Chatbox mode (which creates a fresh chatbox) and
-        // re-typing, but we don't try to preserve unsent text across the
-        // jump (spec §36).
-        if press.modifiers.contains(KMods::CONTROL)
-            && matches!(press.key, Key::Char('v') | Key::Char('V'))
-        {
-            if let Some(c) = self.agent_mut() {
-                c.input_surface = InputSurface::Worksheet;
-            }
-            self.back_to_doc(cx);
             return;
         }
 

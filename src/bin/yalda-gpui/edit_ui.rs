@@ -192,17 +192,6 @@ impl YaldaGpuiView {
                     source: Some(source),
                 })));
             }
-            App::Agent(_tile) => {
-                // Leaving an agent (Ctrl-V) is the ONLY path that converts a
-                // tile from Agent to Buffer (spec-agent-session-ownership.md).
-                // Agent and Buffer are orthogonal — there is no stashed buffer
-                // to restore, so we open a fresh file picker at cwd. The bound
-                // session is NOT killed: it stays in the store as a free
-                // session, re-bindable via the selector or another tile.
-                self.set_screen(App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                ))));
-            }
             other => {
                 self.set_screen(other);
                 return;
