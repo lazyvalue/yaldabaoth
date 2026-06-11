@@ -748,29 +748,42 @@ impl YaldaGpuiView {
     /// Header shows attach status; footer shows mode + send hint + send
     /// state ("…" while a reply is in flight).
     pub(crate) fn render_agent(
-        &self,
+        &mut self,
         root: gpui::Div,
-        ring: &mut AgentRing,
+        tile: &mut AgentTile,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        // Legacy multi-session sidebar removed; the workspace tabs/splits
-        // model is the surface for running multiple agents. Sessions
-        // within a single ring remain reachable via Ctrl-]/Ctrl-[.
-
-        // Empty ring → no session bound yet: render the in-tile session
-        // picker instead of a transcript. A transcript render below would
-        // panic on `ring.active()`; the picker is the only valid view of an
-        // empty ring.
-        if ring.is_empty() {
-            return self.render_agent_picker(root, ring, cx);
-        }
-
-        let active_slot_label = ring.active().label.clone();
-        // Per-slot cwd (spec-agent-cwd.md §6). Cloned before the
-        // active_mut() reborrow so the Status Strip render can compare
-        // against the process cwd without holding two borrows on the ring.
-        let active_slot_cwd = ring.active().cwd.clone();
-        let c = &mut ring.active_mut().state;
+        // Unbound tile (`bound == None`) ⇒ render the session selector
+        // (SessionPicker), not a transcript. This is the canonical unbound
+        // state (session close / unbind / rebind all land here).
+        let Some(id) = tile.bound else {
+            return self.render_agent_picker(root, tile, cx);
+        };
+        // The session lives in the store (disjoint from the layout tree the
+        // caller borrows `tile` from), so `&mut self.sessions` is safe here.
+        let Some(session) = self.sessions.get_mut(id) else {
+            return self.render_agent_picker(root, tile, cx);
+        };
+        let active_slot_label = session.label.clone();
+        let active_slot_cwd = session.cwd.clone();
+        // The render body reads `self.theme`/fonts/`self`-methods AND mutates
+        // the bound session's `AgentState`. Both live behind `&mut self`, but the
+        // session payload (in `self.sessions`) is field-disjoint from everything
+        // else the body reads, so a raw pointer threads `&mut AgentState` through
+        // — the same disjoint-borrow idiom the chrome render path uses for the
+        // layout tree.
+        //
+        // SAFETY (provably sound): (1) `state_ptr` aliases ONLY the
+        // `self.sessions` entry for `id`; the render body never re-borrows
+        // `self.sessions` (it touches `self.theme`/fonts/render helpers, all
+        // distinct fields), so no `&`/`&mut` to the same payload is ever live
+        // alongside `c`. (2) The store is not structurally mutated during render
+        // (no insert/close/rebind), so the entry — and thus the pointer — stays
+        // valid for the whole call. (3) `c` never escapes this function. The
+        // borrow checker can't see field-disjointness through `get_mut`, hence
+        // the raw pointer.
+        let state_ptr: *mut AgentState = &mut session.state as *mut _;
+        let c: &mut AgentState = unsafe { &mut *state_ptr };
 
         let cursor = c.editor.cursor();
         let cursor_line = cursor.line;
@@ -1232,7 +1245,9 @@ impl YaldaGpuiView {
 
                         if expandable {
                             header_row = header_row.cursor_pointer().on_click(
-                                move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut GpuiApp| {
+                                move |_ev: &gpui::ClickEvent,
+                                      _w: &mut Window,
+                                      app: &mut GpuiApp| {
                                     let id = click_id.clone();
                                     let _ = weak.update(app, |this, cx| {
                                         if let Some(c) = this.agent_mut() {
@@ -2255,7 +2270,7 @@ impl YaldaGpuiView {
     pub(crate) fn render_agent_picker(
         &self,
         root: gpui::Div,
-        ring: &AgentRing,
+        tile: &AgentTile,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let at = &self.theme.agent;
@@ -2266,7 +2281,7 @@ impl YaldaGpuiView {
         let sel_bg: Hsla = tint_bg(bg, 0.55, 0.14, 0.07);
         let card_bg: Hsla = tint_bg(bg, 0.55, 0.05, 0.02);
 
-        let selected = ring.picker.as_ref().map(|p| p.selected).unwrap_or(0);
+        let selected = tile.picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
         let header = div()
             .flex()
@@ -2295,7 +2310,7 @@ impl YaldaGpuiView {
             cx,
         ));
 
-        match ring.picker.as_ref().and_then(|p| p.sessions.as_ref()) {
+        match tile.picker.as_ref().and_then(|p| p.sessions.as_ref()) {
             None => {
                 rows = rows.child(
                     div()
@@ -2306,7 +2321,7 @@ impl YaldaGpuiView {
                 );
             }
             Some(sessions) if sessions.is_empty() => {
-                let msg = ring
+                let msg = tile
                     .picker
                     .as_ref()
                     .and_then(|p| p.error.clone())
@@ -2319,7 +2334,11 @@ impl YaldaGpuiView {
                 for (i, s) in sessions.iter().enumerate() {
                     let row = i + 1;
                     let liveness = if s.connected { "live" } else { "idle" };
-                    let owned = if s.has_owner { " · open elsewhere" } else { "" };
+                    let owned = if s.has_owner {
+                        " · open elsewhere"
+                    } else {
+                        ""
+                    };
                     let sub = format!(
                         "{} turn{} · {}{}",
                         s.turns,

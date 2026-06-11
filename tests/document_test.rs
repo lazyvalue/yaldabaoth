@@ -1,6 +1,6 @@
-use yalda::document::Document;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use yalda::document::Document;
 
 #[test]
 fn test_new_document_from_string() {

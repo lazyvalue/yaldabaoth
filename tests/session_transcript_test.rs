@@ -578,8 +578,7 @@ fn prompt_from_expired_same_client_regrants_lease_and_delivers() {
     // 300ms TTL so the lease verifiably lapses between turns; the sweep
     // (5s cadence) may or may not have cleared it to None — the gate must
     // handle both (expired-same-id renew AND free-claim).
-    let server =
-        TestServer::start_with_env(&[("STUB_CHUNKS", "3"), ("YALDA_LEASE_TTL_MS", "300")]);
+    let server = TestServer::start_with_env(&[("STUB_CHUNKS", "3"), ("YALDA_LEASE_TTL_MS", "300")]);
     server.activate_env();
 
     let client = connect_as("gui-napped");

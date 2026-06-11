@@ -9,7 +9,28 @@ use super::*;
 /// next to `debug.log` so all yalda-managed transient state stays in one
 /// place.
 pub(crate) fn acp_session_persist_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(p) = ACP_PERSIST_PATH_OVERRIDE.with(|c| c.borrow().clone()) {
+        return Some(p);
+    }
     yalda::paths::yalda_home().map(|d| d.join("acp_sessions.json"))
+}
+
+/// Test-only seam: redirect the ACP-session persistence file to a tempdir so a
+/// save→restore round-trip test never touches the user's real
+/// `~/.yalda/acp_sessions.json`. Thread-local, so parallel tests don't collide.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ACP_PERSIST_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_acp_persist_path<R>(path: PathBuf, f: impl FnOnce() -> R) -> R {
+    ACP_PERSIST_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+    let r = f();
+    ACP_PERSIST_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    r
 }
 
 /// Path to the one-line UUID file holding this GUI install's STABLE client id
@@ -135,7 +156,31 @@ pub(crate) fn is_candidate_launch() -> bool {
 /// `YALDA_SESSION_SERVER=0` to force the legacy in-process direct-spawn path.
 /// Returns `None` when disabled, or when the connection/launch fails (falls
 /// back to direct spawning so the GUI still starts).
+/// Test-only hermetic seam: when set on the current thread, `connect_session_
+/// server` returns `None` so a headless view never reaches out to whatever
+/// `yalda-session-server` happens to be running on the dev box. Set/cleared via
+/// [`with_no_session_server`] around a view construction.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_NO_SESSION_SERVER: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the session server forced OFF on this thread (test-only). The
+/// flag is restored afterward so the seam is scoped to the construction.
+#[cfg(test)]
+pub(crate) fn with_no_session_server<R>(f: impl FnOnce() -> R) -> R {
+    FORCE_NO_SESSION_SERVER.with(|c| c.set(true));
+    let r = f();
+    FORCE_NO_SESSION_SERVER.with(|c| c.set(false));
+    r
+}
+
 pub(crate) fn connect_session_server() -> Option<SessionServerClient> {
+    #[cfg(test)]
+    if FORCE_NO_SESSION_SERVER.with(|c| c.get()) {
+        return None;
+    }
     if std::env::var("YALDA_SESSION_SERVER").as_deref() == Ok("0") {
         eprintln!("[yalda-gpui] session server disabled (YALDA_SESSION_SERVER=0); direct spawn");
         return None;
@@ -373,15 +418,11 @@ pub(crate) fn save_preferences(prefs: &Preferences) {
 #[serde(rename_all = "snake_case", tag = "kind", content = "data")]
 pub(crate) enum PersistedKind {
     /// A Buffer tile in one of its three modes.
-    Buffer {
-        mode: PersistedBufferMode,
-    },
+    Buffer { mode: PersistedBufferMode },
     /// JSON tag stays as "claude" so the ACP-session side-channel keys line up;
     /// the in-memory variant is `Agent` to match the rename pass.
     #[serde(rename = "claude")]
-    Agent {
-        session_id: Option<String>,
-    },
+    Agent { session_id: Option<String> },
 }
 
 /// Persisted shadow of `BufferApp`'s mode (B1). `viewing`/`editing` carry the
@@ -519,17 +560,14 @@ pub(crate) fn snapshot_content(content: &App) -> PersistedKind {
                 dir: b.fb.current_dir().to_path_buf(),
             },
         },
-        App::Agent(ring) => {
-            // Use the active session's id if any. Multi-session restore is
-            // handled by the existing ACP persistence path; this is just
-            // enough to know "this slot had a Claude session" so on restore
-            // we can spawn the ring shell.
-            let session_id = ring
-                .slots
-                .first()
-                .and_then(|s| s.state.channel.as_ref())
-                .and_then(|c| c.session_id().map(|s| s.to_string()));
-            PersistedKind::Agent { session_id }
+        App::Agent(_tile) => {
+            // The layout snapshot only records "this tile is an Agent" so the
+            // tab survives restore; the session id itself is restored from the
+            // ACP-session side-channel (acp_sessions.json), not from here. The
+            // channel/sid live in the store now, which `snapshot_content` does
+            // not have access to — so we always persist `None` and let
+            // `restore_agent_leaves` rebind via the side-channel.
+            PersistedKind::Agent { session_id: None }
         }
     }
 }
@@ -787,10 +825,7 @@ pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<App>) -> PersistedWor
 
 /// Best-effort write of the workspace snapshot for `cwd`. Silently no-ops
 /// on any I/O / serialization failure (Behavior 23: best-effort + silent).
-pub(crate) fn save_persisted_workspace(
-    cwd: &std::path::Path,
-    ws: &workspace::Workspace<App>,
-) {
+pub(crate) fn save_persisted_workspace(cwd: &std::path::Path, ws: &workspace::Workspace<App>) {
     let Some(path) = workspace_persist_path() else {
         return;
     };
@@ -1024,7 +1059,20 @@ pub(crate) fn forget_persisted_acp_session_ids(ids: &[String]) {
 /// Concurrent yalda instances on the same `cwd`: last-writer-wins. Each
 /// call does a read-modify-write of the file, replacing only the cwd
 /// entry; other cwds are preserved.
-pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRing) {
+/// A persistable snapshot of one bound agent session (spec-agent-session-
+/// ownership.md). Gathered by `YaldaGpuiView::save_agent_ring` from the tiles'
+/// bound sessions in the store, then written by `save_persisted_acp_sessions`.
+pub(crate) struct SessionSnapshot {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) active: bool,
+    pub(crate) mode: InputModeKind,
+    pub(crate) tasklist_open: bool,
+    pub(crate) subagents_open: bool,
+    pub(crate) cwd: PathBuf,
+}
+
+pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[SessionSnapshot]) {
     let Some(path) = acp_session_persist_path() else {
         return;
     };
@@ -1032,31 +1080,20 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRin
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let active_index = ring.active;
-    let entries: Vec<serde_json::Value> = ring
-        .slots
+    let entries: Vec<serde_json::Value> = snaps
         .iter()
-        .enumerate()
-        .filter_map(|(i, slot)| {
-            // resume_id wins over channel id: if we were trying to resume,
-            // keep retrying the original id even when load fell back.
-            let id = slot
-                .resume_id
-                .clone()
-                .or_else(|| slot.state.channel.as_ref().and_then(|c| c.session_id()))?;
+        .map(|snap| {
             let mut obj = serde_json::Map::new();
-            obj.insert("id".into(), serde_json::Value::String(id));
+            obj.insert("id".into(), serde_json::Value::String(snap.id.clone()));
             obj.insert(
                 "label".into(),
-                serde_json::Value::String(slot.label.clone()),
+                serde_json::Value::String(snap.label.clone()),
             );
-            if i == active_index {
+            if snap.active {
                 obj.insert("active".into(), serde_json::Value::Bool(true));
             }
-            // Spec §35: persist input mode and sidebar state per slot.
-            // Older yalda binaries reading this file ignore the unknown
-            // keys (serde's standard behavior); no migration needed.
-            let mode_str = match slot.state.input_surface.mode() {
+            // Spec §35: persist input mode and sidebar state per session.
+            let mode_str = match snap.mode {
                 InputModeKind::Worksheet => "worksheet",
                 InputModeKind::Chatbox => "chatbox",
             };
@@ -1066,21 +1103,18 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, ring: &AgentRin
             );
             obj.insert(
                 "tasklist_open".into(),
-                serde_json::Value::Bool(slot.state.tasklist_open),
+                serde_json::Value::Bool(snap.tasklist_open),
             );
             obj.insert(
                 "subagents_open".into(),
-                serde_json::Value::Bool(slot.state.subagents_open),
+                serde_json::Value::Bool(snap.subagents_open),
             );
-            // spec-agent-cwd.md §5: persist the slot's working directory.
-            // Lossy on non-UTF8 paths (Constraint §11) — same as the
-            // top-level `cwd` key in this file. Acceptable on macOS where
-            // APFS enforces UTF8-encodable names.
+            // spec-agent-cwd.md §5: persist the session's working directory.
             obj.insert(
                 "cwd".into(),
-                serde_json::Value::String(slot.cwd.display().to_string()),
+                serde_json::Value::String(snap.cwd.display().to_string()),
             );
-            Some(serde_json::Value::Object(obj))
+            serde_json::Value::Object(obj)
         })
         .collect();
 

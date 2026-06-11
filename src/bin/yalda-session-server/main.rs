@@ -23,7 +23,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 
 use yalda::acp_channel::{
-    AgentSpawner, AgentTransport, PermissionMode, RealAgentSpawner, YaldaFrontend, TransportHandle,
+    AgentSpawner, AgentTransport, PermissionMode, RealAgentSpawner, TransportHandle, YaldaFrontend,
 };
 use yalda::session_proto::*;
 

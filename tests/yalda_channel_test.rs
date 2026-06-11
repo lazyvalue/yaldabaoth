@@ -66,10 +66,7 @@ impl Harness {
         let deadline = Instant::now() + Duration::from_secs(2);
         while !socket_path.exists() {
             if Instant::now() > deadline {
-                panic!(
-                    "yalda-channel never bound socket {}",
-                    socket_path.display()
-                );
+                panic!("yalda-channel never bound socket {}", socket_path.display());
             }
             std::thread::sleep(Duration::from_millis(20));
         }
