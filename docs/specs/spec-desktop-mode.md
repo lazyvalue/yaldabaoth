@@ -323,4 +323,7 @@ content; `Preferences` owns tile size.
   rejects an unabsorbable insertion (Behavior 4). Collision policy is **Block**
   (grow into free desktop only) — the *push* model is deferred. Spans persist
   in a parallel optional `desktop_spans` vector (1 × 1 default; old files load
-  unchanged). Anchors never move on resize.
+  unchanged). Anchors never move on resize. **Implemented and runtime-smoked
+  the same day** — engine is headlessly unit-tested (9 cases: rectangle-aware
+  occupancy, Block clamp, wall-rejected inserts, span persistence); the
+  east/south bands + live clamped preview were confirmed by hand.
