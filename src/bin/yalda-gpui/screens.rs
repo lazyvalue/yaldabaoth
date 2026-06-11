@@ -438,8 +438,8 @@ impl YaldaGpuiView {
     }
 
     /// Code (raw markdown) view: monospace, gutter with line numbers,
-    /// per-line `md_highlight` source colors. Cursor splice via the shared
-    /// `build_line_content` helper.
+    /// per-line `md_highlight` source colors. Lines soft-wrap and the cursor
+    /// splices inline via the shared `build_wrapped_line` helper.
     ///
     /// **Virtualized**: rendered through a `gpui::list` so only the visible rows
     /// are built/laid-out per frame, not one element per document line. Combined
@@ -509,7 +509,11 @@ impl YaldaGpuiView {
                 .text_color(dim_fg)
                 .child(format!("{:>3} ", line_idx + 1));
 
-            let content = build_line_content(
+            // Soft-wrap: long lines break at whitespace and stack below the
+            // gutter rather than running off the right edge — which is what
+            // let the cursor scroll out of view. `build_wrapped_line` emits
+            // the caret as an inline flex child so it wraps with the text.
+            let content = build_wrapped_line(
                 &segs,
                 &line_str,
                 line_idx == cursor_line,
@@ -536,6 +540,9 @@ impl YaldaGpuiView {
             .flex_col()
             .flex_1()
             .min_h_0()
+            // Clip the rare unbroken token (no whitespace to wrap at) instead
+            // of letting it widen the row and reintroduce horizontal scroll.
+            .overflow_x_hidden()
             .px_4()
             .py_2()
             .text_size(text_size)
@@ -652,7 +659,12 @@ impl YaldaGpuiView {
                 _ => &body_font,
             };
 
-            let content = build_line_content(
+            // Soft-wrap (mirrors the Code view): tokens break at whitespace
+            // so long prose lines wrap below instead of pushing the caret
+            // off-screen. WP uses a proportional `line_font`; whitespace
+            // tokens at wrap boundaries can leave a slightly ragged left
+            // margin — acceptable vs. an invisible cursor.
+            let content = build_wrapped_line(
                 &segs,
                 &line_str,
                 line_idx == cursor_line,
@@ -710,6 +722,7 @@ impl YaldaGpuiView {
             .flex_col()
             .flex_1()
             .min_h_0()
+            .overflow_x_hidden()
             .px_8()
             .py_4()
             .text_size(px(14.0 * self.text_scale))
@@ -1061,6 +1074,7 @@ impl YaldaGpuiView {
                             cursor_color,
                             base_style,
                             line_base_fg,
+                            &code_font_snap,
                             &code_font_snap,
                         );
 

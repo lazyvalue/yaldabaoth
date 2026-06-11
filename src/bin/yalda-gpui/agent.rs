@@ -903,6 +903,10 @@ pub(crate) fn cap_string_chars(s: &str, max_chars: usize) -> String {
 /// inline as its own flex child between the before/after halves of the
 /// containing token. This keeps wrap behaviour consistent across cursor
 /// and non-cursor lines.
+///
+/// `line_font` is the typography font for ordinary spans (monospace in the
+/// Code/worksheet views, proportional in the WP view); `code_font` is the
+/// fallback `styled_line_element` uses for spans carrying a code background.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_wrapped_line(
     segs: &[Segment],
@@ -913,6 +917,7 @@ pub(crate) fn build_wrapped_line(
     cursor_color: Hsla,
     base_style: NStyle,
     base_fg: u32,
+    line_font: &SharedString,
     code_font: &SharedString,
 ) -> AnyElement {
     let mut row = div().flex().flex_row().flex_wrap().flex_1().min_w_0();
@@ -948,7 +953,7 @@ pub(crate) fn build_wrapped_line(
     if tokens.is_empty() {
         let line = segments_to_styled_line(&[(" ".to_string(), base_style)]);
         row = row.child(styled_line_element(
-            &line, base_style, base_fg, code_font, code_font,
+            &line, base_style, base_fg, line_font, code_font,
         ));
         if is_cursor_line {
             row = row.child(make_caret(mode, ' ', cursor_color));
@@ -960,7 +965,7 @@ pub(crate) fn build_wrapped_line(
         for (text, style) in &tokens {
             let line = segments_to_styled_line(&[(text.clone(), *style)]);
             row = row.child(styled_line_element(
-                &line, base_style, base_fg, code_font, code_font,
+                &line, base_style, base_fg, line_font, code_font,
             ));
         }
         return row.into_any_element();
@@ -986,7 +991,7 @@ pub(crate) fn build_wrapped_line(
             if !before.is_empty() {
                 let line = segments_to_styled_line(&[(before, *style)]);
                 row = row.child(styled_line_element(
-                    &line, base_style, base_fg, code_font, code_font,
+                    &line, base_style, base_fg, line_font, code_font,
                 ));
             }
             let cursor_char = chars.get(split_point).copied().unwrap_or(' ');
@@ -1003,13 +1008,13 @@ pub(crate) fn build_wrapped_line(
                 let after: String = chars[after_start..].iter().collect();
                 let line = segments_to_styled_line(&[(after, *style)]);
                 row = row.child(styled_line_element(
-                    &line, base_style, base_fg, code_font, code_font,
+                    &line, base_style, base_fg, line_font, code_font,
                 ));
             }
         } else {
             let line = segments_to_styled_line(&[(text.clone(), *style)]);
             row = row.child(styled_line_element(
-                &line, base_style, base_fg, code_font, code_font,
+                &line, base_style, base_fg, line_font, code_font,
             ));
         }
         col_so_far = token_end_col;
