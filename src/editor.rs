@@ -1015,6 +1015,39 @@ impl EditorView {
         core.reparse();
     }
 
+    /// Replace the single character under the cursor with `ch` (vim `r`),
+    /// leaving the cursor on it. No-op on an empty line or past end-of-line
+    /// (nothing to replace), and respects the same frozen-line / lockable
+    /// guards as delete + insert. The delete and re-insert land in one undo
+    /// group so `r` is a single undo step.
+    pub fn replace_char_at_cursor(&mut self, core: &mut EditorCore, ch: char) {
+        let line = self.cursor.line;
+        let col = self.cursor.col;
+        if col >= core.document.line_len_chars(line) {
+            return;
+        }
+        let char_idx = core.document.line_col_to_char(line, col);
+        if !core.can_delete_range(char_idx, char_idx + 1) || !core.can_insert_char_at(line, col, ch)
+        {
+            return;
+        }
+        core.document.begin_undo_group(
+            line,
+            col,
+            &core.frozen_lines,
+            core.lockable_through_line,
+        );
+        core.shift_frozen_lines_for_delete(char_idx, char_idx + 1);
+        core.document.delete_char(line, col);
+        core.shift_frozen_lines_for_insert(line, col, &ch.to_string());
+        core.document.insert_char(line, col, ch);
+        // Cursor stays on the replaced character (normal-mode position).
+        self.cursor.line = line;
+        self.cursor.col = col;
+        core.document.end_undo_group(line, col);
+        core.reparse();
+    }
+
     pub fn delete_current_line(&mut self, core: &mut EditorCore) {
         let line = self.cursor.line;
         let line_start = core.document.line_col_to_char(line, 0);
@@ -1557,6 +1590,10 @@ impl Editor {
         self.view.delete_char_at_cursor(&mut self.core);
     }
 
+    pub fn replace_char_at_cursor(&mut self, ch: char) {
+        self.view.replace_char_at_cursor(&mut self.core, ch);
+    }
+
     pub fn delete_current_line(&mut self) {
         self.view.delete_current_line(&mut self.core);
     }
@@ -1864,6 +1901,36 @@ mod tests {
 
     fn new_editor(text: &str) -> Editor {
         Editor::new(text.to_string(), PathBuf::from("test.md"))
+    }
+
+    #[test]
+    fn replace_char_swaps_under_cursor_and_keeps_position() {
+        let mut ed = new_editor("hello\n");
+        ed.cursor_mut().line = 0;
+        ed.cursor_mut().col = 1; // 'e'
+        ed.replace_char_at_cursor('a');
+        assert_eq!(ed.document().line_text(0).trim_end_matches('\n'), "hallo");
+        // Cursor stays on the replaced char (vim `r` leaves it in place).
+        assert_eq!(ed.cursor().col, 1);
+    }
+
+    #[test]
+    fn replace_char_is_a_single_undo_step() {
+        let mut ed = new_editor("abc\n");
+        ed.cursor_mut().col = 0;
+        ed.replace_char_at_cursor('X');
+        assert_eq!(ed.document().line_text(0).trim_end_matches('\n'), "Xbc");
+        ed.undo();
+        assert_eq!(ed.document().line_text(0).trim_end_matches('\n'), "abc");
+    }
+
+    #[test]
+    fn replace_char_noop_on_empty_line() {
+        let mut ed = new_editor("\nx\n");
+        ed.cursor_mut().line = 0;
+        ed.cursor_mut().col = 0;
+        ed.replace_char_at_cursor('z');
+        assert_eq!(ed.document().line_text(0).trim_end_matches('\n'), "");
     }
 
     #[test]

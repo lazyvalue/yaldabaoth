@@ -579,6 +579,26 @@ impl YaldaGpuiView {
             None => return,
         };
         edit.last_save_msg = None;
+
+        // `r{char}` replace-char chord. `r` arms `pending_replace`; the next
+        // keypress is consumed as the replacement (Esc / non-char cancels).
+        if edit.pending_replace {
+            edit.pending_replace = false;
+            if let Key::Char(c) = press.key
+                && !press.modifiers.contains(KMods::CONTROL)
+            {
+                edit.editor.replace_char_at_cursor(c);
+            }
+            cx.notify();
+            return;
+        }
+        if press.key == Key::Char('r') && press.modifiers.is_empty() {
+            edit.pending_replace = true;
+            edit.last_save_msg = Some("replace".into());
+            cx.notify();
+            return;
+        }
+
         match Self::dispatch_normal_core(
             &mut edit.editor,
             &mut edit.mode,
@@ -743,19 +763,9 @@ impl YaldaGpuiView {
                 *mode = EditMode::Insert;
             }
             // ---- Helix selection actions ----
-            "delete-selection" => {
-                if editor.selection_anchor().is_some() {
-                    editor.delete_selection();
-                } else {
-                    editor.delete_char_at_cursor();
-                }
-            }
+            "delete-selection" => Self::yank_then_delete_selection(editor),
             "change-selection" => {
-                if editor.selection_anchor().is_some() {
-                    editor.delete_selection();
-                } else {
-                    editor.delete_char_at_cursor();
-                }
+                Self::yank_then_delete_selection(editor);
                 editor.begin_insert();
                 *mode = EditMode::Insert;
             }
@@ -782,9 +792,16 @@ impl YaldaGpuiView {
             }
             // ---- Direct-edit actions (still callable via custom config) ----
             "delete-char" => {
+                if let Some(t) = char_under_cursor(editor) {
+                    Self::yank_to_clipboard(&t);
+                }
                 editor.delete_char_at_cursor();
             }
             "delete-line" => {
+                let line = editor.line_text_at_cursor();
+                if !line.is_empty() {
+                    Self::yank_to_clipboard(&line);
+                }
                 editor.delete_current_line();
             }
             "undo" => {
@@ -808,6 +825,24 @@ impl YaldaGpuiView {
         let last = editor.line_count().saturating_sub(1) as isize;
         let target = (cur + delta).clamp(0, last.max(0)) as usize;
         editor.jump_to_line(target);
+    }
+
+    /// Vim default-register semantics for a delete: copy the about-to-be-
+    /// deleted text to the clipboard (yalda's yank buffer) before removing it,
+    /// so a subsequent `p`/`P` puts it back. Deletes the active selection, or
+    /// the single character under the cursor when there's no selection.
+    fn yank_then_delete_selection<E: EditOps>(editor: &mut E) {
+        if editor.selection_anchor().is_some() {
+            if let Some(t) = editor.yank_selection().filter(|s| !s.is_empty()) {
+                Self::yank_to_clipboard(&t);
+            }
+            editor.delete_selection();
+        } else {
+            if let Some(t) = char_under_cursor(editor) {
+                Self::yank_to_clipboard(&t);
+            }
+            editor.delete_char_at_cursor();
+        }
     }
 
     /// Charwise put of `text` at (P, `before=true`) or just after (p,
@@ -863,6 +898,15 @@ pub(crate) enum ListContinuation {
 /// markdown list / TODO / blockquote. Returns `None` for ordinary lines (plain
 /// newline) and when the cursor isn't at end-of-line — splitting mid-line keeps
 /// the naive behavior to avoid surprising the typist.
+/// The single character under the cursor as an owned string, used to seed the
+/// yank buffer on a vim-style delete. `None` on an empty line or when the
+/// cursor sits past end-of-line (nothing to delete/yank).
+pub(crate) fn char_under_cursor<E: EditOps>(editor: &E) -> Option<String> {
+    let raw = editor.line_text_at_cursor();
+    let line = raw.strip_suffix('\n').unwrap_or(&raw);
+    line.chars().nth(editor.cursor().col).map(|c| c.to_string())
+}
+
 pub(crate) fn list_continuation_action<E: EditOps>(editor: &E) -> Option<ListContinuation> {
     let cur = editor.cursor();
     let raw = editor.line_text_at_cursor();

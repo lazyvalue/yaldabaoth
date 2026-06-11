@@ -495,12 +495,7 @@ impl YaldaGpuiView {
                 .map(|lh| lh.raw.clone())
                 .unwrap_or_else(|| vec![(line_str.clone(), base_style)]);
             if let Some(sel) = sel {
-                let line_chars = line_str.chars().count();
-                if let Some((s, e_col)) = line_selection_range(sel, line_idx, line_chars)
-                    && e_col > s
-                {
-                    segs = apply_selection_bg(&segs, s, e_col, selection_bg);
-                }
+                segs = apply_line_selection(&segs, &line_str, sel, line_idx, base_style, selection_bg);
             }
 
             let gutter = div()
@@ -622,12 +617,7 @@ impl YaldaGpuiView {
                 .map(|lh| lh.raw.clone())
                 .unwrap_or_else(|| vec![(line_str.clone(), base_style)]);
             if let Some(sel) = sel {
-                let line_chars = line_str.chars().count();
-                if let Some((s, e_col)) = line_selection_range(sel, line_idx, line_chars)
-                    && e_col > s
-                {
-                    segs = apply_selection_bg(&segs, s, e_col, selection_bg);
-                }
+                segs = apply_line_selection(&segs, &line_str, sel, line_idx, base_style, selection_bg);
             }
 
             // Per-kind typography. Headings get scaled sizes + bold; lists
