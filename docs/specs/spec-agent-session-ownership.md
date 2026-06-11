@@ -105,26 +105,53 @@ impl AgentSessions {
 }
 ```
 
-Tiles change from owning state to holding keys:
+Tiles change from owning state to holding *one* key:
 
 ```rust
-enum App { Buffer(BufferApp), Agent(AgentRing) }
+enum App { Buffer(BufferApp), Agent(AgentTile) }
 
-struct AgentRing {           // now a VIEW, not a store
-    order: Vec<SessionId>,   // distinct sessions in this tile, in tab order
-    active: usize,
+struct AgentTile {                 // a VIEW onto one session, not a store
+    bound: Option<SessionId>,      // the session shown here; None ⇒ show the picker
     underlying: Option<Box<BufferApp>>,
-    picker: Option<SessionPicker>,
+    picker: Option<SessionPicker>, // lists FREE sessions + "new"
 }
 ```
+
+A tile shows **exactly one** session at a time. There is no in-tile session
+ring; instead a tile can be **rebound** to any *free* session.
+
+## Placement, free sessions, and rebind
+
+Sessions exist in the store independently of tiles — a session can be running
+with no tile displaying it. Placement is the (dynamic) map from tiles to the
+session each shows.
+
+- **Free session** — a `SessionId` in the store that no tile currently binds.
+  Computed as `store.ids() − {tiles' bound ids}` (a cheap scan; tiles are few).
+  There is one source of truth for existence (the store) and one for placement
+  (the tiles), so nothing drifts.
+- **Bind** — point a tile at a free session: set `tile.bound = Some(id)`. Only a
+  free session (or the tile's own current one) is a legal target; binding a
+  session already shown elsewhere is refused (INV-2).
+- **Rebind** — change `tile.bound` from A to a free B; A becomes free (it keeps
+  running in the store / on the server — rebinding never kills a session).
+- **Close the tile** — frees its session (the session keeps running); the tile
+  falls back to its `underlying` buffer.
+- **Kill the session** — an explicit, separate action: `store.close(id)` +
+  server-side close. Removes it from the store and detaches.
+
+The picker/switcher is the UI for this: it lists the **free** sessions plus a
+"start a new session" row. Opening an agent over a buffer, or invoking the
+switcher on an existing agent tile, both go through it.
 
 ## Invariants (enforced by construction)
 
 - **INV-1 — one session per sid.** `by_sid` is a map; `open_or_focus`/`bind_sid`
   are the only writers. Two `AgentSession`s for one sid cannot exist.
-- **INV-2 — one tile per session.** A `SessionId` appears in at most one
-  `AgentRing.order`. Enforced by the single placement choke (below): a session
-  is added to a ring only at `Created`; `AlreadyOpen` focuses the existing tile.
+- **INV-2 — at most one tile per session.** A `SessionId` is `bound` by at most
+  one `AgentTile`. A session bound by no tile is *free* and re-bindable. Enforced
+  by the bind/rebind operations, which only target free sessions; `open_or_focus`
+  on an already-shown sid focuses its tile instead of binding a second copy.
 - **INV-3 — one channel per session.** The channel/forwarder lives on the single
   `AgentSession`; closing it is the only detach. No second attach can occur
   because `open_or_focus` short-circuits on an existing sid.
@@ -168,10 +195,13 @@ change is required for the client to behave 1:1.
    single-session routing; assert-or-log if >1 ever appears (it can't).
 5. **Dormant promote.** Stop calling lease/owner APIs from the client.
 
-## Open decision (needs Scott)
+## Resolved decisions
 
-**Keep the in-tile multi-session ring (Ctrl-]/[) or go one-session-per-tile?**
-The ring is orthogonal to the bug and the design keeps it cheaply (`order:
-Vec<SessionId>`). Recommendation: **keep it** — it's free under this model and
-removing it is extra churn + a UX change. If you'd rather one-tile-one-session,
-`order` collapses to a single `SessionId` and a few render/switch paths drop out.
+- **One session per tile, rebindable** (not an in-tile ring). A tile shows one
+  session; the switcher rebinds it to any free session. This replaces Ctrl-]/[
+  cycling with explicit rebind and is strictly simpler.
+- **Closing a tile frees its session; it is not killed.** Killing is an explicit
+  separate action.
+- **`AgentRing` → `AgentTile`.** The `Vec<AgentSlot>` ring collapses to a single
+  optional `SessionId` binding + the picker. Ring-cycling code (`next`/`prev`,
+  `active`, `slot_by_index`, the Ctrl-]/[ handlers) is deleted.
