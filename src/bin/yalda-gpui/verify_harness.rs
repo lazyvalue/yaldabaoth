@@ -2091,24 +2091,35 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         v.apply_picker_sessions(
             PathBuf::from("."),
-            Ok(vec![
-                crate::PickerSession {
-                    sid: "S1".into(),
+            Ok((
+                vec![
+                    crate::PickerSession {
+                        sid: "S1".into(),
+                        acp_id: None,
+                        label: "claude-1".into(),
+                        turns: 2,
+                        connected: true,
+                        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                    },
+                    crate::PickerSession {
+                        sid: "S2".into(),
+                        acp_id: None,
+                        label: "claude-2".into(),
+                        turns: 9,
+                        connected: false,
+                        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                    },
+                ],
+                // One bound session — informational column, not a selectable row.
+                vec![crate::PickerSession {
+                    sid: "S3".into(),
                     acp_id: None,
-                    label: "claude-1".into(),
-                    turns: 2,
+                    label: "claude-3".into(),
+                    turns: 1,
                     connected: true,
                     permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
-                },
-                crate::PickerSession {
-                    sid: "S2".into(),
-                    acp_id: None,
-                    label: "claude-2".into(),
-                    turns: 9,
-                    connected: false,
-                    permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
-                },
-            ]),
+                }],
+            )),
             cx,
         );
     });
@@ -2118,8 +2129,56 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
         assert_eq!(
             p.row_count(),
             3,
-            "new-session row + two listed sessions = 3 rows"
+            "new-session row + two FREE sessions = 3 rows (bound ones don't count)"
         );
+        assert_eq!(p.bound.len(), 1, "the bound session is stored separately");
+    });
+}
+
+/// `next_agent_label` never hands out a name already taken by a session in the
+/// store, and reuses a freed number in the gap. This is what keeps two freshly
+/// created sessions from both being "claude-1".
+#[gpui::test]
+fn next_agent_label_is_unique_and_fills_gaps(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState};
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+
+    let add = |view: &gpui::Entity<YaldaGpuiView>,
+               vcx: &mut gpui::VisualTestContext,
+               label: &str| {
+        let label = label.to_string();
+        view.update(vcx, |v, _cx| {
+            v.show_local_session(AgentSession {
+                state: AgentState::new_server_managed(None),
+                label,
+                cwd: PathBuf::from("."),
+                resume_id: None,
+            });
+        });
+    };
+
+    // Empty store → claude-1.
+    view.read_with(vcx, |v, _cx| {
+        assert_eq!(v.next_agent_label(), "claude-1");
+    });
+    // With claude-1 present → claude-2 (NOT another claude-1).
+    add(&view, &mut *vcx, "claude-1");
+    view.read_with(vcx, |v, _cx| {
+        assert_eq!(v.next_agent_label(), "claude-2");
+    });
+    // Leave a gap (claude-1, claude-3) → the next label fills the hole.
+    add(&view, &mut *vcx, "claude-3");
+    view.read_with(vcx, |v, _cx| {
+        assert_eq!(v.next_agent_label(), "claude-2");
     });
 }
 

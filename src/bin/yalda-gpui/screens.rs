@@ -1488,6 +1488,54 @@ impl YaldaGpuiView {
                 .child(SharedString::from(active_slot_label.clone())),
         );
 
+        // Edit-surface status (moved up from the old footer): which surface +
+        // mode is active, the cursor position, and any transient status/awaiting
+        // note. This is the primary "what am I doing" readout, so it sits at the
+        // top next to the agent identity.
+        {
+            let in_chatbox = c.input_surface.is_chatbox();
+            let mode_label = if in_chatbox {
+                match c.input_surface.chatbox().unwrap().mode {
+                    EditMode::Normal => "CHATBOX",
+                    EditMode::Insert => "CHATBOX INSERT",
+                }
+            } else {
+                match c.mode {
+                    EditMode::Normal => "WORKSHEET",
+                    EditMode::Insert => "WORKSHEET INSERT",
+                }
+            };
+            let dirty_mark = if c.editor.document().is_modified() {
+                "•"
+            } else {
+                ""
+            };
+            let extend_mark = if c.editor.extend_mode() { " EXT" } else { "" };
+            let mut status_text = format!(
+                "{}{}{} · L{}:C{}",
+                dirty_mark,
+                mode_label,
+                extend_mark,
+                cursor_line + 1,
+                cursor_col + 1,
+            );
+            if c.turn_phase.is_awaiting() {
+                status_text.push_str(" · …awaiting reply");
+            }
+            if let Some(msg) = &c.status {
+                status_text.push_str("  [");
+                status_text.push_str(msg);
+                status_text.push(']');
+            }
+            strip = strip.child(
+                div()
+                    .pr_2()
+                    .text_color(strip_dim)
+                    .font_weight(FontWeight::NORMAL)
+                    .child(SharedString::from(status_text)),
+            );
+        }
+
         // Session-server indicator.
         if c.server_managed {
             strip = strip.child(
@@ -1574,22 +1622,47 @@ impl YaldaGpuiView {
             strip = strip.child(badge);
         }
 
-        // Context-window usage + cost (when the unstable feature is on
-        // and the agent has emitted a UsageUpdate).
+        // Context-window usage — a subtle progress bar plus a compact number.
+        // The bar fills proportionally and shifts to the warm/danger accent as
+        // the window approaches full; cost (when present) trails it.
         if let Some(usage) = &c.usage {
             let used_k = (usage.tokens_used as f64) / 1000.0;
             let total_k = (usage.tokens_total as f64) / 1000.0;
-            let pct = if usage.tokens_total > 0 {
-                (usage.tokens_used as f64 / usage.tokens_total as f64) * 100.0
+            let frac = if usage.tokens_total > 0 {
+                (usage.tokens_used as f64 / usage.tokens_total as f64).clamp(0.0, 1.0)
             } else {
                 0.0
             };
-            let usage_text = format!("{:.1}k / {:.0}k ({:.0}%)", used_k, total_k, pct);
+            let pct = frac * 100.0;
+            const BAR_W: f32 = 64.0;
+            let fill_w = (BAR_W * frac as f32).max(if frac > 0.0 { 2.0 } else { 0.0 });
+            let fill_color = if pct >= 85.0 { strip_warm } else { nc(at.user_bar) };
+            let track_bg = {
+                let mut h = strip_dim;
+                h.a = 0.22;
+                h
+            };
+            let track = div()
+                .w(px(BAR_W))
+                .h(px(5.0))
+                .rounded_full()
+                .bg(track_bg)
+                .child(div().w(px(fill_w)).h_full().rounded_full().bg(fill_color));
+            let label = format!("{:.0}k/{:.0}k ({:.0}%)", used_k, total_k, pct);
             strip = strip.child(
                 div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
                     .pr_2()
-                    .text_color(strip_dim)
-                    .child(SharedString::from(usage_text)),
+                    .child(track)
+                    .child(
+                        div()
+                            .text_color(strip_dim)
+                            .font_weight(FontWeight::NORMAL)
+                            .child(SharedString::from(label)),
+                    ),
             );
             if let Some(cost) = usage.cost_usd {
                 strip = strip.child(
@@ -1610,6 +1683,12 @@ impl YaldaGpuiView {
             completed_turns
         };
         let turn_started = c.turn_phase.turn_started();
+
+        // Right side of the header strip: turn/elapsed plus a Stop button while
+        // a reply is in flight. Pushed right with a flex spacer so it anchors to
+        // the strip's trailing edge regardless of how much status sits left.
+        let mut header_right = div().flex().flex_row().items_center().gap_2();
+        let mut header_right_has_content = false;
         if display_turn > 0 || turn_started.is_some() {
             let elapsed_str = if let Some(t) = turn_started {
                 let s = t.elapsed().as_secs();
@@ -1627,11 +1706,47 @@ impl YaldaGpuiView {
             } else {
                 format!("turn {} · {}", display_turn, elapsed_str)
             };
-            strip = strip.child(div().flex_1()).child(
+            header_right = header_right
+                .child(div().text_color(turn_color).child(SharedString::from(label)));
+            header_right_has_content = true;
+        }
+        // Stop button — dispatches the same StopAgent path as ⌘.; after a
+        // graceful cancel is already pending it escalates to a hard kill+resume.
+        if c.turn_phase.is_awaiting() {
+            let stop_fg: Hsla = nc(at.tool_failed);
+            let escalating = c.turn_phase.stop_requested();
+            let stop_label = if escalating {
+                "■ Force-restart ⌘."
+            } else {
+                "■ Stop ⌘."
+            };
+            let weak_stop = cx.entity().downgrade();
+            header_right = header_right.child(
                 div()
-                    .text_color(turn_color)
-                    .child(SharedString::from(label)),
+                    .id("agent-stop-btn")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px_2()
+                    .py(px(1.0))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(stop_fg)
+                    .text_color(stop_fg)
+                    .cursor_pointer()
+                    .on_click(
+                        move |_ev: &gpui::ClickEvent, window: &mut Window, app: &mut GpuiApp| {
+                            let _ = weak_stop.update(app, |this, cx| {
+                                this.stop_agent(&StopAgent, window, cx);
+                            });
+                        },
+                    )
+                    .child(SharedString::from(stop_label)),
             );
+            header_right_has_content = true;
+        }
+        if header_right_has_content {
+            strip = strip.child(div().flex_1()).child(header_right);
         }
 
         let header = strip;
@@ -1757,103 +1872,10 @@ impl YaldaGpuiView {
                 )
         };
 
-        let in_chatbox = c.input_surface.is_chatbox();
-        let mode_label = if in_chatbox {
-            match c.input_surface.chatbox().unwrap().mode {
-                EditMode::Normal => "CHATBOX",
-                EditMode::Insert => "CHATBOX INSERT",
-            }
-        } else {
-            match c.mode {
-                EditMode::Normal => "WORKSHEET",
-                EditMode::Insert => "WORKSHEET INSERT",
-            }
-        };
-        let dirty_mark = if c.editor.document().is_modified() {
-            "•"
-        } else {
-            " "
-        };
-        let extend_mark = if c.editor.extend_mode() { " EXT" } else { "" };
-        let mut left_status = format!(
-            "{} CLAUDE {}{} · L{}:C{}",
-            dirty_mark,
-            mode_label,
-            extend_mark,
-            cursor_line + 1,
-            cursor_col + 1,
-        );
-        if c.turn_phase.is_awaiting() {
-            left_status.push_str(" · …awaiting reply");
-        }
-        if let Some(msg) = &c.status {
-            left_status.push_str("  [");
-            left_status.push_str(msg);
-            left_status.push(']');
-        }
-        // dim_fg is now used actively via agent theme
+        // Status (mode, cursor, awaiting) and the Stop button now live in the
+        // header strip at the top; keyboard hints were removed. No footer.
 
-        let hints = if in_chatbox {
-            "Ctrl-Enter send · Ctrl-Alt-Enter worksheet · esc normal"
-        } else {
-            "Ctrl-Enter send · Ctrl-Alt-Enter chatbox · Ctrl-V back · i insert · esc normal"
-        };
-
-        // Right side of the footer: a Stop button (only while a reply is in
-        // flight) followed by the key hints. The button dispatches the same
-        // StopAgent path as Cmd-. — ACP session/cancel for the active turn.
-        let stop_fg: Hsla = nc(at.tool_failed);
-        let mut footer_right = div().flex().flex_row().items_center().gap_2();
-        if c.turn_phase.is_awaiting() {
-            // After a graceful cancel is already pending, the button (and
-            // ⌘.) escalate to a hard kill + resume.
-            let escalating = c.turn_phase.stop_requested();
-            let stop_label = if escalating {
-                "■ Force-restart ⌘."
-            } else {
-                "■ Stop ⌘."
-            };
-            let weak_stop = cx.entity().downgrade();
-            footer_right = footer_right.child(
-                div()
-                    .id("agent-stop-btn")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .px_2()
-                    .py(px(1.0))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(stop_fg)
-                    .text_color(stop_fg)
-                    .cursor_pointer()
-                    .on_click(
-                        move |_ev: &gpui::ClickEvent, window: &mut Window, app: &mut GpuiApp| {
-                            let _ = weak_stop.update(app, |this, cx| {
-                                this.stop_agent(&StopAgent, window, cx);
-                            });
-                        },
-                    )
-                    .child(SharedString::from(stop_label)),
-            );
-        }
-        footer_right = footer_right.child(SharedString::from(hints));
-
-        let footer = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .px_4()
-            .py_1()
-            .h(px(22.0))
-            .bg(bg_or(bot, STATUS_BG))
-            .text_color(fg_or(bot, 0x666666))
-            .text_size(px(11.0))
-            .child(left_status)
-            .child(footer_right);
-
-        // Chatbox panel — rendered between body and footer when active.
+        // Chatbox panel — rendered between body and the bottom edge when active.
         //
         // Each line is rendered as a non-wrapping row inside a per-line
         // overflow_hidden clip container. The cursor line is shifted left
@@ -2199,16 +2221,12 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::tag_toggle_chord))
             .on_action(cx.listener(Self::clear_tag_view));
         let out = match self.agent_status_position {
-            AgentStatusPosition::Top => root
-                .child(header)
-                .child(info_bar)
-                .child(content_area)
-                .child(footer),
-            AgentStatusPosition::Bottom => root
-                .child(header)
-                .child(content_area)
-                .child(info_bar)
-                .child(footer),
+            AgentStatusPosition::Top => {
+                root.child(header).child(info_bar).child(content_area)
+            }
+            AgentStatusPosition::Bottom => {
+                root.child(header).child(content_area).child(info_bar)
+            }
         };
 
         if let Some(t0) = t_render0 {
@@ -2264,7 +2282,20 @@ impl YaldaGpuiView {
             .child(SharedString::new_static("Claude — choose a session"));
 
         // "Start a new session" is always the first row.
-        let mut rows = div().flex().flex_col().gap_1().w(px(560.0));
+        let mut rows = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w(px(560.0))
+            .child(
+                div()
+                    .px_1()
+                    .pb_1()
+                    .text_size(px(12.0))
+                    .text_color(dim)
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::new_static("AVAILABLE")),
+            );
         rows = rows.child(self.picker_row(
             0,
             selected == 0,
@@ -2324,6 +2355,65 @@ impl YaldaGpuiView {
             }
         }
 
+        // Bound sessions: a read-only column, present only when some tile binds
+        // a cwd-matched session. They can't be attached from here (1:1 binding),
+        // so the rows are static — no highlight, no click handler.
+        let bound_col = {
+            let bound = tile.picker.as_ref().map(|p| p.bound.as_slice()).unwrap_or(&[]);
+            (!bound.is_empty()).then(|| {
+                let mut col = div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .w(px(320.0))
+                    .child(
+                        div()
+                            .px_1()
+                            .pb_1()
+                            .text_size(px(12.0))
+                            .text_color(dim)
+                            .font_weight(FontWeight::BOLD)
+                            .child(SharedString::new_static("IN USE (bound to a tile)")),
+                    );
+                for s in bound {
+                    let liveness = if s.connected { "live" } else { "idle" };
+                    let sub = format!(
+                        "{} turn{} · {}",
+                        s.turns,
+                        if s.turns == 1 { "" } else { "s" },
+                        liveness,
+                    );
+                    let mut text_col = div().flex().flex_col();
+                    text_col = text_col.child(div().text_color(dim).child(SharedString::from(s.label.clone())));
+                    text_col = text_col.child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(dim)
+                            .child(SharedString::from(sub)),
+                    );
+                    col = col.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .w_full()
+                            .px_4()
+                            .py_2()
+                            .bg(card_bg)
+                            .border_l(px(2.0))
+                            .border_color(card_bg)
+                            .child(text_col),
+                    );
+                }
+                col
+            })
+        };
+
+        let mut columns = div().flex().flex_row().gap_6().items_start().child(rows);
+        if let Some(bc) = bound_col {
+            columns = columns.child(bc);
+        }
+
         let footer = div()
             .flex()
             .flex_row()
@@ -2368,7 +2458,7 @@ impl YaldaGpuiView {
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .child(rows),
+                    .child(columns),
             )
             .child(footer)
     }

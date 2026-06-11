@@ -1178,6 +1178,12 @@ pub(crate) fn build_chatbox_line(
         .min_w_0()
         .w_full()
         .min_h(line_h)
+        // Pin the text line-box to the caret height (18px) so a line carrying
+        // a glyph is exactly as tall as the empty/placeholder line (which only
+        // holds the fixed-height caret). Without this, the font's default
+        // line-height makes a one-character chatbox a hair taller than an
+        // empty one.
+        .line_height(line_h)
         .font_family(code_font.clone())
         .text_size(px(13.0))
         .text_color(fg);
@@ -2805,7 +2811,12 @@ pub(crate) struct PickerSession {
 pub(crate) struct SessionPicker {
     /// `None` while the background `list_sessions` round-trip is in flight;
     /// `Some` once it lands (possibly empty — only the "new session" row).
+    /// These are the FREE sessions — selectable rows `1..=N`.
     pub(crate) sessions: Option<Vec<PickerSession>>,
+    /// Sessions already BOUND to some tile (cwd-matched). Rendered in a
+    /// separate, NON-selectable column — informational only, since a session
+    /// is bound by at most one tile and can't be attached from here.
+    pub(crate) bound: Vec<PickerSession>,
     /// Set if the list round-trip failed; rendered in place of the list.
     pub(crate) error: Option<SharedString>,
     /// Highlighted row. Row 0 is always "start a new session"; rows `1..=N`
@@ -2819,6 +2830,7 @@ impl SessionPicker {
     pub(crate) fn loading(cwd: PathBuf) -> Self {
         Self {
             sessions: None,
+            bound: Vec::new(),
             error: None,
             selected: 0,
             cwd,

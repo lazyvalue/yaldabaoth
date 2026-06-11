@@ -67,10 +67,11 @@ impl YaldaGpuiView {
             .cloned();
         let id = match chosen {
             None => {
+                let label = self.next_agent_label();
                 let state = self.create_agent_session(None, proc_cwd.clone(), cx);
                 self.show_local_session(AgentSession {
                     state,
-                    label: "claude-1".into(),
+                    label,
                     cwd: proc_cwd.clone(),
                     resume_id: None,
                 })
@@ -116,24 +117,35 @@ impl YaldaGpuiView {
         let open_sids = self.bound_sid_set();
         cx.spawn(async move |this, cx| {
             let cwd_for_apply = cwd.clone();
-            let result: Result<Vec<PickerSession>, String> = cx
+            // Returns `(free, bound)`: cwd-matched sessions partitioned by
+            // whether some tile already binds them. Bound ones are surfaced as
+            // a read-only column; free ones are the selectable rows.
+            let result: Result<(Vec<PickerSession>, Vec<PickerSession>), String> = cx
                 .background_executor()
                 .spawn(async move {
                     let existing = handle.list_sessions().map_err(|e| e.to_string())?;
                     let cwd_key = cwd_match_key(&cwd);
-                    Ok(existing
+                    let (mut free, mut bound) = (Vec::new(), Vec::new());
+                    for s in existing
                         .into_iter()
                         .filter(|s| cwd_match_key(&s.cwd) == cwd_key)
-                        .filter(|s| !open_sids.contains(&s.session_id))
-                        .map(|s| PickerSession {
+                    {
+                        let is_bound = open_sids.contains(&s.session_id);
+                        let ps = PickerSession {
                             sid: s.session_id,
                             acp_id: s.acp_session_id,
                             label: s.label,
                             turns: s.turns,
                             connected: s.connected,
                             permission_mode: s.permission_mode,
-                        })
-                        .collect())
+                        };
+                        if is_bound {
+                            bound.push(ps);
+                        } else {
+                            free.push(ps);
+                        }
+                    }
+                    Ok((free, bound))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -151,7 +163,7 @@ impl YaldaGpuiView {
     pub(crate) fn apply_picker_sessions(
         &mut self,
         cwd: PathBuf,
-        result: Result<Vec<PickerSession>, String>,
+        result: Result<(Vec<PickerSession>, Vec<PickerSession>), String>,
         cx: &mut Context<Self>,
     ) {
         if let Some(tile) = self.agent_tile_mut()
@@ -160,7 +172,10 @@ impl YaldaGpuiView {
             && cwd_match_key(&picker.cwd) == cwd_match_key(&cwd)
         {
             match result {
-                Ok(sessions) => picker.sessions = Some(sessions),
+                Ok((free, bound)) => {
+                    picker.sessions = Some(free);
+                    picker.bound = bound;
+                }
                 Err(e) => {
                     picker.error = Some(format!("couldn't list sessions — {e}").into());
                     picker.sessions = Some(Vec::new());
@@ -168,6 +183,32 @@ impl YaldaGpuiView {
             }
             cx.notify();
         }
+    }
+
+    /// A unique `claude-N` label for a session about to be created. `N` is the
+    /// smallest positive integer whose `claude-N` isn't already taken by a
+    /// session in the store OR by a session listed in the focused tile's picker
+    /// (free + bound) — so the label is unique against everything we currently
+    /// know about, local or server-side. The label is sent to the server at
+    /// create time (`create_session`), so deduping here keeps the persisted
+    /// names distinct too. Reuses a freed number (close claude-2, create →
+    /// claude-2 again).
+    pub(crate) fn next_agent_label(&self) -> String {
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_, s) in self.sessions.iter() {
+            used.insert(s.label.clone());
+        }
+        // Also avoid names of sessions the picker has listed but we haven't
+        // attached (so they're not yet in the store).
+        if let Some(picker) = self.agent_tile().and_then(|t| t.picker.as_ref()) {
+            for s in picker.sessions.iter().flatten().chain(picker.bound.iter()) {
+                used.insert(s.label.clone());
+            }
+        }
+        (1..)
+            .map(|n| format!("claude-{n}"))
+            .find(|l| !used.contains(l))
+            .expect("infinite range always yields a free label")
     }
 
     /// The set of server sids currently BOUND to some tile (across all tabs).
@@ -249,7 +290,7 @@ impl YaldaGpuiView {
     /// Picker → "start a new session": clear the picker, bind a placeholder
     /// session to this tile, and create a fresh session via the shared path.
     fn picker_start_new(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
-        let label = "claude-1".to_string();
+        let label = self.next_agent_label();
         let open_token = alloc_open_token();
         if self.agent_tile_mut().is_none() {
             return;
@@ -615,7 +656,7 @@ impl YaldaGpuiView {
         // session is freed (kept running in the store) UNLESS it is a pre-attach
         // local placeholder mid-open — that would orphan its in-flight create
         // (no tile would match its token), so close it.
-        let label = "claude".to_string();
+        let label = self.next_agent_label();
         let slot_cwd = cwd.unwrap_or_else(process_cwd);
         self.release_focused_session_for_rebind();
 
@@ -672,7 +713,7 @@ impl YaldaGpuiView {
         let tile = AgentTile::new();
         self.set_screen(App::Agent(tile));
         let slot_cwd = cwd.unwrap_or_else(process_cwd);
-        let label = "claude-1".to_string();
+        let label = self.next_agent_label();
 
         if self.session_server.is_some() {
             // Server path: placeholder + create-only round-trip (NO resolve /
