@@ -1,7 +1,9 @@
 # Project: agent-model-refactor
 
-**Status:** 🔄 active — subtask #1 code-complete on branch, #2–#5 pending.
-**Branch:** `agent-session-owner` (worktree `.claude/worktrees/agent-session-owner`).
+**Status:** 🔄 active — #1 merged to `main` (runtime-verified) + Ctrl-V removed;
+#3 in flight; #2/#5(server-doc) pending.
+**Branch:** `agent-session-owner` → merged to `main` (`9776148`). #3 on
+`agent-server-cleanup`.
 **Spec:** `docs/specs/spec-agent-session-ownership.md` (on the branch; lands on `main` at merge).
 **Tickets:** `001-ticket-refactor-model.md`.
 

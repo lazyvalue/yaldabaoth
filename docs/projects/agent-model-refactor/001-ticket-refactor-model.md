@@ -128,6 +128,12 @@ App::Agent(AgentTile)          App::Buffer(BufferApp)
   layer leaks orphans on bind-conflict). Full fix set dispatched back to the impl
   agent. Next: re-check the root fix + new tests, then #2 (AgentState split),
   #3 (server cleanup), #5 (docs), and the human #4 runtime check.
+- 2026-06-11 — All 11 review fixes applied + re-verified (158 tests, M1 root fix
+  confirmed correct, new no-mirror/dedup tests real). **#4 runtime-verified by
+  Scott** ("looks good"). **Ctrl-V (leave-agent-to-buffer) removed** — Agent and
+  Buffer fully orthogonal. **Merged to `main` (`9776148`)**; full suite green.
+  Remaining: #3 (server promote/lease deletion, in flight on
+  `agent-server-cleanup`) and #2 (AgentState field split, deferred).
   Store owns `AgentSession`; `App::Agent(AgentRing)` → `App::Agent(AgentTile{
   bound: Option<SessionId>, pending_open_token, picker })`; all 11 bind paths
   routed through `open_or_focus`; delete `for_each_server_session_slot` fan-out,
