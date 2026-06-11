@@ -40,6 +40,14 @@ pub struct BrowserEntry {
     pub modified: Option<std::time::SystemTime>,
 }
 
+/// Transient state for an in-progress rename of the selected entry.
+pub struct RenameState {
+    /// The edited name (seeded with the entry's current name).
+    pub input: String,
+    /// Last failed-commit message, shown inline until the user edits again.
+    pub error: Option<String>,
+}
+
 /// Transient state for the worktree-picker overlay inside the file browser.
 pub struct WorktreeMode {
     pub worktrees: Vec<worktree::Worktree>,
@@ -83,6 +91,8 @@ pub struct FileBrowser {
     /// When `Some`, the browser shows a worktree-picker overlay instead of
     /// the normal directory listing.
     pub worktree_mode: Option<WorktreeMode>,
+    /// When `Some`, the selected entry is being renamed in place.
+    pub rename: Option<RenameState>,
 }
 
 impl FileBrowser {
@@ -99,6 +109,7 @@ impl FileBrowser {
             show_hidden: false,
             sort_order: SortOrder::Name,
             worktree_mode: None,
+            rename: None,
         };
         browser.refresh();
         browser
@@ -360,6 +371,93 @@ impl FileBrowser {
         self.selected = 0;
         self.clear_filter();
         self.refresh();
+    }
+
+    // ── Rename ───────────────────────────────────────────────────
+
+    /// Begin renaming the selected entry. No-op while filtering or in
+    /// worktree mode, and never on the `..` parent row.
+    pub fn begin_rename(&mut self) {
+        if self.worktree_mode.is_some() || self.filter_mode {
+            return;
+        }
+        if let Some(e) = self.selected_entry()
+            && e.name != ".."
+        {
+            self.rename = Some(RenameState {
+                input: e.name.clone(),
+                error: None,
+            });
+        }
+    }
+
+    /// Abandon an in-progress rename.
+    pub fn cancel_rename(&mut self) {
+        self.rename = None;
+    }
+
+    /// Push a character into the rename buffer (clears any prior error).
+    pub fn rename_push(&mut self, c: char) {
+        if let Some(r) = &mut self.rename {
+            r.input.push(c);
+            r.error = None;
+        }
+    }
+
+    /// Delete the last character of the rename buffer.
+    pub fn rename_backspace(&mut self) {
+        if let Some(r) = &mut self.rename {
+            r.input.pop();
+            r.error = None;
+        }
+    }
+
+    /// Commit the in-progress rename via `fs::rename`. On a filesystem error
+    /// or name conflict the rename stays open with the message stashed in
+    /// `RenameState::error`; on success (or a no-op rename) it closes.
+    pub fn commit_rename(&mut self) {
+        let new_name = match &self.rename {
+            Some(r) => r.input.trim().to_string(),
+            None => return,
+        };
+        let entry = match self.selected_entry() {
+            Some(e) => e.clone(),
+            None => {
+                self.rename = None;
+                return;
+            }
+        };
+        // Empty or unchanged → treat as cancel.
+        if new_name.is_empty() || new_name == entry.name {
+            self.rename = None;
+            return;
+        }
+        if new_name.contains('/') || new_name.contains('\\') {
+            self.set_rename_error("name cannot contain a path separator");
+            return;
+        }
+        let dest = self.current_dir.join(&new_name);
+        if dest.exists() {
+            self.set_rename_error(&format!("\"{new_name}\" already exists"));
+            return;
+        }
+        match fs::rename(&entry.path, &dest) {
+            Ok(()) => {
+                self.rename = None;
+                self.refresh();
+                // Keep the renamed entry selected if we can find it again.
+                if let Some(idx) = self.entries.iter().position(|e| e.name == new_name) {
+                    self.selected = idx;
+                }
+            }
+            Err(e) => self.set_rename_error(&format!("rename failed: {e}")),
+        }
+    }
+
+    fn set_rename_error(&mut self, msg: &str) {
+        if let Some(r) = &mut self.rename {
+            r.error = Some(msg.to_string());
+        }
     }
 
     /// Enter worktree selection mode.

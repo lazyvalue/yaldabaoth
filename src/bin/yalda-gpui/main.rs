@@ -214,6 +214,7 @@ actions!(
         BrowserClose,
         BrowserWorktrees,
         BrowserFilter,
+        BrowserRename,
         // Document text zoom (scales body + headings; chrome stays fixed)
         ZoomIn,
         ZoomOut,
@@ -6628,6 +6629,7 @@ fn register_keymap(app: &mut GpuiApp) {
         KeyBinding::new("escape", BrowserClose, Some("BrowserView")),
         KeyBinding::new("w", BrowserWorktrees, Some("BrowserView")),
         KeyBinding::new("/", BrowserFilter, Some("BrowserView")),
+        KeyBinding::new("r", BrowserRename, Some("BrowserView")),
     ]);
 
     // Rail-view bindings (spec-rail.md §6). Active only while the rail

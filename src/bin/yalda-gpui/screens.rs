@@ -485,6 +485,7 @@ impl YaldaGpuiView {
         let hl_snap = hl_snap.clone();
         let code_font = self.code_font.clone();
         let editor_fg = self.editor_fg();
+        let selection_bg = self.theme.agent.selection_bg;
         let text_size = px(14.0 * self.text_scale);
 
         let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
@@ -498,7 +499,7 @@ impl YaldaGpuiView {
                 if let Some((s, e_col)) = line_selection_range(sel, line_idx, line_chars)
                     && e_col > s
                 {
-                    segs = apply_selection_bg(&segs, s, e_col, SELECTION_BG);
+                    segs = apply_selection_bg(&segs, s, e_col, selection_bg);
                 }
             }
 
@@ -606,6 +607,7 @@ impl YaldaGpuiView {
         let body_font = self.body_font.clone();
         let code_font = self.code_font.clone();
         let editor_fg = self.editor_fg();
+        let selection_bg = self.theme.agent.selection_bg;
         let text_scale = self.text_scale;
 
         let render_fn = move |line_idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
@@ -624,7 +626,7 @@ impl YaldaGpuiView {
                 if let Some((s, e_col)) = line_selection_range(sel, line_idx, line_chars)
                     && e_col > s
                 {
-                    segs = apply_selection_bg(&segs, s, e_col, SELECTION_BG);
+                    segs = apply_selection_bg(&segs, s, e_col, selection_bg);
                 }
             }
 
@@ -2552,7 +2554,32 @@ impl YaldaGpuiView {
                 let visible_rows = 80usize;
                 let scroll = scroll_to_keep_visible(selected, visible_rows, entries.len());
                 for (i, entry) in entries.iter().enumerate().skip(scroll).take(visible_rows) {
-                    list = list.child(browser_row(entry, i == selected, &self.code_font, ov));
+                    if i == selected
+                        && let Some(r) = &b.fb.rename
+                    {
+                        let mut input_row = div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .px_4()
+                            .py_1()
+                            .bg(nc(ov.selected_bg))
+                            .text_color(nc(ov.input))
+                            .font_family(self.code_font.clone())
+                            .child(SharedString::from(format!("{}\u{2588}", r.input)));
+                        if let Some(err) = &r.error {
+                            input_row = input_row.child(
+                                div()
+                                    .pl_4()
+                                    .text_size(px(11.0))
+                                    .text_color(nc(ov.accent))
+                                    .child(SharedString::from(err.clone())),
+                            );
+                        }
+                        list = list.child(input_row);
+                    } else {
+                        list = list.child(browser_row(entry, i == selected, &self.code_font, ov));
+                    }
                 }
             }
 
@@ -2582,7 +2609,7 @@ impl YaldaGpuiView {
                     .text_color(nc(ov.label))
                     .text_size(px(11.0))
                     .child(format!(
-                        "enter:open · -:parent · /:filter · .:menu · s:sort({}) · w:wt · q:close",
+                        "enter:open · -:parent · /:filter · r:rename · .:menu · s:sort({}) · w:wt · q:close",
                         b.fb.sort_order.label()
                     ))
             };
@@ -2605,6 +2632,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::browser_close))
             .on_action(cx.listener(Self::browser_worktrees))
             .on_action(cx.listener(Self::browser_filter))
+            .on_action(cx.listener(Self::browser_rename))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::open_agent))

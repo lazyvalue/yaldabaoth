@@ -47,14 +47,14 @@
 ## Features
 
 ### General Buffer TODO
-- [ ] Selected text in a buffer looks ugly with the folio theme.
+- [x] Selected text in a buffer looks ugly with the folio theme. (edit views now use the theme's selection bg, not hardcoded Dracula)
 - [x] Buffers have no paste. You can yank, but you can't put. (p/P normal-mode put, branch buffer-todos)
-- [ ] Better TODO handling. Hitting enter after a line like this should auto generate the next TODO.
-- [ ] BUG: Your cursor can go off screen
+- [x] Better TODO handling. Hitting enter after a line like this should auto generate the next TODO. (Enter continues `- [ ]`/`- `/`* `/`+ `/`N.`/`> `; empty item ends the list)
+- [ ] BUG: Your cursor can go off screen (root cause = no soft-wrap + no horizontal scroll on long lines; fix is coupled to Wordwrap below)
 - [x] No redo? There is undo (already worked — bound to Ctrl-R; redo stack in document.rs)
-- [ ] Wordwrap in buffers
+- [ ] Wordwrap in buffers (deferred: render-architecture change — cursor line is a non-wrapping flex_row of [before][caret-div][after]; needs caret-as-inline-run + variable-height rows. Subsumes the cursor-off-screen bug.)
 - [x] <num>g does not work to jump to lines (count prefix + <num>g/<num>G, branch buffer-todos)
-- [ ] want to be able to rename files in the file browser
+- [x] want to be able to rename files in the file browser (`r` in the Cmd+O browser → inline rename, Enter commits via fs::rename, Esc cancels; rail browser not yet wired)
 - [x] ctrl-d/ctrl-u do not work to page up and down (also ctrl-f/ctrl-b, branch buffer-todos)
 
 

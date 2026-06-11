@@ -158,6 +158,18 @@ impl YaldaGpuiView {
         }
     }
 
+    pub(crate) fn browser_rename(
+        &mut self,
+        _: &BrowserRename,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(b) = self.browser_mut() {
+            b.fb.begin_rename();
+            cx.notify();
+        }
+    }
+
     pub(crate) fn browser_filter(
         &mut self,
         _: &BrowserFilter,
@@ -183,6 +195,22 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
+        // Rename input takes precedence over every other browser key while it's
+        // open — intercept here so the `j`/`r`/etc. action bindings don't fire.
+        let renaming = self.browser_mut().is_some_and(|b| b.fb.rename.is_some());
+        if renaming {
+            let Some(b) = self.browser_mut() else { return };
+            match press.key {
+                Key::Esc => b.fb.cancel_rename(),
+                Key::Enter => b.fb.commit_rename(),
+                Key::Backspace => b.fb.rename_backspace(),
+                Key::Char(c) if !press.modifiers.contains(KMods::CONTROL) => b.fb.rename_push(c),
+                _ => {}
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         let filter_mode = match self.browser_mut() {
             Some(b) => b.fb.filter_mode,
             None => return,

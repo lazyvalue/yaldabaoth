@@ -535,7 +535,24 @@ impl YaldaGpuiView {
                 }
             }
             Key::Enter => {
-                editor.insert_char('\n');
+                match list_continuation_action(editor) {
+                    Some(ListContinuation::Continue(prefix)) => {
+                        editor.insert_char('\n');
+                        for ch in prefix.chars() {
+                            editor.insert_char(ch);
+                        }
+                    }
+                    Some(ListContinuation::Terminate) => {
+                        // Enter on an empty list item ends the list: wipe the
+                        // dangling marker, then drop to a fresh blank line.
+                        let col = editor.cursor().col;
+                        for _ in 0..col {
+                            editor.backspace();
+                        }
+                        editor.insert_char('\n');
+                    }
+                    None => editor.insert_char('\n'),
+                }
             }
             Key::Backspace => {
                 editor.backspace();
@@ -831,5 +848,133 @@ impl YaldaGpuiView {
             Some(text) => Self::put_text(editor, &text, before),
             None => false,
         }
+    }
+}
+
+/// What pressing Enter should do on a list/TODO line.
+pub(crate) enum ListContinuation {
+    /// Start the next item with this prefix (indent + marker).
+    Continue(String),
+    /// The current item is empty — clear its marker and break the list.
+    Terminate,
+}
+
+/// Decide whether an Enter keypress on the cursor's line should auto-continue a
+/// markdown list / TODO / blockquote. Returns `None` for ordinary lines (plain
+/// newline) and when the cursor isn't at end-of-line — splitting mid-line keeps
+/// the naive behavior to avoid surprising the typist.
+pub(crate) fn list_continuation_action<E: EditOps>(editor: &E) -> Option<ListContinuation> {
+    let cur = editor.cursor();
+    let raw = editor.line_text_at_cursor();
+    let line = raw.strip_suffix('\n').unwrap_or(&raw);
+    // Only continue from the end of the line's content.
+    if cur.col < line.chars().count() {
+        return None;
+    }
+    let indent_len = line.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+    let indent: String = line.chars().take(indent_len).collect();
+    let rest: String = line.chars().skip(indent_len).collect();
+    let (marker_chars, continuation) = parse_list_marker(&rest)?;
+    let content: String = rest.chars().skip(marker_chars).collect();
+    if content.trim().is_empty() {
+        return Some(ListContinuation::Terminate);
+    }
+    Some(ListContinuation::Continue(format!("{indent}{continuation}")))
+}
+
+/// Given the post-indent remainder of a line, recognize a leading list marker.
+/// Returns `(chars consumed by the marker, the prefix to start the next item)`.
+/// Checkbox items reset to unchecked; ordered items increment.
+fn parse_list_marker(rest: &str) -> Option<(usize, String)> {
+    let chars: Vec<char> = rest.chars().collect();
+    // Bullet markers: `-`, `*`, `+` followed by a space.
+    if chars.len() >= 2 && matches!(chars[0], '-' | '*' | '+') && chars[1] == ' ' {
+        let bullet = chars[0];
+        // Checkbox: `- [ ] ` / `- [x] ` / `- [X] `.
+        if chars.len() >= 6
+            && chars[2] == '['
+            && matches!(chars[3], ' ' | 'x' | 'X')
+            && chars[4] == ']'
+            && chars[5] == ' '
+        {
+            return Some((6, format!("{bullet} [ ] ")));
+        }
+        return Some((2, format!("{bullet} ")));
+    }
+    // Blockquote: `> `.
+    if chars.len() >= 2 && chars[0] == '>' && chars[1] == ' ' {
+        return Some((2, "> ".to_string()));
+    }
+    // Ordered list: digits then `.` or `)` then a space.
+    let digits = chars.iter().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0
+        && chars.len() >= digits + 2
+        && matches!(chars[digits], '.' | ')')
+        && chars[digits + 1] == ' '
+    {
+        let sep = chars[digits];
+        let n: u64 = rest[..digits].parse().ok()?;
+        return Some((digits + 2, format!("{}{sep} ", n.saturating_add(1))));
+    }
+    None
+}
+
+#[cfg(test)]
+mod list_continuation_tests {
+    use super::parse_list_marker;
+
+    fn cont(rest: &str) -> Option<String> {
+        parse_list_marker(rest).map(|(_, c)| c)
+    }
+
+    #[test]
+    fn unchecked_todo_continues_unchecked() {
+        assert_eq!(cont("- [ ] buy milk").as_deref(), Some("- [ ] "));
+    }
+
+    #[test]
+    fn checked_todo_resets_to_unchecked() {
+        assert_eq!(cont("- [x] done").as_deref(), Some("- [ ] "));
+        assert_eq!(cont("- [X] done").as_deref(), Some("- [ ] "));
+    }
+
+    #[test]
+    fn bullets_preserve_their_marker() {
+        assert_eq!(cont("- item").as_deref(), Some("- "));
+        assert_eq!(cont("* item").as_deref(), Some("* "));
+        assert_eq!(cont("+ item").as_deref(), Some("+ "));
+    }
+
+    #[test]
+    fn star_todo_keeps_star_bullet() {
+        assert_eq!(cont("* [ ] task").as_deref(), Some("* [ ] "));
+    }
+
+    #[test]
+    fn ordered_lists_increment() {
+        assert_eq!(cont("1. first").as_deref(), Some("2. "));
+        assert_eq!(cont("9. nth").as_deref(), Some("10. "));
+        assert_eq!(cont("3) paren").as_deref(), Some("4) "));
+    }
+
+    #[test]
+    fn blockquote_continues() {
+        assert_eq!(cont("> quote").as_deref(), Some("> "));
+    }
+
+    #[test]
+    fn non_list_lines_dont_continue() {
+        assert_eq!(cont("plain text"), None);
+        assert_eq!(cont("# heading"), None);
+        assert_eq!(cont("-no space"), None);
+        assert_eq!(cont("---"), None);
+        assert_eq!(cont(""), None);
+    }
+
+    #[test]
+    fn marker_char_count_matches_marker_length() {
+        assert_eq!(parse_list_marker("- [ ] x").unwrap().0, 6);
+        assert_eq!(parse_list_marker("- x").unwrap().0, 2);
+        assert_eq!(parse_list_marker("12. x").unwrap().0, 4);
     }
 }
