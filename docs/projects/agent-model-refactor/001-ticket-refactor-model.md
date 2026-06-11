@@ -159,6 +159,25 @@ App::Agent(AgentTile)          App::Buffer(BufferApp)
   final model (App::Agent = tag; AgentTile = UX; AgentSession = conversation; no
   underlying; selector states; command set). Worklog the change. *Blocked by #1.*
 
+### Open follow-ups (surfaced during the work; not blocking)
+
+- [ ] **6. Session-server protocol version handshake (upgrade-skew guard).**
+  Surfaced by the #3 review. After the lease/owner deletion, `Request::Attach`
+  dropped its non-`#[serde(default)]` `mode`/`client_id` fields with **no
+  protocol version negotiation**. Hazard: a NEW GUI connecting to an OLD
+  still-running server (e.g. a launchd LaunchAgent kept alive across a GUI
+  rebuild, ADR-0013) fails to deserialize the new Attach frame → "bad frame" →
+  every attach silently fails. Mitigation today: kill the running
+  `yalda-session-server` before launching a rebuilt GUI (`dev-all.sh` does this);
+  documented as a ⚠ UPGRADE HAZARD in `spec-session-server-actor.md`. Proper
+  fix: implement the deferred `initialize` handshake — client sends a protocol
+  version on connect; on mismatch with a reused running server, SIGTERM-handoff +
+  relaunch the matching binary (as `install` does). *Accepted + documented during
+  #3; not blocking.*
+
+  (#2 above — the AgentState field split — is the other open follow-up: pure
+  internal cleanup, deferred from #1, no behavior change.)
+
 ## Key invariants (enforced by `SessionStore`)
 
 - INV-1 — one session per sid (`open_or_focus`/`bind_sid` are the only writers).
