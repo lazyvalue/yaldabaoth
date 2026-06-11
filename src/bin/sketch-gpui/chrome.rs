@@ -339,9 +339,9 @@ impl SketchGpuiView {
             let east_band = div()
                 .absolute()
                 .top_0()
+                .bottom_0()
                 .right_0()
                 .w(px(DESKTOP_RESIZE_BAND))
-                .h_full()
                 .cursor(gpui::CursorStyle::ResizeLeftRight)
                 .on_mouse_down(
                     MouseButton::Left,
@@ -358,8 +358,8 @@ impl SketchGpuiView {
                 .absolute()
                 .bottom_0()
                 .left_0()
+                .right_0()
                 .h(px(DESKTOP_RESIZE_BAND))
-                .w_full()
                 .cursor(gpui::CursorStyle::ResizeUpDown)
                 .on_mouse_down(
                     MouseButton::Left,
