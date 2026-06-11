@@ -190,24 +190,3 @@ fn test_format_named_key() {
     let keys = parse_key_sequence("enter").unwrap();
     assert_eq!(format_key_sequence(&keys), "enter");
 }
-
-// Crossterm adapter sanity check — at least one path through the From impl.
-#[test]
-fn test_from_crossterm_keyevent() {
-    use crossterm::event::{
-        KeyCode as CtKeyCode, KeyEvent as CtKeyEvent, KeyModifiers as CtKeyModifiers,
-    };
-    use yalda::keys::KeyPress;
-
-    let press = KeyPress::from(CtKeyEvent::new(
-        CtKeyCode::Char('d'),
-        CtKeyModifiers::CONTROL,
-    ));
-    assert_eq!(press.key, Key::Char('d'));
-    assert_eq!(press.modifiers, Modifiers::CONTROL);
-
-    // SHIFT is stripped (matches the from_event semantics — see keys.rs).
-    let press = KeyPress::from(CtKeyEvent::new(CtKeyCode::Char('K'), CtKeyModifiers::SHIFT));
-    assert_eq!(press.key, Key::Char('K'));
-    assert_eq!(press.modifiers, Modifiers::NONE);
-}

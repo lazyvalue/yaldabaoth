@@ -4,9 +4,9 @@ Agentic operating system for Scott's life. Yaldabaoth is the Demiurge, the blind
 craftsman who spins up a whole hierarchy of archons to run the world beneath him
 while remaining serenely unaware there's a higher pleroma he's not party to.
 
-Built in Rust. Ships as two binaries: a GPUI desktop GUI (`yalda-gpui`, the
-primary surface) and a terminal TUI (`yalda`) built on ratatui + crossterm. It
-began life as a markdown editor; that's now just one App among many.
+Built in Rust. The surface is a GPUI desktop GUI (`yalda-gpui`), backed by
+supporting binaries (`yalda-channel`, `yalda-session-server`). It began life as
+a markdown editor; that's now just one App among many.
 
 ## Tiles and Apps
 
@@ -56,12 +56,11 @@ git worktree add .claude/worktrees/<task-slug> -b <task-slug>
 Trivial one-file edits and conversational answers don't need a worktree; new
 features, multi-file changes, and anything you'd run agents on do.
 
-## Default surface: the GUI
+## The GUI
 
-**Work on the GUI by default.** Unless the user says "TUI" or names the TUI by
-feature (debug overlay, viewport wrap math, etc.), assume new work targets
-`yalda-gpui`. Both binaries share the document/editor/render crates under
-`src/`, but the user-facing surface is the GPUI app.
+`yalda-gpui` is the user-facing surface; all new UX work targets it. The
+shared document/editor/render crates live under `src/` (see "Shared crates"
+below) and the GUI binary lives under `src/bin/yalda-gpui/`.
 
 `cargo run --bin yalda-gpui [path]` launches it.
 
@@ -148,54 +147,17 @@ Two top-level modes:
 
 In code, `ViewMode::Rendered` corresponds to View Mode, and `ViewMode::Raw` corresponds to Edit Mode. `AppMode::Normal` and `AppMode::Insert` are the Edit Mode submodes.
 
-(The TUI uses the View/Edit terminology above. The GPUI app uses the screen
-names from "GUI screens" — they don't perfectly correspond, since the GUI's
-EditView itself has Code/WordProcessor sub-modes that the TUI doesn't have.)
+## Shared crates
 
-## TUI Architecture
+The document/editor/render layer under `src/` (consumed by `yalda-gpui` and
+the supporting binaries):
 
-- `app.rs` — main application loop, input handling, state management
-- `view.rs` — rendering (both rendered and raw modes)
 - `document.rs` — text buffer backed by ropey rope
 - `render.rs` — markdown-to-rendered-blocks conversion (pulldown-cmark)
-- `viewport.rs` — scroll position, content width/offset
+- `editor.rs` — editing operations over the document
 - `keybind.rs` — key binding definitions and sequence matching
+- `keys.rs` / `style.rs` — frontend-neutral key + styling primitives
 - `command.rs` — command registry (`:` commands)
-- `md_highlight.rs` — syntax highlighting for raw/edit mode
+- `md_highlight.rs` — syntax highlighting for edit mode
 - `theme.rs` — color themes
 - `blocks.rs` — rendered block types (Heading, Paragraph, Table, etc.)
-
-## Debug Overlay (TUI)
-
-Run with `YALDA_DEBUG=1` to capture per-frame ground-truth state from the
-renderer to a JSON-lines log:
-
-```
-YALDA_DEBUG=1 yalda <file>
-tail -f ~/.yalda/debug.log | jq .   # all platforms (durable home, ADR-0018)
-```
-
-Each line records terminal size, computed vs. actual content-area height,
-scroll offset, total visual rows, the cursor's expected visual row (from
-scroll math), the cursor's actual screen y (from the renderer — `null` if
-the cursor wasn't painted), the first/last visible doc-line indices, frozen
-state, mode, and view mode.
-
-The log dedupes identical frames (so it stays quiet on idle ticks) and ALWAYS
-records frames where the cursor is off-screen or where off-screen status
-flipped. Splash frames are skipped.
-
-Use this whenever you suspect a viewport/scroll bug. Compare `expected_visual_row`
-(scroll math's view) against `cursor_screen_y` and `last_visible_doc_line`
-(renderer's view); when they disagree, the bug is in the predictor, not the
-renderer.
-
-### Source-of-truth invariant for visual row math
-
-The renderer's wrap algorithm is the only authority on how lines lay out.
-`view::wrap_row_count` and `view::wrap_row_count_with_cursor` expose that
-algorithm; `buffer::raw_visual_row_count` and `buffer::raw_cursor_visual_row`
-MUST call them (against the same tab-expanded line text the renderer uses)
-rather than re-implementing wrap with `div_ceil`. Any divergence between
-predictor and renderer compounds over the buffer and pushes the cursor
-off-screen near the bottom of the viewport.

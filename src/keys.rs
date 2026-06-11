@@ -1,15 +1,11 @@
 //! Frontend-neutral key types.
 //!
 //! `Key`, `Modifiers`, and `KeyPress` model "a key was pressed" without
-//! depending on any specific TUI/GUI framework. The crossterm `From` impls
-//! at the bottom of this file are the bridge for `runtime.rs` (the only
-//! place that talks to crossterm directly). A GUI frontend (GPUI, web,
+//! depending on any specific TUI/GUI framework. A frontend (GPUI, web,
 //! etc.) writes its own `From<their::KeyEvent> for KeyPress` adapter and
 //! then drives the same `keybind.rs` matcher and `Action` enum.
 
 use std::fmt;
-
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A logical key, independent of any terminal/GUI framework's enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,65 +87,6 @@ pub struct KeyPress {
 impl KeyPress {
     pub fn new(key: Key, modifiers: Modifiers) -> Self {
         Self { key, modifiers }
-    }
-
-    /// Convert from a crossterm `KeyEvent`. SHIFT is stripped — by convention
-    /// our bindings encode shifted chars as the uppercase char itself
-    /// (`KeyPress { key: Key::Char('G'), modifiers: NONE }`), not as
-    /// `Key::Char('g') + SHIFT`. See `apply_shift` in `parse_key_combo`.
-    pub fn from_event(event: KeyEvent) -> Self {
-        let modifiers = Modifiers::from(event.modifiers) & !Modifiers::SHIFT;
-        Self {
-            key: Key::from(event.code),
-            modifiers,
-        }
-    }
-}
-
-impl From<KeyEvent> for KeyPress {
-    fn from(event: KeyEvent) -> Self {
-        KeyPress::from_event(event)
-    }
-}
-
-impl From<KeyCode> for Key {
-    fn from(code: KeyCode) -> Self {
-        match code {
-            KeyCode::Char(c) => Key::Char(c),
-            KeyCode::Enter => Key::Enter,
-            KeyCode::Tab => Key::Tab,
-            KeyCode::BackTab => Key::BackTab,
-            KeyCode::Esc => Key::Esc,
-            KeyCode::Backspace => Key::Backspace,
-            KeyCode::Delete => Key::Delete,
-            KeyCode::Insert => Key::Insert,
-            KeyCode::Up => Key::Up,
-            KeyCode::Down => Key::Down,
-            KeyCode::Left => Key::Left,
-            KeyCode::Right => Key::Right,
-            KeyCode::Home => Key::Home,
-            KeyCode::End => Key::End,
-            KeyCode::PageUp => Key::PageUp,
-            KeyCode::PageDown => Key::PageDown,
-            KeyCode::F(n) => Key::F(n),
-            _ => Key::Other,
-        }
-    }
-}
-
-impl From<KeyModifiers> for Modifiers {
-    fn from(m: KeyModifiers) -> Self {
-        let mut out = Modifiers::NONE;
-        if m.contains(KeyModifiers::CONTROL) {
-            out |= Modifiers::CONTROL;
-        }
-        if m.contains(KeyModifiers::ALT) {
-            out |= Modifiers::ALT;
-        }
-        if m.contains(KeyModifiers::SHIFT) {
-            out |= Modifiers::SHIFT;
-        }
-        out
     }
 }
 

@@ -2,7 +2,6 @@ pub mod acp_channel;
 pub mod agent_event;
 pub mod agent_transcript;
 pub mod blocks;
-pub mod buffer;
 pub mod claude_channel;
 pub mod command;
 pub mod config;
@@ -26,8 +25,6 @@ pub mod session_wal;
 pub mod style;
 pub mod theme;
 pub mod tree;
-pub mod view;
-pub mod viewport;
 pub mod worktree;
 
 /// Human-readable build identifier produced by build.rs:

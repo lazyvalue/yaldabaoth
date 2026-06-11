@@ -92,27 +92,21 @@ macro_rules! acp_debug {
 pub const DEFAULT_AGENT_COMMAND: &str = "claude-code-acp";
 
 /// Which yalda frontend is hosting this ACP session. Threaded into the
-/// system-prompt append so Claude knows whether it's running inside the
-/// terminal TUI or the GPUI desktop app — affects nothing protocol-side,
-/// only the host-description sentence at the top of the prompt.
+/// system-prompt append so Claude knows which host it's running inside —
+/// affects nothing protocol-side, only the host-description sentence at the
+/// top of the prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum YaldaFrontend {
-    /// Terminal frontend (ratatui + crossterm). The default — preserves
-    /// existing behaviour for any caller that didn't opt in to the
-    /// frontend-aware spawn variants.
-    #[default]
-    Tui,
     /// Desktop frontend (GPUI). Selected by `yalda-gpui`.
+    #[default]
     Gpui,
 }
 
 impl YaldaFrontend {
     /// Sentence describing the host — interpolated into the system-prompt
-    /// append so the model can adapt phrasing if it cares (most behaviour
-    /// is identical between the two).
+    /// append so the model can adapt phrasing if it cares.
     fn host_description(self) -> &'static str {
         match self {
-            Self::Tui => "the ratatui/crossterm terminal frontend (`yalda` binary)",
             Self::Gpui => "the GPUI desktop frontend (`yalda-gpui` binary)",
         }
     }
@@ -733,7 +727,7 @@ impl AcpChannelClient {
         cwd: Option<PathBuf>,
         resume_session_id: Option<String>,
     ) -> io::Result<Self> {
-        Self::spawn_with_resume_in(command_str, cwd, resume_session_id, YaldaFrontend::Tui)
+        Self::spawn_with_resume_in(command_str, cwd, resume_session_id, YaldaFrontend::Gpui)
     }
 
     /// Frontend-aware variant of [`spawn_with_resume`]. The `frontend`

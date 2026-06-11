@@ -4,9 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
-pulldown-cmark = { version = "0.12", default-features = false, features = ["simd"] }
+pulldown-cmark ={ version = "0.12", default-features = false, features = ["simd"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 kdl = "6"
 clap = { version = "4", features = ["derive"] }
@@ -50,10 +48,6 @@ pretty_assertions = "1"
 insta = "1"
 tempfile = "3"
 gpui = { version = "0.2", features = ["test-support"] }
-
-[[bin]]
-name = "yalda"
-path = "src/main.rs"
 
 [[bin]]
 name = "yalda-channel"
