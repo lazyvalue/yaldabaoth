@@ -146,16 +146,16 @@ App::Agent(AgentTile)          App::Buffer(BufferApp)
   (→ `AgentTile`) fields. The purity follow-up; deferred from #1. Subtlety: in
   Worksheet mode the editable lines live in the transcript editor (session) — only
   the mode flag + chatbox draft are viewport. *Blocked by #1.*
-- [ ] **3. Delete dormant server-side `:promote`/lease/owner/forwarder-fan
+- [x] **3. Delete dormant server-side `:promote`/lease/owner/forwarder-fan
   machinery** (~232 sites in the session server + protocol surface). Protocol
   change; do only once the client no longer references lease/owner APIs.
   Update `spec-session-server-actor.md`. *Blocked by #1.*
-- [ ] **4. Runtime-verify the 1:1 model** (GPUI can't be driven headlessly).
+- [x] **4. Runtime-verify the 1:1 model** (GPUI can't be driven headlessly).
   Two tiles → distinct sessions, no mirrored I/O, no "attached ×N"; rebind frees
   the old; close → selector (not buffer/vanish); Ctrl-V → buffer picker;
   Worksheet⇄MessageBox toggle; the four `.` commands; logs show exactly one
   forwarder per session. Use `./dev-all.sh`. *Blocked by #1.*
-- [ ] **5. Reconcile `spec-agent-session-ownership.md` + `CLAUDE.md`** with the
+- [x] **5. Reconcile `spec-agent-session-ownership.md` + `CLAUDE.md`** with the
   final model (App::Agent = tag; AgentTile = UX; AgentSession = conversation; no
   underlying; selector states; command set). Worklog the change. *Blocked by #1.*
 

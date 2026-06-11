@@ -1,9 +1,10 @@
 # Project: agent-model-refactor
 
-**Status:** 🔄 active — #1 merged to `main` (runtime-verified) + Ctrl-V removed;
-#3 in flight; #2/#5(server-doc) pending.
-**Branch:** `agent-session-owner` → merged to `main` (`9776148`). #3 on
-`agent-server-cleanup`.
+**Status:** ✅ core done — #1, #3, #5 merged to `main`; #4 runtime-verified.
+Open follow-ups: #2 (AgentState split, deferred), #6 (protocol version
+handshake — upgrade-skew guard, tracked in 001 ticket).
+**Merged:** `agent-session-owner` (`9776148`) + `agent-server-cleanup`
+(`76d9be8`). All feature branches deleted; repo is down to `main`.
 **Spec:** `docs/specs/spec-agent-session-ownership.md` (on the branch; lands on `main` at merge).
 **Tickets:** `001-ticket-refactor-model.md`.
 
