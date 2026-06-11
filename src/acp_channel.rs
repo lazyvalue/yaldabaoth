@@ -13,9 +13,9 @@
 //! ## Architecture
 //!
 //! The official `agent-client-protocol` crate is async/Tokio-based, but the
-//! rest of yalda is sync (single-threaded `App::run` loop with
-//! `crossterm::event::poll`). To bridge this without rewriting `app.rs`, this
-//! module follows the same pattern as `claude_channel.rs`:
+//! frontend drives it synchronously (the GPUI app pumps events on each tick).
+//! To bridge async-to-sync, this module follows the same pattern as
+//! `claude_channel.rs`:
 //!
 //! 1. Spawn a dedicated background **worker thread** that owns a multi-thread
 //!    Tokio runtime.
@@ -76,7 +76,7 @@ use agent_client_protocol::{Agent, Client, ConnectionTo};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 /// Emit a diagnostic line to stderr when YALDA_ACP_DEBUG is set in the env.
-/// Gated this way so the chatter doesn't corrupt yalda's TUI in normal use
+/// Gated this way so the chatter doesn't pollute stderr in normal use
 /// but is one env-var away when something looks wrong.
 macro_rules! acp_debug {
     ($($arg:tt)*) => {
@@ -644,7 +644,7 @@ pub use fake::{FakeAgentControls, FakeAgentSpawner, FakeTransport};
 
 /// A live ACP connection to a locally-spawned agent subprocess.
 ///
-/// API mirrors `claude_channel::ChannelClient` so that `app.rs` can drive
+/// API mirrors `claude_channel::ChannelClient` so the frontend can drive
 /// either by trait-like sniffing without inheriting any of the protocol
 /// details.
 pub struct AcpChannelClient {
@@ -732,9 +732,7 @@ impl AcpChannelClient {
 
     /// Frontend-aware variant of [`spawn_with_resume`]. The `frontend`
     /// argument is woven into the system-prompt append so Claude knows
-    /// which yalda host is driving it — used by `yalda-gpui` to
-    /// announce itself as the GPUI desktop frontend rather than the
-    /// default TUI. All other behaviour is identical to
+    /// which yalda host is driving it. All other behaviour is identical to
     /// [`spawn_with_resume`].
     pub fn spawn_with_resume_in(
         command_str: &str,
@@ -1377,8 +1375,8 @@ async fn worker_async(
         .stdout(std::process::Stdio::piped())
         // Pipe-and-discard the agent's stderr by default. Agents (including
         // claude-agent-acp) may log diagnostics there; keeping it inherit
-        // would corrupt yalda's TUI. Set YALDA_ACP_AGENT_STDERR=inherit to
-        // surface it for debugging.
+        // would pollute yalda-gpui's stderr. Set YALDA_ACP_AGENT_STDERR=inherit
+        // to surface it for debugging.
         .stderr(
             if std::env::var("YALDA_ACP_AGENT_STDERR").as_deref() == Ok("inherit") {
                 std::process::Stdio::inherit()
@@ -1646,7 +1644,7 @@ async fn worker_async(
                     //    sees in the append.
                     // Body of the system-prompt append. The first sentence
                     // is built separately so it can name the active yalda
-                    // frontend (TUI vs GPUI) — everything below is shared.
+                    // frontend — everything below is shared.
                     const CLAUDE_CODE_APPEND_BODY: &str = r#"Treat this as an interactive coding session, not a one-shot agent run.
 
 # Tone and style

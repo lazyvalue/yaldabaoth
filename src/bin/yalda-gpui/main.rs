@@ -1,9 +1,8 @@
 //! `yalda-gpui` — GPU-accelerated desktop frontend for yalda.
 //!
-//! Rendered-markdown viewer + file browser using Zed's GPUI framework. The
-//! TUI frontend (`src/main.rs` + `src/app.rs`) is left untouched; this binary
-//! consumes only the framework-neutral core (`document`, `render`, `theme`,
-//! `blocks`, `style`, `file_browser`).
+//! Rendered-markdown viewer + file browser using Zed's GPUI framework. This
+//! binary consumes only the framework-neutral core (`document`, `render`,
+//! `theme`, `blocks`, `style`, `file_browser`).
 //!
 //! Run:
 //!     cargo run --bin yalda-gpui                       # opens browser at cwd
@@ -275,11 +274,10 @@ actions!(
 // gpui::Keystroke → yalda::keys::KeyPress bridge
 // ----------------------------------------------------------------------------
 
-/// Convert a GPUI keystroke to our framework-neutral `KeyPress` so the same
-/// `KeybindManager` + `Action` vocabulary the TUI uses can drive the GPUI
-/// edit mode. SHIFT is omitted by convention — uppercase chars are encoded
-/// as `Key::Char('G')` with no SHIFT modifier (matches `KeyPress::from_event`
-/// behavior on the crossterm side).
+/// Convert a GPUI keystroke to our framework-neutral `KeyPress` so the
+/// `KeybindManager` + `Action` vocabulary can drive the GPUI edit mode.
+/// SHIFT is omitted by convention — uppercase chars are encoded as
+/// `Key::Char('G')` with no SHIFT modifier.
 fn keystroke_to_keypress(ks: &Keystroke) -> KeyPress {
     let mut mods = KMods::NONE;
     if ks.modifiers.control {
