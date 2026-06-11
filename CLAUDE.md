@@ -19,10 +19,19 @@ the work happens inside them:
   one `BufferMode`: `Picking` (file/buffer browser), `Viewing` (rendered
   markdown), or `Editing` (raw source). `Viewing ⇄ Editing` toggle over the same
   pooled `SharedCore`; `Picking` is reachable via Cmd+O (Buffer-scoped).
-- **`App::Agent`** — an `AgentRing`: the ACP multi-session panel where Claude
-  agents (the archons) do the actual work. Opening an agent over a Buffer
-  (Ctrl-K) stashes that buffer and restores it on close (Ctrl-V); a closed
-  session always falls back to a usable buffer rather than vanishing the Tile.
+- **`App::Agent`** — an `AgentTile`: a **viewport** bound to (at most) one ACP
+  session. `App::Agent` is just the enum tag; the real split is `AgentTile` =
+  the viewport/UX (in the layout tree, holds `bound: Option<SessionId>`) vs
+  `AgentSession` = the conversation (transcript, channel, tools), owned by the
+  `AgentSessions` store on the view (see `spec-agent-session-ownership.md`). The
+  store enforces strict **1:1** — a session is bound by at most one tile; a
+  session no tile binds is **free** and re-bindable. An unbound tile
+  (`bound: None`) renders the **selector** (free sessions + "create new"); close
+  / unbind / rebind keep the tile `App::Agent` showing the selector — it never
+  vanishes and never silently becomes a Buffer (Agent and Buffer are orthogonal;
+  there is no nested `underlying` buffer). Ctrl-V converts the tile to a fresh
+  Buffer picker. Agent commands (`.` menu): select session · stop · send
+  message · switch Worksheet⇄Message Box.
 
 ## Dev system (read this for how we work)
 
@@ -75,16 +84,20 @@ so items stay crate-visible regardless of file):
   key bindings + `main()`. A Tile (`Window<App>`) holds one `App`
   (`spec-tiles-and-apps.md`, ADR-0019): `App::Buffer(BufferApp)` —
   `BufferApp::{Picking(file browser), Viewing(rendered doc), Editing(raw)}`
-  — or `App::Agent(AgentRing)`. The render path branches on that, each
-  screen with its own `key_context` (`YaldaView`, `EditView`,
-  `BrowserView`, `AgentView`) and its own `on_action` wiring.
+  — or `App::Agent(AgentTile)` (a viewport bound to one session in the
+  `AgentSessions` store; see `spec-agent-session-ownership.md`). The render path
+  branches on that, each screen with its own `key_context` (`YaldaView`,
+  `EditView`, `BrowserView`, `AgentView`) and its own `on_action` wiring.
 - `screens.rs` — the screen render bodies: `render_doc`, `render_edit`
   (Code + WP), `render_agent`, `render_browser`.
 - `agent.rs` — agent-tile data layer: tool-call model, `FlatItem` view model
   + S1 cache + `rebuild_agent_view_model`, `TurnPhase`, `AgentState`,
-  `AgentRing`.
+  `AgentSession`, `AgentTile`.
+- `agent_sessions.rs` — the `SessionStore`/`AgentSessions` owner: the private
+  `SessionId → AgentSession` registry that enforces the 1:1 binding invariant
+  (`open_or_focus`, `bind_sid`, `locate`, `close`).
 - `agent_ui.rs` — agent/session methods on the view: open/attach/create/
-  close flows, lease heartbeat, server pump + reducers (`apply_server_batch`
+  close flows, server pump + reducers (`apply_server_batch`
   / `apply_reply_events` / `apply_agent_event`), submit paths, Claude key
   handler.
 - `chrome.rs` — focused-window/layout render, tab strip, tag bar, rails.
