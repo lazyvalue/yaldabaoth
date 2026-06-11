@@ -53,7 +53,9 @@ impl YaldaGpuiView {
             self.set_screen(App::Agent(tile));
             cx.notify();
 
-            self.spawn_list_sessions_for_picker(proc_cwd, cx);
+            // The picker lives on the tile we just made focused content.
+            let target = self.workspace.focused_window_id();
+            self.spawn_list_sessions_for_picker(target, proc_cwd, cx);
             return;
         }
 
@@ -107,7 +109,20 @@ impl YaldaGpuiView {
     /// `apply_picker_sessions`. Mirrors the discovery half of
     /// `spawn_open_agent_server`, but stops at "list" — the user, not the
     /// code, decides what (if anything) to attach.
-    pub(crate) fn spawn_list_sessions_for_picker(&self, cwd: PathBuf, cx: &mut Context<Self>) {
+    /// Kick off the off-thread `list_sessions` round-trip for the picker on
+    /// the tile identified by `target` (its stable `WindowId`). The CALLER
+    /// names the tile — this function never reads ambient focus, because the
+    /// async result lands later, after focus may have moved (INV-PR / ADR-0020).
+    /// Passing the wrong tile here is the only way to misroute, and the type
+    /// forces every caller to state which tile it set the loading picker on:
+    /// routing one picker's result onto another tile is what made a restored
+    /// tile hang on "loading sessions…" forever while a sibling got its list.
+    pub(crate) fn spawn_list_sessions_for_picker(
+        &self,
+        target: Option<workspace::WindowId>,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
         let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
             return;
         };
@@ -149,24 +164,30 @@ impl YaldaGpuiView {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.apply_picker_sessions(cwd_for_apply, result, cx);
+                this.apply_picker_sessions(target, cwd_for_apply, result, cx);
             });
         })
         .detach();
     }
 
-    /// Fold a completed `list_sessions` result into the focused tile's picker.
-    /// No-op if the focused tile is no longer an empty Agent ring whose picker
-    /// is still loading for this cwd (the user switched tabs or already picked
-    /// before the list landed) — the same harmless-discard contract as
-    /// `apply_open_agent_resolution`.
+    /// Fold a completed `list_sessions` result into the picker of the tile
+    /// that REQUESTED it, addressed by the stable `WindowId` captured at spawn
+    /// (INV-PR) — never the currently-focused tile. No-op if that tile is gone,
+    /// is no longer an unbound Agent ring, already filled/picked, or its picker
+    /// is now for a different cwd (the user switched tabs or picked before the
+    /// list landed) — the same harmless-discard contract as
+    /// `apply_open_agent_resolution`. Routing by id (not focus) is what makes
+    /// two restored pickers each receive their OWN list instead of racing onto
+    /// whichever tile happens to be focused when the results land.
     pub(crate) fn apply_picker_sessions(
         &mut self,
+        target: Option<workspace::WindowId>,
         cwd: PathBuf,
         result: Result<(Vec<PickerSession>, Vec<PickerSession>), String>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(tile) = self.agent_tile_mut()
+        let Some(target) = target else { return };
+        if let Some(tile) = self.agent_tile_by_id_mut(target)
             && let Some(picker) = tile.picker.as_mut()
             && picker.sessions.is_none()
             && cwd_match_key(&picker.cwd) == cwd_match_key(&cwd)
@@ -492,6 +513,48 @@ impl YaldaGpuiView {
             });
             if found.is_some() {
                 return found;
+            }
+        }
+        None
+    }
+
+    /// The stable `WindowId` of the agent tile currently BOUND to session
+    /// `sid` (at most one, INV-2), scanning every tab. Deliberately
+    /// focus-INDEPENDENT: the async close/reconcile paths use it to address a
+    /// replacement selector's list back to the bound tile (INV-PR), so it must
+    /// never depend on which tile holds focus. Directly unit-tested
+    /// (`session_close_shows_selector_on_bound_tile_not_focused`) so a revert to
+    /// focus-based routing fails CI rather than silently passing.
+    pub(crate) fn agent_tile_id_bound_to(&self, sid: SessionId) -> Option<workspace::WindowId> {
+        for tab in self.workspace.tabs.iter() {
+            let mut found = None;
+            tab.layout.for_each_leaf(&mut |w| {
+                if let App::Agent(tile) = &w.content
+                    && tile.bound == Some(sid)
+                {
+                    found = Some(w.id);
+                }
+            });
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+
+    /// Resolve an agent tile by its stable `WindowId`, scanning every tab's
+    /// layout (ids are unique workspace-wide). The canonical way for an async
+    /// reducer to reach the tile that originated its work — `agent_tile_mut()`
+    /// (the FOCUSED tile) must never be used from a `cx.spawn` continuation,
+    /// because focus can move between spawn and resolution (INV-PR / ADR-0020).
+    /// Returns `None` if the id is gone or no longer holds an `App::Agent`.
+    fn agent_tile_by_id_mut(&mut self, id: workspace::WindowId) -> Option<&mut AgentTile> {
+        for tab in self.workspace.tabs.iter_mut() {
+            if let Some(w) = tab.layout.find_leaf_mut(id) {
+                return match &mut w.content {
+                    App::Agent(tile) => Some(tile),
+                    _ => None,
+                };
             }
         }
         None
@@ -914,7 +977,9 @@ impl YaldaGpuiView {
             tile.picker = Some(SessionPicker::loading(cwd.clone()));
         }
         if self.session_server.is_some() {
-            self.spawn_list_sessions_for_picker(cwd, cx);
+            // Picker set on the focused tile above → address it by that id.
+            let target = self.workspace.focused_window_id();
+            self.spawn_list_sessions_for_picker(target, cwd, cx);
         }
     }
 
@@ -1066,6 +1131,7 @@ impl YaldaGpuiView {
             last_scrolled_edit_seq: u64::MAX,
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
+            pending_reveal_cursor: false,
             view_model: AgentViewModel::new(),
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
@@ -1439,6 +1505,14 @@ impl YaldaGpuiView {
         // Find the tile that showed this session (at most one, INV-2). Skip a
         // tile mid-respawn (pending_open_token in flight).
         let mut tile_was_respawning = false;
+        // This path runs from async/background triggers (server SessionClosed
+        // broadcast, the restore-attach-failure reaper) where the closed
+        // session's tile is usually NOT the focused one. Address the selector
+        // list back to the BOUND tile by its stable id (INV-PR) — reading focus
+        // here would reinstate the "wrong tile fills, the real one hangs on
+        // 'loading…' forever" bug. Resolved up front via a focus-independent,
+        // unit-tested query.
+        let closed_tile_id = self.agent_tile_id_bound_to(id);
         let mut tile_found = false;
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
@@ -1460,11 +1534,12 @@ impl YaldaGpuiView {
             return false;
         }
         self.sessions.close(id);
-        // Kick the (now-unbound) tile's selector list off the paint thread. The
-        // list reducer (`apply_picker_sessions`) guards on the focused tile
-        // still loading, so a no-op for a background tile is harmless.
+        // Kick the (now-unbound) tile's selector list off the paint thread,
+        // addressed to that exact tile by id. The list reducer
+        // (`apply_picker_sessions`) no-ops if the tile is gone or already
+        // filled, so a late result is always harmless.
         if tile_found && self.session_server.is_some() {
-            self.spawn_list_sessions_for_picker(cwd, cx);
+            self.spawn_list_sessions_for_picker(closed_tile_id, cwd, cx);
         }
         true
     }
@@ -3330,31 +3405,22 @@ impl YaldaGpuiView {
             }
         };
 
-        // Keep the cursor's doc line in view after every key. Compute
-        // the cursor's index in the virtualised list (text lines are
-        // interleaved with tool blocks anchored above them) and ask
-        // the ListState to scroll just enough to reveal it.
-        if let Some(c) = self.agent_mut() {
-            let cursor_line = c.editor.cursor().line;
-            let ranges = c.block_ranges.clone();
-            let line_count = c.editor.document().line_count();
-            // Hoist the metadata view out of the per-line loop — same fix as
-            // the S1 gutter scan: `metadata::<TurnId>()` does a by-TypeId map
-            // lookup and builds a fresh view per call, so calling it per line
-            // made every Worksheet keystroke O(n) view constructions.
-            let gutter_tags: Vec<Option<TurnId>> = {
-                let turn_meta = c.editor.metadata::<TurnId>();
-                (0..line_count)
-                    .map(|i| {
-                        c.editor
-                            .anchor_for_line_opt(i)
-                            .and_then(|a| turn_meta.get(a).copied())
-                    })
-                    .collect()
-            };
-            let th_before = count_turn_headers_before(&gutter_tags, cursor_line);
-            let target = cursor_visible_child_index(c, cursor_line, &ranges, th_before);
-            c.list_state.scroll_to_reveal_item(target);
+        // Reveal the cursor's line after every key — but do NO transcript-
+        // sized work here. The previous implementation rebuilt a per-line
+        // gutter `Vec` and re-derived the cursor's flat-item index on EVERY
+        // keystroke (O(transcript)), which is exactly why Worksheet typing
+        // degraded as a session grew. Now the key handler only records intent;
+        // the render path resolves the scroll target via the O(1) build-time
+        // line→item index (`AgentViewModel::item_for_line`, INV-RV / ADR-0020).
+        //
+        // Gate on a non-`Skipped` outcome: `Skipped` (unmatched key / partial
+        // chord) neither moves the cursor nor calls `cx.notify()`, so setting
+        // the flag there would leave it armed to fire a spurious scroll-to-
+        // cursor on the next UNRELATED render (e.g. an agent stream tick).
+        if !matches!(outcome, NormalOutcome::Skipped)
+            && let Some(c) = self.agent_mut()
+        {
+            c.pending_reveal_cursor = true;
         }
 
         match outcome {

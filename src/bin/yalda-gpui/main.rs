@@ -1849,7 +1849,9 @@ impl YaldaGpuiView {
                             tile.bound = None;
                             tile.picker = Some(SessionPicker::loading(proc_cwd.clone()));
                         }
-                        self.spawn_list_sessions_for_picker(proc_cwd.clone(), cx);
+                        // Address the list back to THIS leaf (INV-PR), not
+                        // whatever ends up focused once all leaves are restored.
+                        self.spawn_list_sessions_for_picker(Some(leaf_id), proc_cwd.clone(), cx);
                     }
                 }
             }

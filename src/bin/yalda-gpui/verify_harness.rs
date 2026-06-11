@@ -2087,9 +2087,12 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
         assert_eq!(p.row_count(), 1, "only the 'new session' row while loading");
     });
 
-    // Fold in a list result through the real reducer, then render again.
+    // Fold in a list result through the real reducer, then render again. The
+    // result is addressed to the originating tile by its WindowId (INV-PR).
+    let target = view.read_with(vcx, |v, _cx| v.workspace.focused_window_id());
     view.update(vcx, |v, cx| {
         v.apply_picker_sessions(
+            target,
             PathBuf::from("."),
             Ok((
                 vec![
@@ -2132,6 +2135,164 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
             "new-session row + two FREE sessions = 3 rows (bound ones don't count)"
         );
         assert_eq!(p.bound.len(), 1, "the bound session is stored separately");
+    });
+}
+
+/// INV-PR regression: a `list_sessions` result lands on the tile that
+/// REQUESTED it (addressed by WindowId), not on whichever tile is focused when
+/// the async result arrives. This is the "two restored agent tiles — one hangs
+/// on 'loading sessions…' forever while the other fills, and picking in one
+/// opens a session in the other" bug. With two unbound picker tiles in a split,
+/// we deliver tile A's result while tile B is focused and assert A (not B) is
+/// the one that fills.
+#[gpui::test]
+fn picker_list_result_routes_to_originating_tile_not_focused(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App, PickerSession, SessionPicker};
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    let mk_tile = || {
+        let mut t = AgentTile::new();
+        t.picker = Some(SessionPicker::loading(PathBuf::from(".")));
+        t
+    };
+
+    // Tile A (focused) gets a loading picker; record its WindowId.
+    let win_a = view.update(vcx, |v, _cx| {
+        v.set_screen(App::Agent(mk_tile()));
+        v.workspace.focused_window_id().expect("focused window A")
+    });
+    // Split off tile B with its own loading picker — focus moves to B.
+    let win_b = view.update(vcx, |v, _cx| {
+        v.workspace
+            .split_focused(crate::workspace::SplitDir::H, App::Agent(mk_tile()));
+        v.workspace.focused_window_id().expect("focused window B")
+    });
+    assert_ne!(win_a, win_b, "the split produced two distinct tiles");
+
+    // Deliver tile A's list result WHILE B is focused. The pre-fix reducer
+    // routed by `agent_tile_mut()` (focus) and would have filled B and left A
+    // loading forever.
+    view.update(vcx, |v, cx| {
+        v.apply_picker_sessions(
+            Some(win_a),
+            PathBuf::from("."),
+            Ok((
+                vec![PickerSession {
+                    sid: "S1".into(),
+                    acp_id: None,
+                    label: "claude-1".into(),
+                    turns: 1,
+                    connected: true,
+                    permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                }],
+                vec![],
+            )),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // Read a specific tile's picker-loaded state by WindowId.
+    let loaded = |v: &YaldaGpuiView, id: crate::workspace::WindowId| -> Option<bool> {
+        for tab in v.workspace.tabs.iter() {
+            if let Some(w) = tab.layout.find_leaf(id)
+                && let App::Agent(t) = &w.content
+            {
+                return t.picker.as_ref().map(|p| p.sessions.is_some());
+            }
+        }
+        None
+    };
+    view.read_with(vcx, |v, _cx| {
+        assert_eq!(
+            loaded(v, win_a),
+            Some(true),
+            "A's list must land on A — the tile that requested it"
+        );
+        assert_eq!(
+            loaded(v, win_b),
+            Some(false),
+            "B must be untouched — still loading, NOT hijacked because it holds focus"
+        );
+    });
+}
+
+/// INV-PR regression (the close path the adversarial review flagged): when a
+/// session closes from a background/async trigger, the replacement selector's
+/// list is addressed by `agent_tile_id_bound_to(sid)` — the BOUND tile's id,
+/// resolved INDEPENDENTLY of focus. The pre-fix close path listed against
+/// `focused_window_id()`, so a bound-but-unfocused tile hung on "loading…"
+/// forever. This drives the close path AND asserts the focus-independent query
+/// directly: a revert to focus-based routing fails here, not silently passes.
+#[gpui::test]
+fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState, AgentTile, App};
+
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    let (win_a, win_b) = view.update(vcx, |v, _cx| {
+        v.set_screen(App::Agent(AgentTile::new()));
+        let mk = |label: &str| AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: label.into(),
+            cwd: PathBuf::from("."),
+            resume_id: None,
+        };
+        // Tile A → bound to sid "A". Capture A's WindowId.
+        let id_a = v.show_local_session(mk("claude-A"));
+        v.sessions.bind_sid(id_a, "A".into()).unwrap();
+        let win_a = v.workspace.focused_window_id().expect("focused A");
+        // Split → tile B, focus it, bind sid "B". B now holds focus.
+        v.workspace
+            .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
+        let id_b = v.show_local_session(mk("claude-B"));
+        v.sessions.bind_sid(id_b, "B".into()).unwrap();
+        let win_b = v.workspace.focused_window_id().expect("focused B");
+        (win_a, win_b)
+    });
+    assert_ne!(win_a, win_b);
+
+    // The capture query (what the close path feeds to `spawn_list_sessions…`)
+    // must resolve to A by BINDING, even though B holds focus. This is the
+    // exact value a revert to `focused_window_id()` would get wrong.
+    view.read_with(vcx, |v, _cx| {
+        let sid_a = v.sessions.locate("A").expect("sid A in store");
+        assert_eq!(
+            v.agent_tile_id_bound_to(sid_a),
+            Some(win_a),
+            "the close path must target the BOUND tile A, not the focused tile B"
+        );
+    });
+
+    // Close sid A while B is focused (mirrors a server SessionClosed broadcast).
+    view.update(vcx, |v, cx| {
+        v.reconcile_session_closed("A", cx);
+    });
+    vcx.run_until_parked();
+
+    let tile_state = |v: &YaldaGpuiView, id: crate::workspace::WindowId| {
+        for tab in v.workspace.tabs.iter() {
+            if let Some(w) = tab.layout.find_leaf(id)
+                && let App::Agent(t) = &w.content
+            {
+                return Some((t.bound.is_some(), t.picker.is_some()));
+            }
+        }
+        None
+    };
+    view.read_with(vcx, |v, _cx| {
+        assert_eq!(
+            tile_state(v, win_a),
+            Some((false, true)),
+            "A (the bound, UNFOCUSED tile) must be unbound and showing a loading picker"
+        );
+        assert_eq!(
+            tile_state(v, win_b),
+            Some((true, false)),
+            "B (focused) must be untouched — still bound, no picker hijacked onto it"
+        );
     });
 }
 

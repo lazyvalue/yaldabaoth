@@ -673,88 +673,6 @@ pub(crate) fn anchor_for_new_tool_call(editor: &mut Editor) -> LineAnchor {
     editor.anchor_for_line(line)
 }
 
-/// Map a doc-line index to the flat-child index inside the claude body
-/// container, accounting for tool blocks rendered between text lines.
-///
-/// `render_agent` emits children in this order:
-///
-/// ```text
-/// line 0
-/// (any tool blocks anchored at line 0)
-/// line 1
-/// (any tool blocks anchored at line 1)
-/// ...
-/// line N
-/// ```
-///
-/// Maps a document line to its position in the flat_items list.
-///
-/// Accounts for tool groups (each adds one item) and block ranges
-/// (each collapses N lines into one FlatItem::Block, removing N-1
-/// items).
-pub(crate) fn cursor_visible_child_index(
-    c: &AgentState,
-    doc_line: usize,
-    block_ranges: &[(usize, usize)],
-    turn_headers_before: usize,
-) -> usize {
-    // Count distinct anchor lines before doc_line (each = one ToolGroup item).
-    // `LineAnchor` is opaque; resolve to a current line index via the editor.
-    // Anchors whose line was consumed by a delete (`None`) are treated as
-    // EOF — they sort after `doc_line` and don't count.
-    let eof_line = c.editor.document().line_count();
-    let mut anchors_before: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for id in &c.tools.order {
-        if let Some(&anchor) = c.tools.anchor.get(id) {
-            let line = c.editor.line_for_anchor(anchor).unwrap_or(eof_line);
-            if line < doc_line {
-                anchors_before.insert(line);
-            }
-        }
-    }
-    // Each block range (start..end) before doc_line replaces `end-start`
-    // Line items with 1 Block item, saving `end-start-1` slots.
-    let mut lines_collapsed: usize = 0;
-    for &(s, e) in block_ranges {
-        if s < doc_line {
-            lines_collapsed += (e - s) - 1; // N lines → 1 block = N-1 fewer items
-        }
-    }
-    doc_line - lines_collapsed + anchors_before.len() + turn_headers_before
-}
-
-/// Count `TurnHeader` items that would be inserted before `before_line`
-/// during the flat-items build. Must match the insertion logic in
-/// `render_agent`'s flat-items loop.
-pub(crate) fn count_turn_headers_before(tags: &[Option<TurnId>], before_line: usize) -> usize {
-    let mut count = 0usize;
-    let mut prev: Option<TurnId> = None;
-    for tag in tags.iter().take(before_line) {
-        if let Some(tid) = *tag {
-            let dominated_by = match tid {
-                // Mirror the flat-items loop: Tool and System are non-dominant
-                // (no header, no turn-run break) — Finding 5, INV-3.
-                TurnId::Tool(_) | TurnId::System => None,
-                other => Some(other),
-            };
-            if let Some(dt) = dominated_by {
-                let changed = match prev {
-                    Some(p) => p != dt,
-                    None => true,
-                };
-                if changed {
-                    count += 1;
-                    prev = Some(dt);
-                }
-            }
-        } else if prev.is_some() {
-            count += 1;
-            prev = None;
-        }
-    }
-    count
-}
-
 /// Detect line ranges in `lines` that should be rendered as structured
 /// blocks (tables and fenced code blocks) rather than line-by-line.
 /// Only considers frozen (agent-written) lines.
@@ -1716,6 +1634,12 @@ pub(crate) struct AgentViewModel {
     pub(crate) flat_items_cache: std::rc::Rc<Vec<FlatItem>>,
     /// Memoized per-line gutter tags, paired with `flat_items_cache`.
     pub(crate) gutter_cache: std::rc::Rc<Vec<Option<TurnId>>>,
+    /// Reverse index: doc line → its position in `flat_items_cache`. Derived
+    /// from the canonical `flat_items` at build time (single source of truth),
+    /// so cursor-reveal scroll math is an O(1) array lookup that can never
+    /// drift from what's actually rendered. This is what makes Worksheet
+    /// typing O(changed) instead of O(transcript) — see ADR-0020 / INV-RV.
+    pub(crate) line_to_item_cache: std::rc::Rc<Vec<u32>>,
     /// Fingerprint of the structural inputs the cached view-model was built
     /// from. `None` = never built (forces a rebuild on first render).
     pub(crate) view_model_fp: Option<u64>,
@@ -1754,6 +1678,7 @@ impl AgentViewModel {
         fp: u64,
         flat_items: Vec<FlatItem>,
         gutter: Vec<Option<TurnId>>,
+        line_to_item: Vec<u32>,
     ) -> (std::rc::Rc<Vec<FlatItem>>, std::rc::Rc<Vec<Option<TurnId>>>) {
         #[cfg(test)]
         {
@@ -1763,10 +1688,76 @@ impl AgentViewModel {
         let gutter_rc = std::rc::Rc::new(gutter);
         self.flat_items_cache = flat_rc.clone();
         self.gutter_cache = gutter_rc.clone();
+        self.line_to_item_cache = std::rc::Rc::new(line_to_item);
         self.view_model_fp = Some(fp);
         self.view_model_seq = self.view_model_seq.wrapping_add(1);
         (flat_rc, gutter_rc)
     }
+
+    /// O(1) flat-item index for `doc_line`, clamped into range. This is the
+    /// ONLY supported way to compute a cursor-reveal scroll target — it reads
+    /// the build-time reverse index so callers never re-derive (and never
+    /// re-scan the transcript) the line→item mapping. Empty cache → 0.
+    pub(crate) fn item_for_line(&self, doc_line: usize) -> usize {
+        let m = &self.line_to_item_cache;
+        m.get(doc_line)
+            .or_else(|| m.last())
+            .copied()
+            .unwrap_or(0) as usize
+    }
+}
+
+/// Build the doc-line → flat-item reverse index from the CANONICAL final
+/// `flat_items`. Single source of truth: it reads the very list the renderer
+/// virtualises, so a cursor-reveal target can never disagree with what's on
+/// screen. O(items + collapsed block lines); runs only on a view-model
+/// rebuild (cache miss), never per keystroke.
+fn build_line_to_item(flat_items: &[FlatItem], resolved: &[ResolvedBlock], line_count: usize) -> Vec<u32> {
+    let mut map = vec![u32::MAX; line_count];
+    // PARSED ranges became `FlatItem::Block`, emitted in ascending-start order
+    // — the same order they appear in `flat_items` — so a single forward
+    // cursor pairs each Block item with its source range.
+    let parsed: Vec<(usize, usize)> = resolved
+        .iter()
+        .filter_map(|((s, e), b)| b.as_ref().map(|_| (*s, *e)))
+        .collect();
+    let mut bi = 0usize;
+    for (p, item) in flat_items.iter().enumerate() {
+        match item {
+            FlatItem::Line(idx) => {
+                if let Some(slot) = map.get_mut(*idx) {
+                    *slot = p as u32;
+                }
+            }
+            FlatItem::Block(_) => {
+                if let Some(&(s, e)) = parsed.get(bi) {
+                    for l in s..e.min(line_count) {
+                        map[l] = p as u32;
+                    }
+                    bi += 1;
+                }
+            }
+            // ToolGroup/TurnHeader/ThinkingIndicator own no doc line.
+            _ => {}
+        }
+    }
+    debug_assert!(
+        bi == parsed.len(),
+        "block items ({bi}) did not consume all parsed ranges ({})",
+        parsed.len()
+    );
+    // Lines with no item of their own (blank lines collapsed away by the
+    // blank-collapse pass) inherit the previous mapped item, so a cursor that
+    // lands on one reveals the nearest rendered row, not the top.
+    let mut last = 0u32;
+    for v in map.iter_mut() {
+        if *v == u32::MAX {
+            *v = last;
+        } else {
+            last = *v;
+        }
+    }
+    map
 }
 
 /// S1 view-model rebuild — the `cached()` miss path of `render_agent`: the
@@ -2016,8 +2007,13 @@ pub(crate) fn rebuild_agent_view_model(
         flat_items.push(FlatItem::ThinkingIndicator);
     }
 
+    // Derive the cursor-reveal reverse index from the FINAL flat_items (after
+    // blank-collapse, tool-group merge, and the tail indicator) so it matches
+    // the rendered list exactly.
+    let line_to_item = build_line_to_item(&flat_items, resolved, lines.len());
+
     c.view_model
-        .store(view_model_fp, flat_items, gutter_tag_per_line)
+        .store(view_model_fp, flat_items, gutter_tag_per_line, line_to_item)
 }
 
 /// State held while the user is conversing with an ACP-attached Claude
@@ -2100,8 +2096,14 @@ pub(crate) struct AgentState {
     pub(crate) tools: ToolCalls,
     /// Line ranges `(start, end)` that are rendered as structural blocks
     /// (tables, fenced code blocks) instead of line-by-line. Updated each
-    /// render pass; used by `cursor_visible_child_index` for scroll math.
+    /// render pass.
     pub(crate) block_ranges: Vec<(usize, usize)>,
+    /// Set by a Worksheet keystroke to request "reveal the cursor's line in
+    /// the virtualised list on the next render". The render path consumes it
+    /// via the O(1) `AgentViewModel::item_for_line` lookup (INV-RV) — the key
+    /// handler itself does NO transcript-sized work, which is what keeps
+    /// Worksheet typing flat as the session grows (ADR-0020).
+    pub(crate) pending_reveal_cursor: bool,
     /// The memoized `render_agent` view-model caches (block cache, flat-items,
     /// gutter tags, fingerprint, seq) — one owner instead of six sibling
     /// fields (A.7). See [`AgentViewModel`].
@@ -2317,6 +2319,7 @@ impl AgentState {
             last_scrolled_edit_seq: u64::MAX,
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
+            pending_reveal_cursor: false,
             view_model: AgentViewModel::new(),
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
@@ -2366,6 +2369,7 @@ impl AgentState {
             last_scrolled_edit_seq: u64::MAX,
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
+            pending_reveal_cursor: false,
             view_model: AgentViewModel::new(),
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
