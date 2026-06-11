@@ -2772,6 +2772,66 @@ pub(crate) struct AgentSlot {
     pub(crate) pending_open_token: Option<u64>,
 }
 
+/// One existing server session offered in the in-tile [`SessionPicker`].
+/// Built from a [`SessionInfo`] returned by `list_sessions`; carries
+/// everything the attach path needs so selecting a row never has to make a
+/// second round-trip to learn the sid / acp id / permission mode.
+pub(crate) struct PickerSession {
+    pub(crate) sid: String,
+    pub(crate) acp_id: Option<String>,
+    pub(crate) label: String,
+    pub(crate) turns: usize,
+    pub(crate) connected: bool,
+    /// Another connection currently drives this session — attaching here
+    /// lands as an observer (read-only) unless ownership is handed over.
+    pub(crate) has_owner: bool,
+    pub(crate) permission_mode: yalda::acp_channel::PermissionMode,
+}
+
+/// In-tile session chooser shown when a fresh Agent app opens over the
+/// session server: it lists the existing sessions for the cwd plus a
+/// "start a new session" row, so the user picks instead of the old behaviour
+/// of silently resuming/creating. Lives on an otherwise-empty [`AgentRing`]
+/// (zero slots); selecting a row binds the ring's first slot and clears the
+/// picker, after which `render_agent` renders the normal transcript.
+pub(crate) struct SessionPicker {
+    /// `None` while the background `list_sessions` round-trip is in flight;
+    /// `Some` once it lands (possibly empty — only the "new session" row).
+    pub(crate) sessions: Option<Vec<PickerSession>>,
+    /// Set if the list round-trip failed; rendered in place of the list.
+    pub(crate) error: Option<SharedString>,
+    /// Highlighted row. Row 0 is always "start a new session"; rows `1..=N`
+    /// map to `sessions[row - 1]`.
+    pub(crate) selected: usize,
+    /// The cwd this picker was opened for, threaded into create/attach.
+    pub(crate) cwd: PathBuf,
+}
+
+impl SessionPicker {
+    pub(crate) fn loading(cwd: PathBuf) -> Self {
+        Self {
+            sessions: None,
+            error: None,
+            selected: 0,
+            cwd,
+        }
+    }
+
+    /// Selectable rows: the "new session" row plus one per listed session.
+    pub(crate) fn row_count(&self) -> usize {
+        1 + self.sessions.as_ref().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Move the highlight by `delta`, wrapping at both ends.
+    pub(crate) fn move_selection(&mut self, delta: isize) {
+        let n = self.row_count() as isize;
+        if n <= 0 {
+            return;
+        }
+        self.selected = (self.selected as isize + delta).rem_euclid(n) as usize;
+    }
+}
+
 /// An ordered collection of `AgentSlot`s with one active slot.
 /// Ring-style next/prev navigation wraps around.
 pub(crate) struct AgentRing {
@@ -2785,6 +2845,10 @@ pub(crate) struct AgentRing {
     /// never `App` (D3/C4): an Agent can only ever be backed by a Buffer,
     /// never by another Agent — agent-over-agent is unrepresentable.
     pub(crate) underlying: Option<Box<BufferApp>>,
+    /// When `Some` AND `slots` is empty, this Agent tile shows the in-tile
+    /// session picker instead of a transcript. Cleared the moment a slot is
+    /// bound (a session is chosen or a new one started).
+    pub(crate) picker: Option<SessionPicker>,
 }
 
 impl AgentRing {
@@ -2794,6 +2858,7 @@ impl AgentRing {
             active: 0,
             next_index: 0,
             underlying,
+            picker: None,
         }
     }
 

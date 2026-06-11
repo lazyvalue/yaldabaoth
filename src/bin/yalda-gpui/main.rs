@@ -2717,30 +2717,35 @@ impl YaldaGpuiView {
                     false
                 }
             }
-            Some(App::Agent(ring)) => {
-                let c = &mut ring.active_mut().state;
-                if c.input_surface.is_chatbox() {
-                    if let Some(cb) = c.input_surface.chatbox_mut() {
-                        if cb.mode == EditMode::Insert {
-                            for ch in text.chars() {
-                                cb.editor.insert_char(ch);
+            // `get_mut` (not `active_mut`) so an empty ring — the session
+            // picker — is a no-op rather than an out-of-bounds panic.
+            Some(App::Agent(ring)) => match ring.slots.get_mut(ring.active) {
+                Some(slot) => {
+                    let c = &mut slot.state;
+                    if c.input_surface.is_chatbox() {
+                        if let Some(cb) = c.input_surface.chatbox_mut() {
+                            if cb.mode == EditMode::Insert {
+                                for ch in text.chars() {
+                                    cb.editor.insert_char(ch);
+                                }
+                                true
+                            } else {
+                                false
                             }
-                            true
                         } else {
                             false
                         }
+                    } else if c.mode == EditMode::Insert {
+                        for ch in text.chars() {
+                            c.editor.insert_char(ch);
+                        }
+                        true
                     } else {
                         false
                     }
-                } else if c.mode == EditMode::Insert {
-                    for ch in text.chars() {
-                        c.editor.insert_char(ch);
-                    }
-                    true
-                } else {
-                    false
                 }
-            }
+                None => false,
+            },
             _ => false,
         };
         if pasted {
@@ -2763,8 +2768,10 @@ impl YaldaGpuiView {
         // Edit / Agent views: copy editor selection.
         let text = match self.workspace.focused_content() {
             Some(App::Buffer(BufferApp::Editing(e))) => e.editor.selection_text(),
-            Some(App::Agent(ring)) => {
-                let c = &ring.active().state;
+            // `get` (not `active()`) so the empty-ring session picker yields
+            // no selection rather than panicking.
+            Some(App::Agent(ring)) => ring.slots.get(ring.active).and_then(|slot| {
+                let c = &slot.state;
                 if c.input_surface.is_chatbox() {
                     c.input_surface
                         .chatbox()
@@ -2772,7 +2779,7 @@ impl YaldaGpuiView {
                 } else {
                     c.editor.selection_text()
                 }
-            }
+            }),
             _ => None,
         };
         if let Some(t) = text
@@ -4878,7 +4885,11 @@ impl YaldaGpuiView {
         let Some(ring) = self.agent_ring() else {
             return;
         };
-        let slot = &ring.slots[ring.active];
+        // `.get` so the empty-ring session picker (no slot to rename) is a
+        // no-op rather than an out-of-bounds panic.
+        let Some(slot) = ring.slots.get(ring.active) else {
+            return;
+        };
         // Own the reads so the `ring`/`slot` (&self) borrow ends before
         // `open_overlay` takes `&mut self`.
         let text = slot.label.clone();
