@@ -48,34 +48,21 @@ impl YaldaGpuiView {
         let proc_cwd = process_cwd();
 
         if self.session_server.is_some() {
-            // ── Session-server path (S4: non-blocking) ───────────────
-            // Render IMMEDIATELY in a "connecting…" placeholder, then do the
-            // (potentially slow) list_sessions / attach / create round-trips
-            // on a background thread. The server pump replays each session's
-            // full event_log on attach, so the transcript lands through the
-            // pump — we never have to block the paint thread on an Ack. The
-            // worst case the old synchronous path could hit was a ~30s freeze
-            // (request `recv_timeout`) when the server stalled.
-            let placeholder =
-                AgentState::new_server_managed(Some("connecting to session server…".into()));
-            let open_token = alloc_open_token();
-            ring.push("claude-1".into(), placeholder, None, proc_cwd.clone(), None);
-            // Start the unified server pump (one per view, routes by
-            // session_id) and stash it on the placeholder so it lives as long
-            // as the ring does — events for the soon-to-be-attached sessions
-            // need it running before the attach Ack returns.
+            // ── Session-server path: in-tile session picker ──────────
+            // Rather than silently resume-or-create, open the tile straight
+            // into a session picker: an empty ring in `picker` mode renders
+            // the chooser (existing cwd sessions + "start new") and the user
+            // decides. The (potentially slow) `list_sessions` round-trip runs
+            // off the paint thread and fills the picker when it lands. The
+            // server pump is started now (one per view, routes by session_id)
+            // so a chosen session's replayed events route the instant its slot
+            // binds — no attach Ack to block the paint thread on.
+            ring.picker = Some(SessionPicker::loading(proc_cwd.clone()));
             self.start_server_pump(cx);
-            if let Some(slot) = ring.slots.first_mut() {
-                slot.pending_open_token = Some(open_token);
-            }
-
             self.set_screen(App::Agent(ring));
-            if let Some(c) = self.agent_mut() {
-                c.editor.begin_insert();
-            }
             cx.notify();
 
-            self.spawn_open_agent_server(open_token, proc_cwd, cx);
+            self.spawn_list_sessions_for_picker(proc_cwd, cx);
             return;
         } else {
             // ── Direct-spawn path (legacy) ───────────────────────────
@@ -114,6 +101,251 @@ impl YaldaGpuiView {
             c.editor.begin_insert();
         }
         cx.notify();
+    }
+
+    /// Background half of the in-tile session picker: list the server's
+    /// sessions for `cwd` off the paint thread, keep those for this cwd that
+    /// aren't already open in another tile, and hand the result to
+    /// `apply_picker_sessions`. Mirrors the discovery half of
+    /// `spawn_open_agent_server`, but stops at "list" — the user, not the
+    /// code, decides what (if anything) to attach.
+    pub(crate) fn spawn_list_sessions_for_picker(&self, cwd: PathBuf, cx: &mut Context<Self>) {
+        let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
+            return;
+        };
+        // Snapshot sids already shown in any tile so the picker never offers a
+        // session that's open elsewhere. Taken on the (single-threaded) UI
+        // thread so it can't race a concurrent ring mutation.
+        let mut open_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for tab in self.workspace.tabs.iter() {
+            tab.layout.for_each_leaf(&mut |w| {
+                if let App::Agent(ring) = &w.content {
+                    for slot in ring.slots.iter() {
+                        if let Some(sid) = &slot.server_session_id {
+                            open_sids.insert(sid.clone());
+                        }
+                    }
+                }
+            });
+        }
+        cx.spawn(async move |this, cx| {
+            let cwd_for_apply = cwd.clone();
+            let result: Result<Vec<PickerSession>, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let existing = handle.list_sessions().map_err(|e| e.to_string())?;
+                    let cwd_key = cwd_match_key(&cwd);
+                    Ok(existing
+                        .into_iter()
+                        .filter(|s| cwd_match_key(&s.cwd) == cwd_key)
+                        .filter(|s| !open_sids.contains(&s.session_id))
+                        .map(|s| PickerSession {
+                            sid: s.session_id,
+                            acp_id: s.acp_session_id,
+                            label: s.label,
+                            turns: s.turns,
+                            connected: s.connected,
+                            has_owner: s.has_owner,
+                            permission_mode: s.permission_mode,
+                        })
+                        .collect())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_picker_sessions(cwd_for_apply, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Fold a completed `list_sessions` result into the focused tile's picker.
+    /// No-op if the focused tile is no longer an empty Agent ring whose picker
+    /// is still loading for this cwd (the user switched tabs or already picked
+    /// before the list landed) — the same harmless-discard contract as
+    /// `apply_open_agent_resolution`.
+    pub(crate) fn apply_picker_sessions(
+        &mut self,
+        cwd: PathBuf,
+        result: Result<Vec<PickerSession>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ring) = self.agent_ring_mut()
+            && let Some(picker) = ring.picker.as_mut()
+            && picker.sessions.is_none()
+            && cwd_match_key(&picker.cwd) == cwd_match_key(&cwd)
+        {
+            match result {
+                Ok(sessions) => picker.sessions = Some(sessions),
+                Err(e) => {
+                    picker.error = Some(format!("couldn't list sessions — {e}").into());
+                    picker.sessions = Some(Vec::new());
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    /// Move the picker highlight (j/k or ↑/↓). No-op outside picker mode.
+    pub(crate) fn agent_picker_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(ring) = self.agent_ring_mut()
+            && let Some(picker) = ring.picker.as_mut()
+        {
+            picker.move_selection(delta);
+            cx.notify();
+        }
+    }
+
+    /// Activate picker row `row`: row 0 starts a fresh session; rows `1..=N`
+    /// attach the corresponding listed session. No-op outside picker mode or
+    /// for an out-of-range / still-loading row.
+    pub(crate) fn agent_picker_activate(&mut self, row: usize, cx: &mut Context<Self>) {
+        // What to do, extracted before the helpers borrow `&mut self`.
+        enum Choice {
+            New(PathBuf),
+            Attach {
+                cwd: PathBuf,
+                sid: String,
+                acp_id: Option<String>,
+                label: String,
+                connected: bool,
+                permission_mode: yalda::acp_channel::PermissionMode,
+            },
+        }
+        let choice = self.agent_ring_mut().and_then(|ring| {
+            let picker = ring.picker.as_ref()?;
+            if row == 0 {
+                Some(Choice::New(picker.cwd.clone()))
+            } else {
+                let s = picker.sessions.as_ref()?.get(row - 1)?;
+                Some(Choice::Attach {
+                    cwd: picker.cwd.clone(),
+                    sid: s.sid.clone(),
+                    acp_id: s.acp_id.clone(),
+                    label: s.label.clone(),
+                    connected: s.connected,
+                    permission_mode: s.permission_mode,
+                })
+            }
+        });
+        match choice {
+            Some(Choice::New(cwd)) => self.picker_start_new(cwd, cx),
+            Some(Choice::Attach {
+                cwd,
+                sid,
+                acp_id,
+                label,
+                connected,
+                permission_mode,
+            }) => self.picker_attach_existing(cwd, sid, acp_id, label, connected, permission_mode, cx),
+            None => {}
+        }
+    }
+
+    /// Picker → "start a new session": clear the picker, push a placeholder
+    /// slot, and create a fresh session via the shared create path.
+    fn picker_start_new(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
+        let label = "claude-1".to_string();
+        let open_token = alloc_open_token();
+        let Some(ring) = self.agent_ring_mut() else {
+            return;
+        };
+        ring.picker = None;
+        ring.push(
+            label.clone(),
+            AgentState::new_server_managed(Some("connecting to session server…".into())),
+            None,
+            cwd.clone(),
+            None,
+        );
+        if let Some(slot) = ring.slots.last_mut() {
+            slot.pending_open_token = Some(open_token);
+        }
+        self.spawn_create_agent_session(open_token, label, cwd, cx);
+        if let Some(c) = self.agent_mut() {
+            c.editor.begin_insert();
+        }
+        self.save_agent_ring();
+        cx.notify();
+    }
+
+    /// Picker → attach an existing session. The sid / acp id / permission mode
+    /// all came from the `list_sessions` result, so we feed the bind+attach
+    /// path directly (no second round-trip): push a placeholder bound to this
+    /// open token, then synchronously run `apply_open_agent_resolution`, which
+    /// fills the slot and kicks off `spawn_attach_sessions`.
+    #[allow(clippy::too_many_arguments)]
+    fn picker_attach_existing(
+        &mut self,
+        cwd: PathBuf,
+        sid: String,
+        acp_id: Option<String>,
+        label: String,
+        connected: bool,
+        permission_mode: yalda::acp_channel::PermissionMode,
+        cx: &mut Context<Self>,
+    ) {
+        let open_token = alloc_open_token();
+        {
+            let Some(ring) = self.agent_ring_mut() else {
+                return;
+            };
+            ring.picker = None;
+            ring.push(
+                label.clone(),
+                AgentState::new_server_managed(Some("reconnecting…".into())),
+                None,
+                cwd,
+                None,
+            );
+            if let Some(slot) = ring.slots.last_mut() {
+                slot.pending_open_token = Some(open_token);
+            }
+        }
+        let status = if connected {
+            "reconnecting…"
+        } else {
+            "reconnecting (agent spawning…)"
+        };
+        let resolution = OpenResolution::Attached(vec![AttachedSlot {
+            label,
+            sid,
+            acp_id,
+            status: status.to_string(),
+            permission_mode,
+        }]);
+        self.apply_open_agent_resolution(open_token, resolution, cx);
+        if let Some(c) = self.agent_mut() {
+            c.editor.begin_insert();
+        }
+    }
+
+    /// Key handler for the in-tile session picker (`AgentPickerView`):
+    /// j/k or ↑/↓ to move, Enter to activate, Ctrl-V to back out to the
+    /// underlying buffer so a mis-opened agent tile is never a dead end.
+    pub(crate) fn handle_picker_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        if press.modifiers.contains(KMods::CONTROL)
+            && matches!(press.key, Key::Char('v') | Key::Char('V'))
+        {
+            self.back_to_doc(cx);
+            return;
+        }
+        match press.key {
+            Key::Up | Key::Char('k') => self.agent_picker_move(-1, cx),
+            Key::Down | Key::Char('j') => self.agent_picker_move(1, cx),
+            Key::Enter => {
+                if let Some(row) = self.agent_ring().and_then(|r| r.picker.as_ref()).map(|p| p.selected)
+                {
+                    self.agent_picker_activate(row, cx);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Background half of `open_agent_inner`'s session-server path (S4). Runs

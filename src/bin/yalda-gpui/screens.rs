@@ -757,6 +757,14 @@ impl YaldaGpuiView {
         // model is the surface for running multiple agents. Sessions
         // within a single ring remain reachable via Ctrl-]/Ctrl-[.
 
+        // Empty ring → no session bound yet: render the in-tile session
+        // picker instead of a transcript. A transcript render below would
+        // panic on `ring.active()`; the picker is the only valid view of an
+        // empty ring.
+        if ring.is_empty() {
+            return self.render_agent_picker(root, ring, cx);
+        }
+
         let active_slot_label = ring.active().label.clone();
         // Per-slot cwd (spec-agent-cwd.md §6). Cloned before the
         // active_mut() reborrow so the Status Strip render can compare
@@ -2237,6 +2245,196 @@ impl YaldaGpuiView {
             );
         }
         out
+    }
+
+    /// Render the in-tile session picker shown on an empty Agent ring
+    /// (`ring.picker`): a "start a new session" row followed by the existing
+    /// sessions for this cwd. Keys go through `handle_picker_key`; rows are
+    /// also clickable. Selecting a row binds the ring's first slot and clears
+    /// the picker, after which `render_agent` takes over.
+    pub(crate) fn render_agent_picker(
+        &self,
+        root: gpui::Div,
+        ring: &AgentRing,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let at = &self.theme.agent;
+        let bg: Hsla = self.editor_bg();
+        let fg: Hsla = self.editor_fg();
+        let dim: Hsla = nc(at.dim);
+        let accent: Hsla = nc(at.user_bar);
+        let sel_bg: Hsla = tint_bg(bg, 0.55, 0.14, 0.07);
+        let card_bg: Hsla = tint_bg(bg, 0.55, 0.05, 0.02);
+
+        let selected = ring.picker.as_ref().map(|p| p.selected).unwrap_or(0);
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .px_5()
+            .h(px(40.0))
+            .text_color(accent)
+            .font_weight(FontWeight::BOLD)
+            .text_size(px(15.0))
+            .child(SharedString::new_static("Claude — choose a session"));
+
+        // "Start a new session" is always the first row.
+        let mut rows = div().flex().flex_col().gap_1().w(px(560.0));
+        rows = rows.child(self.picker_row(
+            0,
+            selected == 0,
+            SharedString::new_static("＋  Start a new session"),
+            None,
+            sel_bg,
+            card_bg,
+            fg,
+            dim,
+            accent,
+            cx,
+        ));
+
+        match ring.picker.as_ref().and_then(|p| p.sessions.as_ref()) {
+            None => {
+                rows = rows.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_color(dim)
+                        .child(SharedString::new_static("loading sessions…")),
+                );
+            }
+            Some(sessions) if sessions.is_empty() => {
+                let msg = ring
+                    .picker
+                    .as_ref()
+                    .and_then(|p| p.error.clone())
+                    .unwrap_or_else(|| {
+                        SharedString::new_static("No existing sessions for this folder.")
+                    });
+                rows = rows.child(div().px_4().py_2().text_color(dim).child(msg));
+            }
+            Some(sessions) => {
+                for (i, s) in sessions.iter().enumerate() {
+                    let row = i + 1;
+                    let liveness = if s.connected { "live" } else { "idle" };
+                    let owned = if s.has_owner { " · open elsewhere" } else { "" };
+                    let sub = format!(
+                        "{} turn{} · {}{}",
+                        s.turns,
+                        if s.turns == 1 { "" } else { "s" },
+                        liveness,
+                        owned,
+                    );
+                    rows = rows.child(self.picker_row(
+                        row,
+                        selected == row,
+                        SharedString::from(s.label.clone()),
+                        Some(SharedString::from(sub)),
+                        sel_bg,
+                        card_bg,
+                        fg,
+                        dim,
+                        accent,
+                        cx,
+                    ));
+                }
+            }
+        }
+
+        let footer = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .px_5()
+            .h(px(28.0))
+            .text_color(dim)
+            .text_size(px(12.0))
+            .child(SharedString::new_static(
+                "↑/↓ or j/k to move · Enter to open · Ctrl-V to go back",
+            ));
+
+        root.key_context("AgentPickerView")
+            .on_key_down(cx.listener(Self::handle_picker_key))
+            .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::restart))
+            .on_action(cx.listener(Self::close_window))
+            .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::open_browser))
+            .on_action(cx.listener(Self::focus_left))
+            .on_action(cx.listener(Self::focus_right))
+            .on_action(cx.listener(Self::focus_up))
+            .on_action(cx.listener(Self::focus_down))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::move_tile))
+            .on_action(cx.listener(Self::also_show_tile))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(bg)
+            .text_color(fg)
+            .child(header)
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .child(rows),
+            )
+            .child(footer)
+    }
+
+    /// One row in the session picker. `row` is the activation index handed to
+    /// `agent_picker_activate` on click; `is_sel` drives the highlight.
+    #[allow(clippy::too_many_arguments)]
+    fn picker_row(
+        &self,
+        row: usize,
+        is_sel: bool,
+        title: SharedString,
+        subtitle: Option<SharedString>,
+        sel_bg: Hsla,
+        card_bg: Hsla,
+        fg: Hsla,
+        dim: Hsla,
+        accent: Hsla,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut text_col = div().flex().flex_col();
+        text_col = text_col.child(
+            div()
+                .text_color(if is_sel { accent } else { fg })
+                .child(title),
+        );
+        if let Some(sub) = subtitle {
+            text_col = text_col.child(div().text_size(px(12.0)).text_color(dim).child(sub));
+        }
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .px_4()
+            .py_2()
+            .bg(if is_sel { sel_bg } else { card_bg })
+            .border_l(px(2.0))
+            .border_color(if is_sel { accent } else { card_bg })
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev: &MouseDownEvent, _w, cx| {
+                    this.agent_picker_activate(row, cx);
+                }),
+            )
+            .child(text_col)
     }
 
     pub(crate) fn render_browser(

@@ -1989,3 +1989,175 @@ fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppCo
         );
     });
 }
+
+// ---- Session picker (in-tile, empty-ring) --------------------------------
+//
+// A fresh Agent app opens into a picker: an empty `AgentRing` whose `picker`
+// is Some. The render path must handle the empty ring (no `active()` panic),
+// navigation must wrap, and activating a row must bind the ring's first slot
+// and clear the picker.
+
+/// Install an empty agent ring in picker mode on `view`. When `sessions` is
+/// non-empty the list is marked loaded; otherwise the picker stays in its
+/// "loading" state (`sessions: None`).
+#[cfg(test)]
+fn install_agent_picker(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    sessions: &[(&str, &str)],
+) {
+    use crate::{AgentRing, App, PickerSession, SessionPicker};
+    let sessions: Vec<PickerSession> = sessions
+        .iter()
+        .map(|(sid, label)| PickerSession {
+            sid: sid.to_string(),
+            acp_id: None,
+            label: label.to_string(),
+            turns: 3,
+            connected: true,
+            has_owner: false,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        })
+        .collect();
+    view.update(vcx, |v, _cx| {
+        let mut ring = AgentRing::new(None);
+        let mut picker = SessionPicker::loading(PathBuf::from("."));
+        if !sessions.is_empty() {
+            picker.sessions = Some(sessions);
+        }
+        ring.picker = Some(picker);
+        v.set_screen(App::Agent(ring));
+    });
+}
+
+/// The empty-ring picker renders headlessly in BOTH its loading and loaded
+/// states without panicking on `ring.active()`, and `apply_picker_sessions`
+/// wires a list result into the focused picker.
+#[gpui::test]
+fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+
+    // Loading state (sessions: None) renders without panic.
+    install_agent_picker(&view, &mut *vcx, &[]);
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _cx| {
+        let ring = v.agent_ring().expect("agent ring");
+        assert!(ring.is_empty(), "picker ring stays empty until a row binds");
+        let p = ring.picker.as_ref().expect("picker present");
+        assert!(p.sessions.is_none(), "still loading");
+        assert_eq!(p.row_count(), 1, "only the 'new session' row while loading");
+    });
+
+    // Fold in a list result through the real reducer, then render again.
+    view.update(vcx, |v, cx| {
+        v.apply_picker_sessions(
+            PathBuf::from("."),
+            Ok(vec![
+                crate::PickerSession {
+                    sid: "S1".into(),
+                    acp_id: None,
+                    label: "claude-1".into(),
+                    turns: 2,
+                    connected: true,
+                    has_owner: false,
+                    permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                },
+                crate::PickerSession {
+                    sid: "S2".into(),
+                    acp_id: None,
+                    label: "claude-2".into(),
+                    turns: 9,
+                    connected: false,
+                    has_owner: true,
+                    permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+                },
+            ]),
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _cx| {
+        let p = v.agent_ring().unwrap().picker.as_ref().unwrap();
+        assert_eq!(
+            p.row_count(),
+            3,
+            "new-session row + two listed sessions = 3 rows"
+        );
+    });
+}
+
+/// j/k navigation wraps at both ends across the picker's rows.
+#[gpui::test]
+fn session_picker_navigation_wraps(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_picker(&view, &mut *vcx, &[("S1", "claude-1"), ("S2", "claude-2")]);
+    vcx.run_until_parked();
+
+    let selected = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, _cx| {
+            v.agent_ring().unwrap().picker.as_ref().unwrap().selected
+        })
+    };
+
+    // 3 rows (new + S1 + S2). Down from 0 → 1 → 2 → wraps to 0.
+    view.update(vcx, |v, cx| v.agent_picker_move(1, cx));
+    view.update(vcx, |v, cx| v.agent_picker_move(1, cx));
+    assert_eq!(selected(&view, &mut *vcx), 2);
+    view.update(vcx, |v, cx| v.agent_picker_move(1, cx));
+    assert_eq!(selected(&view, &mut *vcx), 0, "down past the end wraps to top");
+    // Up from 0 wraps to the last row.
+    view.update(vcx, |v, cx| v.agent_picker_move(-1, cx));
+    assert_eq!(selected(&view, &mut *vcx), 2, "up past the top wraps to bottom");
+}
+
+/// Activating a listed row binds the ring's first slot (with the chosen
+/// server session id) and clears the picker; activating row 0 binds a fresh
+/// placeholder slot. Both make `render_agent` take over from the picker.
+#[gpui::test]
+fn session_picker_activation_binds_slot(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_picker(&view, &mut *vcx, &[("S1", "claude-1"), ("S2", "claude-2")]);
+    vcx.run_until_parked();
+
+    // Activate row 2 (the second listed session, sid "S2").
+    view.update(vcx, |v, cx| v.agent_picker_activate(2, cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _cx| {
+        let ring = v.agent_ring().expect("agent ring");
+        assert!(!ring.is_empty(), "a slot is bound after activation");
+        assert!(ring.picker.is_none(), "picker cleared once a slot binds");
+        assert_eq!(ring.slots.len(), 1, "exactly one slot bound");
+        assert_eq!(
+            ring.slots[0].server_session_id.as_deref(),
+            Some("S2"),
+            "the bound slot carries the chosen session id"
+        );
+    });
+}
