@@ -1096,7 +1096,6 @@ pub(crate) fn build_chatbox_line(
     let mut row = div()
         .flex()
         .flex_row()
-        .flex_wrap()
         .items_center()
         .min_w_0()
         .w_full()
@@ -1157,17 +1156,20 @@ pub(crate) fn build_chatbox_line(
     }
 
     if !is_cursor_line {
-        let mut col_so_far = 0usize;
-        for token in &tokens {
-            let token_len = token.chars().count();
-            row = emit_chunk(row, token.clone(), col_so_far);
-            col_so_far += token_len;
-        }
-        return row.into_any_element();
+        // ONE selection-aware text element for the whole line, NOT one flex
+        // child per token. The token-per-flex-child tree (with `flex_wrap`) was
+        // the per-keystroke Taffy layout cost the profiler flagged — every
+        // compose line re-laid-out a wide flex tree on each character. Non-cursor
+        // lines don't need wrapping (you're not typing there); they clip like
+        // the transcript. The CURSOR line below keeps `flex_wrap` so the caret
+        // stays visible when you type past the box width.
+        return emit_chunk(row, full_text.to_string(), 0).into_any_element();
     }
 
-    // Cursor line: walk tokens by column and inject the caret at the cursor's
+    // Cursor line: keep word-wrap (so the caret can't scroll off the right
+    // edge) and walk tokens by column to inject the caret at the cursor's
     // column boundary, splitting the containing token if needed.
+    let mut row = row.flex_wrap();
     let cursor_col = cursor_col.min(char_count);
     let mut col_so_far = 0usize;
     let mut caret_emitted = false;
