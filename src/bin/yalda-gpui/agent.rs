@@ -2127,6 +2127,10 @@ pub(crate) struct AgentState {
     /// `plan` / `learn`, etc.). Distinct from the permission mode on
     /// `AcpChannelClient`. Surfaced by the Status Strip.
     pub(crate) agent_mode: Option<yalda::acp_channel::SessionModeId>,
+    /// Last-seen active model id from the agent (e.g. `claude-opus-4-8`),
+    /// sourced from the `session/new` response's `config_options`. Surfaced
+    /// by the Status Strip in place of the old best-effort model label.
+    pub(crate) agent_model: Option<String>,
     /// The session's permission mode, as session state sourced from the
     /// server. In session-server mode the agent/channel live in the server
     /// (not the GUI), so `channel` is `None` and the live `AcpChannelClient`
@@ -2314,6 +2318,7 @@ impl AgentState {
             input_surface: InputSurface::Chatbox(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
+            agent_model: None,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
@@ -2362,6 +2367,7 @@ impl AgentState {
             input_surface: InputSurface::Chatbox(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
+            agent_model: None,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,

@@ -61,8 +61,8 @@ use std::thread::{self, JoinHandle};
 use agent_client_protocol::schema::{
     ContentBlock, ContentChunk, InitializeRequest, LoadSessionRequest, NewSessionRequest,
     PermissionOptionKind, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
-    SessionUpdate,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionId, SessionNotification, SessionUpdate,
 };
 // Re-exported via this module so consumers (App / GPUI) don't need a
 // direct dependency on the agent-client-protocol schema crate just to
@@ -89,7 +89,7 @@ macro_rules! acp_debug {
 /// Default agent command, kept for backwards compatibility (e.g. callers
 /// that want to display "the default" somewhere). Real spawning uses
 /// [`DEFAULT_AGENT_FALLBACKS`] so users on either binary name still work.
-pub const DEFAULT_AGENT_COMMAND: &str = "claude-code-acp";
+pub const DEFAULT_AGENT_COMMAND: &str = "claude-agent-acp";
 
 /// Which yalda frontend is hosting this ACP session. Threaded into the
 /// system-prompt append so Claude knows which host it's running inside —
@@ -152,6 +152,13 @@ pub enum ReplyEvent {
     /// `default` / `plan` / `learn` modes). Consumed by the Status Strip
     /// (spec-agent-window.md §30).
     ModeChanged(SessionModeId),
+    /// The session's active model id (e.g. `claude-opus-4-8`). Sourced from
+    /// the `model` entry in the `session/new` response's `config_options`
+    /// (the modern `claude-agent-acp` adapter advertises the model selector
+    /// there). Consumed by the Status Strip to replace the old best-effort
+    /// label. Carries the current model id only; the available-models list
+    /// (for an in-app switcher) is a follow-up.
+    ModelChanged(String),
     /// Updated context-window utilization and cost. Variant is unconditional;
     /// the *emitter* in the notification handler is gated on the upstream
     /// `unstable_session_usage` feature (spec-agent-window.md §31).
@@ -341,6 +348,22 @@ impl PermissionMode {
 /// hard-coded fallback everywhere; the config node is the user-facing knob.
 pub const DEFAULT_PERMISSION_MODE: PermissionMode = PermissionMode::Yolo;
 
+/// Pull the current model id out of a `session/new` (or `session/load`)
+/// response's `config_options`. The modern adapter advertises the model as a
+/// `Select` option categorised `Model` (id `"model"`), whose `current_value`
+/// is the active model id. Returns `None` if no such option is present (older
+/// adapters, or an adapter that doesn't surface model selection).
+fn model_from_config_options(opts: &[SessionConfigOption]) -> Option<String> {
+    opts.iter().find_map(|o| {
+        let is_model = matches!(o.category, Some(SessionConfigOptionCategory::Model))
+            || o.id.0.as_ref() == "model";
+        match (is_model, &o.kind) {
+            (true, SessionConfigKind::Select(sel)) => Some(sel.current_value.0.to_string()),
+            _ => None,
+        }
+    })
+}
+
 /// Decide whether `kind` is allowed under `mode`. Centralised so both
 /// sides of the worker boundary use identical logic.
 fn allow_tool_kind(mode: PermissionMode, kind: ToolKind) -> bool {
@@ -355,11 +378,13 @@ fn allow_tool_kind(mode: PermissionMode, kind: ToolKind) -> bool {
 }
 
 /// Ordered candidate list for an empty `command_str`. Tried in sequence;
-/// the first that successfully spawns wins. The real npm package today is
-/// `@zed-industries/claude-code-acp` which installs as `claude-code-acp`.
-/// `claude-agent-acp` is kept as a forward-compat alias in case the
-/// package is republished under that name.
-pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-code-acp", "claude-agent-acp"];
+/// the first that successfully spawns wins. The adapter was renamed and
+/// moved to the ACP org — `@agentclientprotocol/claude-agent-acp` (binary
+/// `claude-agent-acp`), which bundles the modern Agent SDK 0.3.x runtime
+/// (Workflow + the full multi-agent toolset). We prefer it, falling back to
+/// the legacy `@zed-industries/claude-code-acp` (binary `claude-code-acp`,
+/// SDK 0.2.x, no Workflow) for anyone who only has the old package.
+pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-agent-acp", "claude-code-acp"];
 
 /// How long to wait for `session/load` (resume) before giving up and spawning a
 /// fresh `session/new`. `session/load` returns only AFTER the agent re-emits the
@@ -785,7 +810,7 @@ impl AcpChannelClient {
         Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "no ACP agent on PATH (tried {}). Install with `npm i -g @zed-industries/claude-code-acp`, or set YALDA_ACP_AGENT=/path/to/agent. Last error: {}",
+                "no ACP agent on PATH (tried {}). Install with `npm i -g @agentclientprotocol/claude-agent-acp`, or set YALDA_ACP_AGENT=/path/to/agent. Last error: {}",
                 tried.join(", "),
                 last_err
                     .as_ref()
@@ -1779,7 +1804,16 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                 .block_task()
                                 .await
                             {
-                                Ok(r) => r.session_id,
+                                Ok(r) => {
+                                    if let Some(opts) = &r.config_options {
+                                        if let Some(model) = model_from_config_options(opts) {
+                                            let _ = event_tx_for_driver.send(WorkerEvent::Reply(
+                                                ReplyEvent::ModelChanged(model),
+                                            ));
+                                        }
+                                    }
+                                    r.session_id
+                                }
                                 Err(e2) => {
                                     let _ = ready_tx.send(Err(io::Error::other(format!(
                                         "ACP new session failed (after load fallback): {e2}"
@@ -1796,7 +1830,16 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             .block_task()
                             .await
                         {
-                            Ok(r) => r.session_id,
+                            Ok(r) => {
+                                if let Some(opts) = &r.config_options {
+                                    if let Some(model) = model_from_config_options(opts) {
+                                        let _ = event_tx_for_driver.send(WorkerEvent::Reply(
+                                            ReplyEvent::ModelChanged(model),
+                                        ));
+                                    }
+                                }
+                                r.session_id
+                            }
                             Err(e) => {
                                 let _ = ready_tx.send(Err(io::Error::other(format!(
                                     "ACP new session failed: {e}"

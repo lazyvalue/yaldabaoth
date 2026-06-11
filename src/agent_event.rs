@@ -172,6 +172,10 @@ pub enum AgentEventKind {
     ToolCallUpdated(ToolCallUpdate),
     PlanUpdated(Plan),
     ModeChanged(SessionModeId),
+    /// Active model id (e.g. `claude-opus-4-8`), mirrored from
+    /// [`ReplyEvent::ModelChanged`]. Sourced from `session/new`'s
+    /// `config_options`.
+    ModelChanged(String),
     UsageUpdated(UsageSnapshot),
     /// Transient status ONLY (spec §1) — terminal failure is `TurnEnded`.
     Notice {
@@ -246,6 +250,12 @@ enum KnownKind {
     ModeChanged {
         mode: SessionModeId,
     },
+    // Same tagged-newtype-wrapping-a-string hazard as `ModeChanged` above: the
+    // model id rides under a named `model` field rather than as a flattened
+    // newtype, so it serializes under the `#[serde(tag = "kind")]` mirror.
+    ModelChanged {
+        model: String,
+    },
     UsageUpdated(UsageSnapshot),
     // `kind` is the internal enum tag, so the Notice severity rides the wire as
     // `level` to avoid colliding with it.
@@ -285,6 +295,7 @@ impl AgentEventKind {
             },
             AgentEventKind::PlanUpdated(p) => KnownKind::PlanUpdated(p.clone()),
             AgentEventKind::ModeChanged(m) => KnownKind::ModeChanged { mode: m.clone() },
+            AgentEventKind::ModelChanged(m) => KnownKind::ModelChanged { model: m.clone() },
             AgentEventKind::UsageUpdated(s) => KnownKind::UsageUpdated(s.clone()),
             AgentEventKind::Notice { kind, msg } => KnownKind::Notice {
                 kind: *kind,
@@ -315,6 +326,7 @@ impl AgentEventKind {
             }
             KnownKind::PlanUpdated(p) => AgentEventKind::PlanUpdated(p),
             KnownKind::ModeChanged { mode } => AgentEventKind::ModeChanged(mode),
+            KnownKind::ModelChanged { model } => AgentEventKind::ModelChanged(model),
             KnownKind::UsageUpdated(s) => AgentEventKind::UsageUpdated(s),
             KnownKind::Notice { kind, msg } => AgentEventKind::Notice { kind, msg },
             KnownKind::UserMessage { text } => AgentEventKind::UserMessage { text },
@@ -498,6 +510,7 @@ pub fn agent_kind_from_reply(reply: &ReplyEvent) -> Option<AgentEventKind> {
         ReplyEvent::ToolCallUpdated(u) => AgentEventKind::ToolCallUpdated(u.clone()),
         ReplyEvent::PlanUpdated(p) => AgentEventKind::PlanUpdated(p.clone()),
         ReplyEvent::ModeChanged(m) => AgentEventKind::ModeChanged(m.clone()),
+        ReplyEvent::ModelChanged(m) => AgentEventKind::ModelChanged(m.clone()),
         ReplyEvent::UsageUpdated(s) => AgentEventKind::UsageUpdated(s.clone()),
         ReplyEvent::Notice(msg) => AgentEventKind::Notice {
             // Legacy Notice conflates retry-status with terminal failure; during
