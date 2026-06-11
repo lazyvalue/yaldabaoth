@@ -524,6 +524,12 @@ impl YaldaGpuiView {
             div()
                 .flex()
                 .flex_row()
+                // Fill the list width so `content`'s `flex_1` has a bounded
+                // space to soft-wrap within. `gpui::list` lays each row out in
+                // isolation (no parent align-items: stretch), so without this
+                // the row shrinks to content width and long lines never wrap —
+                // they overflow and get clipped by the body's overflow_x_hidden.
+                .w_full()
                 .child(gutter)
                 .child(content)
                 .into_any_element()
@@ -703,7 +709,10 @@ impl YaldaGpuiView {
                     .child(content),
             };
 
-            line_div.into_any_element()
+            // Fill the list width (same reason as the Code view): rows in a
+            // `gpui::list` don't stretch, so `content`'s `flex_1` needs `w_full`
+            // on the row to have a bounded width to soft-wrap within.
+            line_div.w_full().into_any_element()
         };
 
         div()
