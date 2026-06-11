@@ -1,0 +1,143 @@
+# 001 — Refactor the agent session/tile ownership model
+
+**Project:** agent-model-refactor
+**Status:** 🔄 in progress (subtask 1 building)
+**Opened:** 2026-06-10
+**Branch:** `agent-session-owner` (worktree `.claude/worktrees/agent-session-owner`)
+**Spec:** `docs/specs/spec-agent-session-ownership.md` (lives on the branch; lands on `main` at merge)
+**Live task mirror:** in-session task list #1–#5 (this ticket is the durable copy)
+
+---
+
+## Problem
+
+Agent session management has been broken for months and survived two large
+"redesign" refactors. Symptoms: two agent tiles mirroring each other's input
+and output, "attached ×4" (one session attached multiple times), duplicate
+forwarders, stuck-reconnecting ghost tiles, the picker letting you re-attach an
+already-open session.
+
+**Root cause (one defect, many hats):** there was no enforced invariant binding
+a session to a tile, and the binding state lived in raw public fields
+(`AgentSlot.server_session_id`, `AgentRing.slots`) that ~11 code paths mutated
+directly with no coordination. `for_each_server_session_slot` then *fanned a
+session's events out to every tile holding it* — turning any duplicate binding
+into visible mirroring instead of a loud failure.
+
+**Why the big refactors didn't fix it:** they were *layer* refactors (transcript
+reconciler, render pipeline, session-server actor, lease). Each made its own
+layer internally correct. This bug lives in the **seam** between the server's
+notion of a "session" and the GUI's notion of a "tile" — no layer owned the
+seam, so the symptom relocated to whichever bind path wasn't hardened that round.
+
+The whole multi-subscriber apparatus (forwarder fan-out, leases, owner/observer,
+candidate/promote) existed for ONE feature: the self-hosting blue-green
+`:promote` loop (old + new build watching one live session). Scott confirmed
+that feature is **not needed** — which removes the entire reason for many-to-many
+binding.
+
+## Decision
+
+1. **Strict 1:1.** A server session is shown in at most one tile. No mirroring.
+2. **One owner.** A single struct (`SessionStore`, alias `AgentSessions`) owns
+   all agent-session state behind a private API. The `sid → SessionId` index is
+   private. Two sessions for one sid is *unrepresentable* — the only way to get a
+   session for a sid is `open_or_focus`, which returns the existing one.
+3. **Ownership inversion.** Session state moves OUT of the layout tree into the
+   store; tiles hold lightweight `SessionId` keys. Routing is an O(1) map lookup.
+4. **`:promote` machinery → dormant now, deleted later.** The client stops using
+   the server's lease/forwarder-fan/owner surface; the server is untouched this
+   pass (no protocol change) and cleaned up in a separate ticket.
+
+## The model (final, after design discussion)
+
+```
+App::Agent(AgentTile)          App::Buffer(BufferApp)
+        │                              │
+        │ bound: Option<SessionId>     │ (view onto the buffer pool)
+        ▼                              ▼
+  AgentSessions store            file-buffer pool
+```
+
+- **`App::Agent` is just the enum tag** — not a third entity, owns nothing
+  beyond its `AgentTile` payload. The real split is two homes:
+  - **`AgentTile` = the viewport (UX state), in the layout tree.** `bound`,
+    input mode (Worksheet ⇄ Message Box) + chatbox draft, cursor mode, scroll,
+    render caches, transient status, focused sub-agent, sidebar toggles, picker,
+    `pending_open_token`.
+  - **`AgentSession` = the conversation, in the store.** Transcript editor, ACP
+    channel + attach state, tool calls, turn phase, plan, agent mode, permission
+    mode, usage, generation, identity (label/cwd/resume_id).
+  - Litmus test for which side a field is on: *"does it still mean something when
+    no tile is showing this session?"* Yes → session. No → tile.
+- **Free sessions + rebind.** A session is **free** when no tile binds it
+  (`free = store ids − tiles' bound ids`). A tile can be **rebound** to any free
+  session; the old one frees and keeps running (rebind never kills). Closing a
+  tile frees (not kills) its session. Killing is an explicit, separate act.
+- **Unbound tile renders the selector** — the `SessionPicker` listing free
+  sessions + "create new". Session-close / unbind / rebind all leave the tile as
+  `App::Agent` with `bound: None` showing the selector; a tile never vanishes or
+  silently becomes a Buffer.
+- **No `underlying` buffer.** Agent and Buffer are fully orthogonal App variants;
+  an Agent never nests/stashes a Buffer. Flipping a tile loses nothing (both are
+  views onto pools). Ctrl-V ("leave agent") converts the tile to a fresh Buffer
+  picker at cwd — not a restore of a stashed doc.
+
+### Canonical agent-tile commands (in the `.` local menu)
+
+1. **Select session** — opens the selector (free sessions + create-new); on a
+   bound tile this is the rebind flow.
+2. **Stop** — `stop_agent` (Cmd-.).
+3. **Send message** — `submit_agent` (Ctrl-Enter).
+4. **Switch Worksheet ⇄ Message Box** — `toggle_agent_input_mode`
+   (Ctrl-Alt-Enter). Message Box = the chatbox (compose box, transcript
+   read-only); Worksheet = the transcript itself is editable.
+
+(Existing extras — tasklist/subagents sidebars, change-cwd, rename — are kept.)
+
+## Subtasks
+
+- [~] **1. Ownership inversion (strict 1:1).** ✅ code-complete on branch
+  `agent-session-owner` (build green, 153 tests pass); ⏳ pending my diff review
+  + runtime verify (#4). Deviations to scrutinize in review: `show_session`
+  (sid-first choke) is present but `#[allow(dead_code)]` — live paths use
+  `show_local_session` + `bind_session_sid` (bind-after-attach ordering), which
+  enforce the same INV-1/2/3; `candidate_take_over`/`_lease_heartbeat` left
+  dormant per brief.
+  Store owns `AgentSession`; `App::Agent(AgentRing)` → `App::Agent(AgentTile{
+  bound: Option<SessionId>, pending_open_token, picker })`; all 11 bind paths
+  routed through `open_or_focus`; delete `for_each_server_session_slot` fan-out,
+  `AgentSlot`, ring-cycling, `is_driver`, lease heartbeat; selector on unbound
+  tile; rebind-to-free; no `underlying`; the four `.` menu commands.
+  **AgentState stays monolithic on `AgentSession` this pass.**
+  Gate: `cargo build` + `cargo test` green. (Stage 1 — the `SessionStore` owner +
+  5 invariant tests — already committed: `368d369`.)
+- [ ] **2. Split `AgentState`** into conversation (→ `AgentSession`) vs viewport
+  (→ `AgentTile`) fields. The purity follow-up; deferred from #1. Subtlety: in
+  Worksheet mode the editable lines live in the transcript editor (session) — only
+  the mode flag + chatbox draft are viewport. *Blocked by #1.*
+- [ ] **3. Delete dormant server-side `:promote`/lease/owner/forwarder-fan
+  machinery** (~232 sites in the session server + protocol surface). Protocol
+  change; do only once the client no longer references lease/owner APIs.
+  Update `spec-session-server-actor.md`. *Blocked by #1.*
+- [ ] **4. Runtime-verify the 1:1 model** (GPUI can't be driven headlessly).
+  Two tiles → distinct sessions, no mirrored I/O, no "attached ×N"; rebind frees
+  the old; close → selector (not buffer/vanish); Ctrl-V → buffer picker;
+  Worksheet⇄MessageBox toggle; the four `.` commands; logs show exactly one
+  forwarder per session. Use `./dev-all.sh`. *Blocked by #1.*
+- [ ] **5. Reconcile `spec-agent-session-ownership.md` + `CLAUDE.md`** with the
+  final model (App::Agent = tag; AgentTile = UX; AgentSession = conversation; no
+  underlying; selector states; command set). Worklog the change. *Blocked by #1.*
+
+## Key invariants (enforced by `SessionStore`)
+
+- INV-1 — one session per sid (`open_or_focus`/`bind_sid` are the only writers).
+- INV-2 — at most one tile per session; unbound = free = re-bindable.
+- INV-3 — one channel/forwarder per session.
+- INV-4 — routing is total and unique (`locate`); fan-out deleted.
+
+## Methodology note
+
+This ticket is the cross-session-durable record. It mirrors the in-session task
+list but outlives it. See `CLAUDE.md` → "Project tickets (docs/projects/)" for
+the convention.

@@ -33,7 +33,30 @@ work discipline, and the verification-harness plan. Key artifacts:
 - `docs/specs/` — design (what). Skill: `/spec`.
 - `docs/decisions/` — ADRs (why a path was chosen). Skill: `/decision`.
 - `docs/worklog/` + `docs/backlog.md` — what happened / what's open. Skill: `/worklog`.
+- `docs/projects/` — **multi-session project tickets** (see below).
 - `/integrate` — converge parallel branches into one buildable branch.
+
+### Project tickets (`docs/projects/`)
+
+Work that spans multiple sessions (a refactor done in stages, a feature with a
+tail of follow-ups) gets a **durable ticket** so it survives context loss. The
+in-session task list (TaskCreate) is the live mirror; the ticket is the record
+that outlives it.
+
+```
+docs/projects/<project-slug>/NNN-ticket-<slug>.md
+```
+
+A ticket carries: **status** + branch/spec links at the top; **problem** (the
+real root cause, not just symptoms); **decision**; **the model** (diagrams /
+field allocation); **subtasks as `- [ ]` checkboxes** with per-task status and
+blockers; **invariants**; and any cross-session context a fresh agent needs to
+resume cold. Tick the boxes as subtasks land; open `NNN+1` tickets for new
+threads in the same project. Live on `main` (durable regardless of feature
+branches). Example: `docs/projects/agent-model-refactor/001-ticket-refactor-model.md`.
+
+When you start a multi-stage effort, create the ticket first and mirror its
+subtasks into the session task list; keep them in sync as work lands.
 
 **Definition of done:** builds + tests + pasted evidence + runtime-checked-or-
 flagged + artifacts updated. "Compiles" is not done. The GPUI app can't be
