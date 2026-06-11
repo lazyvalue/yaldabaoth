@@ -4,6 +4,14 @@
 
 use super::*;
 
+/// Lines the cursor moves per Ctrl-D / Ctrl-U (half page). A fixed sane
+/// default: the dispatch site can't see the live viewport height, and the
+/// render path scroll-reveals the cursor anyway, so an exact viewport-derived
+/// count isn't required for correct behavior.
+const HALF_PAGE_LINES: usize = 15;
+/// Lines the cursor moves per Ctrl-F / Ctrl-B (full page).
+const FULL_PAGE_LINES: usize = 30;
+
 impl YaldaGpuiView {
     /// `Some(edit)` if currently editing, else `None`.
     pub(crate) fn edit_mut(&mut self) -> Option<&mut EditState> {
@@ -568,6 +576,14 @@ impl YaldaGpuiView {
             }
             NormalOutcome::Quit => cx.quit(),
             NormalOutcome::OpenMenu => self.open_menu_inner(cx),
+            NormalOutcome::Paste { before } => {
+                if let Some(e) = self.edit_mut() {
+                    if Self::apply_paste(&mut e.editor, before) {
+                        e.last_save_msg = Some("put".into());
+                    }
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -592,6 +608,9 @@ impl YaldaGpuiView {
             Some(name) => name,
             None => return NormalOutcome::Skipped,
         };
+        // Numeric count prefix typed ahead of this action (e.g. `42` in
+        // `42G`). Taken-and-cleared here; arms that don't use it ignore it.
+        let count = keybinds.take_count();
 
         match action_name.as_str() {
             // ---- Pure motions: collapse selection (or extend in extend mode) ----
@@ -636,12 +655,45 @@ impl YaldaGpuiView {
             // ---- Doc-level jumps ----
             "goto-top" => {
                 editor.pre_move(false);
-                editor.cursor_jump_top();
+                // `<count>gg` jumps to line `count` (1-indexed); bare `gg`
+                // goes to the top.
+                match count {
+                    Some(n) => editor.jump_to_line(n.saturating_sub(1)),
+                    None => editor.cursor_jump_top(),
+                }
             }
             "goto-bottom" => {
                 editor.pre_move(false);
-                editor.jump_cursor_bottom();
+                // `<count>G` jumps to line `count` (1-indexed); bare `G`
+                // goes to the last line.
+                match count {
+                    Some(n) => editor.jump_to_line(n.saturating_sub(1)),
+                    None => editor.jump_cursor_bottom(),
+                }
             }
+            // ---- Half / full page paging ----
+            // The Edit + Agent render paths both scroll-to-reveal the cursor
+            // line every frame, so paging is just a cursor move by N lines;
+            // no viewport-height plumbing is needed at this `self`-less site.
+            "half-page-down" => {
+                editor.pre_move(false);
+                Self::page_cursor(editor, HALF_PAGE_LINES as isize);
+            }
+            "half-page-up" => {
+                editor.pre_move(false);
+                Self::page_cursor(editor, -(HALF_PAGE_LINES as isize));
+            }
+            "full-page-down" => {
+                editor.pre_move(false);
+                Self::page_cursor(editor, FULL_PAGE_LINES as isize);
+            }
+            "full-page-up" => {
+                editor.pre_move(false);
+                Self::page_cursor(editor, -(FULL_PAGE_LINES as isize));
+            }
+            // ---- Put (paste) — deferred to the caller for clipboard access ----
+            "paste" => return NormalOutcome::Paste { before: false },
+            "paste-before" => return NormalOutcome::Paste { before: true },
             // ---- Mode switches ----
             "insert-mode" => {
                 if let Some(((sl, sc), _)) = editor.selection_range() {
@@ -729,5 +781,55 @@ impl YaldaGpuiView {
             _ => return NormalOutcome::Skipped,
         }
         NormalOutcome::Handled
+    }
+
+    /// Move the cursor by `delta` lines (negative = up), clamped to the
+    /// document bounds, resetting column to a clamped position on the new
+    /// line. Shared by the half/full-page paging actions.
+    fn page_cursor<E: EditOps>(editor: &mut E, delta: isize) {
+        let cur = editor.cursor().line as isize;
+        let last = editor.line_count().saturating_sub(1) as isize;
+        let target = (cur + delta).clamp(0, last.max(0)) as usize;
+        editor.jump_to_line(target);
+    }
+
+    /// Charwise put of `text` at (P, `before=true`) or just after (p,
+    /// `before=false`) the cursor. Charwise because yalda's yank stores raw
+    /// text in the system clipboard with no linewise-vs-charwise register
+    /// metadata. Leaves the cursor on the last inserted character (vim
+    /// convention). Returns false if there was nothing to insert.
+    fn put_text<E: EditOps>(editor: &mut E, text: &str, before: bool) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        // For `p`, start inserting after the cursor's char (unless the line
+        // is empty / cursor already past end). `begin_insert`/`end_insert`
+        // bracket the splice so it lands as one undo group, matching how
+        // insert-mode typing is grouped.
+        if !before {
+            let line = editor.cursor().line;
+            if editor.line_len_chars(line) > 0 {
+                editor.move_right_clamped(true);
+            }
+        }
+        editor.begin_insert();
+        for ch in text.chars() {
+            editor.insert_char(ch);
+        }
+        editor.end_insert();
+        // Step back onto the last inserted char (cursor sits one past it).
+        if editor.cursor().col > 0 {
+            editor.cursor_move_left();
+        }
+        true
+    }
+
+    /// Resolve a [`NormalOutcome::Paste`] by reading the system clipboard and
+    /// putting it into `editor`. Shared by the Edit and Agent dispatch sites.
+    pub(crate) fn apply_paste<E: EditOps>(editor: &mut E, before: bool) -> bool {
+        match Self::read_from_clipboard() {
+            Some(text) => Self::put_text(editor, &text, before),
+            None => false,
+        }
     }
 }

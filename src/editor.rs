@@ -1147,6 +1147,10 @@ impl EditorView {
         self.cursor.jump_bottom(&core.document);
     }
 
+    pub fn jump_to_line(&mut self, core: &EditorCore, line: usize) {
+        self.cursor.jump_to_line(&core.document, line);
+    }
+
     pub fn find_char_forward(&mut self, core: &EditorCore, ch: char) -> bool {
         self.cursor.find_char_forward(&core.document, ch)
     }
@@ -1611,6 +1615,10 @@ impl Editor {
         self.view.jump_cursor_bottom(&self.core);
     }
 
+    pub fn jump_to_line(&mut self, line: usize) {
+        self.view.jump_to_line(&self.core, line);
+    }
+
     pub fn find_char_forward(&mut self, ch: char) -> bool {
         self.view.find_char_forward(&self.core, ch)
     }
@@ -1856,6 +1864,17 @@ mod tests {
 
     fn new_editor(text: &str) -> Editor {
         Editor::new(text.to_string(), PathBuf::from("test.md"))
+    }
+
+    #[test]
+    fn jump_to_line_moves_cursor_and_clamps() {
+        let mut ed = new_editor("a\nb\nc\nd\ne\n");
+        ed.jump_to_line(2);
+        assert_eq!(ed.cursor().line, 2);
+        assert_eq!(ed.cursor().col, 0);
+        // Past-the-end clamps to the last line.
+        ed.jump_to_line(999);
+        assert_eq!(ed.cursor().line, ed.document().line_count() - 1);
     }
 
     #[test]

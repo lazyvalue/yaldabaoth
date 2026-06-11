@@ -3246,6 +3246,14 @@ impl YaldaGpuiView {
             match outcome {
                 NormalOutcome::OpenMenu => self.open_menu_inner(cx),
                 NormalOutcome::Quit => cx.quit(),
+                NormalOutcome::Paste { before } => {
+                    if let Some(c) = self.agent_mut()
+                        && let Some(cb) = c.input_surface.chatbox_mut()
+                    {
+                        Self::apply_paste(&mut cb.editor, before);
+                    }
+                    cx.notify();
+                }
                 _ => cx.notify(),
             }
             return;
@@ -3311,6 +3319,14 @@ impl YaldaGpuiView {
             }
             NormalOutcome::Quit => cx.quit(),
             NormalOutcome::OpenMenu => self.open_menu_inner(cx),
+            NormalOutcome::Paste { before } => {
+                if let Some(c) = self.agent_mut()
+                    && Self::apply_paste(&mut c.editor, before)
+                {
+                    c.status = Some("put".into());
+                }
+                cx.notify();
+            }
         }
     }
 }

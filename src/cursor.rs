@@ -272,6 +272,15 @@ impl CursorPos {
         self.col = 0;
         self.desired_col = None;
     }
+
+    /// Jump to a specific line (0-indexed), clamped to the document's last
+    /// line. Column resets to 0. Used by `<num>g`/`<num>G` and (via
+    /// repeated stepping at the dispatch layer) half-page paging.
+    pub fn jump_to_line(&mut self, doc: &Document, line: usize) {
+        self.line = line.min(doc.line_count().saturating_sub(1));
+        self.col = 0;
+        self.desired_col = None;
+    }
 }
 
 impl Default for CursorPos {
