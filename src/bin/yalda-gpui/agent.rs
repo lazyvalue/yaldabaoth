@@ -1455,6 +1455,13 @@ pub(crate) struct Chatbox {
     pub(crate) editor: Editor,
     pub(crate) mode: EditMode,
     pub(crate) scroll_handle: ScrollHandle,
+    /// Virtualised scroll state for the compose panel, used ONLY once the draft
+    /// exceeds the visible cap (`COMPOSE_MAX_VISIBLE_LINES`). Below that the
+    /// panel renders every line directly (cheap); above it, building the whole
+    /// draft every keystroke was O(draft) element assembly — the Message Box
+    /// typing lag. `gpui::list` then builds only the visible rows (INV-2,
+    /// matching the transcript + Edit view).
+    pub(crate) list_state: gpui::ListState,
 }
 
 impl Chatbox {
@@ -1463,6 +1470,7 @@ impl Chatbox {
             editor: Editor::new(String::new(), std::path::PathBuf::from("*chatbox*")),
             mode: EditMode::Insert,
             scroll_handle: ScrollHandle::new(),
+            list_state: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(64.0)),
         }
     }
 

@@ -1909,16 +1909,18 @@ impl YaldaGpuiView {
         // container inherits its width from the flex layout — no need to
         // know the pixel width at render time.
         let compose_panel = if let InputSurface::Chatbox(tb) = &mut c.input_surface {
-            let compose_lines: Vec<String> = {
-                let doc = tb.editor.document();
-                (0..doc.line_count().max(1))
-                    .map(|i| {
-                        doc.line_text(i)
-                            .trim_end_matches('\n')
-                            .replace('\t', "    ")
-                    })
-                    .collect()
-            };
+            // Logical lines shown before the box caps height + scrolls. At/below
+            // this the panel renders every line directly (grows to content,
+            // cheap — nothing to virtualise). ABOVE it, building the whole draft
+            // every keystroke is O(draft) element assembly (the Message Box
+            // typing lag), so the panel switches to a fixed-height `gpui::list`
+            // that builds only the visible rows — same 8-line scrolling box,
+            // O(visible) cost.
+            const COMPOSE_MAX_VISIBLE_LINES: usize = 8;
+            let line_h = 18.0f32;
+            let max_visible_h = COMPOSE_MAX_VISIBLE_LINES as f32 * line_h;
+
+            let line_count = tb.editor.document().line_count().max(1);
             let compose_cursor_line = tb.editor.cursor().line;
             let compose_cursor_col = tb.editor.cursor().col;
             let compose_mode = tb.mode;
@@ -1926,68 +1928,123 @@ impl YaldaGpuiView {
             let sep_color: Hsla = nc(at.compose_separator);
             let compose_cursor_color: Hsla = nc(at.cursor);
             let compose_code_font = self.code_font.clone();
-
             let separator = div().w_full().h(px(1.0)).bg(dim_fg);
 
-            // Cap height at ~8 logical lines, then vertical scroll kicks in.
-            // Wrapped lines may exceed one row visually, so the actual cap
-            // can show fewer logical lines when text wraps — that's fine,
-            // overflow_y_scroll handles it.
-            let max_visible_h = 8.0 * 18.0f32;
+            let compose_body: AnyElement = if line_count <= COMPOSE_MAX_VISIBLE_LINES {
+                // ── Small draft: render every line directly (unchanged). ──
+                let compose_lines: Vec<String> = {
+                    let doc = tb.editor.document();
+                    (0..line_count)
+                        .map(|i| {
+                            doc.line_text(i).trim_end_matches('\n').replace('\t', "    ")
+                        })
+                        .collect()
+                };
+                let compose_scroll = tb.scroll_handle.clone();
+                compose_scroll.scroll_to_item(compose_cursor_line);
+                let min_compose_h = line_h + 16.0;
+                let mut body = div()
+                    .id("compose-scroll")
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(min_compose_h))
+                    .max_h(px(max_visible_h))
+                    .overflow_y_scroll()
+                    .overflow_x_hidden()
+                    .track_scroll(&compose_scroll)
+                    .px_4()
+                    .py(px(8.0))
+                    .bg(compose_panel_bg)
+                    .border_1()
+                    .border_color(dim_fg)
+                    .rounded_md()
+                    .mx_2()
+                    .mb_1()
+                    .font_family(compose_code_font.clone())
+                    .text_size(px(13.0))
+                    .text_color(compose_fg);
+                for (i, line_text) in compose_lines.iter().enumerate() {
+                    let total_chars = line_text.chars().count();
+                    body = body.child(build_chatbox_line(
+                        line_text,
+                        i == compose_cursor_line,
+                        compose_cursor_col,
+                        compose_mode,
+                        compose_cursor_color,
+                        compose_sel,
+                        i,
+                        total_chars,
+                        &compose_code_font,
+                        compose_fg,
+                    ));
+                }
+                body.into_any_element()
+            } else {
+                // ── Long draft: virtualise. Fixed 8-line height; `gpui::list`
+                //    (default, visible-only sizing) builds ONLY the visible
+                //    rows, so per-keystroke cost is O(visible), not O(draft). ──
+                let lines_snap: std::rc::Rc<Vec<String>> = {
+                    let doc = tb.editor.document();
+                    std::rc::Rc::new(
+                        (0..line_count)
+                            .map(|i| {
+                                doc.line_text(i).trim_end_matches('\n').replace('\t', "    ")
+                            })
+                            .collect(),
+                    )
+                };
+                tb.list_state.reset(line_count);
+                tb.list_state.scroll_to_reveal_item(compose_cursor_line);
+                let font = compose_code_font.clone();
+                let cur_color = compose_cursor_color;
+                let fg = compose_fg;
+                let render_fn =
+                    move |idx: usize, _w: &mut Window, _a: &mut GpuiApp| -> AnyElement {
+                        let Some(line_text) = lines_snap.get(idx) else {
+                            return div().into_any_element();
+                        };
+                        let total_chars = line_text.chars().count();
+                        build_chatbox_line(
+                            line_text,
+                            idx == compose_cursor_line,
+                            compose_cursor_col,
+                            compose_mode,
+                            cur_color,
+                            compose_sel,
+                            idx,
+                            total_chars,
+                            &font,
+                            fg,
+                        )
+                    };
+                div()
+                    .id("compose-scroll")
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .min_w_0()
+                    .h(px(max_visible_h + 16.0))
+                    .px_4()
+                    .py(px(8.0))
+                    .bg(compose_panel_bg)
+                    .border_1()
+                    .border_color(dim_fg)
+                    .rounded_md()
+                    .mx_2()
+                    .mb_1()
+                    .font_family(compose_code_font.clone())
+                    .text_size(px(13.0))
+                    .text_color(compose_fg)
+                    .child(
+                        gpui::list(tb.list_state.clone(), render_fn)
+                            .flex_1()
+                            .w_full(),
+                    )
+                    .into_any_element()
+            };
 
-            let compose_scroll = tb.scroll_handle.clone();
-            // scroll_to_item only sees direct children of the scroll
-            // container, so each logical line is added straight to
-            // `compose_body` (no intermediate wrapper) — that's what keeps
-            // the cursor in view when the user types past the visible area.
-            compose_scroll.scroll_to_item(compose_cursor_line);
-
-            // Minimum height: 1 line (18px) + py padding (8+8) = 34px.
-            // Keeps the box visually stable whether empty or populated.
-            let min_compose_h = 1.0 * 18.0 + 16.0;
-
-            let mut compose_body = div()
-                .id("compose-scroll")
-                .w_full()
-                .min_w_0()
-                .min_h(px(min_compose_h))
-                .max_h(px(max_visible_h))
-                .overflow_y_scroll()
-                .overflow_x_hidden()
-                .track_scroll(&compose_scroll)
-                .px_4()
-                .py(px(8.0))
-                .bg(compose_panel_bg)
-                .border_1()
-                .border_color(dim_fg)
-                .rounded_md()
-                .mx_2()
-                .mb_1()
-                .font_family(compose_code_font.clone())
-                .text_size(px(13.0))
-                .text_color(compose_fg);
-
-            for (i, line_text) in compose_lines.iter().enumerate() {
-                let is_cursor_line = i == compose_cursor_line;
-                let total_chars = line_text.chars().count();
-                let line_el = build_chatbox_line(
-                    line_text,
-                    is_cursor_line,
-                    compose_cursor_col,
-                    compose_mode,
-                    compose_cursor_color,
-                    compose_sel,
-                    i,
-                    total_chars,
-                    &compose_code_font,
-                    compose_fg,
-                );
-                compose_body = compose_body.child(line_el);
-            }
-
-            // Top edge: a 1px darker rule creates a subtle
-            // visual separation between the scrolling transcript
-            // and the fixed compose panel.
+            // Top edge: a 1px darker rule creates a subtle visual separation
+            // between the scrolling transcript and the fixed compose panel.
             let edge_color = {
                 let mut h = sep_color;
                 h.a = 0.4;
