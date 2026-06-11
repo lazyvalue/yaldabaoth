@@ -40,6 +40,20 @@
 > - `AdminSessionInfo` keeps `subscriber_count` (now `0` or `1`),
 >   `event_log_len`, `log_base`, `channel_generation`, etc.; it dropped
 >   `has_owner` and `lease_holder`.
+>
+> **⚠ UPGRADE HAZARD (no wire-version handshake yet).** The single-subscriber
+> cleanup made `Request::Attach` drop its `mode` and `client_id` fields, and
+> those were NOT `#[serde(default)]`. There is no `initialize` protocol-version
+> negotiation today, so a **NEW GUI talking to an OLD still-running server** (the
+> realistic case: a `yalda-session-server` LaunchAgent kept alive across a GUI
+> rebuild) sends the new, field-stripped `attach` frame, which the old server
+> fails to deserialize and rejects as a "bad frame" — every attach silently
+> fails and the GUI shows empty/unattached sessions. **Mitigation today:** kill
+> the running `yalda-session-server` before launching a rebuilt GUI
+> (`dev-all.sh` already does this). **Proper fix:** the deferred `initialize`
+> protocol-version + capability handshake (§Interfaces, "Protocol versioning")
+> so client and server can evolve independently — out of scope for this cleanup,
+> tracked as a follow-up.
 - **Provenance:** Design review prompted by the reconnect-storm incident (root-
   caused + fixed, `81ae216`, branch `session-resilience` merged to `master`). The
   fix closed the immediate bug (client never `shutdown` its socket → server never

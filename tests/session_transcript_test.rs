@@ -1059,38 +1059,45 @@ fn slow_subscriber_is_disconnected_owner_unaffected() {
 
 /// 6b. HIGH-WATER BACKLOG BOUND (spec §6, MAJOR — disconnect-before-gap).
 ///
-///     The owner hard-ceiling (`floor = min(sent_seq)` over live forwarders,
+///     The forwarder hard-ceiling (`floor = the single forwarder's sent_seq`,
 ///     never compact past it) means a slow/PAUSED forwarder — concretely a
 ///     backgrounded GUI under macOS App Nap that stops draining its socket —
-///     pins `min(sent_seq)`, blocks the trim, and grows the in-memory `event_log`
+///     pins the floor, blocks the trim, and grows the in-memory `event_log`
 ///     `Vec`. The 60s slow-sub write timeout is the only other reaper, so a
 ///     reader that pauses can pin growth for up to 60s (or unbounded if it drains
 ///     just enough to keep resetting the write timer). Spec §6 requires a
 ///     subscriber past the high-water backlog threshold to be DISCONNECTED
-///     (forced clean from-0 reconnect) and thereby dropped from the `min`, so the
+///     (forced clean from-0 reconnect) and thereby dropped from the floor, so the
 ///     trim resumes — high-water disconnect fires BEFORE any gap-marker.
 ///
-///     Setup mirrors the slow-subscriber test but isolates the HIGH-WATER reaper
-///     from the WRITE-TIMEOUT reaper: the write timeout is set HUGE (60s) so it
-///     can NEVER fire within the test, leaving the high-water disconnect as the
-///     ONLY mechanism that can reap the wedged consumer. A tiny CAP (16) and a
-///     low HIGH_WATER (= cap×2 = 32) make a long turn (CHUNKS=600) blow past the
-///     bound quickly. A healthy draining owner drives the turn; a raw observer
-///     attaches and then NEVER reads, pinning the floor.
+///     STRICT 1:1 NOTE: there is exactly ONE forwarder per session. Earlier this
+///     test attached a "healthy owner" client AND a wedged observer to one
+///     session — but under 1:1 a second attach OVERWRITES `session.forwarder`, so
+///     two live forwarders on one session is non-representable. The honest setup
+///     is therefore a SINGLE wedged forwarder (the raw never-reading client) plus
+///     a LEASELESS `admin_prompt` (ADR-0015) to drive the turn server-side with
+///     no second forwarder. The driver takes no forwarder, so the wedged client
+///     is the sole floor-holder — exactly the App-Nap case the bound defends.
+///
+///     Setup isolates the HIGH-WATER reaper from the WRITE-TIMEOUT reaper: the
+///     write timeout is set HUGE (60s) so it can NEVER fire within the test,
+///     leaving the high-water disconnect as the ONLY mechanism that can reap the
+///     wedged consumer. A tiny CAP (16) and a low HIGH_WATER make a long turn
+///     (CHUNKS=600) blow past the bound quickly.
 ///
 ///     Assertions:
-///       (1) the wedged observer is DISCONNECTED — the server logs the
+///       (1) the wedged forwarder is DISCONNECTED — the server logs the
 ///           "high-water disconnect" warning AND the raw stream sees EOF;
 ///       (2) the in-memory log is BOUNDED — `event_log_len` settles far below the
 ///           full CHUNKS transcript (near the cap), and `log_base` advanced past
 ///           HIGH_WATER, proving the trim RESUMED after the disconnect.
 ///
-///     FAIL-BEFORE (without the high-water bound): the wedged observer is never
+///     FAIL-BEFORE (without the high-water bound): the wedged forwarder is never
 ///     disconnected (the 60s write timeout can't fire in-test), so the floor
-///     stays pinned at the wedged observer's `sent_seq ≈ 0`, the trim never
+///     stays pinned at the wedged forwarder's `sent_seq ≈ 0`, the trim never
 ///     advances `log_base`, and `event_log_len` grows to the full transcript.
 #[test]
-fn slow_owner_past_high_water_is_disconnected_log_bounded() {
+fn wedged_forwarder_past_high_water_is_disconnected_log_bounded() {
     use std::io::Read as _;
     use std::io::Write as _;
     use std::os::unix::net::UnixStream as StdUnixStream;
@@ -1098,22 +1105,18 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     let _g = serial_lock();
     const CHUNKS: usize = 600;
     const CAP: usize = 16;
-    // HIGH_WATER must be (a) comfortably ABOVE any transient lag a HEALTHY
-    // draining owner exhibits (so the owner is never falsely reaped), and (b)
-    // well BELOW the full transcript (~2×CHUNKS events, since each chunk is
-    // logged twice — legacy ReplyEvent + additive Agent) so a WEDGED consumer
-    // pinned near seq 0 crosses it long before the turn ends. 150 sits in that
-    // window for CHUNKS=600 (full ≈ 1200).
+    // HIGH_WATER must be well BELOW the full transcript (~2×CHUNKS events, since
+    // each chunk is logged twice — legacy ReplyEvent + additive Agent) so the
+    // WEDGED forwarder pinned near seq 0 crosses it long before the turn ends.
+    // 150 sits in that window for CHUNKS=600 (full ≈ 1200).
     const HIGH_WATER: usize = 150;
-    // A modest per-chunk text so the wedged observer's send buffer fills (pinning
+    // A modest per-chunk text so the wedged forwarder's send buffer fills (pinning
     // the floor).
     let chunk_text = "y".repeat(64);
     let server = TestServer::start_with_env(&[
         ("STUB_CHUNKS", &CHUNKS.to_string()),
         ("STUB_CHUNK_TEXT", &chunk_text),
-        // Pace the stream so the HEALTHY owner's reader keeps up and its forwarder
-        // never lags past HIGH_WATER (only the never-draining wedged observer
-        // does). Fast enough that the whole turn still finishes promptly.
+        // Pace the stream so the turn still finishes promptly.
         ("STUB_DELAY_MS", "3"),
         ("YALDA_EVENT_LOG_CAP", &CAP.to_string()),
         ("YALDA_EVENT_LOG_HIGH_WATER", &HIGH_WATER.to_string()),
@@ -1122,20 +1125,23 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     ]);
     server.activate_env();
 
-    // Healthy owner: a normal client that reads continuously and drives the turn.
-    let owner = connect_as("gui-highwater");
-    let info = owner
+    // Create the session via a normal client (which then drops — it never
+    // attaches, so it holds no forwarder).
+    let creator = connect_as("gui-highwater");
+    let info = creator
         .create_session(std::env::temp_dir(), "high-water".into(), None)
         .expect("create_session");
-    owner.attach(&info.session_id).expect("attach owner");
+    let sid = info.session_id.clone();
 
-    // Wedged observer: a RAW UnixStream that attaches as Observer over the wire,
-    // then NEVER reads. Its forwarder's writes pile up in the kernel send buffer
-    // and its `sent_seq` stays pinned near 0, holding the trim floor down.
+    // The SOLE forwarder: a RAW UnixStream that attaches over the wire, then
+    // NEVER reads. Its forwarder's writes pile up in the kernel send buffer and
+    // its `sent_seq` stays pinned near 0, holding the trim floor down — the App-
+    // Nap case. (Attaching it BEFORE the prompt makes it the live forwarder for
+    // the whole turn.)
     let mut wedged = StdUnixStream::connect(&server.socket).expect("raw connect");
     let attach_frame = format!(
-        "{{\"kind\":\"request\",\"id\":1,\"req\":{{\"method\":\"attach\",\"session_id\":{sid}}}}}\n",
-        sid = serde_json::to_string(&info.session_id).unwrap()
+        "{{\"kind\":\"request\",\"id\":1,\"req\":{{\"method\":\"attach\",\"session_id\":{sid_json}}}}}\n",
+        sid_json = serde_json::to_string(&sid).unwrap()
     );
     wedged
         .write_all(attach_frame.as_bytes())
@@ -1143,14 +1149,17 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     wedged.flush().expect("flush raw attach");
     // Deliberately do NOT read from `wedged` from here on (paused-reader sim).
 
-    // Drive a long turn. The stub streams 600 chunks; the wedged observer's send
-    // buffer fills and pins the floor; the backlog crosses HIGH_WATER → the
-    // server force-disconnects the wedged observer and the trim resumes.
-    owner
-        .prompt(&info.session_id, "flood past the high-water mark")
-        .expect("prompt");
+    // Drive a long turn via a LEASELESS admin_prompt (ADR-0015): it takes no
+    // forwarder, so the wedged raw client stays the SOLE floor-holder. The stub
+    // streams 600 chunks; the wedged forwarder's send buffer fills and pins the
+    // floor; the backlog crosses HIGH_WATER → the server force-disconnects the
+    // wedged forwarder and the trim resumes.
+    let driver = SessionServerClient::connect_existing().expect("connect_existing");
+    driver
+        .admin_prompt(&sid, "flood past the high-water mark")
+        .expect("admin_prompt");
 
-    // (1a) The server logs a high-water disconnect for the wedged observer —
+    // (1a) The server logs a high-water disconnect for the wedged forwarder —
     // and NOT a write-timeout disconnect (the 60s timeout can't fire in-test).
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut saw_high_water = false;
@@ -1165,16 +1174,16 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     let log = server.read_log();
     assert!(
         saw_high_water,
-        "expected a 'high-water disconnect' for the wedged observer (CAP={CAP}, \
+        "expected a 'high-water disconnect' for the wedged forwarder (CAP={CAP}, \
          HIGH_WATER={HIGH_WATER}, CHUNKS={CHUNKS}); the high-water bound never fired.\nlog:\n{log}"
     );
     assert!(
         !log.contains("write stalled"),
         "the high-water disconnect — NOT the 60s write timeout — must reap the wedged \
-         observer; the write-timeout path fired unexpectedly.\nlog:\n{log}"
+         forwarder; the write-timeout path fired unexpectedly.\nlog:\n{log}"
     );
 
-    // (1b) The wedged observer's connection is closed: a read returns EOF (0
+    // (1b) The wedged forwarder's connection is closed: a read returns EOF (0
     // bytes) or an error once the server drops the forwarder and closes the
     // write half. (Its OS buffer may hold queued frames we never read; we read
     // until EOF/error, bounded.)
@@ -1205,18 +1214,19 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     }
     assert!(
         saw_eof,
-        "the wedged observer's connection must be CLOSED by the high-water disconnect \
+        "the wedged forwarder's connection must be CLOSED by the high-water disconnect \
          (read should hit EOF), but it stayed open.\nlog:\n{}",
         server.read_log()
     );
 
     // (2) The in-memory log is BOUNDED. Probe via admin_status from a FRESH
-    // client (decoupled from the owner's liveness). Poll until the trim has
-    // RESUMED — `log_base` advanced past HIGH_WATER, which it could NOT have done
-    // had the wedged observer kept pinning the floor near seq 0. Throughout, the
-    // resident `Vec` must stay BOUNDED: far below the full transcript (~2×CHUNKS
-    // entries — each chunk is logged twice), settling near the high-water + cap
-    // window. A wedged consumer pinning unbounded growth is the bug under test.
+    // client (it only polls; it never attaches, so it holds no forwarder). Poll
+    // until the trim has RESUMED — `log_base` advanced past HIGH_WATER, which it
+    // could NOT have done had the wedged forwarder kept pinning the floor near
+    // seq 0. Throughout, the resident `Vec` must stay BOUNDED: far below the full
+    // transcript (~2×CHUNKS entries — each chunk is logged twice), settling near
+    // the high-water + cap window. A wedged consumer pinning unbounded growth is
+    // the bug under test.
     let admin = connect_as("admin-probe");
     let bound = HIGH_WATER + CAP + 8;
     let probe_deadline = Instant::now() + Duration::from_secs(60);
@@ -1224,11 +1234,7 @@ fn slow_owner_past_high_water_is_disconnected_log_bounded() {
     let mut last = None;
     while Instant::now() < probe_deadline {
         let snap = admin.admin_status().expect("admin_status");
-        if let Some(s) = snap
-            .sessions
-            .iter()
-            .find(|s| s.session_id == info.session_id)
-        {
+        if let Some(s) = snap.sessions.iter().find(|s| s.session_id == sid) {
             // The in-memory Vec must NEVER blow past the bound — assert on every
             // poll so a transient overshoot is caught, not just the final state.
             assert!(

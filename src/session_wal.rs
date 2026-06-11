@@ -237,16 +237,21 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
                 cwd,
                 permission_mode,
             } => {
-                // Phase-4 version gate: a header from a prior schema (v1) is
-                // discarded wholesale — the session resumes empty and re-loads
-                // from the live agent on the next attach (locked decision: no
-                // converter). The header is always the FIRST record, so this
-                // fires before any (potentially `owner_changed`) Event line is
-                // parsed, so a stale log never reaches serde Event parsing.
+                // Version gate: a header from any prior schema is discarded
+                // wholesale — the session resumes empty and re-loads from the
+                // live agent on the next attach (locked decision: no converter).
+                // This validates the v1/v2 → v3 discard: an older log can carry
+                // Event variants that the current `Notification` enum no longer
+                // deserializes, so loading it line-by-line would silently drop
+                // them; discarding at the header (always the FIRST record) avoids
+                // a half-parsed log. (The retired `owner_changed`/`lease_changed`
+                // control notes were broadcast-only and never appended to the
+                // event_log, so the gate is NOT what keeps them out — they simply
+                // were never WAL records.)
                 if version != WAL_VERSION {
                     eprintln!(
-                        "[session-wal] discarding pre-v{WAL_VERSION} WAL {} (version {version}, \
-                         AgentEvent collapse); session resumes empty",
+                        "[session-wal] discarding pre-v{WAL_VERSION} WAL {} (version {version}); \
+                         session resumes empty",
                         path.display()
                     );
                     return Ok(None);

@@ -1169,14 +1169,13 @@ impl YaldaGpuiView {
             sids.push(sid);
         }
 
-        // Re-attach off the paint thread, with the same Owner-reclaim retry the
-        // open path uses. The PREVIOUS connection's server-side teardown races
-        // this fresh one: the new socket can re-attach before the server has
-        // processed the old socket's close and released ownership, so a bare
-        // attach momentarily loses to a not-yet-cleared owner ("another GUI
-        // already owns this session"). `spawn_attach_sessions` retries past
-        // that window and reconciles per-slot status. (Doing blocking attach
-        // round-trips inline here, as before, also froze rendering.)
+        // Re-attach off the paint thread (strict 1:1: attach is unconditional —
+        // there is no owner to reclaim or contend with). The PREVIOUS
+        // connection's server-side teardown races this fresh one, but a bare
+        // attach simply succeeds: the server replays the full event_log on
+        // attach and tears down any stale forwarder when this one registers.
+        // `spawn_attach_sessions` reconciles per-slot status. (Doing blocking
+        // attach round-trips inline here, as before, also froze rendering.)
         let n = sids.len();
         if !sids.is_empty() {
             self.spawn_attach_sessions(sids, cx);

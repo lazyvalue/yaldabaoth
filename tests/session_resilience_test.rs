@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use yalda::acp_channel::PermissionMode;
 use yalda::session_client::SessionServerClient;
-use yalda::session_proto::{AdminSnapshot, socket_path};
+use yalda::session_proto::{AdminSnapshot, Notification, socket_path};
 
 /// A running server instance bound to a private socket, with its stderr
 /// captured to a file we can scan for connect/disconnect lines.
@@ -43,6 +43,22 @@ static SEQ: AtomicU32 = AtomicU32::new(0);
 
 impl TestServer {
     fn start() -> TestServer {
+        // Default agent is a no-op (`/usr/bin/true`): most tests here exercise
+        // the socket/attach/reconnect layer, where the agent never spawns a
+        // real transcript.
+        Self::spawn_with_agent("/usr/bin/true", &[])
+    }
+
+    /// Start a server whose spawned agents are the real `yalda-acp-stub`, with
+    /// the given `(VAR, value)` env knobs (e.g. `STUB_CHUNKS`) applied to the
+    /// server process and inherited by every agent it spawns. Used by the one
+    /// test that needs a real streamed transcript to assert reconnect REPLAY,
+    /// not just reconnect success.
+    fn start_with_stub_agent(knobs: &[(&str, &str)]) -> TestServer {
+        Self::spawn_with_agent(env!("CARGO_BIN_EXE_yalda-acp-stub"), knobs)
+    }
+
+    fn spawn_with_agent(agent: &str, knobs: &[(&str, &str)]) -> TestServer {
         // Unique socket + log per test instance. pid is stable per process;
         // SEQ disambiguates multiple servers within one test.
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
@@ -56,17 +72,18 @@ impl TestServer {
         let logfile = std::fs::File::create(&log).expect("create server log");
         let bin = env!("CARGO_BIN_EXE_yalda-session-server");
         let mut builder = Command::new(bin);
-        builder.env("YALDA_SESSION_SOCKET", &socket);
-        let child = builder
-            // Point the agent at a binary that exits immediately. Spawn-fail is
-            // fine: the session is created and persists regardless; we are
-            // testing the socket/attach/reconnect layer, not the agent.
-            .env("YALDA_ACP_AGENT", "/usr/bin/true")
+        builder
+            .env("YALDA_SESSION_SOCKET", &socket)
+            .env("YALDA_ACP_AGENT", agent)
             // Hermetic: force the no-config path so default-mode assertions
             // see the built-in default (Yolo), not whatever ~/.config/yalda/
             // config.kdl the dev box happens to have. config_path() returns
             // this nonexistent path → Config::default().
-            .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl")
+            .env("YALDA_CONFIG", "/nonexistent/yalda-test-config.kdl");
+        for (k, v) in knobs {
+            builder.env(k, v);
+        }
+        let child = builder
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(logfile))
@@ -158,6 +175,76 @@ fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
 
 fn drain_log_lines(log: &str) -> Vec<String> {
     log.lines().map(|l| l.to_string()).collect()
+}
+
+/// Drain server notifications into a `Vec` until `done(accumulated)` holds or
+/// the deadline passes. Returns everything drained. Mirrors the transcript
+/// harness so reconnect-replay can be content-asserted here too.
+fn drain_until<F>(client: &SessionServerClient, timeout: Duration, mut done: F) -> Vec<Notification>
+where
+    F: FnMut(&[Notification]) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    let mut out: Vec<Notification> = Vec::new();
+    loop {
+        while let Some(n) = client.try_recv() {
+            out.push(n);
+        }
+        if done(&out) || Instant::now() > deadline {
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Like [`drain_until`] but over a raw notification receiver handed back by
+/// `SessionServerClient::reconnect()` (which TAKES the client's internal
+/// receiver and returns it to the caller — the GUI's pump re-installs it; a test
+/// must read from this returned handle, since `client.try_recv()` no longer has
+/// a receiver after reconnect).
+fn drain_rx_until<F>(
+    rx: &std::sync::mpsc::Receiver<Notification>,
+    timeout: Duration,
+    mut done: F,
+) -> Vec<Notification>
+where
+    F: FnMut(&[Notification]) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    let mut out: Vec<Notification> = Vec::new();
+    loop {
+        while let Ok(n) = rx.try_recv() {
+            out.push(n);
+        }
+        if done(&out) || Instant::now() > deadline {
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Count `ReplyEvent(Chunk)` notifications carrying agent text in a drained
+/// batch — the per-turn transcript payload the stub produces.
+fn count_agent_chunks(notes: &[Notification]) -> usize {
+    notes
+        .iter()
+        .filter(|n| {
+            matches!(
+                n,
+                Notification::ReplyEvent {
+                    event: yalda::acp_channel::ReplyEvent::Chunk(_),
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+/// Whether a drained batch contains a `TurnEnded` for `sid`.
+fn saw_turn_ended(notes: &[Notification], sid: &str) -> bool {
+    notes
+        .iter()
+        .any(|n| matches!(n, Notification::TurnEnded { session_id, .. } if session_id == sid))
 }
 
 /// Baseline: a session created on the server survives the client going away
@@ -503,39 +590,82 @@ fn admin_status_reports_live_sessions() {
 
 /// The in-place `reconnect()` path the GUI pump uses (not a brand-new client).
 /// This is the exact code that runs when the server reader thread sees EOF and
-/// the pump rebuilds the connection. It must succeed against a live server and
-/// leave the session attachable.
+/// the pump rebuilds the connection — the LIVE GUI's actual reconnect mechanism.
+///
+/// It must not only succeed: after the reconnect + re-attach it must REPLAY the
+/// full durable transcript without gap or duplication (the property a GUI
+/// depends on to rebuild its panel after a flap). So we drive a real streamed
+/// turn first, then reconnect-in-place and assert the entire event_log replays
+/// — mirroring what `large_replay_reconnect` / `prompt_turn_round_trip` assert
+/// for the drop-and-fresh-connect path.
 #[test]
 fn in_place_reconnect_reattaches() {
     let _g = serial_lock();
-    let server = TestServer::start();
+    const CHUNKS: usize = 6;
+    let server = TestServer::start_with_stub_agent(&[("STUB_CHUNKS", "6")]);
     server.activate_env();
 
     let mut client = connect_as("gui-reconn");
     let info = client
         .create_session(std::env::temp_dir(), "reconn".into(), None)
         .expect("create_session");
-    client.attach(&info.session_id).expect("attach");
+    let sid = info.session_id.clone();
+    client.attach(&sid).expect("attach");
 
-    // Drive the in-place reconnect the pump uses. Against a live server this
-    // must rebuild cleanly and hand back fresh receivers.
-    let result = client.reconnect();
-    assert!(
-        result.is_ok(),
-        "in-place reconnect failed: {:?}; log:\n{}",
-        result.err(),
+    // Drive a real turn: the stub streams CHUNKS chunks then ends the turn.
+    client.prompt(&sid, "hello").expect("prompt");
+    let live = drain_until(&client, Duration::from_secs(15), |n| {
+        saw_turn_ended(n, &sid)
+    });
+    let live_chunks = count_agent_chunks(&live);
+    assert_eq!(
+        live_chunks,
+        CHUNKS,
+        "live turn must stream all {CHUNKS} chunks before reconnect, got {live_chunks}; log:\n{}",
         server.read_log()
     );
+
+    // Drive the in-place reconnect the pump uses. Against a live server this
+    // must rebuild cleanly and HAND BACK the fresh notification receiver — the
+    // GUI's pump re-takes it; here the test drains it directly (the client's
+    // internal `try_recv` receiver is the one handed out by `reconnect`, so we
+    // must read from the returned `note_rx`, exactly like the pump does).
+    let (note_rx, _wake_rx) = client.reconnect().unwrap_or_else(|e| {
+        panic!(
+            "in-place reconnect failed: {e}; log:\n{}",
+            server.read_log()
+        )
+    });
     assert!(
         client.is_connected(),
         "client not connected after reconnect"
     );
 
-    // Re-attach on the rebuilt connection. The old connection's teardown races
-    // this, but a fresh attach simply succeeds.
+    // Re-attach on the rebuilt connection. The server replays the full event_log
+    // from index 0, so the rebuilt pump rebuilds the whole transcript.
     client
-        .attach(&info.session_id)
+        .attach(&sid)
         .expect("re-attach after in-place reconnect");
+
+    // The replay must reproduce the ENTIRE transcript: exactly CHUNKS chunks
+    // (no gap, no duplication) plus the turn boundary. Drain the receiver the
+    // reconnect handed back.
+    let replay = drain_rx_until(&note_rx, Duration::from_secs(15), |n| {
+        saw_turn_ended(n, &sid)
+    });
+    let replay_chunks = count_agent_chunks(&replay);
+    assert_eq!(
+        replay_chunks,
+        CHUNKS,
+        "in-place reconnect replay must reproduce the full transcript ({CHUNKS} chunks, \
+         no gap/dup), got {replay_chunks}; replay={replay:#?}\nlog:\n{}",
+        server.read_log()
+    );
+    assert!(
+        saw_turn_ended(&replay, &sid),
+        "replay must include the turn boundary; log:\n{}",
+        server.read_log()
+    );
 
     // Surface the log for eyeballing even on success when run with --nocapture.
     let lines = drain_log_lines(&server.read_log());
