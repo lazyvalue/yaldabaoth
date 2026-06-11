@@ -135,6 +135,19 @@ impl<P> SessionStore<P> {
         Ok(())
     }
 
+    /// Release the sid a session currently holds (if any), keeping the session
+    /// itself alive in the store under its `SessionId`. After this, the sid is
+    /// no longer routable (`locate` returns `None`), so an in-flight
+    /// `SessionClosed(sid)` broadcast can't locate — and destroy — a session
+    /// that is being respawned (the close-before-create race). Returns the
+    /// released sid for teardown bookkeeping.
+    pub(crate) fn clear_sid(&mut self, id: SessionId) -> Option<String> {
+        let entry = self.entries.get_mut(&id)?;
+        let old = entry.sid.take()?;
+        self.by_sid.remove(&old);
+        Some(old)
+    }
+
     /// O(1) routing: the session bound to `sid`, if any (INV-4).
     pub(crate) fn locate(&self, sid: &str) -> Option<SessionId> {
         self.by_sid.get(sid).copied()
@@ -261,5 +274,34 @@ mod tests {
         s.bind_sid(id, "X".into()).unwrap();
         assert_eq!(s.sid_of(id), Some("X"));
         assert_eq!(s.get_by_sid_mut("X"), Some(&mut 7));
+    }
+
+    #[test]
+    fn bind_sid_replaces_a_sessions_prior_sid() {
+        // Re-binding the SAME session to a new sid releases the old one so
+        // `by_sid` stays total (the sid-replacement branch of `bind_sid`).
+        let mut s = Store::new();
+        let id = s.create_local(|_| 1);
+        s.bind_sid(id, "A".into()).unwrap();
+        s.bind_sid(id, "B".into()).unwrap();
+        assert_eq!(s.locate("A"), None, "old sid released");
+        assert_eq!(s.locate("B"), Some(id), "new sid routes");
+        assert_eq!(s.sid_of(id), Some("B"));
+    }
+
+    #[test]
+    fn clear_sid_keeps_the_session_but_frees_routing() {
+        // `clear_sid` drops only the sid binding; the session payload and id
+        // survive so a respawn can re-bind without losing transcript state.
+        let mut s = Store::new();
+        let id = s.open_or_focus("S", |_| 9).id();
+        assert_eq!(s.clear_sid(id), Some("S".to_string()));
+        assert_eq!(s.locate("S"), None, "sid no longer routable");
+        assert_eq!(s.sid_of(id), None, "session carries no sid");
+        assert!(s.contains(id), "session itself survives");
+        assert_eq!(s.get(id), Some(&9), "payload preserved");
+        // Re-bind works afterward.
+        s.bind_sid(id, "S2".into()).unwrap();
+        assert_eq!(s.locate("S2"), Some(id));
     }
 }

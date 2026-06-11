@@ -1117,6 +1117,12 @@ impl<C> Workspace<C> {
     /// Close the tab at index `idx`. The active-tab pointer adjusts to stay
     /// in range; closing the last tab leaves the workspace with zero tabs
     /// (caller is responsible for the spec Behavior 2 placeholder).
+    ///
+    /// Agent tiles in the closed tab hold only a `SessionId` key — the session
+    /// STATE lives in `YaldaGpuiView::sessions`. So closing a tab/window FREES
+    /// (does not KILL) any agent session it showed: the session stays in the
+    /// store, still running, re-bindable from another tile's selector. An
+    /// explicit close (`claude-close`) is the only path that kills a session.
     pub fn close_tab(&mut self, idx: usize) {
         if idx >= self.tabs.len() {
             return;

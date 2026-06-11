@@ -9,7 +9,28 @@ use super::*;
 /// next to `debug.log` so all yalda-managed transient state stays in one
 /// place.
 pub(crate) fn acp_session_persist_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(p) = ACP_PERSIST_PATH_OVERRIDE.with(|c| c.borrow().clone()) {
+        return Some(p);
+    }
     yalda::paths::yalda_home().map(|d| d.join("acp_sessions.json"))
+}
+
+/// Test-only seam: redirect the ACP-session persistence file to a tempdir so a
+/// save→restore round-trip test never touches the user's real
+/// `~/.yalda/acp_sessions.json`. Thread-local, so parallel tests don't collide.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ACP_PERSIST_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_acp_persist_path<R>(path: PathBuf, f: impl FnOnce() -> R) -> R {
+    ACP_PERSIST_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+    let r = f();
+    ACP_PERSIST_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    r
 }
 
 /// Path to the one-line UUID file holding this GUI install's STABLE client id
@@ -135,7 +156,31 @@ pub(crate) fn is_candidate_launch() -> bool {
 /// `YALDA_SESSION_SERVER=0` to force the legacy in-process direct-spawn path.
 /// Returns `None` when disabled, or when the connection/launch fails (falls
 /// back to direct spawning so the GUI still starts).
+/// Test-only hermetic seam: when set on the current thread, `connect_session_
+/// server` returns `None` so a headless view never reaches out to whatever
+/// `yalda-session-server` happens to be running on the dev box. Set/cleared via
+/// [`with_no_session_server`] around a view construction.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_NO_SESSION_SERVER: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the session server forced OFF on this thread (test-only). The
+/// flag is restored afterward so the seam is scoped to the construction.
+#[cfg(test)]
+pub(crate) fn with_no_session_server<R>(f: impl FnOnce() -> R) -> R {
+    FORCE_NO_SESSION_SERVER.with(|c| c.set(true));
+    let r = f();
+    FORCE_NO_SESSION_SERVER.with(|c| c.set(false));
+    r
+}
+
 pub(crate) fn connect_session_server() -> Option<SessionServerClient> {
+    #[cfg(test)]
+    if FORCE_NO_SESSION_SERVER.with(|c| c.get()) {
+        return None;
+    }
     if std::env::var("YALDA_SESSION_SERVER").as_deref() == Ok("0") {
         eprintln!("[yalda-gpui] session server disabled (YALDA_SESSION_SERVER=0); direct spawn");
         return None;

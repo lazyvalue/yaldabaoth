@@ -766,15 +766,23 @@ impl YaldaGpuiView {
         };
         let active_slot_label = session.label.clone();
         let active_slot_cwd = session.cwd.clone();
-        // The render body reads `self.theme`/fonts and calls `self`-methods
-        // while mutating the bound session's state. The store entry is disjoint
-        // from those fields and is not structurally mutated during render, so a
-        // raw pointer threads `&mut AgentState` through alongside `&self` — the
-        // same disjoint-borrow pattern the chrome render path uses for the
+        // The render body reads `self.theme`/fonts/`self`-methods AND mutates
+        // the bound session's `AgentState`. Both live behind `&mut self`, but the
+        // session payload (in `self.sessions`) is field-disjoint from everything
+        // else the body reads, so a raw pointer threads `&mut AgentState` through
+        // — the same disjoint-borrow idiom the chrome render path uses for the
         // layout tree.
+        //
+        // SAFETY (provably sound): (1) `state_ptr` aliases ONLY the
+        // `self.sessions` entry for `id`; the render body never re-borrows
+        // `self.sessions` (it touches `self.theme`/fonts/render helpers, all
+        // distinct fields), so no `&`/`&mut` to the same payload is ever live
+        // alongside `c`. (2) The store is not structurally mutated during render
+        // (no insert/close/rebind), so the entry — and thus the pointer — stays
+        // valid for the whole call. (3) `c` never escapes this function. The
+        // borrow checker can't see field-disjointness through `get_mut`, hence
+        // the raw pointer.
         let state_ptr: *mut AgentState = &mut session.state as *mut _;
-        // SAFETY: `state_ptr` stays valid for this render call — `self.sessions`
-        // is not structurally mutated here, and the entry for `id` outlives it.
         let c: &mut AgentState = unsafe { &mut *state_ptr };
 
         let cursor = c.editor.cursor();

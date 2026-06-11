@@ -387,6 +387,29 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
 // the REAL pump path through a headless view so a regression in the wiring —
 // not just the pure logic — is caught here.
 
+/// Hermetic headless browser view: the session server is forced OFF via the
+/// test seam (`with_no_session_server`), so the harness never reaches out to
+/// whatever `yalda-session-server` is running on the dev box. With no server,
+/// `spawn_attach_sessions` / `spawn_list_sessions_for_picker` early-return, so
+/// binds are deterministic and survive `run_until_parked`. Returns the
+/// build-root closure to hand to `add_window_view` (whose `&mut
+/// VisualTestContext` return tie-up keeps it from being wrapped in a helper).
+#[cfg(test)]
+fn hermetic_browser_view(
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<YaldaGpuiView>,
+) -> YaldaGpuiView {
+    let focus_handle = cx.focus_handle();
+    focus_handle.focus(window);
+    crate::with_no_session_server(|| {
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    })
+}
+
 /// Install an agent tile on `view` bound to one server-managed session,
 /// optionally carrying `server_sid`. The focused tile shows the new session.
 #[cfg(test)]
@@ -2144,33 +2167,27 @@ fn session_picker_navigation_wraps(cx: &mut TestAppContext) {
     );
 }
 
-/// Activating a listed row binds the ring's first slot (with the chosen
-/// server session id) and clears the picker; activating row 0 binds a fresh
-/// placeholder slot. Both make `render_agent` take over from the picker.
+/// Activating a listed row binds the tile to the chosen session and clears the
+/// picker; the bound session SURVIVES the attach round-trip (hermetic — no
+/// server, so the attach early-returns rather than dropping the session).
 #[gpui::test]
 fn session_picker_activation_binds_slot(cx: &mut TestAppContext) {
-    let (view, vcx) = cx.add_window_view(|window, cx| {
-        let focus_handle = cx.focus_handle();
-        focus_handle.focus(window);
-        YaldaGpuiView::new_browser(
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            Theme::default(),
-            focus_handle,
-        )
-    });
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
     vcx.run_until_parked();
     install_agent_picker(&view, &mut *vcx, &[("S1", "claude-1"), ("S2", "claude-2")]);
     vcx.run_until_parked();
 
-    // Activate row 2 (the second listed session, sid "S2"). The bind is
-    // synchronous (show_local_session + apply_open_agent_resolution); the
-    // subsequent attach is async and, with no real "S2" on the test server,
-    // would later drop the session — so we assert the bind BEFORE parking the
-    // executor (this test verifies activation binds, not attach survival).
+    // Activate row 2 (the second listed session, sid "S2").
     view.update(vcx, |v, cx| v.agent_picker_activate(2, cx));
+    // Park the executor: with the server off, the attach round-trip is a no-op,
+    // so the bind must SURVIVE (regression guard for the orphaned-tile bug).
+    vcx.run_until_parked();
     view.read_with(vcx, |v, _cx| {
         let tile = v.agent_tile().expect("agent tile");
-        assert!(tile.bound.is_some(), "a session is bound after activation");
+        assert!(
+            tile.bound.is_some(),
+            "a session is bound after activation and survives the attach"
+        );
         assert!(tile.picker.is_none(), "picker cleared once a session binds");
         assert_eq!(v.sessions.len(), 1, "exactly one session in the store");
         let id = tile.bound.unwrap();
@@ -2180,4 +2197,199 @@ fn session_picker_activation_binds_slot(cx: &mut TestAppContext) {
             "the bound session carries the chosen session id"
         );
     });
+}
+
+// ---- Ownership invariants (hermetic — server forced off) -----------------
+
+/// INV-2 (no mirror): two tiles bound to two DISTINCT sids; a server batch for
+/// sid X mutates EXACTLY one tile's transcript. The deleted fan-out used to
+/// mirror X into every tile holding it; with strict 1:1 + store routing that
+/// is structurally impossible.
+#[gpui::test]
+fn two_sessions_route_to_exactly_one_tile(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState, AgentTile, App};
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    // Two agent tiles (a split), each bound to its own sid.
+    let (id_a, id_b) = view.update(vcx, |v, _cx| {
+        v.set_screen(App::Agent(AgentTile::new()));
+        let mk = |label: &str| AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: label.into(),
+            cwd: PathBuf::from("."),
+            resume_id: None,
+        };
+        // First tile → sid A.
+        let id_a = v.show_local_session(mk("claude-A"));
+        v.sessions.bind_sid(id_a, "A".into()).unwrap();
+        // Split off a second agent tile, focus it, bind → sid B.
+        v.workspace
+            .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
+        let id_b = v.show_local_session(mk("claude-B"));
+        v.sessions.bind_sid(id_b, "B".into()).unwrap();
+        (id_a, id_b)
+    });
+    assert_ne!(id_a, id_b);
+
+    // A server batch for sid A only.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::ReplyEvent {
+                session_id: "A".into(),
+                event: ReplyEvent::Chunk("only-in-A".into()),
+            }],
+            cx,
+        );
+    });
+
+    view.read_with(vcx, |v, _cx| {
+        let text_a = v
+            .sessions
+            .get(id_a)
+            .unwrap()
+            .state
+            .editor
+            .document()
+            .full_text();
+        let text_b = v
+            .sessions
+            .get(id_b)
+            .unwrap()
+            .state
+            .editor
+            .document()
+            .full_text();
+        assert!(
+            text_a.contains("only-in-A"),
+            "sid A's tile received the chunk"
+        );
+        assert!(
+            !text_b.contains("only-in-A"),
+            "sid B's tile must NOT mirror sid A's output (INV-2 no fan-out)"
+        );
+    });
+}
+
+/// The AlreadyBound dedup path (#1): a duplicate resolution for an already-owned
+/// sid CLOSES the orphan placeholder and FOCUSES the existing owner, rather than
+/// leaving an orphan stuck on "attaching…".
+#[gpui::test]
+fn duplicate_resolution_closes_orphan_and_focuses_owner(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState, AgentTile, App, OpenResolution};
+
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    // Owner: a tile already bound to sid "S".
+    let owner_id = view.update(vcx, |v, _cx| {
+        v.set_screen(App::Agent(AgentTile::new()));
+        let id = v.show_local_session(AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: "owner".into(),
+            cwd: PathBuf::from("."),
+            resume_id: None,
+        });
+        v.sessions.bind_sid(id, "S".into()).unwrap();
+        id
+    });
+
+    // A second tile mints a placeholder mid-open, then a duplicate Created("S")
+    // resolution lands on it — `apply_open_agent_resolution` must close the
+    // orphan and point this tile at the owner.
+    view.update(vcx, |v, cx| {
+        v.workspace
+            .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
+        let token = crate::alloc_open_token();
+        let orphan = v.show_local_session(AgentSession {
+            state: AgentState::new_server_managed(Some("attaching…".into())),
+            label: "orphan".into(),
+            cwd: PathBuf::from("."),
+            resume_id: None,
+        });
+        if let Some(tile) = v.agent_tile_mut() {
+            tile.pending_open_token = Some(token);
+        }
+        let before = v.sessions.len();
+        assert_eq!(before, 2, "owner + orphan placeholder");
+        v.apply_open_agent_resolution(
+            token,
+            OpenResolution::Created {
+                sid: "S".into(),
+                acp_id: None,
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            },
+            cx,
+        );
+        let _ = orphan;
+    });
+
+    view.read_with(vcx, |v, _cx| {
+        assert_eq!(
+            v.sessions.len(),
+            1,
+            "orphan placeholder dropped — only the owner remains"
+        );
+        let tile = v.agent_tile().expect("focused agent tile");
+        assert_eq!(
+            tile.bound,
+            Some(owner_id),
+            "the focused tile now shows the existing owner (focus-on-conflict)"
+        );
+        assert!(tile.picker.is_none());
+    });
+}
+
+/// Multi-session save→restore: persisting N bound sessions and loading them back
+/// yields N slots, each carrying its OWN sid/label — the mapping
+/// `restore_agent_leaves` zips one slot per leaf. Hermetic: the persistence file
+/// is redirected to a tempdir (no touch to `~/.yalda`).
+#[test]
+fn multi_session_persistence_round_trips_distinct_sids() {
+    use crate::{
+        InputModeKind, SessionSnapshot, load_persisted_acp_sessions, save_persisted_acp_sessions,
+        with_acp_persist_path,
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("acp_sessions.json");
+    let cwd = PathBuf::from("/tmp/proj");
+
+    let snaps = vec![
+        SessionSnapshot {
+            id: "SID-A".into(),
+            label: "claude-A".into(),
+            active: true,
+            mode: InputModeKind::Chatbox,
+            tasklist_open: false,
+            subagents_open: false,
+            cwd: cwd.clone(),
+        },
+        SessionSnapshot {
+            id: "SID-B".into(),
+            label: "claude-B".into(),
+            active: false,
+            mode: InputModeKind::Worksheet,
+            tasklist_open: true,
+            subagents_open: false,
+            cwd: cwd.clone(),
+        },
+    ];
+
+    let loaded = with_acp_persist_path(file.clone(), || {
+        save_persisted_acp_sessions(&cwd, &snaps);
+        load_persisted_acp_sessions(&cwd)
+    });
+
+    assert_eq!(loaded.len(), 2, "both sessions round-trip");
+    // Each slot kept its OWN sid + label (no cross-binding).
+    assert_eq!(loaded[0].id, "SID-A");
+    assert_eq!(loaded[0].label, "claude-A");
+    assert!(loaded[0].active, "first session is the active one");
+    assert_eq!(loaded[1].id, "SID-B");
+    assert_eq!(loaded[1].label, "claude-B");
+    assert_eq!(loaded[1].mode, InputModeKind::Worksheet);
+    assert!(loaded[1].tasklist_open);
 }

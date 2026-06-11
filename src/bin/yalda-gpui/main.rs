@@ -117,7 +117,6 @@ pub(crate) use yalda::render;
 pub(crate) use yalda::session_client::SessionServerClient;
 pub(crate) use yalda::session_proto::AttachMode;
 pub(crate) use yalda::session_proto::Notification as ServerNotification;
-pub(crate) use yalda::session_proto::SessionInfo;
 pub(crate) use yalda::style::{Color as NColor, Modifier, Style as NStyle};
 pub(crate) use yalda::theme::{OverlayTheme, Theme, ThemeName};
 pub(crate) use yalda::worktree;
@@ -1809,50 +1808,69 @@ impl YaldaGpuiView {
     /// layout — by that point `self.workspace` is populated and we have `cx`.
     fn restore_agent_leaves(&mut self, leaf_ids: &[workspace::WindowId], cx: &mut Context<Self>) {
         let proc_cwd = process_cwd();
+        let persisted = load_persisted_acp_sessions(&proc_cwd);
 
-        for &leaf_id in leaf_ids {
-            // Install a fresh (unbound) Agent tile at the leaf first, so the
-            // bind-choke methods (`show_local_session`) target it.
-            self.install_agent_tile(leaf_id, AgentTile::new());
-            self.focus_window_for_restore(leaf_id);
+        if self.session_server.is_some() {
+            self.start_server_pump(cx);
+            // Strict 1:1: zip persisted slots to leaves, ONE session per tile.
+            // Each leaf binds its OWN sid up front (no per-leaf re-list, which
+            // would hand every tile the same Attached([S1,S2,…]) and race them
+            // onto the first sid). Attach the bound sids once, together.
+            let mut attach_sids: Vec<String> = Vec::new();
+            for (i, &leaf_id) in leaf_ids.iter().enumerate() {
+                self.install_agent_tile(leaf_id, AgentTile::new());
+                self.focus_window_for_restore(leaf_id);
 
-            if self.session_server.is_some() {
-                // Session-server path: a local placeholder bound to this tile,
-                // then async list+attach. The persisted label is shown so the
-                // user sees the right name before the server responds. Strict
-                // 1:1: restore only ONE session per tile (the active one).
-                let persisted = load_persisted_acp_sessions(&proc_cwd);
-                let placeholder_label = persisted
-                    .iter()
-                    .find(|s| s.active)
-                    .or(persisted.first())
-                    .map(|s| s.label.clone())
-                    .unwrap_or_else(|| "claude-1".into());
-                let placeholder = AgentSession {
-                    state: AgentState::new_server_managed(Some(
-                        "connecting to session server…".into(),
-                    )),
-                    label: placeholder_label,
-                    cwd: proc_cwd.clone(),
-                    resume_id: None,
-                };
-                let open_token = alloc_open_token();
-                self.show_local_session(placeholder);
-                self.start_server_pump(cx);
-                if let Some(tile) = self.agent_tile_mut() {
-                    tile.pending_open_token = Some(open_token);
+                match persisted.get(i).cloned() {
+                    Some(slot) => {
+                        // Bind this leaf to its OWN persisted sid via the store's
+                        // idempotent choke. AlreadyOpen ⇒ focus (a duplicate sid
+                        // across leaves can't double-bind, INV-2).
+                        let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
+                        let label = slot.label.clone();
+                        let bind = self.sessions.open_or_focus(&slot.id, |_id| AgentSession {
+                            state: AgentState::new_server_managed(Some("reconnecting…".into())),
+                            label,
+                            cwd: slot_cwd,
+                            resume_id: Some(slot.id.clone()),
+                        });
+                        let sid_id = bind.id();
+                        if let Some(session) = self.sessions.get_mut(sid_id) {
+                            if slot.mode == InputModeKind::Worksheet {
+                                session.state.input_surface = InputSurface::Worksheet;
+                            }
+                            session.state.tasklist_open = slot.tasklist_open;
+                            session.state.subagents_open = slot.subagents_open;
+                        }
+                        if let Some(tile) = self.agent_tile_mut() {
+                            tile.bound = Some(sid_id);
+                            tile.picker = None;
+                        }
+                        if matches!(bind, agent_sessions::Bind::Created(_)) {
+                            attach_sids.push(slot.id.clone());
+                        }
+                    }
+                    None => {
+                        // More agent leaves than persisted sessions: open this
+                        // one straight into the free-session selector.
+                        if let Some(tile) = self.agent_tile_mut() {
+                            tile.bound = None;
+                            tile.picker = Some(SessionPicker::loading(proc_cwd.clone()));
+                        }
+                        self.spawn_list_sessions_for_picker(proc_cwd.clone(), cx);
+                    }
                 }
-                self.spawn_open_agent_server(open_token, proc_cwd.clone(), cx);
-            } else {
-                // Legacy direct-spawn path. One tile shows one session: restore
-                // the active persisted session (or a fresh claude-1).
-                let persisted = load_persisted_acp_sessions(&proc_cwd);
-                let chosen = persisted
-                    .iter()
-                    .find(|s| s.active)
-                    .or(persisted.first())
-                    .cloned();
-                let id = match chosen {
+            }
+            if !attach_sids.is_empty() {
+                self.spawn_attach_sessions(attach_sids, cx);
+            }
+        } else {
+            // Legacy direct-spawn path. One tile shows one session; zip slots to
+            // leaves, fresh claude-1 for leaves past the persisted list.
+            for (i, &leaf_id) in leaf_ids.iter().enumerate() {
+                self.install_agent_tile(leaf_id, AgentTile::new());
+                self.focus_window_for_restore(leaf_id);
+                let id = match persisted.get(i).cloned() {
                     None => {
                         let state = self.create_agent_session(None, proc_cwd.clone(), cx);
                         self.show_local_session(AgentSession {
@@ -4664,15 +4682,15 @@ impl YaldaGpuiView {
             Key::Enter | Key::Char('l') => {
                 self.close_session_switcher();
                 if selected == 0 {
-                    // "new session" row: free this tile and start fresh.
-                    if let Some(tile) = self.agent_tile_mut() {
-                        tile.bound = None;
-                    }
+                    // "new session" row: rebind this tile to a fresh session
+                    // (release_focused_session_for_rebind runs inside).
                     self.new_agent_session(None, cx);
                 } else {
-                    // Rebind to the chosen free session.
+                    // Rebind to the chosen free session. Release the current one
+                    // first (closes a mid-open placeholder; frees a live one).
                     let free = self.free_session_ids();
                     if let Some(&id) = free.get(selected - 1) {
+                        self.release_focused_session_for_rebind();
                         if let Some(tile) = self.agent_tile_mut() {
                             tile.bound = Some(id);
                             tile.picker = None;

@@ -7,6 +7,15 @@
 
 use super::*;
 
+/// Outcome of `bind_session_sid` (the live-view bind choke). `Bound` ⇒ the
+/// placeholder now carries the sid and the caller should attach; `Focused` ⇒ the
+/// sid was already owned, the orphan placeholder was dropped, and the tile was
+/// pointed at the existing owner (no attach needed — it is already live).
+enum BindOutcome {
+    Bound,
+    Focused(SessionId),
+}
+
 impl YaldaGpuiView {
     /// Open the Claude screen and attempt to attach to an ACP agent. Bound
     /// to `Ctrl-K` in the Doc and Edit views. Stashes the prior screen so
@@ -342,97 +351,6 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Background half of `open_agent_inner`'s session-server path (S4). Runs
-    /// `list_sessions` and the resulting `attach`/`create_session` round-trips
-    /// off the paint thread, then splices the real slot(s) into the
-    /// placeholder ring via `this.update`. `placeholder_index` identifies the
-    /// "connecting…" slot to fill in place (it owns the pump task, so we
-    /// mutate it rather than replace it). If the window/ring is gone by the
-    /// time the result lands (weak entity dropped, screen switched), every
-    /// `this.update` is a no-op and the work is harmlessly discarded.
-    pub(crate) fn spawn_open_agent_server(
-        &self,
-        open_token: u64,
-        proc_cwd: PathBuf,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
-            return;
-        };
-        // Snapshot the server sids BOUND to a tile so the background thread can
-        // dedup against sessions already shown. (Attach is deferred to
-        // `spawn_attach_sessions` after the bind.)
-        let open_sids = self.bound_sid_set();
-
-        cx.spawn(async move |this, cx| {
-            let cwd = proc_cwd.clone();
-            let resolution = cx
-                .background_executor()
-                .spawn(async move {
-                    // 1. Discover existing sessions for this cwd that aren't
-                    //    already shown elsewhere.
-                    let existing = match handle.list_sessions() {
-                        Ok(v) => v,
-                        Err(e) => return OpenResolution::Failed(format!("list failed: {e}")),
-                    };
-                    let cwd_key = cwd_match_key(&cwd);
-                    let matching: Vec<SessionInfo> = existing
-                        .into_iter()
-                        .filter(|s| cwd_match_key(&s.cwd) == cwd_key)
-                        .filter(|s| !open_sids.contains(&s.session_id))
-                        .collect();
-
-                    if matching.is_empty() {
-                        // 2a. None — create a fresh session. The server
-                        //     registers it and returns the sid immediately
-                        //     (ACP subprocess spawns server-side). NOTE: we do
-                        //     NOT attach here. Attaching starts the server's
-                        //     event replay, and the slot's `server_session_id`
-                        //     isn't bound until `apply_open_agent_resolution`
-                        //     runs on the foreground — attaching first races
-                        //     that bind and the pump drops the replay (the
-                        //     "resumed session is wonky/empty" bug). Attach is
-                        //     deferred to after the bind; see `spawn_attach_sessions`.
-                        match handle.create_session(cwd, "claude-1".to_string(), None) {
-                            Ok(info) => OpenResolution::Created {
-                                sid: info.session_id,
-                                acp_id: info.acp_session_id,
-                                permission_mode: info.permission_mode,
-                            },
-                            Err(e) => OpenResolution::Failed(format!("create failed: {e}")),
-                        }
-                    } else {
-                        // 2b. Resume each matching session — bind first, attach
-                        //     later. Same rationale as 2a: deferring the attach
-                        //     until the slot is bound closes the replay-drop
-                        //     race. Owner reclaim + status come from the
-                        //     deferred `spawn_attach_sessions`.
-                        let attached: Vec<AttachedSlot> = matching
-                            .iter()
-                            .map(|info| AttachedSlot {
-                                label: info.label.clone(),
-                                sid: info.session_id.clone(),
-                                acp_id: info.acp_session_id.clone(),
-                                status: if info.connected {
-                                    "reconnecting…".to_string()
-                                } else {
-                                    "reconnecting (agent spawning…)".to_string()
-                                },
-                                permission_mode: info.permission_mode,
-                            })
-                            .collect();
-                        OpenResolution::Attached(attached)
-                    }
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                this.apply_open_agent_resolution(open_token, resolution, cx);
-            });
-        })
-        .detach();
-    }
-
     /// Apply the result of the background `open_agent` round-trips: fill the
     /// "connecting…" placeholder slot (preserving its pump) and, for the
     /// re-attach case, push any additional slots. A no-op if the placeholder
@@ -445,9 +363,24 @@ impl YaldaGpuiView {
     ) {
         // Find the placeholder TILE that started this open by its globally-
         // unique `open_token`, then bind the resolved sid into the store
-        // through the single choke. If the tile is gone (screen closed before
-        // the round-trip returned), this is a harmless no-op.
+        // through the single choke. If the tile is gone (screen closed, OR the
+        // user rebound the tile to a different session mid-open), the placeholder
+        // is orphaned — but the server may have already SPAWNED a session for
+        // this resolution. Close it so it doesn't leak a running agent.
         let Some(id) = self.session_id_for_open_token(open_token) else {
+            let orphan_sid = match &resolution {
+                OpenResolution::Created { sid, .. } => Some(sid.clone()),
+                OpenResolution::Attached(attached) => attached.first().map(|a| a.sid.clone()),
+                OpenResolution::Failed(_) => None,
+            };
+            if let Some(sid) = orphan_sid {
+                eprintln!(
+                    "[yalda-gpui] open token {open_token} has no tile (rebound mid-open); \
+                     closing orphaned server session {}",
+                    &sid[..sid.len().min(8)]
+                );
+                self.spawn_close_session(sid, cx);
+            }
             return;
         };
         // Consume the token regardless of outcome so a late duplicate
@@ -467,8 +400,8 @@ impl YaldaGpuiView {
                 sid,
                 acp_id,
                 permission_mode,
-            } => {
-                if self.bind_session_sid(id, &sid) {
+            } => match self.bind_session_sid(id, &sid) {
+                BindOutcome::Bound => {
                     if let Some(session) = self.sessions.get_mut(id) {
                         session.resume_id = acp_id;
                         session.state.permission_mode = permission_mode;
@@ -477,21 +410,25 @@ impl YaldaGpuiView {
                     }
                     bound_sids.push(sid);
                 }
-            }
+                BindOutcome::Focused(owner) => self.focus_existing_session(owner),
+            },
             OpenResolution::Attached(attached) => {
                 // Strict 1:1: a tile shows exactly one session. Bind the FIRST
                 // attached session to this tile; ignore extras (the server may
                 // list several per cwd, but each gets its own tile via the
                 // picker, never a hidden ring).
                 if let Some(first) = attached.into_iter().next() {
-                    if self.bind_session_sid(id, &first.sid) {
-                        if let Some(session) = self.sessions.get_mut(id) {
-                            session.label = first.label;
-                            session.resume_id = first.acp_id;
-                            session.state.permission_mode = first.permission_mode;
-                            session.state.status = Some(first.status.into());
+                    match self.bind_session_sid(id, &first.sid) {
+                        BindOutcome::Bound => {
+                            if let Some(session) = self.sessions.get_mut(id) {
+                                session.label = first.label;
+                                session.resume_id = first.acp_id;
+                                session.state.permission_mode = first.permission_mode;
+                                session.state.status = Some(first.status.into());
+                            }
+                            bound_sids.push(first.sid);
                         }
-                        bound_sids.push(first.sid);
+                        BindOutcome::Focused(owner) => self.focus_existing_session(owner),
                     }
                 }
             }
@@ -540,19 +477,43 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Bind `sid` to session `id` through the store (INV-1/INV-3). Returns
-    /// whether the bind succeeded; on `AlreadyBound` (another session already
-    /// owns the sid — a duplicate resolution) the caller drops the duplicate.
-    fn bind_session_sid(&mut self, id: SessionId, sid: &str) -> bool {
+    /// Bind `sid` to the freshly-minted placeholder session `id` through the
+    /// store, with focus-on-conflict semantics (INV-1/INV-2/INV-3).
+    ///
+    /// - `Ok(())` ⇒ `id` now carries `sid`; the caller proceeds to attach.
+    /// - `Err(AlreadyBound(owner))` ⇒ another session already owns `sid` (a
+    ///   duplicate resolution — e.g. two restored tiles racing the same listed
+    ///   session). We must NOT leave the orphan placeholder `id` stuck on
+    ///   "attaching…": drop it from the store and point the focused tile at the
+    ///   existing `owner` instead (the same AlreadyOpen/focus semantics
+    ///   `show_session` implements). Returns [`BindOutcome`] so the caller can
+    ///   skip the (redundant) attach for the focus case.
+    fn bind_session_sid(&mut self, id: SessionId, sid: &str) -> BindOutcome {
         match self.sessions.bind_sid(id, sid.to_string()) {
-            Ok(()) => true,
-            Err(AlreadyBound(_owner)) => {
+            Ok(()) => BindOutcome::Bound,
+            Err(AlreadyBound(owner)) => {
                 eprintln!(
-                    "[yalda-gpui] sid {} already bound elsewhere; dropping duplicate",
+                    "[yalda-gpui] sid {} already owned by another session; \
+                     dropping orphan placeholder and focusing the owner",
                     &sid[..sid.len().min(8)]
                 );
-                false
+                // Drop the orphan placeholder we just minted (it carries no sid,
+                // so this only tears down its local channel/pump, never the live
+                // server session).
+                self.sessions.close(id);
+                BindOutcome::Focused(owner)
             }
+        }
+    }
+
+    /// Point the focused tile at `owner` (the existing session that already
+    /// holds the sid we tried to bind) — the focus half of the AlreadyBound
+    /// path. Clears the picker/token so the tile shows the live transcript.
+    fn focus_existing_session(&mut self, owner: SessionId) {
+        if let Some(tile) = self.agent_tile_mut() {
+            tile.bound = Some(owner);
+            tile.picker = None;
+            tile.pending_open_token = None;
         }
     }
 
@@ -627,7 +588,7 @@ impl YaldaGpuiView {
                 // a buffer). Then re-persist so the stale id doesn't resume.
                 let mut dropped_any = false;
                 for sid in &dead_sids {
-                    if this.reconcile_session_closed(sid) {
+                    if this.reconcile_session_closed(sid, cx) {
                         dropped_any = true;
                     }
                 }
@@ -666,13 +627,12 @@ impl YaldaGpuiView {
         }
         // On an Agent tile: a tile shows exactly one session (1:1), so "new
         // session" REBINDS this tile to a fresh session. The previously-bound
-        // session is freed (kept running in the store), not killed.
+        // session is freed (kept running in the store) UNLESS it is a pre-attach
+        // local placeholder mid-open — that would orphan its in-flight create
+        // (no tile would match its token), so close it.
         let label = "claude".to_string();
         let slot_cwd = cwd.unwrap_or_else(process_cwd);
-        if let Some(tile) = self.agent_tile_mut() {
-            tile.bound = None;
-            tile.picker = None;
-        }
+        self.release_focused_session_for_rebind();
 
         if self.session_server.is_some() {
             // Server path: bind a "connecting…" placeholder and create the
@@ -841,7 +801,14 @@ impl YaldaGpuiView {
         if self.session_server.is_some() {
             // Server path: close the old server session, then create a new one
             // and rebind THIS session's sid when the round-trip returns.
-            let old_sid = self.sessions.sid_of(id).map(|s| s.to_string());
+            //
+            // Release the old sid from the store SYNCHRONOUSLY before firing the
+            // close, so the in-flight `SessionClosed(old_sid)` broadcast can no
+            // longer `locate` this session and destroy it mid-respawn (the
+            // close-before-create race). The `SessionId`/payload survive — only
+            // the sid binding is dropped — so the create resolution rebinds the
+            // new sid onto the same live session/transcript.
+            let old_sid = self.sessions.clear_sid(id);
             if let Some(old_sid) = old_sid {
                 self.spawn_close_session(old_sid, cx);
             }
@@ -883,8 +850,50 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// Prepare the focused tile to be REBOUND to a different session (rebind /
+    /// new-session). Frees its current session (kept running in the store) —
+    /// EXCEPT a pre-attach local placeholder whose create round-trip is still in
+    /// flight (`pending_open_token` set, no sid): rebinding away would overwrite
+    /// the token so the resolution can never find a tile, leaking the server
+    /// session its create spawns. So we CLOSE that placeholder up front (its
+    /// channel/pump cancel on drop). Always clears `bound`/`picker`/token on the
+    /// tile so the caller can bind fresh.
+    pub(crate) fn release_focused_session_for_rebind(&mut self) {
+        let bound = self.focused_bound_session();
+        let pending = self.agent_tile().and_then(|t| t.pending_open_token);
+        if let Some(id) = bound {
+            let sid_less = self.sessions.sid_of(id).is_none();
+            if sid_less && pending.is_some() {
+                // Orphaned pre-attach placeholder: kill it. If its create
+                // already spawned a server session, that is closed when its
+                // resolution finds no tile (see `apply_open_agent_resolution`).
+                self.sessions.close(id);
+            }
+        }
+        if let Some(tile) = self.agent_tile_mut() {
+            tile.bound = None;
+            tile.picker = None;
+            tile.pending_open_token = None;
+        }
+    }
+
+    /// Unbind the focused tile and land it in a LIVE free-session selector:
+    /// install a loading `SessionPicker` and kick off the server list (server
+    /// mode), so Enter/j/k are immediately usable — NOT a dead `picker == None`
+    /// state that only Ctrl-V can escape. Used by close / reconcile.
+    pub(crate) fn show_selector_on_focused_tile(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
+        if let Some(tile) = self.agent_tile_mut() {
+            tile.bound = None;
+            tile.pending_open_token = None;
+            tile.picker = Some(SessionPicker::loading(cwd.clone()));
+        }
+        if self.session_server.is_some() {
+            self.spawn_list_sessions_for_picker(cwd, cx);
+        }
+    }
+
     /// Close the focused session. The tile stays an Agent tile, transitioning
-    /// to the unbound selector (it does NOT fall back to a buffer — only an
+    /// to a LIVE unbound selector (it does NOT fall back to a buffer — only an
     /// explicit Ctrl-V / back_to_doc does that).
     pub(crate) fn close_active_agent_session(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.focused_bound_session() else {
@@ -896,13 +905,15 @@ impl YaldaGpuiView {
         if let Some(sid) = server_sid {
             self.spawn_close_session(sid, cx);
         }
+        let cwd = self
+            .sessions
+            .get(id)
+            .map(|s| s.cwd.clone())
+            .unwrap_or_else(process_cwd);
         // Drop the session from the store (its channel/pump cancel on drop) and
-        // unbind the tile → it renders the selector.
+        // land the tile in a live selector.
         self.sessions.close(id);
-        if let Some(tile) = self.agent_tile_mut() {
-            tile.bound = None;
-            tile.picker = None;
-        }
+        self.show_selector_on_focused_tile(cwd, cx);
         // Wipe the cwd entry so reboot doesn't resurrect the closed session.
         if let Ok(cwd) = std::env::current_dir() {
             forget_persisted_acp_sessions(&cwd);
@@ -946,18 +957,18 @@ impl YaldaGpuiView {
             .detach();
     }
 
-    /// Snapshot the current ring to disk. Called after every ring mutation
-    /// (new/close/switch) and from the pump after a slot's attach resolves.
-    /// Best-effort: any failure to write is silently ignored.
+    /// Snapshot every bound agent session to disk. Walks ALL tabs (not just the
+    /// active one) so it is SYMMETRIC with restore (`restore_agent_leaves`
+    /// collects agent leaves across every tab) — otherwise an agent in a
+    /// background tab would be saved-but-not-restored or vice versa. The first
+    /// bound session is marked active. Free sessions (no tile) are not persisted
+    /// — they only live for the running process. Best-effort.
     pub(crate) fn save_agent_ring(&self) {
         let Ok(cwd) = std::env::current_dir() else {
             return;
         };
-        // Gather a snapshot for every session BOUND to a tile in the active
-        // tab. The first bound session is marked active. Sessions free (no
-        // tile) are not persisted — they only live for the running process.
         let mut snaps: Vec<SessionSnapshot> = Vec::new();
-        if let Some(tab) = self.workspace.active_tab() {
+        for tab in self.workspace.tabs.iter() {
             tab.layout.for_each_leaf(&mut |window| {
                 if let App::Agent(tile) = &window.content
                     && let Some(id) = tile.bound
@@ -1380,25 +1391,56 @@ impl YaldaGpuiView {
     }
 
     /// Reconcile a server-side close: drop the session for `sid` from the store
-    /// and unbind whichever tile showed it. The tile stays an Agent tile and
-    /// transitions to the unbound selector (it does NOT fall back to a buffer —
-    /// only an explicit Ctrl-V does that). Returns whether anything changed.
-    pub(crate) fn reconcile_session_closed(&mut self, sid: &str) -> bool {
+    /// and land whichever tile showed it in a LIVE free-session selector. The
+    /// tile stays an Agent tile (it does NOT fall back to a buffer — only an
+    /// explicit Ctrl-V does that). Returns whether anything changed.
+    ///
+    /// A tile carrying a `pending_open_token` is mid-respawn (change_agent_cwd
+    /// closed the OLD sid and is creating a new one); its in-flight
+    /// `SessionClosed(old_sid)` must NOT destroy the respawning session. We
+    /// guard that two ways: the respawn path `clear_sid`s before firing the
+    /// close (so `locate` already misses), and here we additionally skip a tile
+    /// whose token is in flight.
+    pub(crate) fn reconcile_session_closed(&mut self, sid: &str, cx: &mut Context<Self>) -> bool {
         let Some(id) = self.sessions.locate(sid) else {
             return false;
         };
-        // Unbind every tile that showed this session (at most one, INV-2).
+        // The session's cwd seeds the replacement selector's list.
+        let cwd = self
+            .sessions
+            .get(id)
+            .map(|s| s.cwd.clone())
+            .unwrap_or_else(process_cwd);
+        // Find the tile that showed this session (at most one, INV-2). Skip a
+        // tile mid-respawn (pending_open_token in flight).
+        let mut tile_was_respawning = false;
+        let mut tile_found = false;
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
                 if let App::Agent(tile) = content
                     && tile.bound == Some(id)
                 {
-                    tile.bound = None;
-                    tile.picker = None;
+                    tile_found = true;
+                    if tile.pending_open_token.is_some() {
+                        tile_was_respawning = true;
+                    } else {
+                        tile.bound = None;
+                        tile.picker = Some(SessionPicker::loading(cwd.clone()));
+                    }
                 }
             });
         }
+        if tile_was_respawning {
+            // Leave the respawning session alone; its new sid will rebind.
+            return false;
+        }
         self.sessions.close(id);
+        // Kick the (now-unbound) tile's selector list off the paint thread. The
+        // list reducer (`apply_picker_sessions`) guards on the focused tile
+        // still loading, so a no-op for a background tile is harmless.
+        if tile_found && self.session_server.is_some() {
+            self.spawn_list_sessions_for_picker(cwd, cx);
+        }
         true
     }
 
@@ -1682,9 +1724,9 @@ impl YaldaGpuiView {
                 }
                 ServerNotification::SessionClosed { session_id } => {
                     // A session closed somewhere (this GUI, another tile, or
-                    // another GUI instance). Drop its slot from every tile so
-                    // the lists stay consistent.
-                    self.reconcile_session_closed(&session_id);
+                    // another GUI instance). Drop it from the store and land its
+                    // tile in a live selector.
+                    self.reconcile_session_closed(&session_id, cx);
                 }
                 ServerNotification::SessionRenamed { session_id, label } => {
                     self.reconcile_session_renamed(&session_id, &label);
@@ -2385,28 +2427,27 @@ impl YaldaGpuiView {
     /// without restarting yalda.
     pub(crate) fn clear_agent_session(&mut self, cx: &mut Context<Self>) {
         // Forget every persisted slot BEFORE re-opening so the new spawn
-        // hits session/new instead of session/load. Done first so even
-        // if open_agent_inner panics partway through, the next manual
-        // attach won't accidentally resume any cleared session.
+        // hits session/new instead of session/load.
         if let Ok(cwd) = std::env::current_dir() {
             forget_persisted_acp_sessions(&cwd);
         }
-        // Drop the current claude screen entirely; open_agent_inner
-        // builds a new one. We don't try to surgically reset fields on
-        // the existing AgentState because the underlying screen
-        // (browser/doc) is also stashed there — preserving it is the
-        // job of open_agent_inner via the prior-screen swap dance.
-        if matches!(
-            self.workspace.focused_content().expect("no focused window"),
-            App::Agent(_)
-        ) {
-            // Restore underlying first so open_agent_inner can capture
-            // it as the new "prior" screen. Otherwise we'd lose the
-            // file/browser the user was viewing before they opened
-            // claude.
-            self.back_to_doc(cx);
+        // KILL (not free) the focused session — `/clear` discards the
+        // conversation, so the old session must not linger in the store still
+        // running. Capture the sid first, close it on the server, then drop it
+        // from the store and unbind the tile.
+        if let Some(id) = self.focused_bound_session() {
+            if let Some(sid) = self.sessions.sid_of(id).map(|s| s.to_string()) {
+                self.spawn_close_session(sid, cx);
+            }
+            self.sessions.close(id);
+            if let Some(tile) = self.agent_tile_mut() {
+                tile.bound = None;
+                tile.picker = None;
+            }
         }
-        self.open_agent_inner(cx);
+        // Open a fresh session in place. We're already on an Agent tile (unbound
+        // now), so `new_agent_session` rebinds this tile to a brand-new session.
+        self.new_agent_session(None, cx);
         if let Some(c) = self.agent_mut() {
             c.status = Some("session cleared".into());
         }
@@ -2523,6 +2564,26 @@ impl YaldaGpuiView {
     /// `resume_id` so persistence captures the new channel's id once it
     /// binds (rather than retrying the original-load id forever).
     pub(crate) fn attach_active_agent_session(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.focused_bound_session() else {
+            return;
+        };
+        // A server-managed session is driven by the shared server pump — never
+        // graft a SECOND direct channel + per-session pump onto it, or the two
+        // pumps double-apply every event ("attached ×N" class). The server path
+        // re-attaches via the reconnect flow, not this direct-spawn helper.
+        let has_server = self.session_server.is_some();
+        let server_managed = self
+            .sessions
+            .get(id)
+            .map(|s| s.state.server_managed)
+            .unwrap_or(false);
+        if has_server && server_managed {
+            if let Some(c) = self.agent_mut() {
+                c.status = Some("session is server-managed — it reconnects automatically".into());
+            }
+            cx.notify();
+            return;
+        }
         if let Some(c) = self.agent_mut()
             && (c.channel.is_some() || c.attach_pending.is_some())
         {
@@ -2533,9 +2594,6 @@ impl YaldaGpuiView {
 
         // Use the session's per-session cwd (spec-agent-cwd.md §3) so a session
         // that lives at /foo re-attaches at /foo, not at the launch directory.
-        let Some(id) = self.focused_bound_session() else {
-            return;
-        };
         let slot_cwd = self.sessions.get(id).map(|s| s.cwd.clone());
         let (attach_tx, attach_rx) =
             std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
