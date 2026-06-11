@@ -1032,6 +1032,7 @@ impl YaldaGpuiView {
             input_surface: InputSurface::Chatbox(Chatbox::new()),
             current_plan: None,
             agent_mode: None,
+            agent_model: None,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
@@ -2021,6 +2022,9 @@ impl YaldaGpuiView {
                 ReplyEvent::ModeChanged(mode_id) => {
                     claude.agent_mode = Some(mode_id);
                 }
+                ReplyEvent::ModelChanged(model_id) => {
+                    claude.agent_model = Some(model_id);
+                }
                 ReplyEvent::UsageUpdated(snap) => {
                     claude.usage = Some(snap);
                 }
@@ -2212,6 +2216,10 @@ impl YaldaGpuiView {
             }
             AgentEventKind::ModeChanged(mode_id) => {
                 claude.agent_mode = Some(mode_id.clone());
+                AgentEventEffect::None
+            }
+            AgentEventKind::ModelChanged(model_id) => {
+                claude.agent_model = Some(model_id.clone());
                 AgentEventEffect::None
             }
             AgentEventKind::UsageUpdated(snap) => {

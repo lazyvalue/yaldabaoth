@@ -1525,11 +1525,15 @@ impl YaldaGpuiView {
             );
         }
 
-        // Model id (best-effort: agent_mode → channel description).
+        // Model id: the authoritative value comes from the agent
+        // (`agent_model`, mirrored from `session/new`'s `config_options`).
+        // Fall back to the old best-effort guesses (session mode → channel
+        // command) only when the adapter never advertised a model — e.g. an
+        // older `claude-code-acp` that doesn't surface a model selector.
         let model_label: Option<String> = c
-            .agent_mode
-            .as_ref()
-            .map(|m| m.0.to_string())
+            .agent_model
+            .clone()
+            .or_else(|| c.agent_mode.as_ref().map(|m| m.0.to_string()))
             .or_else(|| c.channel.as_ref().map(|ch| ch.command().to_string()));
         if let Some(m) = model_label {
             strip = strip.child(
