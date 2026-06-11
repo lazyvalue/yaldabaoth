@@ -445,6 +445,85 @@ fn worksheet_rebuild_cost_probe() {
     );
 }
 
+/// INV-RV regression: cursor-reveal is O(1) and the reverse index is a
+/// faithful mirror of the rendered `flat_items`. The old Worksheet key
+/// handler recomputed the cursor's flat-item position from scratch on EVERY
+/// keystroke — an O(transcript) gutter scan + tool/anchor walk — which is the
+/// monotonic "typing gets slower as the session grows" regression. The fix
+/// derives a doc-line → item index FROM the canonical flat list at build
+/// time, so the per-keystroke reveal is a single array read. This test pins
+/// (a) the map points every `Line` item at its real position (single source
+/// of truth — it can't drift from what's rendered), (b) lookups are
+/// bounds-clamped (cursor past EOF must not panic), and (c) the map is built
+/// once per rebuild, not per keystroke.
+#[test]
+fn reveal_index_mirrors_flat_items_and_is_o1() {
+    let mut st = AgentState::new_for_test();
+    let theme = Theme::default();
+    // Several fenced blocks + interleaved prose + an editable tail.
+    let (lines, frozen, frozen_len) = synthetic_transcript(4, 6);
+
+    VIEW_MODEL_REBUILDS.with(|n| n.set(0));
+    let (flat, _gut) = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &theme, 1);
+
+    // (a) Every `Line(idx)` is reachable in O(1) at its REAL flat position —
+    // the reverse index mirrors the canonical list exactly.
+    let mut checked = 0usize;
+    for (p, item) in flat.iter().enumerate() {
+        if let FlatItem::Line(idx) = item {
+            assert_eq!(
+                st.view_model.item_for_line(*idx),
+                p,
+                "item_for_line({idx}) must equal the Line's real flat position {p}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "transcript must contain Line items to validate");
+
+    // (a') The desync vector: Block items dropped their source range, so the
+    // map must re-pair them with `resolved`. Verify every doc line resolves
+    // IN-RANGE, and that lines collapsed into a structural Block resolve to a
+    // `Block` item (not to a stray Line or off-by-one position). At least one
+    // line must land on a Block (the synthetic transcript has fenced blocks).
+    let mut lines_on_a_block = 0usize;
+    for line in 0..lines.len() {
+        let idx = st.view_model.item_for_line(line);
+        assert!(idx < flat.len(), "line {line} resolved out of range ({idx})");
+        if matches!(flat[idx], FlatItem::Block(_)) {
+            lines_on_a_block += 1;
+        }
+    }
+    assert!(
+        lines_on_a_block > 0,
+        "block-covered lines must resolve to their Block item, not a Line/off-by-one"
+    );
+
+    // (b) Out-of-range (cursor past EOF) clamps into the list, never panics.
+    let last = flat.len().saturating_sub(1);
+    assert!(
+        st.view_model.item_for_line(usize::MAX) <= last,
+        "an out-of-range reveal must clamp into the built list"
+    );
+
+    // (c) The reverse index is part of the memoized view model: re-rendering
+    // at the SAME structural fingerprint is a pure cache hit, so neither the
+    // flat list NOR the reveal index is rebuilt per keystroke — the reveal
+    // cost stays independent of transcript length.
+    let rebuilds = VIEW_MODEL_REBUILDS.with(|n| n.get());
+    for _ in 0..100 {
+        match st.view_model.cached(1) {
+            Some(_hit) => {} // O(1) reuse, no store
+            None => panic!("same-fingerprint render must hit the S1 cache"),
+        }
+    }
+    assert_eq!(
+        VIEW_MODEL_REBUILDS.with(|n| n.get()),
+        rebuilds,
+        "100 same-fingerprint renders must not rebuild — per-keystroke work is O(changed)"
+    );
+}
+
 /// S1 enforcement, on the split `cached` + `store` API: an unchanged
 /// fingerprint must hit (`cached` returns `Some` the same-pointer `Rc`s
 /// and the caller never `store`s, so ZERO rebuilds). A changed fingerprint
@@ -463,7 +542,7 @@ fn view_model_memoization_fast_skip() {
     assert!(st.view_model.cached(fp1).is_none(), "cold cache must miss");
     let (flat1, gut1) = st
         .view_model
-        .store(fp1, vec![FlatItem::Line(0)], vec![None]);
+        .store(fp1, vec![FlatItem::Line(0)], vec![None], vec![0]);
     assert_eq!(
         VIEW_MODEL_REBUILDS.with(|n| n.get()),
         1,
@@ -508,7 +587,7 @@ fn view_model_memoization_fast_skip() {
     );
     let (flat3, _gut3) = st
         .view_model
-        .store(fp2, vec![FlatItem::ThinkingIndicator], vec![None]);
+        .store(fp2, vec![FlatItem::ThinkingIndicator], vec![None], vec![0]);
     assert_eq!(
         VIEW_MODEL_REBUILDS.with(|n| n.get()),
         2,

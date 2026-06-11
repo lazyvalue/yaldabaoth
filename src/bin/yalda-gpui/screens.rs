@@ -948,6 +948,19 @@ impl YaldaGpuiView {
         // the pump's scroll.
         c.reveal_tail_if_following(new_count);
 
+        // Worksheet cursor-reveal (INV-RV): consume the intent the key handler
+        // recorded. The scroll target is an O(1) lookup into the build-time
+        // line→item index that was just (re)validated above — no transcript
+        // scan, no re-derivation of the flat-item position. Deferring to here
+        // (rather than the key handler) also guarantees the mapping reflects
+        // the freshly-rebuilt list after a newline insert.
+        if c.pending_reveal_cursor {
+            c.pending_reveal_cursor = false;
+            let cursor_line = c.editor.cursor().line;
+            let target = c.view_model.item_for_line(cursor_line);
+            c.list_state.scroll_to_reveal_item(target);
+        }
+
         // Snapshot data for the render closure. Cloned once per
         // render_agent call; the closure is then called only for
         // visible items.
