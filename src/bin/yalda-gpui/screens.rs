@@ -1475,8 +1475,18 @@ impl YaldaGpuiView {
             .font_family(self.code_font.clone())
             .text_color(self.editor_fg())
             .child(
+                // Default (visible-only) measuring — NOT `Auto`. `Auto` measures
+                // EVERY item every frame (gpui list.rs): a profiler on a live
+                // session showed each keystroke re-running taffy layout + text
+                // measurement over all ~680 transcript items via the list's
+                // `layout_items`/`prepaint_items` — O(transcript) per keystroke,
+                // the real Message Box typing lag (NOT the element build, which
+                // `[perf]` measured and found cheap — this cost is in GPUI layout
+                // AFTER render returns, which `[perf]` doesn't capture). The body
+                // parent is `flex_1().min_h_0()`, so the list fills the viewport
+                // and scrolls without sizing to content. Default also avoids the
+                // `Auto`-only hazard of measured-but-unprepainted item bounds.
                 gpui::list(c.list_state.clone(), render_fn)
-                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
                     .flex_1()
                     .w_full(),
             );
