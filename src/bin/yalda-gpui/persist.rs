@@ -33,54 +33,6 @@ pub(crate) fn with_acp_persist_path<R>(path: PathBuf, f: impl FnOnce() -> R) -> 
     r
 }
 
-/// Path to the one-line UUID file holding this GUI install's STABLE client id
-/// (spec phase 4). Sibling to `acp_session_persist_path` under
-/// `~/.yalda/`. Chosen over `config.kdl` (this is an implementation
-/// detail, not user-facing) and `preferences.json` (no JSON restructure; `rm`
-/// to reset).
-pub(crate) fn client_id_path() -> Option<PathBuf> {
-    yalda::paths::yalda_home().map(|d| d.join("client_id"))
-}
-
-/// Load (or first-time generate) this GUI's stable `client_id`. The lease model
-/// keys ownership on this id so a restart/reconnect resumes with zero
-/// contention.
-///
-/// A per-process `YALDA_CLIENT_ID` override WINS, so a blue-green *candidate*
-/// (launched with a fresh per-process UUID) is a DISTINCT client from the
-/// original — it lands as Observer while the original's lease is live, then
-/// Promotes under its own id. This is load-bearing: if the candidate read the
-/// on-disk id it would impersonate the original and steal the lease.
-///
-/// Production (no env) reads/creates the persistent file, so a normal restart
-/// resumes the lease.
-pub(crate) fn load_or_create_client_id() -> String {
-    if let Ok(env_id) = std::env::var("YALDA_CLIENT_ID") {
-        let t = env_id.trim();
-        if !t.is_empty() {
-            return t.to_string();
-        }
-    }
-    if let Some(path) = client_id_path() {
-        if let Ok(id) = std::fs::read_to_string(&path) {
-            let t = id.trim();
-            if !t.is_empty() {
-                return t.to_string();
-            }
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        if let Some(p) = path.parent() {
-            let _ = std::fs::create_dir_all(p);
-        }
-        let _ = std::fs::write(&path, &id);
-        id
-    } else {
-        // No cache dir: ephemeral per-process id (rare; lease still works within
-        // this process's lifetime, just doesn't survive a restart).
-        uuid::Uuid::new_v4().to_string()
-    }
-}
-
 /// Yalda's process cwd, with a safe fallback. Used both as the default
 /// per-session cwd for new agent slots (spec-agent-cwd.md §1) and as the
 /// top-level key in `acp_sessions.json` / `workspace.json`.
@@ -112,42 +64,15 @@ pub(crate) fn persist_cwd_key(cwd: &std::path::Path) -> String {
     cwd_match_key(cwd).to_string_lossy().into_owned()
 }
 
-/// Attach to a server session and learn our role in ONE deterministic round
-/// trip (spec phase 4 — replaces the old `attach_owner_with_retry` race).
-///
-/// The lease keys on this GUI's STABLE `client_id` (already set on the client),
-/// so a returning instance presents the SAME id as any lingering lease and the
-/// server's same-`client_id` branch RESUMES on the first attempt — regardless
-/// of whether the prior socket's EOF has been processed, and regardless of
-/// expiry (live → renew, expired → re-grant). There is nothing to wait out, so
-/// the 8×300ms retry + "already own" error-string sniffing is gone.
-///
-/// Returns `Ok(true)` when this attach was granted drive rights (the lease) and
-/// `Ok(false)` when it downgraded to Observer (a different live client holds the
-/// lease, or `want_owner` is false). The role comes straight from the response's
-/// `driver` flag, never from an inferred error.
-///
-/// Still runs on the background executor (never the paint thread).
-///
-/// Named `attach_for_role` (not `_with_retry`): there is no retry loop anymore —
-/// it is a single deterministic attach whose Owner/Observer outcome the caller
-/// records onto the slot's `is_driver`.
-pub(crate) fn attach_for_role(
+/// Attach the single client to a server session (strict 1:1) in one round trip.
+/// The server replays the full event log before the response, so the pump picks
+/// up the entire transcript on its first drain cycle. Runs on the background
+/// executor (never the paint thread).
+pub(crate) fn attach_session(
     handle: &yalda::session_client::SessionServerHandle,
     sid: &str,
-    want_owner: bool,
-) -> Result<bool, String> {
-    let mode = if want_owner {
-        AttachMode::Owner
-    } else {
-        AttachMode::Observer
-    };
-    handle.attach(sid, mode).map_err(|e| e.to_string())
-}
-
-/// Whether this process was launched as a build-loop candidate.
-pub(crate) fn is_candidate_launch() -> bool {
-    std::env::var("YALDA_CANDIDATE").as_deref() == Ok("1")
+) -> Result<(), String> {
+    handle.attach(sid).map_err(|e| e.to_string())
 }
 
 /// Connect to the session server, the default model: a persistent server owns
@@ -187,11 +112,6 @@ pub(crate) fn connect_session_server() -> Option<SessionServerClient> {
     }
     match SessionServerClient::connect() {
         Ok(client) => {
-            // Install the stable lease identity (phase 4) right after connect so
-            // every attach / heartbeat / gated action carries it. Survives
-            // in-place reconnect (the client re-applies it onto the rebuilt
-            // struct) AND app restart (persisted to ~/.yalda/client_id).
-            client.set_client_id(load_or_create_client_id());
             eprintln!("[yalda-gpui] connected to session server");
             Some(client)
         }

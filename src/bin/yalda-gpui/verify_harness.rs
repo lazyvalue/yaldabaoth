@@ -2046,7 +2046,6 @@ fn install_agent_picker(
             label: label.to_string(),
             turns: 3,
             connected: true,
-            has_owner: false,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
         })
         .collect();
@@ -2099,7 +2098,6 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
                     label: "claude-1".into(),
                     turns: 2,
                     connected: true,
-                    has_owner: false,
                     permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
                 },
                 crate::PickerSession {
@@ -2108,7 +2106,6 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
                     label: "claude-2".into(),
                     turns: 9,
                     connected: false,
-                    has_owner: true,
                     permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
                 },
             ]),

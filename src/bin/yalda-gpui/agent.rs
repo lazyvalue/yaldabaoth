@@ -2788,9 +2788,6 @@ pub(crate) struct PickerSession {
     pub(crate) label: String,
     pub(crate) turns: usize,
     pub(crate) connected: bool,
-    /// Another connection currently drives this session — attaching here
-    /// lands as an observer (read-only) unless ownership is handed over.
-    pub(crate) has_owner: bool,
     pub(crate) permission_mode: yalda::acp_channel::PermissionMode,
 }
 

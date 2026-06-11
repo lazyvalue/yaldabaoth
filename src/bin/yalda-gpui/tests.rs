@@ -1199,8 +1199,6 @@ fn gpui_menu_has_required_entries() {
         "desktop-grid",
         "tag-add",
         "list-marks",
-        "dev-build-candidate",
-        "dev-take-over",
         "dev-restart-gui",
         "back-to-doc",
         "quit",
