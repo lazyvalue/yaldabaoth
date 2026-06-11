@@ -97,13 +97,37 @@ App::Agent(AgentTile)          App::Buffer(BufferApp)
 
 ## Subtasks
 
-- [~] **1. Ownership inversion (strict 1:1).** ✅ code-complete on branch
-  `agent-session-owner` (build green, 153 tests pass); ⏳ pending my diff review
-  + runtime verify (#4). Deviations to scrutinize in review: `show_session`
-  (sid-first choke) is present but `#[allow(dead_code)]` — live paths use
-  `show_local_session` + `bind_session_sid` (bind-after-attach ordering), which
-  enforce the same INV-1/2/3; `candidate_take_over`/`_lease_heartbeat` left
-  dormant per brief.
+- [~] **1. Ownership inversion (strict 1:1).** Code landed (build green, 153
+  tests). **5-lens adversarial review done** (21 findings → 3 must-fix +
+  8 should-fix); **fixes in progress** (impl agent). ⏳ then re-check + runtime
+  verify (#4). Review verdict: the store layer is correct (1:1 genuinely
+  enforced, fan-out gone) — but the live view code *discarded the store's
+  recovery info*, so conflicts produced stuck/orphaned tiles instead of focusing
+  the existing one. Must-fixes:
+  - M1 (root) — `bind_session_sid` collapsed `AlreadyBound(owner)` → `false`;
+    callers left an orphan placeholder + never focused the owner. Fix: return the
+    owner, `close(orphan)`, rebind tile to owner (the AlreadyOpen semantics the
+    dead `show_session` choke already had).
+  - M2 — multi-tile restore strands tiles (every leaf re-lists, all get the same
+    `Attached`, only `first` binds). Fix: drive restore by the persisted snapshot
+    list, one sid per leaf, bind up front.
+  - M3 — close/reconcile lands the tile in a *dead* selector (`bound=None` AND
+    `picker=None` → permanent "loading…", Enter a no-op). Fix: install a loading
+    picker + `spawn_list_sessions_for_picker` after unbinding.
+  - Should-fix tail: cwd close-before-create race; `desktop_tile_title` `&self`
+    aliasing (UB under SB/Miri); `/clear` leaks the session (frees vs kills);
+    `attach_active_agent_session` dual-pump; the harness depends on the ambient
+    server (one test weakened — force `session_server=None`); placeholder-rebind
+    orphan; save/restore tab-scope mismatch; **missing INV-2 no-mirror +
+    multi-tile-restore tests**.
+
+## Progress log
+
+- 2026-06-11 — Stage 2 ownership inversion landed (impl agent, build + 153
+  tests green). 5-lens adversarial review (`SessionStore` correct; live placement
+  layer leaks orphans on bind-conflict). Full fix set dispatched back to the impl
+  agent. Next: re-check the root fix + new tests, then #2 (AgentState split),
+  #3 (server cleanup), #5 (docs), and the human #4 runtime check.
   Store owns `AgentSession`; `App::Agent(AgentRing)` → `App::Agent(AgentTile{
   bound: Option<SessionId>, pending_open_token, picker })`; all 11 bind paths
   routed through `open_or_focus`; delete `for_each_server_session_slot` fan-out,
