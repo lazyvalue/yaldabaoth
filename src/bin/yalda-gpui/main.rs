@@ -595,6 +595,13 @@ enum NormalOutcome {
     /// User pressed the `open-menu` binding (Space by default). Caller
     /// should open the menu overlay; the editor / mode were not modified.
     OpenMenu,
+    /// User pressed `p`/`P` (put). The core can't reach the system
+    /// clipboard (that lives on `YaldaGpuiView`), so it defers: the caller
+    /// reads the clipboard and inserts it charwise. `before` is true for
+    /// `P` (insert at cursor) vs `p` (insert after cursor).
+    Paste {
+        before: bool,
+    },
 }
 
 /// Which rendering style the Edit screen uses. Both views share the same
@@ -729,6 +736,8 @@ trait EditOps {
     fn move_cursor_word_backward(&mut self);
     fn move_cursor_word_end(&mut self);
     fn jump_cursor_bottom(&mut self);
+    fn jump_to_line(&mut self, line: usize);
+    fn line_count(&self) -> usize;
 
     fn begin_insert(&mut self);
     fn end_insert(&mut self);
@@ -832,6 +841,12 @@ impl EditOps for Editor {
     }
     fn jump_cursor_bottom(&mut self) {
         Editor::jump_cursor_bottom(self);
+    }
+    fn jump_to_line(&mut self, line: usize) {
+        Editor::jump_to_line(self, line);
+    }
+    fn line_count(&self) -> usize {
+        self.document().line_count()
     }
     fn begin_insert(&mut self) {
         Editor::begin_insert(self);
@@ -960,6 +975,12 @@ impl EditOps for SharedEditor {
     }
     fn jump_cursor_bottom(&mut self) {
         self.view.jump_cursor_bottom(&self.core.borrow());
+    }
+    fn jump_to_line(&mut self, line: usize) {
+        self.view.jump_to_line(&self.core.borrow(), line);
+    }
+    fn line_count(&self) -> usize {
+        self.core.borrow().document().line_count()
     }
     fn begin_insert(&mut self) {
         self.view.begin_insert(&mut self.core.borrow_mut());

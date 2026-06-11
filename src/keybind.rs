@@ -198,6 +198,11 @@ pub struct KeybindManager {
     single: HashMap<KeyPress, String>,
     multi: HashMap<Vec<KeyPress>, String>,
     matcher: KeySequenceMatcher,
+    /// Numeric count prefix accumulated ahead of a motion/action (vim-style:
+    /// `42g` jumps to line 42). `None` until the first count digit is typed.
+    /// Read-and-cleared by [`take_count`](Self::take_count) once an action
+    /// resolves.
+    pending_count: Option<usize>,
 }
 
 impl KeybindManager {
@@ -206,11 +211,30 @@ impl KeybindManager {
             single,
             multi,
             matcher: KeySequenceMatcher::new(),
+            pending_count: None,
         }
     }
 
     pub fn process_key(&mut self, press: KeyPress) -> Option<String> {
-        let matched = self.matcher.feed(press, &self.single, &self.multi)?;
+        // Count-prefix accumulation: a bare digit extends the pending count.
+        // `0` only counts as a digit once a count is already in progress —
+        // a leading `0` stays bound to `move-line-start` (vim semantics).
+        if press.modifiers.is_empty()
+            && let Key::Char(c) = press.key
+            && let Some(d) = c.to_digit(10)
+            && !(d == 0 && self.pending_count.is_none())
+        {
+            let acc = self.pending_count.unwrap_or(0);
+            // Saturate rather than overflow on absurd counts.
+            self.pending_count = Some(acc.saturating_mul(10).saturating_add(d as usize));
+            return None;
+        }
+
+        let matched = self.matcher.feed(press, &self.single, &self.multi);
+        let matched = match matched {
+            Some(m) => m,
+            None => return None,
+        };
         if matched.len() == 1 {
             self.single.get(&matched[0]).cloned()
         } else {
@@ -218,8 +242,15 @@ impl KeybindManager {
         }
     }
 
+    /// Take the accumulated numeric count prefix, clearing it. Returns `None`
+    /// if no digits were typed before the resolved action.
+    pub fn take_count(&mut self) -> Option<usize> {
+        self.pending_count.take()
+    }
+
     pub fn reset_pending(&mut self) {
         self.matcher.reset();
+        self.pending_count = None;
     }
 
     pub fn has_pending(&self) -> bool {
@@ -268,6 +299,8 @@ impl Default for KeybindManager {
         single.insert(key('%'), "select-all".into());
         single.insert(key('v'), "toggle-extend-mode".into());
         single.insert(key('u'), "undo".into());
+        single.insert(key('p'), "paste".into());
+        single.insert(key('P'), "paste-before".into());
         single.insert(key(':'), "enter-command".into());
         single.insert(ctrl('r'), "redo".into());
         single.insert(ctrl('d'), "half-page-down".into());
@@ -330,4 +363,65 @@ fn key(c: char) -> KeyPress {
 
 fn ctrl(c: char) -> KeyPress {
     KeyPress::new(Key::Char(c), Modifiers::CONTROL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn k(c: char) -> KeyPress {
+        KeyPress::new(Key::Char(c), Modifiers::NONE)
+    }
+
+    #[test]
+    fn count_prefix_accumulates_multi_digit() {
+        let mut km = KeybindManager::default();
+        // Digits accumulate and do not resolve to an action.
+        assert_eq!(km.process_key(k('4')), None);
+        assert_eq!(km.process_key(k('2')), None);
+        // The next non-digit resolves; the count is available alongside it.
+        assert_eq!(km.process_key(k('G')).as_deref(), Some("goto-bottom"));
+        assert_eq!(km.take_count(), Some(42));
+        // Count is cleared after being taken.
+        assert_eq!(km.take_count(), None);
+    }
+
+    #[test]
+    fn leading_zero_is_line_start_not_count() {
+        let mut km = KeybindManager::default();
+        // A bare leading `0` keeps its motion binding rather than starting a count.
+        assert_eq!(km.process_key(k('0')).as_deref(), Some("move-line-start"));
+        assert_eq!(km.take_count(), None);
+    }
+
+    #[test]
+    fn zero_extends_an_in_progress_count() {
+        let mut km = KeybindManager::default();
+        assert_eq!(km.process_key(k('1')), None);
+        assert_eq!(km.process_key(k('0')), None);
+        assert_eq!(km.process_key(k('G')).as_deref(), Some("goto-bottom"));
+        assert_eq!(km.take_count(), Some(10));
+    }
+
+    #[test]
+    fn no_count_means_none() {
+        let mut km = KeybindManager::default();
+        assert_eq!(km.process_key(k('G')).as_deref(), Some("goto-bottom"));
+        assert_eq!(km.take_count(), None);
+    }
+
+    #[test]
+    fn reset_pending_clears_count() {
+        let mut km = KeybindManager::default();
+        assert_eq!(km.process_key(k('9')), None);
+        km.reset_pending();
+        assert_eq!(km.take_count(), None);
+    }
+
+    #[test]
+    fn paste_bindings_resolve() {
+        let mut km = KeybindManager::default();
+        assert_eq!(km.process_key(k('p')).as_deref(), Some("paste"));
+        assert_eq!(km.process_key(k('P')).as_deref(), Some("paste-before"));
+    }
 }
