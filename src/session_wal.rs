@@ -60,6 +60,14 @@ enum WalRecord {
     },
     /// One transcript event, in `event_log` order.
     Event(Notification),
+    /// A session rename. Renames are metadata (like the header `label`), NOT
+    /// transcript events, so they are persisted as their own record rather than
+    /// pushed through the event_log — which keeps them out of the replay stream
+    /// and immune to event-log compaction. `recover_one` applies the LAST
+    /// rename over the header label. Older binaries that don't know this variant
+    /// skip it on the `serde` error path and fall back to the header label
+    /// (graceful downgrade), so no version bump is needed.
+    Rename { label: String },
 }
 
 /// On-disk WAL format version.
@@ -137,6 +145,17 @@ impl SessionWal {
         Ok(())
     }
 
+    /// Persist a session rename. Always fsynced: a rename is a small, rare,
+    /// user-visible metadata change, and losing it on a crash is exactly the
+    /// bug this record exists to prevent. Recovery applies the last such record
+    /// over the header label.
+    pub fn append_rename(&mut self, label: &str) -> std::io::Result<()> {
+        self.write_record(&WalRecord::Rename {
+            label: label.to_string(),
+        })?;
+        self.file.sync_data()
+    }
+
     /// Delete the WAL file — the session was explicitly closed, so its
     /// transcript should not be recovered on the next start.
     pub fn remove(self) {
@@ -212,6 +231,10 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
 
     let mut header: Option<(String, String, PathBuf, PermissionMode)> = None;
     let mut event_log: Vec<Notification> = Vec::new();
+    // The most recent rename, if any. Applied over the header label so a
+    // session recovered after a server restart keeps its renamed name rather
+    // than reverting to the creation-time label.
+    let mut renamed_label: Option<String> = None;
 
     for line in reader.lines() {
         let line = match line {
@@ -259,12 +282,15 @@ pub fn recover_one(path: &Path) -> std::io::Result<Option<RecoveredSession>> {
                 header = Some((server_session_id, label, cwd, permission_mode));
             }
             WalRecord::Event(note) => event_log.push(note),
+            WalRecord::Rename { label } => renamed_label = Some(label),
         }
     }
 
-    let Some((server_session_id, label, cwd, permission_mode)) = header else {
+    let Some((server_session_id, header_label, cwd, permission_mode)) = header else {
         return Ok(None);
     };
+    // Last rename wins over the creation-time header label.
+    let label = renamed_label.unwrap_or(header_label);
 
     // Re-derive the agent resume id from the last SessionAttached. KEPT as a
     // control variant in the collapse (spec §1) precisely so this recovery
@@ -385,6 +411,51 @@ mod tests {
         assert_eq!(s.turns, 1);
         // header is not an event; 4 events were appended.
         assert_eq!(s.event_log.len(), 4);
+    }
+
+    #[test]
+    fn rename_survives_recovery_overriding_header_label() {
+        // The "names keep getting forgotten" regression: a session renamed
+        // after creation must recover under its NEW name, not the header's
+        // creation-time label.
+        let dir = tmp_dir("rename");
+        {
+            let mut wal = SessionWal::create(
+                &dir,
+                "s1",
+                "claude-1",
+                Path::new("/tmp/work"),
+                PermissionMode::Yolo,
+            )
+            .unwrap();
+            wal.append(&attached("acp-123"), false).unwrap();
+            wal.append_rename("first-rename").unwrap();
+            wal.append(&chunk("hi"), false).unwrap();
+            // Last rename wins.
+            wal.append_rename("final-name").unwrap();
+        }
+        let recovered = recover_all(&dir);
+        assert_eq!(recovered.len(), 1);
+        let s = &recovered[0];
+        assert_eq!(s.label, "final-name");
+        // Rename records are metadata, not transcript events: the event_log
+        // holds only the two real events (attached + chunk).
+        assert_eq!(s.event_log.len(), 2);
+    }
+
+    #[test]
+    fn header_label_kept_when_no_rename() {
+        // Guard the non-renamed path: absent any Rename record, the header
+        // label is used unchanged.
+        let dir = tmp_dir("no-rename");
+        {
+            let mut wal =
+                SessionWal::create(&dir, "s9", "keep-me", Path::new("/tmp"), PermissionMode::Yolo)
+                    .unwrap();
+            wal.append(&chunk("x"), false).unwrap();
+        }
+        let recovered = recover_all(&dir);
+        assert_eq!(recovered[0].label, "keep-me");
     }
 
     #[test]
