@@ -1774,6 +1774,22 @@ impl AgentViewModel {
         Self::default()
     }
 
+    /// Drop the theme-dependent caches so the next render re-resolves under the
+    /// CURRENT theme. Fenced code blocks + tables bake their span colors
+    /// (background + syntect foregrounds) into the parsed `RenderedBlock` at
+    /// parse time, and `block_cache` keys on content — not theme — and only
+    /// re-parses when the frozen line count changes. So after a theme toggle a
+    /// block parsed under the old theme keeps its stale colors (e.g. a Folio
+    /// light-on-light code box surviving into Nightfox). Clearing the block
+    /// cache + forcing the frozen-count guard to miss re-parses every block;
+    /// dropping `view_model_fp` forces the S1 flat-items rebuild that consumes
+    /// them. Call on `set_theme` for every live session.
+    pub(crate) fn invalidate_theme(&mut self) {
+        self.block_cache.clear();
+        self.block_cache_frozen_count = usize::MAX;
+        self.view_model_fp = None;
+    }
+
     /// Cache hit: return the memoized `Rc`s iff `fp` matches the fingerprint
     /// the cache was built at; `None` = miss → the caller rebuilds and calls
     /// [`store`](Self::store). The S1 cache decision is split into
