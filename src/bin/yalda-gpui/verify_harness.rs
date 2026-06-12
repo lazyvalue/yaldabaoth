@@ -2874,3 +2874,248 @@ fn cached_notify_from_render_is_parked(cx: &mut TestAppContext) {
         "an external (non-draw) notify must schedule exactly one redraw, got {after_external}"
     );
 }
+
+// ===================================================================
+// TICKET 021 — TranscriptView render-count regressions.
+//
+// The flagship invariants, asserted headlessly via the `cached_panel` render
+// counter (`perf_render_count("transcript")`). The GUI cannot be driven for
+// PAINT headlessly, so these prove RENDER-skip / render-fresh (the cache path),
+// NOT the on-screen pixels — the human runtime `sample` profile remains the
+// paint-thread ground truth (flagged in the ticket).
+//
+// Model (project.md component model): a chatbox keystroke moves no transcript
+// slice ⇒ the observe filter does NOT self-notify ⇒ the cached transcript's
+// render() is SKIPPED (count FLAT). A worksheet edit / stream chunk / tool
+// expand / theme/zoom moves a slice (or a global) ⇒ the view is notified
+// OUTSIDE the draw ⇒ the NEXT frame re-renders fresh (count +1), zero frames
+// late — including the FINAL append of a streaming burst (the rev-1 stale-tail
+// hazard).
+
+/// Boot a browser view, focus it, run a frame, install ONE bound agent slot,
+/// and return the focused session's id + entity. The first `render_agent`
+/// (driven by the next `run_until_parked`) lazily creates the `TranscriptView`.
+#[cfg(test)]
+fn boot_with_transcript<'a>(
+    cx: &'a mut TestAppContext,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    crate::SessionId,
+    gpui::Entity<crate::AgentSession>,
+) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+    // Dismiss the startup splash — it would otherwise short-circuit `render`
+    // before `render_agent` runs (wall-clock doesn't advance under
+    // `run_until_parked`, so the 1.5s deadline never expires headlessly).
+    let (id, session) = view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        let id = v.focused_bound_session().expect("bound session");
+        let ent = v.session_entity(id).expect("session entity");
+        cx.notify();
+        (id, ent)
+    });
+    (view, vcx, id, session)
+}
+
+/// (a) A chatbox keystroke re-renders the root chrome + compose, but the
+/// transcript's render() is SKIPPED: its count stays FLAT. This is finding #1
+/// (chatbox keystroke re-lays-out the static transcript) closed.
+#[gpui::test]
+fn transcript_021_chatbox_keystroke_is_render_flat(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (_view, vcx, _id, session) = boot_with_transcript(cx);
+
+    // First real frame: render_agent runs, creates + renders the transcript.
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+    assert!(base >= 1, "transcript must render at least once on first frame");
+
+    // A real chatbox keystroke mutates the COMPOSE editor (inside the
+    // `InputSurface::Chatbox`) and notifies the SESSION — but the transcript's
+    // observed seqs (transcript `edit_seq`, frozen/tools gen, cursor, …) read
+    // the *transcript* editor, which is untouched. So the observe filter must
+    // NOT self-notify, and the cached transcript's render() must be skipped.
+    // This is the slice-filter doing its job, not merely `cached()`.
+    for _ in 0..5 {
+        session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+            if let Some(cb) = s.state.input_surface.chatbox_mut() {
+                let len = cb.editor.document().rope().len_chars();
+                cb.editor.programmatic_insert(len, "x");
+            }
+            // The keystroke path notifies the session (mutation-site notify).
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    }
+    let after = crate::perf_render_count("transcript");
+    assert_eq!(
+        after, base,
+        "a chatbox keystroke (compose-only session mutation) must NOT re-render \
+         the cached transcript — the observe slice-filter sees no transcript slice \
+         move, so render() is skipped; count must stay flat ({base}), got {after}"
+    );
+}
+
+/// (b) A worksheet edit (a real session mutation + notify) busts the cache: the
+/// observe filter sees `edit_seq` move and self-notifies, so the NEXT frame
+/// re-renders the transcript exactly once.
+#[gpui::test]
+fn transcript_021_session_edit_busts_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (_view, vcx, _id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    // Mutate the session transcript at its mutation site (insert text + notify
+    // the session) — exactly what a worksheet keystroke / stream chunk does.
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state.editor.programmatic_insert(0, "hello from claude\n");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("transcript");
+    assert_eq!(
+        after,
+        base + 1,
+        "a session transcript edit must re-render the transcript exactly once \
+         on the next frame (base {base}), got {after}"
+    );
+}
+
+/// (b′) The STALE-TAIL case (the rev-1 hazard): a STREAMING BURST of chunks,
+/// where the FINAL append must also land a +1. Each chunk is a separate
+/// session.update+notify; the last one must not be stranded behind the cache.
+#[gpui::test]
+fn transcript_021_streaming_burst_final_append_renders(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (_view, vcx, _id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    let mut expected = crate::perf_render_count("transcript");
+
+    // Stream several chunks; assert the count advances on EACH, including the
+    // final append — there is no frame where a fresh chunk is left invisible.
+    for i in 0..4 {
+        session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+            s.state
+                .editor
+                .programmatic_insert(s.state.editor.document().rope().len_chars(), "chunk ");
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        expected += 1;
+        let now = crate::perf_render_count("transcript");
+        assert_eq!(
+            now, expected,
+            "streaming chunk #{i} must re-render the transcript (expected {expected}), got {now}"
+        );
+    }
+}
+
+/// (c) A tool-group expand toggle bumps `tools_gen`, which the observe filter
+/// watches ⇒ +1. Toggling expanded is the canonical tool-structure mutation.
+#[gpui::test]
+fn transcript_021_tool_expand_busts_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (_view, vcx, _id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state.tools.toggle_expanded("anchor-7");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("transcript");
+    assert_eq!(
+        after,
+        base + 1,
+        "a tool expand toggle (tools_gen bump) must re-render the transcript once \
+         (base {base}), got {after}"
+    );
+}
+
+/// (d) Theme and zoom are GLOBAL: their action handlers notify each live
+/// transcript view directly (event context). Each must yield +1.
+#[gpui::test]
+fn transcript_021_theme_and_zoom_bust_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    // Theme swap → notify_transcript_views(Refresh).
+    view.update(vcx, |v, cx| {
+        v.set_theme(crate::ThemeName::Nightfox, cx);
+    });
+    vcx.run_until_parked();
+    let after_theme = crate::perf_render_count("transcript");
+    assert_eq!(
+        after_theme,
+        base + 1,
+        "a theme swap must re-render the transcript once (base {base}), got {after_theme}"
+    );
+
+    // Zoom in → notify_transcript_views(TextStyle). Drive the scale setter
+    // directly (the `zoom_in` action handler is a thin wrapper over it that
+    // also needs a `&mut Window` we don't have headlessly).
+    view.update(vcx, |v, cx| {
+        v.set_text_scale(v.text_scale * crate::TEXT_SCALE_STEP, cx);
+    });
+    vcx.run_until_parked();
+    let after_zoom = crate::perf_render_count("transcript");
+    assert_eq!(
+        after_zoom,
+        after_theme + 1,
+        "a zoom-in must re-render the transcript once ({after_theme} -> got {after_zoom})"
+    );
+}
+
+/// (e) Follow-tail still reveals grown content: after a streaming append while
+/// following, the list's registered item count grows to match the freshly
+/// built flat-items (the reconcile + reveal path runs in TranscriptView's
+/// render). Reads the count through the view's `TranscriptScroll`.
+#[gpui::test]
+fn transcript_021_follow_tail_reveals_grown_content(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+
+    let count_before = view.update(vcx, |v, cx| {
+        v.transcript_views
+            .get(&id)
+            .map(|tv| tv.read(cx).scroll.list_item_count)
+            .unwrap_or(0)
+    });
+
+    // Append several lines (rows) while following (the default).
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, "line one\nline two\nline three\n");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    let count_after = view.update(vcx, |v, cx| {
+        v.transcript_views
+            .get(&id)
+            .map(|tv| tv.read(cx).scroll.list_item_count)
+            .unwrap_or(0)
+    });
+    assert!(
+        count_after > count_before,
+        "follow-tail: the transcript's registered item count must grow with the \
+         appended rows (before {count_before}, after {count_after})"
+    );
+}

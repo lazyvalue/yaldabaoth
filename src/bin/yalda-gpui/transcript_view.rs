@@ -1,0 +1,861 @@
+//! `TranscriptView` — the flagship ticket-021 widget: a per-session GPUI view
+//! entity that OWNS the transcript's scroll/list UI state, READS its
+//! `Entity<AgentSession>` directly in `render()`, and invalidates itself by
+//! OBSERVING that session (filtered by monotonic version counters). Embedded by
+//! `render_agent` via `cached_child` so a chatbox keystroke — which never moves
+//! any transcript slice — re-renders only the root chrome + compose, while the
+//! transcript's `render()` is skipped and its prepaint reused.
+//!
+//! # Why this is the durable fix (project.md root cause)
+//!
+//! `YaldaGpuiView` is the only GPUI entity, so any `cx.notify()` re-runs its
+//! whole render+layout tree. Moving the transcript into its own entity gives
+//! the framework per-session invalidation granularity for free: a transcript
+//! mutation notifies the session (mutation-site notify, timing-correct per fact
+//! 4), the view's `cx.observe(&session)` callback fires in effect flush (fact
+//! 5), and IF a slice this render reads actually moved it self-notifies — which
+//! is the ONLY thing that lands this view in `dirty_views` and busts the
+//! `cached()` reuse (facts 3/6). A keystroke in the compose box leaves every
+//! observed seq stable ⇒ no self-notify ⇒ render-skip.
+//!
+//! # Timing law (fact 4 — load-bearing)
+//!
+//! `render()` NEVER calls `cx.notify()`. Cache mutations the render performs
+//! (lines/highlight/view-model caches on `AgentSession`) go through
+//! `session.update(cx, …)` WITHOUT an inner notify — a plain mutation, not an
+//! invalidation. Invalidation happens only in the observe callback and at
+//! mutation sites, both outside the draw.
+//!
+//! # Stale-capture hazard (ticket 021 risk)
+//!
+//! A `cached()` hit reuses the prepaint, whose listeners captured the PRIOR
+//! render's data. Interactive rows (tool-group expand, links) therefore act via
+//! ids/indices resolved at EVENT time through the root `WeakEntity` —
+//! never via captured row data.
+
+use super::*;
+
+/// The slice-version watermark the observe filter compares across renders. Each
+/// field is a monotonic (or monotonic-equivalent) counter for one input the
+/// transcript `render()` reads; the observe callback recomputes the live values
+/// and self-notifies iff ANY differs from what was last rendered, logging which
+/// slice moved for the `YALDA_PERF` notify-reason counter.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct TranscriptSeqs {
+    /// Document `edit_seq` — text content (insert/delete; freezing via
+    /// `freeze_as_user_turn` is an edit so it bumps this too).
+    pub(crate) edit_seq: u64,
+    /// Frozen-line set fingerprint — covers the pure `add_frozen_lines` path
+    /// (worksheet commit) that does NOT bump `edit_seq`. See
+    /// `AgentState::frozen_gen`.
+    pub(crate) frozen_gen: u64,
+    /// Tool-structure generation — `calls`/`order`/`expanded` mutations (a tool
+    /// start, an update, an expand toggle). See `AgentState::tools_gen`.
+    pub(crate) tools_gen: u64,
+    /// Transcript cursor line — the focused row's bar/caret.
+    pub(crate) cursor_line: usize,
+    /// Transcript cursor column — the caret position within its row.
+    pub(crate) cursor_col: usize,
+    /// Selection range projected onto the transcript (highlight bands).
+    pub(crate) selection: Option<((usize, usize), (usize, usize))>,
+    /// Whether a reply is streaming — drives the thinking indicator's presence
+    /// (its pulse animation is frame-driven; this only gates appear/disappear).
+    pub(crate) awaiting: bool,
+    /// Worksheet cursor-reveal intent latched by a key handler. A toggle to
+    /// `true` must re-render so the reveal is consumed.
+    pub(crate) pending_reveal: bool,
+}
+
+impl TranscriptSeqs {
+    /// Read the live slice versions off an `AgentState`. Cheap: `frozen_gen` is
+    /// O(1) (len + last range), the rest are field reads.
+    pub(crate) fn of(c: &AgentState) -> Self {
+        let cursor = c.editor.cursor();
+        Self {
+            edit_seq: c.editor.document().edit_seq(),
+            frozen_gen: c.frozen_gen(),
+            tools_gen: c.tools_gen(),
+            cursor_line: cursor.line,
+            cursor_col: cursor.col,
+            selection: c.editor.selection_range(),
+            awaiting: c.turn_phase.is_awaiting(),
+            pending_reveal: c.pending_reveal_cursor,
+        }
+    }
+
+    /// Which slice moved between `self` (last rendered) and `now`. Returns the
+    /// `MissReason` to log, or `None` if the slice the render reads is
+    /// unchanged (⇒ no self-notify, ⇒ cache reuse).
+    pub(crate) fn diff_reason(&self, now: &TranscriptSeqs) -> Option<MissReason> {
+        if self == now {
+            None
+        } else {
+            // All transcript invalidations are "our slice moved"; the gpui-
+            // internal Bounds/TextStyle reasons are stamped elsewhere (resize,
+            // zoom). One label is enough for the audit trail.
+            Some(MissReason::Dirtied)
+        }
+    }
+}
+
+/// Per-session transcript widget (ticket 021). One per session; the 1:1
+/// session↔tile invariant means multi-tile splits need no extra logic.
+pub(crate) struct TranscriptView {
+    /// The domain model, read directly in `render()` via `.read(cx)` — no
+    /// snapshot copy, no push protocol. Also observed at construction.
+    pub(crate) session: Entity<AgentSession>,
+    /// Weak handle to the root view: render reads it for the GLOBAL theme /
+    /// fonts / zoom (not session state), and interactive rows re-enter through
+    /// it at event time (stale-capture-safe — ids resolved on click).
+    pub(crate) root: WeakEntity<YaldaGpuiView>,
+    /// The scroll/list UI state moved out of `AgentState` (widgets own UI
+    /// state; models own domain state).
+    pub(crate) scroll: TranscriptScroll,
+    /// The slice versions this view last rendered. The observe callback
+    /// compares against the live values and self-notifies only on a real move.
+    pub(crate) last_rendered: TranscriptSeqs,
+    /// Stable perf-counter label (per session) so headless render-count
+    /// assertions and the `YALDA_PERF` trace can name this transcript.
+    pub(crate) perf_label: &'static str,
+}
+
+impl TranscriptView {
+    /// Construct a transcript view for `session` and register the
+    /// `cx.observe(&session)` subscription that self-notifies on a slice move.
+    /// The follow-output scroll handler is wired onto the fresh `ListState`.
+    pub(crate) fn new(
+        session: Entity<AgentSession>,
+        root: WeakEntity<YaldaGpuiView>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let scroll = TranscriptScroll::new();
+        // Wire the follow-output handler: the session owns the `follow_output`
+        // intent flag; the list lives here.
+        {
+            let follow = session.read(cx).follow_output.clone();
+            setup_list_follow_handler(&scroll.list_state, &follow);
+        }
+        // INVALIDATION (project.md facts 4–5): observe the session; the callback
+        // runs in effect flush (outside the draw). Compare the slice versions
+        // the render reads against what was last rendered, and self-notify ONLY
+        // when a slice moved — logging the reason for the notify counter.
+        cx.observe(&session, |this: &mut TranscriptView, session, cx| {
+            let now = TranscriptSeqs::of(&session.read(cx).state);
+            if let Some(reason) = this.last_rendered.diff_reason(&now) {
+                record_notify(this.perf_label, reason);
+                cx.notify();
+            }
+        })
+        .detach();
+        Self {
+            session,
+            root,
+            scroll,
+            last_rendered: TranscriptSeqs::default(),
+            perf_label: "transcript",
+        }
+    }
+}
+
+impl Render for TranscriptView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        record_render(self.perf_label);
+        // Build the transcript body first; it consumes the worksheet
+        // `pending_reveal_cursor` intent inside its session update. THEN stamp
+        // `last_rendered` from a fresh read so the observe filter compares
+        // against the POST-render state (otherwise consuming `pending_reveal`
+        // mid-render would leave the watermark stale and trigger one spurious
+        // re-render on the next notify). Never notifies (timing law, fact 4).
+        let body = self.build_body(cx);
+        self.last_rendered = TranscriptSeqs::of(&self.session.read(cx).state);
+        body
+    }
+}
+
+impl TranscriptView {
+    /// Build the virtualised transcript list element (the ticket-021 seam: the
+    /// row-data build + `render_fn` + `gpui::list` relocated here from
+    /// `render_agent`). Reads GLOBAL theme/fonts off the root view; reads + (for
+    /// caches only) mutates the session via `session.update` WITHOUT notifying
+    /// (timing law); reconciles + re-reveals through `self.scroll`.
+    fn build_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // The root view holds the GLOBAL theme / fonts / zoom (not session
+        // state). If it's gone (teardown), render an empty sized placeholder —
+        // never panic on a transient weak miss.
+        let Some(root_ent) = self.root.upgrade() else {
+            return div().size_full().into_any_element();
+        };
+
+        // Snapshot the root-owned render inputs into OWNED locals, releasing the
+        // root read borrow before any `session.update` (which needs `&mut cx`).
+        let RootSnapshot {
+            theme,
+            agent_theme: at_snap,
+            code_font,
+            body_font,
+            editor_fg,
+            base_style,
+            editor_fg_u32,
+            frozen_fg_u32,
+            syntect_hl,
+        } = {
+            let root = root_ent.read(cx);
+            RootSnapshot {
+                theme: root.theme.clone(),
+                agent_theme: root.theme.agent.clone(),
+                code_font: root.code_font.clone(),
+                body_font: root.body_font.clone(),
+                editor_fg: root.editor_fg(),
+                base_style: root.theme.paragraph,
+                editor_fg_u32: ncolor_to_u32(root.theme.editor_fg, DEFAULT_FG),
+                frozen_fg_u32: ncolor_to_u32(root.theme.agent.frozen_fg, DEFAULT_FG),
+                syntect_hl: root.syntect_hl.clone(),
+            }
+        };
+
+        // Theme-derived colors used by the row builder (computed from the
+        // snapshot, no root borrow held).
+        let cursor_color: Hsla = nc(at_snap.cursor);
+        let dim_fg: Hsla = nc(at_snap.dim);
+        let frozen_bar: Hsla = nc(at_snap.frozen_bar);
+        let user_bar: Hsla = nc(at_snap.user_bar);
+        let claude_turn_bg: Hsla = nc(at_snap.agent_turn_bg);
+        let user_turn_bg: Hsla = nc(at_snap.user_turn_bg);
+
+        // Weak handle for the interactive rows' click listeners. Captured here
+        // and resolved (with event-time ids) on click — stale-capture-safe.
+        let weak_self = self.root.clone();
+
+        // ── Heavy prep inside the session update (cache mutation only; NO
+        // notify — timing law). Returns the snapshots the render closure needs
+        // plus the values reconcile/reveal consume. ──
+        let session = self.session.clone();
+        let TranscriptPrep {
+            flat_items_arc,
+            gutter_tag_snap,
+            lines_snap,
+            hl_snap,
+            tool_calls_snap,
+            expanded_snap,
+            frozen_lines_snap,
+            lockable_through_snap,
+            sel_snap,
+            mode_snap,
+            cursor_line,
+            cursor_col,
+            turn_started_snap,
+            last_event_at_snap,
+            new_count,
+            edit_seq,
+            block_ranges_active,
+            follow_tail,
+            pending_reveal_line,
+        } = session.update(cx, |sp, _scx| {
+            let c: &mut AgentState = &mut sp.state;
+
+            let cursor = c.editor.cursor();
+            let cursor_line = cursor.line;
+            let cursor_col = cursor.col;
+            let line_count = c.editor.document().line_count();
+            let edit_seq = c.editor.document().edit_seq();
+
+            // Perf: only re-extract the per-line transcript text when the
+            // document actually changed (cached `Rc` reuse on idle frames).
+            let lines_rc: std::rc::Rc<Vec<String>> = if c.lines_cache_seq == edit_seq {
+                c.lines_cache.clone()
+            } else {
+                let built: Vec<String> = (0..line_count.max(1))
+                    .map(|i| {
+                        c.editor
+                            .document()
+                            .line_text(i)
+                            .trim_end_matches('\n')
+                            .replace('\t', "    ")
+                    })
+                    .collect();
+                let rc = std::rc::Rc::new(built);
+                c.lines_cache = rc.clone();
+                c.lines_cache_seq = edit_seq;
+                rc
+            };
+            let lines: &Vec<String> = &lines_rc;
+
+            // Per-line highlight (incremental cache or full bypass).
+            let hl_snap: std::rc::Rc<Vec<std::rc::Rc<LineHl>>> = if hl_cache_enabled() {
+                c.highlight_cache
+                    .snapshot_syn(lines, &theme, edit_seq, &syntect_hl)
+            } else {
+                let raw = highlight_markdown_lines_syn(lines, &theme, &syntect_hl);
+                let stripped = highlight_markdown_lines_stripped_syn(lines, &theme, &syntect_hl);
+                std::rc::Rc::new(
+                    raw.into_iter()
+                        .zip(stripped)
+                        .map(|(raw, stripped)| std::rc::Rc::new(LineHl { raw, stripped }))
+                        .collect(),
+                )
+            };
+
+            // Frozen ranges drive both the structural-block cache and the
+            // view-model fingerprint.
+            let frozen_ranges: Vec<(usize, usize)> = c.editor.frozen_lines().to_vec();
+            let frozen_line_count: usize = frozen_ranges.iter().map(|(s, e)| e - s).sum();
+
+            // ── View-model memoization (S1) ──
+            let view_model_fp: u64 = c.view_model_fingerprint(line_count, frozen_line_count);
+            let (flat_items_arc, gutter_tag_snap) = match c.view_model.cached(view_model_fp) {
+                Some(hit) => hit,
+                None => rebuild_agent_view_model(
+                    c,
+                    lines,
+                    &frozen_ranges,
+                    frozen_line_count,
+                    &theme,
+                    view_model_fp,
+                ),
+            };
+
+            let new_count = flat_items_arc.len();
+            let block_ranges_active = !c.block_ranges.is_empty();
+            let follow_tail = c.follow_tail();
+
+            // Worksheet cursor-reveal intent (INV-RV): consume here, return the
+            // O(1) target so `self.scroll` can issue the scroll after the update.
+            let pending_reveal_line = if c.pending_reveal_cursor {
+                c.pending_reveal_cursor = false;
+                let cl = c.editor.cursor().line;
+                Some(c.view_model.item_for_line(cl))
+            } else {
+                None
+            };
+
+            // Snapshots for the render closure (O(1) pointer clones).
+            let lines_snap = lines_rc.clone();
+            let tool_calls_snap = c.tools.calls_snapshot();
+            let expanded_snap = c.tools.expanded_snapshot();
+            let lockable_through_snap = c.editor.lockable_through_line();
+            let sel_snap = c.editor.selection_range();
+            let mode_snap = c.mode;
+            let turn_started_snap = c.turn_phase.turn_started();
+            let last_event_at_snap = c.turn_phase.last_event_at();
+
+            TranscriptPrep {
+                flat_items_arc,
+                gutter_tag_snap,
+                lines_snap,
+                hl_snap,
+                tool_calls_snap,
+                expanded_snap,
+                frozen_lines_snap: frozen_ranges,
+                lockable_through_snap,
+                sel_snap,
+                mode_snap,
+                cursor_line,
+                cursor_col,
+                turn_started_snap,
+                last_event_at_snap,
+                new_count,
+                edit_seq,
+                block_ranges_active,
+                follow_tail,
+                pending_reveal_line,
+            }
+        });
+
+        // ── Reconcile (count parity → splice/reset) + follow-scroll, on the
+        // view-owned `TranscriptScroll`. The session borrow is dropped. ──
+        self.scroll
+            .reconcile_list(block_ranges_active, new_count, edit_seq);
+        debug_assert!(
+            self.scroll.list_item_count == flat_items_arc.len(),
+            "list_item_count ({}) out of sync with flat_items ({})",
+            self.scroll.list_item_count,
+            flat_items_arc.len(),
+        );
+        self.scroll
+            .reveal_tail_if_following(follow_tail, edit_seq, new_count);
+        if let Some(target) = pending_reveal_line {
+            self.scroll.list_state.scroll_to_reveal_item(target);
+        }
+
+        // Helper: "is this line in a frozen range" — inlined into the closure.
+        let is_frozen_at = move |line_idx: usize, ranges: &[(usize, usize)]| -> bool {
+            ranges.iter().any(|&(s, e)| line_idx >= s && line_idx < e)
+        };
+
+        let render_fn = {
+            let flat_items = flat_items_arc.clone();
+            let weak_self = weak_self.clone();
+            let lines_snap = lines_snap.clone();
+            let hl_snap = hl_snap.clone();
+            let frozen_lines_snap = frozen_lines_snap.clone();
+            let tool_calls_snap = tool_calls_snap.clone();
+            let expanded_snap = expanded_snap.clone();
+            let code_font_snap = code_font.clone();
+            let body_font_snap = body_font.clone();
+            let theme_snap = theme.clone();
+            let at_snap = at_snap.clone();
+            let self_editor_fg = editor_fg;
+            move |idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
+                let item = &flat_items[idx];
+                match item {
+                    FlatItem::Line(line_idx) => {
+                        let line_idx = *line_idx;
+                        let line_str = lines_snap.get(line_idx).cloned().unwrap_or_default();
+                        let is_frozen = is_frozen_at(line_idx, &frozen_lines_snap);
+                        let is_locked = line_idx < lockable_through_snap;
+                        let _ = is_locked; // kept for future visual cue parity
+
+                        let mut segs: Vec<Segment> = match hl_snap.get(line_idx) {
+                            Some(hl) if is_frozen => hl.stripped.clone(),
+                            Some(hl) => hl.raw.clone(),
+                            None => vec![(line_str.clone(), base_style)],
+                        };
+                        let author_tint: NColor = if is_frozen {
+                            at_snap.agent_tint
+                        } else {
+                            at_snap.user_tint
+                        };
+                        for (_text, style) in segs.iter_mut() {
+                            if *style == base_style {
+                                *style = style.fg(author_tint);
+                            }
+                        }
+                        if let Some(sel) = sel_snap {
+                            let line_chars = line_str.chars().count();
+                            if let Some((s, e_col)) =
+                                line_selection_range(sel, line_idx, line_chars)
+                                && e_col > s
+                            {
+                                segs = apply_selection_bg(&segs, s, e_col, at_snap.selection_bg);
+                            }
+                        }
+
+                        let line_base_fg = if is_frozen {
+                            frozen_fg_u32
+                        } else {
+                            editor_fg_u32
+                        };
+                        let content = build_wrapped_line(
+                            &segs,
+                            &line_str,
+                            line_idx == cursor_line,
+                            cursor_col,
+                            mode_snap,
+                            cursor_color,
+                            base_style,
+                            line_base_fg,
+                            &code_font_snap,
+                            &code_font_snap,
+                        );
+
+                        let line_has_content = !line_str.trim().is_empty();
+                        let bar_color: Hsla = if is_frozen {
+                            frozen_bar
+                        } else if line_has_content {
+                            user_bar
+                        } else {
+                            rgba(0x00000000).into()
+                        };
+                        let line_text_color = if is_frozen {
+                            nc(at_snap.frozen_fg)
+                        } else {
+                            self_editor_fg
+                        };
+
+                        let tag = gutter_tag_snap.get(line_idx).copied().flatten();
+                        let prev_tag = if line_idx > 0 {
+                            gutter_tag_snap.get(line_idx - 1).copied().flatten()
+                        } else {
+                            None
+                        };
+                        let is_first_in_turn = tag != prev_tag;
+                        let (label_text, label_color): (SharedString, Hsla) = if !is_first_in_turn {
+                            ("   ".into(), dim_fg)
+                        } else {
+                            match tag {
+                                Some(TurnId::Llm(n)) => (format!("{:>3}", n).into(), frozen_bar),
+                                Some(TurnId::User(n)) => {
+                                    (format!("{:>3}", format!("U{}", n)).into(), user_bar)
+                                }
+                                Some(TurnId::Tool(n)) => (
+                                    format!("{:>3}", format!("T{}", n)).into(),
+                                    nc(at_snap.tool_label),
+                                ),
+                                Some(TurnId::System) | None => ("   ".into(), dim_fg),
+                            }
+                        };
+                        let card_bg: Hsla = match tag {
+                            Some(TurnId::Llm(_)) => claude_turn_bg,
+                            Some(TurnId::User(_)) => user_turn_bg,
+                            Some(TurnId::Tool(_)) | Some(TurnId::System) | None => {
+                                rgba(0x00000000).into()
+                            }
+                        };
+                        let row_bg: Hsla = if line_idx == cursor_line {
+                            let mut h = nc(at_snap.dim);
+                            h.a = 0.2;
+                            h
+                        } else {
+                            card_bg
+                        };
+
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_start()
+                            .w_full()
+                            .py(px(2.0))
+                            .bg(row_bg)
+                            .text_color(line_text_color)
+                            .child(
+                                div()
+                                    .w(px(28.0))
+                                    .flex_none()
+                                    .text_size(px(10.0))
+                                    .text_color(label_color)
+                                    .font_family(code_font_snap.clone())
+                                    .pr_1()
+                                    .child(label_text),
+                            )
+                            .child(div().w(px(3.0)).flex_none().bg(bar_color).mr_2())
+                            .child(content)
+                            .into_any_element()
+                    }
+                    FlatItem::ToolGroup { anchor_line, ids } => {
+                        let anchor = *anchor_line;
+                        let calls: Vec<&yalda::acp_channel::ToolCall> = ids
+                            .iter()
+                            .filter_map(|id| tool_calls_snap.get(id))
+                            .collect();
+                        if calls.is_empty() {
+                            return div().h(px(0.0)).into_any_element();
+                        }
+                        let group_expanded = expanded_snap.contains(&anchor.to_string());
+                        let count = calls.len();
+
+                        use yalda::acp_channel::ToolCallStatus;
+                        let has_failed = calls.iter().any(|tc| tc.status == ToolCallStatus::Failed);
+                        let has_in_progress = calls
+                            .iter()
+                            .any(|tc| tc.status == ToolCallStatus::InProgress);
+                        let all_completed = calls
+                            .iter()
+                            .all(|tc| tc.status == ToolCallStatus::Completed);
+                        let (group_glyph, group_color): (&str, Hsla) = if has_failed {
+                            ("✗", nc(at_snap.tool_failed))
+                        } else if has_in_progress {
+                            ("◐", nc(at_snap.tool_in_progress))
+                        } else if all_completed {
+                            ("●", nc(at_snap.tool_completed))
+                        } else {
+                            ("○", nc(at_snap.tool_pending))
+                        };
+
+                        let header_title: String = if count == 1 {
+                            let tc = calls[0];
+                            let base = if tc.title.is_empty() {
+                                "(tool)".to_string()
+                            } else {
+                                tc.title.clone()
+                            };
+                            if let Some(detail) = tool_inline_detail(tc) {
+                                format!("{} {}", base, detail)
+                            } else {
+                                base
+                            }
+                        } else {
+                            let mut order: Vec<String> = Vec::new();
+                            let mut counts: std::collections::HashMap<String, usize> =
+                                std::collections::HashMap::new();
+                            for tc in &calls {
+                                let label = tool_type_label(tc);
+                                if !counts.contains_key(&label) {
+                                    order.push(label.clone());
+                                }
+                                *counts.entry(label).or_insert(0) += 1;
+                            }
+                            order
+                                .iter()
+                                .map(|l| format!("{} {}", counts[l], l))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+
+                        let single_policy = if count == 1 {
+                            Some(tool_render_policy(calls[0]))
+                        } else {
+                            None
+                        };
+                        let expandable = if count > 1 {
+                            true
+                        } else {
+                            !matches!(single_policy, Some(ToolRenderPolicy::HeaderOnly))
+                        };
+                        let arrow = if !expandable {
+                            " "
+                        } else if group_expanded {
+                            "▼"
+                        } else {
+                            "▶"
+                        };
+
+                        let anchor_str = anchor.to_string();
+                        let weak = weak_self.clone();
+                        let click_id = anchor_str.clone();
+                        let mut header_row = div()
+                            .id(SharedString::from(format!("tool-group-{}", anchor)))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .py(px(6.0))
+                            .px_2()
+                            .child(div().text_color(dim_fg).child(arrow))
+                            .child(div().text_color(group_color).child(group_glyph))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_color(self_editor_fg)
+                                    .text_size(px(12.0))
+                                    .child(header_title),
+                            );
+
+                        if expandable {
+                            header_row = header_row.cursor_pointer().on_click(
+                                move |_ev: &gpui::ClickEvent,
+                                      _w: &mut Window,
+                                      app: &mut GpuiApp| {
+                                    // STALE-CAPTURE SAFE: the id is resolved at
+                                    // event time and toggled through the root,
+                                    // never via captured row data.
+                                    let id = click_id.clone();
+                                    let _ = weak.update(app, |this, cx| {
+                                        if let Some(mut c) = this.agent_mut(cx) {
+                                            c.tools.toggle_expanded(&id);
+                                        }
+                                        cx.notify();
+                                    });
+                                },
+                            );
+                        }
+
+                        let mut block = div()
+                            .flex()
+                            .flex_col()
+                            .mt(px(16.0))
+                            .mb(px(8.0))
+                            .mx_4()
+                            .child(header_row);
+
+                        if group_expanded && expandable {
+                            if count == 1 {
+                                let tc = calls[0];
+                                block = append_tool_body(
+                                    block,
+                                    tc,
+                                    single_policy.unwrap_or(ToolRenderPolicy::Full),
+                                    &code_font_snap,
+                                    &at_snap,
+                                );
+                            } else {
+                                for tc in &calls {
+                                    let expanded_detail =
+                                        expanded_snap.contains(&tc.tool_call_id.0.to_string());
+                                    block = block.child(build_tool_block_with_weak(
+                                        tc,
+                                        expanded_detail,
+                                        &code_font_snap,
+                                        weak_self.clone(),
+                                        &at_snap,
+                                    ));
+                                }
+                            }
+                        }
+
+                        block.into_any_element()
+                    }
+                    FlatItem::Block(rendered_block) => {
+                        let ctx = RenderCtx {
+                            theme: &theme_snap,
+                            body_font: body_font_snap.clone(),
+                            code_font: code_font_snap.clone(),
+                            text_scale: 1.0,
+                            cursor_block: None,
+                            doc_selection: None,
+                            line_layouts: None,
+                            current_block: None,
+                            weak_view: None,
+                            doc_dir: None,
+                            block_count: 0,
+                        };
+                        let inner = block_inner(&ctx, rendered_block);
+                        div()
+                            .mt(px(4.0))
+                            .mb(px(4.0))
+                            .child(inner)
+                            .into_any_element()
+                    }
+                    FlatItem::TurnHeader { role } => {
+                        let (label, accent): (&str, Hsla) = match role {
+                            TurnRole::Claude => ("Claude", nc(at_snap.turn_header_agent)),
+                            TurnRole::User => ("You", nc(at_snap.turn_header_user)),
+                        };
+                        let rule_color = nc(at_snap.turn_rule);
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .w_full()
+                            .pt(px(32.0))
+                            .pb(px(8.0))
+                            .px_4()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(accent)
+                                    .font_weight(FontWeight::BOLD)
+                                    .font_family(body_font_snap.clone())
+                                    .child(SharedString::from(label)),
+                            )
+                            .child(div().flex_1().h(px(1.0)).bg(rule_color))
+                            .into_any_element()
+                    }
+                    FlatItem::ThinkingIndicator => {
+                        let phase = if let Some(t) = turn_started_snap {
+                            let ms = t.elapsed().as_millis() as f64;
+                            ((ms / 750.0).sin() * 0.5 + 0.5) as f32
+                        } else {
+                            1.0
+                        };
+                        let alpha = 0.3 + phase * 0.7;
+
+                        const STALL_WARN_S: u64 = 30;
+                        let elapsed_s = turn_started_snap
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let quiet_s = last_event_at_snap
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let fmt_ms = |s: u64| format!("{}:{:02}", s / 60, s % 60);
+                        let stalled = quiet_s >= STALL_WARN_S;
+
+                        let dot_color = if stalled {
+                            nc(at_snap.warm_accent)
+                        } else {
+                            Hsla {
+                                h: 0.53,
+                                s: 0.9,
+                                l: 0.76,
+                                a: alpha,
+                            }
+                        };
+                        let (label, label_color) = if stalled {
+                            (
+                                format!(
+                                    "No reply for {} (running {}) — the API may be overloaded. ⌘. to stop · ⌘. again to force-restart",
+                                    fmt_ms(quiet_s),
+                                    fmt_ms(elapsed_s),
+                                ),
+                                nc(at_snap.warm_accent),
+                            )
+                        } else {
+                            (
+                                format!("Thinking\u{2026} {}", fmt_ms(elapsed_s)),
+                                Hsla {
+                                    h: 0.0,
+                                    s: 0.0,
+                                    l: 0.6,
+                                    a: alpha,
+                                },
+                            )
+                        };
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_start()
+                            .w_full()
+                            .pt_3()
+                            .pb_2()
+                            .pl_1()
+                            .pr_4()
+                            .gap_2()
+                            .child(div().text_size(px(14.0)).text_color(dot_color).child("●"))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(12.0))
+                                    .text_color(label_color)
+                                    .font_family(body_font_snap.clone())
+                                    .child(SharedString::from(label)),
+                            )
+                            .into_any_element()
+                    }
+                }
+            }
+        };
+
+        // The transcript body fills the cached slot (`cached_child` bakes in
+        // `size_full`, but the inner list still needs to fill). Default
+        // (visible-only) measuring — NOT `Auto` (which measures every item every
+        // frame): the body parent is `flex_1().min_h_0()` so the list fills the
+        // viewport and scrolls without sizing to content.
+        div()
+            .id("claude-body")
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h_0()
+            .px_6()
+            .py_3()
+            .text_size(px(13.0))
+            .font_family(code_font.clone())
+            .text_color(editor_fg)
+            .child(
+                gpui::list(self.scroll.list_state.clone(), render_fn)
+                    .flex_1()
+                    .w_full(),
+            )
+            .into_any_element()
+    }
+}
+
+/// Owned snapshot of the root view's GLOBAL render inputs (theme / fonts /
+/// zoom), taken before the session update releases the root borrow.
+struct RootSnapshot {
+    theme: Theme,
+    agent_theme: yalda::theme::AgentTheme,
+    code_font: SharedString,
+    body_font: SharedString,
+    editor_fg: Hsla,
+    base_style: NStyle,
+    editor_fg_u32: u32,
+    frozen_fg_u32: u32,
+    syntect_hl: std::rc::Rc<yalda::highlight::Highlighter>,
+}
+
+/// Everything the row-render closure + reconcile/reveal consume, computed inside
+/// the session update and returned so the borrow can end before the list builds.
+struct TranscriptPrep {
+    flat_items_arc: std::rc::Rc<Vec<FlatItem>>,
+    gutter_tag_snap: std::rc::Rc<Vec<Option<TurnId>>>,
+    lines_snap: std::rc::Rc<Vec<String>>,
+    hl_snap: std::rc::Rc<Vec<std::rc::Rc<LineHl>>>,
+    tool_calls_snap:
+        std::rc::Rc<std::collections::HashMap<ToolCallKey, yalda::acp_channel::ToolCall>>,
+    expanded_snap: std::rc::Rc<std::collections::HashSet<String>>,
+    frozen_lines_snap: Vec<(usize, usize)>,
+    lockable_through_snap: usize,
+    sel_snap: Option<((usize, usize), (usize, usize))>,
+    mode_snap: EditMode,
+    cursor_line: usize,
+    cursor_col: usize,
+    turn_started_snap: Option<std::time::Instant>,
+    last_event_at_snap: Option<std::time::Instant>,
+    new_count: usize,
+    edit_seq: u64,
+    block_ranges_active: bool,
+    follow_tail: bool,
+    pending_reveal_line: Option<usize>,
+}

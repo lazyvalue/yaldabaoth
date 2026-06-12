@@ -692,26 +692,30 @@ fn header_role_is_total_over_turn_id() {
 /// registered count equals the requested count.
 #[test]
 fn reconcile_list_keeps_count_in_sync_and_reports_growth() {
-    let mut st = AgentState::new_for_test();
-    assert_eq!(st.list_item_count, 0);
+    // Ticket 021: the `(list_state, list_item_count)` pair moved out of
+    // `AgentState` into the `TranscriptScroll` UI-state struct owned by
+    // `TranscriptView`. The reconcile logic is unchanged and still pure-
+    // testable — `block_ranges_active` is now passed in rather than read off
+    // `AgentState`.
+    let mut sc = TranscriptScroll::new();
+    assert_eq!(sc.list_item_count, 0);
 
     // Growth: count rises, reports grew=true, splices.
-    assert!(st.reconcile_list_test(5), "0 -> 5 must report growth");
-    assert_eq!(st.list_item_count, 5, "count tracks the requested length");
+    assert!(sc.reconcile_list(false, 5, 0), "0 -> 5 must report growth");
+    assert_eq!(sc.list_item_count, 5, "count tracks the requested length");
 
     // No change: same count, reports grew=false, count unchanged.
-    assert!(!st.reconcile_list_test(5), "5 -> 5 is not growth");
-    assert_eq!(st.list_item_count, 5);
+    assert!(!sc.reconcile_list(false, 5, 0), "5 -> 5 is not growth");
+    assert_eq!(sc.list_item_count, 5);
 
     // Shrink: count falls, reports grew=false, resets.
-    assert!(!st.reconcile_list_test(2), "5 -> 2 is not growth");
-    assert_eq!(st.list_item_count, 2, "count tracks a shrink too");
+    assert!(!sc.reconcile_list(false, 2, 0), "5 -> 2 is not growth");
+    assert_eq!(sc.list_item_count, 2, "count tracks a shrink too");
 
     // With block ranges active, even growth resets (height cache can't be
     // spliced) — but parity must still hold.
-    st.block_ranges.push((0, 3));
-    assert!(st.reconcile_list_test(9));
-    assert_eq!(st.list_item_count, 9);
+    assert!(sc.reconcile_list(true, 9, 0));
+    assert_eq!(sc.list_item_count, 9);
 }
 
 /// F10 / INV-10 (block/line partition is total): a range
@@ -877,7 +881,13 @@ fn fingerprint_tracks_resolved_tool_anchor_line() {
 /// anyway, and must NOT re-request at the same `edit_seq` (idle ticks).
 #[test]
 fn reveal_tail_keys_on_content_growth_not_count() {
+    // Ticket 021: the reveal logic + the `last_scrolled_edit_seq` watermark
+    // moved to `TranscriptScroll`; `follow_tail()` (the follow DECISION) stays
+    // on `AgentState`. The caller threads `follow_tail()` + the document's
+    // `edit_seq` into `reveal_tail_if_following`, exactly as `TranscriptView`
+    // does in render. The behavior under test is unchanged.
     let mut st = AgentState::new_for_test();
+    let mut sc = TranscriptScroll::new();
     // new_for_test starts in Chatbox with follow_output = true, so the
     // follow decision is satisfied; we isolate the edit_seq/count behavior.
     assert!(st.follow_tail(), "Chatbox + follow_output should follow");
@@ -887,18 +897,18 @@ fn reveal_tail_keys_on_content_growth_not_count() {
 
     // First reveal at the current edit_seq: requested (watermark was MAX).
     assert!(
-        st.reveal_tail_if_following(count),
+        sc.reveal_tail_if_following(st.follow_tail(), seq0, count),
         "first reveal at a new edit_seq must be requested"
     );
     assert_eq!(
-        st.last_scrolled_edit_seq, seq0,
+        sc.last_scrolled_edit_seq, seq0,
         "reveal stamps the watermark to the current edit_seq"
     );
 
     // Idle tick — same edit_seq, same count: must NOT re-reveal (so a
     // user who scrolled up isn't yanked back every frame).
     assert!(
-        !st.reveal_tail_if_following(count),
+        !sc.reveal_tail_if_following(st.follow_tail(), seq0, count),
         "no content growth ⇒ no re-reveal at the same edit_seq"
     );
 
@@ -914,20 +924,21 @@ fn reveal_tail_keys_on_content_growth_not_count() {
     // Count is held constant (no new row) — the reveal must STILL fire,
     // keyed on the advanced edit_seq, not on a count delta.
     assert!(
-        st.reveal_tail_if_following(count),
+        sc.reveal_tail_if_following(st.follow_tail(), seq1, count),
         "intra-line content growth must re-reveal even with unchanged count"
     );
-    assert_eq!(st.last_scrolled_edit_seq, seq1);
+    assert_eq!(sc.last_scrolled_edit_seq, seq1);
 
     // A zero count never reveals (guards the `count - 1` underflow).
-    let seq2_before = st.last_scrolled_edit_seq;
+    let seq2_before = sc.last_scrolled_edit_seq;
     st.editor.programmatic_insert(0, "x");
+    let seq2 = st.editor.document().edit_seq();
     assert!(
-        !st.reveal_tail_if_following(0),
+        !sc.reveal_tail_if_following(st.follow_tail(), seq2, 0),
         "an empty list never reveals regardless of growth"
     );
     assert_eq!(
-        st.last_scrolled_edit_seq, seq2_before,
+        sc.last_scrolled_edit_seq, seq2_before,
         "a skipped reveal must not advance the watermark"
     );
 
@@ -936,8 +947,9 @@ fn reveal_tail_keys_on_content_growth_not_count() {
     st.follow_output.set(false);
     assert!(!st.follow_tail());
     st.editor.programmatic_insert(0, "y");
+    let seq3 = st.editor.document().edit_seq();
     assert!(
-        !st.reveal_tail_if_following(count),
+        !sc.reveal_tail_if_following(st.follow_tail(), seq3, count),
         "no reveal while the user has scrolled away from the tail"
     );
 }

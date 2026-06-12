@@ -76,6 +76,7 @@ mod highlight_cache;
 mod persist;
 mod render_blocks;
 mod screens;
+mod transcript_view;
 #[cfg(test)]
 mod verify_harness;
 pub(crate) use agent::*;
@@ -83,6 +84,7 @@ pub(crate) use agent_sessions::*;
 pub(crate) use cached_panel::*;
 pub(crate) use persist::*;
 pub(crate) use render_blocks::*;
+pub(crate) use transcript_view::*;
 mod workspace;
 
 pub(crate) use highlight_cache::{HighlightCache, LineHl};
@@ -101,7 +103,8 @@ pub(crate) use gpui::{
     LayoutId, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
     StrikethroughStyle, Styled, StyledText, Task, TextLayout, TextRun, TitlebarOptions,
-    UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, point, px, rgb, rgba, size,
+    UnderlineStyle, WeakEntity, Window, WindowBounds, WindowOptions, actions, div, point, px, rgb,
+    rgba, size,
 };
 
 pub(crate) use yalda::acp_channel::AcpChannelClient;
@@ -1578,8 +1581,11 @@ struct YaldaGpuiView {
     /// Next keystroke is looked up in tag_shortcuts.
     pending_tag_chord: Option<char>,
     /// Shared syntect highlighter for code block syntax coloring in Edit Mode
-    /// and the agent transcript tile. Loaded once at startup.
-    syntect_hl: yalda::highlight::Highlighter,
+    /// and the agent transcript tile. Loaded once at startup. `Rc` so each
+    /// `TranscriptView` (ticket 021) can hold a cheap clone for its highlight
+    /// pass — the `Highlighter` owns a full `SyntaxSet`, far too costly to deep-
+    /// clone per render; swapped wholesale (not mutated in place) on theme change.
+    syntect_hl: Rc<yalda::highlight::Highlighter>,
     /// The ONE server-notification pump for this view (`start_server_pump`),
     /// singleton like the heartbeat above. It MUST live on the view, never on
     /// an agent slot: the pump owns the `SessionServerClient`'s notification
@@ -1594,6 +1600,13 @@ struct YaldaGpuiView {
     /// store; the store enforces strict 1:1 session↔sid and is the single
     /// source of truth for session existence (placement is the tiles).
     sessions: AgentSessions,
+    /// One [`TranscriptView`] per session (ticket 021): the cached, self-
+    /// invalidating transcript widget. Lazily created on the first
+    /// `render_agent` of a bound tile (the constructor registers the
+    /// `cx.observe(&session)` subscription) and dropped on
+    /// `AgentSessions::close`. The 1:1 session↔tile invariant means one view
+    /// per session suffices — multi-tile splits need no extra logic.
+    transcript_views: HashMap<SessionId, Entity<TranscriptView>>,
 }
 
 impl YaldaGpuiView {
@@ -1604,7 +1617,7 @@ impl YaldaGpuiView {
         focus_handle: FocusHandle,
     ) -> Self {
         let syntect_hl =
-            yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
+            Rc::new(yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme()));
         let label: SharedString = file_label.into();
         let initial = App::Buffer(BufferApp::Viewing(DocState {
             blocks,
@@ -1641,12 +1654,13 @@ impl YaldaGpuiView {
             pending_mark_chord: None,
             pending_tag_chord: None,
             sessions: AgentSessions::new(),
+            transcript_views: HashMap::new(),
         }
     }
 
     fn new_browser(start_dir: PathBuf, theme: Theme, focus_handle: FocusHandle) -> Self {
         let syntect_hl =
-            yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme());
+            Rc::new(yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme()));
         let initial = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(start_dir)));
         Self {
             theme,
@@ -1672,6 +1686,7 @@ impl YaldaGpuiView {
             pending_mark_chord: None,
             pending_tag_chord: None,
             sessions: AgentSessions::new(),
+            transcript_views: HashMap::new(),
         }
     }
 
@@ -2005,6 +2020,28 @@ impl YaldaGpuiView {
     /// simultaneously clone the handle first to sidestep the borrow overlap.
     pub(crate) fn session_entity(&self, id: SessionId) -> Option<Entity<AgentSession>> {
         self.sessions.get(id).cloned()
+    }
+
+    /// The [`TranscriptView`] for session `id`, created lazily on the first
+    /// `render_agent` of a bound tile (ticket 021). The constructor registers
+    /// the `cx.observe(&session)` subscription; the view is dropped on
+    /// `AgentSessions::close` (each close site `remove`s it). The 1:1
+    /// session↔tile invariant means one view per session is exactly right —
+    /// a re-bound tile reuses the same view, multi-tile splits need no extra
+    /// logic. `session_ent` is the already-cloned handle the caller holds.
+    pub(crate) fn transcript_view_for(
+        &mut self,
+        id: SessionId,
+        session_ent: Entity<AgentSession>,
+        cx: &mut Context<Self>,
+    ) -> Entity<TranscriptView> {
+        if let Some(v) = self.transcript_views.get(&id) {
+            return v.clone();
+        }
+        let weak = cx.entity().downgrade();
+        let view = cx.new(|vcx| TranscriptView::new(session_ent, weak, vcx));
+        self.transcript_views.insert(id, view.clone());
+        view
     }
 
     /// Mutable `AgentState` for the focused tile's bound session, leased from
@@ -2544,7 +2581,26 @@ impl YaldaGpuiView {
         if (clamped - self.text_scale).abs() > f32::EPSILON {
             self.text_scale = clamped;
             self.save_settings();
+            // Text-zoom is GLOBAL, not session state (ticket 021): the action
+            // handler notifies each live transcript view directly so the cached
+            // subtree re-renders. (The transcript itself renders at fixed size —
+            // zoom is scoped to the doc view — but the notify keeps the contract
+            // uniform with theme and is the audited invalidation path.)
+            self.notify_transcript_views(MissReason::TextStyle, cx);
             cx.notify();
+        }
+    }
+
+    /// Notify every live [`TranscriptView`] (ticket 021). Theme and text-zoom
+    /// are GLOBAL, not session state, so their action handlers — which run in
+    /// event context, outside any draw (timing-correct, fact 4) — bust each
+    /// cached transcript directly rather than relying on a session observe.
+    /// `reason` is logged for the `YALDA_PERF` notify-reason counter.
+    fn notify_transcript_views(&mut self, reason: MissReason, cx: &mut Context<Self>) {
+        for v in self.transcript_views.values() {
+            let label = v.read(cx).perf_label;
+            record_notify(label, reason);
+            v.update(cx, |_tv, vcx| vcx.notify());
         }
     }
 
@@ -2590,11 +2646,16 @@ impl YaldaGpuiView {
         // Keep the edit-view syntect highlighter in lockstep with the theme:
         // light themes need light syntect colors. The highlight cache keys on
         // theme name, so stale dark-on-light lines are invalidated next paint.
-        self.syntect_hl =
-            yalda::highlight::Highlighter::with_syntect_theme(self.theme.name.syntect_theme());
+        self.syntect_hl = Rc::new(yalda::highlight::Highlighter::with_syntect_theme(
+            self.theme.name.syntect_theme(),
+        ));
         for tab in self.workspace.tabs.iter_mut() {
             re_render_layout_docs(&mut tab.layout, &self.theme);
         }
+        // Theme is GLOBAL, not session state (ticket 021): the transcript reads
+        // the theme's agent palette in its render, so the theme-swap handler
+        // busts each live transcript view directly (event context, fact 4).
+        self.notify_transcript_views(MissReason::Refresh, cx);
         self.save_settings();
         cx.notify();
     }
@@ -4658,6 +4719,7 @@ impl YaldaGpuiView {
                         if let Some(sid) = sid {
                             self.spawn_close_session(sid, cx);
                         }
+                        self.transcript_views.remove(&id);
                         self.sessions.close(id);
                     }
                     let new_count = self.switcher_row_count();

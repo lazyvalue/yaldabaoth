@@ -1229,6 +1229,112 @@ pub(crate) fn setup_list_follow_handler(
     });
 }
 
+/// The scroll/list UI state for one transcript, moved OUT of `AgentState` into
+/// the [`TranscriptView`] widget (ticket 021 — widgets own UI state; models own
+/// domain state). The `ListState` is a virtualised, non-uniform-height list
+/// that only paints visible rows; `list_item_count` mirrors what's registered
+/// so growth can splice (preserving the height cache) instead of resetting; the
+/// two `*_seq` watermarks de-dupe the per-frame reconcile + follow-scroll.
+///
+/// Kept a plain struct (no GPUI `Context`) so its reconcile/reveal logic stays
+/// unit-testable against an `AgentState` with no window — the original
+/// `reconcile_list` / `reveal_tail_if_following` tests carry over verbatim.
+pub(crate) struct TranscriptScroll {
+    /// Virtualized list state for the claude transcript. We render every
+    /// doc-line + tool-block as an item in a `gpui::list` — non-uniform-height
+    /// list that only paints visible rows. `ListAlignment::Bottom` gives the
+    /// chat-style initial pin. The `follow_output` flag (on `AgentState`,
+    /// maintained by the scroll handler) gates pump-driven auto-scroll so the
+    /// user can scroll up to read history without being yanked to the bottom.
+    pub(crate) list_state: gpui::ListState,
+    /// Total number of items currently registered in `list_state`. Tracked
+    /// separately so new items splice in as the buffer grows without a reset.
+    pub(crate) list_item_count: usize,
+    /// `edit_seq` at the last `reconcile_list` call that actually touched the
+    /// list. Detects mid-line appends (count unchanged but content grew) so the
+    /// tail item's cached height is invalidated.
+    pub(crate) last_reconciled_edit_seq: u64,
+    /// `edit_seq` at which the tail was last revealed by the follow-scroll
+    /// (F4, INV-13). Keying the re-reveal on content growth (not count delta)
+    /// re-pins the viewport even when a chunk grows the last line without
+    /// adding a row. `u64::MAX` = never scrolled.
+    pub(crate) last_scrolled_edit_seq: u64,
+}
+
+impl TranscriptScroll {
+    pub(crate) fn new() -> Self {
+        Self {
+            list_state: gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0)),
+            list_item_count: 0,
+            last_reconciled_edit_seq: 0,
+            last_scrolled_edit_seq: u64::MAX,
+        }
+    }
+
+    /// Reconcile the `(list_state, list_item_count)` pair to a new flat-item
+    /// count, updating BOTH atomically so the GPUI `ListState` it paints and
+    /// the scalar we splice against can never drift (Finding 8, INV-12). When
+    /// block ranges are active the item count can shrink unpredictably, so we
+    /// reset rather than splice; an incremental splice preserves the height
+    /// cache on pure growth. Returns whether the list grew. This is the only
+    /// mutator that touches `list_item_count`, so parity is a property of the
+    /// method rather than discipline at each render surface.
+    pub(crate) fn reconcile_list(
+        &mut self,
+        block_ranges_active: bool,
+        new_count: usize,
+        edit_seq: u64,
+    ) -> bool {
+        let old_count = self.list_item_count;
+        if new_count != old_count {
+            if block_ranges_active || new_count < old_count {
+                self.list_state.reset(new_count);
+            } else {
+                self.list_state
+                    .splice(old_count..old_count, new_count - old_count);
+            }
+            self.list_item_count = new_count;
+            self.last_reconciled_edit_seq = edit_seq;
+        } else if new_count > 0 && edit_seq != self.last_reconciled_edit_seq {
+            // Mid-line append: item count unchanged but text grew inside the
+            // last item (streaming agent prose before a `\n`). Invalidate
+            // just the tail item's cached height so GPUI re-measures it
+            // instead of painting new content at the old height.
+            let last = new_count - 1;
+            self.list_state.splice(last..last + 1, 1);
+            self.last_reconciled_edit_seq = edit_seq;
+        }
+        new_count > old_count
+    }
+
+    /// Reveal the tail item if `following` AND content has actually grown since
+    /// the last reveal (F4, INV-13). Keys on `edit_seq` (true content growth),
+    /// NOT on flat-item COUNT, so a chunk that extends the last line/block
+    /// without adding a row still re-pins the viewport. Idempotent within a
+    /// frame: a repeat call at the same `edit_seq` is a no-op. Returns whether
+    /// a reveal was actually requested. `following` is the caller's
+    /// `AgentState::follow_tail()`, `edit_seq` the document's current seq.
+    pub(crate) fn reveal_tail_if_following(
+        &mut self,
+        following: bool,
+        edit_seq: u64,
+        count: usize,
+    ) -> bool {
+        if count == 0 || edit_seq == self.last_scrolled_edit_seq || !following {
+            return false;
+        }
+        self.last_scrolled_edit_seq = edit_seq;
+        self.list_state.scroll_to_reveal_item(count - 1);
+        true
+    }
+}
+
+impl Default for TranscriptScroll {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Called when the ACP turn ends (the agent's `session/prompt` response
 /// resolves). Ensures the transcript has a trailing newline so the next
 /// chunk has a clean starting point. The cursor stays where the user put
@@ -2053,24 +2159,6 @@ pub(crate) struct AgentState {
     pub(crate) attach_pending: Option<std::sync::mpsc::Receiver<std::io::Result<AcpChannelClient>>>,
     pub(crate) mode: EditMode,
     pub(crate) keybinds: KeybindManager,
-    /// Virtualized list state for the claude transcript. We render
-    /// every doc-line + tool-block as an item in a `gpui::list` —
-    /// non-uniform-height list that only paints visible rows. Without
-    /// this, render scaled with total transcript length and made input
-    /// laggy on long sessions because every cx.notify re-tokenized
-    /// every line for word-wrap. `ListAlignment::Bottom` gives the
-    /// chat-style initial pin. The `follow_output` flag (maintained by
-    /// the scroll handler) gates pump-driven auto-scroll so the user
-    /// can scroll up to read history without being yanked to the bottom.
-    pub(crate) list_state: gpui::ListState,
-    /// Total number of items currently registered in `list_state`. We
-    /// track it separately so we can splice in new items as the
-    /// buffer grows without paying for a full reset.
-    pub(crate) list_item_count: usize,
-    /// `edit_seq` at the last `reconcile_list` call that actually touched
-    /// the list. Used to detect mid-line appends (count unchanged but
-    /// content grew) so we can invalidate the tail item's cached height.
-    pub(crate) last_reconciled_edit_seq: u64,
     /// Footer status line — attach result, send result, error. Cleared on
     /// the next non-Ctrl keystroke so it persists for at least one frame.
     pub(crate) status: Option<SharedString>,
@@ -2097,15 +2185,6 @@ pub(crate) struct AgentState {
     /// (Was two loose `usize` fields reconstructed into a temporary `ReplayTurns`
     /// on every read and copied back out on every mutation — now owned directly.)
     pub(crate) replay_turns: yalda::acp_channel::ReplayTurns,
-    /// `edit_seq` at which the tail was last revealed by the follow-scroll
-    /// (F4, INV-13). The render-time re-reveal historically fired only when
-    /// the flat-item COUNT changed, so a chunk that grows the last line/block
-    /// without adding a row (agent prose before a `\n`, or a streaming code
-    /// fence) was skipped and the freshly grown tail fell below the fold.
-    /// Tracking the last-scrolled `edit_seq` lets the reveal fire on content
-    /// growth regardless of count delta, while still de-duping idle frames
-    /// (same `edit_seq` ⇒ no re-scroll). `u64::MAX` = never scrolled.
-    pub(crate) last_scrolled_edit_seq: u64,
     /// The live tool-call state cluster (calls + order + anchors + expanded
     /// set) — one owner instead of four sibling fields. See [`ToolCalls`].
     pub(crate) tools: ToolCalls,
@@ -2245,6 +2324,36 @@ pub(crate) struct AgentState {
 }
 
 impl AgentState {
+    /// The transcript-structure generation counter — bumped on every mutation
+    /// to the tool-call cluster (`calls`/`order`/`expanded`). Ticket 021's
+    /// observe filter compares it across renders so a tool start / update /
+    /// expand re-renders the transcript while a chatbox keystroke (which never
+    /// touches tools) does not. A genuine monotonic counter (not a derived
+    /// fingerprint): `ToolCalls` already maintains it for its snapshot caches.
+    pub(crate) fn tools_gen(&self) -> u64 {
+        self.tools.snap_gen
+    }
+
+    /// A monotonic-equivalent fingerprint of the frozen-line set (ticket 021's
+    /// observe filter). Frozen ranges are append/merge-only in this transcript
+    /// model, so `(range_count, total_frozen_lines, last_range_end)` changes
+    /// iff the frozen set moved — including the pure `add_frozen_lines` path
+    /// (a worksheet commit that freezes already-present lines) which does NOT
+    /// bump `edit_seq`. Deriving it from the live state (rather than threading
+    /// a hand-maintained counter through every freeze site across `editor.rs`)
+    /// is deliberate: it cannot drift from a missed mutation site — the exact
+    /// "missed dependency" failure mode the ticket's risk section warns about.
+    /// O(1): reads only the range vec's len + last element.
+    pub(crate) fn frozen_gen(&self) -> u64 {
+        let ranges = self.editor.frozen_lines();
+        let count: usize = ranges.iter().map(|(s, e)| e - s).sum();
+        let last_end = ranges.last().map(|&(_, e)| e).unwrap_or(0);
+        // Pack the three monotonic-ish signals into one u64. Each component is
+        // small (line counts on a transcript), so collisions across a real
+        // mutation are not reachable in practice.
+        ((ranges.len() as u64) << 40) ^ ((count as u64) << 20) ^ (last_end as u64)
+    }
+
     /// Derived list of classified sub-agents (§25–§26), folded over
     /// `tool_call_order` + `tool_calls` in first-seen order. This is a pure
     /// projection of the tool-call state — there is no stored mirror to keep
@@ -2325,13 +2434,10 @@ impl AgentState {
             attach_pending: None,
             mode: EditMode::Insert,
             keybinds: KeybindManager::default(),
-            list_state: gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0)),
-            list_item_count: 0,
-            last_reconciled_edit_seq: 0,
+
             status: None,
             turn_phase: TurnPhase::Idle,
             replay_turns: yalda::acp_channel::ReplayTurns::default(),
-            last_scrolled_edit_seq: u64::MAX,
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
             pending_reveal_cursor: false,
@@ -2375,13 +2481,10 @@ impl AgentState {
             attach_pending: None,
             mode: EditMode::Insert,
             keybinds: KeybindManager::default(),
-            list_state: gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0)),
-            list_item_count: 0,
-            last_reconciled_edit_seq: 0,
+
             status,
             turn_phase: TurnPhase::Idle,
             replay_turns: yalda::acp_channel::ReplayTurns::default(),
-            last_scrolled_edit_seq: u64::MAX,
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
             pending_reveal_cursor: false,
@@ -2408,7 +2511,9 @@ impl AgentState {
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         };
-        setup_list_follow_handler(&state.list_state, &state.follow_output);
+        // The follow-output scroll handler is wired by the owning
+        // `TranscriptView` (ticket 021): the `ListState` now lives in
+        // `TranscriptScroll`, not on `AgentState`.
         state
     }
 
@@ -2579,62 +2684,6 @@ impl AgentState {
         )
     }
 
-    /// Reveal the tail item if we're following AND content has actually grown
-    /// since the last reveal (F4, INV-13). The trigger keys on `edit_seq`
-    /// (true content growth), NOT on flat-item COUNT, so a chunk that extends
-    /// the last line/block without adding a row still re-pins the viewport.
-    /// Idempotent within a frame: a repeat call at the same `edit_seq` is a
-    /// no-op, so idle ticks don't fight a user who scrolled up. Returns whether
-    /// a reveal was actually requested (exercised by the unit test).
-    pub(crate) fn reveal_tail_if_following(&mut self, count: usize) -> bool {
-        let edit_seq = self.editor.document().edit_seq();
-        if count == 0 || edit_seq == self.last_scrolled_edit_seq || !self.follow_tail() {
-            return false;
-        }
-        self.last_scrolled_edit_seq = edit_seq;
-        self.list_state.scroll_to_reveal_item(count - 1);
-        true
-    }
-
-    /// Reconcile the `(list_state, list_item_count)` pair to a new flat-item
-    /// count, updating BOTH atomically so the GPUI `ListState` GPUI paints and
-    /// the scalar we splice against can never drift (Finding 8, INV-12). When
-    /// block ranges are active the item count can shrink unpredictably, so we
-    /// reset rather than splice; an incremental splice preserves the height
-    /// cache on pure growth. Returns whether the list grew (so callers / the
-    /// follow path can key on growth without re-deriving it). This is the only
-    /// mutator that touches `list_item_count`, so parity is a property of the
-    /// method rather than discipline at each render surface.
-    pub(crate) fn reconcile_list(&mut self, new_count: usize, edit_seq: u64) -> bool {
-        let old_count = self.list_item_count;
-        if new_count != old_count {
-            if !self.block_ranges.is_empty() || new_count < old_count {
-                self.list_state.reset(new_count);
-            } else {
-                self.list_state
-                    .splice(old_count..old_count, new_count - old_count);
-            }
-            self.list_item_count = new_count;
-            self.last_reconciled_edit_seq = edit_seq;
-        } else if new_count > 0 && edit_seq != self.last_reconciled_edit_seq {
-            // Mid-line append: item count unchanged but text grew inside the
-            // last item (streaming agent prose before a `\n`). Invalidate
-            // just the tail item's cached height so GPUI re-measures it
-            // instead of painting new content at the old height.
-            let last = new_count - 1;
-            self.list_state.splice(last..last + 1, 1);
-            self.last_reconciled_edit_seq = edit_seq;
-        }
-        new_count > old_count
-    }
-
-    /// Test-only wrapper that passes a dummy `edit_seq` (the tests don't
-    /// exercise the mid-line-append height invalidation).
-    #[cfg(test)]
-    pub(crate) fn reconcile_list_test(&mut self, new_count: usize) -> bool {
-        self.reconcile_list(new_count, 0)
-    }
-
     /// Fold the replay cursor back into the live counter at end-of-replay
     /// (Finding 13, INV-4).
     pub(crate) fn finish_replay(&mut self) {
@@ -2691,12 +2740,12 @@ impl AgentState {
     /// only the rendered transcript and its derived caches are cleared.
     pub(crate) fn reset_for_replay(&mut self) {
         self.editor = Editor::new(String::new(), PathBuf::from("*claude*"));
-        self.list_state = gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0));
-        setup_list_follow_handler(&self.list_state, &self.follow_output);
-        self.list_item_count = 0;
-        // Fresh editor restarts `edit_seq` at 0; clear the follow-scroll
-        // watermark so the first replayed chunk re-reveals the tail (F4).
-        self.last_scrolled_edit_seq = u64::MAX;
+        // The list/scroll UI state (`list_state`, counts, watermarks) now lives
+        // in the owning `TranscriptView`'s `TranscriptScroll` (ticket 021). A
+        // replay wipes the transcript ⇒ the flat-item count drops, and the
+        // view's next render reconciles the `ListState` down (a shrink resets
+        // it) and re-reveals the tail from the fresh `edit_seq` (which restarts
+        // at 0 on the new editor) — no explicit list reset needed here.
         self.turn_phase = TurnPhase::Idle;
         self.replay_turns = yalda::acp_channel::ReplayTurns::default();
         // The transcript is being rebuilt from the authoritative event_log:

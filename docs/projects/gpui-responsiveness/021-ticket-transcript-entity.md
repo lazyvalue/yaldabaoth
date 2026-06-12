@@ -65,22 +65,30 @@ session ⇒ multi-tile splits need no extra logic.
 
 ## Subtasks
 
-- [ ] `TranscriptView` entity: UI-state fields moved in from `AgentState`;
-      `render()` relocates the row build + `render_fn` + `list` element;
-      render counter for tests.
-- [ ] Seq plumbing: ensure each observed slice has a monotonic counter on
-      `AgentSession` (`edit_seq` exists; add frozen-gen / tools-gen where only
-      collections exist today).
-- [ ] Observe subscription with slice filter + notify-reason logging; zoom and
-      theme action handlers notify live transcript views.
-- [ ] `transcript_views: HashMap<SessionId, Entity<TranscriptView>>` + lazy
-      create + close hook; `render_agent` embeds via `cached_child`.
-- [ ] Headless regression tests: chatbox keystroke ⇒ transcript render count
-      flat; worksheet edit / stream chunk (session.update) ⇒ +1 on the next
-      frame **including the final append of a burst** (the rev-1 stale-tail
-      case); tool expand ⇒ +1; theme/zoom ⇒ +1; follow-tail still reveals
-      grown content.
-- [ ] Build + full test suite.
+- [x] `TranscriptView` entity: UI-state fields moved in from `AgentState`
+      (the scroll/list cluster → `TranscriptScroll`); `render()` relocates the
+      row build + `render_fn` + `list` element (new `transcript_view.rs`);
+      render counter (`record_render("transcript")`) for tests.
+- [x] Seq plumbing: each observed slice has a monotonic counter — `edit_seq`
+      (existing), `AgentState::tools_gen()` (= `ToolCalls::snap_gen`),
+      `AgentState::frozen_gen()` (O(1) frozen-set fingerprint covering the pure
+      `add_frozen_lines` path that doesn't bump `edit_seq`), cursor/selection,
+      awaiting, pending-reveal — bundled in `TranscriptSeqs`.
+- [x] Observe subscription (`cx.observe(&session)`) with `TranscriptSeqs`
+      slice filter + `record_notify` reason logging; `set_theme` /
+      `set_text_scale` action handlers call `notify_transcript_views` (global,
+      event-context, fact 4).
+- [x] `transcript_views: HashMap<SessionId, Entity<TranscriptView>>` on
+      `YaldaGpuiView` + lazy create (`transcript_view_for`, registers observe)
+      + drop at every `AgentSessions::close` site; `render_agent` embeds via
+      `cached_child(transcript_view)` (size_full baked in).
+- [x] Headless regression tests (`verify_harness.rs`, 6 tests): chatbox
+      keystroke (real compose-editor mutation+notify) ⇒ render count FLAT;
+      session edit ⇒ +1; streaming burst ⇒ +1 on EACH chunk including the final
+      append (rev-1 stale-tail); tool expand ⇒ +1; theme +1 and zoom +1;
+      follow-tail grows the registered item count.
+- [x] Build + full test suite (`cargo test` all green; `cargo test --bin
+      yalda-gpui` = 183 passed / 0 failed).
 - [ ] **Human runtime:** `sample` while typing in a large transcript (no
       per-keystroke transcript layout); stream a long reply and confirm the
       tail lands without input wiggling; adversarial pass: cursor blink,

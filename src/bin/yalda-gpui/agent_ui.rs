@@ -626,6 +626,7 @@ impl YaldaGpuiView {
                 // Drop the orphan placeholder we just minted (it carries no sid,
                 // so this only tears down its local channel/pump, never the live
                 // server session).
+                self.transcript_views.remove(&id);
                 self.sessions.close(id);
                 BindOutcome::Focused(owner)
             }
@@ -1014,6 +1015,7 @@ impl YaldaGpuiView {
                 // Orphaned pre-attach placeholder: kill it. If its create
                 // already spawned a server session, that is closed when its
                 // resolution finds no tile (see `apply_open_agent_resolution`).
+                self.transcript_views.remove(&id);
                 self.sessions.close(id);
             }
         }
@@ -1060,6 +1062,7 @@ impl YaldaGpuiView {
             .unwrap_or_else(process_cwd);
         // Drop the session from the store (its channel/pump cancel on drop) and
         // land the tile in a live selector.
+        self.transcript_views.remove(&id);
         self.sessions.close(id);
         self.show_selector_on_focused_tile(cwd, cx);
         // Wipe the cwd entry so reboot doesn't resurrect the closed session.
@@ -1181,13 +1184,10 @@ impl YaldaGpuiView {
             attach_pending: Some(attach_rx),
             mode: EditMode::Insert,
             keybinds: KeybindManager::default(),
-            list_state: gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0)),
-            list_item_count: 0,
-            last_reconciled_edit_seq: 0,
+
             status: Some("attaching to ACP agent…".into()),
             turn_phase: TurnPhase::Idle,
             replay_turns: yalda::acp_channel::ReplayTurns::default(),
-            last_scrolled_edit_seq: u64::MAX,
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
             pending_reveal_cursor: false,
@@ -1214,7 +1214,9 @@ impl YaldaGpuiView {
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         };
-        setup_list_follow_handler(&state.list_state, &state.follow_output);
+        // The follow-output scroll handler is wired by the owning
+        // `TranscriptView` (ticket 021) — the `ListState` lives in
+        // `TranscriptScroll`, not on `AgentState`.
         state
     }
 
@@ -1616,6 +1618,7 @@ impl YaldaGpuiView {
             // Leave the respawning session alone; its new sid will rebind.
             return false;
         }
+        self.transcript_views.remove(&id);
         self.sessions.close(id);
         // Kick the (now-unbound) tile's selector list off the paint thread,
         // addressed to that exact tile by id. The list reducer
@@ -1935,21 +1938,13 @@ impl YaldaGpuiView {
         // per-event path did (the authoritative re-scroll with the fresh count
         // happens later in render_agent after the ListState splice); this just
         // keeps unfocused tiles that miss render's scroll roughly pinned.
-        for sid in &scrolled_sessions {
-            self.with_server_session_slot(sid, cx, |slot| {
-                let claude = &mut slot.state;
-                // Stale-count pre-pin; the authoritative reveal with the fresh
-                // post-reconcile count runs in render_agent
-                // (`reveal_tail_if_following`). This does NOT stamp
-                // `last_scrolled_edit_seq`, so it never suppresses that
-                // render-time reveal. Shares the `follow_tail` decision (F4).
-                if claude.follow_tail() && claude.list_item_count > 0 {
-                    claude
-                        .list_state
-                        .scroll_to_reveal_item(claude.list_item_count - 1);
-                }
-            });
-        }
+        // Ticket 021: the pump-side stale-count pre-pin is gone. The
+        // `ListState` + `list_item_count` now live in the owning
+        // `TranscriptView`, and its render-time `reveal_tail_if_following`
+        // (with the FRESH post-reconcile count) is the single authoritative
+        // re-reveal — it runs for every live transcript view, focused or not,
+        // so unfocused tiles stay pinned without a pump-side poke.
+        let _ = &scrolled_sessions;
         if did_work {
             cx.notify();
         }
@@ -2086,16 +2081,13 @@ impl YaldaGpuiView {
                         claude.turn_phase = TurnPhase::Idle;
                     }
                 }
-                // Spec §19 auto-scroll. Shares the `follow_tail` decision (F4).
-                // Stale-count pre-pin only; the authoritative reveal with the
-                // fresh post-reconcile count runs in render_agent
-                // (`reveal_tail_if_following`), so this does NOT stamp
-                // `last_scrolled_edit_seq`.
-                if claude.follow_tail() && claude.list_item_count > 0 {
-                    claude
-                        .list_state
-                        .scroll_to_reveal_item(claude.list_item_count - 1);
-                }
+                // Spec §19 auto-scroll. Ticket 021: the pump-side stale-count
+                // pre-pin is gone — the `ListState` lives in the owning
+                // `TranscriptView`, whose render-time `reveal_tail_if_following`
+                // (with the fresh post-reconcile count) is the authoritative
+                // re-reveal. The session notify below buses the transcript view
+                // to re-render this same effect-flush, so the reveal lands on
+                // the very frame this chunk scheduled (no stale tail).
             }
 
             // Mutation-site notify on the session entity (load-bearing after
@@ -2622,6 +2614,7 @@ impl YaldaGpuiView {
             if let Some(sid) = self.sessions.sid_of(id).map(|s| s.to_string()) {
                 self.spawn_close_session(sid, cx);
             }
+            self.transcript_views.remove(&id);
             self.sessions.close(id);
             if let Some(tile) = self.agent_tile_mut() {
                 tile.bound = None;

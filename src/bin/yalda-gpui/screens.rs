@@ -804,728 +804,43 @@ impl YaldaGpuiView {
             let s = session_ent.read(cx);
             (s.label.clone(), s.cwd.clone())
         };
-        // Weak handle to THIS view, captured by the click listeners inside the
-        // transcript body (they re-enter via `weak.update(app, …)` at click
+        // Weak handle to THIS view, captured by the status-strip / sidebar
+        // click listeners (they re-enter via `weak.update(app, …)` at click
         // time). Computed before the entity `update` borrows `cx`.
         let weak_self = cx.entity().downgrade();
 
-        // Build the transcript body + status strips inside the session entity's
-        // update — `c` is a real `&mut AgentState`, valid for the whole closure.
-        let (
-            header,
-            info_bar,
-            content_area,
-            t_render0,
-            perf_extract_ms,
-            perf_hl_ms,
-            perf_lines,
-            perf_recomputed,
-            perf_skip,
-        ) = session_ent.update(cx, |session_payload, _scx| {
-            let c: &mut AgentState = &mut session_payload.state;
+        // ── Transcript (ticket 021) ──────────────────────────────────────
+        // The transcript list is its own cached view entity now: it OWNS the
+        // scroll/list state, READS the session in its render, and invalidates
+        // itself by OBSERVING the session (slice-filtered). Lazily create the
+        // per-session `TranscriptView` (the constructor registers the observe),
+        // then embed it via `cached_child` so a chatbox keystroke (which never
+        // moves a transcript slice) skips the transcript's render entirely.
+        let transcript_view = self.transcript_view_for(id, session_ent.clone(), cx);
+        let transcript_body: AnyElement = cached_child(transcript_view);
+
+        // Build the status strips + compose + sidebars inside the session
+        // entity's update — `c` is a real `&mut AgentState` for the chrome that
+        // STAYS inline (tickets 022/023). The transcript body (built above) is
+        // moved in and slotted into the content layout.
+        let (header, info_bar, content_area) =
+            session_ent.update(cx, |session_payload, _scx| {
+                let c: &mut AgentState = &mut session_payload.state;
 
         let cursor = c.editor.cursor();
         let cursor_line = cursor.line;
         let cursor_col = cursor.col;
-        let line_count = c.editor.document().line_count();
         let at = &self.theme.agent; // shorthand for agent theme
-        let cursor_color: Hsla = nc(at.cursor);
         let dim_fg: Hsla = nc(at.dim);
-        // Frozen Claude prose vs user-authored content get distinct bars so
-        // the read/write boundary reads at a glance — same idiom as the
-        // rendered-mode focused-block bar.
-        let frozen_bar: Hsla = nc(at.frozen_bar);
-        let user_bar: Hsla = nc(at.user_bar);
         // Theme-derived background tints for turn cards. Blend a faint
         // tint into the editor background so cards work on any theme.
         let base_bg: Hsla = self.editor_bg();
-        let claude_turn_bg: Hsla = nc(at.agent_turn_bg);
-        let user_turn_bg: Hsla = nc(at.user_turn_bg);
-        let _frozen_fg: Hsla = self.editor_fg();
         let compose_panel_bg: Hsla = tint_bg(base_bg, 0.55, 0.1, 0.03);
         // Compose input text uses the theme's editor foreground so it stays
         // legible against `compose_panel_bg` on light themes (folio, FT,
         // solarized-light) — not the hardcoded Dracula light gray, which
         // vanished into the near-white panel.
         let compose_fg: Hsla = self.editor_fg();
-
-        let perf = perf_enabled();
-        // Whole-body timer: covers extract + highlight + gutter tags + block
-        // parse + flat_items build + element-tree assembly (everything in
-        // render_agent up to the return). GPUI's own layout/paint happens
-        // after we return and is not captured here.
-        let t_render0 = perf.then(std::time::Instant::now);
-        let t_extract0 = perf.then(std::time::Instant::now);
-        let edit_seq = c.editor.document().edit_seq();
-        // Perf: only re-extract the per-line transcript text when the document
-        // actually changed. On cursor-blink / cross-tile notifies edit_seq is
-        // unchanged, so reuse the cached Rc verbatim instead of re-allocating a
-        // String per line (an O(L) cost that previously ran every frame). The
-        // Rc clone below is O(1).
-        let lines_rc: std::rc::Rc<Vec<String>> = if c.lines_cache_seq == edit_seq {
-            c.lines_cache.clone()
-        } else {
-            let built: Vec<String> = (0..line_count.max(1))
-                .map(|i| {
-                    c.editor
-                        .document()
-                        .line_text(i)
-                        .trim_end_matches('\n')
-                        .replace('\t', "    ")
-                })
-                .collect();
-            let rc = std::rc::Rc::new(built);
-            c.lines_cache = rc.clone();
-            c.lines_cache_seq = edit_seq;
-            rc
-        };
-        let lines: &Vec<String> = &lines_rc;
-        let t_extract = t_extract0.map(|t| t.elapsed());
-
-        // Per-line highlight, raw + stripped. The incremental cache
-        // re-highlights only changed lines and hands back a cheap `Rc`
-        // snapshot; the bypass path (YALDA_HL_CACHE=0) recomputes both
-        // passes in full every frame, feeding the identical closure shape so
-        // the two paths are directly comparable.
-        let t_hl0 = perf.then(std::time::Instant::now);
-        let hl_snap: std::rc::Rc<Vec<std::rc::Rc<LineHl>>> = if hl_cache_enabled() {
-            c.highlight_cache
-                .snapshot_syn(lines, &self.theme, edit_seq, &self.syntect_hl)
-        } else {
-            let raw = highlight_markdown_lines_syn(lines, &self.theme, &self.syntect_hl);
-            let stripped =
-                highlight_markdown_lines_stripped_syn(lines, &self.theme, &self.syntect_hl);
-            std::rc::Rc::new(
-                raw.into_iter()
-                    .zip(stripped)
-                    .map(|(raw, stripped)| std::rc::Rc::new(LineHl { raw, stripped }))
-                    .collect(),
-            )
-        };
-        // Stash the per-section timings; the consolidated trace prints at the
-        // end of render_agent so we can attribute cost across the whole body.
-        let perf_hl_ms = t_hl0.map(|t| t.elapsed().as_secs_f64() * 1e3);
-        let perf_extract_ms = t_extract.map(|d| d.as_secs_f64() * 1e3);
-        let (perf_recomputed, perf_skip) = if hl_cache_enabled() {
-            (
-                c.highlight_cache.last_recomputed,
-                c.highlight_cache.last_was_skip,
-            )
-        } else {
-            (lines.len(), false)
-        };
-        let perf_lines = lines.len();
-        let base_style = self.theme.paragraph;
-
-        // Frozen ranges drive both the structural-block cache and the
-        // blank-collapse pass below; resolve once here so they're also
-        // available for the view-model fingerprint.
-        let frozen_ranges: Vec<(usize, usize)> = c.editor.frozen_lines().to_vec();
-        let frozen_line_count: usize = frozen_ranges.iter().map(|(s, e)| e - s).sum();
-
-        // ── View-model memoization (S1) ──────────────────────────────
-        // `flat_items` + `gutter_tag_per_line` depend ONLY on structural
-        // inputs — NOT on cursor/selection/theme/edit_seq. Mid-line chunk
-        // appends bump `edit_seq` but don't change line count, frozen
-        // ranges, or tool structure, so the cache hits and we skip the
-        // expensive gutter scan, tool-anchor resolution, flat build and
-        // blank-collapse pass. This is what makes streaming smooth.
-        //
-        // Trap check: `ToolCallUpdated` mutates tool-call *content* in
-        // `c.tools.calls` without touching `tool_call_order` or line count.
-        // That content is rendered inside the closure from `tool_calls_snap`,
-        // never baked into a `FlatItem` (ToolGroup carries only ids), so it
-        // is correctly EXCLUDED from this fingerprint.
-        let view_model_fp: u64 = c.view_model_fingerprint(line_count, frozen_line_count);
-
-        // S1 cache: on a fingerprint hit `cached` returns the memoized `Rc`s
-        // and the rebuild below is skipped entirely; on a miss the rebuild runs
-        // on `&mut AgentState` (it reads `tools`/`editor` and writes
-        // `c.view_model.block_cache`) and `store` stamps the fingerprint and
-        // bumps `view_model_seq`. The decision lives on `AgentViewModel`.
-        let theme_ref = &self.theme;
-        let (flat_items_arc, gutter_tag_snap) = match c.view_model.cached(view_model_fp) {
-            Some(hit) => hit,
-            None => rebuild_agent_view_model(
-                c,
-                lines,
-                &frozen_ranges,
-                frozen_line_count,
-                theme_ref,
-                view_model_fp,
-            ),
-        };
-
-        // Splice ListState to match new item count. When block ranges
-        // are active, line count can shrink unpredictably, so always
-        // reset. Otherwise use incremental splice for height cache.
-        // (Side-effect — must run EVERY frame, so it lives OUTSIDE the
-        // memoized boundary above.)
-        let new_count = flat_items_arc.len();
-        // Reconcile (count parity → splice/reset) stays count-keyed, but the
-        // `(list_state, list_item_count)` mutation is funneled through one
-        // mutator so the two can't drift (Finding 8, INV-12).
-        c.reconcile_list(new_count, edit_seq);
-        // INV-12: after reconcile, the registered count equals what we built.
-        debug_assert!(
-            c.list_item_count == flat_items_arc.len(),
-            "list_item_count ({}) out of sync with flat_items ({})",
-            c.list_item_count,
-            flat_items_arc.len(),
-        );
-
-        // Follow-scroll is SEPARATE from reconcile (F4, INV-13). Re-reveal the
-        // tail whenever following AND content grew since the last reveal —
-        // keyed on `edit_seq`, NOT on the count delta — so an intra-line chunk
-        // (agent prose before a `\n`, a streaming code fence) that bumps the
-        // last item's height without adding a row still re-pins the viewport.
-        // The pump functions also scroll, but they fire before render so their
-        // count is stale; this is the authoritative re-reveal with the fresh
-        // post-reconcile count, and also catches unfocused tiles that missed
-        // the pump's scroll.
-        c.reveal_tail_if_following(new_count);
-
-        // Worksheet cursor-reveal (INV-RV): consume the intent the key handler
-        // recorded. The scroll target is an O(1) lookup into the build-time
-        // line→item index that was just (re)validated above — no transcript
-        // scan, no re-derivation of the flat-item position. Deferring to here
-        // (rather than the key handler) also guarantees the mapping reflects
-        // the freshly-rebuilt list after a newline insert.
-        if c.pending_reveal_cursor {
-            c.pending_reveal_cursor = false;
-            let cursor_line = c.editor.cursor().line;
-            let target = c.view_model.item_for_line(cursor_line);
-            c.list_state.scroll_to_reveal_item(target);
-        }
-
-        // Snapshot data for the render closure. Cloned once per
-        // render_agent call; the closure is then called only for
-        // visible items.
-        // O(1) pointer clone — the closure shares the cached line vec for the
-        // frame instead of deep-copying every transcript line each render.
-        let lines_snap: std::rc::Rc<Vec<String>> = lines_rc.clone();
-        // The per-line highlight snapshot `hl_snap` (an O(1) pointer clone)
-        // is moved into the closure below, which indexes `.raw` / `.stripped`
-        // per line.
-        // `gutter_tag_snap` and `flat_items_arc` come from the memoized
-        // view-model tuple above (cached `Rc`s reused across frames when the
-        // structural fingerprint is unchanged).
-        let tool_calls_snap = c.tools.calls_snapshot();
-        let expanded_snap = c.tools.expanded_snapshot();
-        // Reuse the `frozen_ranges` snapshotted above (line-count memo input).
-        // It was only *borrowed* (by `&`) by the view-model rebuild, so it is
-        // still owned + in scope here; moving it into the render closure avoids
-        // a second O(frozen) `.to_vec()` every frame. `c.editor.frozen_lines()`
-        // is unchanged since the snapshot (no intervening mutation), so the two
-        // are identical.
-        let frozen_lines_snap: Vec<(usize, usize)> = frozen_ranges;
-        let lockable_through_snap = c.editor.lockable_through_line();
-        let sel_snap = c.editor.selection_range();
-        let mode_snap = c.mode;
-        let code_font_snap = self.code_font.clone();
-        let body_font_snap = self.body_font.clone();
-        let theme_snap = self.theme.clone();
-        let at_snap = self.theme.agent.clone();
-        let self_editor_fg = self.editor_fg();
-        // u32 base colors for `styled_line_element`, which falls back to the
-        // base for spans without an explicit fg. Theme-derived so plain
-        // editable / frozen text stays legible on light themes (folio, FT)
-        // instead of using the hardcoded Dracula `DEFAULT_FG`.
-        let editor_fg_u32 = ncolor_to_u32(self.theme.editor_fg, DEFAULT_FG);
-        let frozen_fg_u32 = ncolor_to_u32(self.theme.agent.frozen_fg, DEFAULT_FG);
-        let turn_started_snap = c.turn_phase.turn_started();
-        let last_event_at_snap = c.turn_phase.last_event_at();
-        // `weak_self` is captured from the enclosing scope (computed before this
-        // entity `update`, where `cx` is no longer reachable).
-
-        // Helper closures for frozen-line lookup and "block starts
-        // here" gating (used to gate the T-label). Inlined inside the
-        // render closure.
-        let is_frozen_at = move |line_idx: usize, ranges: &[(usize, usize)]| -> bool {
-            ranges.iter().any(|&(s, e)| line_idx >= s && line_idx < e)
-        };
-
-        let render_fn = {
-            let flat_items = flat_items_arc.clone();
-            // Clone for the per-item closure so the outer `weak_self` survives
-            // for the status-strip / sidebar click listeners built below.
-            let weak_self = weak_self.clone();
-            move |idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
-                let item = &flat_items[idx];
-                match item {
-                    FlatItem::Line(line_idx) => {
-                        let line_idx = *line_idx;
-                        let line_str = lines_snap.get(line_idx).cloned().unwrap_or_default();
-                        let is_frozen = is_frozen_at(line_idx, &frozen_lines_snap);
-                        let is_locked = line_idx < lockable_through_snap;
-                        let _ = is_locked; // kept for future visual cue parity
-
-                        // md_highlight segments + author tint. Frozen (Claude)
-                        // lines use stripped highlights (no raw delimiters);
-                        // editable (user) lines use raw highlights.
-                        let mut segs: Vec<Segment> = match hl_snap.get(line_idx) {
-                            Some(hl) if is_frozen => hl.stripped.clone(),
-                            Some(hl) => hl.raw.clone(),
-                            None => vec![(line_str.clone(), base_style)],
-                        };
-                        let author_tint: NColor = if is_frozen {
-                            at_snap.agent_tint
-                        } else {
-                            at_snap.user_tint
-                        };
-                        for (_text, style) in segs.iter_mut() {
-                            if *style == base_style {
-                                *style = style.fg(author_tint);
-                            }
-                        }
-                        if let Some(sel) = sel_snap {
-                            let line_chars = line_str.chars().count();
-                            if let Some((s, e_col)) =
-                                line_selection_range(sel, line_idx, line_chars)
-                                && e_col > s
-                            {
-                                segs = apply_selection_bg(&segs, s, e_col, at_snap.selection_bg);
-                            }
-                        }
-
-                        // Per-line rendering uses monospace (code_font)
-                        // for all lines — the token-based flex-wrap in
-                        // build_wrapped_line doesn't play well with
-                        // proportional fonts. Proportional rendering is
-                        // handled by the FlatItem::Block path which uses
-                        // body_font through block_inner/doc_styled_line_element.
-                        let line_base_fg = if is_frozen {
-                            frozen_fg_u32
-                        } else {
-                            editor_fg_u32
-                        };
-                        let content = build_wrapped_line(
-                            &segs,
-                            &line_str,
-                            line_idx == cursor_line,
-                            cursor_col,
-                            mode_snap,
-                            cursor_color,
-                            base_style,
-                            line_base_fg,
-                            &code_font_snap,
-                            &code_font_snap,
-                        );
-
-                        let line_has_content = !line_str.trim().is_empty();
-                        let bar_color: Hsla = if is_frozen {
-                            frozen_bar
-                        } else if line_has_content {
-                            user_bar
-                        } else {
-                            rgba(0x00000000).into()
-                        };
-                        let line_text_color = if is_frozen {
-                            nc(at_snap.frozen_fg)
-                        } else {
-                            self_editor_fg
-                        };
-
-                        // Gutter tag from the editor's per-line `TurnId`
-                        // metadata (spec §11): `N` for LLM lines, `Un`
-                        // for user lines, `Tn` for tool-call anchor
-                        // lines, blank for currently-editable
-                        // (unsubmitted) lines. Only show the label on the
-                        // first line of each contiguous turn block.
-                        let tag = gutter_tag_snap.get(line_idx).copied().flatten();
-                        let prev_tag = if line_idx > 0 {
-                            gutter_tag_snap.get(line_idx - 1).copied().flatten()
-                        } else {
-                            None
-                        };
-                        let is_first_in_turn = tag != prev_tag;
-                        let (label_text, label_color): (SharedString, Hsla) = if !is_first_in_turn {
-                            ("   ".into(), dim_fg)
-                        } else {
-                            match tag {
-                                Some(TurnId::Llm(n)) => (format!("{:>3}", n).into(), frozen_bar),
-                                Some(TurnId::User(n)) => {
-                                    (format!("{:>3}", format!("U{}", n)).into(), user_bar)
-                                }
-                                Some(TurnId::Tool(n)) => (
-                                    format!("{:>3}", format!("T{}", n)).into(),
-                                    nc(at_snap.tool_label),
-                                ),
-                                // System notices carry no turn number — blank
-                                // gutter, like untagged lines (Finding 5).
-                                Some(TurnId::System) | None => ("   ".into(), dim_fg),
-                            }
-                        };
-                        let card_bg: Hsla = match tag {
-                            Some(TurnId::Llm(_)) => claude_turn_bg,
-                            Some(TurnId::User(_)) => user_turn_bg,
-                            // Tool-anchor, System-notice, and untagged lines
-                            // float on the base editor_bg — no turn tint
-                            // (Constraint 6, Finding 5).
-                            Some(TurnId::Tool(_)) | Some(TurnId::System) | None => {
-                                rgba(0x00000000).into()
-                            }
-                        };
-                        let row_bg: Hsla = if line_idx == cursor_line {
-                            // Blend cursor highlight on top of turn bg.
-                            let mut h = nc(at_snap.dim);
-                            h.a = 0.2;
-                            h
-                        } else {
-                            card_bg
-                        };
-
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_start()
-                            .w_full()
-                            .py(px(2.0))
-                            .bg(row_bg)
-                            .text_color(line_text_color)
-                            .child(
-                                div()
-                                    .w(px(28.0))
-                                    .flex_none()
-                                    .text_size(px(10.0))
-                                    .text_color(label_color)
-                                    .font_family(code_font_snap.clone())
-                                    .pr_1()
-                                    .child(label_text),
-                            )
-                            .child(div().w(px(3.0)).flex_none().bg(bar_color).mr_2())
-                            .child(content)
-                            .into_any_element()
-                    }
-                    FlatItem::ToolGroup { anchor_line, ids } => {
-                        let anchor = *anchor_line;
-                        // Collect resolved tool calls for this group.
-                        let calls: Vec<&yalda::acp_channel::ToolCall> = ids
-                            .iter()
-                            .filter_map(|id| tool_calls_snap.get(id))
-                            .collect();
-                        if calls.is_empty() {
-                            return div().h(px(0.0)).into_any_element();
-                        }
-                        let group_expanded = expanded_snap.contains(&anchor.to_string());
-                        let count = calls.len();
-
-                        // Aggregate status for the group header glyph.
-                        use yalda::acp_channel::ToolCallStatus;
-                        let has_failed = calls.iter().any(|tc| tc.status == ToolCallStatus::Failed);
-                        let has_in_progress = calls
-                            .iter()
-                            .any(|tc| tc.status == ToolCallStatus::InProgress);
-                        let all_completed = calls
-                            .iter()
-                            .all(|tc| tc.status == ToolCallStatus::Completed);
-                        let (group_glyph, group_color): (&str, Hsla) = if has_failed {
-                            ("✗", nc(at_snap.tool_failed))
-                        } else if has_in_progress {
-                            ("◐", nc(at_snap.tool_in_progress))
-                        } else if all_completed {
-                            ("●", nc(at_snap.tool_completed))
-                        } else {
-                            ("○", nc(at_snap.tool_pending))
-                        };
-
-                        let header_title: String = if count == 1 {
-                            let tc = calls[0];
-                            let base = if tc.title.is_empty() {
-                                "(tool)".to_string()
-                            } else {
-                                tc.title.clone()
-                            };
-                            // Append a useful detail for single-tool groups so
-                            // the user doesn't need to expand to see *what* was
-                            // read/edited/executed.
-                            if let Some(detail) = tool_inline_detail(tc) {
-                                format!("{} {}", base, detail)
-                            } else {
-                                base
-                            }
-                        } else {
-                            // Typed summary of the run: count each tool label in
-                            // first-appearance order → "4 grep, 3 edit, 7 read".
-                            let mut order: Vec<String> = Vec::new();
-                            let mut counts: std::collections::HashMap<String, usize> =
-                                std::collections::HashMap::new();
-                            for tc in &calls {
-                                let label = tool_type_label(tc);
-                                if !counts.contains_key(&label) {
-                                    order.push(label.clone());
-                                }
-                                *counts.entry(label).or_insert(0) += 1;
-                            }
-                            order
-                                .iter()
-                                .map(|l| format!("{} {}", counts[l], l))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        };
-
-                        // For single-tool groups: determine if the inner tool
-                        // has a body worth showing. If HeaderOnly, the header
-                        // line is the entire UI — no expand arrow, no nesting.
-                        let single_policy = if count == 1 {
-                            Some(tool_render_policy(calls[0]))
-                        } else {
-                            None
-                        };
-                        let expandable = if count > 1 {
-                            true
-                        } else {
-                            !matches!(single_policy, Some(ToolRenderPolicy::HeaderOnly))
-                        };
-                        let arrow = if !expandable {
-                            " "
-                        } else if group_expanded {
-                            "▼"
-                        } else {
-                            "▶"
-                        };
-
-                        let anchor_str = anchor.to_string();
-                        let weak = weak_self.clone();
-                        let click_id = anchor_str.clone();
-                        let mut header_row = div()
-                            .id(SharedString::from(format!("tool-group-{}", anchor)))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .py(px(6.0))
-                            .px_2()
-                            .child(div().text_color(dim_fg).child(arrow))
-                            .child(div().text_color(group_color).child(group_glyph))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_color(self_editor_fg)
-                                    .text_size(px(12.0))
-                                    .child(header_title),
-                            );
-
-                        if expandable {
-                            header_row = header_row.cursor_pointer().on_click(
-                                move |_ev: &gpui::ClickEvent,
-                                      _w: &mut Window,
-                                      app: &mut GpuiApp| {
-                                    let id = click_id.clone();
-                                    let _ = weak.update(app, |this, cx| {
-                                        if let Some(mut c) = this.agent_mut(cx) {
-                                            c.tools.toggle_expanded(&id);
-                                        }
-                                        cx.notify();
-                                    });
-                                },
-                            );
-                        }
-
-                        let mut block = div()
-                            .flex()
-                            .flex_col()
-                            .mt(px(16.0))
-                            .mb(px(8.0))
-                            .mx_4()
-                            .child(header_row);
-
-                        // Expanded: show contents.
-                        if group_expanded && expandable {
-                            if count == 1 {
-                                // Single-tool group: render body directly
-                                // under the header — no nested sub-header.
-                                let tc = calls[0];
-                                block = append_tool_body(
-                                    block,
-                                    tc,
-                                    single_policy.unwrap_or(ToolRenderPolicy::Full),
-                                    &code_font_snap,
-                                    &at_snap,
-                                );
-                            } else {
-                                for tc in &calls {
-                                    let expanded_detail =
-                                        expanded_snap.contains(&tc.tool_call_id.0.to_string());
-                                    block = block.child(build_tool_block_with_weak(
-                                        tc,
-                                        expanded_detail,
-                                        &code_font_snap,
-                                        weak_self.clone(),
-                                        &at_snap,
-                                    ));
-                                }
-                            }
-                        }
-
-                        block.into_any_element()
-                    }
-                    FlatItem::Block(rendered_block) => {
-                        let ctx = RenderCtx {
-                            theme: &theme_snap,
-                            body_font: body_font_snap.clone(),
-                            code_font: code_font_snap.clone(),
-                            // Claude session chat blocks stay at fixed size —
-                            // Cmd-zoom is scoped to the document view.
-                            text_scale: 1.0,
-                            cursor_block: None,
-                            doc_selection: None,
-                            line_layouts: None,
-                            current_block: None,
-                            // Wiki link clicks in Claude messages aren't
-                            // wired up — they'd need a per-message source
-                            // path which we don't track. Skip for v1.
-                            weak_view: None,
-                            doc_dir: None,
-                            block_count: 0,
-                        };
-                        let inner = block_inner(&ctx, rendered_block);
-                        div()
-                            .mt(px(4.0))
-                            .mb(px(4.0))
-                            .child(inner)
-                            .into_any_element()
-                    }
-                    FlatItem::TurnHeader { role } => {
-                        let (label, accent): (&str, Hsla) = match role {
-                            TurnRole::Claude => ("Claude", nc(at_snap.turn_header_agent)),
-                            TurnRole::User => ("You", nc(at_snap.turn_header_user)),
-                        };
-                        let rule_color = nc(at_snap.turn_rule);
-                        // TurnHeaders float on editor_bg — no turn tint
-                        // (Constraint 6). The neutral gap between tinted
-                        // text bands is the visual separator.
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .w_full()
-                            .pt(px(32.0))
-                            .pb(px(8.0))
-                            .px_4()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(accent)
-                                    .font_weight(FontWeight::BOLD)
-                                    .font_family(body_font_snap.clone())
-                                    .child(SharedString::from(label)),
-                            )
-                            .child(div().flex_1().h(px(1.0)).bg(rule_color))
-                            .into_any_element()
-                    }
-                    FlatItem::ThinkingIndicator => {
-                        // Pulsing dot: opacity cycles 0.3–1.0 on a sine wave.
-                        let phase = if let Some(t) = turn_started_snap {
-                            let ms = t.elapsed().as_millis() as f64;
-                            ((ms / 750.0).sin() * 0.5 + 0.5) as f32
-                        } else {
-                            1.0
-                        };
-                        let alpha = 0.3 + phase * 0.7;
-
-                        // Live elapsed (since the prompt was sent) and quiet
-                        // time (since the last streamed event). A streaming
-                        // turn keeps `quiet` near zero; a stall lets it climb,
-                        // which is the tell that the API — not yalda — is
-                        // wedged. Past STALL_WARN_S we switch to an explicit
-                        // warning so the user knows it's abnormal.
-                        const STALL_WARN_S: u64 = 30;
-                        let elapsed_s = turn_started_snap
-                            .map(|t| t.elapsed().as_secs())
-                            .unwrap_or(0);
-                        let quiet_s = last_event_at_snap
-                            .map(|t| t.elapsed().as_secs())
-                            .unwrap_or(0);
-                        let fmt_ms = |s: u64| format!("{}:{:02}", s / 60, s % 60);
-                        let stalled = quiet_s >= STALL_WARN_S;
-
-                        let dot_color = if stalled {
-                            // Amber when stalled, regardless of pulse phase.
-                            nc(at_snap.warm_accent)
-                        } else {
-                            Hsla {
-                                h: 0.53,
-                                s: 0.9,
-                                l: 0.76,
-                                a: alpha,
-                            }
-                        };
-                        let (label, label_color) = if stalled {
-                            (
-                                format!(
-                                    "No reply for {} (running {}) — the API may be overloaded. ⌘. to stop · ⌘. again to force-restart",
-                                    fmt_ms(quiet_s),
-                                    fmt_ms(elapsed_s),
-                                ),
-                                nc(at_snap.warm_accent),
-                            )
-                        } else {
-                            (
-                                format!("Thinking\u{2026} {}", fmt_ms(elapsed_s)),
-                                Hsla {
-                                    h: 0.0,
-                                    s: 0.0,
-                                    l: 0.6,
-                                    a: alpha,
-                                },
-                            )
-                        };
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_start()
-                            .w_full()
-                            .pt_3()
-                            .pb_2()
-                            .pl_1()
-                            .pr_4()
-                            .gap_2()
-                            .child(div().text_size(px(14.0)).text_color(dot_color).child("●"))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(px(12.0))
-                                    .text_color(label_color)
-                                    .font_family(body_font_snap.clone())
-                                    .child(SharedString::from(label)),
-                            )
-                            .into_any_element()
-                    }
-                }
-            }
-        };
-
-        let body = div()
-            .id("claude-body")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .px_6()
-            .py_3()
-            .text_size(px(13.0))
-            .font_family(self.code_font.clone())
-            .text_color(self.editor_fg())
-            .child(
-                // Default (visible-only) measuring — NOT `Auto`. `Auto` measures
-                // EVERY item every frame (gpui list.rs): a profiler on a live
-                // session showed each keystroke re-running taffy layout + text
-                // measurement over all ~680 transcript items via the list's
-                // `layout_items`/`prepaint_items` — O(transcript) per keystroke,
-                // the real Message Box typing lag (NOT the element build, which
-                // `[perf]` measured and found cheap — this cost is in GPUI layout
-                // AFTER render returns, which `[perf]` doesn't capture). The body
-                // parent is `flex_1().min_h_0()`, so the list fills the viewport
-                // and scrolls without sizing to content. Default also avoids the
-                // `Auto`-only hazard of measured-but-unprepainted item bounds.
-                gpui::list(c.list_state.clone(), render_fn)
-                    .flex_1()
-                    .w_full(),
-            );
-
         let top = self.theme.top_bar;
         let bot = self.theme.bottom_bar;
 
@@ -2280,7 +1595,10 @@ impl YaldaGpuiView {
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
-                .child(body),
+                // The transcript body is the cached `TranscriptView` (ticket
+                // 021), built before this update and moved in here. `flex_1`
+                // gives the cached slot real bounds to fill (size-from-style).
+                .child(transcript_body),
         );
         if let Some(p) = tasklist_sidebar {
             transcript_row = transcript_row.child(p);
@@ -2301,17 +1619,7 @@ impl YaldaGpuiView {
         }
         let content_area: gpui::AnyElement = col.into_any_element();
 
-            (
-                header,
-                info_bar,
-                content_area,
-                t_render0,
-                perf_extract_ms,
-                perf_hl_ms,
-                perf_lines,
-                perf_recomputed,
-                perf_skip,
-            )
+            (header, info_bar, content_area)
         });
 
         let root = root
@@ -2361,32 +1669,19 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::tag_view_chord))
             .on_action(cx.listener(Self::tag_toggle_chord))
             .on_action(cx.listener(Self::clear_tag_view));
-        let out = match self.agent_status_position {
+        // The per-section `[perf] agent-render` trace moved with the transcript
+        // body into `TranscriptView` (ticket 021): the extract/highlight/flat
+        // costs it measured now live there, behind the cached render-skip, and
+        // the `YALDA_PERF` render-count + notify-reason counters are the
+        // instrumentation this refactor verifies against.
+        match self.agent_status_position {
             AgentStatusPosition::Top => {
                 root.child(header).child(info_bar).child(content_area)
             }
             AgentStatusPosition::Bottom => {
                 root.child(header).child(content_area).child(info_bar)
             }
-        };
-
-        if let Some(t0) = t_render0 {
-            let total_ms = t0.elapsed().as_secs_f64() * 1e3;
-            let extract_ms = perf_extract_ms.unwrap_or(0.0);
-            let hl_ms = perf_hl_ms.unwrap_or(0.0);
-            // `rest` = the untimed remainder inside render_agent: gutter tags,
-            // block detect/parse, flat_items build, element-tree assembly.
-            // If total is large but extract+hl are small, the cost is here
-            // (or in GPUI layout after we return — not captured).
-            let rest_ms = (total_ms - extract_ms - hl_ms).max(0.0);
-            eprintln!(
-                "[perf] agent-render lines={perf_lines} total={total_ms:.2}ms \
-                 extract={extract_ms:.2}ms hl={hl_ms:.2}ms rest={rest_ms:.2}ms \
-                 recomputed={perf_recomputed} skip={perf_skip} cache={}",
-                if hl_cache_enabled() { "on" } else { "off" },
-            );
         }
-        out
     }
 
     /// Render the in-tile session picker shown on an empty Agent ring
