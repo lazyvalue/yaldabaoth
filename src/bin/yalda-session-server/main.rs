@@ -1544,6 +1544,20 @@ impl Manager {
                 .get_mut(session_id)
                 .ok_or_else(|| format!("no such session: {session_id}"))?;
             session.label = label.clone();
+            // Persist the rename to the WAL so it survives a server restart;
+            // without this the session recovers under its creation-time name
+            // (the header label), which is the "names keep getting forgotten"
+            // bug. A WAL error is logged, never fatal — the live broadcast below
+            // still updates connected GUIs.
+            if let Some(wal) = session.wal.as_mut()
+                && let Err(e) = wal.append_rename(&label)
+            {
+                tracing::error!(
+                    session_id = %&session_id[..8.min(session_id.len())],
+                    error = %e,
+                    "WAL rename append failed"
+                );
+            }
         }
         let _ = self.events.send(Notification::SessionRenamed {
             session_id: session_id.to_string(),
