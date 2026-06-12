@@ -336,7 +336,7 @@ impl YaldaGpuiView {
         if let Some(tile) = self.agent_tile_mut() {
             tile.pending_open_token = Some(open_token);
         }
-        self.spawn_create_agent_session(open_token, label, cwd, cx);
+        self.spawn_create_agent_session(open_token, label, cwd, None, cx);
         if let Some(mut c) = self.agent_mut(cx) {
             c.editor.begin_insert();
         }
@@ -774,7 +774,7 @@ impl YaldaGpuiView {
             if let Some(tile) = self.agent_tile_mut() {
                 tile.pending_open_token = Some(open_token);
             }
-            self.spawn_create_agent_session(open_token, label, slot_cwd, cx);
+            self.spawn_create_agent_session(open_token, label, slot_cwd, None, cx);
         } else {
             // Direct-spawn path.
             let state = self.create_agent_session(None, slot_cwd.clone(), cx);
@@ -842,7 +842,7 @@ impl YaldaGpuiView {
                 c.editor.begin_insert();
             }
             cx.notify();
-            self.spawn_create_agent_session(open_token, label, slot_cwd, cx);
+            self.spawn_create_agent_session(open_token, label, slot_cwd, None, cx);
         } else {
             // Direct-spawn path: a fresh session has no resume_id.
             let state = self.create_agent_session(None, slot_cwd.clone(), cx);
@@ -873,6 +873,12 @@ impl YaldaGpuiView {
         open_token: u64,
         label: String,
         cwd: PathBuf,
+        // When `Some`, force this permission mode on the freshly-created session
+        // instead of the server's default. Used by `/clear` to carry the cleared
+        // session's mode across the close+create. Applied in the same background
+        // round-trip (the new sid is known there), so the GUI badge reflects it
+        // when the slot binds.
+        desired_mode: Option<yalda::acp_channel::PermissionMode>,
         cx: &mut Context<Self>,
     ) {
         let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
@@ -887,11 +893,28 @@ impl YaldaGpuiView {
                     // `server_session_id`) so the bind-before-attach ordering
                     // is uniform across the open and new-session paths.
                     match handle.create_session(cwd, label, None) {
-                        Ok(info) => OpenResolution::Created {
-                            sid: info.session_id,
-                            acp_id: info.acp_session_id,
-                            permission_mode: info.permission_mode,
-                        },
+                        Ok(info) => {
+                            let mut permission_mode = info.permission_mode;
+                            // Preserve a non-default mode across `/clear`: the
+                            // create returns the server default, so push the
+                            // desired mode now (we have the sid) and reflect it
+                            // in the resolution so the badge is correct on bind.
+                            if let Some(want) = desired_mode
+                                && want != permission_mode
+                            {
+                                match handle.set_permission_mode(&info.session_id, want) {
+                                    Ok(()) => permission_mode = want,
+                                    Err(e) => eprintln!(
+                                        "[yalda-gpui] clear: preserve permission mode failed: {e}"
+                                    ),
+                                }
+                            }
+                            OpenResolution::Created {
+                                sid: info.session_id,
+                                acp_id: info.acp_session_id,
+                                permission_mode,
+                            }
+                        }
                         Err(e) => OpenResolution::Failed(format!("create failed: {e}")),
                     }
                 })
@@ -975,6 +998,7 @@ impl YaldaGpuiView {
                 open_token,
                 "respawned".to_string(),
                 new_cwd.clone(),
+                None,
                 cx,
             );
         } else {
@@ -2603,40 +2627,101 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Wipe the local claude buffer + tool-call state, drop the saved
-    /// session id for the current cwd, and reattach. Equivalent to
-    /// `/clear` in the Claude Code TUI: previous turns disappear from
-    /// the view *and* the agent gets a fresh `session/new` so it isn't
-    /// holding on to context from the cleared conversation. Use this
-    /// when the model has gone off-track and you want a clean slate
-    /// without restarting yalda.
+    /// Discard the focused session's conversation and start a fresh one **in
+    /// place, preserving the session's identity** — name (label), working
+    /// directory, and permission mode all carry across; only the transcript and
+    /// the agent's context are reset. Equivalent to `/clear` in the Claude Code
+    /// TUI. Use this when the model has gone off-track and you want a clean
+    /// slate without restarting yalda or losing the session's setup.
+    ///
+    /// Mechanically this is still a close+create: the conversation lives in the
+    /// agent subprocess, so there is no in-place reset — the old session is
+    /// killed and a new one is spawned. The internal `SessionId` / server sid
+    /// therefore change; everything the *user* sees (label, cwd, mode, the tile
+    /// binding) is preserved. A no-op with a status hint if no session is bound.
     pub(crate) fn clear_agent_session(&mut self, cx: &mut Context<Self>) {
-        // Forget every persisted slot BEFORE re-opening so the new spawn
-        // hits session/new instead of session/load.
+        let Some(id) = self.focused_bound_session() else {
+            if let Some(mut c) = self.agent_mut(cx) {
+                c.status = Some("clear: no session".into());
+            }
+            cx.notify();
+            return;
+        };
+
+        // Snapshot the identity to carry across the reset BEFORE closing.
+        let Some((label, slot_cwd)) = self
+            .sessions
+            .get(id)
+            .map(|ent| {
+                let s = ent.read(cx);
+                (s.label.clone(), s.cwd.clone())
+            })
+        else {
+            return;
+        };
+        let desired_mode = self.read_session(id, cx, |s| s.permission_mode);
+
+        // Forget persisted slots BEFORE re-opening so the new spawn hits
+        // session/new, not session/load (a load would resume the conversation
+        // we are trying to discard).
         if let Ok(cwd) = std::env::current_dir() {
             forget_persisted_acp_sessions(&cwd);
         }
-        // KILL (not free) the focused session — `/clear` discards the
-        // conversation, so the old session must not linger in the store still
-        // running. Capture the sid first, close it on the server, then drop it
-        // from the store and unbind the tile.
-        if let Some(id) = self.focused_bound_session() {
-            if let Some(sid) = self.sessions.sid_of(id).map(|s| s.to_string()) {
-                self.spawn_close_session(sid, cx);
-            }
-            self.transcript_views.remove(&id);
-            self.sessions.close(id);
-            if let Some(tile) = self.agent_tile_mut() {
-                tile.bound = None;
-                tile.picker = None;
-            }
+
+        // KILL the old session (clear discards the conversation): close it on
+        // the server, drop it from the store, unbind the tile.
+        if let Some(sid) = self.sessions.sid_of(id).map(|s| s.to_string()) {
+            self.spawn_close_session(sid, cx);
         }
-        // Open a fresh session in place. We're already on an Agent tile (unbound
-        // now), so `new_agent_session` rebinds this tile to a brand-new session.
-        self.new_agent_session(None, cx);
+        self.transcript_views.remove(&id);
+        self.sessions.close(id);
+        if let Some(tile) = self.agent_tile_mut() {
+            tile.bound = None;
+            tile.picker = None;
+        }
+
+        // Re-create in place on the now-unbound focused tile, reusing the
+        // snapshotted label + cwd and forcing the preserved permission mode.
+        if self.session_server.is_some() {
+            let open_token = alloc_open_token();
+            self.show_local_session(
+                AgentSession {
+                    state: AgentState::new_server_managed(Some(
+                        "connecting to session server…".into(),
+                    )),
+                    label: label.clone(),
+                    cwd: slot_cwd.clone(),
+                    resume_id: None,
+                },
+                cx,
+            );
+            if let Some(tile) = self.agent_tile_mut() {
+                tile.pending_open_token = Some(open_token);
+            }
+            self.spawn_create_agent_session(open_token, label, slot_cwd, desired_mode, cx);
+        } else {
+            // Direct-spawn fallback (legacy YALDA_SESSION_SERVER=0). The channel
+            // attaches asynchronously, so the permission mode is not forced here
+            // — this path keeps the server default. The server path above is the
+            // real one.
+            let state = self.create_agent_session(None, slot_cwd.clone(), cx);
+            let new_id = self.show_local_session(
+                AgentSession {
+                    state,
+                    label,
+                    cwd: slot_cwd,
+                    resume_id: None,
+                },
+                cx,
+            );
+            self.start_session_pump(new_id, cx);
+        }
+
         if let Some(mut c) = self.agent_mut(cx) {
+            c.editor.begin_insert();
             c.status = Some("session cleared".into());
         }
+        self.save_agent_ring(cx);
         cx.notify();
     }
 

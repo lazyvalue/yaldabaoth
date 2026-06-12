@@ -711,4 +711,18 @@ impl SessionServerHandle {
             Response::Error { message } => Err(io::Error::other(message)),
         }
     }
+
+    /// Set a session's permission mode off-thread. Mirrors
+    /// [`SessionServerClient::set_permission_mode`]; used by `/clear` to carry
+    /// the cleared session's mode onto the freshly-created one from inside the
+    /// background create round-trip.
+    pub fn set_permission_mode(&self, session_id: &str, mode: PermissionMode) -> io::Result<()> {
+        match self.request(Request::SetPermissionMode {
+            session_id: session_id.to_string(),
+            mode,
+        })? {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message } => Err(io::Error::other(message)),
+        }
+    }
 }
