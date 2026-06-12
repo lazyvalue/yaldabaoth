@@ -1274,6 +1274,12 @@ enum RenameTarget {
     /// Path-input overlay that, on commit, changes the bound session's
     /// cwd (spec-agent-cwd.md §4). Targeted by stable `SessionId`.
     AgentChangeCwd { id: SessionId },
+    /// Path-input overlay that, on commit, writes the active workspace's
+    /// registry `"cwd"` (untitled.md "Set CWD … implemented as a kv"). Agent
+    /// sessions created in this workspace then inherit it. Targeted by current
+    /// tab position (safe: the overlay captures key dispatch, so no structural
+    /// mutation can shift indices mid-edit, same as `Tab`).
+    WorkspaceCwd { index: usize },
     /// `{cols}x{rows}` input that sets the global desktop-mode tile size
     /// (spec-desktop-mode.md Behavior 6). Clamped to [20, 400] × [5, 200];
     /// unparseable input cancels with a footer hint.
@@ -1387,6 +1393,7 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("]", "next workspace (Ctrl-Tab)", "next-tab"),
                 MenuNode::entry("[", "prev workspace (Ctrl-Shift-Tab)", "prev-tab"),
                 MenuNode::entry("r", "rename workspace (Cmd-Shift-R)", "rename-tab"),
+                MenuNode::entry("c", "set cwd", "workspace-set-cwd"),
                 MenuNode::entry("m", "move tile to workspace (Ctrl-W m)", "move-tile"),
                 MenuNode::entry(
                     "M",
@@ -1512,8 +1519,6 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("r", "rename session", "claude-rename"),
         MenuNode::entry("S", "send selection", "claude-send-selection"),
         MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
-        MenuNode::entry("d", "detach", "claude-detach"),
-        MenuNode::entry("a", "attach", "claude-attach"),
     ]
 }
 
@@ -1775,6 +1780,7 @@ impl YaldaGpuiView {
                     resize: None,
                     last_reveal: None,
                 },
+                kv: ptab.kv,
             });
             ws.next_tab_index += 1;
         }
@@ -3991,8 +3997,6 @@ impl YaldaGpuiView {
             "claude-reboot" => self.reboot_into_claude(cx),
             "claude-mode-cycle" => self.cycle_claude_permission_mode(cx),
             "claude-clear" => self.clear_agent_session(cx),
-            "claude-detach" => self.detach_active_agent_session(cx),
-            "claude-attach" => self.attach_active_agent_session(cx),
             "claude-rename" => self.open_rename_overlay(cx),
             "claude-new-here" => self.open_new_agent_session_cwd_overlay(cx),
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
@@ -4011,6 +4015,7 @@ impl YaldaGpuiView {
             "back-to-doc" => self.back_to_doc(cx),
             "reload-file" => self.reload_focused_from_disk(cx),
             "rename-tab" => self.open_rename_active_tab_overlay(cx),
+            "workspace-set-cwd" => self.open_set_workspace_cwd_overlay(cx),
             "theme-dracula" => self.set_theme(ThemeName::Dracula, cx),
             "theme-nightfox" => self.set_theme(ThemeName::Nightfox, cx),
             "theme-solarized-light" => self.set_theme(ThemeName::SolarizedLight, cx),
@@ -4610,6 +4615,7 @@ impl YaldaGpuiView {
             master_count: 1,
             tag_view: std::collections::BTreeSet::new(),
             desktop: workspace::DesktopState::default(),
+            kv: std::collections::HashMap::new(),
         });
     }
 
@@ -5138,6 +5144,32 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// Open a path-input overlay that sets the active workspace's registry
+    /// `"cwd"` (untitled.md "Set CWD"). Pre-fills with the current workspace
+    /// cwd if set, otherwise the process cwd, so Enter confirms a sensible
+    /// default. On commit the path is resolved + validated (same rules as
+    /// `:claude-new <path>`) and written to the tab's kv; new agent sessions
+    /// in this workspace inherit it.
+    fn open_set_workspace_cwd_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.overlay_is_rename() {
+            return;
+        }
+        let idx = self.workspace.active_tab;
+        let Some(tab) = self.workspace.tabs.get(idx) else {
+            return;
+        };
+        let text = tab
+            .kv_get("cwd")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| process_cwd().display().to_string());
+        self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
+            text,
+            target: RenameTarget::WorkspaceCwd { index: idx },
+        }));
+        cx.notify();
+    }
+
     /// Open the rename overlay targeting the active workspace tab. The
     /// input pre-fills with the tab's current display label (display_name
     /// if set, else auto_name).
@@ -5229,6 +5261,23 @@ impl YaldaGpuiView {
                     if let Some(mut c) = self.agent_mut(cx) {
                         c.status = Some(msg.into());
                     }
+                    cx.notify();
+                }
+            },
+            RenameTarget::WorkspaceCwd { index } => match resolve_agent_cwd_arg(&new_label) {
+                Ok(resolved) => {
+                    self.close_rename_overlay();
+                    let path = resolved.display().to_string();
+                    if let Some(tab) = self.workspace.tabs.get_mut(index) {
+                        tab.kv_set("cwd", path.clone());
+                    }
+                    self.transient_status = Some(format!("workspace cwd → {path}").into());
+                    self.save_workspace_state();
+                    cx.notify();
+                }
+                Err(msg) => {
+                    self.close_rename_overlay();
+                    self.transient_status = Some(msg.into());
                     cx.notify();
                 }
             },
@@ -5942,6 +5991,7 @@ impl YaldaGpuiView {
             RenameTarget::Tab { .. } => "RENAME WORKSPACE",
             RenameTarget::AgentNewSessionCwd => "NEW SESSION AT…",
             RenameTarget::AgentChangeCwd { .. } => "CHANGE SESSION CWD",
+            RenameTarget::WorkspaceCwd { .. } => "SET WORKSPACE CWD",
             RenameTarget::DesktopTileSize => "DESKTOP GRID (COLSxROWS OF TILES)",
         };
         let header = div()

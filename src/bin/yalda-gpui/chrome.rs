@@ -640,6 +640,34 @@ impl YaldaGpuiView {
         }
     }
 
+    /// Mouse click into a tile focuses it (untitled.md Workspace TODO). No-op
+    /// when `id` is already focused so an ordinary click inside the focused
+    /// tile doesn't thrash persistence. Mirrors the keyboard focus-motion side
+    /// effects (`focus_next`): re-assert the view focus, sync the rail,
+    /// persist, notify.
+    pub(crate) fn focus_window_by_click(
+        &mut self,
+        id: workspace::WindowId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let already = self
+            .workspace
+            .active_tab()
+            .map(|t| t.focused == id)
+            .unwrap_or(false);
+        if already {
+            return;
+        }
+        if let Some(tab) = self.workspace.active_tab_mut() {
+            tab.focused = id;
+        }
+        self.focus_handle.focus(window);
+        self.sync_rail_focus_after_motion();
+        self.save_workspace_state();
+        cx.notify();
+    }
+
     /// Recursively render a `Layout<App>`. The `root` div is used
     /// only for the leaf case (so leaves can attach focus + key bindings);
     /// split branches build their own container.
@@ -702,9 +730,23 @@ impl YaldaGpuiView {
                 // tag in the upper-right corner.
                 let multi_leaf = self.active_tab_leaf_count() > 1;
                 let mark_ch = self.workspace.marks.mark_for_window(window.id);
-                if (is_focused && multi_leaf) || mark_ch.is_some() {
+                // Wrap whenever there's more than one leaf (so every tile can
+                // catch a focus click) or this leaf carries a mark badge.
+                if multi_leaf || mark_ch.is_some() {
                     let accent: Hsla = rgb(STATUS_FG).into();
                     let mut wrapper = div().size_full().relative();
+                    // Click into an unfocused tile focuses it (untitled.md
+                    // Workspace TODO). Bubble phase, so a click inside an
+                    // editor positions the caret first, then focus follows.
+                    if multi_leaf && !is_focused {
+                        let wid = window.id;
+                        wrapper = wrapper.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, _ev: &MouseDownEvent, w, cx| {
+                                view.focus_window_by_click(wid, w, cx);
+                            }),
+                        );
+                    }
                     if is_focused && multi_leaf {
                         wrapper = wrapper.border_2().border_color(accent);
                     }

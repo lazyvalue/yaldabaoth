@@ -740,6 +740,20 @@ impl YaldaGpuiView {
     /// new slot's cwd — the caller (typically the `:claude-new <path>`
     /// command handler) is responsible for running the input through
     /// `resolve_agent_cwd_arg` first.
+    /// The active workspace's registry `"cwd"`, if set and non-empty. An agent
+    /// session created without an explicit cwd inherits this (untitled.md Agent
+    /// TODO: "inherit CWD from workspace. If none, inherit CWD from app"), with
+    /// `process_cwd` — the app/process directory — as the final fallback. The
+    /// path is whatever `Set CWD` resolved+validated at write time; a since-
+    /// deleted dir surfaces as a spawn error (spec-agent-cwd.md §9), not here.
+    pub(crate) fn active_workspace_cwd(&self) -> Option<PathBuf> {
+        self.workspace
+            .active_tab()
+            .and_then(|t| t.kv_get("cwd"))
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    }
+
     pub(crate) fn new_agent_session(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
         // Not on an Agent tile yet — bootstrap one AND create a brand-new
         // session (never re-attach an existing per-cwd one).
@@ -753,7 +767,9 @@ impl YaldaGpuiView {
         // local placeholder mid-open — that would orphan its in-flight create
         // (no tile would match its token), so close it.
         let label = self.next_agent_label(cx);
-        let slot_cwd = cwd.unwrap_or_else(process_cwd);
+        let slot_cwd = cwd
+            .or_else(|| self.active_workspace_cwd())
+            .unwrap_or_else(process_cwd);
         self.release_focused_session_for_rebind();
 
         if self.session_server.is_some() {
@@ -816,7 +832,9 @@ impl YaldaGpuiView {
         // Agent and Buffer are orthogonal).
         let tile = AgentTile::new();
         self.set_screen(App::Agent(tile));
-        let slot_cwd = cwd.unwrap_or_else(process_cwd);
+        let slot_cwd = cwd
+            .or_else(|| self.active_workspace_cwd())
+            .unwrap_or_else(process_cwd);
         let label = self.next_agent_label(cx);
 
         if self.session_server.is_some() {
@@ -2806,6 +2824,10 @@ impl YaldaGpuiView {
     /// `claude-new` slots without a `resume_id` will silently drop from
     /// persistence on the next save (per spec: "slots without a session id
     /// are not written").
+    ///
+    /// No longer on the agent `.` menu (untitled.md removed detach/attach as
+    /// user commands); kept as internal machinery for a future re-wiring.
+    #[allow(dead_code)]
     pub(crate) fn detach_active_agent_session(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.focused_bound_session() else {
             return;
@@ -2838,6 +2860,10 @@ impl YaldaGpuiView {
     /// subprocess was killed on detach, so the session is gone. Clear
     /// `resume_id` so persistence captures the new channel's id once it
     /// binds (rather than retrying the original-load id forever).
+    ///
+    /// No longer on the agent `.` menu (untitled.md removed detach/attach as
+    /// user commands); kept as internal machinery for a future re-wiring.
+    #[allow(dead_code)]
     pub(crate) fn attach_active_agent_session(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.focused_bound_session() else {
             return;

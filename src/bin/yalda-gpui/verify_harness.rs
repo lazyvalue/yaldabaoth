@@ -63,6 +63,54 @@ fn constructs_and_renders_real_view(cx: &mut TestAppContext) {
     );
 }
 
+/// Workspace KV registry → agent CWD inheritance (untitled.md Workspace +
+/// Agent TODOs). A `"cwd"` written into the active workspace's registry is
+/// what `active_workspace_cwd` surfaces — the value an agent session created
+/// without an explicit cwd inherits before falling back to the process cwd.
+/// Absent / empty keys yield `None` so the call site falls through to
+/// `process_cwd`.
+#[gpui::test]
+fn workspace_kv_cwd_inheritance(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+
+    // No registry entry → None (caller uses process cwd).
+    let none = view.read_with(vcx, |v, _| v.active_workspace_cwd());
+    assert_eq!(none, None, "absent cwd key yields None");
+
+    // Write a cwd into the active tab's registry → inherited.
+    view.update(vcx, |v, _cx| {
+        v.workspace
+            .active_tab_mut()
+            .expect("active tab")
+            .kv_set("cwd", "/tmp/example-ws");
+    });
+    let got = view.read_with(vcx, |v, _| v.active_workspace_cwd());
+    assert_eq!(
+        got,
+        Some(PathBuf::from("/tmp/example-ws")),
+        "registry cwd is inherited"
+    );
+
+    // Empty string is treated as unset.
+    view.update(vcx, |v, _cx| {
+        v.workspace
+            .active_tab_mut()
+            .expect("active tab")
+            .kv_set("cwd", "");
+    });
+    let empty = view.read_with(vcx, |v, _| v.active_workspace_cwd());
+    assert_eq!(empty, None, "empty cwd key yields None");
+}
+
 /// Tier-3 latency gate: prove the Edit view does **O(changed)** highlight work
 /// per keystroke, not O(document). Open a 3000-line buffer, render it (cold:
 /// every line highlighted once), then perform a single-character insert and

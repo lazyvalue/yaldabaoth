@@ -979,11 +979,35 @@ pub struct Tab<C> {
     /// layout tree above remains the content owner. Kept (not cleared) when
     /// switching away from Desktop so the arrangement survives round-trips.
     pub desktop: DesktopState,
+    /// Per-workspace key-value registry (untitled.md "Workspace"). Apps read
+    /// it during render (so a write + `cx.notify()` is the "all apps notified"
+    /// mechanism) and at lifecycle moments — e.g. an agent tile reads the
+    /// `"cwd"` key when spawning a session. Persisted in `PersistedTab`.
+    pub kv: HashMap<String, String>,
 }
 
 impl<C> Tab<C> {
     pub fn display_label(&self) -> &str {
         self.display_name.as_deref().unwrap_or(&self.auto_name)
+    }
+
+    /// Read a registry value. Empty strings are treated as present (the
+    /// caller decides whether empty is meaningful).
+    pub fn kv_get(&self, key: &str) -> Option<&str> {
+        self.kv.get(key).map(String::as_str)
+    }
+
+    /// Set a registry value. Caller is responsible for `cx.notify()` + persist
+    /// so all apps re-render against the new value.
+    pub fn kv_set(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.kv.insert(key.into(), value.into());
+    }
+
+    /// Remove a registry value, returning the prior value if any. Kept for
+    /// API symmetry — no command clears the registry yet.
+    #[allow(dead_code)]
+    pub fn kv_remove(&mut self, key: &str) -> Option<String> {
+        self.kv.remove(key)
     }
 }
 
@@ -1109,6 +1133,7 @@ impl<C> Workspace<C> {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
+            kv: HashMap::new(),
         });
         self.active_tab = self.tabs.len() - 1;
         id
@@ -2435,6 +2460,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
+            kv: HashMap::new(),
         });
         // Ensure window-id allocator skips past the ids we hand-rolled.
         let max_id = ws.tabs[0].layout.leaf_ids().into_iter().max().unwrap_or(0);
@@ -2827,6 +2853,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
+            kv: HashMap::new(),
         });
         let w = Window {
             id: 9,
@@ -2855,6 +2882,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
+            kv: HashMap::new(),
         });
         let w = Window {
             id: 9,
@@ -2892,6 +2920,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
+            kv: HashMap::new(),
         });
         let (window, empty) = ws.detach_focused().unwrap();
         assert!(!empty);
