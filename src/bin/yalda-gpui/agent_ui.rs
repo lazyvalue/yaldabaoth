@@ -69,14 +69,17 @@ impl YaldaGpuiView {
             .cloned();
         let id = match chosen {
             None => {
-                let label = self.next_agent_label();
+                let label = self.next_agent_label(cx);
                 let state = self.create_agent_session(None, proc_cwd.clone(), cx);
-                self.show_local_session(AgentSession {
-                    state,
-                    label,
-                    cwd: proc_cwd.clone(),
-                    resume_id: None,
-                })
+                self.show_local_session(
+                    AgentSession {
+                        state,
+                        label,
+                        cwd: proc_cwd.clone(),
+                        resume_id: None,
+                    },
+                    cx,
+                )
             }
             Some(slot) => {
                 let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
@@ -87,17 +90,20 @@ impl YaldaGpuiView {
                 }
                 state.tasklist_open = slot.tasklist_open;
                 state.subagents_open = slot.subagents_open;
-                self.show_local_session(AgentSession {
-                    state,
-                    label: slot.label,
-                    cwd: slot_cwd,
-                    resume_id: Some(slot.id),
-                })
+                self.show_local_session(
+                    AgentSession {
+                        state,
+                        label: slot.label,
+                        cwd: slot_cwd,
+                        resume_id: Some(slot.id),
+                    },
+                    cx,
+                )
             }
         };
         self.start_session_pump(id, cx);
 
-        if let Some(c) = self.agent_mut() {
+        if let Some(mut c) = self.agent_mut(cx) {
             c.editor.begin_insert();
         }
         cx.notify();
@@ -214,10 +220,10 @@ impl YaldaGpuiView {
     /// create time (`create_session`), so deduping here keeps the persisted
     /// names distinct too. Reuses a freed number (close claude-2, create →
     /// claude-2 again).
-    pub(crate) fn next_agent_label(&self) -> String {
+    pub(crate) fn next_agent_label(&self, cx: &GpuiApp) -> String {
         let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (_, s) in self.sessions.iter() {
-            used.insert(s.label.clone());
+            used.insert(s.read(cx).label.clone());
         }
         // Also avoid names of sessions the picker has listed but we haven't
         // attached (so they're not yet in the store).
@@ -311,25 +317,30 @@ impl YaldaGpuiView {
     /// Picker → "start a new session": clear the picker, bind a placeholder
     /// session to this tile, and create a fresh session via the shared path.
     fn picker_start_new(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
-        let label = self.next_agent_label();
+        let label = self.next_agent_label(cx);
         let open_token = alloc_open_token();
         if self.agent_tile_mut().is_none() {
             return;
         }
-        self.show_local_session(AgentSession {
-            state: AgentState::new_server_managed(Some("connecting to session server…".into())),
-            label: label.clone(),
-            cwd: cwd.clone(),
-            resume_id: None,
-        });
+        self.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(Some(
+                    "connecting to session server…".into(),
+                )),
+                label: label.clone(),
+                cwd: cwd.clone(),
+                resume_id: None,
+            },
+            cx,
+        );
         if let Some(tile) = self.agent_tile_mut() {
             tile.pending_open_token = Some(open_token);
         }
         self.spawn_create_agent_session(open_token, label, cwd, cx);
-        if let Some(c) = self.agent_mut() {
+        if let Some(mut c) = self.agent_mut(cx) {
             c.editor.begin_insert();
         }
-        self.save_agent_ring();
+        self.save_agent_ring(cx);
         cx.notify();
     }
 
@@ -353,12 +364,15 @@ impl YaldaGpuiView {
         if self.agent_tile_mut().is_none() {
             return;
         }
-        self.show_local_session(AgentSession {
-            state: AgentState::new_server_managed(Some("reconnecting…".into())),
-            label: label.clone(),
-            cwd,
-            resume_id: None,
-        });
+        self.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(Some("reconnecting…".into())),
+                label: label.clone(),
+                cwd,
+                resume_id: None,
+            },
+            cx,
+        );
         if let Some(tile) = self.agent_tile_mut() {
             tile.pending_open_token = Some(open_token);
         }
@@ -375,7 +389,7 @@ impl YaldaGpuiView {
             permission_mode,
         }]);
         self.apply_open_agent_resolution(open_token, resolution, cx);
-        if let Some(c) = self.agent_mut() {
+        if let Some(mut c) = self.agent_mut(cx) {
             c.editor.begin_insert();
         }
     }
@@ -445,9 +459,12 @@ impl YaldaGpuiView {
         match resolution {
             OpenResolution::Failed(msg) => {
                 let m = format!("session server error — {msg}");
-                if let Some(session) = self.sessions.get_mut(id) {
-                    Self::append_system_notice(&mut session.state, &m);
-                    session.state.status = Some(m.into());
+                if let Some(ent) = self.session_entity(id) {
+                    ent.update(cx, |session, scx| {
+                        Self::append_system_notice(&mut session.state, &m);
+                        session.state.status = Some(m.into());
+                        scx.notify();
+                    });
                 }
             }
             OpenResolution::Created {
@@ -456,11 +473,14 @@ impl YaldaGpuiView {
                 permission_mode,
             } => match self.bind_session_sid(id, &sid) {
                 BindOutcome::Bound => {
-                    if let Some(session) = self.sessions.get_mut(id) {
-                        session.resume_id = acp_id;
-                        session.state.permission_mode = permission_mode;
-                        session.state.status =
-                            Some("attaching to ACP agent via session server…".into());
+                    if let Some(ent) = self.session_entity(id) {
+                        ent.update(cx, |session, scx| {
+                            session.resume_id = acp_id;
+                            session.state.permission_mode = permission_mode;
+                            session.state.status =
+                                Some("attaching to ACP agent via session server…".into());
+                            scx.notify();
+                        });
                     }
                     bound_sids.push(sid);
                 }
@@ -474,20 +494,30 @@ impl YaldaGpuiView {
                 if let Some(first) = attached.into_iter().next() {
                     match self.bind_session_sid(id, &first.sid) {
                         BindOutcome::Bound => {
-                            if let Some(session) = self.sessions.get_mut(id) {
-                                session.label = first.label;
-                                session.resume_id = first.acp_id;
-                                session.state.permission_mode = first.permission_mode;
-                                session.state.status = Some(first.status.into());
+                            let AttachedSlot {
+                                label,
+                                sid,
+                                acp_id,
+                                status,
+                                permission_mode,
+                            } = first;
+                            if let Some(ent) = self.session_entity(id) {
+                                ent.update(cx, |session, scx| {
+                                    session.label = label;
+                                    session.resume_id = acp_id;
+                                    session.state.permission_mode = permission_mode;
+                                    session.state.status = Some(status.into());
+                                    scx.notify();
+                                });
                             }
-                            bound_sids.push(first.sid);
+                            bound_sids.push(sid);
                         }
                         BindOutcome::Focused(owner) => self.focus_existing_session(owner),
                     }
                 }
             }
         }
-        self.save_agent_ring();
+        self.save_agent_ring(cx);
         cx.notify();
 
         // Now that the session carries its sid, attach (which starts the
@@ -596,6 +626,7 @@ impl YaldaGpuiView {
                 // Drop the orphan placeholder we just minted (it carries no sid,
                 // so this only tears down its local channel/pump, never the live
                 // server session).
+                self.transcript_views.remove(&id);
                 self.sessions.close(id);
                 BindOutcome::Focused(owner)
             }
@@ -665,9 +696,11 @@ impl YaldaGpuiView {
                         }
                     };
                     if let Some(s) = status
-                        && let Some(session) = this.sessions.get_by_sid_mut(&sid)
+                        && let Some(sid_id) = this.sessions.locate(&sid)
                     {
-                        session.state.status = Some(s);
+                        this.with_session(sid_id, cx, |st| {
+                            st.status = Some(s);
+                        });
                     }
                 }
                 // Drop dead sessions via the same path the server's
@@ -682,7 +715,7 @@ impl YaldaGpuiView {
                     }
                 }
                 if dropped_any {
-                    this.save_agent_ring();
+                    this.save_agent_ring(cx);
                 }
                 // Authoritatively scrub the dead ids from the persisted file by
                 // id (across every cwd key). `save_agent_ring` alone misses the
@@ -719,7 +752,7 @@ impl YaldaGpuiView {
         // session is freed (kept running in the store) UNLESS it is a pre-attach
         // local placeholder mid-open — that would orphan its in-flight create
         // (no tile would match its token), so close it.
-        let label = self.next_agent_label();
+        let label = self.next_agent_label(cx);
         let slot_cwd = cwd.unwrap_or_else(process_cwd);
         self.release_focused_session_for_rebind();
 
@@ -727,12 +760,17 @@ impl YaldaGpuiView {
             // Server path: bind a "connecting…" placeholder and create the
             // session off-thread; the sid binds when the round-trip returns.
             let open_token = alloc_open_token();
-            self.show_local_session(AgentSession {
-                state: AgentState::new_server_managed(Some("connecting to session server…".into())),
-                label: label.clone(),
-                cwd: slot_cwd.clone(),
-                resume_id: None,
-            });
+            self.show_local_session(
+                AgentSession {
+                    state: AgentState::new_server_managed(Some(
+                        "connecting to session server…".into(),
+                    )),
+                    label: label.clone(),
+                    cwd: slot_cwd.clone(),
+                    resume_id: None,
+                },
+                cx,
+            );
             if let Some(tile) = self.agent_tile_mut() {
                 tile.pending_open_token = Some(open_token);
             }
@@ -740,18 +778,21 @@ impl YaldaGpuiView {
         } else {
             // Direct-spawn path.
             let state = self.create_agent_session(None, slot_cwd.clone(), cx);
-            let id = self.show_local_session(AgentSession {
-                state,
-                label,
-                cwd: slot_cwd,
-                resume_id: None,
-            });
+            let id = self.show_local_session(
+                AgentSession {
+                    state,
+                    label,
+                    cwd: slot_cwd,
+                    resume_id: None,
+                },
+                cx,
+            );
             self.start_session_pump(id, cx);
         }
-        if let Some(c) = self.agent_mut() {
+        if let Some(mut c) = self.agent_mut(cx) {
             c.editor.begin_insert();
         }
-        self.save_agent_ring();
+        self.save_agent_ring(cx);
         cx.notify();
     }
 
@@ -776,23 +817,28 @@ impl YaldaGpuiView {
         let tile = AgentTile::new();
         self.set_screen(App::Agent(tile));
         let slot_cwd = cwd.unwrap_or_else(process_cwd);
-        let label = self.next_agent_label();
+        let label = self.next_agent_label(cx);
 
         if self.session_server.is_some() {
             // Server path: placeholder + create-only round-trip (NO resolve /
             // reattach — that is the whole point of "fresh").
             let open_token = alloc_open_token();
-            self.show_local_session(AgentSession {
-                state: AgentState::new_server_managed(Some("connecting to session server…".into())),
-                label: label.clone(),
-                cwd: slot_cwd.clone(),
-                resume_id: None,
-            });
+            self.show_local_session(
+                AgentSession {
+                    state: AgentState::new_server_managed(Some(
+                        "connecting to session server…".into(),
+                    )),
+                    label: label.clone(),
+                    cwd: slot_cwd.clone(),
+                    resume_id: None,
+                },
+                cx,
+            );
             self.start_server_pump(cx);
             if let Some(tile) = self.agent_tile_mut() {
                 tile.pending_open_token = Some(open_token);
             }
-            if let Some(c) = self.agent_mut() {
+            if let Some(mut c) = self.agent_mut(cx) {
                 c.editor.begin_insert();
             }
             cx.notify();
@@ -800,17 +846,20 @@ impl YaldaGpuiView {
         } else {
             // Direct-spawn path: a fresh session has no resume_id.
             let state = self.create_agent_session(None, slot_cwd.clone(), cx);
-            let id = self.show_local_session(AgentSession {
-                state,
-                label,
-                cwd: slot_cwd,
-                resume_id: None,
-            });
+            let id = self.show_local_session(
+                AgentSession {
+                    state,
+                    label,
+                    cwd: slot_cwd,
+                    resume_id: None,
+                },
+                cx,
+            );
             self.start_session_pump(id, cx);
-            if let Some(c) = self.agent_mut() {
+            if let Some(mut c) = self.agent_mut(cx) {
                 c.editor.begin_insert();
             }
-            self.save_agent_ring();
+            self.save_agent_ring(cx);
             cx.notify();
         }
     }
@@ -873,17 +922,20 @@ impl YaldaGpuiView {
         }
 
         // Phase 1: tear down the existing channel + attach state.
-        if let Some(session) = self.sessions.get_mut(id) {
-            // Dropping `channel` kills the subprocess via kill_on_drop.
-            session.state.channel = None;
-            session.state.attach_pending = None;
-            session.state.turn_phase = TurnPhase::Idle;
-            let msg = format!("changing cwd to {}…", shorten_cwd_for_display(&new_cwd));
-            Self::append_system_notice(&mut session.state, &msg);
-            session.state.status = Some(msg.into());
-            session.cwd = new_cwd.clone();
-            // A fresh session/new is the right resume strategy for the new cwd.
-            session.resume_id = None;
+        if let Some(ent) = self.session_entity(id) {
+            ent.update(cx, |session, scx| {
+                // Dropping `channel` kills the subprocess via kill_on_drop.
+                session.state.channel = None;
+                session.state.attach_pending = None;
+                session.state.turn_phase = TurnPhase::Idle;
+                let msg = format!("changing cwd to {}…", shorten_cwd_for_display(&new_cwd));
+                Self::append_system_notice(&mut session.state, &msg);
+                session.state.status = Some(msg.into());
+                session.cwd = new_cwd.clone();
+                // A fresh session/new is the right resume strategy for the new cwd.
+                session.resume_id = None;
+                scx.notify();
+            });
         }
 
         // Phase 2: build a fresh agent session at the new cwd.
@@ -902,15 +954,18 @@ impl YaldaGpuiView {
                 self.spawn_close_session(old_sid, cx);
             }
             let open_token = alloc_open_token();
-            if let Some(session) = self.sessions.get_mut(id) {
-                session.state.attach_pending = None;
-                session.state.channel = None;
-                let msg = format!(
-                    "cwd → {}, connecting to fresh session…",
-                    shorten_cwd_for_display(&new_cwd),
-                );
-                Self::append_system_notice(&mut session.state, &msg);
-                session.state.status = Some(msg.into());
+            if let Some(ent) = self.session_entity(id) {
+                ent.update(cx, |session, scx| {
+                    session.state.attach_pending = None;
+                    session.state.channel = None;
+                    let msg = format!(
+                        "cwd → {}, connecting to fresh session…",
+                        shorten_cwd_for_display(&new_cwd),
+                    );
+                    Self::append_system_notice(&mut session.state, &msg);
+                    session.state.status = Some(msg.into());
+                    scx.notify();
+                });
             }
             // Stamp the focused tile (which shows this session) with the token.
             if let Some(tile) = self.agent_tile_mut() {
@@ -926,16 +981,20 @@ impl YaldaGpuiView {
             // Direct-spawn path: graft a throwaway AgentState's attach handle
             // into the existing session, then (re)start its pump.
             let fresh = self.create_agent_session(None, new_cwd.clone(), cx);
-            if let Some(session) = self.sessions.get_mut(id) {
-                session.state.attach_pending = fresh.attach_pending;
-                let msg = format!("cwd → {}, fresh session", shorten_cwd_for_display(&new_cwd));
-                Self::append_system_notice(&mut session.state, &msg);
-                session.state.status = Some(msg.into());
+            if let Some(ent) = self.session_entity(id) {
+                ent.update(cx, |session, scx| {
+                    session.state.attach_pending = fresh.attach_pending;
+                    let msg =
+                        format!("cwd → {}, fresh session", shorten_cwd_for_display(&new_cwd));
+                    Self::append_system_notice(&mut session.state, &msg);
+                    session.state.status = Some(msg.into());
+                    scx.notify();
+                });
             }
             self.start_session_pump(id, cx);
         }
 
-        self.save_agent_ring();
+        self.save_agent_ring(cx);
         cx.notify();
     }
 
@@ -956,6 +1015,7 @@ impl YaldaGpuiView {
                 // Orphaned pre-attach placeholder: kill it. If its create
                 // already spawned a server session, that is closed when its
                 // resolution finds no tile (see `apply_open_agent_resolution`).
+                self.transcript_views.remove(&id);
                 self.sessions.close(id);
             }
         }
@@ -998,17 +1058,18 @@ impl YaldaGpuiView {
         let cwd = self
             .sessions
             .get(id)
-            .map(|s| s.cwd.clone())
+            .map(|s| s.read(cx).cwd.clone())
             .unwrap_or_else(process_cwd);
         // Drop the session from the store (its channel/pump cancel on drop) and
         // land the tile in a live selector.
+        self.transcript_views.remove(&id);
         self.sessions.close(id);
         self.show_selector_on_focused_tile(cwd, cx);
         // Wipe the cwd entry so reboot doesn't resurrect the closed session.
         if let Ok(cwd) = std::env::current_dir() {
             forget_persisted_acp_sessions(&cwd);
         }
-        self.save_agent_ring();
+        self.save_agent_ring(cx);
         cx.notify();
         // No early `back_to_doc` — the tile stays Agent (unbound → selector).
     }
@@ -1053,7 +1114,7 @@ impl YaldaGpuiView {
     /// background tab would be saved-but-not-restored or vice versa. The first
     /// bound session is marked active. Free sessions (no tile) are not persisted
     /// — they only live for the running process. Best-effort.
-    pub(crate) fn save_agent_ring(&self) {
+    pub(crate) fn save_agent_ring(&self, cx: &GpuiApp) {
         let Ok(cwd) = std::env::current_dir() else {
             return;
         };
@@ -1062,8 +1123,9 @@ impl YaldaGpuiView {
             tab.layout.for_each_leaf(&mut |window| {
                 if let App::Agent(tile) = &window.content
                     && let Some(id) = tile.bound
-                    && let Some(session) = self.sessions.get(id)
+                    && let Some(ent) = self.sessions.get(id)
                 {
+                    let session = ent.read(cx);
                     // resume_id wins over the channel id (keep retrying the
                     // original id even when load fell back).
                     let resolved_id = session
@@ -1122,13 +1184,10 @@ impl YaldaGpuiView {
             attach_pending: Some(attach_rx),
             mode: EditMode::Insert,
             keybinds: KeybindManager::default(),
-            list_state: gpui::ListState::new(0, gpui::ListAlignment::Bottom, gpui::px(256.0)),
-            list_item_count: 0,
-            last_reconciled_edit_seq: 0,
+
             status: Some("attaching to ACP agent…".into()),
             turn_phase: TurnPhase::Idle,
             replay_turns: yalda::acp_channel::ReplayTurns::default(),
-            last_scrolled_edit_seq: u64::MAX,
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
             pending_reveal_cursor: false,
@@ -1155,7 +1214,9 @@ impl YaldaGpuiView {
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         };
-        setup_list_follow_handler(&state.list_state, &state.follow_output);
+        // The follow-output scroll handler is wired by the owning
+        // `TranscriptView` (ticket 021) — the `ListState` lives in
+        // `TranscriptScroll`, not on `AgentState`.
         state
     }
 
@@ -1186,12 +1247,12 @@ impl YaldaGpuiView {
                     wake_rx = Some(rx);
                 } else {
                     cx.background_executor().timer(idle_delay).await;
-                    let _ = this.update(cx, |this, _cx| {
-                        if let Some(session) = this.sessions.get_mut(id)
-                            && let Some(ch) = &session.state.channel
-                        {
-                            wake_rx = ch.take_wake_receiver();
-                        }
+                    let _ = this.update(cx, |this, cx| {
+                        wake_rx = this
+                            .read_session(id, cx, |state| {
+                                state.channel.as_ref().and_then(|ch| ch.take_wake_receiver())
+                            })
+                            .flatten();
                     });
                 }
                 loop {
@@ -1220,10 +1281,15 @@ impl YaldaGpuiView {
                         // notify() here would waste a full transcript rebuild.
                         // Mirrors the server pump's ~1Hz throttle above (this
                         // legacy direct-spawn path previously notified every 120ms).
-                        let fp = this.awaiting_anim_fingerprint();
+                        let fp = this.awaiting_anim_fingerprint(cx);
                         if fp.is_some() && fp != last_anim_fp {
                             last_anim_fp = fp;
-                            cx.notify();
+                            // The clock lives INSIDE the cached TranscriptView; a
+                            // root notify cannot bust a cached child (facts 3/6)
+                            // and no session seq moves during a stall, so tick each
+                            // awaiting session's transcript directly (timer
+                            // context, timing-correct, fact 4).
+                            this.tick_awaiting_transcript_views(cx);
                         } else if fp.is_none() {
                             last_anim_fp = None;
                         }
@@ -1235,8 +1301,10 @@ impl YaldaGpuiView {
                 }
             }
         });
-        if let Some(session) = self.sessions.get_mut(id) {
-            session.state._pump = Some(pump);
+        if let Some(ent) = self.session_entity(id) {
+            ent.update(cx, |session, _scx| {
+                session.state._pump = Some(pump);
+            });
         }
     }
 
@@ -1272,10 +1340,13 @@ impl YaldaGpuiView {
             let Some(sid) = self.sessions.sid_of(id).map(|s| s.to_string()) else {
                 continue;
             };
-            if let Some(session) = self.sessions.get_mut(id) {
-                session.state.reset_for_replay();
-                Self::append_system_notice(&mut session.state, "reconnecting…");
-                session.state.status = Some("reconnecting…".into());
+            if let Some(ent) = self.session_entity(id) {
+                ent.update(cx, |session, scx| {
+                    session.state.reset_for_replay();
+                    Self::append_system_notice(&mut session.state, "reconnecting…");
+                    session.state.status = Some("reconnecting…".into());
+                    scx.notify();
+                });
             }
             sids.push(sid);
         }
@@ -1426,10 +1497,15 @@ impl YaldaGpuiView {
                             // "Thinking… mm:ss" label is identical, so the full
                             // transcript rebuild a notify() triggers would be
                             // wasted (this is the dominant idle-stall cost).
-                            let fp = this.awaiting_anim_fingerprint();
+                            let fp = this.awaiting_anim_fingerprint(cx);
                             if fp.is_some() && fp != last_anim_fp {
                                 last_anim_fp = fp;
-                                cx.notify();
+                                // The clock lives INSIDE the cached TranscriptView;
+                                // a root notify cannot bust a cached child (facts
+                                // 3/6) and no session seq moves during a stall, so
+                                // tick each awaiting session's transcript directly
+                                // (timer context, timing-correct, fact 4).
+                                this.tick_awaiting_transcript_views(cx);
                             } else if fp.is_none() {
                                 last_anim_fp = None;
                             }
@@ -1481,15 +1557,23 @@ impl YaldaGpuiView {
     pub(crate) fn with_server_session_slot(
         &mut self,
         sid: &str,
+        cx: &mut Context<Self>,
         mut f: impl FnMut(&mut AgentSession),
     ) -> bool {
-        match self.sessions.get_by_sid_mut(sid) {
-            Some(session) => {
-                f(session);
-                true
-            }
-            None => false,
-        }
+        let Some(id) = self.sessions.locate(sid) else {
+            return false;
+        };
+        let Some(ent) = self.session_entity(id) else {
+            return false;
+        };
+        // Mutation-site notify on the session entity (timing-correct, fact 4);
+        // the root is also notified by the reducer's own `cx.notify()` today —
+        // the per-session notify is load-bearing only after 021's observation.
+        ent.update(cx, |session, scx| {
+            f(session);
+            scx.notify();
+        });
+        true
     }
 
     /// Reconcile a server-side close: drop the session for `sid` from the store
@@ -1511,7 +1595,7 @@ impl YaldaGpuiView {
         let cwd = self
             .sessions
             .get(id)
-            .map(|s| s.cwd.clone())
+            .map(|s| s.read(cx).cwd.clone())
             .unwrap_or_else(process_cwd);
         // Find the tile that showed this session (at most one, INV-2). Skip a
         // tile mid-respawn (pending_open_token in flight).
@@ -1544,6 +1628,7 @@ impl YaldaGpuiView {
             // Leave the respawning session alone; its new sid will rebind.
             return false;
         }
+        self.transcript_views.remove(&id);
         self.sessions.close(id);
         // Kick the (now-unbound) tile's selector list off the paint thread,
         // addressed to that exact tile by id. The list reducer
@@ -1557,14 +1642,27 @@ impl YaldaGpuiView {
 
     /// Reconcile a server-side rename: update the label on the session for
     /// `sid`. Returns whether anything changed.
-    pub(crate) fn reconcile_session_renamed(&mut self, sid: &str, label: &str) -> bool {
-        if let Some(session) = self.sessions.get_by_sid_mut(sid) {
+    pub(crate) fn reconcile_session_renamed(
+        &mut self,
+        sid: &str,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(id) = self.sessions.locate(sid) else {
+            return false;
+        };
+        let Some(ent) = self.session_entity(id) else {
+            return false;
+        };
+        ent.update(cx, |session, scx| {
             if session.label != label {
                 session.label = label.to_string();
-                return true;
+                scx.notify();
+                true
+            } else {
+                false
             }
-        }
-        false
+        })
     }
 
     /// Apply a pre-drained batch of server notifications to the model. Called
@@ -1628,7 +1726,7 @@ impl YaldaGpuiView {
                             _ => unreachable!(),
                         }
                     }
-                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                    let routed = self.with_server_session_slot(&session_id, cx, |slot| {
                         let claude = &mut slot.state;
                         // §9 gate: once the canonical `AgentEvent` stream is the
                         // authoritative driver for this session (it has forwarded
@@ -1693,7 +1791,7 @@ impl YaldaGpuiView {
                             _ => unreachable!(),
                         }
                     }
-                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                    let routed = self.with_server_session_slot(&session_id, cx, |slot| {
                         let claude = &mut slot.state;
                         for event in &events {
                             // BEFORE the gate flips, the reducer would race the
@@ -1730,7 +1828,7 @@ impl YaldaGpuiView {
                     turn_count,
                     generation,
                 } => {
-                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                    let routed = self.with_server_session_slot(&session_id, cx, |slot| {
                         let claude = &mut slot.state;
                         // Turn boundary: clear last-inserted so the next turn's
                         // user echo isn't mistaken for a duplicate of this one.
@@ -1762,7 +1860,7 @@ impl YaldaGpuiView {
                     warn_unrouted(routed, &session_id);
                 }
                 ServerNotification::UserPrompt { session_id, text } => {
-                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                    let routed = self.with_server_session_slot(&session_id, cx, |slot| {
                         // Route through the single chokepoint as an `Echo`: the
                         // reconciler suppresses it when it matches our own
                         // optimistic submit (live) or a turn already inserted by
@@ -1781,7 +1879,7 @@ impl YaldaGpuiView {
                     session_id,
                     acp_session_id,
                 } => {
-                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                    let routed = self.with_server_session_slot(&session_id, cx, |slot| {
                         let label = acp_session_id.as_deref().unwrap_or("connected");
                         let msg = format!("attached: {label}");
                         Self::append_system_notice(&mut slot.state, &msg);
@@ -1790,7 +1888,7 @@ impl YaldaGpuiView {
                     warn_unrouted(routed, &session_id);
                 }
                 ServerNotification::SessionDetached { session_id, reason } => {
-                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                    let routed = self.with_server_session_slot(&session_id, cx, |slot| {
                         let msg = format!("detached: {reason}");
                         Self::append_system_notice(&mut slot.state, &msg);
                         slot.state.status = Some(msg.into());
@@ -1813,7 +1911,7 @@ impl YaldaGpuiView {
                     self.reconcile_session_closed(&session_id, cx);
                 }
                 ServerNotification::SessionRenamed { session_id, label } => {
-                    self.reconcile_session_renamed(&session_id, &label);
+                    self.reconcile_session_renamed(&session_id, &label, cx);
                 }
                 ServerNotification::PromptRejected {
                     session_id,
@@ -1827,7 +1925,7 @@ impl YaldaGpuiView {
                     // the transcript + status line, and put the text back in
                     // the chatbox (only if the user hasn't typed something
                     // new) so a resubmit is one keypress.
-                    let routed = self.with_server_session_slot(&session_id, |slot| {
+                    let routed = self.with_server_session_slot(&session_id, cx, |slot| {
                         let msg = format!("✗ message NOT delivered: {reason}");
                         Self::append_system_notice(&mut slot.state, &msg);
                         slot.state.status = Some(msg.into());
@@ -1850,21 +1948,13 @@ impl YaldaGpuiView {
         // per-event path did (the authoritative re-scroll with the fresh count
         // happens later in render_agent after the ListState splice); this just
         // keeps unfocused tiles that miss render's scroll roughly pinned.
-        for sid in &scrolled_sessions {
-            self.with_server_session_slot(sid, |slot| {
-                let claude = &mut slot.state;
-                // Stale-count pre-pin; the authoritative reveal with the fresh
-                // post-reconcile count runs in render_agent
-                // (`reveal_tail_if_following`). This does NOT stamp
-                // `last_scrolled_edit_seq`, so it never suppresses that
-                // render-time reveal. Shares the `follow_tail` decision (F4).
-                if claude.follow_tail() && claude.list_item_count > 0 {
-                    claude
-                        .list_state
-                        .scroll_to_reveal_item(claude.list_item_count - 1);
-                }
-            });
-        }
+        // Ticket 021: the pump-side stale-count pre-pin is gone. The
+        // `ListState` + `list_item_count` now live in the owning
+        // `TranscriptView`, and its render-time `reveal_tail_if_following`
+        // (with the FRESH post-reconcile count) is the single authoritative
+        // re-reveal — it runs for every live transcript view, focused or not,
+        // so unfocused tiles stay pinned without a pump-side poke.
+        let _ = &scrolled_sessions;
         if did_work {
             cx.notify();
         }
@@ -1878,14 +1968,18 @@ impl YaldaGpuiView {
     pub(crate) fn pump_session(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
         const PUMP_EVENT_BUDGET: usize = 64;
 
-        // The session lives in the store (disjoint from the layout tree); route
-        // directly. Returns (has_events, more_pending, attached_with_id) so
-        // post-borrow work (persistence) can proceed.
-        let (has_events, more_pending, attached_with_id) = {
-            let claude = match self.sessions.get_mut(id) {
-                Some(session) => &mut session.state,
-                None => return false, // session gone: pump task should exit
-            };
+        // The session lives in its own entity; drain + apply inside its
+        // `update` so the mutation-site notify on the session is timing-correct
+        // (fact 4). The closure returns `None` to signal the pump task should
+        // exit (session gone / disconnected), or `Some((has_events,
+        // more_pending, attached_with_id))` to continue with the post-borrow
+        // persistence below.
+        let Some(ent) = self.session_entity(id) else {
+            return false; // session gone: pump task should exit
+        };
+        let Some((has_events, more_pending, attached_with_id)) =
+            ent.update(cx, |session, scx| {
+            let claude = &mut session.state;
 
             // 1) Resolve pending attach.
             let mut attach_resolved = false;
@@ -1937,8 +2031,8 @@ impl YaldaGpuiView {
                 claude.turn_phase = TurnPhase::Idle;
                 Self::append_system_notice(claude, "agent disconnected");
                 claude.status = Some("agent disconnected".into());
-                cx.notify();
-                return false;
+                scx.notify();
+                return None;
             }
 
             // 3) Drain up to PUMP_EVENT_BUDGET reply events.
@@ -1997,19 +2091,23 @@ impl YaldaGpuiView {
                         claude.turn_phase = TurnPhase::Idle;
                     }
                 }
-                // Spec §19 auto-scroll. Shares the `follow_tail` decision (F4).
-                // Stale-count pre-pin only; the authoritative reveal with the
-                // fresh post-reconcile count runs in render_agent
-                // (`reveal_tail_if_following`), so this does NOT stamp
-                // `last_scrolled_edit_seq`.
-                if claude.follow_tail() && claude.list_item_count > 0 {
-                    claude
-                        .list_state
-                        .scroll_to_reveal_item(claude.list_item_count - 1);
-                }
+                // Spec §19 auto-scroll. Ticket 021: the pump-side stale-count
+                // pre-pin is gone — the `ListState` lives in the owning
+                // `TranscriptView`, whose render-time `reveal_tail_if_following`
+                // (with the fresh post-reconcile count) is the authoritative
+                // re-reveal. The session notify below buses the transcript view
+                // to re-render this same effect-flush, so the reveal lands on
+                // the very frame this chunk scheduled (no stale tail).
             }
 
-            (has_events, more_pending, attached_with_id)
+            // Mutation-site notify on the session entity (load-bearing after
+            // 021; redundant with the root notify below today).
+            if has_events {
+                scx.notify();
+            }
+            Some((has_events, more_pending, attached_with_id))
+        }) else {
+            return false; // disconnected: pump task should exit
         };
 
         // Post-borrow: persist the whole ring snapshot so the just-attached
@@ -2018,7 +2116,7 @@ impl YaldaGpuiView {
         // a stale pump from a removed slot safe — it contributes nothing
         // if its slot isn't in the ring anymore.
         if attached_with_id {
-            self.save_agent_ring();
+            self.save_agent_ring(cx);
         }
 
         if has_events {
@@ -2526,6 +2624,7 @@ impl YaldaGpuiView {
             if let Some(sid) = self.sessions.sid_of(id).map(|s| s.to_string()) {
                 self.spawn_close_session(sid, cx);
             }
+            self.transcript_views.remove(&id);
             self.sessions.close(id);
             if let Some(tile) = self.agent_tile_mut() {
                 tile.bound = None;
@@ -2535,7 +2634,7 @@ impl YaldaGpuiView {
         // Open a fresh session in place. We're already on an Agent tile (unbound
         // now), so `new_agent_session` rebinds this tile to a brand-new session.
         self.new_agent_session(None, cx);
-        if let Some(c) = self.agent_mut() {
+        if let Some(mut c) = self.agent_mut(cx) {
             c.status = Some("session cleared".into());
         }
         cx.notify();
@@ -2550,14 +2649,13 @@ impl YaldaGpuiView {
         // while also touching `self.session_server` (also borrows `self`), so
         // we snapshot the current mode + whether a local channel exists first,
         // then drop the borrow before talking to the server.
-        let snapshot = self
-            .focused_bound_session()
-            .and_then(|id| self.sessions.get(id))
-            .map(|s| (s.state.permission_mode, s.state.channel.is_some()));
+        let snapshot = self.focused_bound_session().and_then(|id| {
+            self.read_session(id, cx, |s| (s.permission_mode, s.channel.is_some()))
+        });
         let (current, has_channel) = match snapshot {
             Some(v) => v,
             None => {
-                if let Some(c) = self.agent_mut() {
+                if let Some(mut c) = self.agent_mut(cx) {
                     c.status = Some("permission mode: no session".into());
                 }
                 cx.notify();
@@ -2581,15 +2679,15 @@ impl YaldaGpuiView {
             // session-state field for the badge.
             match result {
                 Ok(()) => {
-                    if let Some(claude) = self.agent_mut() {
+                    if let Some(mut claude) = self.agent_mut(cx) {
                         claude.permission_mode = next;
                         let msg = format!("permission mode → {}", next.short_label());
-                        Self::append_system_notice(claude, &msg);
+                        Self::append_system_notice(&mut claude, &msg);
                         claude.status = Some(msg.into());
                     }
                 }
                 Err(e) => {
-                    if let Some(claude) = self.agent_mut() {
+                    if let Some(mut claude) = self.agent_mut(cx) {
                         claude.status = Some(format!("permission mode change failed: {e}").into());
                     }
                 }
@@ -2597,18 +2695,18 @@ impl YaldaGpuiView {
         } else if has_channel {
             // Legacy direct-spawn fallback: the live channel is the authority.
             // Flip it AND keep the session-state mirror in sync.
-            if let Some(claude) = self.agent_mut() {
+            if let Some(mut claude) = self.agent_mut(cx) {
                 if let Some(ch) = &claude.channel {
                     ch.set_permission_mode(next);
                 }
                 claude.permission_mode = next;
                 let msg = format!("permission mode → {}", next.short_label());
-                Self::append_system_notice(claude, &msg);
+                Self::append_system_notice(&mut claude, &msg);
                 claude.status = Some(msg.into());
             }
         } else {
             // Neither a server session nor a local channel — nothing to drive.
-            if let Some(claude) = self.agent_mut() {
+            if let Some(mut claude) = self.agent_mut(cx) {
                 claude.status = Some("permission mode: no session".into());
             }
         }
@@ -2624,24 +2722,29 @@ impl YaldaGpuiView {
     /// persistence on the next save (per spec: "slots without a session id
     /// are not written").
     pub(crate) fn detach_active_agent_session(&mut self, cx: &mut Context<Self>) {
-        let claude = match self.agent_mut() {
-            Some(c) => c,
-            None => return,
-        };
-        if claude.channel.is_none() && claude.attach_pending.is_none() {
-            claude.status = Some("session is already detached".into());
-            cx.notify();
+        let Some(id) = self.focused_bound_session() else {
             return;
+        };
+        let already_detached = self
+            .with_session(id, cx, |claude| {
+                if claude.channel.is_none() && claude.attach_pending.is_none() {
+                    claude.status = Some("session is already detached".into());
+                    return true;
+                }
+                // Drop runs `kill_on_drop` on the subprocess; cancel any
+                // in-flight attach by dropping its receiver (the spawning
+                // thread's send fails silently when the connection drops).
+                claude.channel = None;
+                claude.attach_pending = None;
+                claude.turn_phase = TurnPhase::Idle;
+                Self::append_system_notice(claude, "session detached");
+                claude.status = Some("session detached".into());
+                false
+            })
+            .unwrap_or(true);
+        if !already_detached {
+            self.save_agent_ring(cx);
         }
-        // Drop runs `kill_on_drop` on the subprocess; cancel any in-flight
-        // attach by dropping its receiver (the spawning thread's send will
-        // fail silently when the connection drops).
-        claude.channel = None;
-        claude.attach_pending = None;
-        claude.turn_phase = TurnPhase::Idle;
-        Self::append_system_notice(claude, "session detached");
-        claude.status = Some("session detached".into());
-        self.save_agent_ring();
         cx.notify();
     }
 
@@ -2660,28 +2763,29 @@ impl YaldaGpuiView {
         // re-attaches via the reconnect flow, not this direct-spawn helper.
         let has_server = self.session_server.is_some();
         let server_managed = self
-            .sessions
-            .get(id)
-            .map(|s| s.state.server_managed)
+            .read_session(id, cx, |s| s.server_managed)
             .unwrap_or(false);
         if has_server && server_managed {
-            if let Some(c) = self.agent_mut() {
+            if let Some(mut c) = self.agent_mut(cx) {
                 c.status = Some("session is server-managed — it reconnects automatically".into());
             }
             cx.notify();
             return;
         }
-        if let Some(c) = self.agent_mut()
-            && (c.channel.is_some() || c.attach_pending.is_some())
-        {
-            c.status = Some("session is already attached".into());
+        let already_attached = self
+            .read_session(id, cx, |c| c.channel.is_some() || c.attach_pending.is_some())
+            .unwrap_or(false);
+        if already_attached {
+            if let Some(mut c) = self.agent_mut(cx) {
+                c.status = Some("session is already attached".into());
+            }
             cx.notify();
             return;
         }
 
         // Use the session's per-session cwd (spec-agent-cwd.md §3) so a session
         // that lives at /foo re-attaches at /foo, not at the launch directory.
-        let slot_cwd = self.sessions.get(id).map(|s| s.cwd.clone());
+        let slot_cwd = self.sessions.get(id).map(|s| s.read(cx).cwd.clone());
         let (attach_tx, attach_rx) =
             std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
         let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
@@ -2696,14 +2800,17 @@ impl YaldaGpuiView {
                 ));
             });
 
-        if let Some(session) = self.sessions.get_mut(id) {
-            session.resume_id = None;
-            session.state.attach_pending = Some(attach_rx);
-            Self::append_system_notice(&mut session.state, "attaching new session…");
-            session.state.status = Some("attaching new session…".into());
+        if let Some(ent) = self.session_entity(id) {
+            ent.update(cx, |session, scx| {
+                session.resume_id = None;
+                session.state.attach_pending = Some(attach_rx);
+                Self::append_system_notice(&mut session.state, "attaching new session…");
+                session.state.status = Some("attaching new session…".into());
+                scx.notify();
+            });
         }
         self.start_session_pump(id, cx);
-        self.save_agent_ring();
+        self.save_agent_ring(cx);
         cx.notify();
     }
 
@@ -2739,7 +2846,7 @@ impl YaldaGpuiView {
         match cmd.spawn() {
             Ok(_) => cx.quit(),
             Err(e) => {
-                if let Some(c) = self.agent_mut() {
+                if let Some(mut c) = self.agent_mut(cx) {
                     c.status = Some(format!("reboot failed: {e}").into());
                 }
             }
@@ -2752,7 +2859,7 @@ impl YaldaGpuiView {
     /// retroactively edited.
     /// Toggle the Tasklist sidebar visibility (§24).
     pub(crate) fn toggle_tasklist(&mut self, cx: &mut Context<Self>) {
-        if let Some(c) = self.agent_mut() {
+        if let Some(mut c) = self.agent_mut(cx) {
             c.tasklist_open = !c.tasklist_open;
         }
         cx.notify();
@@ -2760,7 +2867,7 @@ impl YaldaGpuiView {
 
     /// Toggle the Subagents sidebar visibility (§28).
     pub(crate) fn toggle_subagents(&mut self, cx: &mut Context<Self>) {
-        if let Some(c) = self.agent_mut() {
+        if let Some(mut c) = self.agent_mut(cx) {
             c.subagents_open = !c.subagents_open;
         }
         cx.notify();
@@ -2772,7 +2879,7 @@ impl YaldaGpuiView {
     /// keeps focus pinned to the same sub-agent regardless of how the
     /// derived `subagents()` list is ordered (ADR-0006 quick win #1).
     pub(crate) fn focus_subagent(&mut self, key: ToolCallKey, cx: &mut Context<Self>) {
-        if let Some(c) = self.agent_mut()
+        if let Some(mut c) = self.agent_mut(cx)
             && c.tools.calls.contains_key(&key)
         {
             c.focused_subagent = Some(key);
@@ -2782,7 +2889,7 @@ impl YaldaGpuiView {
 
     /// Return focus from a sub-agent transcript to the root agent (§27).
     pub(crate) fn unfocus_subagent(&mut self, cx: &mut Context<Self>) {
-        if let Some(c) = self.agent_mut() {
+        if let Some(mut c) = self.agent_mut(cx) {
             c.focused_subagent = None;
         }
         cx.notify();
@@ -2803,10 +2910,10 @@ impl YaldaGpuiView {
     /// The chatbox's undo history is per-`Editor`; closing the chatbox
     /// drops that history (§7).
     pub(crate) fn toggle_agent_input_mode(&mut self, cx: &mut Context<Self>) {
-        let claude = match self.agent_mut() {
-            Some(c) => c,
-            None => return,
+        let Some(id) = self.focused_bound_session() else {
+            return;
         };
+        self.with_session(id, cx, |claude| {
         match &claude.input_surface {
             // Read the draft text out (last use of `cb`) BEFORE reassigning the
             // field, so the match's shared borrow ends and the write is clean.
@@ -2837,6 +2944,7 @@ impl YaldaGpuiView {
                 claude.input_surface = InputSurface::Chatbox(Chatbox::new());
             }
         }
+        });
         cx.notify();
     }
 
@@ -2846,14 +2954,16 @@ impl YaldaGpuiView {
     /// Chatbox submit (§18) takes the chatbox text, appends + freezes it
     /// at EOF of the transcript, then sends and clears the chatbox.
     pub(crate) fn submit_agent(&mut self, cx: &mut Context<Self>) {
-        let is_chatbox = match self.agent_mut() {
-            Some(c) => {
+        let Some(id) = self.focused_bound_session() else {
+            return;
+        };
+        let is_chatbox = self
+            .with_session(id, cx, |c| {
                 // Re-enable auto-scroll when the user sends a message.
                 c.follow_output.set(true);
                 c.input_surface.is_chatbox()
-            }
-            None => return,
-        };
+            })
+            .unwrap_or(false);
         if is_chatbox {
             self.submit_chatbox(cx);
         } else {
@@ -2864,10 +2974,10 @@ impl YaldaGpuiView {
     /// Whether any agent slot (across all tabs/tiles) is mid-turn. Cheap
     /// traversal the pumps use to decide whether an idle animation tick is
     /// worth a re-render.
-    pub(crate) fn any_agent_awaiting(&mut self) -> bool {
+    pub(crate) fn any_agent_awaiting(&self, cx: &GpuiApp) -> bool {
         self.sessions
             .iter()
-            .any(|(_, s)| s.state.turn_phase.is_awaiting())
+            .any(|(_, s)| s.read(cx).state.turn_phase.is_awaiting())
     }
 
     /// Whole-second fingerprint of the thinking-indicator clock across all
@@ -2876,10 +2986,11 @@ impl YaldaGpuiView {
     /// notify (and trigger the full transcript re-render) at most ~1Hz instead
     /// of every 120ms — 8x fewer O(transcript) rebuilds during a stall. We fold
     /// elapsed + quiet seconds into one value so a change in either repaints.
-    pub(crate) fn awaiting_anim_fingerprint(&mut self) -> Option<u64> {
+    pub(crate) fn awaiting_anim_fingerprint(&self, cx: &GpuiApp) -> Option<u64> {
         let mut any = false;
         let mut fp: u64 = 0;
-        for (_, s) in self.sessions.iter() {
+        for (_, ent) in self.sessions.iter() {
+            let s = ent.read(cx);
             if s.state.turn_phase.is_awaiting() {
                 any = true;
                 let elapsed = s
@@ -2914,11 +3025,10 @@ impl YaldaGpuiView {
     pub(crate) fn stop_agent_inner(&mut self, cx: &mut Context<Self>) {
         // Only meaningful mid-turn.
         let awaiting = self
-            .agent_mut()
-            .map(|c| c.turn_phase.is_awaiting())
+            .agent_read(cx, |c| c.turn_phase.is_awaiting())
             .unwrap_or(false);
         if !awaiting {
-            if let Some(claude) = self.agent_mut() {
+            if let Some(mut claude) = self.agent_mut(cx) {
                 claude.status = Some("nothing to stop".into());
             }
             cx.notify();
@@ -2929,14 +3039,13 @@ impl YaldaGpuiView {
         // kill + resume — for a turn wedged on a hung upstream request the
         // cooperative `session/cancel` may never land.
         let escalate = self
-            .agent_mut()
-            .map(|c| c.turn_phase.stop_requested())
+            .agent_read(cx, |c| c.turn_phase.stop_requested())
             .unwrap_or(false);
         if escalate {
             // Record the escalation on the phase before the hard kill so the
             // transition stays a total function over `TurnPhase` (the marker is
             // transient — `force_restart_agent` drops to Idle immediately after).
-            if let Some(claude) = self.agent_mut() {
+            if let Some(mut claude) = self.agent_mut(cx) {
                 claude.turn_phase.escalate();
             }
             self.force_restart_agent(cx);
@@ -2950,18 +3059,17 @@ impl YaldaGpuiView {
                 .as_ref()
                 .and_then(|s| s.cancel(sid).ok())
                 .is_some()
-        } else if let Some(claude) = self.agent_mut() {
-            match claude.channel.as_ref() {
+        } else {
+            self.agent_read(cx, |claude| match claude.channel.as_ref() {
                 Some(channel) => {
                     channel.cancel();
                     true
                 }
                 None => false,
-            }
-        } else {
-            false
+            })
+            .unwrap_or(false)
         };
-        if let Some(claude) = self.agent_mut() {
+        if let Some(mut claude) = self.agent_mut(cx) {
             claude.turn_phase.request_stop(std::time::Instant::now());
             claude.status = Some(if sent {
                 "stopping… (⌘. again to force-restart)".into()
@@ -2984,7 +3092,7 @@ impl YaldaGpuiView {
                 .as_ref()
                 .and_then(|s| s.restart_session(&sid).ok())
                 .is_some();
-            if let Some(claude) = self.agent_mut() {
+            if let Some(mut claude) = self.agent_mut(cx) {
                 claude.turn_phase = TurnPhase::Idle;
                 claude.status = Some(if ok {
                     "force-restarting agent (resuming session)…".into()
@@ -3002,10 +3110,11 @@ impl YaldaGpuiView {
             return;
         };
         let resume_id = self
-            .sessions
-            .get(id)
-            .and_then(|s| s.state.channel.as_ref().and_then(|ch| ch.session_id()));
-        let slot_cwd = self.sessions.get(id).map(|s| s.cwd.clone());
+            .read_session(id, cx, |s| {
+                s.channel.as_ref().and_then(|ch| ch.session_id())
+            })
+            .flatten();
+        let slot_cwd = self.sessions.get(id).map(|s| s.read(cx).cwd.clone());
         let (attach_tx, attach_rx) =
             std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
         let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
@@ -3020,19 +3129,23 @@ impl YaldaGpuiView {
                     yalda::acp_channel::YaldaFrontend::Gpui,
                 ));
             });
-        if let Some(session) = self.sessions.get_mut(id) {
-            session.resume_id = resume_id;
-            session.state.channel = None; // Drop → kills the wedged subprocess.
-            session.state.attach_pending = Some(attach_rx);
-            session.state.turn_phase = TurnPhase::Idle;
-            Self::append_system_notice(
-                &mut session.state,
-                "force-restarting agent (resuming session)…",
-            );
-            session.state.status = Some("force-restarting agent (resuming session)…".into());
+        if let Some(ent) = self.session_entity(id) {
+            ent.update(cx, |session, scx| {
+                session.resume_id = resume_id;
+                session.state.channel = None; // Drop → kills the wedged subprocess.
+                session.state.attach_pending = Some(attach_rx);
+                session.state.turn_phase = TurnPhase::Idle;
+                Self::append_system_notice(
+                    &mut session.state,
+                    "force-restarting agent (resuming session)…",
+                );
+                session.state.status =
+                    Some("force-restarting agent (resuming session)…".into());
+                scx.notify();
+            });
         }
         self.start_session_pump(id, cx);
-        self.save_agent_ring();
+        self.save_agent_ring(cx);
         cx.notify();
     }
 
@@ -3042,45 +3155,52 @@ impl YaldaGpuiView {
     /// spacers — and tag each with `TurnId::User(k)` so the gutter shows
     /// `Uk`. If the body is empty, no-op with a footer hint.
     pub(crate) fn submit_worksheet(&mut self, cx: &mut Context<Self>) {
-        // Capture server path info before borrowing agent_mut.
+        // Capture server path info before borrowing the session.
         let server_sid = self.active_server_session_id();
-
-        let claude = match self.agent_mut() {
-            Some(c) => c,
-            None => return,
+        let Some(id) = self.focused_bound_session() else {
+            return;
         };
-        // Check sendability: either direct channel or server session.
-        if claude.channel.is_none() && server_sid.is_none() {
-            claude.status = Some("no channel attached".into());
-            cx.notify();
-            return;
-        }
 
-        // Walk every line, classify editable vs frozen.
-        let line_count = claude.editor.document().line_count();
-        let mut collected: Vec<(usize, String)> = Vec::new();
-        for l in 0..line_count {
-            if claude.editor.is_frozen_line(l) {
-                continue;
+        // Validate sendability + collect the editable lines inside one session
+        // borrow, returning the prompt body (or `None` to early-out with a
+        // status already set on the session).
+        let collected_and_body = self.with_session(id, cx, |claude| {
+            // Check sendability: either direct channel or server session.
+            if claude.channel.is_none() && server_sid.is_none() {
+                claude.status = Some("no channel attached".into());
+                return None;
             }
-            let line_text = claude.editor.document().line_text(l);
-            let stripped = line_text.trim_end_matches('\n').to_string();
-            collected.push((l, stripped));
-        }
 
-        // Build prompt body from lines with non-whitespace content.
-        let prompt_body: String = collected
-            .iter()
-            .filter(|(_, t)| !t.trim().is_empty())
-            .map(|(_, t)| t.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+            // Walk every line, classify editable vs frozen.
+            let line_count = claude.editor.document().line_count();
+            let mut collected: Vec<(usize, String)> = Vec::new();
+            for l in 0..line_count {
+                if claude.editor.is_frozen_line(l) {
+                    continue;
+                }
+                let line_text = claude.editor.document().line_text(l);
+                let stripped = line_text.trim_end_matches('\n').to_string();
+                collected.push((l, stripped));
+            }
 
-        if prompt_body.is_empty() {
-            claude.status = Some("nothing to send".into());
+            // Build prompt body from lines with non-whitespace content.
+            let prompt_body: String = collected
+                .iter()
+                .filter(|(_, t)| !t.trim().is_empty())
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if prompt_body.is_empty() {
+                claude.status = Some("nothing to send".into());
+                return None;
+            }
+            Some((collected, prompt_body))
+        });
+        let Some(Some((collected, prompt_body))) = collected_and_body else {
             cx.notify();
             return;
-        }
+        };
 
         // Send FIRST, then freeze the authored lines only on success — mirroring
         // submit_chatbox. The old order computed `last_seen_turns + 1` by hand
@@ -3098,7 +3218,7 @@ impl YaldaGpuiView {
                 .as_ref()
                 .and_then(|s| s.prompt(sid, &prompt_body).ok())
                 .is_some()
-        } else if let Some(claude) = self.agent_mut() {
+        } else if let Some(mut claude) = self.agent_mut(cx) {
             // Direct path: send via AcpChannelClient.
             if let Some(channel) = claude.channel.as_mut() {
                 channel.send(&prompt_body).is_ok()
@@ -3110,7 +3230,7 @@ impl YaldaGpuiView {
         };
 
         if sent {
-            if let Some(claude) = self.agent_mut() {
+            if let Some(mut claude) = self.agent_mut(cx) {
                 // Derive `k` + arm dedup through the shared reconciler core and
                 // freeze the authored lines in place. Registering `prompt_body`
                 // as a LocalSubmit is what suppresses the echo. `None` means the
@@ -3119,12 +3239,12 @@ impl YaldaGpuiView {
                 claude.commit_worksheet_turn(&collected, &prompt_body);
                 claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
             }
-        } else if let Some(claude) = self.agent_mut() {
+        } else if let Some(mut claude) = self.agent_mut(cx) {
             // Send failed: keep the authored lines editable so the user can
             // retry, and surface it rather than dropping the prompt silently.
             claude.status = Some("send failed — reconnecting; press ⏎ to retry".into());
         }
-        if let Some(claude) = self.agent_mut() {
+        if let Some(mut claude) = self.agent_mut(cx) {
             claude.editor.clear_selection();
         }
         cx.notify();
@@ -3135,27 +3255,37 @@ impl YaldaGpuiView {
     /// `TurnId::User(k)`, send via the channel, clear the chatbox. Mode
     /// stays `Chatbox`.
     pub(crate) fn submit_chatbox(&mut self, cx: &mut Context<Self>) {
-        // Capture server path info before borrowing agent_mut.
+        // Capture server path info before borrowing the session.
         let server_sid = self.active_server_session_id();
+        let Some(id) = self.focused_bound_session() else {
+            return;
+        };
 
-        let claude = match self.agent_mut() {
-            Some(c) => c,
-            None => return,
+        // Read the chatbox draft + validate sendability inside one session
+        // borrow. `Some(None)` ⇒ early-out with a status already set; `None` ⇒
+        // no chatbox / no session (no status); `Some(Some(text))` ⇒ proceed.
+        let text = match self.with_session(id, cx, |claude| {
+            let text = match claude.input_surface.chatbox() {
+                Some(cb) => cb.text(),
+                None => return None,
+            };
+            if text.trim().is_empty() {
+                claude.status = Some("nothing to send".into());
+                return Some(None);
+            }
+            if claude.channel.is_none() && server_sid.is_none() {
+                claude.status = Some("no channel attached".into());
+                return Some(None);
+            }
+            Some(Some(text))
+        }) {
+            Some(Some(Some(text))) => text,
+            Some(Some(None)) => {
+                cx.notify();
+                return;
+            }
+            _ => return,
         };
-        let text = match claude.input_surface.chatbox() {
-            Some(cb) => cb.text(),
-            None => return,
-        };
-        if text.trim().is_empty() {
-            claude.status = Some("nothing to send".into());
-            cx.notify();
-            return;
-        }
-        if claude.channel.is_none() && server_sid.is_none() {
-            claude.status = Some("no channel attached".into());
-            cx.notify();
-            return;
-        }
 
         // Send FIRST, then freeze the optimistic echo only on success. Freezing
         // before the send could leave a "phantom" user turn in the transcript
@@ -3172,7 +3302,7 @@ impl YaldaGpuiView {
                 .as_ref()
                 .and_then(|s| s.prompt(sid, &prompt_body).ok())
                 .is_some()
-        } else if let Some(claude) = self.agent_mut() {
+        } else if let Some(mut claude) = self.agent_mut(cx) {
             if let Some(channel) = claude.channel.as_mut() {
                 channel.send(&prompt_body).is_ok()
             } else {
@@ -3183,7 +3313,7 @@ impl YaldaGpuiView {
         };
 
         if sent {
-            if let Some(claude) = self.agent_mut() {
+            if let Some(mut claude) = self.agent_mut(cx) {
                 // Optimistic echo + begin the turn. `LocalSubmit` always
                 // inserts and records the text so the stream echo that follows
                 // (server `UserPrompt` or agent `UserMessage`, in any order
@@ -3198,7 +3328,7 @@ impl YaldaGpuiView {
                 // Reset the chatbox to empty; cursor stays inside.
                 claude.input_surface = InputSurface::Chatbox(Chatbox::new());
             }
-        } else if let Some(claude) = self.agent_mut() {
+        } else if let Some(mut claude) = self.agent_mut(cx) {
             // Send failed: leave the chatbox text intact so the user can retry,
             // and surface it instead of dropping the message into the void.
             claude.status = Some("send failed — reconnecting; press ⏎ to retry".into());
@@ -3213,10 +3343,13 @@ impl YaldaGpuiView {
     pub(crate) fn send_agent_selection(&mut self, cx: &mut Context<Self>) {
         let server_sid = self.active_server_session_id();
 
-        let text = match self.agent_mut().and_then(|c| c.editor.selection_text()) {
+        let text = match self
+            .agent_read(cx, |c| c.editor.selection_text())
+            .flatten()
+        {
             Some(t) if !t.trim().is_empty() => t,
             _ => {
-                if let Some(c) = self.agent_mut() {
+                if let Some(mut c) = self.agent_mut(cx) {
                     c.status = Some("no selection to send".into());
                 }
                 cx.notify();
@@ -3224,11 +3357,10 @@ impl YaldaGpuiView {
             }
         };
         let no_channel = self
-            .agent_mut()
-            .map(|c| c.channel.is_none())
+            .agent_read(cx, |c| c.channel.is_none())
             .unwrap_or(true);
         if no_channel && server_sid.is_none() {
-            if let Some(c) = self.agent_mut() {
+            if let Some(mut c) = self.agent_mut(cx) {
                 c.status = Some("no channel attached".into());
             }
             cx.notify();
@@ -3241,7 +3373,7 @@ impl YaldaGpuiView {
                 .as_ref()
                 .and_then(|s| s.prompt(sid, &prompt_body).ok())
                 .is_some()
-        } else if let Some(claude) = self.agent_mut() {
+        } else if let Some(mut claude) = self.agent_mut(cx) {
             if let Some(channel) = claude.channel.as_mut() {
                 channel.send(&prompt_body).is_ok()
             } else {
@@ -3252,7 +3384,7 @@ impl YaldaGpuiView {
         };
 
         if sent {
-            if let Some(claude) = self.agent_mut() {
+            if let Some(mut claude) = self.agent_mut(cx) {
                 claude.follow_output.set(true);
                 // Optimistic echo, same as a chatbox submit — LocalSubmit
                 // records the text so the stream echo is suppressed.
@@ -3264,7 +3396,7 @@ impl YaldaGpuiView {
                 claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
                 claude.editor.clear_selection();
             }
-        } else if let Some(claude) = self.agent_mut() {
+        } else if let Some(mut claude) = self.agent_mut(cx) {
             claude.status = Some("send failed — selection not sent".into());
         }
         cx.notify();
@@ -3294,8 +3426,7 @@ impl YaldaGpuiView {
         // Esc keeps the existing per-mode behavior (toggle Normal etc.).
         if press.key == Key::Esc
             && self
-                .agent_mut()
-                .map(|c| c.focused_subagent.is_some())
+                .agent_read(cx, |c| c.focused_subagent.is_some())
                 .unwrap_or(false)
         {
             self.unfocus_subagent(cx);
@@ -3325,24 +3456,22 @@ impl YaldaGpuiView {
         // Worksheet mode the transcript IS the editing surface and the
         // chatbox doesn't exist.
         let in_chatbox = self
-            .agent_mut()
-            .map(|c| c.input_surface.is_chatbox())
+            .agent_read(cx, |c| c.input_surface.is_chatbox())
             .unwrap_or(false);
 
         // Bare `m`/`'` in NORMAL mode starts a mark chord — agent tiles are
         // markable/jumpable like any other tile. Insert mode is untouched so
         // typing `m`/`'` into the chatbox/worksheet still works.
         let in_normal = if in_chatbox {
-            self.agent_mut()
-                .and_then(|c| {
-                    c.input_surface
-                        .chatbox_mut()
-                        .map(|cb| cb.mode == EditMode::Normal)
-                })
-                .unwrap_or(false)
+            self.agent_read(cx, |c| {
+                c.input_surface
+                    .chatbox()
+                    .map(|cb| cb.mode == EditMode::Normal)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
         } else {
-            self.agent_mut()
-                .map(|c| c.mode == EditMode::Normal)
+            self.agent_read(cx, |c| c.mode == EditMode::Normal)
                 .unwrap_or(false)
         };
         if in_normal && self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
@@ -3357,12 +3486,11 @@ impl YaldaGpuiView {
             return;
         }
 
+        let Some(focused_id) = self.focused_bound_session() else {
+            return;
+        };
         if in_chatbox {
-            let outcome = {
-                let claude = match self.agent_mut() {
-                    Some(c) => c,
-                    None => return,
-                };
+            let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
                 claude.status = None;
                 let cb = claude.input_surface.chatbox_mut().unwrap();
                 match cb.mode {
@@ -3377,12 +3505,14 @@ impl YaldaGpuiView {
                         press,
                     ),
                 }
+            }) else {
+                return;
             };
             match outcome {
                 NormalOutcome::OpenMenu => self.open_menu_inner(cx),
                 NormalOutcome::Quit => cx.quit(),
                 NormalOutcome::Paste { before } => {
-                    if let Some(c) = self.agent_mut()
+                    if let Some(mut c) = self.agent_mut(cx)
                         && let Some(cb) = c.input_surface.chatbox_mut()
                     {
                         Self::apply_paste(&mut cb.editor, before);
@@ -3394,11 +3524,7 @@ impl YaldaGpuiView {
             return;
         }
 
-        let outcome = {
-            let claude = match self.agent_mut() {
-                Some(c) => c,
-                None => return,
-            };
+        let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
             // Any non-shortcut keystroke clears the transient status.
             claude.status = None;
 
@@ -3414,6 +3540,8 @@ impl YaldaGpuiView {
                     press,
                 ),
             }
+        }) else {
+            return;
         };
 
         // Reveal the cursor's line after every key — but do NO transcript-
@@ -3429,7 +3557,7 @@ impl YaldaGpuiView {
         // the flag there would leave it armed to fire a spurious scroll-to-
         // cursor on the next UNRELATED render (e.g. an agent stream tick).
         if !matches!(outcome, NormalOutcome::Skipped)
-            && let Some(c) = self.agent_mut()
+            && let Some(mut c) = self.agent_mut(cx)
         {
             c.pending_reveal_cursor = true;
         }
@@ -3438,7 +3566,7 @@ impl YaldaGpuiView {
             NormalOutcome::Skipped => {}
             NormalOutcome::Handled => cx.notify(),
             NormalOutcome::Yanked => {
-                if let Some(c) = self.agent_mut() {
+                if let Some(mut c) = self.agent_mut(cx) {
                     c.status = Some("yanked".into());
                 }
                 cx.notify();
@@ -3446,7 +3574,7 @@ impl YaldaGpuiView {
             NormalOutcome::Quit => cx.quit(),
             NormalOutcome::OpenMenu => self.open_menu_inner(cx),
             NormalOutcome::Paste { before } => {
-                if let Some(c) = self.agent_mut()
+                if let Some(mut c) = self.agent_mut(cx)
                     && Self::apply_paste(&mut c.editor, before)
                 {
                     c.status = Some("put".into());

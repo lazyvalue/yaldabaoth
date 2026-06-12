@@ -241,7 +241,41 @@ pub(crate) fn workspace_persist_path() -> Option<PathBuf> {
 /// from the menu, that's what they expect next time, regardless of what
 /// the kdl says.
 pub(crate) fn preferences_path() -> Option<PathBuf> {
-    yalda::paths::yalda_home().map(|d| d.join("preferences.json"))
+    // Fail safe in test builds: NEVER touch the user's real
+    // `~/.yalda/preferences.json`. A test that genuinely exercises
+    // preference persistence opts in via `with_preferences_path`; every other
+    // test that merely triggers `save_settings()` as a side-effect (e.g. a
+    // theme/zoom render-cache test calling `set_theme`) gets `None`, so the
+    // write is a no-op instead of clobbering real user preferences. Mirrors
+    // `acp_session_persist_path`'s `ACP_PERSIST_PATH_OVERRIDE` seam.
+    #[cfg(test)]
+    {
+        return PREFS_PATH_OVERRIDE.with(|c| c.borrow().clone());
+    }
+    #[cfg(not(test))]
+    {
+        yalda::paths::yalda_home().map(|d| d.join("preferences.json"))
+    }
+}
+
+/// Test-only seam: redirect the preferences file to a tempdir so a save→load
+/// round-trip test never touches the user's real `~/.yalda/preferences.json`.
+/// When unset (the default in any test), `preferences_path()` returns `None`
+/// and a `save_preferences` call is a silent no-op. Thread-local, so parallel
+/// tests don't collide.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PREFS_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn with_preferences_path<R>(path: PathBuf, f: impl FnOnce() -> R) -> R {
+    PREFS_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+    let r = f();
+    PREFS_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    r
 }
 
 /// Where the agent info bar sits relative to the transcript.

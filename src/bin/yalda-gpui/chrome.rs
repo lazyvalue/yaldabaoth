@@ -274,7 +274,7 @@ impl YaldaGpuiView {
             // structural tree mutation happens during this render pass.
             let content = unsafe { &mut *content_ptr };
 
-            let title = Self::desktop_tile_title(&self.sessions, content);
+            let title = Self::desktop_tile_title(&self.sessions, content, cx);
             let mark = self.workspace.marks.mark_for_window(id);
 
             // The leaf-root CONTRACT (see `screen_root` in render() and the
@@ -443,7 +443,7 @@ impl YaldaGpuiView {
     /// holds a live `&mut App` (`content_ptr`) into the layout tree, and
     /// reborrowing all of `&self` here would alias it (UB under Stacked
     /// Borrows). `sessions` is field-disjoint from the layout tree.
-    fn desktop_tile_title(sessions: &AgentSessions, content: &App) -> String {
+    fn desktop_tile_title(sessions: &AgentSessions, content: &App, cx: &GpuiApp) -> String {
         match content {
             App::Buffer(BufferApp::Viewing(d)) => d.file_label.to_string(),
             App::Buffer(BufferApp::Editing(e)) => e.file_label.to_string(),
@@ -451,7 +451,7 @@ impl YaldaGpuiView {
             App::Agent(tile) => tile
                 .bound
                 .and_then(|id| sessions.get(id))
-                .map(|s| s.label.clone())
+                .map(|s| s.read(cx).label.clone())
                 .unwrap_or_else(|| "claude".to_string()),
         }
     }

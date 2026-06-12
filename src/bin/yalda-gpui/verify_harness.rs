@@ -103,7 +103,7 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
 
     // --- Cold paint: first render highlights every line once. ---
     vcx.run_until_parked();
-    let (cold_recomputed, cold_skip) = view.update(vcx, |v, _cx| v.test_edit_cache_stats());
+    let (cold_recomputed, cold_skip) = view.update(vcx, |v, cx| v.test_edit_cache_stats());
     assert!(
         cold_recomputed >= N,
         "cold paint should highlight all {N} lines, got {cold_recomputed}"
@@ -114,7 +114,7 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
     //     (edit_seq unchanged) and recompute zero lines. ---
     view.update(vcx, |_v, cx| cx.notify());
     vcx.run_until_parked();
-    let (idle_recomputed, idle_skip) = view.update(vcx, |v, _cx| v.test_edit_cache_stats());
+    let (idle_recomputed, idle_skip) = view.update(vcx, |v, cx| v.test_edit_cache_stats());
     assert_eq!(
         idle_recomputed, 0,
         "no-change re-render must recompute 0 lines (fast skip), got {idle_recomputed}"
@@ -135,7 +135,7 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
         cx.notify();
     });
     vcx.run_until_parked();
-    let (edit_recomputed, edit_skip) = view.update(vcx, |v, _cx| v.test_edit_cache_stats());
+    let (edit_recomputed, edit_skip) = view.update(vcx, |v, cx| v.test_edit_cache_stats());
     assert!(!edit_skip, "an edit must not fast-skip");
     assert_eq!(
         edit_recomputed, 1,
@@ -245,7 +245,7 @@ fn doc_hit_test_never_touches_unpainted_layout(cx: &mut TestAppContext) {
     // Sanity: the virtualized list actually rendered lines (not a collapsed,
     // zero-height body — which removing `Auto` could cause if the parent didn't
     // bound the height). Otherwise the hit-test below would be vacuous.
-    let registered = view.update(vcx, |v, _cx| v.line_layouts.borrow().len());
+    let registered = view.update(vcx, |v, cx| v.line_layouts.borrow().len());
     assert!(
         registered > 0,
         "doc body rendered no lines (list collapsed?)"
@@ -259,16 +259,16 @@ fn doc_hit_test_never_touches_unpainted_layout(cx: &mut TestAppContext) {
     // layout and call `.bounds()` on each. If any registered line was measured
     // but not prepainted, this panics → test fails. With visible-only measuring
     // every registered layout is painted, so it returns None safely.
-    let miss = view.update(vcx, |v, _cx| v.doc_pos_at(point(px(40.0), px(1_000_000.0))));
+    let miss = view.update(vcx, |v, cx| v.doc_pos_at(point(px(40.0), px(1_000_000.0))));
     assert!(miss.is_none(), "a point far below all content hits no line");
 
     // And hit-testing still resolves: a point inside a painted line yields a pos.
-    let p = view.update(vcx, |v, _cx| {
+    let p = view.update(vcx, |v, cx| {
         let ll = v.line_layouts.borrow();
         let b = ll.values().next().expect("a painted line").bounds();
         point(b.left() + px(2.0), b.top() + px(2.0))
     });
-    let hit = view.update(vcx, |v, _cx| v.doc_pos_at(p));
+    let hit = view.update(vcx, |v, cx| v.doc_pos_at(p));
     assert!(
         hit.is_some(),
         "a point inside a painted line resolves to a DocPos"
@@ -309,7 +309,7 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
 
     // Pick drag endpoints from the REAL painted bounds: top-most painted line →
     // bottom-most painted line (both guaranteed prepainted, so bounds() is safe).
-    let (start, end, start_block, end_block) = view.update(vcx, |v, _cx| {
+    let (start, end, start_block, end_block) = view.update(vcx, |v, cx| {
         let ll = v.line_layouts.borrow();
         let mut keys: Vec<(usize, usize)> = ll.keys().copied().collect();
         keys.sort();
@@ -338,7 +338,7 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
 
     // Model: a selection exists after the drag.
     assert!(
-        view.update(vcx, |v, _cx| v.doc_selection.is_some()),
+        view.update(vcx, |v, cx| v.doc_selection.is_some()),
         "drag produced no doc selection"
     );
 
@@ -420,7 +420,7 @@ fn install_agent_slot(
 ) {
     use crate::{AgentSession, AgentState, AgentTile, App};
     let sid = server_sid.map(|s| s.to_string());
-    view.update(vcx, |v, _cx| {
+    view.update(vcx, |v, cx| {
         v.set_screen(App::Agent(AgentTile::new()));
         let session = AgentSession {
             state: AgentState::new_server_managed(None),
@@ -428,7 +428,7 @@ fn install_agent_slot(
             cwd: PathBuf::from("."),
             resume_id: None,
         };
-        let id = v.show_local_session(session);
+        let id = v.show_local_session(session, cx);
         if let Some(sid) = sid {
             v.sessions.bind_sid(id, sid).expect("fresh sid binds");
         }
@@ -441,8 +441,8 @@ fn active_transcript_text(
     view: &gpui::Entity<YaldaGpuiView>,
     vcx: &mut gpui::VisualTestContext,
 ) -> String {
-    view.update(vcx, |v, _cx| {
-        v.agent_mut()
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx)
             .map(|c| c.editor.document().full_text())
             .unwrap_or_default()
     })
@@ -472,7 +472,7 @@ fn agent_seam_suppresses_double_render_when_chunk_precedes_echo(cx: &mut TestApp
 
     view.update(vcx, |v, cx| {
         // What submit_chatbox does on send success: optimistic echo of "hello".
-        v.agent_mut()
+        v.agent_mut(cx)
             .unwrap()
             .insert_user_turn("hello", UserTurnOrigin::LocalSubmit, false);
         // Assistant streams FIRST, then the server's UserPrompt echo arrives.
@@ -540,7 +540,7 @@ fn agent_seam_routes_reply_only_after_session_is_bound(cx: &mut TestAppContext) 
     );
 
     // Bind the sid (what apply_open_agent_resolution does), then re-feed.
-    view.update(vcx, |v, _cx| {
+    view.update(vcx, |v, cx| {
         let id = v.focused_bound_session().expect("a session is bound");
         v.sessions
             .bind_sid(id, "S1".into())
@@ -594,7 +594,7 @@ fn cmd_b_toggles_file_browser_rail(cx: &mut TestAppContext) {
     // Read the rail kind on the active tab: None = no rail, Some(true) = a
     // file-browser rail, Some(false) = some other rail kind.
     let rail_kind = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-        view.update(vcx, |v, _cx| {
+        view.update(vcx, |v, cx| {
             v.workspace
                 .active_tab()
                 .and_then(|t| t.rail.as_ref())
@@ -661,8 +661,8 @@ fn seed_worksheet_line(
     vcx: &mut gpui::VisualTestContext,
     token: &str,
 ) {
-    view.update(vcx, |v, _cx| {
-        let claude = v.agent_mut().expect("active agent slot");
+    view.update(vcx, |v, cx| {
+        let mut claude = v.agent_mut(cx).expect("active agent slot");
         claude.input_surface = crate::InputSurface::Worksheet;
         for ch in token.chars() {
             claude.editor.insert_char(ch);
@@ -700,8 +700,8 @@ fn agent_seam_worksheet_submit_suppresses_double_render(cx: &mut TestAppContext)
     // Commit the worksheet submit through the shared reconciler core, exactly as
     // `submit_worksheet` does on send-success: derive k, freeze line 0 in place,
     // and register the prompt so the echo is suppressed.
-    view.update(vcx, |v, _cx| {
-        let claude = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut claude = v.agent_mut(cx).unwrap();
         let collected = vec![(0usize, TOKEN.to_string())];
         let k = claude.commit_worksheet_turn(&collected, TOKEN);
         assert_eq!(k, Some(1), "first worksheet submit is turn 1");
@@ -814,13 +814,13 @@ fn agent_seam_pipelined_worksheet_submits_get_distinct_turns(cx: &mut TestAppCon
     install_agent_slot(&view, &mut *vcx, Some("S1"));
 
     // Turn 1 has settled (its TurnEnded advanced last_seen to 1).
-    view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().replay_turns.last_seen = 1;
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().replay_turns.last_seen = 1;
     });
 
     // First in-flight submit -> turn 2.
-    let k1 = view.update(vcx, |v, _cx| {
-        v.agent_mut()
+    let k1 = view.update(vcx, |v, cx| {
+        v.agent_mut(cx)
             .unwrap()
             .commit_worksheet_turn(&[(0usize, "alpha".to_string())], "alpha")
     });
@@ -828,8 +828,8 @@ fn agent_seam_pipelined_worksheet_submits_get_distinct_turns(cx: &mut TestAppCon
 
     // Second submit BEFORE turn 2's boundary advances last_seen (still 1). It
     // must be a distinct turn (3), NOT collide on 2 and trip the tripwire.
-    let k2 = view.update(vcx, |v, _cx| {
-        v.agent_mut()
+    let k2 = view.update(vcx, |v, cx| {
+        v.agent_mut(cx)
             .unwrap()
             .commit_worksheet_turn(&[(0usize, "beta".to_string())], "beta")
     });
@@ -860,13 +860,13 @@ fn agent_seam_unsuppressed_echo_during_inflight_turn_gets_distinct_k(cx: &mut Te
     });
     vcx.run_until_parked();
     install_agent_slot(&view, &mut *vcx, Some("S1"));
-    view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().replay_turns.last_seen = 1;
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().replay_turns.last_seen = 1;
     });
 
     // Local submit -> turn 2 (in flight; last_seen still 1).
-    let k1 = view.update(vcx, |v, _cx| {
-        v.agent_mut()
+    let k1 = view.update(vcx, |v, cx| {
+        v.agent_mut(cx)
             .unwrap()
             .register_user_turn("alpha", UserTurnOrigin::LocalSubmit, false)
     });
@@ -874,8 +874,8 @@ fn agent_seam_unsuppressed_echo_during_inflight_turn_gets_distinct_k(cx: &mut Te
 
     // A live echo with NON-matching text (not suppressed) before turn 2's
     // boundary settles. Must be a distinct turn, not a collision on 2.
-    let k2 = view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().register_user_turn(
+    let k2 = view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().register_user_turn(
             "a totally different unsuppressed echo",
             UserTurnOrigin::Echo,
             false,
@@ -909,7 +909,7 @@ fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    view.update(vcx, |v, _cx| {
+    view.update(vcx, |v, cx| {
         assert!(!v.has_overlay(), "fresh view has no overlay");
 
         v.open_overlay(ActiveOverlay::BufferSwitcher(BufferSwitcher {
@@ -964,8 +964,8 @@ fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
     install_agent_slot(&view, &mut *vcx, Some("S1"));
 
     // New session starts in Chatbox — a box exists.
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert!(c.input_surface.is_chatbox());
         assert!(
             c.input_surface.chatbox().is_some(),
@@ -975,8 +975,8 @@ fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
 
     // Toggle -> Worksheet: the box is gone (no stranded Some).
     view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert!(!c.input_surface.is_chatbox());
         assert!(
             c.input_surface.chatbox().is_none(),
@@ -986,8 +986,8 @@ fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
 
     // Toggle back -> Chatbox: a fresh box.
     view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
-    view.update(vcx, |v, _cx| {
-        assert!(v.agent_mut().unwrap().input_surface.is_chatbox());
+    view.update(vcx, |v, cx| {
+        assert!(v.agent_mut(cx).unwrap().input_surface.is_chatbox());
     });
 }
 
@@ -1079,8 +1079,8 @@ fn agent_reducer_drives_transcript_after_gate_flips(cx: &mut TestAppContext) {
         v.apply_server_batch(batch, cx);
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert_eq!(c.generation, 1, "ChannelOpened rebaselined to gen 1");
         assert!(
             c.agent_stream_authoritative,
@@ -1126,8 +1126,8 @@ fn agent_reducer_drives_transcript_after_gate_flips(cx: &mut TestAppContext) {
         v.apply_server_batch(batch, cx);
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         let text = c.editor.document().full_text();
         assert!(
             text.contains("live turn-2 prose"),
@@ -1314,8 +1314,8 @@ fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
         v.apply_server_batch(batch, cx);
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert_eq!(c.generation, 2, "adopted the newer generation");
         let text = c.editor.document().full_text();
         assert!(
@@ -1525,8 +1525,8 @@ fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContex
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert!(
             c.finalized.contains(&(1, 1)),
             "forwarded TurnEnded must finalize the 0-based (generation 1, turn 1) key; \
@@ -1551,8 +1551,8 @@ fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContex
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         // The forwarded and legacy boundaries collapsed to a SINGLE ledger entry.
         assert!(
             c.finalized.contains(&(1, 1)),
@@ -1646,8 +1646,8 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
     // replay path leaves it just before `ReplayEnd` (a replayed user boundary
     // seeds replay_turn = last_seen + 1 = 1). Without this `finish_replay` folds
     // `last_seen` to 0 and the bug's aliasing never occurs.
-    view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().replay_turns.replay_turn = 1;
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().replay_turns.replay_turn = 1;
     });
 
     // End of the replayed prefix. `finish_replay` now folds `last_seen` → 1,
@@ -1667,8 +1667,8 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert!(
             c.agent_stream_authoritative,
             "the forwarded TurnEnded must flip the §9 gate after replay"
@@ -1693,8 +1693,8 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
     // The user submits a fresh prompt: the turn begins (thinking indicator on),
     // then the live content + boundary stream through the now-authoritative
     // reducer. envelope turn == 1 (settled count 2 -> completed_turn 1).
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
     });
 
@@ -1725,8 +1725,8 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         let text = c.editor.document().full_text();
         assert!(
             text.contains("LIVE-AFTER-REPLAY"),
@@ -1799,8 +1799,8 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
 
     // Drive the replay cursor to the upcoming live turn's index (2), the way the
     // legacy replay path leaves it after two replayed user boundaries.
-    view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().replay_turns.replay_turn = 2;
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().replay_turns.replay_turn = 2;
     });
 
     // ReplayEnd: `finish_replay` folds `last_seen` → 2, aliasing the live turn.
@@ -1819,8 +1819,8 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert!(c.agent_stream_authoritative, "gate flipped after replay");
         assert!(
             c.finalized.contains(&(0, 0)),
@@ -1842,8 +1842,8 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
     });
 
     // Live turn 2: begin (thinking), stream content, end. Stamped turn 2.
-    view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
     });
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
@@ -1872,8 +1872,8 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         let text = c.editor.document().full_text();
         assert!(
             text.contains("LIVE-PROSE"),
@@ -1939,8 +1939,8 @@ fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppCo
     // Drive `replay_turns` so the replay cursor lands on the live turn index, the
     // way the legacy replay path leaves it just before `ReplayEnd` (a replayed
     // user boundary seeds replay_turn = last_seen + 1 = 1).
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         c.replay_turns.replay_turn = 1; // pending replayed boundary for turn 1
         c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
     });
@@ -1962,8 +1962,8 @@ fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppCo
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert!(
             c.turn_phase.is_awaiting(),
             "ReplayEnd with a live turn in flight must keep the phase Awaiting"
@@ -2005,8 +2005,8 @@ fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppCo
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         let text = c.editor.document().full_text();
         assert!(
             text.contains("LIVE-MID-RESUME"),
@@ -2049,7 +2049,7 @@ fn install_agent_picker(
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
         })
         .collect();
-    view.update(vcx, |v, _cx| {
+    view.update(vcx, |v, cx| {
         let mut tile = AgentTile::new();
         let mut picker = SessionPicker::loading(PathBuf::from("."));
         if !sessions.is_empty() {
@@ -2079,7 +2079,7 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     // Loading state (sessions: None) renders without panic.
     install_agent_picker(&view, &mut *vcx, &[]);
     vcx.run_until_parked();
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         let tile = v.agent_tile().expect("agent tile");
         assert!(tile.bound.is_none(), "tile stays unbound until a row binds");
         let p = tile.picker.as_ref().expect("picker present");
@@ -2089,7 +2089,7 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
 
     // Fold in a list result through the real reducer, then render again. The
     // result is addressed to the originating tile by its WindowId (INV-PR).
-    let target = view.read_with(vcx, |v, _cx| v.workspace.focused_window_id());
+    let target = view.read_with(vcx, |v, cx| v.workspace.focused_window_id());
     view.update(vcx, |v, cx| {
         v.apply_picker_sessions(
             target,
@@ -2127,7 +2127,7 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
         );
     });
     vcx.run_until_parked();
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         let p = v.agent_tile().unwrap().picker.as_ref().unwrap();
         assert_eq!(
             p.row_count(),
@@ -2158,12 +2158,12 @@ fn picker_list_result_routes_to_originating_tile_not_focused(cx: &mut TestAppCon
     };
 
     // Tile A (focused) gets a loading picker; record its WindowId.
-    let win_a = view.update(vcx, |v, _cx| {
+    let win_a = view.update(vcx, |v, cx| {
         v.set_screen(App::Agent(mk_tile()));
         v.workspace.focused_window_id().expect("focused window A")
     });
     // Split off tile B with its own loading picker — focus moves to B.
-    let win_b = view.update(vcx, |v, _cx| {
+    let win_b = view.update(vcx, |v, cx| {
         v.workspace
             .split_focused(crate::workspace::SplitDir::H, App::Agent(mk_tile()));
         v.workspace.focused_window_id().expect("focused window B")
@@ -2204,7 +2204,7 @@ fn picker_list_result_routes_to_originating_tile_not_focused(cx: &mut TestAppCon
         }
         None
     };
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         assert_eq!(
             loaded(v, win_a),
             Some(true),
@@ -2232,7 +2232,7 @@ fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContex
     let (view, vcx) = cx.add_window_view(hermetic_browser_view);
     vcx.run_until_parked();
 
-    let (win_a, win_b) = view.update(vcx, |v, _cx| {
+    let (win_a, win_b) = view.update(vcx, |v, cx| {
         v.set_screen(App::Agent(AgentTile::new()));
         let mk = |label: &str| AgentSession {
             state: AgentState::new_server_managed(None),
@@ -2241,13 +2241,13 @@ fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContex
             resume_id: None,
         };
         // Tile A → bound to sid "A". Capture A's WindowId.
-        let id_a = v.show_local_session(mk("claude-A"));
+        let id_a = v.show_local_session(mk("claude-A"), cx);
         v.sessions.bind_sid(id_a, "A".into()).unwrap();
         let win_a = v.workspace.focused_window_id().expect("focused A");
         // Split → tile B, focus it, bind sid "B". B now holds focus.
         v.workspace
             .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
-        let id_b = v.show_local_session(mk("claude-B"));
+        let id_b = v.show_local_session(mk("claude-B"), cx);
         v.sessions.bind_sid(id_b, "B".into()).unwrap();
         let win_b = v.workspace.focused_window_id().expect("focused B");
         (win_a, win_b)
@@ -2257,7 +2257,7 @@ fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContex
     // The capture query (what the close path feeds to `spawn_list_sessions…`)
     // must resolve to A by BINDING, even though B holds focus. This is the
     // exact value a revert to `focused_window_id()` would get wrong.
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         let sid_a = v.sessions.locate("A").expect("sid A in store");
         assert_eq!(
             v.agent_tile_id_bound_to(sid_a),
@@ -2282,7 +2282,7 @@ fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContex
         }
         None
     };
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         assert_eq!(
             tile_state(v, win_a),
             Some((false, true)),
@@ -2317,29 +2317,32 @@ fn next_agent_label_is_unique_and_fills_gaps(cx: &mut TestAppContext) {
                vcx: &mut gpui::VisualTestContext,
                label: &str| {
         let label = label.to_string();
-        view.update(vcx, |v, _cx| {
-            v.show_local_session(AgentSession {
-                state: AgentState::new_server_managed(None),
-                label,
-                cwd: PathBuf::from("."),
-                resume_id: None,
-            });
+        view.update(vcx, |v, cx| {
+            v.show_local_session(
+                AgentSession {
+                    state: AgentState::new_server_managed(None),
+                    label,
+                    cwd: PathBuf::from("."),
+                    resume_id: None,
+                },
+                cx,
+            );
         });
     };
 
     // Empty store → claude-1.
-    view.read_with(vcx, |v, _cx| {
-        assert_eq!(v.next_agent_label(), "claude-1");
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(v.next_agent_label(cx), "claude-1");
     });
     // With claude-1 present → claude-2 (NOT another claude-1).
     add(&view, &mut *vcx, "claude-1");
-    view.read_with(vcx, |v, _cx| {
-        assert_eq!(v.next_agent_label(), "claude-2");
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(v.next_agent_label(cx), "claude-2");
     });
     // Leave a gap (claude-1, claude-3) → the next label fills the hole.
     add(&view, &mut *vcx, "claude-3");
-    view.read_with(vcx, |v, _cx| {
-        assert_eq!(v.next_agent_label(), "claude-2");
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(v.next_agent_label(cx), "claude-2");
     });
 }
 
@@ -2360,7 +2363,7 @@ fn session_picker_navigation_wraps(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let selected = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-        view.read_with(vcx, |v, _cx| {
+        view.read_with(vcx, |v, cx| {
             v.agent_tile().unwrap().picker.as_ref().unwrap().selected
         })
     };
@@ -2399,7 +2402,7 @@ fn session_picker_activation_binds_slot(cx: &mut TestAppContext) {
     // Park the executor: with the server off, the attach round-trip is a no-op,
     // so the bind must SURVIVE (regression guard for the orphaned-tile bug).
     vcx.run_until_parked();
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         let tile = v.agent_tile().expect("agent tile");
         assert!(
             tile.bound.is_some(),
@@ -2432,7 +2435,7 @@ fn two_sessions_route_to_exactly_one_tile(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     // Two agent tiles (a split), each bound to its own sid.
-    let (id_a, id_b) = view.update(vcx, |v, _cx| {
+    let (id_a, id_b) = view.update(vcx, |v, cx| {
         v.set_screen(App::Agent(AgentTile::new()));
         let mk = |label: &str| AgentSession {
             state: AgentState::new_server_managed(None),
@@ -2441,12 +2444,12 @@ fn two_sessions_route_to_exactly_one_tile(cx: &mut TestAppContext) {
             resume_id: None,
         };
         // First tile → sid A.
-        let id_a = v.show_local_session(mk("claude-A"));
+        let id_a = v.show_local_session(mk("claude-A"), cx);
         v.sessions.bind_sid(id_a, "A".into()).unwrap();
         // Split off a second agent tile, focus it, bind → sid B.
         v.workspace
             .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
-        let id_b = v.show_local_session(mk("claude-B"));
+        let id_b = v.show_local_session(mk("claude-B"), cx);
         v.sessions.bind_sid(id_b, "B".into()).unwrap();
         (id_a, id_b)
     });
@@ -2463,11 +2466,12 @@ fn two_sessions_route_to_exactly_one_tile(cx: &mut TestAppContext) {
         );
     });
 
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         let text_a = v
             .sessions
             .get(id_a)
             .unwrap()
+            .read(cx)
             .state
             .editor
             .document()
@@ -2476,6 +2480,7 @@ fn two_sessions_route_to_exactly_one_tile(cx: &mut TestAppContext) {
             .sessions
             .get(id_b)
             .unwrap()
+            .read(cx)
             .state
             .editor
             .document()
@@ -2502,14 +2507,17 @@ fn duplicate_resolution_closes_orphan_and_focuses_owner(cx: &mut TestAppContext)
     vcx.run_until_parked();
 
     // Owner: a tile already bound to sid "S".
-    let owner_id = view.update(vcx, |v, _cx| {
+    let owner_id = view.update(vcx, |v, cx| {
         v.set_screen(App::Agent(AgentTile::new()));
-        let id = v.show_local_session(AgentSession {
-            state: AgentState::new_server_managed(None),
-            label: "owner".into(),
-            cwd: PathBuf::from("."),
-            resume_id: None,
-        });
+        let id = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(None),
+                label: "owner".into(),
+                cwd: PathBuf::from("."),
+                resume_id: None,
+            },
+            cx,
+        );
         v.sessions.bind_sid(id, "S".into()).unwrap();
         id
     });
@@ -2521,12 +2529,15 @@ fn duplicate_resolution_closes_orphan_and_focuses_owner(cx: &mut TestAppContext)
         v.workspace
             .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
         let token = crate::alloc_open_token();
-        let orphan = v.show_local_session(AgentSession {
-            state: AgentState::new_server_managed(Some("attaching…".into())),
-            label: "orphan".into(),
-            cwd: PathBuf::from("."),
-            resume_id: None,
-        });
+        let orphan = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(Some("attaching…".into())),
+                label: "orphan".into(),
+                cwd: PathBuf::from("."),
+                resume_id: None,
+            },
+            cx,
+        );
         if let Some(tile) = v.agent_tile_mut() {
             tile.pending_open_token = Some(token);
         }
@@ -2544,7 +2555,7 @@ fn duplicate_resolution_closes_orphan_and_focuses_owner(cx: &mut TestAppContext)
         let _ = orphan;
     });
 
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         assert_eq!(
             v.sessions.len(),
             1,
@@ -2611,30 +2622,45 @@ fn multi_session_persistence_round_trips_distinct_sids() {
     assert!(loaded[1].tasklist_open);
 }
 
-// ---- Render-skip keystone (CachedPanel) ----------------------------------
+// ---- Render-skip keystone + invalidation model (rev 2) -------------------
 //
 // The single most important mechanism of the responsiveness refactor: a child
 // panel embedded as a *cached* `AnyView` must have its `render()` SKIPPED when
-// the parent re-renders but the child was never notified (its inputs unchanged),
-// and re-run only when its fingerprint moves and `CachedPanel::notify_if_changed`
-// dirties it. This test proves the GPUI `cached()` wiring actually skips render
-// — not just that a counter increments. The negative leg (step b) is the proof:
-// if `element()` forgot `.cached()`, the parent re-render WOULD re-run the
-// child's render and the step-(b) assert would catch it (see the in-test note).
+// the parent re-renders but the child was never notified (its inputs
+// unchanged), and re-run only when the child entity is itself dirtied — the
+// rev-2 way: a `cx.observe(model) -> cx.notify()` on the view, or a notify at
+// the model's mutation site. (Rev 1's fingerprint poll from inside `render()`
+// is retired — see `project.md` "Design history" and `cached_panel.rs` docs.)
+//
+// Three tests pin the model:
+//   * `cached_panel_skips_render_until_child_is_notified` — the render-skip
+//     proof: a parent-only notify does NOT re-render the cached child; a notify
+//     on the child entity does. (Adapted from the old fingerprint test.)
+//   * `cached_observe_protocol_busts_cache_fresh` — the CANONICAL protocol:
+//     mutate a model entity inside `update`, the view's `cx.observe` callback
+//     notifies the view, and the next frame re-renders fresh (zero frames late).
+//   * `cached_notify_from_render_is_parked` — the TIMING-LAW pin: a `cx.notify`
+//     issued from INSIDE a `render()` does NOT invalidate that frame and does
+//     NOT schedule a redraw (`project.md` fact 4 / `window.rs:116`). This pins
+//     the gpui behavior rev 1 tripped over; a gpui upgrade that changes it
+//     fails loudly here.
 
 #[cfg(test)]
 thread_local! {
-    /// Incremented inside `Probe::render`. The render-skip proof reads this
+    /// Incremented inside `Probe::render`. The render-skip proofs read this
     /// across notify cycles (mirrors the `VIEW_MODEL_REBUILDS` counter idiom).
     static PROBE_RENDERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Test-only leaf view: counts its own renders and exposes a settable
-/// fingerprint. Its `render()` returns a SIZED div (cached layout is sized from
-/// the style, but the content still must be a real element).
+/// Test-only leaf view: counts its own renders. Its `render()` returns a SIZED
+/// div (cached layout is sized from the style, but the content still must be a
+/// real element). Also feeds the `cached_panel` perf counter under a label so
+/// the instrumentation path is exercised headlessly.
 #[cfg(test)]
 struct Probe {
-    fp: u64,
+    /// Optional model the probe observes; mutating it (via the observe wiring
+    /// in `cached_observe_protocol_busts_cache_fresh`) busts the cache.
+    _model: Option<gpui::Entity<u64>>,
 }
 
 #[cfg(test)]
@@ -2646,23 +2672,18 @@ impl gpui::Render for Probe {
     ) -> impl gpui::IntoElement {
         use gpui::Styled;
         PROBE_RENDERS.with(|c| c.set(c.get() + 1));
+        crate::record_render("test-probe");
         gpui::div().size_full()
     }
 }
 
-#[cfg(test)]
-impl crate::FingerprintedPanel for Probe {
-    fn render_fp(&self) -> u64 {
-        self.fp
-    }
-}
-
-/// Parent test view: holds the child `Entity<Probe>` and its `CachedPanel`, and
-/// renders the cached panel inside a sized container. The parent re-renders
-/// every frame (root always does); the cached child must not, unless dirtied.
+/// Parent test view: holds the child `Entity<Probe>` and embeds it via the
+/// rev-2 [`cached_child`] helper inside a sized container. The parent
+/// re-renders every frame (root always does); the cached child must not, unless
+/// its own entity is dirtied.
 #[cfg(test)]
 struct CachedHost {
-    panel: crate::CachedPanel<Probe>,
+    child: gpui::Entity<Probe>,
 }
 
 #[cfg(test)]
@@ -2677,26 +2698,25 @@ impl gpui::Render for CachedHost {
         gpui::div()
             .w(px(400.0))
             .h(px(300.0))
-            .child(self.panel.element(crate::size_full_style()))
+            .child(crate::cached_child(self.child.clone()))
     }
 }
 
-/// THE keystone proof. Three legs:
+/// THE keystone proof, rev 2. Three legs:
 ///   (a) first frame populates the cache: render-count == 1.
 ///   (b) notify the PARENT only + re-render: the child's render-count MUST stay
 ///       at 1 — a parent re-render does NOT re-render the un-dirtied cached
-///       child. This is the core render-skip guarantee.
-///   (c) change the Probe's fp and call `notify_if_changed` (dirties the child)
-///       + re-render: render-count MUST increment to 2 (cache invalidated).
+///       child. This is the core render-skip guarantee (parent notify dirties
+///       the parent + its ancestors, NOT the child — `window.rs:1304`).
+///   (c) notify the CHILD entity + re-render: render-count MUST increment to 2
+///       (the cached entity is in `dirty_views`, so its render runs).
 #[gpui::test]
-fn cached_panel_skips_render_until_fingerprint_changes(cx: &mut TestAppContext) {
+fn cached_panel_skips_render_until_child_is_notified(cx: &mut TestAppContext) {
     PROBE_RENDERS.with(|c| c.set(0));
 
     let (host, vcx) = cx.add_window_view(|_window, cx| {
-        // Build the child entity, seed a CachedPanel from it.
-        let probe = cx.new(|_cx| Probe { fp: 1 });
-        let panel = crate::CachedPanel::new(probe, cx);
-        CachedHost { panel }
+        let child = cx.new(|_cx| Probe { _model: None });
+        CachedHost { child }
     });
 
     // --- (a) Initial frame populates the cache. ---
@@ -2708,7 +2728,7 @@ fn cached_panel_skips_render_until_fingerprint_changes(cx: &mut TestAppContext) 
     );
 
     // --- (b) Notify the PARENT only. The child is NOT in dirty_views, so its
-    //     cached prepaint is reused and render() is SKIPPED. If `element()`
+    //     cached prepaint is reused and render() is SKIPPED. If `cached_child`
     //     forgot `.cached()`, the parent re-render would re-run the child here
     //     and this assert would fail — so it is NOT a tautology. ---
     host.update(vcx, |_v, cx| cx.notify());
@@ -2720,35 +2740,468 @@ fn cached_panel_skips_render_until_fingerprint_changes(cx: &mut TestAppContext) 
          (render-skip is the whole point); render-count went to {after_parent_notify}"
     );
 
-    // Sanity: notify_if_changed with an UNCHANGED fingerprint must return false
-    // and must NOT dirty the child — render stays skipped.
-    let changed = host.update(vcx, |v, cx| v.panel.notify_if_changed(cx));
-    assert!(
-        !changed,
-        "notify_if_changed must return false when the fingerprint is unchanged"
+    // --- (c) Notify the CHILD entity. It enters `dirty_views`, so cached()
+    //     re-runs its render. This is the rev-2 invalidation: notify the view
+    //     itself (what a `cx.observe` callback or mutation site would do). ---
+    host.update(vcx, |v, cx| v.child.update(cx, |_p, cx| cx.notify()));
+    vcx.run_until_parked();
+    let after_child_notify = PROBE_RENDERS.with(|c| c.get());
+    assert_eq!(
+        after_child_notify, 2,
+        "notifying the cached child entity must re-run its render exactly once more, \
+         got {after_child_notify}"
     );
+}
+
+/// CANONICAL OBSERVE-PROTOCOL test. A view `cx.observe`s a model entity; the
+/// callback `cx.notify()`s the VIEW. Mutating the model inside `cx.update` (the
+/// mutation site notifies the model) fires the observer OUTSIDE the draw
+/// (`apply_notify_effect`, `app.rs:1301`), which notifies the view, dirtying it
+/// — so the NEXT frame re-renders the cached child fresh, zero frames late.
+/// This is the rev-2 cache-busting path (`project.md` fact 5 / component model).
+#[gpui::test]
+fn cached_observe_protocol_busts_cache_fresh(cx: &mut TestAppContext) {
+    PROBE_RENDERS.with(|c| c.set(0));
+
+    let (host, vcx) = cx.add_window_view(|_window, cx| {
+        // The domain model: a plain entity standing in for an AgentSession.
+        let model = cx.new(|_cx| 0u64);
+        // The cached child observes the model and self-notifies on change —
+        // the canonical `cx.observe(model) -> cx.notify(view)` wiring.
+        let child = cx.new(|cx| {
+            cx.observe(&model, |_probe, _model, cx| {
+                // Outside the draw (effect flush): legitimate to notify the view.
+                crate::record_notify("test-probe", crate::MissReason::Dirtied);
+                cx.notify();
+            })
+            .detach();
+            Probe {
+                _model: Some(model.clone()),
+            }
+        });
+        CachedHost { child }
+    });
+
+    // First frame populates the cache.
     vcx.run_until_parked();
     assert_eq!(
         PROBE_RENDERS.with(|c| c.get()),
         1,
-        "an unchanged fingerprint must not invalidate the cache"
+        "first frame renders the child once"
     );
 
-    // --- (c) Move the fingerprint, then notify_if_changed (dirties the child).
-    //     The cache is invalidated and render() runs again. ---
-    let changed = host.update(vcx, |v, cx| {
-        v.panel.view().update(cx, |p, _cx| p.fp = 2);
-        v.panel.notify_if_changed(cx)
+    // Mutate the MODEL at its mutation site (notify the model). The view's
+    // observe callback fires in effect flush and notifies the view; the next
+    // frame re-renders the cached child — fresh, not a frame late.
+    host.update(vcx, |v, cx| {
+        let model = v.child.read(cx)._model.clone().expect("model");
+        model.update(cx, |n, cx| {
+            *n += 1;
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        PROBE_RENDERS.with(|c| c.get()),
+        2,
+        "mutating the observed model must bust the cached child's cache via the \
+         observe->notify protocol — exactly one extra render, zero frames late"
+    );
+}
+
+/// TIMING-LAW PIN. A `cx.notify` issued from INSIDE a `render()` is parked
+/// (`invalidate_view` under `draw_phase != None`, `window.rs:116`): it does NOT
+/// dirty the current frame (`dirty_views` is drained at draw start,
+/// `window.rs:1926`) and does NOT schedule a next frame (the loop draws only
+/// when `is_dirty()`, `window.rs:128`). So a view that notifies itself from
+/// render renders ONCE and then goes quiet — the render count stays flat until
+/// an EXTERNAL notify arrives. This pins the exact gpui behavior rev 1 tripped
+/// over; a gpui change that makes mid-draw notify self-perpetuate (or schedule
+/// a frame) would spin the render loop and fail loudly here.
+#[gpui::test]
+fn cached_notify_from_render_is_parked(cx: &mut TestAppContext) {
+    use std::cell::Cell;
+    thread_local! {
+        static SELF_NOTIFY_RENDERS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    // A view that (illegally) notifies itself from inside render().
+    struct SelfNotifier;
+    impl gpui::Render for SelfNotifier {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use gpui::Styled;
+            SELF_NOTIFY_RENDERS.with(|c| c.set(c.get() + 1));
+            // THE forbidden call. Under the timing law this is parked: it must
+            // not re-dirty this view for another frame.
+            cx.notify();
+            gpui::div().size_full()
+        }
+    }
+
+    SELF_NOTIFY_RENDERS.with(|c| c.set(0));
+    let (view, vcx) = cx.add_window_view(|_window, _cx| SelfNotifier);
+
+    // Drive frames. If the mid-draw notify scheduled a redraw, the render loop
+    // would spin and this count would climb past 1.
+    vcx.run_until_parked();
+    let after_first = SELF_NOTIFY_RENDERS.with(|c| c.get());
+    assert_eq!(
+        after_first, 1,
+        "a notify issued from render must NOT schedule another frame on its own; \
+         render ran {after_first} times (loop is spinning => timing law broken)"
+    );
+
+    // Park again to be sure no deferred frame is pending. Still flat.
+    vcx.run_until_parked();
+    assert_eq!(
+        SELF_NOTIFY_RENDERS.with(|c| c.get()),
+        1,
+        "mid-draw notify is parked: no redraw is scheduled, count stays flat"
+    );
+
+    // An EXTERNAL notify (outside the draw — the legitimate path) DOES schedule
+    // a redraw: exactly one more render. Proves the view is still wired, the
+    // first assertions weren't passing because rendering was somehow disabled.
+    view.update(vcx, |_v, cx| cx.notify());
+    vcx.run_until_parked();
+    let after_external = SELF_NOTIFY_RENDERS.with(|c| c.get());
+    assert_eq!(
+        after_external, 2,
+        "an external (non-draw) notify must schedule exactly one redraw, got {after_external}"
+    );
+}
+
+// ===================================================================
+// TICKET 021 — TranscriptView render-count regressions.
+//
+// The flagship invariants, asserted headlessly via the `cached_panel` render
+// counter (`perf_render_count("transcript")`). The GUI cannot be driven for
+// PAINT headlessly, so these prove RENDER-skip / render-fresh (the cache path),
+// NOT the on-screen pixels — the human runtime `sample` profile remains the
+// paint-thread ground truth (flagged in the ticket).
+//
+// Model (project.md component model): a chatbox keystroke moves no transcript
+// slice ⇒ the observe filter does NOT self-notify ⇒ the cached transcript's
+// render() is SKIPPED (count FLAT). A worksheet edit / stream chunk / tool
+// expand / theme/zoom moves a slice (or a global) ⇒ the view is notified
+// OUTSIDE the draw ⇒ the NEXT frame re-renders fresh (count +1), zero frames
+// late — including the FINAL append of a streaming burst (the rev-1 stale-tail
+// hazard).
+
+/// Boot a browser view, focus it, run a frame, install ONE bound agent slot,
+/// and return the focused session's id + entity. The first `render_agent`
+/// (driven by the next `run_until_parked`) lazily creates the `TranscriptView`.
+#[cfg(test)]
+fn boot_with_transcript<'a>(
+    cx: &'a mut TestAppContext,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    crate::SessionId,
+    gpui::Entity<crate::AgentSession>,
+) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+    // Dismiss the startup splash — it would otherwise short-circuit `render`
+    // before `render_agent` runs (wall-clock doesn't advance under
+    // `run_until_parked`, so the 1.5s deadline never expires headlessly).
+    let (id, session) = view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        let id = v.focused_bound_session().expect("bound session");
+        let ent = v.session_entity(id).expect("session entity");
+        cx.notify();
+        (id, ent)
+    });
+    (view, vcx, id, session)
+}
+
+/// (a) A chatbox keystroke re-renders the root chrome + compose, but the
+/// transcript's render() is SKIPPED: its count stays FLAT. This is finding #1
+/// (chatbox keystroke re-lays-out the static transcript) closed.
+#[gpui::test]
+fn transcript_021_chatbox_keystroke_is_render_flat(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (_view, vcx, _id, session) = boot_with_transcript(cx);
+
+    // First real frame: render_agent runs, creates + renders the transcript.
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+    assert!(base >= 1, "transcript must render at least once on first frame");
+
+    // A real chatbox keystroke mutates the COMPOSE editor (inside the
+    // `InputSurface::Chatbox`) and notifies the SESSION — but the transcript's
+    // observed seqs (transcript `edit_seq`, frozen/tools gen, cursor, …) read
+    // the *transcript* editor, which is untouched. So the observe filter must
+    // NOT self-notify, and the cached transcript's render() must be skipped.
+    // This is the slice-filter doing its job, not merely `cached()`.
+    for _ in 0..5 {
+        session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+            if let Some(cb) = s.state.input_surface.chatbox_mut() {
+                let len = cb.editor.document().rope().len_chars();
+                cb.editor.programmatic_insert(len, "x");
+            }
+            // The keystroke path notifies the session (mutation-site notify).
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    }
+    let after = crate::perf_render_count("transcript");
+    assert_eq!(
+        after, base,
+        "a chatbox keystroke (compose-only session mutation) must NOT re-render \
+         the cached transcript — the observe slice-filter sees no transcript slice \
+         move, so render() is skipped; count must stay flat ({base}), got {after}"
+    );
+}
+
+/// (b) A worksheet edit (a real session mutation + notify) busts the cache: the
+/// observe filter sees `edit_seq` move and self-notifies, so the NEXT frame
+/// re-renders the transcript exactly once.
+#[gpui::test]
+fn transcript_021_session_edit_busts_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (_view, vcx, _id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    // Mutate the session transcript at its mutation site (insert text + notify
+    // the session) — exactly what a worksheet keystroke / stream chunk does.
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state.editor.programmatic_insert(0, "hello from claude\n");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("transcript");
+    assert_eq!(
+        after,
+        base + 1,
+        "a session transcript edit must re-render the transcript exactly once \
+         on the next frame (base {base}), got {after}"
+    );
+}
+
+/// (b′) The STALE-TAIL case (the rev-1 hazard): a STREAMING BURST of chunks,
+/// where the FINAL append must also land a +1. Each chunk is a separate
+/// session.update+notify; the last one must not be stranded behind the cache.
+#[gpui::test]
+fn transcript_021_streaming_burst_final_append_renders(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (_view, vcx, _id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    let mut expected = crate::perf_render_count("transcript");
+
+    // Stream several chunks; assert the count advances on EACH, including the
+    // final append — there is no frame where a fresh chunk is left invisible.
+    for i in 0..4 {
+        session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+            s.state
+                .editor
+                .programmatic_insert(s.state.editor.document().rope().len_chars(), "chunk ");
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        expected += 1;
+        let now = crate::perf_render_count("transcript");
+        assert_eq!(
+            now, expected,
+            "streaming chunk #{i} must re-render the transcript (expected {expected}), got {now}"
+        );
+    }
+}
+
+/// (c) A tool-group expand toggle bumps `tools_gen`, which the observe filter
+/// watches ⇒ +1. Toggling expanded is the canonical tool-structure mutation.
+#[gpui::test]
+fn transcript_021_tool_expand_busts_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (_view, vcx, _id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state.tools.toggle_expanded("anchor-7");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("transcript");
+    assert_eq!(
+        after,
+        base + 1,
+        "a tool expand toggle (tools_gen bump) must re-render the transcript once \
+         (base {base}), got {after}"
+    );
+}
+
+/// (d) Theme and zoom are GLOBAL: their action handlers notify each live
+/// transcript view directly (event context). Each must yield +1.
+#[gpui::test]
+fn transcript_021_theme_and_zoom_bust_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    // Theme swap → notify_transcript_views(Refresh).
+    view.update(vcx, |v, cx| {
+        v.set_theme(crate::ThemeName::Nightfox, cx);
+    });
+    vcx.run_until_parked();
+    let after_theme = crate::perf_render_count("transcript");
+    assert_eq!(
+        after_theme,
+        base + 1,
+        "a theme swap must re-render the transcript once (base {base}), got {after_theme}"
+    );
+
+    // Zoom in → notify_transcript_views(TextStyle). Drive the scale setter
+    // directly (the `zoom_in` action handler is a thin wrapper over it that
+    // also needs a `&mut Window` we don't have headlessly).
+    view.update(vcx, |v, cx| {
+        v.set_text_scale(v.text_scale * crate::TEXT_SCALE_STEP, cx);
+    });
+    vcx.run_until_parked();
+    let after_zoom = crate::perf_render_count("transcript");
+    assert_eq!(
+        after_zoom,
+        after_theme + 1,
+        "a zoom-in must re-render the transcript once ({after_theme} -> got {after_zoom})"
+    );
+}
+
+/// (e) Follow-tail still reveals grown content: after a streaming append while
+/// following, the list's registered item count grows to match the freshly
+/// built flat-items (the reconcile + reveal path runs in TranscriptView's
+/// render). Reads the count through the view's `TranscriptScroll`.
+#[gpui::test]
+fn transcript_021_follow_tail_reveals_grown_content(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+
+    let count_before = view.update(vcx, |v, cx| {
+        v.transcript_views
+            .get(&id)
+            .map(|tv| tv.read(cx).scroll.list_item_count)
+            .unwrap_or(0)
+    });
+
+    // Append several lines (rows) while following (the default).
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, "line one\nline two\nline three\n");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    let count_after = view.update(vcx, |v, cx| {
+        v.transcript_views
+            .get(&id)
+            .map(|tv| tv.read(cx).scroll.list_item_count)
+            .unwrap_or(0)
     });
     assert!(
-        changed,
-        "notify_if_changed must return true after the fingerprint moves"
+        count_after > count_before,
+        "follow-tail: the transcript's registered item count must grow with the \
+         appended rows (before {count_before}, after {count_after})"
     );
+}
+
+/// (f) SEQ-COVERAGE for `c.mode`: a bare worksheet mode flip (Normal⇄Insert)
+/// moves NO other seq — no cursor move, no `edit_seq` bump — yet `make_caret`
+/// draws the under-cursor CHARACTER in Normal vs a BLANK block in Insert. So
+/// `mode` is a render input that MUST be in `TranscriptSeqs`; flipping it alone
+/// must self-notify and re-render the transcript exactly once. Without the
+/// `mode` field the observe filter returns `None` ⇒ stale caret (the bug the
+/// adversarial review flagged: `i`/`a` into Insert, or `Esc` at col 0).
+#[gpui::test]
+fn transcript_021_mode_flip_busts_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (_view, vcx, _id, session) = boot_with_transcript(cx);
     vcx.run_until_parked();
-    let after_invalidate = PROBE_RENDERS.with(|c| c.get());
+    let base = crate::perf_render_count("transcript");
+
+    // Flip ONLY the edit mode (what a bare `i`/`a` does: begin_insert flips
+    // `*mode` with no cursor move and no edit_seq bump). Notify the session as
+    // the key handler does.
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        let before = s.state.mode;
+        s.state.mode = match before {
+            crate::EditMode::Normal => crate::EditMode::Insert,
+            crate::EditMode::Insert => crate::EditMode::Normal,
+        };
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("transcript");
     assert_eq!(
-        after_invalidate, 2,
-        "a changed fingerprint (child dirtied) must re-run the child's render exactly once more, \
-         got {after_invalidate}"
+        after,
+        base + 1,
+        "a bare worksheet mode flip (caret glyph change, no other seq move) must \
+         re-render the transcript once so the caret is fresh (base {base}), got {after}"
+    );
+}
+
+/// (g) The thinking-indicator CLOCK lives inside the cached `TranscriptView`.
+/// Its ~1Hz anim tick must bust the cached child for every awaiting session —
+/// a root notify cannot (facts 3/6) and no session seq moves during a stall.
+/// `tick_awaiting_transcript_views` is that route; here it must yield +1 on an
+/// awaiting session and 0 on an idle one (the bug the review flagged: the clock
+/// froze during a stall because the tick notified the root, not the view).
+#[gpui::test]
+fn transcript_021_anim_tick_busts_awaiting_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (view, vcx, _id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    // IDLE: a tick must NOT touch the transcript (nothing is awaiting).
+    let ticked_idle = view.update(vcx, |v, cx| v.tick_awaiting_transcript_views(cx));
+    vcx.run_until_parked();
+    assert!(!ticked_idle, "idle session: anim tick must notify no transcript view");
+    assert_eq!(
+        crate::perf_render_count("transcript"),
+        base,
+        "idle session: anim tick must not re-render the transcript"
+    );
+
+    // AWAITING: put the session mid-turn (with timers in the past so the clock
+    // is live), then tick — the cached transcript MUST re-render so the
+    // `Thinking… mm:ss` clock advances.
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(35);
+        s.state.turn_phase = crate::TurnPhase::Awaiting {
+            started: past,
+            last_event: past,
+        };
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    // The awaiting flip itself bumps the `awaiting` seq ⇒ one render. Anchor the
+    // anim-tick assertion off the post-flip count.
+    let after_await = crate::perf_render_count("transcript");
+
+    let ticked = view.update(vcx, |v, cx| v.tick_awaiting_transcript_views(cx));
+    vcx.run_until_parked();
+    assert!(ticked, "awaiting session: anim tick must notify its transcript view");
+    let after_tick = crate::perf_render_count("transcript");
+    assert_eq!(
+        after_tick,
+        after_await + 1,
+        "awaiting anim tick must bust the cached transcript so the stall clock \
+         advances (post-await {after_await}), got {after_tick}"
     );
 }

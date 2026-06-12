@@ -47,14 +47,25 @@ a type-parameter change plus call-site mechanics.
 
 ## Subtasks
 
-- [ ] Store payload swap + `with_session` accessor shim; root keeps
+- [x] Store payload swap + `with_session` accessor shim; root keeps
       `HashMap`-free single source (the store) — no parallel registries.
-- [ ] Convert mutation sites (agent_ui, main, screens) to `update` +
-      mutation-site `cx.notify()` on the session.
-- [ ] Convert read sites to `.read(cx)`; remove/avoid the raw-pointer borrow
-      idiom in `render_agent`.
-- [ ] Build + full test suite; transcript reconciler seam tests stay green
+      (`AgentSessions = SessionStore<Entity<AgentSession>>`; shims
+      `with_session` / `with_session_silent` / `read_session` / `agent_read` /
+      `session_entity` on `YaldaGpuiView`.)
+- [x] Convert mutation sites (agent_ui, main, screens) to `update` +
+      mutation-site `cx.notify()` on the session. (Reducers
+      `apply_server_batch`/`pump_session`/etc. notify the session entity inside
+      their `update`, redundant with the existing root notify today.)
+- [x] Convert read sites to `.read(cx)`; remove/avoid the raw-pointer borrow
+      idiom in `render_agent`. (The `unsafe` `*mut AgentState` in `render_agent`
+      is gone — the body now builds inside `session_ent.update(cx, …)` with a
+      safe `&mut AgentState`; `self`/font/theme locals + the weak handle are
+      precomputed before the update, the root listeners assembled after it.)
+- [x] Build + full test suite; transcript reconciler seam tests stay green
       untouched (pure `agent_transcript.rs` is unaffected by ownership).
+      (`cargo test` = 514 passed / 0 failed; `agent_sessions.rs` and
+      `agent_transcript.rs` were NOT touched — store invariant + reconciler
+      seam tests pass unchanged.)
 - [ ] **Human runtime:** behavior-parity smoke — create/bind/close sessions,
       stream a turn, worksheet + chatbox typing, persistence restore. Nothing
       should look different; this ticket only moves ownership.
