@@ -1440,6 +1440,7 @@ fn gpui_menu() -> Vec<MenuNode> {
             )],
         ),
         MenuNode::separator(),
+        MenuNode::entry("t", "toggle theme — Nightfox ⇄ Folio (Cmd-Shift-T)", "theme-toggle"),
         MenuNode::entry("v", "back to doc", "back-to-doc"),
         MenuNode::separator(),
         MenuNode::entry("q", "quit", "quit"),
