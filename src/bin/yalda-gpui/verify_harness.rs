@@ -103,7 +103,7 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
 
     // --- Cold paint: first render highlights every line once. ---
     vcx.run_until_parked();
-    let (cold_recomputed, cold_skip) = view.update(vcx, |v, _cx| v.test_edit_cache_stats());
+    let (cold_recomputed, cold_skip) = view.update(vcx, |v, cx| v.test_edit_cache_stats());
     assert!(
         cold_recomputed >= N,
         "cold paint should highlight all {N} lines, got {cold_recomputed}"
@@ -114,7 +114,7 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
     //     (edit_seq unchanged) and recompute zero lines. ---
     view.update(vcx, |_v, cx| cx.notify());
     vcx.run_until_parked();
-    let (idle_recomputed, idle_skip) = view.update(vcx, |v, _cx| v.test_edit_cache_stats());
+    let (idle_recomputed, idle_skip) = view.update(vcx, |v, cx| v.test_edit_cache_stats());
     assert_eq!(
         idle_recomputed, 0,
         "no-change re-render must recompute 0 lines (fast skip), got {idle_recomputed}"
@@ -135,7 +135,7 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
         cx.notify();
     });
     vcx.run_until_parked();
-    let (edit_recomputed, edit_skip) = view.update(vcx, |v, _cx| v.test_edit_cache_stats());
+    let (edit_recomputed, edit_skip) = view.update(vcx, |v, cx| v.test_edit_cache_stats());
     assert!(!edit_skip, "an edit must not fast-skip");
     assert_eq!(
         edit_recomputed, 1,
@@ -245,7 +245,7 @@ fn doc_hit_test_never_touches_unpainted_layout(cx: &mut TestAppContext) {
     // Sanity: the virtualized list actually rendered lines (not a collapsed,
     // zero-height body — which removing `Auto` could cause if the parent didn't
     // bound the height). Otherwise the hit-test below would be vacuous.
-    let registered = view.update(vcx, |v, _cx| v.line_layouts.borrow().len());
+    let registered = view.update(vcx, |v, cx| v.line_layouts.borrow().len());
     assert!(
         registered > 0,
         "doc body rendered no lines (list collapsed?)"
@@ -259,16 +259,16 @@ fn doc_hit_test_never_touches_unpainted_layout(cx: &mut TestAppContext) {
     // layout and call `.bounds()` on each. If any registered line was measured
     // but not prepainted, this panics → test fails. With visible-only measuring
     // every registered layout is painted, so it returns None safely.
-    let miss = view.update(vcx, |v, _cx| v.doc_pos_at(point(px(40.0), px(1_000_000.0))));
+    let miss = view.update(vcx, |v, cx| v.doc_pos_at(point(px(40.0), px(1_000_000.0))));
     assert!(miss.is_none(), "a point far below all content hits no line");
 
     // And hit-testing still resolves: a point inside a painted line yields a pos.
-    let p = view.update(vcx, |v, _cx| {
+    let p = view.update(vcx, |v, cx| {
         let ll = v.line_layouts.borrow();
         let b = ll.values().next().expect("a painted line").bounds();
         point(b.left() + px(2.0), b.top() + px(2.0))
     });
-    let hit = view.update(vcx, |v, _cx| v.doc_pos_at(p));
+    let hit = view.update(vcx, |v, cx| v.doc_pos_at(p));
     assert!(
         hit.is_some(),
         "a point inside a painted line resolves to a DocPos"
@@ -309,7 +309,7 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
 
     // Pick drag endpoints from the REAL painted bounds: top-most painted line →
     // bottom-most painted line (both guaranteed prepainted, so bounds() is safe).
-    let (start, end, start_block, end_block) = view.update(vcx, |v, _cx| {
+    let (start, end, start_block, end_block) = view.update(vcx, |v, cx| {
         let ll = v.line_layouts.borrow();
         let mut keys: Vec<(usize, usize)> = ll.keys().copied().collect();
         keys.sort();
@@ -338,7 +338,7 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
 
     // Model: a selection exists after the drag.
     assert!(
-        view.update(vcx, |v, _cx| v.doc_selection.is_some()),
+        view.update(vcx, |v, cx| v.doc_selection.is_some()),
         "drag produced no doc selection"
     );
 
@@ -420,7 +420,7 @@ fn install_agent_slot(
 ) {
     use crate::{AgentSession, AgentState, AgentTile, App};
     let sid = server_sid.map(|s| s.to_string());
-    view.update(vcx, |v, _cx| {
+    view.update(vcx, |v, cx| {
         v.set_screen(App::Agent(AgentTile::new()));
         let session = AgentSession {
             state: AgentState::new_server_managed(None),
@@ -428,7 +428,7 @@ fn install_agent_slot(
             cwd: PathBuf::from("."),
             resume_id: None,
         };
-        let id = v.show_local_session(session);
+        let id = v.show_local_session(session, cx);
         if let Some(sid) = sid {
             v.sessions.bind_sid(id, sid).expect("fresh sid binds");
         }
@@ -441,8 +441,8 @@ fn active_transcript_text(
     view: &gpui::Entity<YaldaGpuiView>,
     vcx: &mut gpui::VisualTestContext,
 ) -> String {
-    view.update(vcx, |v, _cx| {
-        v.agent_mut()
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx)
             .map(|c| c.editor.document().full_text())
             .unwrap_or_default()
     })
@@ -472,7 +472,7 @@ fn agent_seam_suppresses_double_render_when_chunk_precedes_echo(cx: &mut TestApp
 
     view.update(vcx, |v, cx| {
         // What submit_chatbox does on send success: optimistic echo of "hello".
-        v.agent_mut()
+        v.agent_mut(cx)
             .unwrap()
             .insert_user_turn("hello", UserTurnOrigin::LocalSubmit, false);
         // Assistant streams FIRST, then the server's UserPrompt echo arrives.
@@ -540,7 +540,7 @@ fn agent_seam_routes_reply_only_after_session_is_bound(cx: &mut TestAppContext) 
     );
 
     // Bind the sid (what apply_open_agent_resolution does), then re-feed.
-    view.update(vcx, |v, _cx| {
+    view.update(vcx, |v, cx| {
         let id = v.focused_bound_session().expect("a session is bound");
         v.sessions
             .bind_sid(id, "S1".into())
@@ -594,7 +594,7 @@ fn cmd_b_toggles_file_browser_rail(cx: &mut TestAppContext) {
     // Read the rail kind on the active tab: None = no rail, Some(true) = a
     // file-browser rail, Some(false) = some other rail kind.
     let rail_kind = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-        view.update(vcx, |v, _cx| {
+        view.update(vcx, |v, cx| {
             v.workspace
                 .active_tab()
                 .and_then(|t| t.rail.as_ref())
@@ -661,8 +661,8 @@ fn seed_worksheet_line(
     vcx: &mut gpui::VisualTestContext,
     token: &str,
 ) {
-    view.update(vcx, |v, _cx| {
-        let claude = v.agent_mut().expect("active agent slot");
+    view.update(vcx, |v, cx| {
+        let mut claude = v.agent_mut(cx).expect("active agent slot");
         claude.input_surface = crate::InputSurface::Worksheet;
         for ch in token.chars() {
             claude.editor.insert_char(ch);
@@ -700,8 +700,8 @@ fn agent_seam_worksheet_submit_suppresses_double_render(cx: &mut TestAppContext)
     // Commit the worksheet submit through the shared reconciler core, exactly as
     // `submit_worksheet` does on send-success: derive k, freeze line 0 in place,
     // and register the prompt so the echo is suppressed.
-    view.update(vcx, |v, _cx| {
-        let claude = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut claude = v.agent_mut(cx).unwrap();
         let collected = vec![(0usize, TOKEN.to_string())];
         let k = claude.commit_worksheet_turn(&collected, TOKEN);
         assert_eq!(k, Some(1), "first worksheet submit is turn 1");
@@ -814,13 +814,13 @@ fn agent_seam_pipelined_worksheet_submits_get_distinct_turns(cx: &mut TestAppCon
     install_agent_slot(&view, &mut *vcx, Some("S1"));
 
     // Turn 1 has settled (its TurnEnded advanced last_seen to 1).
-    view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().replay_turns.last_seen = 1;
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().replay_turns.last_seen = 1;
     });
 
     // First in-flight submit -> turn 2.
-    let k1 = view.update(vcx, |v, _cx| {
-        v.agent_mut()
+    let k1 = view.update(vcx, |v, cx| {
+        v.agent_mut(cx)
             .unwrap()
             .commit_worksheet_turn(&[(0usize, "alpha".to_string())], "alpha")
     });
@@ -828,8 +828,8 @@ fn agent_seam_pipelined_worksheet_submits_get_distinct_turns(cx: &mut TestAppCon
 
     // Second submit BEFORE turn 2's boundary advances last_seen (still 1). It
     // must be a distinct turn (3), NOT collide on 2 and trip the tripwire.
-    let k2 = view.update(vcx, |v, _cx| {
-        v.agent_mut()
+    let k2 = view.update(vcx, |v, cx| {
+        v.agent_mut(cx)
             .unwrap()
             .commit_worksheet_turn(&[(0usize, "beta".to_string())], "beta")
     });
@@ -860,13 +860,13 @@ fn agent_seam_unsuppressed_echo_during_inflight_turn_gets_distinct_k(cx: &mut Te
     });
     vcx.run_until_parked();
     install_agent_slot(&view, &mut *vcx, Some("S1"));
-    view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().replay_turns.last_seen = 1;
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().replay_turns.last_seen = 1;
     });
 
     // Local submit -> turn 2 (in flight; last_seen still 1).
-    let k1 = view.update(vcx, |v, _cx| {
-        v.agent_mut()
+    let k1 = view.update(vcx, |v, cx| {
+        v.agent_mut(cx)
             .unwrap()
             .register_user_turn("alpha", UserTurnOrigin::LocalSubmit, false)
     });
@@ -874,8 +874,8 @@ fn agent_seam_unsuppressed_echo_during_inflight_turn_gets_distinct_k(cx: &mut Te
 
     // A live echo with NON-matching text (not suppressed) before turn 2's
     // boundary settles. Must be a distinct turn, not a collision on 2.
-    let k2 = view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().register_user_turn(
+    let k2 = view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().register_user_turn(
             "a totally different unsuppressed echo",
             UserTurnOrigin::Echo,
             false,
@@ -909,7 +909,7 @@ fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    view.update(vcx, |v, _cx| {
+    view.update(vcx, |v, cx| {
         assert!(!v.has_overlay(), "fresh view has no overlay");
 
         v.open_overlay(ActiveOverlay::BufferSwitcher(BufferSwitcher {
@@ -964,8 +964,8 @@ fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
     install_agent_slot(&view, &mut *vcx, Some("S1"));
 
     // New session starts in Chatbox — a box exists.
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert!(c.input_surface.is_chatbox());
         assert!(
             c.input_surface.chatbox().is_some(),
@@ -975,8 +975,8 @@ fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
 
     // Toggle -> Worksheet: the box is gone (no stranded Some).
     view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert!(!c.input_surface.is_chatbox());
         assert!(
             c.input_surface.chatbox().is_none(),
@@ -986,8 +986,8 @@ fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
 
     // Toggle back -> Chatbox: a fresh box.
     view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
-    view.update(vcx, |v, _cx| {
-        assert!(v.agent_mut().unwrap().input_surface.is_chatbox());
+    view.update(vcx, |v, cx| {
+        assert!(v.agent_mut(cx).unwrap().input_surface.is_chatbox());
     });
 }
 
@@ -1079,8 +1079,8 @@ fn agent_reducer_drives_transcript_after_gate_flips(cx: &mut TestAppContext) {
         v.apply_server_batch(batch, cx);
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert_eq!(c.generation, 1, "ChannelOpened rebaselined to gen 1");
         assert!(
             c.agent_stream_authoritative,
@@ -1126,8 +1126,8 @@ fn agent_reducer_drives_transcript_after_gate_flips(cx: &mut TestAppContext) {
         v.apply_server_batch(batch, cx);
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         let text = c.editor.document().full_text();
         assert!(
             text.contains("live turn-2 prose"),
@@ -1314,8 +1314,8 @@ fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
         v.apply_server_batch(batch, cx);
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert_eq!(c.generation, 2, "adopted the newer generation");
         let text = c.editor.document().full_text();
         assert!(
@@ -1525,8 +1525,8 @@ fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContex
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert!(
             c.finalized.contains(&(1, 1)),
             "forwarded TurnEnded must finalize the 0-based (generation 1, turn 1) key; \
@@ -1551,8 +1551,8 @@ fn agent_reducer_legacy_and_forwarded_turn_ended_collapse(cx: &mut TestAppContex
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         // The forwarded and legacy boundaries collapsed to a SINGLE ledger entry.
         assert!(
             c.finalized.contains(&(1, 1)),
@@ -1646,8 +1646,8 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
     // replay path leaves it just before `ReplayEnd` (a replayed user boundary
     // seeds replay_turn = last_seen + 1 = 1). Without this `finish_replay` folds
     // `last_seen` to 0 and the bug's aliasing never occurs.
-    view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().replay_turns.replay_turn = 1;
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().replay_turns.replay_turn = 1;
     });
 
     // End of the replayed prefix. `finish_replay` now folds `last_seen` → 1,
@@ -1667,8 +1667,8 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert!(
             c.agent_stream_authoritative,
             "the forwarded TurnEnded must flip the §9 gate after replay"
@@ -1693,8 +1693,8 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
     // The user submits a fresh prompt: the turn begins (thinking indicator on),
     // then the live content + boundary stream through the now-authoritative
     // reducer. envelope turn == 1 (settled count 2 -> completed_turn 1).
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
     });
 
@@ -1725,8 +1725,8 @@ fn agent_reducer_live_turn_after_replay_finalizes(cx: &mut TestAppContext) {
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         let text = c.editor.document().full_text();
         assert!(
             text.contains("LIVE-AFTER-REPLAY"),
@@ -1799,8 +1799,8 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
 
     // Drive the replay cursor to the upcoming live turn's index (2), the way the
     // legacy replay path leaves it after two replayed user boundaries.
-    view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().replay_turns.replay_turn = 2;
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().replay_turns.replay_turn = 2;
     });
 
     // ReplayEnd: `finish_replay` folds `last_seen` → 2, aliasing the live turn.
@@ -1819,8 +1819,8 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert!(c.agent_stream_authoritative, "gate flipped after replay");
         assert!(
             c.finalized.contains(&(0, 0)),
@@ -1842,8 +1842,8 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
     });
 
     // Live turn 2: begin (thinking), stream content, end. Stamped turn 2.
-    view.update(vcx, |v, _cx| {
-        v.agent_mut().unwrap().turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
     });
     view.update(vcx, |v, cx| {
         v.apply_server_batch(
@@ -1872,8 +1872,8 @@ fn agent_reducer_live_turn_after_multi_turn_replay_finalizes(cx: &mut TestAppCon
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         let text = c.editor.document().full_text();
         assert!(
             text.contains("LIVE-PROSE"),
@@ -1939,8 +1939,8 @@ fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppCo
     // Drive `replay_turns` so the replay cursor lands on the live turn index, the
     // way the legacy replay path leaves it just before `ReplayEnd` (a replayed
     // user boundary seeds replay_turn = last_seen + 1 = 1).
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         c.replay_turns.replay_turn = 1; // pending replayed boundary for turn 1
         c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
     });
@@ -1962,8 +1962,8 @@ fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppCo
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         assert!(
             c.turn_phase.is_awaiting(),
             "ReplayEnd with a live turn in flight must keep the phase Awaiting"
@@ -2005,8 +2005,8 @@ fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppCo
         );
     });
 
-    view.update(vcx, |v, _cx| {
-        let c = v.agent_mut().unwrap();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
         let text = c.editor.document().full_text();
         assert!(
             text.contains("LIVE-MID-RESUME"),
@@ -2049,7 +2049,7 @@ fn install_agent_picker(
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
         })
         .collect();
-    view.update(vcx, |v, _cx| {
+    view.update(vcx, |v, cx| {
         let mut tile = AgentTile::new();
         let mut picker = SessionPicker::loading(PathBuf::from("."));
         if !sessions.is_empty() {
@@ -2079,7 +2079,7 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     // Loading state (sessions: None) renders without panic.
     install_agent_picker(&view, &mut *vcx, &[]);
     vcx.run_until_parked();
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         let tile = v.agent_tile().expect("agent tile");
         assert!(tile.bound.is_none(), "tile stays unbound until a row binds");
         let p = tile.picker.as_ref().expect("picker present");
@@ -2089,7 +2089,7 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
 
     // Fold in a list result through the real reducer, then render again. The
     // result is addressed to the originating tile by its WindowId (INV-PR).
-    let target = view.read_with(vcx, |v, _cx| v.workspace.focused_window_id());
+    let target = view.read_with(vcx, |v, cx| v.workspace.focused_window_id());
     view.update(vcx, |v, cx| {
         v.apply_picker_sessions(
             target,
@@ -2127,7 +2127,7 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
         );
     });
     vcx.run_until_parked();
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         let p = v.agent_tile().unwrap().picker.as_ref().unwrap();
         assert_eq!(
             p.row_count(),
@@ -2158,12 +2158,12 @@ fn picker_list_result_routes_to_originating_tile_not_focused(cx: &mut TestAppCon
     };
 
     // Tile A (focused) gets a loading picker; record its WindowId.
-    let win_a = view.update(vcx, |v, _cx| {
+    let win_a = view.update(vcx, |v, cx| {
         v.set_screen(App::Agent(mk_tile()));
         v.workspace.focused_window_id().expect("focused window A")
     });
     // Split off tile B with its own loading picker — focus moves to B.
-    let win_b = view.update(vcx, |v, _cx| {
+    let win_b = view.update(vcx, |v, cx| {
         v.workspace
             .split_focused(crate::workspace::SplitDir::H, App::Agent(mk_tile()));
         v.workspace.focused_window_id().expect("focused window B")
@@ -2204,7 +2204,7 @@ fn picker_list_result_routes_to_originating_tile_not_focused(cx: &mut TestAppCon
         }
         None
     };
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         assert_eq!(
             loaded(v, win_a),
             Some(true),
@@ -2232,7 +2232,7 @@ fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContex
     let (view, vcx) = cx.add_window_view(hermetic_browser_view);
     vcx.run_until_parked();
 
-    let (win_a, win_b) = view.update(vcx, |v, _cx| {
+    let (win_a, win_b) = view.update(vcx, |v, cx| {
         v.set_screen(App::Agent(AgentTile::new()));
         let mk = |label: &str| AgentSession {
             state: AgentState::new_server_managed(None),
@@ -2241,13 +2241,13 @@ fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContex
             resume_id: None,
         };
         // Tile A → bound to sid "A". Capture A's WindowId.
-        let id_a = v.show_local_session(mk("claude-A"));
+        let id_a = v.show_local_session(mk("claude-A"), cx);
         v.sessions.bind_sid(id_a, "A".into()).unwrap();
         let win_a = v.workspace.focused_window_id().expect("focused A");
         // Split → tile B, focus it, bind sid "B". B now holds focus.
         v.workspace
             .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
-        let id_b = v.show_local_session(mk("claude-B"));
+        let id_b = v.show_local_session(mk("claude-B"), cx);
         v.sessions.bind_sid(id_b, "B".into()).unwrap();
         let win_b = v.workspace.focused_window_id().expect("focused B");
         (win_a, win_b)
@@ -2257,7 +2257,7 @@ fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContex
     // The capture query (what the close path feeds to `spawn_list_sessions…`)
     // must resolve to A by BINDING, even though B holds focus. This is the
     // exact value a revert to `focused_window_id()` would get wrong.
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         let sid_a = v.sessions.locate("A").expect("sid A in store");
         assert_eq!(
             v.agent_tile_id_bound_to(sid_a),
@@ -2282,7 +2282,7 @@ fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContex
         }
         None
     };
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         assert_eq!(
             tile_state(v, win_a),
             Some((false, true)),
@@ -2317,29 +2317,32 @@ fn next_agent_label_is_unique_and_fills_gaps(cx: &mut TestAppContext) {
                vcx: &mut gpui::VisualTestContext,
                label: &str| {
         let label = label.to_string();
-        view.update(vcx, |v, _cx| {
-            v.show_local_session(AgentSession {
-                state: AgentState::new_server_managed(None),
-                label,
-                cwd: PathBuf::from("."),
-                resume_id: None,
-            });
+        view.update(vcx, |v, cx| {
+            v.show_local_session(
+                AgentSession {
+                    state: AgentState::new_server_managed(None),
+                    label,
+                    cwd: PathBuf::from("."),
+                    resume_id: None,
+                },
+                cx,
+            );
         });
     };
 
     // Empty store → claude-1.
-    view.read_with(vcx, |v, _cx| {
-        assert_eq!(v.next_agent_label(), "claude-1");
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(v.next_agent_label(cx), "claude-1");
     });
     // With claude-1 present → claude-2 (NOT another claude-1).
     add(&view, &mut *vcx, "claude-1");
-    view.read_with(vcx, |v, _cx| {
-        assert_eq!(v.next_agent_label(), "claude-2");
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(v.next_agent_label(cx), "claude-2");
     });
     // Leave a gap (claude-1, claude-3) → the next label fills the hole.
     add(&view, &mut *vcx, "claude-3");
-    view.read_with(vcx, |v, _cx| {
-        assert_eq!(v.next_agent_label(), "claude-2");
+    view.read_with(vcx, |v, cx| {
+        assert_eq!(v.next_agent_label(cx), "claude-2");
     });
 }
 
@@ -2360,7 +2363,7 @@ fn session_picker_navigation_wraps(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let selected = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-        view.read_with(vcx, |v, _cx| {
+        view.read_with(vcx, |v, cx| {
             v.agent_tile().unwrap().picker.as_ref().unwrap().selected
         })
     };
@@ -2399,7 +2402,7 @@ fn session_picker_activation_binds_slot(cx: &mut TestAppContext) {
     // Park the executor: with the server off, the attach round-trip is a no-op,
     // so the bind must SURVIVE (regression guard for the orphaned-tile bug).
     vcx.run_until_parked();
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         let tile = v.agent_tile().expect("agent tile");
         assert!(
             tile.bound.is_some(),
@@ -2432,7 +2435,7 @@ fn two_sessions_route_to_exactly_one_tile(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     // Two agent tiles (a split), each bound to its own sid.
-    let (id_a, id_b) = view.update(vcx, |v, _cx| {
+    let (id_a, id_b) = view.update(vcx, |v, cx| {
         v.set_screen(App::Agent(AgentTile::new()));
         let mk = |label: &str| AgentSession {
             state: AgentState::new_server_managed(None),
@@ -2441,12 +2444,12 @@ fn two_sessions_route_to_exactly_one_tile(cx: &mut TestAppContext) {
             resume_id: None,
         };
         // First tile → sid A.
-        let id_a = v.show_local_session(mk("claude-A"));
+        let id_a = v.show_local_session(mk("claude-A"), cx);
         v.sessions.bind_sid(id_a, "A".into()).unwrap();
         // Split off a second agent tile, focus it, bind → sid B.
         v.workspace
             .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
-        let id_b = v.show_local_session(mk("claude-B"));
+        let id_b = v.show_local_session(mk("claude-B"), cx);
         v.sessions.bind_sid(id_b, "B".into()).unwrap();
         (id_a, id_b)
     });
@@ -2463,11 +2466,12 @@ fn two_sessions_route_to_exactly_one_tile(cx: &mut TestAppContext) {
         );
     });
 
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         let text_a = v
             .sessions
             .get(id_a)
             .unwrap()
+            .read(cx)
             .state
             .editor
             .document()
@@ -2476,6 +2480,7 @@ fn two_sessions_route_to_exactly_one_tile(cx: &mut TestAppContext) {
             .sessions
             .get(id_b)
             .unwrap()
+            .read(cx)
             .state
             .editor
             .document()
@@ -2502,14 +2507,17 @@ fn duplicate_resolution_closes_orphan_and_focuses_owner(cx: &mut TestAppContext)
     vcx.run_until_parked();
 
     // Owner: a tile already bound to sid "S".
-    let owner_id = view.update(vcx, |v, _cx| {
+    let owner_id = view.update(vcx, |v, cx| {
         v.set_screen(App::Agent(AgentTile::new()));
-        let id = v.show_local_session(AgentSession {
-            state: AgentState::new_server_managed(None),
-            label: "owner".into(),
-            cwd: PathBuf::from("."),
-            resume_id: None,
-        });
+        let id = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(None),
+                label: "owner".into(),
+                cwd: PathBuf::from("."),
+                resume_id: None,
+            },
+            cx,
+        );
         v.sessions.bind_sid(id, "S".into()).unwrap();
         id
     });
@@ -2521,12 +2529,15 @@ fn duplicate_resolution_closes_orphan_and_focuses_owner(cx: &mut TestAppContext)
         v.workspace
             .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
         let token = crate::alloc_open_token();
-        let orphan = v.show_local_session(AgentSession {
-            state: AgentState::new_server_managed(Some("attaching…".into())),
-            label: "orphan".into(),
-            cwd: PathBuf::from("."),
-            resume_id: None,
-        });
+        let orphan = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(Some("attaching…".into())),
+                label: "orphan".into(),
+                cwd: PathBuf::from("."),
+                resume_id: None,
+            },
+            cx,
+        );
         if let Some(tile) = v.agent_tile_mut() {
             tile.pending_open_token = Some(token);
         }
@@ -2544,7 +2555,7 @@ fn duplicate_resolution_closes_orphan_and_focuses_owner(cx: &mut TestAppContext)
         let _ = orphan;
     });
 
-    view.read_with(vcx, |v, _cx| {
+    view.read_with(vcx, |v, cx| {
         assert_eq!(
             v.sessions.len(),
             1,

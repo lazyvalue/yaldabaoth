@@ -236,7 +236,7 @@ pub(crate) fn build_tool_block_with_weak(
             move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut GpuiApp| {
                 let id = id_for_click.clone();
                 let _ = weak_view.update(app, |this, cx| {
-                    if let Some(c) = this.agent_mut() {
+                    if let Some(mut c) = this.agent_mut(cx) {
                         c.tools.toggle_expanded(&id);
                     }
                     cx.notify();
@@ -2807,7 +2807,16 @@ impl std::ops::DerefMut for AgentSession {
 
 /// THE owner of agent-session state (spec-agent-session-ownership.md). Strict
 /// 1:1 session↔sid enforced by [`SessionStore`].
-pub(crate) type AgentSessions = SessionStore<AgentSession>;
+///
+/// The payload is an `Entity<AgentSession>` (not a bare `AgentSession`): per-
+/// session state lives in a GPUI entity so the framework's invalidation
+/// (notify-at-mutation-site + observation) has per-session granularity. The
+/// store's 1:1 sid invariant is untouched — `SessionStore<P>` is payload-
+/// generic, so this is purely a payload-type swap. Mutate via
+/// `entity.update(cx, |s, cx| { …; cx.notify() })`, read via `entity.read(cx)`;
+/// the `with_session` / `read_session` shims on `YaldaGpuiView` keep the call
+/// sites terse.
+pub(crate) type AgentSessions = SessionStore<Entity<AgentSession>>;
 
 /// One existing server session offered in the in-tile [`SessionPicker`].
 /// Built from a [`SessionInfo`] returned by `list_sessions`; carries

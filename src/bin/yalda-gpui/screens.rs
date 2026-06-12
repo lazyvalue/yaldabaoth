@@ -788,31 +788,41 @@ impl YaldaGpuiView {
         let Some(id) = tile.bound else {
             return self.render_agent_picker(root, tile, cx);
         };
-        // The session lives in the store (disjoint from the layout tree the
-        // caller borrows `tile` from), so `&mut self.sessions` is safe here.
-        let Some(session) = self.sessions.get_mut(id) else {
+        // The bound session is a GPUI entity (spec-agent-session-ownership.md /
+        // ticket 025). Clone the (cheap) handle so the store borrow ends, then
+        // build the transcript body inside the entity's `update`, where the
+        // render body gets a SAFE `&mut AgentState` for the whole pass — no raw
+        // pointer, no `unsafe`. The body reads `self.theme`/fonts/render helpers
+        // (immutable `&self` borrows, disjoint from `cx`) directly through the
+        // outer `self`; values that need the outer `Context<Self>` (the weak
+        // handle for click listeners) are precomputed BEFORE the update, since
+        // the update borrows `cx`.
+        let Some(session_ent) = self.session_entity(id) else {
             return self.render_agent_picker(root, tile, cx);
         };
-        let active_slot_label = session.label.clone();
-        let active_slot_cwd = session.cwd.clone();
-        // The render body reads `self.theme`/fonts/`self`-methods AND mutates
-        // the bound session's `AgentState`. Both live behind `&mut self`, but the
-        // session payload (in `self.sessions`) is field-disjoint from everything
-        // else the body reads, so a raw pointer threads `&mut AgentState` through
-        // — the same disjoint-borrow idiom the chrome render path uses for the
-        // layout tree.
-        //
-        // SAFETY (provably sound): (1) `state_ptr` aliases ONLY the
-        // `self.sessions` entry for `id`; the render body never re-borrows
-        // `self.sessions` (it touches `self.theme`/fonts/render helpers, all
-        // distinct fields), so no `&`/`&mut` to the same payload is ever live
-        // alongside `c`. (2) The store is not structurally mutated during render
-        // (no insert/close/rebind), so the entry — and thus the pointer — stays
-        // valid for the whole call. (3) `c` never escapes this function. The
-        // borrow checker can't see field-disjointness through `get_mut`, hence
-        // the raw pointer.
-        let state_ptr: *mut AgentState = &mut session.state as *mut _;
-        let c: &mut AgentState = unsafe { &mut *state_ptr };
+        let (active_slot_label, active_slot_cwd) = {
+            let s = session_ent.read(cx);
+            (s.label.clone(), s.cwd.clone())
+        };
+        // Weak handle to THIS view, captured by the click listeners inside the
+        // transcript body (they re-enter via `weak.update(app, …)` at click
+        // time). Computed before the entity `update` borrows `cx`.
+        let weak_self = cx.entity().downgrade();
+
+        // Build the transcript body + status strips inside the session entity's
+        // update — `c` is a real `&mut AgentState`, valid for the whole closure.
+        let (
+            header,
+            info_bar,
+            content_area,
+            t_render0,
+            perf_extract_ms,
+            perf_hl_ms,
+            perf_lines,
+            perf_recomputed,
+            perf_skip,
+        ) = session_ent.update(cx, |session_payload, _scx| {
+            let c: &mut AgentState = &mut session_payload.state;
 
         let cursor = c.editor.cursor();
         let cursor_line = cursor.line;
@@ -1025,7 +1035,8 @@ impl YaldaGpuiView {
         let frozen_fg_u32 = ncolor_to_u32(self.theme.agent.frozen_fg, DEFAULT_FG);
         let turn_started_snap = c.turn_phase.turn_started();
         let last_event_at_snap = c.turn_phase.last_event_at();
-        let weak_self = cx.entity().downgrade();
+        // `weak_self` is captured from the enclosing scope (computed before this
+        // entity `update`, where `cx` is no longer reachable).
 
         // Helper closures for frozen-line lookup and "block starts
         // here" gating (used to gate the T-label). Inlined inside the
@@ -1036,6 +1047,9 @@ impl YaldaGpuiView {
 
         let render_fn = {
             let flat_items = flat_items_arc.clone();
+            // Clone for the per-item closure so the outer `weak_self` survives
+            // for the status-strip / sidebar click listeners built below.
+            let weak_self = weak_self.clone();
             move |idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
                 let item = &flat_items[idx];
                 match item {
@@ -1299,7 +1313,7 @@ impl YaldaGpuiView {
                                       app: &mut GpuiApp| {
                                     let id = click_id.clone();
                                     let _ = weak.update(app, |this, cx| {
-                                        if let Some(c) = this.agent_mut() {
+                                        if let Some(mut c) = this.agent_mut(cx) {
                                             c.tools.toggle_expanded(&id);
                                         }
                                         cx.notify();
@@ -1777,7 +1791,7 @@ impl YaldaGpuiView {
             } else {
                 "■ Stop ⌘."
             };
-            let weak_stop = cx.entity().downgrade();
+            let weak_stop = weak_self.clone();
             header_right = header_right.child(
                 div()
                     .id("agent-stop-btn")
@@ -2233,7 +2247,7 @@ impl YaldaGpuiView {
                     } else {
                         rgba(0x00000000).into()
                     };
-                    let weak = cx.entity().downgrade();
+                    let weak = weak_self.clone();
                     let row_key = sa.tool_call_id.clone();
                     let row = div()
                         .id(SharedString::from(format!("subagent-row-{}", i)))
@@ -2286,6 +2300,19 @@ impl YaldaGpuiView {
             col = col.child(panel);
         }
         let content_area: gpui::AnyElement = col.into_any_element();
+
+            (
+                header,
+                info_bar,
+                content_area,
+                t_render0,
+                perf_extract_ms,
+                perf_hl_ms,
+                perf_lines,
+                perf_recomputed,
+                perf_skip,
+            )
+        });
 
         let root = root
             .key_context("AgentView")
