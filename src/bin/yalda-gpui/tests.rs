@@ -106,7 +106,6 @@ fn persist_cwd_key_canonicalizes_symlinks() {
 fn preferences_round_trip_with_text_scale() {
     let prefs = Preferences {
         theme: Some("dracula".into()),
-        agent_status_position: Some("top".into()),
         text_scale: Some(1.21),
         desktop_grid_cols: Some(100),
         desktop_grid_rows: Some(30),
@@ -114,7 +113,6 @@ fn preferences_round_trip_with_text_scale() {
     let json = serde_json::to_string(&prefs).unwrap();
     let back: Preferences = serde_json::from_str(&json).unwrap();
     assert_eq!(back.theme.as_deref(), Some("dracula"));
-    assert_eq!(back.agent_status_position.as_deref(), Some("top"));
     assert_eq!(back.text_scale, Some(1.21));
     assert_eq!(back.desktop_grid_cols, Some(100));
     assert_eq!(back.desktop_grid_rows, Some(30));
@@ -1325,6 +1323,7 @@ fn gpui_menu_has_required_entries() {
         "workspace-set-cwd",
         "new-agent-tile",
         "new-buffer-tile",
+        "new-linear-tile",
         "theme-nightfox",
         "theme-folio",
         "dev-restart-gui",
@@ -1504,6 +1503,7 @@ fn menu_root_submenus_resolve() {
     for (ch, follow, expected) in &[
         ('n', 'a', "new-agent-tile"),
         ('n', 'b', "new-buffer-tile"),
+        ('n', 'l', "new-linear-tile"),
         ('t', 'n', "theme-nightfox"),
         ('t', 'f', "theme-folio"),
     ] {

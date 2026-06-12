@@ -1357,6 +1357,7 @@ fn gpui_menu() -> Vec<MenuNode> {
             vec![
                 MenuNode::entry("a", "agent", "new-agent-tile"),
                 MenuNode::entry("b", "buffer", "new-buffer-tile"),
+                MenuNode::entry("l", "linear", "new-linear-tile"),
             ],
         ),
         MenuNode::submenu(
@@ -1514,8 +1515,6 @@ struct YaldaGpuiView {
     /// restarts). Activated by `YALDA_SESSION_SERVER=1`. When `None`, the
     /// GUI spawns `AcpChannelClient` directly (legacy path).
     session_server: Option<SessionServerClient>,
-    /// Where the agent info bar renders: above or below the transcript.
-    agent_status_position: AgentStatusPosition,
     /// Splash screen shown at startup. `Some(deadline)` while visible;
     /// `None` after dismissal (auto-timeout or keypress).
     splash_until: Option<std::time::Instant>,
@@ -1593,7 +1592,6 @@ impl YaldaGpuiView {
             doc_selection: None,
             line_layouts: Rc::new(RefCell::new(HashMap::new())),
             session_server: connect_session_server(),
-            agent_status_position: AgentStatusPosition::default(),
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
             syntect_hl,
             _server_pump: None,
@@ -1625,7 +1623,6 @@ impl YaldaGpuiView {
             doc_selection: None,
             line_layouts: Rc::new(RefCell::new(HashMap::new())),
             session_server: connect_session_server(),
-            agent_status_position: AgentStatusPosition::default(),
             splash_until: Some(std::time::Instant::now() + Duration::from_millis(1500)),
             syntect_hl,
             _server_pump: None,
@@ -2611,7 +2608,6 @@ impl YaldaGpuiView {
     fn save_settings(&self) {
         save_preferences(&Preferences {
             theme: Some(self.theme.name.as_kebab().to_string()),
-            agent_status_position: Some(self.agent_status_position.as_str().to_string()),
             text_scale: Some(self.text_scale),
             desktop_grid_cols: Some(self.desktop_grid_cols),
             desktop_grid_rows: Some(self.desktop_grid_rows),
@@ -3979,11 +3975,6 @@ impl YaldaGpuiView {
             "theme-financial-times-dark" => self.set_theme(ThemeName::FinancialTimesDark, cx),
             "theme-folio" => self.set_theme(ThemeName::Folio, cx),
             "theme-toggle" => self.toggle_theme_now(cx),
-            "claude-status-bar" => {
-                self.agent_status_position = self.agent_status_position.toggle();
-                self.save_settings();
-                cx.notify();
-            }
             // Window splits + focus + sizing — same logic the keyboard
             // handlers run, so behavior is identical via either path.
             "split-h" => {
@@ -4225,6 +4216,24 @@ impl YaldaGpuiView {
                 {
                     self.workspace.retile_active();
                     self.open_agent_inner(cx);
+                    self.save_workspace_state();
+                    cx.notify();
+                }
+            }
+            "new-linear-tile" => {
+                // Split a new tile (focus lands on it), then swap it for a
+                // Linear viewport via `open_linear_inner` — mirrors new-agent-tile.
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                if self
+                    .workspace
+                    .split_focused(
+                        workspace::SplitDir::V,
+                        App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
+                    )
+                    .is_some()
+                {
+                    self.workspace.retile_active();
+                    self.open_linear_inner(cx);
                     self.save_workspace_state();
                     cx.notify();
                 }
@@ -7012,10 +7021,6 @@ fn main() {
                             if !names.iter().any(|n| n == "SF Mono") {
                                 view.code_font = SharedString::new_static("Menlo");
                             }
-                        }
-                        // Agent info bar placement from preferences.
-                        if let Some(pos) = prefs.agent_status_position.as_deref() {
-                            view.agent_status_position = AgentStatusPosition::parse(pos);
                         }
                         // Restore the saved text zoom (clamped so a hand-edited
                         // preferences file can't push the body off-screen).

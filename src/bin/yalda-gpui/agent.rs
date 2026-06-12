@@ -1156,14 +1156,53 @@ pub(crate) fn build_chatbox_line(
     }
 
     if !is_cursor_line {
-        // ONE selection-aware text element for the whole line, NOT one flex
-        // child per token. The token-per-flex-child tree (with `flex_wrap`) was
-        // the per-keystroke Taffy layout cost the profiler flagged — every
-        // compose line re-laid-out a wide flex tree on each character. Non-cursor
-        // lines don't need wrapping (you're not typing there); they clip like
-        // the transcript. The CURSOR line below keeps `flex_wrap` so the caret
-        // stays visible when you type past the box width.
-        return emit_chunk(row, full_text.to_string(), 0).into_any_element();
+        // ONE `StyledText` element for the whole line — NOT one flex child per
+        // token. GPUI's text shaper word-wraps a StyledText to the box width
+        // natively (the same primitive the transcript uses), so a long line
+        // wraps instead of clipping, and the selection highlight rides along as
+        // a run `background_color`. This is cheaper than the token-per-flex-
+        // child tree the profiler once flagged AND fixes the "doesn't wrap
+        // unless the cursor is on it" bug. The CURSOR line below keeps the
+        // token `flex_wrap` path so the caret can be injected mid-line.
+        let base_font = font_for(NStyle::default(), code_font);
+        let mut runs: Vec<TextRun> = Vec::new();
+        let mut push_run = |len_bytes: usize, bg: Option<Hsla>| {
+            if len_bytes == 0 {
+                return;
+            }
+            runs.push(TextRun {
+                len: len_bytes,
+                font: base_font.clone(),
+                color: fg,
+                background_color: bg,
+                underline: None,
+                strikethrough: None,
+            });
+        };
+        // Empty lines are handled by the `tokens.is_empty()` early return
+        // above, so `full_text` is non-empty here.
+        let text: String = full_text.to_string();
+        if let Some((ss, se)) = line_sel {
+            // Map char-offset selection bounds to byte offsets for TextRun lens.
+            let byte_at = |col: usize| -> usize {
+                chars.iter().take(col).map(|c| c.len_utf8()).sum()
+            };
+            let pre = byte_at(ss);
+            let sel = byte_at(se) - pre;
+            let post = text.len() - pre - sel;
+            push_run(pre, None);
+            push_run(sel, Some(sel_bg));
+            push_run(post, None);
+        } else {
+            push_run(text.len(), None);
+        }
+        let line = div()
+            .w_full()
+            .min_w_0()
+            .min_h(line_h)
+            .line_height(line_h)
+            .child(StyledText::new(text).with_runs(runs));
+        return line.into_any_element();
     }
 
     // Cursor line: keep word-wrap (so the caret can't scroll off the right

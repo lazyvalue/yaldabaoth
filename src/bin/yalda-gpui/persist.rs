@@ -309,37 +309,6 @@ pub(crate) fn with_preferences_path<R>(path: PathBuf, f: impl FnOnce() -> R) -> 
     r
 }
 
-/// Where the agent info bar sits relative to the transcript.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum AgentStatusPosition {
-    Top,
-    #[default]
-    Bottom,
-}
-
-impl AgentStatusPosition {
-    pub(crate) fn toggle(self) -> Self {
-        match self {
-            Self::Top => Self::Bottom,
-            Self::Bottom => Self::Top,
-        }
-    }
-
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Top => "top",
-            Self::Bottom => "bottom",
-        }
-    }
-
-    pub(crate) fn parse(s: &str) -> Self {
-        match s {
-            "top" => Self::Top,
-            _ => Self::Bottom,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Preferences {
     /// Kebab-case theme identifier — `ThemeName::as_kebab()` /
@@ -347,9 +316,6 @@ pub(crate) struct Preferences {
     /// the value from config.kdl (or the built-in default)."
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) theme: Option<String>,
-    /// Agent info bar placement: "top" or "bottom".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) agent_status_position: Option<String>,
     /// Document text-zoom factor (`Cmd-=`/`Cmd--`/`Cmd-0`). `None` means "no
     /// saved zoom; start at 1.0." Clamped to `[MIN_TEXT_SCALE, MAX_TEXT_SCALE]`
     /// on load so a hand-edited file can't push the body off-screen.

@@ -827,7 +827,7 @@ impl YaldaGpuiView {
         // entity's update — `c` is a real `&mut AgentState` for the chrome that
         // STAYS inline (tickets 022/023). The transcript body (built above) is
         // moved in and slotted into the content layout.
-        let (header, info_bar, content_area) =
+        let (header, content_area) =
             session_ent.update(cx, |session_payload, _scx| {
                 let c: &mut AgentState = &mut session_payload.state;
 
@@ -846,7 +846,6 @@ impl YaldaGpuiView {
         // vanished into the near-white panel.
         let compose_fg: Hsla = self.editor_fg();
         let top = self.theme.top_bar;
-        let bot = self.theme.bottom_bar;
 
         // ---- Status Strip (spec §30) ----
         // Single-row header showing agent label, sub-agent breadcrumb
@@ -1064,6 +1063,46 @@ impl YaldaGpuiView {
             }
         }
 
+        // Active sub-agents — the one readout that used to live only in the
+        // (now-removed) bottom info bar. Compact glyph+label list of any
+        // in-progress / pending subagents; omitted entirely when none.
+        {
+            use yalda::acp_channel::ToolCallStatus;
+            let active: Vec<String> = c
+                .subagents()
+                .iter()
+                .filter(|sa| {
+                    matches!(
+                        sa.status,
+                        ToolCallStatus::InProgress | ToolCallStatus::Pending
+                    )
+                })
+                .map(|sa| {
+                    let glyph = match sa.status {
+                        ToolCallStatus::InProgress => "\u{25d0}",
+                        ToolCallStatus::Pending => "\u{25cb}",
+                        _ => "\u{00b7}",
+                    };
+                    let label: String = if sa.label.chars().count() > 16 {
+                        let head: String = sa.label.chars().take(15).collect();
+                        format!("{}\u{2026}", head)
+                    } else {
+                        sa.label.clone()
+                    };
+                    format!("{}{}", glyph, label)
+                })
+                .collect();
+            if !active.is_empty() {
+                strip = strip.child(
+                    div()
+                        .pr_2()
+                        .text_color(strip_warm)
+                        .font_weight(FontWeight::NORMAL)
+                        .child(SharedString::from(active.join("  "))),
+                );
+            }
+        }
+
         // Turn / elapsed. Show "turn N · M:SS" when a turn has run; "turn
         // N" alone if no timer is active; nothing if no turns have run.
         let completed_turns = c.channel.as_ref().map(|ch| ch.turn_count()).unwrap_or(0);
@@ -1140,159 +1179,6 @@ impl YaldaGpuiView {
         }
 
         let header = strip;
-
-        // ---- Agent Info Bar ----
-        // Dedicated status bar showing context-window size, cwd, and active
-        // subagents. Position (top/bottom) is a user preference.
-        let info_bar = {
-            use yalda::acp_channel::ToolCallStatus;
-
-            // Context window segment: numeric reading + fill fraction for the
-            // progress bar. `None` fraction → no data yet (bar omitted, em dash).
-            let (ctx_text, ctx_frac): (String, Option<f32>) = if let Some(usage) = &c.usage {
-                let used_k = (usage.tokens_used as f64) / 1000.0;
-                let total_k = (usage.tokens_total as f64) / 1000.0;
-                let frac = if usage.tokens_total > 0 {
-                    (usage.tokens_used as f64 / usage.tokens_total as f64).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                (
-                    format!("{:.1}k / {:.0}k ({:.0}%)", used_k, total_k, frac * 100.0),
-                    Some(frac as f32),
-                )
-            } else {
-                ("\u{2014}".to_string(), None)
-            };
-
-            // Cwd segment — always shown.
-            let cwd_text = shorten_cwd_for_display(&active_slot_cwd);
-
-            // Subagents segment — show in-progress agents with glyphs.
-            let agents_text: String = {
-                let active: Vec<String> = c
-                    .subagents()
-                    .iter()
-                    .filter(|sa| {
-                        matches!(
-                            sa.status,
-                            ToolCallStatus::InProgress | ToolCallStatus::Pending
-                        )
-                    })
-                    .map(|sa| {
-                        let glyph = match sa.status {
-                            ToolCallStatus::InProgress => "\u{25d0}",
-                            ToolCallStatus::Pending => "\u{25cb}",
-                            _ => "\u{00b7}",
-                        };
-                        let label: String = if sa.label.chars().count() > 16 {
-                            let head: String = sa.label.chars().take(15).collect();
-                            format!("{}\u{2026}", head)
-                        } else {
-                            sa.label.clone()
-                        };
-                        format!("{}{}", glyph, label)
-                    })
-                    .collect();
-                if active.is_empty() {
-                    "\u{2014}".to_string()
-                } else {
-                    active.join("  ")
-                }
-            };
-
-            let sep_color: Hsla = nc(at.turn_rule);
-
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_4()
-                .py_1()
-                .h(px(22.0))
-                .bg(bg_or(bot, STATUS_BG))
-                .text_color(fg_or(bot, 0x666666))
-                .text_size(px(11.0))
-                .font_family(self.code_font.clone())
-                .child({
-                    // Context-window fullness: a label, a proportional bar that
-                    // shifts to the warm accent as the window nears full, and
-                    // the numeric reading beside it (untitled.md Agent UX:
-                    // "Context Window full progress bar + tokens used").
-                    let mut seg = div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_color(strip_dim)
-                                .child(SharedString::new_static("ctx")),
-                        );
-                    if let Some(frac) = ctx_frac {
-                        const IB_BAR_W: f32 = 60.0;
-                        let fill_w = (IB_BAR_W * frac).max(if frac > 0.0 { 2.0 } else { 0.0 });
-                        let fill_color = if frac >= 0.85 { strip_warm } else { nc(at.user_bar) };
-                        let track_bg = {
-                            let mut h = strip_dim;
-                            h.a = 0.22;
-                            h
-                        };
-                        seg = seg.child(
-                            div()
-                                .w(px(IB_BAR_W))
-                                .h(px(5.0))
-                                .rounded_full()
-                                .bg(track_bg)
-                                .child(
-                                    div()
-                                        .w(px(fill_w))
-                                        .h_full()
-                                        .rounded_full()
-                                        .bg(fill_color),
-                                ),
-                        );
-                    }
-                    seg.child(SharedString::from(ctx_text))
-                })
-                .child(
-                    div()
-                        .text_color(sep_color)
-                        .child(SharedString::new_static("\u{00b7}")),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_color(strip_dim)
-                                .child(SharedString::new_static("cwd")),
-                        )
-                        .child(SharedString::from(cwd_text)),
-                )
-                .child(
-                    div()
-                        .text_color(sep_color)
-                        .child(SharedString::new_static("\u{00b7}")),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_color(strip_dim)
-                                .child(SharedString::new_static("agents")),
-                        )
-                        .child(SharedString::from(agents_text)),
-                )
-        };
 
         // Status (mode, cursor, awaiting) and the Stop button now live in the
         // header strip at the top; keyboard hints were removed. No footer.
@@ -1655,7 +1541,7 @@ impl YaldaGpuiView {
         }
         let content_area: gpui::AnyElement = col.into_any_element();
 
-            (header, info_bar, content_area)
+            (header, content_area)
         });
 
         let root = root
@@ -1712,14 +1598,9 @@ impl YaldaGpuiView {
         // costs it measured now live there, behind the cached render-skip, and
         // the `YALDA_PERF` render-count + notify-reason counters are the
         // instrumentation this refactor verifies against.
-        match self.agent_status_position {
-            AgentStatusPosition::Top => {
-                root.child(header).child(info_bar).child(content_area)
-            }
-            AgentStatusPosition::Bottom => {
-                root.child(header).child(content_area).child(info_bar)
-            }
-        }
+        // Single top header strip over the content; the old bottom info bar
+        // (which duplicated the ctx-window readout) was removed.
+        root.child(header).child(content_area)
     }
 
     /// Render a Linear tile (`App::Linear`): a top input line (type an issue
@@ -1837,64 +1718,51 @@ impl YaldaGpuiView {
         tile: &AgentTile,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let at = &self.theme.agent;
-        let bg: Hsla = self.editor_bg();
-        let fg: Hsla = self.editor_fg();
-        let dim: Hsla = nc(at.dim);
-        let accent: Hsla = nc(at.user_bar);
-        let sel_bg: Hsla = tint_bg(bg, 0.55, 0.14, 0.07);
-        let card_bg: Hsla = tint_bg(bg, 0.55, 0.05, 0.02);
-
+        // Styled to match the file browser (`render_browser`): a compact
+        // header rule, a single full-width row list, and a hint footer —
+        // not the old two-column card layout.
+        let ov = &self.theme.overlay;
         let selected = tile.picker.as_ref().map(|p| p.selected).unwrap_or(0);
 
         let header = div()
             .flex()
             .flex_row()
             .items_center()
-            .w_full()
-            .px_5()
-            .h(px(40.0))
-            .text_color(accent)
+            .px_4()
+            .py_1()
+            .h(px(28.0))
+            .bg(nc(ov.bg))
+            .text_color(nc(ov.accent))
             .font_weight(FontWeight::BOLD)
-            .text_size(px(15.0))
-            .child(SharedString::new_static("Claude — choose a session"));
+            .child(SharedString::new_static("▸ choose a session"));
 
-        // "Start a new session" is always the first row.
-        let mut rows = div()
+        let mut list = div()
             .flex()
             .flex_col()
-            .gap_1()
-            .w(px(560.0))
-            .child(
-                div()
-                    .px_1()
-                    .pb_1()
-                    .text_size(px(12.0))
-                    .text_color(dim)
-                    .font_weight(FontWeight::BOLD)
-                    .child(SharedString::new_static("AVAILABLE")),
-            );
-        rows = rows.child(self.picker_row(
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .text_size(px(13.0))
+            .font_family(self.body_font.clone());
+
+        // Row 0 is always "start a new session".
+        list = list.child(self.picker_row(
             0,
             selected == 0,
-            SharedString::new_static("＋  Start a new session"),
+            SharedString::new_static("＋ Start a new session"),
             None,
-            sel_bg,
-            card_bg,
-            fg,
-            dim,
-            accent,
+            ov,
             cx,
         ));
 
         match tile.picker.as_ref().and_then(|p| p.sessions.as_ref()) {
             None => {
-                rows = rows.child(
+                list = list.child(
                     div()
-                        .px_4()
-                        .py_2()
-                        .text_color(dim)
-                        .child(SharedString::new_static("loading sessions…")),
+                        .px_2()
+                        .py_0p5()
+                        .text_color(nc(ov.label))
+                        .child(SharedString::new_static("  loading sessions…")),
                 );
             }
             Some(sessions) if sessions.is_empty() => {
@@ -1903,9 +1771,9 @@ impl YaldaGpuiView {
                     .as_ref()
                     .and_then(|p| p.error.clone())
                     .unwrap_or_else(|| {
-                        SharedString::new_static("No existing sessions for this folder.")
+                        SharedString::new_static("  No existing sessions for this folder.")
                     });
-                rows = rows.child(div().px_4().py_2().text_color(dim).child(msg));
+                list = list.child(div().px_2().py_0p5().text_color(nc(ov.label)).child(msg));
             }
             Some(sessions) => {
                 for (i, s) in sessions.iter().enumerate() {
@@ -1917,92 +1785,81 @@ impl YaldaGpuiView {
                         if s.turns == 1 { "" } else { "s" },
                         liveness,
                     );
-                    rows = rows.child(self.picker_row(
+                    list = list.child(self.picker_row(
                         row,
                         selected == row,
                         SharedString::from(s.label.clone()),
                         Some(SharedString::from(sub)),
-                        sel_bg,
-                        card_bg,
-                        fg,
-                        dim,
-                        accent,
+                        ov,
                         cx,
                     ));
                 }
             }
         }
 
-        // Bound sessions: a read-only column, present only when some tile binds
-        // a cwd-matched session. They can't be attached from here (1:1 binding),
-        // so the rows are static — no highlight, no click handler.
-        let bound_col = {
-            let bound = tile.picker.as_ref().map(|p| p.bound.as_slice()).unwrap_or(&[]);
-            (!bound.is_empty()).then(|| {
-                let mut col = div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .w(px(320.0))
-                    .child(
-                        div()
-                            .px_1()
-                            .pb_1()
-                            .text_size(px(12.0))
-                            .text_color(dim)
-                            .font_weight(FontWeight::BOLD)
-                            .child(SharedString::new_static("IN USE (bound to a tile)")),
-                    );
-                for s in bound {
-                    let liveness = if s.connected { "live" } else { "idle" };
-                    let sub = format!(
-                        "{} turn{} · {}",
-                        s.turns,
-                        if s.turns == 1 { "" } else { "s" },
-                        liveness,
-                    );
-                    let mut text_col = div().flex().flex_col();
-                    text_col = text_col.child(div().text_color(dim).child(SharedString::from(s.label.clone())));
-                    text_col = text_col.child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(dim)
-                            .child(SharedString::from(sub)),
-                    );
-                    col = col.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .w_full()
-                            .px_4()
-                            .py_2()
-                            .bg(card_bg)
-                            .border_l(px(2.0))
-                            .border_color(card_bg)
-                            .child(text_col),
-                    );
-                }
-                col
-            })
-        };
-
-        let mut columns = div().flex().flex_row().gap_6().items_start().child(rows);
-        if let Some(bc) = bound_col {
-            columns = columns.child(bc);
+        // Bound sessions (bound to another tile): listed dim and non-
+        // interactive — they can't be attached from here (1:1 binding).
+        let bound = tile.picker.as_ref().map(|p| p.bound.as_slice()).unwrap_or(&[]);
+        if !bound.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .pt_2()
+                    .pb_0p5()
+                    .text_size(px(11.0))
+                    .text_color(nc(ov.label))
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::new_static("IN USE")),
+            );
+            for s in bound {
+                let liveness = if s.connected { "live" } else { "idle" };
+                let sub = format!(
+                    "{} turn{} · {}",
+                    s.turns,
+                    if s.turns == 1 { "" } else { "s" },
+                    liveness,
+                );
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .w_full()
+                        .px_2()
+                        .py_0p5()
+                        .bg(nc(ov.bg))
+                        .child(div().w(px(20.0)).flex_none())
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_color(nc(ov.label))
+                                .child(SharedString::from(s.label.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.0))
+                                .text_color(nc(ov.label))
+                                .child(SharedString::from(sub)),
+                        ),
+                );
+            }
         }
 
-        let footer = div()
+        let hint = div()
             .flex()
             .flex_row()
             .items_center()
-            .w_full()
-            .px_5()
-            .h(px(28.0))
-            .text_color(dim)
-            .text_size(px(12.0))
+            .px_4()
+            .py_1()
+            .h(px(22.0))
+            .bg(nc(ov.bg))
+            .text_color(nc(ov.label))
+            .text_size(px(11.0))
             .child(SharedString::new_static(
-                "↑/↓ or j/k to move · Enter to open · Ctrl-V to go back",
+                "↑/↓ or j/k:move · enter:open · ctrl-v:back",
             ));
 
         root.key_context("AgentPickerView")
@@ -2028,56 +1885,36 @@ impl YaldaGpuiView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(bg)
-            .text_color(fg)
+            .bg(nc(ov.bg))
+            .text_color(nc(ov.fg))
             .child(header)
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .child(columns),
-            )
-            .child(footer)
+            .child(list)
+            .child(hint)
     }
 
     /// One row in the session picker. `row` is the activation index handed to
-    /// `agent_picker_activate` on click; `is_sel` drives the highlight.
-    #[allow(clippy::too_many_arguments)]
+    /// `agent_picker_activate` on click; `is_sel` drives the highlight. Styled
+    /// like `browser_row`: a marker gutter, a flex name, and a right-aligned
+    /// dim meta column — full width, compact, no card/border.
     fn picker_row(
         &self,
         row: usize,
         is_sel: bool,
         title: SharedString,
         subtitle: Option<SharedString>,
-        sel_bg: Hsla,
-        card_bg: Hsla,
-        fg: Hsla,
-        dim: Hsla,
-        accent: Hsla,
+        ov: &OverlayTheme,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let mut text_col = div().flex().flex_col();
-        text_col = text_col.child(
-            div()
-                .text_color(if is_sel { accent } else { fg })
-                .child(title),
-        );
-        if let Some(sub) = subtitle {
-            text_col = text_col.child(div().text_size(px(12.0)).text_color(dim).child(sub));
-        }
-        div()
+        let row_bg = if is_sel { nc(ov.selected_bg) } else { nc(ov.bg) };
+        let name_color = if is_sel { nc(ov.accent) } else { nc(ov.fg) };
+        let mut r = div()
             .flex()
             .flex_row()
             .items_center()
             .w_full()
-            .px_4()
-            .py_2()
-            .bg(if is_sel { sel_bg } else { card_bg })
-            .border_l(px(2.0))
-            .border_color(if is_sel { accent } else { card_bg })
+            .px_2()
+            .py_0p5()
+            .bg(row_bg)
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
@@ -2085,7 +1922,31 @@ impl YaldaGpuiView {
                     this.agent_picker_activate(row, cx);
                 }),
             )
-            .child(text_col)
+            .child(
+                div()
+                    .w(px(20.0))
+                    .flex_none()
+                    .text_color(nc(ov.key))
+                    .child(SharedString::new_static(if is_sel { "▸ " } else { "  " })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_color(name_color)
+                    .child(title),
+            );
+        if let Some(sub) = subtitle {
+            r = r.child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.0))
+                    .text_color(nc(ov.label))
+                    .child(sub),
+            );
+        }
+        r
     }
 
     pub(crate) fn render_browser(
