@@ -1544,7 +1544,14 @@ async fn worker_async(
                         let snap = UsageSnapshot {
                             tokens_used: usage.used,
                             tokens_total: usage.size,
-                            cost_usd: usage.cost.as_ref().map(|c| c.amount_usd),
+                            // Upstream `Cost` (0.11) carries `amount` + an ISO
+                            // `currency` code (it dropped the old `amount_usd`).
+                            // `UsageSnapshot.cost_usd` is USD, so only surface
+                            // amounts already in USD; other currencies are
+                            // dropped rather than mislabeled.
+                            cost_usd: usage.cost.as_ref().and_then(|c| {
+                                c.currency.eq_ignore_ascii_case("usd").then_some(c.amount)
+                            }),
                         };
                         let _ = event_tx_for_handlers
                             .send(WorkerEvent::Reply(ReplyEvent::UsageUpdated(snap)));

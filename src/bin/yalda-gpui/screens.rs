@@ -1145,18 +1145,22 @@ impl YaldaGpuiView {
         let info_bar = {
             use yalda::acp_channel::ToolCallStatus;
 
-            // Context window segment.
-            let ctx_text: String = if let Some(usage) = &c.usage {
+            // Context window segment: numeric reading + fill fraction for the
+            // progress bar. `None` fraction → no data yet (bar omitted, em dash).
+            let (ctx_text, ctx_frac): (String, Option<f32>) = if let Some(usage) = &c.usage {
                 let used_k = (usage.tokens_used as f64) / 1000.0;
                 let total_k = (usage.tokens_total as f64) / 1000.0;
-                let pct = if usage.tokens_total > 0 {
-                    (usage.tokens_used as f64 / usage.tokens_total as f64) * 100.0
+                let frac = if usage.tokens_total > 0 {
+                    (usage.tokens_used as f64 / usage.tokens_total as f64).clamp(0.0, 1.0)
                 } else {
                     0.0
                 };
-                format!("{:.1}k / {:.0}k ({:.0}%)", used_k, total_k, pct)
+                (
+                    format!("{:.1}k / {:.0}k ({:.0}%)", used_k, total_k, frac * 100.0),
+                    Some(frac as f32),
+                )
             } else {
-                "\u{2014}".to_string()
+                ("\u{2014}".to_string(), None)
             };
 
             // Cwd segment — always shown.
@@ -1209,8 +1213,12 @@ impl YaldaGpuiView {
                 .text_color(fg_or(bot, 0x666666))
                 .text_size(px(11.0))
                 .font_family(self.code_font.clone())
-                .child(
-                    div()
+                .child({
+                    // Context-window fullness: a label, a proportional bar that
+                    // shifts to the warm accent as the window nears full, and
+                    // the numeric reading beside it (untitled.md Agent UX:
+                    // "Context Window full progress bar + tokens used").
+                    let mut seg = div()
                         .flex()
                         .flex_row()
                         .items_center()
@@ -1219,9 +1227,33 @@ impl YaldaGpuiView {
                             div()
                                 .text_color(strip_dim)
                                 .child(SharedString::new_static("ctx")),
-                        )
-                        .child(SharedString::from(ctx_text)),
-                )
+                        );
+                    if let Some(frac) = ctx_frac {
+                        const IB_BAR_W: f32 = 60.0;
+                        let fill_w = (IB_BAR_W * frac).max(if frac > 0.0 { 2.0 } else { 0.0 });
+                        let fill_color = if frac >= 0.85 { strip_warm } else { nc(at.user_bar) };
+                        let track_bg = {
+                            let mut h = strip_dim;
+                            h.a = 0.22;
+                            h
+                        };
+                        seg = seg.child(
+                            div()
+                                .w(px(IB_BAR_W))
+                                .h(px(5.0))
+                                .rounded_full()
+                                .bg(track_bg)
+                                .child(
+                                    div()
+                                        .w(px(fill_w))
+                                        .h_full()
+                                        .rounded_full()
+                                        .bg(fill_color),
+                                ),
+                        );
+                    }
+                    seg.child(SharedString::from(ctx_text))
+                })
                 .child(
                     div()
                         .text_color(sep_color)
