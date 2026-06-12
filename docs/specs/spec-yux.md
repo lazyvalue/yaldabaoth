@@ -1,8 +1,10 @@
-# Spec: GPUI Panel framework — make the wrong thing structurally impossible
+# Spec: yux (yalda-ux) — a GPUI component layer that makes the wrong thing structurally impossible
 
-Status: **draft** (begins the effort the owner asked for: a component layer
-wrapped around GPUI so a future session cannot re-introduce the responsiveness
-regressions). Supersedes the "free helpers" framing of `cached_panel.rs`.
+**yux** (yalda-ux) is yalda's own thin component layer over GPUI. Status:
+**draft** (begins the effort the owner asked for: components wrapped around GPUI
+so a future session cannot re-introduce the responsiveness regressions). Lands
+as the `yux` module (`yux.rs`, renamed from `cached_panel.rs`), superseding its
+"free helpers" framing.
 
 ## Problem
 
@@ -44,11 +46,15 @@ pub(crate) trait CachedView: 'static {
 /// The ONLY `impl Render` for a cached surface. Owns the model handle, the
 /// `cx.observe(&model)` subscription (registered in `new`), `last_fp`, the
 /// diff, `record_*`, and the `cached_child` embed.
-pub(crate) struct Panel<V: CachedView> { /* model, view-state V, last_fp, perf_label */ }
+pub(crate) struct Cached<V: CachedView> { /* model, view-state V, last_fp, perf_label */ }
 ```
 
-`render_agent`-style call sites shrink to: `cached_child(panel)` — the host
-does the rest.
+`render_agent`-style call sites shrink to: `cached_child(cached)` — the
+`Cached<V>` host does the rest. (`CachedView` = the trait the author implements;
+`Cached<V>` = the framework-owned host entity. The term "Panel" is deliberately
+avoided — it connotes a dockable UI region, GPUI/Zed's meaning, whereas this is
+a render-skip boundary that also wraps non-region surfaces like the status strip
+and thinking indicator.)
 
 ### What each guarantee is worth (honest)
 
@@ -92,9 +98,10 @@ onto it as the proof. Revisit (B) per-surface if coverage drift actually recurs.
 
 ## Migration (one surface at a time; each is a ticket)
 
-1. Build `CachedView` + `Panel<V>` + `BuildCx` + `#[derive(Fingerprint)]` in
-   `cached_panel.rs` (+ the existing `record_*`). Headless: re-prove the
-   render-skip + timing-law + observe-protocol tests against `Panel`.
+1. Build `CachedView` + `Cached<V>` + `BuildCx` + `#[derive(Fingerprint)]` in
+   the `yux` module (`yux.rs`, renamed from `cached_panel.rs`; keeps the existing
+   `record_*`). Headless: re-prove the render-skip + timing-law + observe-protocol
+   tests against `Cached<V>`.
 2. Re-express `TranscriptView` as `impl CachedView` (the flagship; behavior-
    identical, all `transcript_021_*` tests stay green). Deletes the hand-rolled
    `new`/observe/diff.
@@ -115,5 +122,6 @@ onto it as the proof. Revisit (B) per-surface if coverage drift actually recurs.
 ## Links
 
 `docs/projects/gpui-responsiveness/project.md` (facts + component model),
-`cached_panel.rs`, `transcript_view.rs`, module `CLAUDE.md`. Warrants an ADR for
-the (A)/(B) decision once made (`/decision`).
+`cached_panel.rs` (→ `yux.rs`), `transcript_view.rs`, module `CLAUDE.md`.
+Warrants an ADR for the framework name (yux) and the (A)/(B) decision once made
+(`/decision`).

@@ -61,13 +61,14 @@ Anatomy (what every cached surface has):
 
 ## Don't hand-roll `impl Render` for an expensive surface
 
-Use the `CachedView`/`Panel` abstraction (`cached_panel.rs`; framework spec:
-`docs/specs/spec-gpui-panel-framework.md`). It owns the observe wiring, the
-fingerprint diff, the `record_*` accounting, and the cached embed, and its
-`build` method is handed no `Context` — so rule 1 is structural, not a thing you
-remember. Hand-rolling a `Render` impl with a large inline element tree is the
-mistake the whole module is shaped to prevent; if you think you need to, that is
-a signal to extend the framework instead.
+Use **yux** (yalda-ux) — yalda's component layer over GPUI: the `CachedView`
+trait + `Cached<V>` host (`cached_panel.rs`, becoming `yux.rs`; spec:
+`docs/specs/spec-yux.md`). It owns the observe wiring, the fingerprint diff, the
+`record_*` accounting, and the cached embed, and its `build` method is handed no
+`Context` — so rule 1 is structural, not a thing you remember. Hand-rolling a
+`Render` impl with a large inline element tree is the mistake the whole module is
+shaped to prevent; if you think you need to, that is a signal to extend yux
+instead.
 
 ## Instrumentation
 
