@@ -1284,7 +1284,12 @@ impl YaldaGpuiView {
                         let fp = this.awaiting_anim_fingerprint(cx);
                         if fp.is_some() && fp != last_anim_fp {
                             last_anim_fp = fp;
-                            cx.notify();
+                            // The clock lives INSIDE the cached TranscriptView; a
+                            // root notify cannot bust a cached child (facts 3/6)
+                            // and no session seq moves during a stall, so tick each
+                            // awaiting session's transcript directly (timer
+                            // context, timing-correct, fact 4).
+                            this.tick_awaiting_transcript_views(cx);
                         } else if fp.is_none() {
                             last_anim_fp = None;
                         }
@@ -1495,7 +1500,12 @@ impl YaldaGpuiView {
                             let fp = this.awaiting_anim_fingerprint(cx);
                             if fp.is_some() && fp != last_anim_fp {
                                 last_anim_fp = fp;
-                                cx.notify();
+                                // The clock lives INSIDE the cached TranscriptView;
+                                // a root notify cannot bust a cached child (facts
+                                // 3/6) and no session seq moves during a stall, so
+                                // tick each awaiting session's transcript directly
+                                // (timer context, timing-correct, fact 4).
+                                this.tick_awaiting_transcript_views(cx);
                             } else if fp.is_none() {
                                 last_anim_fp = None;
                             }

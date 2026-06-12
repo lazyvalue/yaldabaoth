@@ -56,6 +56,11 @@ pub(crate) struct TranscriptSeqs {
     pub(crate) cursor_line: usize,
     /// Transcript cursor column — the caret position within its row.
     pub(crate) cursor_col: usize,
+    /// Worksheet edit mode — `make_caret` draws the under-cursor CHARACTER in
+    /// `Normal` vs a BLANK block in `Insert`, so a bare `i`/`a` (or `Esc` at
+    /// col 0) flips the caret glyph while moving no other seq. Without this the
+    /// observe filter would skip the cached transcript and keep the stale caret.
+    pub(crate) mode: EditMode,
     /// Selection range projected onto the transcript (highlight bands).
     pub(crate) selection: Option<((usize, usize), (usize, usize))>,
     /// Whether a reply is streaming — drives the thinking indicator's presence
@@ -77,6 +82,7 @@ impl TranscriptSeqs {
             tools_gen: c.tools_gen(),
             cursor_line: cursor.line,
             cursor_col: cursor.col,
+            mode: c.mode,
             selection: c.editor.selection_range(),
             awaiting: c.turn_phase.is_awaiting(),
             pending_reveal: c.pending_reveal_cursor,

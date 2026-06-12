@@ -3119,3 +3119,89 @@ fn transcript_021_follow_tail_reveals_grown_content(cx: &mut TestAppContext) {
          appended rows (before {count_before}, after {count_after})"
     );
 }
+
+/// (f) SEQ-COVERAGE for `c.mode`: a bare worksheet mode flip (Normal⇄Insert)
+/// moves NO other seq — no cursor move, no `edit_seq` bump — yet `make_caret`
+/// draws the under-cursor CHARACTER in Normal vs a BLANK block in Insert. So
+/// `mode` is a render input that MUST be in `TranscriptSeqs`; flipping it alone
+/// must self-notify and re-render the transcript exactly once. Without the
+/// `mode` field the observe filter returns `None` ⇒ stale caret (the bug the
+/// adversarial review flagged: `i`/`a` into Insert, or `Esc` at col 0).
+#[gpui::test]
+fn transcript_021_mode_flip_busts_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (_view, vcx, _id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    // Flip ONLY the edit mode (what a bare `i`/`a` does: begin_insert flips
+    // `*mode` with no cursor move and no edit_seq bump). Notify the session as
+    // the key handler does.
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        let before = s.state.mode;
+        s.state.mode = match before {
+            crate::EditMode::Normal => crate::EditMode::Insert,
+            crate::EditMode::Insert => crate::EditMode::Normal,
+        };
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("transcript");
+    assert_eq!(
+        after,
+        base + 1,
+        "a bare worksheet mode flip (caret glyph change, no other seq move) must \
+         re-render the transcript once so the caret is fresh (base {base}), got {after}"
+    );
+}
+
+/// (g) The thinking-indicator CLOCK lives inside the cached `TranscriptView`.
+/// Its ~1Hz anim tick must bust the cached child for every awaiting session —
+/// a root notify cannot (facts 3/6) and no session seq moves during a stall.
+/// `tick_awaiting_transcript_views` is that route; here it must yield +1 on an
+/// awaiting session and 0 on an idle one (the bug the review flagged: the clock
+/// froze during a stall because the tick notified the root, not the view).
+#[gpui::test]
+fn transcript_021_anim_tick_busts_awaiting_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (view, vcx, _id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    // IDLE: a tick must NOT touch the transcript (nothing is awaiting).
+    let ticked_idle = view.update(vcx, |v, cx| v.tick_awaiting_transcript_views(cx));
+    vcx.run_until_parked();
+    assert!(!ticked_idle, "idle session: anim tick must notify no transcript view");
+    assert_eq!(
+        crate::perf_render_count("transcript"),
+        base,
+        "idle session: anim tick must not re-render the transcript"
+    );
+
+    // AWAITING: put the session mid-turn (with timers in the past so the clock
+    // is live), then tick — the cached transcript MUST re-render so the
+    // `Thinking… mm:ss` clock advances.
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(35);
+        s.state.turn_phase = crate::TurnPhase::Awaiting {
+            started: past,
+            last_event: past,
+        };
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    // The awaiting flip itself bumps the `awaiting` seq ⇒ one render. Anchor the
+    // anim-tick assertion off the post-flip count.
+    let after_await = crate::perf_render_count("transcript");
+
+    let ticked = view.update(vcx, |v, cx| v.tick_awaiting_transcript_views(cx));
+    vcx.run_until_parked();
+    assert!(ticked, "awaiting session: anim tick must notify its transcript view");
+    let after_tick = crate::perf_render_count("transcript");
+    assert_eq!(
+        after_tick,
+        after_await + 1,
+        "awaiting anim tick must bust the cached transcript so the stall clock \
+         advances (post-await {after_await}), got {after_tick}"
+    );
+}

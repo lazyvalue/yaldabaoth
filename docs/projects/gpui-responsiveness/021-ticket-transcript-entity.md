@@ -82,13 +82,21 @@ session ⇒ multi-tile splits need no extra logic.
       `YaldaGpuiView` + lazy create (`transcript_view_for`, registers observe)
       + drop at every `AgentSessions::close` site; `render_agent` embeds via
       `cached_child(transcript_view)` (size_full baked in).
-- [x] Headless regression tests (`verify_harness.rs`, 6 tests): chatbox
+- [x] Headless regression tests (`verify_harness.rs`, 8 tests): chatbox
       keystroke (real compose-editor mutation+notify) ⇒ render count FLAT;
       session edit ⇒ +1; streaming burst ⇒ +1 on EACH chunk including the final
       append (rev-1 stale-tail); tool expand ⇒ +1; theme +1 and zoom +1;
-      follow-tail grows the registered item count.
+      follow-tail grows the registered item count; **mode flip (Normal⇄Insert)
+      ⇒ +1** (seq-coverage for the caret glyph — adversarial-review fix); **anim
+      tick on an awaiting session ⇒ +1, idle ⇒ 0** (the stall-clock-freeze fix).
+- [x] Seq-coverage fix (adversarial review): `EditMode` added to
+      `TranscriptSeqs` (a bare `i`/`a` / `Esc`-at-col-0 flips the caret glyph
+      but moves no other seq); the ~1Hz anim tick routes through
+      `tick_awaiting_transcript_views` (busts each awaiting session's cached
+      transcript directly — a root notify can't, facts 3/6) so the
+      `Thinking… mm:ss` clock + 30s stall warning stay live during a stall.
 - [x] Build + full test suite (`cargo test` all green; `cargo test --bin
-      yalda-gpui` = 183 passed / 0 failed).
+      yalda-gpui` = 185 passed / 0 failed / 1 ignored).
 - [ ] **Human runtime:** `sample` while typing in a large transcript (no
       per-keystroke transcript layout); stream a long reply and confirm the
       tail lands without input wiggling; adversarial pass: cursor blink,

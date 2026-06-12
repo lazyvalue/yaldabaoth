@@ -581,8 +581,9 @@ impl BrowserWindow {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum EditMode {
+    #[default]
     Normal,
     Insert,
 }
@@ -2602,6 +2603,33 @@ impl YaldaGpuiView {
             record_notify(label, reason);
             v.update(cx, |_tv, vcx| vcx.notify());
         }
+    }
+
+    /// Tick the thinking-indicator clock (ticket 021). The `Thinking… mm:ss`
+    /// label + 30s stall warning live INSIDE the cached `TranscriptView`, so the
+    /// ~1Hz anim tick must bust each *awaiting* session's cached transcript
+    /// directly — a root `cx.notify()` cannot dirty a cached child (facts 3/6),
+    /// and no session seq moves during a stall (the elapsed/quiet timers are
+    /// `last_event_at`-relative, not in `TranscriptSeqs`), so the session
+    /// observe never fires. The anim tick runs in timer context, outside any
+    /// draw (timing-correct, fact 4). Returns whether any view was notified.
+    pub(crate) fn tick_awaiting_transcript_views(&mut self, cx: &mut Context<Self>) -> bool {
+        let awaiting: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.read(cx).state.turn_phase.is_awaiting())
+            .map(|(id, _)| id)
+            .collect();
+        let mut ticked = false;
+        for id in awaiting {
+            if let Some(v) = self.transcript_views.get(&id) {
+                let label = v.read(cx).perf_label;
+                record_notify(label, MissReason::Refresh);
+                v.update(cx, |_tv, vcx| vcx.notify());
+                ticked = true;
+            }
+        }
+        ticked
     }
 
     /// Snapshot the persistable UI settings (theme, agent info-bar placement,
