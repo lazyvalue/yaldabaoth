@@ -4,6 +4,21 @@
 
 use super::*;
 
+/// Process cwd, read once and cached for the process lifetime.
+///
+/// `render_agent` compares each session's per-slot cwd against the process cwd
+/// every frame (cursor blink, streamed chunk, cross-tile wakeup). The underlying
+/// `process_cwd()` (persist.rs) does a `getcwd(2)` syscall on every call — an
+/// O(1) but non-trivial per-frame cost on the paint thread. The cwd is
+/// process-stable (Yalda never `chdir`s after launch), so a one-time read is
+/// correct. Mirrors the `perf_enabled()` OnceLock idiom (main.rs:130); the
+/// static is intentionally defined here, local to screens.rs.
+fn cached_process_cwd() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static CWD: OnceLock<std::path::PathBuf> = OnceLock::new();
+    CWD.get_or_init(process_cwd).as_path()
+}
+
 impl YaldaGpuiView {
     pub(crate) fn render_doc(
         &self,
@@ -987,7 +1002,13 @@ impl YaldaGpuiView {
         // structural fingerprint is unchanged).
         let tool_calls_snap = c.tools.calls_snapshot();
         let expanded_snap = c.tools.expanded_snapshot();
-        let frozen_lines_snap: Vec<(usize, usize)> = c.editor.frozen_lines().to_vec();
+        // Reuse the `frozen_ranges` snapshotted above (line-count memo input).
+        // It was only *borrowed* (by `&`) by the view-model rebuild, so it is
+        // still owned + in scope here; moving it into the render closure avoids
+        // a second O(frozen) `.to_vec()` every frame. `c.editor.frozen_lines()`
+        // is unchanged since the snapshot (no intervening mutation), so the two
+        // are identical.
+        let frozen_lines_snap: Vec<(usize, usize)> = frozen_ranges;
         let lockable_through_snap = c.editor.lockable_through_line();
         let sel_snap = c.editor.selection_range();
         let mode_snap = c.mode;
@@ -1600,8 +1621,8 @@ impl YaldaGpuiView {
         // every session is noise. Tooltip with the absolute path is a
         // follow-up (GPUI tooltip support is patchy on this version);
         // for now the shortened display is the only affordance.
-        let proc_cwd = process_cwd();
-        if active_slot_cwd != proc_cwd {
+        let proc_cwd = cached_process_cwd();
+        if active_slot_cwd.as_path() != proc_cwd {
             let shortened = shorten_cwd_for_display(&active_slot_cwd);
             strip = strip.child(
                 div()

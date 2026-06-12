@@ -1171,6 +1171,7 @@ impl YaldaGpuiView {
             let min_cycle = Duration::from_millis(16);
             let anim_period = Duration::from_millis(120);
             let mut last_anim = std::time::Instant::now();
+            let mut last_anim_fp: Option<u64> = None;
             let mut wake_rx: Option<futures::channel::mpsc::UnboundedReceiver<()>> = None;
             loop {
                 let cycle_start = std::time::Instant::now();
@@ -1213,8 +1214,18 @@ impl YaldaGpuiView {
                 if last_anim.elapsed() >= anim_period {
                     last_anim = std::time::Instant::now();
                     let _ = this.update(cx, |this, cx| {
-                        if this.any_agent_awaiting() {
+                        // Only repaint when the whole-second indicator clock
+                        // actually advanced — an unchanged fingerprint means the
+                        // visible "Thinking… mm:ss" label is identical, so a
+                        // notify() here would waste a full transcript rebuild.
+                        // Mirrors the server pump's ~1Hz throttle above (this
+                        // legacy direct-spawn path previously notified every 120ms).
+                        let fp = this.awaiting_anim_fingerprint();
+                        if fp.is_some() && fp != last_anim_fp {
+                            last_anim_fp = fp;
                             cx.notify();
+                        } else if fp.is_none() {
+                            last_anim_fp = None;
                         }
                     });
                 }
