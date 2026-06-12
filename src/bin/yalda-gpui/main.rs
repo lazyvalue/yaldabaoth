@@ -1495,6 +1495,7 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::separator(),
         MenuNode::entry("n", "new session", "claude-new"),
         MenuNode::entry("x", "close session", "claude-close"),
+        MenuNode::entry("C", "clear session", "claude-clear"),
         MenuNode::entry("r", "rename session", "claude-rename"),
         MenuNode::entry("S", "send selection", "claude-send-selection"),
         MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),

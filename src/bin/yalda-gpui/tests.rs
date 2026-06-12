@@ -1423,6 +1423,21 @@ fn agent_local_c_resolves_to_session_picker() {
 }
 
 #[test]
+fn agent_local_shift_c_resolves_to_claude_clear() {
+    // `/clear` is reachable from the Agent local menu at `C` (capital, distinct
+    // from lowercase `c` = select session). Regression guard for the original
+    // bug: clear_agent_session existed but had no entry point.
+    let mut state = MenuState::new();
+    state.open();
+    let menu = agent_local_menu();
+    let cmd = state.process_key(
+        KeyPress::new(Key::Char('C'), KMods::NONE),
+        &menu,
+    );
+    assert_eq!(cmd, Some("claude-clear".to_string()));
+}
+
+#[test]
 fn menu_n_f_resolves_to_new_buffer_tile() {
     // `n` opens the new submenu; `f` creates a new buffer tile (in Picking).
     let mut state = MenuState::new();
