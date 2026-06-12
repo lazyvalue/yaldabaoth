@@ -12,21 +12,32 @@
 # If you changed the SERVER itself, use ./dev-all.sh instead (it rebuilds and
 # restarts both, dropping live sessions).
 #
+# PROFILE: RELEASE by default — a debug GPUI build stutters on fast text input.
+# Use `DEBUG=1 ./dev-gui.sh` for the fast-compile loop (expect input lag).
+#
 #   GUI logs -> this terminal
 #
 # Quit the GUI and re-run this script to iterate. Pass a file to open it:
-#   ./dev-gui.sh            # opens the browser
-#   ./dev-gui.sh notes.md   # opens a file
+#   ./dev-gui.sh            # release, opens the browser
+#   ./dev-gui.sh notes.md   # release, opens a file
+#   DEBUG=1 ./dev-gui.sh    # fast-compile debug loop (expect input lag)
 #
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo "▸ building yalda-gpui…"
-cargo build --bin yalda-gpui
+if [[ "${DEBUG:-0}" == "1" ]]; then
+  PROFILE="debug"; CARGO_PROFILE_FLAG=()
+else
+  PROFILE="release"; CARGO_PROFILE_FLAG=(--release)
+fi
+
+echo "▸ building yalda-gpui  (${PROFILE})…"
+cargo build "${CARGO_PROFILE_FLAG[@]}" --bin yalda-gpui
 
 echo "▸ stopping any running yalda gui (server left alone — agents survive)…"
-pkill -f 'target/debug/yalda-gpui' 2>/dev/null || true
+pkill -f 'target/debug/yalda-gpui'   2>/dev/null || true
+pkill -f 'target/release/yalda-gpui' 2>/dev/null || true
 sleep 0.3   # let the old window's teardown settle before the new one attaches
 
-echo "▸ launching fresh gui (reconnecting to the existing server)…"
-exec ./target/debug/yalda-gpui "$@"
+echo "▸ launching fresh gui (${PROFILE}; reconnecting to the existing server)…"
+exec "./target/${PROFILE}/yalda-gpui" "$@"
