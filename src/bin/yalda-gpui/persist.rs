@@ -230,7 +230,38 @@ pub(crate) fn shorten_cwd_for_display(cwd: &std::path::Path) -> String {
 /// Path to the JSON file that maps cwd → workspace snapshot (tabs + layout
 /// tree). Companion to acp_sessions.json; cleared by clearing cache_dir.
 pub(crate) fn workspace_persist_path() -> Option<PathBuf> {
-    yalda::paths::yalda_home().map(|d| d.join("workspace.json"))
+    // Fail safe in test builds (same rationale as `preferences_path`): NEVER
+    // touch the user's real `~/.yalda/workspace.json`. `save_workspace_state`
+    // fires from ~75 action handlers (open / split / close / focus), so any
+    // test that dispatches one of those actions would otherwise overwrite the
+    // user's real tab/split layout. Round-trip tests opt in via
+    // `with_workspace_path`; everything else gets `None` → save is a no-op.
+    #[cfg(test)]
+    {
+        return WS_PATH_OVERRIDE.with(|c| c.borrow().clone());
+    }
+    #[cfg(not(test))]
+    {
+        yalda::paths::yalda_home().map(|d| d.join("workspace.json"))
+    }
+}
+
+/// Test-only seam mirroring `with_acp_persist_path` / `with_preferences_path`:
+/// redirect the workspace snapshot file to a tempdir. Unset (the default) ⇒
+/// `workspace_persist_path()` is `None` and `save_workspace_state` no-ops.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WS_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn with_workspace_path<R>(path: PathBuf, f: impl FnOnce() -> R) -> R {
+    WS_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+    let r = f();
+    WS_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    r
 }
 
 /// Path to the JSON file holding app-managed runtime preferences (theme

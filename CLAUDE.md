@@ -170,6 +170,32 @@ Claude session blocks all render at their native sizes. To extend the zoom
 to a new surface, multiply that surface's base `text_size` by `self.text_scale`
 and add `on_action(Self::zoom_in/out/reset)` to its root.
 
+### GUI responsiveness invariants (read before touching agent/transcript UI)
+
+The agent transcript is a **cached child entity** (`transcript_view.rs`,
+`TranscriptView`), not inline render. This is load-bearing for typing latency —
+see `docs/projects/gpui-responsiveness/` (`project.md` has the 6 verified GPUI
+0.2.2 facts + the component model). The rules that keep it fast and correct:
+
+- **Never call `cx.notify()` inside a `render()`/`build_body` path.** A notify
+  issued mid-draw is *parked* (no effect that frame, no scheduled redraw) — the
+  rev-1 stale-tail bug. Notify from event handlers, `cx.observe` callbacks,
+  timers, or `cx.defer` only. Pinned by `cached_notify_from_render_is_parked`.
+- **Every input `TranscriptView::render` reads must have a monotonic seq in
+  `TranscriptSeqs`** (the `cx.observe` slice filter). Add a render input
+  without a covering seq ⇒ stale UI (the caret-glyph / stall-clock class of
+  bugs). Global inputs (theme, zoom) are pushed via `notify_transcript_views`
+  from their action handlers, not via a seq. Add an input → add its seq → add a
+  `transcript_021_*` regression test in `verify_harness.rs`.
+- **Embed cached children via `cached_child(view)`** (carries `size_full`);
+  never hand-roll the `.cached()` call (a sizeless style collapses the panel).
+- **Tests must never touch `~/.yalda`.** `acp_session_persist_path` /
+  `preferences_path` / `workspace_persist_path` return `None` (or a tempdir
+  override) under `cfg(test)`. A test that triggers `set_theme`,
+  `set_text_scale`, or `save_workspace_state` must NOT write the user's real
+  state — if you add a new persisted path, give it the same `*_PATH_OVERRIDE`
+  seam.
+
 ## Naming Conventions
 
 ### Modes
