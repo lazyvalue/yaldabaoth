@@ -86,3 +86,16 @@ required-features = ["test-support"]
 name = "agent_event_stream_test"
 path = "tests/agent_event_stream_test.rs"
 required-features = ["test-support"]
+
+# Optimize DEPENDENCIES even in dev/debug builds. GPUI is immediate-mode: it
+# re-runs full-window layout (Taffy) + glyph shaping + paint every frame, and
+# nearly all of that per-frame cost lives in dependencies (gpui, taffy, the text
+# stack, ropey). Compiling THOSE unoptimized makes a debug build stutter on fast
+# text input even though yalda's own per-keystroke work is O(1). The `"*"` glob
+# applies only to dependencies — yalda's own crates stay at the default dev
+# opt-level 0, so incremental rebuilds of our code remain fast and debuggable,
+# while the per-frame hot path runs at release speed. NOTE: the first dev build
+# after adding this recompiles every dependency optimized (one-time, ~release dep
+# build); incremental builds of our code are fast thereafter.
+[profile.dev.package."*"]
+opt-level = 3
