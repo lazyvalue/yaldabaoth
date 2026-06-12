@@ -28,11 +28,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 gpui = "0.2"
 
 [features]
-# Opt-in pass-through of ACP's unstable token / cost surfacing. When this
-# feature is enabled, the agent window's `ReplyEvent::UsageUpdated` emitter
-# in `acp_channel.rs` fires; otherwise the variant exists but never gets
-# constructed (spec-agent-window.md §31). The variant itself is
-# unconditional so `match ev` arms stay exhaustive regardless.
+# ON by default: without it `ReplyEvent::UsageUpdated` never fires, so the
+# context-window usage bar in the agent view has no data and never renders.
+# The agent view's whole context indicator depends on this, so it ships
+# enabled (spec-agent-window.md §31).
+default = ["unstable_session_usage"]
+# Pass-through of ACP's unstable token / cost surfacing. When enabled, the
+# agent window's `ReplyEvent::UsageUpdated` emitter in `acp_channel.rs` fires;
+# otherwise the variant exists but never gets constructed. The variant itself
+# is unconditional so `match ev` arms stay exhaustive regardless.
 unstable_session_usage = ["agent-client-protocol/unstable_session_usage"]
 
 # Phase 6 (spec-session-server-actor §Rollout): exposes the in-process
