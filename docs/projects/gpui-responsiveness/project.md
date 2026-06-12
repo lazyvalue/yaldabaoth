@@ -119,9 +119,9 @@ finish a refactor while silently missing the cache path.
 | 011 | Clipboard in-process for the 4 main.rs handlers (#4/#5)         | 1 | low | **done** (merged `0dc2b97`) |
 | 012 | Deferred: WP-classify cache; browser filter debounce + bg walk (#2); vim yank/put clipboard | 0/1 | low-med | todo (`012-ticket-deferred.md`) |
 | 020 | `CachedPanel` + render-skip proof test                          | 2 | med | **done** (merged `66c63b9`); fingerprint half superseded → 024 |
-| 024 | Rework `cached_panel`: delete fingerprint layer; `cached_child` embed + counters + timing-law tests | 2 | low | **next** (`024-ticket-cached-panel-rework.md`) |
-| 025 | `Entity<AgentSession>` hoist: store payload swap, mutation-site notify; no behavior change | 2 | med | todo (`025-ticket-session-entity.md`) |
-| 021 | `TranscriptView` entity: observes session, slice-filtered self-notify, cached embed (flagship; closes #1, #7, #8) | 2 | med-high | todo — **rewritten for rev 2** (`021-ticket-transcript-entity.md`) |
+| 024 | Rework `cached_panel`: delete fingerprint layer; `cached_child` embed + counters + timing-law tests | 2 | low | **done** (merged `851f207`) |
+| 025 | `Entity<AgentSession>` hoist: store payload swap, mutation-site notify; no behavior change | 2 | med | **done** (merged `851f207`) |
+| 021 | `TranscriptView` entity: observes session, slice-filtered self-notify, cached embed (flagship; closes #1, #7, #8) | 2 | med-high | **done** — owner runtime-checked 2026-06-11 (merged `851f207`) |
 | 022 | Compose widget: own entity owning the draft, emits Submit/mode events (#1/#7) | 2 | med | todo |
 | 023 | Strip + thinking indicator: measure with 024 counters first; cache only if counters say so (#14) | 2 | low | todo |
 | 030 | Each App leaf a view entity owning its screen state — dismantle the mega-entity (#8, #9); resize coalesce | 3 | high | todo |

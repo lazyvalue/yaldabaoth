@@ -97,11 +97,9 @@ session ⇒ multi-tile splits need no extra logic.
       `Thinking… mm:ss` clock + 30s stall warning stay live during a stall.
 - [x] Build + full test suite (`cargo test` all green; `cargo test --bin
       yalda-gpui` = 185 passed / 0 failed / 1 ignored).
-- [ ] **Human runtime:** `sample` while typing in a large transcript (no
-      per-keystroke transcript layout); stream a long reply and confirm the
-      tail lands without input wiggling; adversarial pass: cursor blink,
-      selection parity, resize, multi-tile splits, follow-tail, session
-      close/rebind.
+- [x] **Human runtime:** owner runtime-checked 2026-06-11 ("seems ok"); merged
+      to `main` (`851f207`). Residual suspicion noted — revisit with a `sample`
+      profile under `--release` if typing lag resurfaces on a large transcript.
 
 ## Risks
 

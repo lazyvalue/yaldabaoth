@@ -66,9 +66,7 @@ a type-parameter change plus call-site mechanics.
       (`cargo test` = 514 passed / 0 failed; `agent_sessions.rs` and
       `agent_transcript.rs` were NOT touched — store invariant + reconciler
       seam tests pass unchanged.)
-- [ ] **Human runtime:** behavior-parity smoke — create/bind/close sessions,
-      stream a turn, worksheet + chatbox typing, persistence restore. Nothing
-      should look different; this ticket only moves ownership.
+- [x] **Human runtime:** owner-tested 2026-06-11; merged to `main` (`851f207`).
 
 ## Risks
 
