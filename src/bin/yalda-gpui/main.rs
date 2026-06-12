@@ -92,8 +92,9 @@ pub(crate) use std::rc::Rc;
 pub(crate) use std::time::Duration;
 
 pub(crate) use gpui::{
-    AnyElement, App as GpuiApp, AppContext, Application, Bounds, Context, Element, ElementId,
-    FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hsla,
+    AnyElement, App as GpuiApp, AppContext, Application, Bounds, ClipboardItem, Context, Element,
+    ElementId, FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight, GlobalElementId,
+    Hsla,
     InspectorElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
     LayoutId, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
@@ -2598,7 +2599,7 @@ impl YaldaGpuiView {
         &mut self,
         _: &CopyDocSelection,
         _w: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         let Some(sel) = self.doc_selection else {
             return;
@@ -2607,7 +2608,7 @@ impl YaldaGpuiView {
             return;
         };
         if !text.is_empty() {
-            Self::yank_to_clipboard(&text);
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
@@ -2677,7 +2678,7 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(text) = Self::read_from_clipboard() else {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
         if text.is_empty() {
@@ -2744,7 +2745,7 @@ impl YaldaGpuiView {
             && let Some(text) = self.collect_doc_selection_text(&sel)
             && !text.is_empty()
         {
-            Self::yank_to_clipboard(&text);
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
             return;
         }
         // Edit / Agent views: copy editor selection. Agent sessions live in
@@ -2769,9 +2770,8 @@ impl YaldaGpuiView {
         if let Some(t) = text
             && !t.is_empty()
         {
-            Self::yank_to_clipboard(&t);
+            cx.write_to_clipboard(ClipboardItem::new_string(t));
         }
-        let _ = cx;
     }
 
     /// Drop every live `AcpChannelClient` we hold so its `Drop` impl can
