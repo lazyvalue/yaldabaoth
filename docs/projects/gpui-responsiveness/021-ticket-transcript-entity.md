@@ -1,80 +1,104 @@
-# 021 — Transcript → cached child entity (flagship)
+# 021 — `TranscriptView` entity (flagship) — rev 2
 
-Closes audit finding #1 (chatbox keystroke re-lays-out the static transcript).
-The first real consumer of the `CachedPanel` keystone (ticket 020). Build on the
-`transcript-entity` branch. **Needs a human runtime `sample` profile** before
-integration — the GUI can't be driven headlessly for paint.
+Closes audit finding #1 (chatbox keystroke re-lays-out the static transcript)
+and transitively #7/#8. **Rewritten for rev 2** (`project.md` "Design
+history"): the rev-1 snapshot-push + render-fingerprint design is replaced by
+the component model — the view observes its session entity and notifies
+itself, with `cached()` as the render-skip wrapper. Depends on 024 (helper +
+counters) and 025 (`Entity<AgentSession>`). **Needs a human runtime `sample`
+profile** before integration.
 
 ## Goal
 
-A chatbox keystroke re-renders only the root chrome + compose box; the
-transcript subtree's layout/paint is **reused** (its `render()` not invoked).
-Proven headlessly; confirmed smooth by runtime profile.
+A chatbox keystroke re-renders only the root chrome + compose; the
+transcript's `render()` is skipped and its prepaint reused. A transcript
+change (stream chunk, worksheet edit, tool expand) re-renders the transcript
+**on the same frame its event scheduled** — zero frames late, no stale tail
+(the rev-1 hazard). Proven headlessly via render counters; confirmed by
+runtime profile.
 
-## The seam (already clean — not a blind 1600-line move)
+## The seam (unchanged from rev 1 — still clean)
 
-The transcript list is `gpui::list(c.list_state.clone(), render_fn).flex_1().w_full()`
-at ~`screens.rs:1489`, where `render_fn` (~`screens.rs:1016`) is already a closure
-over **snapshots** built at ~`screens.rs:890–1015` (`lines_rc`/`lines_snap`, `hl_snap`,
-`frozen_lines_snap`, `tool_calls_snap`, `expanded_snap`, cursor, selection, theme).
-The extraction unit = {snapshot construction + `render_fn` + the `list` element}.
-**Compose box, status strip, headers stay inline in `render_agent`** (they become
-their own cached children in 022/023).
+The transcript list is `gpui::list(list_state, render_fn)` at
+~`screens.rs:1489`; `render_fn` (~`screens.rs:1016`) closes over data built at
+~`screens.rs:890–1015`. The extraction unit = {that data construction +
+`render_fn` + the `list` element} → `TranscriptView::render`. Compose, status
+strip, headers stay inline in `render_agent` (tickets 022/023).
 
-## Design — snapshot-push (AgentState stays source of truth)
+## Design — observe + self-notify (no snapshots, no fingerprints)
 
-`TranscriptView` entity implements `FingerprintedPanel`; holds the snapshot it
-renders from (the `_snap` bundle + `list_state`). `AgentState` is NOT moved into
-an entity (keeps the `AgentSessions` 1:1 store untouched).
+`TranscriptView` is a view entity, one per session:
 
-Flow in `render_agent`, per bound session:
-1. Compute the **render fingerprint** cheaply (no snapshot build).
-2. If it changed since last push: rebuild the snapshot, push it into the
-   `TranscriptView` via `entity.update(..)`, and `CachedPanel::notify_if_changed`
-   (dirties the child). If unchanged (chatbox typing): do neither → child stays
-   out of `dirty_views` → `cached()` reuses its laid-out subtree.
-3. Embed `panel.element(size_full_style())` (or `flex_1`) in the transcript slot.
-   `notify_if_changed` must run BEFORE the element is laid out (helper contract).
+- **Owns (UI state):** `list_state`, `list_item_count`,
+  `last_reconciled_edit_seq`, `last_scrolled_edit_seq`, follow-tail intent —
+  the scroll/list cluster moves here from `AgentState` (widgets own UI state;
+  models own domain state).
+- **Reads (domain state):** `Entity<AgentSession>` directly in `render()` via
+  `.read(cx)` — no snapshot build, no push protocol, no raw-pointer borrows.
+  Renders only when notified, so reads are O(visible) exactly when needed.
+- **Invalidation:** `cx.observe(&session, …)` registered at construction. The
+  callback compares the seqs this render reads — transcript `edit_seq`,
+  frozen-ranges gen, tool-structure gen (`calls`/`expanded`), transcript
+  cursor/selection — against what was last rendered, and calls `cx.notify()`
+  (on itself) only when a slice moved, recording the reason for the
+  `YALDA_PERF` notify-reason counter. Observe callbacks run in effect flush —
+  timing-correct by construction (`project.md` facts 4–5).
+- **Theme / text-zoom:** global, not session state. The zoom/theme *action
+  handlers* (event context) notify each live `TranscriptView` directly. (If a
+  global Settings entity appears later, observe that instead — same pattern.)
+- **Cursor blink (worksheet mode):** the blink timer notifies the
+  `TranscriptView` it animates — timers are event context, sound and scoped.
+- **Embed:** `render_agent` emits `cached_child(transcript_view)` (024 helper,
+  `size_full` baked in) in the transcript slot. No per-frame calls of any kind.
 
-### Render fingerprint (correctness crux — must cover everything rows depend on)
+Chatbox typing mutates compose state only → session seqs the observer checks
+are stable → no self-notify → entity stays out of `dirty_views` → `cached()`
+reuses the subtree. Worksheet typing bumps `edit_seq` → observer fires in the
+same event's effect flush → fresh render on that event's frame. ✓ both modes.
 
-`transcript edit_seq` + frozen-ranges gen + tool-structure fp (`calls_snapshot` +
-`expanded_snapshot`) + **transcript** cursor line/col + selection range + theme id
-+ `text_scale`. NOT viewport width — `cached()`'s bounds cache-key already
-invalidates on resize, and the snapshot segments don't depend on width (wrap is
-layout-time).
+## Lifecycle
 
-- Chatbox mode while typing: caret is in the *chatbox* editor, transcript
-  `edit_seq`/cursor/selection all stable → fp stable → cache hit. ✓
-- Worksheet mode: typing bumps transcript `edit_seq` → fp moves → re-render. ✓ (correct)
-
-### Lifecycle
-
-`HashMap<SessionId, CachedPanel<TranscriptView>>` on `YaldaGpuiView`. Created
-lazily on first render of a bound tile; dropped on session close (hook
-`AgentSessions::close`). 1:1 invariant ⇒ one panel per session ⇒ splits with
-multiple agent tiles work without extra logic.
+`HashMap<SessionId, Entity<TranscriptView>>` on `YaldaGpuiView`. Created
+lazily on first render of a bound tile (constructor registers the observe
+subscription); dropped on `AgentSessions::close`. 1:1 invariant ⇒ one view per
+session ⇒ multi-tile splits need no extra logic.
 
 ## Subtasks
 
-- [ ] `TranscriptView` entity + `FingerprintedPanel` impl (render_fp as above)
-- [ ] Relocate snapshot build + `render_fn` + `list` into `TranscriptView::render`
-- [ ] `transcript_panels: HashMap<SessionId, CachedPanel<TranscriptView>>` on root + lazy create + close hook
-- [ ] `render_agent` gates snapshot rebuild/push on render_fp; embeds `panel.element(..)`; compose/strip stay inline
-- [ ] Headless regression test: chatbox keystroke ⇒ `TranscriptView` render-count flat; transcript content change ⇒ bumps. (counter in `TranscriptView::render`, idiom from `VIEW_MODEL_REBUILDS` / `edit_view_keystroke_is_o_changed`)
-- [ ] Build + full test suite
-- [ ] **Human runtime:** `sample` the live process while typing in a large
-      transcript; confirm no per-keystroke transcript layout. Adversarial review
-      for regressions (cursor blink, streaming, resize, multi-tile, follow-tail).
+- [ ] `TranscriptView` entity: UI-state fields moved in from `AgentState`;
+      `render()` relocates the row build + `render_fn` + `list` element;
+      render counter for tests.
+- [ ] Seq plumbing: ensure each observed slice has a monotonic counter on
+      `AgentSession` (`edit_seq` exists; add frozen-gen / tools-gen where only
+      collections exist today).
+- [ ] Observe subscription with slice filter + notify-reason logging; zoom and
+      theme action handlers notify live transcript views.
+- [ ] `transcript_views: HashMap<SessionId, Entity<TranscriptView>>` + lazy
+      create + close hook; `render_agent` embeds via `cached_child`.
+- [ ] Headless regression tests: chatbox keystroke ⇒ transcript render count
+      flat; worksheet edit / stream chunk (session.update) ⇒ +1 on the next
+      frame **including the final append of a burst** (the rev-1 stale-tail
+      case); tool expand ⇒ +1; theme/zoom ⇒ +1; follow-tail still reveals
+      grown content.
+- [ ] Build + full test suite.
+- [ ] **Human runtime:** `sample` while typing in a large transcript (no
+      per-keystroke transcript layout); stream a long reply and confirm the
+      tail lands without input wiggling; adversarial pass: cursor blink,
+      selection parity, resize, multi-tile splits, follow-tail, session
+      close/rebind.
 
 ## Risks
 
-Largest blast radius so far. Watch: follow-tail/scroll on new content (must still
-notify when content appends), selection/cursor rendering parity, theme/zoom
-changes invalidating correctly, the snapshot raw-pointer borrow idiom currently in
-`render_agent` (the entity owns the snapshot instead — should remove the unsafe).
+Largest blast radius so far. Watch: the moved scroll/list state (every
+`render_agent`/reducer touch-point of `list_state` must move or read through
+the view); stale captures — the reused prepaint holds listeners whose closures
+captured the *previous* render's data, so interactive rows (tool expand, links)
+must act through ids/indices resolved at event time, never cached row data;
+seq coverage — any render input without a counter is a stale-UI bug (the
+adversarial review should hunt for exactly these, with the notify-reason log
+as the audit trail).
 
 ## Links
 
-`docs/projects/gpui-responsiveness/project.md`, `audit-report.md` §3, ticket 020
-(`cached_panel.rs`), `spec-agent-session-ownership.md`.
+`project.md` (facts, component model), tickets 024/025, `audit-report.md` §2
+finding #1, `spec-agent-session-ownership.md`, ADR-0020 (INV-PR/INV-RV).
