@@ -237,6 +237,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::enter_edit))
             .on_action(cx.listener(Self::enter_wp))
             .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::open_linear))
             .on_action(cx.listener(Self::open_menu))
             .on_action(cx.listener(Self::open_local_menu))
             .on_action(cx.listener(Self::quit))
@@ -421,6 +422,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::open_linear))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
@@ -1666,6 +1668,7 @@ impl YaldaGpuiView {
             // agent. Wired here only so the hint fires; it cannot mutate the tile.
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::open_linear))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
@@ -1717,6 +1720,110 @@ impl YaldaGpuiView {
                 root.child(header).child(content_area).child(info_bar)
             }
         }
+    }
+
+    /// Render a Linear tile (`App::Linear`): a top input line (type an issue
+    /// identifier like `FUL-420`, or a project name) over a scrollable body
+    /// showing the fetched issue/project. Keys go through `handle_linear_key`.
+    pub(crate) fn render_linear(
+        &mut self,
+        root: gpui::Div,
+        tile: &mut LinearTile,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        // The body is a cached child entity (yux) — lazily created here because
+        // `restore_content` has no `cx`. Typing in the input below notifies the
+        // ROOT (this view), re-rendering only the input row; the body's entity
+        // isn't notified, so its render is skipped (cached). `tile` is borrowed
+        // from the layout pointer, disjoint from `cx`, so `cx.new` is fine.
+        let weak = cx.entity().downgrade();
+        let view = tile
+            .view
+            .get_or_insert_with(|| cx.new(|_| LinearView::new(weak)))
+            .clone();
+
+        // ── Input line (cheap; re-renders per keystroke) ─────────────────
+        let scale = self.text_scale;
+        let base = px(14.0 * scale);
+        let dim = nc(self.theme.agent.dim);
+        let accent = nc(self.theme.agent.warm_accent);
+        let fg = self.editor_fg();
+        let bg = self.editor_bg();
+        let input_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .px_4()
+            .py_2()
+            .bg(bg_or(self.theme.top_bar, STATUS_BG))
+            .border_b_1()
+            .border_color(dim)
+            .font_family(self.code_font.clone())
+            .text_size(base)
+            .child(
+                div()
+                    .flex_none()
+                    .pr_1()
+                    .text_color(accent)
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::from("linear › ")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(fg)
+                    .child(SharedString::from(format!("{}\u{2588}", tile.input))),
+            );
+
+        // ── Body (cached child; fills the remaining height) ──────────────
+        let body_area = div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(cached_child(view));
+
+        root.key_context("LinearView")
+            .on_key_down(cx.listener(Self::handle_linear_key))
+            .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::restart))
+            .on_action(cx.listener(Self::open_browser))
+            .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::toggle_theme))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::paste_from_clipboard))
+            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::move_tile))
+            .on_action(cx.listener(Self::also_show_tile))
+            .on_action(cx.listener(Self::close_window))
+            .on_action(cx.listener(Self::focus_left))
+            .on_action(cx.listener(Self::focus_right))
+            .on_action(cx.listener(Self::focus_up))
+            .on_action(cx.listener(Self::focus_down))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::toggle_file_browser_rail))
+            .on_action(cx.listener(Self::toggle_outline_rail))
+            .on_action(cx.listener(Self::flip_rail_side))
+            .on_action(cx.listener(Self::cycle_layout_mode))
+            .on_action(cx.listener(Self::desktop_tile_size_overlay))
+            .on_action(cx.listener(Self::promote_to_master))
+            .on_action(cx.listener(Self::increase_master_count))
+            .on_action(cx.listener(Self::decrease_master_count))
+            .on_action(cx.listener(Self::tag_view_chord))
+            .on_action(cx.listener(Self::tag_toggle_chord))
+            .on_action(cx.listener(Self::clear_tag_view))
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(bg)
+            .child(input_row)
+            .child(body_area)
     }
 
     /// Render the in-tile session picker shown on an empty Agent ring
@@ -1904,6 +2011,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::open_linear))
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
@@ -2198,6 +2306,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::open_linear))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
@@ -2231,3 +2340,4 @@ impl YaldaGpuiView {
             .child(hint)
     }
 }
+

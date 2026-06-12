@@ -126,8 +126,13 @@ so items stay crate-visible regardless of file):
 - `chrome.rs` — focused-window/layout render, tab strip, tag bar, rails.
 - `edit_ui.rs` / `browser_ui.rs` — per-screen methods (edit entry/exit + key
   dispatch; browser nav + rail).
-- `render_blocks.rs` — free render helpers: colors/fonts, styled-line/block/
-  table elements, wiki links, WP line classifier.
+- `render_blocks.rs` — free render helpers for the markdown doc/transcript
+  path: colors/fonts, styled-line/block/table elements, wiki links.
+- `linear.rs` / `linear_ui.rs` / `linear_view.rs` — `App::Linear`: the Linear
+  GraphQL client + data model, the view-layer methods, and the cached body
+  component (built on **yux**).
+- `yux/` — the reusable UX component layer (cached-view infra + view
+  primitives). See **"yux" below** and `yux/CLAUDE.md`.
 - `persist.rs` — paths, preferences, workspace + ACP-session persistence,
   server launch helpers.
 - `workspace.rs` — tab strip + n-ary split tree (`Workspace<C>`,
@@ -135,7 +140,32 @@ so items stay crate-visible regardless of file):
 - `tests.rs` / `verify_harness.rs` — unit tests + headless render harness.
 
 Keep the split honest: new agent-tile logic goes in `agent.rs`/`agent_ui.rs`,
-new render helpers in `render_blocks.rs` — don't let `main.rs` re-accrete.
+markdown-block render helpers in `render_blocks.rs`, **all reusable UX in
+`yux/`** — don't let `main.rs` re-accrete.
+
+### yux — the UX component layer (all UI work goes here)
+
+**`src/bin/yalda-gpui/yux/` is the home for every reusable UX building block,
+and all new UX work is built from it.** Read `yux/CLAUDE.md` before touching any
+view. It owns two things:
+
+- **Render-skip infrastructure** (`yux/cached.rs`) — `cached_child`, the
+  `record_render`/`record_notify` perf counters, `MissReason`. The one lever
+  that keeps typing latency O(changed), not O(whole tree).
+- **Reusable view primitives** (`yux/detail.rs`) — `DetailStyle` + domain-free
+  blocks (`multiline_text`, `kv_row`, `section_heading`, `note_block`,
+  `fmt_iso_datetime`) that any read-only detail panel composes from.
+
+The rules (enforced, each maps to a shipped bug): never `cx.notify()` in a
+render path; an expensive/stable surface is its own cached view entity embedded
+via `cached_child`, self-invalidating at its mutation site; globals (theme/zoom)
+are pushed via a `notify_*_views` walk; **state is encapsulated** — a component
+owns its UI state, reads (not owns) the global chrome off the root, and is the
+only thing that notifies for its state; and **every new cached surface ships a
+render-count test**. Reference components: `transcript_view.rs` (`TranscriptView`)
+and `linear_view.rs` (`LinearView`). When you build UX, compose from existing
+primitives and promote anything reused twice into `yux/detail.rs` — the goal is
+reuse and DRY.
 
 ### GUI screens
 

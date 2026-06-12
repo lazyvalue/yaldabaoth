@@ -408,6 +408,11 @@ pub(crate) enum PersistedKind {
     /// the in-memory variant is `Agent` to match the rename pass.
     #[serde(rename = "claude")]
     Agent { session_id: Option<String> },
+    /// A Linear tile. The loaded issue/project isn't persisted — restore opens
+    /// an empty Linear tile and the user re-enters the identifier (the data is
+    /// remote and cheap to re-fetch).
+    #[serde(rename = "linear")]
+    Linear {},
 }
 
 /// Persisted shadow of `BufferApp`'s mode (B1). `viewing`/`editing` carry the
@@ -558,6 +563,7 @@ pub(crate) fn snapshot_content(content: &App) -> PersistedKind {
             // `restore_agent_leaves` rebind via the side-channel.
             PersistedKind::Agent { session_id: None }
         }
+        App::Linear(_tile) => PersistedKind::Linear {},
     }
 }
 
@@ -761,6 +767,7 @@ pub(crate) fn restore_content(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             )))
         }
+        PersistedKind::Linear {} => App::Linear(LinearTile::new()),
     }
 }
 

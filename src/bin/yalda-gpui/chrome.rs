@@ -307,6 +307,7 @@ impl YaldaGpuiView {
                     self.render_browser(leaf_root, b, cx).into_any_element()
                 }
                 App::Agent(tile) => self.render_agent(leaf_root, tile, cx).into_any_element(),
+                App::Linear(tile) => self.render_linear(leaf_root, tile, cx).into_any_element(),
             };
 
             let mut title_bar = div()
@@ -453,6 +454,7 @@ impl YaldaGpuiView {
                 .and_then(|id| sessions.get(id))
                 .map(|s| s.read(cx).label.clone())
                 .unwrap_or_else(|| "claude".to_string()),
+            App::Linear(tile) => tile.title(),
         }
     }
 
@@ -710,6 +712,9 @@ impl YaldaGpuiView {
                         self.render_browser(leaf_root, b, cx).into_any_element()
                     }
                     App::Agent(tile) => self.render_agent(leaf_root, tile, cx).into_any_element(),
+                    App::Linear(tile) => {
+                        self.render_linear(leaf_root, tile, cx).into_any_element()
+                    }
                 };
                 // Pin the rail to the leaf it was opened from, not whichever
                 // leaf currently has focus. Falls back to the focused leaf
@@ -1248,6 +1253,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::open_linear))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))

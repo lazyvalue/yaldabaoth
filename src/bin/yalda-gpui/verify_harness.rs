@@ -3253,3 +3253,94 @@ fn transcript_021_anim_tick_busts_awaiting_cache(cx: &mut TestAppContext) {
          advances (post-await {after_await}), got {after_tick}"
     );
 }
+
+// ── yux cached-body regression: LinearView (linear_view.rs) ─────────────────
+// The Linear tile's body is a cached child entity. Typing in the tile's input
+// line notifies the ROOT (re-rendering the input row only); the body's entity
+// is NOT notified, so its render() is skipped. These pin that contract — the
+// yux/CLAUDE.md rule-5 render-count test for the second cached surface.
+
+/// Boot a window, open a Linear tile, render once (lazily creating the cached
+/// `LinearView`), and return the view + its body entity.
+#[cfg(test)]
+fn boot_with_linear<'a>(
+    cx: &'a mut TestAppContext,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    gpui::Entity<crate::LinearView>,
+) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        v.open_linear_inner(cx);
+    });
+    vcx.run_until_parked();
+    let lv = view.update(vcx, |v, _cx| match v.workspace.focused_content() {
+        Some(crate::App::Linear(tile)) => {
+            tile.view.clone().expect("render_linear lazily creates the LinearView")
+        }
+        _ => panic!("expected a focused Linear tile"),
+    });
+    (view, vcx, lv)
+}
+
+/// Typing in the Linear input notifies only the root; the cached body's
+/// render() is SKIPPED (count stays flat).
+#[gpui::test]
+fn linear_input_keystroke_is_render_flat(cx: &mut TestAppContext) {
+    crate::perf_reset("linear");
+    let (view, vcx, _lv) = boot_with_linear(cx);
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("linear");
+    assert!(base >= 1, "linear body must render at least once on first frame");
+
+    for _ in 0..5 {
+        view.update(vcx, |v, cx| {
+            if let Some(crate::App::Linear(tile)) = v.workspace.focused_content_mut() {
+                tile.input.push('x');
+            }
+            cx.notify(); // mirrors handle_linear_key's Char path (root notify)
+        });
+        vcx.run_until_parked();
+    }
+    let after = crate::perf_render_count("linear");
+    assert_eq!(
+        after, base,
+        "typing in the Linear input (root-only notify) must NOT re-render the \
+         cached body; count must stay flat ({base}), got {after}"
+    );
+}
+
+/// A body payload change (a fetch landing) notifies the body entity itself, so
+/// the NEXT frame re-renders it exactly once.
+#[gpui::test]
+fn linear_state_change_busts_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("linear");
+    let (_view, vcx, lv) = boot_with_linear(cx);
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("linear");
+
+    lv.update(vcx, |v, cx| {
+        v.set_state(crate::LinearViewState::Error("boom".into()));
+        cx.notify(); // mutation-site notify (the only thing that busts the cache)
+    });
+    vcx.run_until_parked();
+
+    let after = crate::perf_render_count("linear");
+    assert_eq!(
+        after,
+        base + 1,
+        "a body payload change must re-render the cached body exactly once \
+         (base {base}), got {after}"
+    );
+}

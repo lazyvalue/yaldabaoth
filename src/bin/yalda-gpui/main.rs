@@ -69,22 +69,29 @@ mod agent;
 mod agent_sessions;
 mod agent_ui;
 mod browser_ui;
-mod cached_panel;
 mod chrome;
 mod edit_ui;
 mod highlight_cache;
+mod linear;
+mod linear_ui;
+mod linear_view;
 mod persist;
 mod render_blocks;
 mod screens;
 mod transcript_view;
 #[cfg(test)]
 mod verify_harness;
+/// yux — reusable UX component layer (cached-view infra + view primitives).
+/// All UX work is built from here; see `yux/CLAUDE.md`.
+mod yux;
 pub(crate) use agent::*;
 pub(crate) use agent_sessions::*;
-pub(crate) use cached_panel::*;
+pub(crate) use linear::*;
+pub(crate) use linear_view::*;
 pub(crate) use persist::*;
 pub(crate) use render_blocks::*;
 pub(crate) use transcript_view::*;
+pub(crate) use yux::*;
 mod workspace;
 
 pub(crate) use highlight_cache::{HighlightCache, LineHl};
@@ -173,6 +180,7 @@ actions!(
         EnterEdit,
         EnterWp,
         OpenAgent,
+        OpenLinear,
         OpenMenu,
         OpenLocalMenu,
         Quit,
@@ -1165,6 +1173,7 @@ impl EditState {
 enum App {
     Buffer(BufferApp),
     Agent(AgentTile),
+    Linear(LinearTile),
 }
 
 impl App {
@@ -1175,8 +1184,9 @@ impl App {
     fn into_buffer_stash(self) -> Option<Box<BufferApp>> {
         match self {
             App::Buffer(buffer) => Some(Box::new(buffer)),
-            // Agent and Buffer are orthogonal — an Agent stashes no buffer.
+            // Agent/Linear and Buffer are orthogonal — they stash no buffer.
             App::Agent(_) => None,
+            App::Linear(_) => None,
         }
     }
 }
@@ -2444,8 +2454,8 @@ impl YaldaGpuiView {
         match self.workspace.focused_content().expect("no focused window") {
             // Already picking — nothing to do.
             App::Buffer(BufferApp::Picking(_)) => return,
-            // Agent tile: out of scope. No buffer here to pick into.
-            App::Agent(_) => {
+            // Agent/Linear tile: out of scope. No buffer here to pick into.
+            App::Agent(_) | App::Linear(_) => {
                 self.transient_status = Some("no buffer here".into());
                 cx.notify();
                 return;
@@ -2609,6 +2619,7 @@ impl YaldaGpuiView {
             // zoom is scoped to the doc view — but the notify keeps the contract
             // uniform with theme and is the audited invalidation path.)
             self.notify_transcript_views(MissReason::TextStyle, cx);
+            self.notify_linear_views(MissReason::TextStyle, cx);
             cx.notify();
         }
     }
@@ -2623,6 +2634,30 @@ impl YaldaGpuiView {
             let label = v.read(cx).perf_label;
             record_notify(label, reason);
             v.update(cx, |_tv, vcx| vcx.notify());
+        }
+    }
+
+    /// Notify every live [`LinearView`] (yux cached body). Theme and text-zoom
+    /// are GLOBAL, not per-tile state — and the Linear body reads both (it
+    /// scales with zoom), so their action handlers bust each cached body
+    /// directly, the same pushed-invalidation contract as the transcript views
+    /// (`yux/CLAUDE.md` rule 4). Linear views live in the layout tree (owned by
+    /// their tile), so collect handles in an immutable walk, then update each.
+    fn notify_linear_views(&mut self, reason: MissReason, cx: &mut Context<Self>) {
+        let mut views: Vec<Entity<LinearView>> = Vec::new();
+        for tab in self.workspace.tabs.iter() {
+            tab.layout.for_each_leaf(&mut |w| {
+                if let App::Linear(tile) = &w.content
+                    && let Some(v) = &tile.view
+                {
+                    views.push(v.clone());
+                }
+            });
+        }
+        for v in views {
+            let label = v.read(cx).perf_label();
+            record_notify(label, reason);
+            v.update(cx, |_lv, vcx| vcx.notify());
         }
     }
 
@@ -2719,6 +2754,7 @@ impl YaldaGpuiView {
         // the theme's agent palette in its render, so the theme-swap handler
         // busts each live transcript view directly (event context, fact 4).
         self.notify_transcript_views(MissReason::Refresh, cx);
+        self.notify_linear_views(MissReason::Refresh, cx);
         self.save_settings();
         cx.notify();
     }
@@ -3891,6 +3927,8 @@ impl YaldaGpuiView {
             Some(App::Buffer(BufferApp::Editing(_))) => (edit_local_menu(), "EDIT"),
             Some(App::Agent(_)) => (agent_local_menu(), "AGENT"),
             Some(App::Buffer(BufferApp::Picking(_))) => (browser_local_menu(), "BROWSE"),
+            // Linear has no `.` local menu (its keys are the input line itself).
+            Some(App::Linear(_)) => return,
             None => return,
         };
         self.transient_status = None;
@@ -6673,6 +6711,7 @@ fn tab_strip_label(tab: &workspace::Tab<App>) -> String {
             }
             App::Buffer(BufferApp::Picking(_)) => format!("Browser ({})", tab.display_label()),
             App::Agent(_) => format!("Claude ({})", tab.display_label()),
+            App::Linear(tile) => tile.title(),
         }
     } else {
         tab.display_label().to_string()
@@ -6779,6 +6818,7 @@ fn register_keymap(app: &mut GpuiApp) {
         // Word-processor entry rebinds to Ctrl-Shift-E.
         KeyBinding::new("ctrl-shift-e", EnterWp, Some("YaldaView")),
         KeyBinding::new("ctrl-k", OpenAgent, Some("YaldaView")),
+        KeyBinding::new("ctrl-l", OpenLinear, Some("YaldaView")),
         KeyBinding::new("space", OpenMenu, Some("YaldaView")),
         // Local leader (spec-menu-scopes.md): `.` opens the content-kind
         // local menu. Edit/Agent views intercept `.` in their key handlers
@@ -6804,6 +6844,7 @@ fn register_keymap(app: &mut GpuiApp) {
         KeyBinding::new("cmd-shift-ctrl-r", Restart, None),
         KeyBinding::new("cmd-o", OpenBrowser, None),
         KeyBinding::new("cmd-k", OpenAgent, None),
+        KeyBinding::new("cmd-l", OpenLinear, None),
         // Agent-window sidebar toggles (§32). Scoped to AgentView
         // so Cmd-1/Cmd-2 don't shadow anything in other screens.
         KeyBinding::new("cmd-1", ToggleTasklist, Some("AgentView")),
@@ -7134,6 +7175,7 @@ fn main() {
                 items: vec![
                     MenuItem::action("Open File Browser", OpenBrowser),
                     MenuItem::action("Open Claude Session", OpenAgent),
+                    MenuItem::action("Open Linear", OpenLinear),
                 ],
             },
         ]);

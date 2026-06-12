@@ -61,18 +61,19 @@ Anatomy (what every cached surface has):
 
 ## Don't hand-roll `impl Render` for an expensive surface
 
-Use **yux** (yalda-ux) — yalda's component layer over GPUI: the `CachedView`
-trait + `Cached<V>` host (`cached_panel.rs`, becoming `yux.rs`; spec:
-`docs/specs/spec-yux.md`). It owns the observe wiring, the fingerprint diff, the
-`record_*` accounting, and the cached embed, and its `build` method is handed no
-`Context` — so rule 1 is structural, not a thing you remember. Hand-rolling a
-`Render` impl with a large inline element tree is the mistake the whole module is
-shaped to prevent; if you think you need to, that is a signal to extend yux
-instead.
+Use **yux** (yalda-ux) — yalda's reusable UX layer over GPUI, in the `yux/`
+module (`yux/cached.rs` = `cached_child` + the `record_*` accounting +
+`MissReason`; `yux/detail.rs` = `DetailStyle` + reusable view primitives). Read
+`yux/CLAUDE.md`: it states the component rules (state encapsulation, the
+never-notify-in-render law, the render-count test) and the contribution mandate
+— **all reusable UX lives in or is built from `yux/`.** Reference components:
+`transcript_view.rs` and `linear_view.rs`. Hand-rolling a `Render` impl with a
+large inline element tree is the mistake the whole module is shaped to prevent;
+if you think you need to, that is a signal to compose from (or extend) yux.
 
 ## Instrumentation
 
-`record_render(label)` / `record_notify(label, MissReason)` (`cached_panel.rs`),
+`record_render(label)` / `record_notify(label, MissReason)` (`yux/cached.rs`),
 read in tests via `perf_render_count` / `perf_last_notify`. Run the live app
 with `YALDA_PERF=1` to watch counts. Render *count* is a proxy, not frame time —
 GPUI can't be driven headlessly for paint, so a real perf read is still a human
