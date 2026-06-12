@@ -1423,6 +1423,19 @@ fn agent_local_c_resolves_to_session_picker() {
 }
 
 #[test]
+fn theme_toggle_alternates_nightfox_and_folio() {
+    // From Folio → Nightfox; from anything else (Nightfox or any other theme)
+    // → Folio, so the toggle always lands on one of the pair and alternates.
+    assert_eq!(next_toggle_theme(ThemeName::Folio), ThemeName::Nightfox);
+    assert_eq!(next_toggle_theme(ThemeName::Nightfox), ThemeName::Folio);
+    // Any non-Folio theme jumps into the pair at Folio.
+    assert_eq!(next_toggle_theme(ThemeName::Dracula), ThemeName::Folio);
+    // Toggling twice from Folio returns to Folio.
+    let back = next_toggle_theme(next_toggle_theme(ThemeName::Folio));
+    assert_eq!(back, ThemeName::Folio);
+}
+
+#[test]
 fn agent_local_shift_c_resolves_to_claude_clear() {
     // `/clear` is reachable from the Agent local menu at `C` (capital, distinct
     // from lowercase `c` = select session). Regression guard for the original

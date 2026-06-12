@@ -225,6 +225,8 @@ actions!(
         ZoomIn,
         ZoomOut,
         ZoomReset,
+        // Flip between the Nightfox (dark) and Folio (light) themes.
+        ToggleTheme,
         // Copy selected text to system clipboard (all screens)
         CopySelection,
         // View-mode mouse text selection (doc view only, legacy alias)
@@ -344,6 +346,17 @@ fn make_caret(mode: EditMode, cursor_char: char, cursor_color: Hsla) -> AnyEleme
             " ".into()
         })
         .into_any_element()
+}
+
+/// The two-theme toggle decision (Nightfox ⇄ Folio): from Folio go to Nightfox,
+/// from anything else go to Folio. Pure so it's unit-testable without touching
+/// `set_theme`'s persistence/render side effects.
+fn next_toggle_theme(current: ThemeName) -> ThemeName {
+    if current == ThemeName::Folio {
+        ThemeName::Nightfox
+    } else {
+        ThemeName::Folio
+    }
 }
 
 /// Format a menu node's key sequence for display (`"f"`, `"g g"`,
@@ -2667,6 +2680,20 @@ impl YaldaGpuiView {
     /// Claude pick the theme up on their next paint via `md_highlight` /
     /// direct theme reads). Persisting the choice across restarts is a
     /// follow-up — for now the theme resets to Dracula on launch.
+    /// Flip between the two everyday themes: Nightfox (dark) and Folio (light).
+    /// From Folio → Nightfox; from anything else (Nightfox or any other theme)
+    /// → Folio, so the toggle always lands on one of the pair and alternates.
+    /// `set_theme` does the heavy lifting (syntect swap, doc re-render,
+    /// transcript bust, persist).
+    fn toggle_theme_now(&mut self, cx: &mut Context<Self>) {
+        self.set_theme(next_toggle_theme(self.theme.name), cx);
+    }
+
+    /// `Cmd-Shift-T` action handler (and the `theme-toggle` command).
+    fn toggle_theme(&mut self, _: &ToggleTheme, _w: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_theme_now(cx);
+    }
+
     fn set_theme(&mut self, name: ThemeName, cx: &mut Context<Self>) {
         if self.theme.name == name {
             return;
@@ -3992,6 +4019,7 @@ impl YaldaGpuiView {
             "theme-financial-times" => self.set_theme(ThemeName::FinancialTimes, cx),
             "theme-financial-times-dark" => self.set_theme(ThemeName::FinancialTimesDark, cx),
             "theme-folio" => self.set_theme(ThemeName::Folio, cx),
+            "theme-toggle" => self.toggle_theme_now(cx),
             "claude-status-bar" => {
                 self.agent_status_position = self.agent_status_position.toggle();
                 self.save_settings();
@@ -6739,6 +6767,7 @@ fn register_keymap(app: &mut GpuiApp) {
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         KeyBinding::new("cmd-t", NewTab, None),
         KeyBinding::new("cmd-shift-w", CloseTab, None),
+        KeyBinding::new("cmd-shift-t", ToggleTheme, None),
         // Vim-style split chord prefix (spec-tabs-and-splits.md §12–§14).
         // GPUI parses "ctrl-w s" as a two-keystroke chord; pressing
         // Ctrl-W alone never resolves (it's a pure prefix here).
