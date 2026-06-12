@@ -3344,3 +3344,51 @@ fn linear_state_change_busts_cache(cx: &mut TestAppContext) {
          (base {base}), got {after}"
     );
 }
+
+/// Navigating the project picker (a body-owned mutation) busts the cached body
+/// exactly once per move — the picker is part of LinearView's state.
+#[gpui::test]
+fn linear_picker_move_busts_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("linear");
+    let (_view, vcx, lv) = boot_with_linear(cx);
+    vcx.run_until_parked();
+
+    // Seed a multi-candidate picker.
+    lv.update(vcx, |v, cx| {
+        let cands = vec![
+            crate::ProjectCandidate {
+                id: "a".into(),
+                name: Some("Alpha".into()),
+                state: Some("started".into()),
+            },
+            crate::ProjectCandidate {
+                id: "b".into(),
+                name: Some("Beta".into()),
+                state: Some("planned".into()),
+            },
+        ];
+        v.set_state(crate::LinearViewState::ProjectPicker {
+            candidates: cands,
+            selected: 0,
+        });
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("linear");
+
+    // One move → one body re-render; selection advanced.
+    lv.update(vcx, |v, cx| {
+        v.picker_move(1);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    let after = crate::perf_render_count("linear");
+    assert_eq!(
+        after,
+        base + 1,
+        "a picker move must re-render the cached body exactly once (base {base}), got {after}"
+    );
+    let sel = lv.update(vcx, |v, _| v.selected_candidate().and_then(|c| c.name));
+    assert_eq!(sel.as_deref(), Some("Beta"), "picker_move advanced the selection");
+}

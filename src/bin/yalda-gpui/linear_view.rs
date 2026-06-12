@@ -19,6 +19,12 @@ pub(crate) enum LinearViewState {
     Loading(String),
     Issue(Box<IssueDetail>),
     Project(Box<ProjectDetail>),
+    /// A name search matched multiple projects — choose one (↑/↓ + Enter, or a
+    /// number key). `selected` is the highlighted row.
+    ProjectPicker {
+        candidates: Vec<ProjectCandidate>,
+        selected: usize,
+    },
     Error(String),
 }
 
@@ -57,6 +63,47 @@ impl LinearView {
 
     pub(crate) fn perf_label(&self) -> &'static str {
         self.perf_label
+    }
+
+    /// Is the body currently a project picker? (Drives key routing.)
+    pub(crate) fn is_picker(&self) -> bool {
+        matches!(self.state, LinearViewState::ProjectPicker { .. })
+    }
+
+    /// Move the picker selection by `delta` rows, wrapping. No-op off-picker.
+    pub(crate) fn picker_move(&mut self, delta: i32) {
+        if let LinearViewState::ProjectPicker {
+            candidates,
+            selected,
+        } = &mut self.state
+            && !candidates.is_empty()
+        {
+            let n = candidates.len() as i32;
+            *selected = (*selected as i32 + delta).rem_euclid(n) as usize;
+        }
+    }
+
+    /// Set the picker selection to `idx` if in range. No-op off-picker.
+    pub(crate) fn picker_set(&mut self, idx: usize) {
+        if let LinearViewState::ProjectPicker {
+            candidates,
+            selected,
+        } = &mut self.state
+            && idx < candidates.len()
+        {
+            *selected = idx;
+        }
+    }
+
+    /// The currently-highlighted candidate, if the body is a picker.
+    pub(crate) fn selected_candidate(&self) -> Option<ProjectCandidate> {
+        match &self.state {
+            LinearViewState::ProjectPicker {
+                candidates,
+                selected,
+            } => candidates.get(*selected).cloned(),
+            _ => None,
+        }
     }
 }
 
@@ -111,6 +158,10 @@ impl Render for LinearView {
                 .into_any_element(),
             LinearViewState::Issue(i) => linear_issue_body(i, &st).into_any_element(),
             LinearViewState::Project(p) => linear_project_body(p, &st).into_any_element(),
+            LinearViewState::ProjectPicker {
+                candidates,
+                selected,
+            } => linear_picker_body(candidates, *selected, &st).into_any_element(),
         };
 
         let scroll = self.scroll.clone();
@@ -148,6 +199,64 @@ fn linear_empty_body(st: &DetailStyle) -> gpui::Div {
         .child(SharedString::from(
             "↑/↓ or PageUp/PageDown scroll · Esc clears the input.",
         ))
+}
+
+fn linear_picker_body(candidates: &[ProjectCandidate], selected: usize, st: &DetailStyle) -> gpui::Div {
+    let mut col = div().flex().flex_col().w_full().gap_1();
+    col = col.child(
+        div()
+            .w_full()
+            .pb_1()
+            .text_color(st.dim)
+            .font_family(st.mono.clone())
+            .text_size(px(st.pt * 0.9))
+            .child(SharedString::from(format!(
+                "{} projects — ↑/↓ to choose, Enter to open (or press its number) · Esc to edit",
+                candidates.len()
+            ))),
+    );
+    let mut sel_bg = st.accent;
+    sel_bg.a = 0.16;
+    let transparent: Hsla = rgba(0x00000000).into();
+    for (i, c) in candidates.iter().enumerate() {
+        let is_sel = i == selected;
+        let name = c.name.clone().unwrap_or_else(|| "(unnamed)".into());
+        let state = c.state.clone().filter(|s| !s.is_empty()).unwrap_or_default();
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .items_center()
+                .w_full()
+                .px_2()
+                .py_1()
+                .bg(if is_sel { sel_bg } else { transparent })
+                .font_family(st.mono.clone())
+                .text_size(st.base)
+                .child(
+                    div()
+                        .w(px(28.0))
+                        .flex_none()
+                        .text_color(if is_sel { st.accent } else { st.dim })
+                        .child(SharedString::from(format!("{}.", i + 1))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(st.fg)
+                        .child(SharedString::from(name)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(st.dim)
+                        .child(SharedString::from(state)),
+                ),
+        );
+    }
+    col
 }
 
 fn linear_issue_body(i: &IssueDetail, st: &DetailStyle) -> gpui::Div {

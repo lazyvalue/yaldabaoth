@@ -206,21 +206,34 @@ query Issue($team: String!, $number: Float!) {
   }
 }"#;
 
-const PROJECT_QUERY: &str = r#"
-query Project($q: String!) {
-  projects(filter: { name: { containsIgnoreCase: $q } }, first: 1) {
-    nodes {
-      name
-      description
-      content
-      state
-      url
-      targetDate
-      lead { displayName name }
-      projectMilestones(first: 100) { nodes { name description targetDate } }
-      issues(first: 250) { nodes { identifier title state { name } } }
-      projectUpdates(first: 50) { nodes { body createdAt user { displayName name } } }
-    }
+/// Lightweight candidate row for the project picker (no heavy nested fields).
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ProjectCandidate {
+    pub id: String,
+    pub name: Option<String>,
+    pub state: Option<String>,
+}
+
+const PROJECT_SEARCH_QUERY: &str = r#"
+query ProjectSearch($q: String!) {
+  projects(filter: { name: { containsIgnoreCase: $q } }, first: 25) {
+    nodes { id name state }
+  }
+}"#;
+
+const PROJECT_DETAIL_QUERY: &str = r#"
+query ProjectDetail($id: String!) {
+  project(id: $id) {
+    name
+    description
+    content
+    state
+    url
+    targetDate
+    lead { displayName name }
+    projectMilestones(first: 100) { nodes { name description targetDate } }
+    issues(first: 250) { nodes { identifier title state { name } } }
+    projectUpdates(first: 50) { nodes { body createdAt user { displayName name } } }
   }
 }"#;
 
@@ -245,20 +258,30 @@ pub(crate) fn fetch_issue(key: &str, team: &str, number: u64) -> Result<IssueDet
     }
 }
 
-/// Fetch the best name-matching project for `query` (case-insensitive contains).
-pub(crate) fn fetch_project(key: &str, query: &str) -> Result<ProjectDetail, String> {
-    let data = graphql(key, PROJECT_QUERY, serde_json::json!({ "q": query }))?;
-    let node = data
+/// Search projects by name (case-insensitive contains), returning lightweight
+/// candidates for the picker. Empty vec = no match.
+pub(crate) fn fetch_projects(key: &str, query: &str) -> Result<Vec<ProjectCandidate>, String> {
+    let data = graphql(key, PROJECT_SEARCH_QUERY, serde_json::json!({ "q": query }))?;
+    let nodes = data
         .get("projects")
         .and_then(|p| p.get("nodes"))
         .and_then(|n| n.as_array())
-        .and_then(|a| a.first())
-        .cloned();
-    match node {
-        Some(n) => serde_json::from_value(n).map_err(|e| format!("parsing project failed: {e}")),
-        None => Err(format!(
-            "No project matching \"{query}\" — type part of the project name (not an issue id)."
-        )),
+        .cloned()
+        .unwrap_or_default();
+    Ok(nodes
+        .into_iter()
+        .filter_map(|n| serde_json::from_value(n).ok())
+        .collect())
+}
+
+/// Fetch a project's full detail by its id (the picker hands us the chosen id).
+pub(crate) fn fetch_project_by_id(key: &str, id: &str) -> Result<ProjectDetail, String> {
+    let data = graphql(key, PROJECT_DETAIL_QUERY, serde_json::json!({ "id": id }))?;
+    match data.get("project").cloned() {
+        Some(n) if !n.is_null() => {
+            serde_json::from_value(n).map_err(|e| format!("parsing project failed: {e}"))
+        }
+        _ => Err("project not found".to_string()),
     }
 }
 
@@ -266,6 +289,8 @@ pub(crate) fn fetch_project(key: &str, query: &str) -> Result<ProjectDetail, Str
 pub(crate) enum LinearFetch {
     Issue(Box<IssueDetail>),
     Project(Box<ProjectDetail>),
+    /// Project-name search hits — 0 ⇒ error, 1 ⇒ auto-open, >1 ⇒ picker.
+    Projects(Vec<ProjectCandidate>),
 }
 
 // ── Tile (layout-tree content) ──────────────────────────────────────────────
