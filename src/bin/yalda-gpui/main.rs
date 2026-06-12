@@ -1344,116 +1344,31 @@ struct TagInputOverlay {
 /// (search, claude-attach via socket, save-quit, …) that have no GPUI
 /// counterpart yet.
 fn gpui_menu() -> Vec<MenuNode> {
-    // Tile-scoped entries (edit views, reload, claude session management)
-    // live in the `.` local menus; rails live on their global chords
-    // (Cmd-B / Cmd-Shift-O / Cmd-Shift-B). The global menu is workspace-
-    // scoped only: create tiles, arrange windows, manage workspaces,
-    // layouts, quit.
+    // Workspace-scoped command menu (<space> leader). Per untitled.md
+    // "Workspace › Commands (12 jun)": only these commands belong in the
+    // workspace scope. Tile-scoped commands live in the `.` local menus;
+    // window/workspace/layout management lives on its Ctrl-W / Cmd chords;
+    // quit is Cmd-Q.
     vec![
+        MenuNode::entry("c", "set cwd", "workspace-set-cwd"),
         MenuNode::submenu(
             "n",
             "new",
             vec![
-                MenuNode::entry("o", "open file in this tile (Cmd-O)", "open-browser"),
-                MenuNode::entry("f", "new buffer tile", "new-buffer-tile"),
-                MenuNode::entry("b", "buffer list", "buffer-list"),
-                MenuNode::entry("c", "claude session tile", "new-agent-tile"),
+                MenuNode::entry("a", "agent", "new-agent-tile"),
+                MenuNode::entry("b", "buffer", "new-buffer-tile"),
             ],
         ),
         MenuNode::submenu(
-            "o",
-            "open in place",
+            "t",
+            "theme",
             vec![
-                MenuNode::entry("o", "open file (Cmd-O)", "open-browser"),
-                MenuNode::entry("f", "pick file here", "inplace-buffer-pick"),
-                MenuNode::entry("b", "buffer list", "buffer-list"),
-                MenuNode::entry("c", "claude session", "inplace-agent-tile"),
+                MenuNode::entry("n", "nightfox", "theme-nightfox"),
+                MenuNode::entry("f", "folio", "theme-folio"),
             ],
         ),
-        MenuNode::submenu(
-            "w",
-            "windows",
-            vec![
-                MenuNode::label("Split"),
-                MenuNode::entry("s", "split horizontal (Ctrl-W s)", "split-h"),
-                MenuNode::entry("v", "split vertical (Ctrl-W v)", "split-v"),
-                MenuNode::entry("c", "close tile (Cmd-W / Ctrl-W c)", "close-window"),
-                MenuNode::entry("o", "only this tile (Ctrl-W o)", "only-window"),
-                MenuNode::separator(),
-                MenuNode::label("Focus"),
-                MenuNode::entry("h", "focus left (Ctrl-W h)", "focus-left"),
-                MenuNode::entry("l", "focus right (Ctrl-W l)", "focus-right"),
-                MenuNode::entry("k", "focus up (Ctrl-W k)", "focus-up"),
-                MenuNode::entry("j", "focus down (Ctrl-W j)", "focus-down"),
-                MenuNode::entry("n", "focus next (Ctrl-W w)", "focus-next"),
-                MenuNode::entry("p", "focus prev (Ctrl-W W)", "focus-prev"),
-                MenuNode::separator(),
-                MenuNode::label("Size"),
-                MenuNode::entry("-", "shrink (Ctrl-W -)", "resize-shrink"),
-                MenuNode::entry("+", "grow (Ctrl-W +)", "resize-grow"),
-                MenuNode::entry("=", "equalize (Ctrl-W =)", "equalize"),
-            ],
-        ),
-        MenuNode::submenu(
-            "s",
-            "workspace",
-            vec![
-                MenuNode::entry("t", "new workspace (Cmd-T)", "new-tab"),
-                MenuNode::entry("x", "close workspace (Cmd-Shift-W)", "close-tab"),
-                MenuNode::entry("]", "next workspace (Ctrl-Tab)", "next-tab"),
-                MenuNode::entry("[", "prev workspace (Ctrl-Shift-Tab)", "prev-tab"),
-                MenuNode::entry("r", "rename workspace (Cmd-Shift-R)", "rename-tab"),
-                MenuNode::entry("c", "set cwd", "workspace-set-cwd"),
-                MenuNode::entry("m", "move tile to workspace (Ctrl-W m)", "move-tile"),
-                MenuNode::entry(
-                    "M",
-                    "also-show tile in workspace (Ctrl-W M)",
-                    "also-show-tile",
-                ),
-            ],
-        ),
-        MenuNode::submenu(
-            "l",
-            "layout",
-            vec![
-                MenuNode::label("Layout"),
-                MenuNode::entry("m", "manual", "layout-manual"),
-                MenuNode::entry("s", "master/stack", "layout-master-stack"),
-                MenuNode::entry("o", "monocle", "layout-monocle"),
-                MenuNode::entry("c", "columns", "layout-columns"),
-                MenuNode::entry("D", "desktop", "layout-desktop"),
-                MenuNode::entry("l", "cycle layout mode (Ctrl-W Space)", "cycle-layout"),
-                MenuNode::entry("g", "desktop grid colsxrows (Ctrl-W p)", "desktop-grid"),
-                MenuNode::entry("p", "promote to master (Ctrl-W Enter)", "promote-master"),
-                MenuNode::entry("i", "increase master count (Ctrl-W i)", "inc-master"),
-                MenuNode::entry("d", "decrease master count (Ctrl-W d)", "dec-master"),
-                MenuNode::separator(),
-                MenuNode::label("Marks"),
-                MenuNode::entry("'", "list marks", "list-marks"),
-                MenuNode::separator(),
-                MenuNode::label("Tags"),
-                MenuNode::entry("t", "tag buffer", "tag-add"),
-                MenuNode::entry("u", "untag buffer", "tag-remove"),
-                MenuNode::entry("v", "view tag", "tag-view"),
-                MenuNode::entry("a", "also-tag buffer", "tag-also"),
-                MenuNode::entry("x", "tag + view", "tag-send"),
-                MenuNode::entry("k", "bind tag shortcut", "tag-bind"),
-            ],
-        ),
-        MenuNode::submenu(
-            "d",
-            "dev",
-            vec![MenuNode::entry(
-                "g",
-                "rebuild & restart gui",
-                "dev-restart-gui",
-            )],
-        ),
-        MenuNode::separator(),
-        MenuNode::entry("t", "toggle theme — Nightfox ⇄ Folio (Cmd-Shift-T)", "theme-toggle"),
-        MenuNode::entry("v", "back to doc", "back-to-doc"),
-        MenuNode::separator(),
-        MenuNode::entry("q", "quit", "quit"),
+        MenuNode::entry("r", "rebuild and restart gui", "dev-restart-gui"),
+        MenuNode::entry("m", "mark tile", "mark-tile"),
     ]
 }
 
@@ -2750,6 +2665,18 @@ impl YaldaGpuiView {
         for tab in self.workspace.tabs.iter_mut() {
             re_render_layout_docs(&mut tab.layout, &self.theme);
         }
+        // Agent transcripts cache parsed code/table blocks with their span
+        // colors baked in at the old theme (keyed by content, not theme), so
+        // invalidate every live session's block + S1 caches to force a
+        // re-parse under the new theme — otherwise a code block parsed under
+        // the prior theme renders with stale colors (e.g. a light-on-light box
+        // surviving Folio → Nightfox). See `AgentViewModel::invalidate_theme`.
+        let session_ids: Vec<SessionId> = self.sessions.iter().map(|(id, _)| id).collect();
+        for id in session_ids {
+            if let Some(ent) = self.sessions.get(id) {
+                ent.update(cx, |s, _| s.state.view_model.invalidate_theme());
+            }
+        }
         // Theme is GLOBAL, not session state (ticket 021): the transcript reads
         // the theme's agent palette in its render, so the theme-swap handler
         // busts each live transcript view directly (event context, fact 4).
@@ -3894,22 +3821,10 @@ impl YaldaGpuiView {
     /// kind are disabled (dimmed, non-dispatching) rather than hidden, so the
     /// menu layout stays spatially stable.
     fn global_menu_disabled(&self) -> HashSet<String> {
-        let mut d = HashSet::new();
-        // `back-to-doc` only makes sense from an Edit tile. (The other
-        // tile-scoped entries moved to the `.` local menus — Phase 2.)
-        if !matches!(
-            self.workspace.focused_content(),
-            Some(App::Buffer(BufferApp::Editing(_)))
-        ) {
-            d.insert("back-to-doc".to_string());
-        }
-        // B2: Cmd+O / inplace-buffer-pick are Buffer-app-scoped. On an Agent
-        // tile they are inert (no buffer to pick into) — dim them in the menu.
-        if matches!(self.workspace.focused_content(), Some(App::Agent(_))) {
-            d.insert("open-browser".to_string());
-            d.insert("inplace-buffer-pick".to_string());
-        }
-        d
+        // Every workspace-scoped command (set cwd, new agent/buffer, theme,
+        // rebuild, mark tile) applies regardless of the focused content kind,
+        // so nothing is context-disabled in the pruned menu.
+        HashSet::new()
     }
 
     /// `.` — open the content-kind-specific local menu (spec-menu-scopes.md
@@ -4248,6 +4163,14 @@ impl YaldaGpuiView {
                 }
                 self.workspace.retile_active();
                 self.save_workspace_state();
+                cx.notify();
+            }
+            "mark-tile" => {
+                // Begin a set-mark chord on the focused tile: the next char
+                // typed assigns the mark (same as the bare `m{char}` chord).
+                // The full-screen chord overlay (render path) captures it.
+                self.pending_mark_chord = Some('m');
+                self.transient_status = Some("mark tile: press a letter".into());
                 cx.notify();
             }
             "list-marks" => {

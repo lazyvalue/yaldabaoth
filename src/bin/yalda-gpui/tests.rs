@@ -413,6 +413,56 @@ fn rebuild_renders_unparsed_range_as_lines() {
     );
 }
 
+/// Pull the background color baked into the first span of the first code
+/// block in a flat-items list (the syntect/`code_block_bg` bake that goes
+/// stale on a theme switch).
+fn first_code_block_bg(flat: &[FlatItem]) -> Option<yalda::style::Color> {
+    flat.iter().find_map(|f| match f {
+        FlatItem::Block(b) => match b.as_ref() {
+            RenderedBlock::CodeBlock { lines, .. } => lines.first()?.spans.first()?.style.bg,
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Theme-switch invariant (the "washed-out code block in Nightfox" bug): a
+/// fenced code block bakes its span colors (background + syntect foregrounds)
+/// in at parse time, and `block_cache` keys on content, not theme — so a
+/// rebuild under a new theme with an unchanged frozen count REUSES the stale
+/// parse. `invalidate_theme` must force the re-parse so the block adopts the
+/// new theme's colors instead of rendering, e.g., a Folio light box on a
+/// Nightfox transcript.
+#[test]
+fn theme_switch_invalidate_reparses_code_blocks() {
+    let mut st = AgentState::new_for_test();
+    let light = Theme::folio();
+    let dark = Theme::nightfox();
+    let (lines, frozen, frozen_len) = synthetic_transcript(1, 4);
+
+    let (flat1, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &light, 1);
+    let bg_light = first_code_block_bg(&flat1).expect("a parsed code block under the light theme");
+
+    // No invalidate: same frozen count ⇒ the stale light-theme parse is reused
+    // even though we rebuild under the dark theme. This is the bug.
+    let (flat2, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &dark, 2);
+    assert_eq!(
+        first_code_block_bg(&flat2),
+        Some(bg_light),
+        "without invalidation the block keeps the prior theme's baked colors"
+    );
+
+    // Invalidate, then rebuild under the dark theme: the block re-parses and
+    // its baked background must now differ from the light theme's.
+    st.view_model.invalidate_theme();
+    let (flat3, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &dark, 3);
+    let bg_dark = first_code_block_bg(&flat3).expect("a re-parsed code block under the dark theme");
+    assert_ne!(
+        bg_dark, bg_light,
+        "after invalidate_theme the code block adopts the new theme's colors"
+    );
+}
+
 /// Cost probe for the worksheet-keystroke path: repeated rebuilds over a
 /// large transcript with the frozen prefix unchanged. Prints the per-
 /// rebuild cost; the assert is a generous debug-build ceiling that only
@@ -1268,31 +1318,17 @@ fn gpui_menu_has_required_entries() {
     let mut leaf_actions: Vec<&str> = Vec::new();
     collect_leaves(&menu, &mut leaf_actions);
     // The expected leaf actions — change here if gpui_menu changes.
+    // Per untitled.md "Workspace › Commands (12 jun)" the workspace menu
+    // is pruned to exactly these: set cwd, new agent/buffer, theme
+    // nightfox/folio, rebuild+restart, mark tile.
     let expected = [
-        // "open file here" returned to the global new-submenu by user
-        // request (2026-06-10) — replaces the focused tile in place, so
-        // it's workspace-scoped enough to live here.
-        "open-browser",
-        "new-buffer-tile",
-        "buffer-list",
+        "workspace-set-cwd",
         "new-agent-tile",
-        "split-h",
-        "close-window",
-        "new-tab",
-        "move-tile",
-        "cycle-layout",
-        // Direct layout-mode selection (no cycling) + desktop grid size.
-        "layout-manual",
-        "layout-master-stack",
-        "layout-monocle",
-        "layout-columns",
-        "layout-desktop",
-        "desktop-grid",
-        "tag-add",
-        "list-marks",
+        "new-buffer-tile",
+        "theme-nightfox",
+        "theme-folio",
         "dev-restart-gui",
-        "back-to-doc",
-        "quit",
+        "mark-tile",
     ];
     for e in expected {
         assert!(
@@ -1302,25 +1338,22 @@ fn gpui_menu_has_required_entries() {
             leaf_actions
         );
     }
-    // Tile-scoped + chrome entries removed from the global menu
-    // (Phase 2 cleanup + restructure): they live in the `.` local
-    // menus / on chords; themes were killed outright.
+    // Everything else moved out of the workspace scope: tile commands to
+    // the `.` local menus, window/workspace/layout management to chords,
+    // quit to Cmd-Q.
     for gone in [
-        "enter-edit",
-        "enter-wp",
-        "reload-file",
-        "claude-status-bar",
-        "rail-files",
-        "rail-outline",
-        "rail-flip",
-        "claude-new",
-        "claude-list",
-        "claude-close",
-        "claude-rename",
-        "agent-input-toggle",
-        "claude-mode-cycle",
-        "theme-dracula",
-        "theme-folio",
+        "open-browser",
+        "buffer-list",
+        "split-h",
+        "close-window",
+        "new-tab",
+        "move-tile",
+        "cycle-layout",
+        "layout-manual",
+        "tag-add",
+        "list-marks",
+        "back-to-doc",
+        "quit",
     ] {
         assert!(
             !leaf_actions.contains(&gone),
@@ -1331,12 +1364,12 @@ fn gpui_menu_has_required_entries() {
 
 #[test]
 fn menu_state_round_trip_picks_command() {
-    // Pressing 'q' at root closes the menu and returns "quit".
+    // Pressing 'c' at root closes the menu and returns "workspace-set-cwd".
     let mut state = MenuState::new();
     state.open();
     let menu = gpui_menu();
-    let cmd = state.process_key(KeyPress::new(Key::Char('q'), KMods::NONE), &menu);
-    assert_eq!(cmd, Some("quit".to_string()));
+    let cmd = state.process_key(KeyPress::new(Key::Char('c'), KMods::NONE), &menu);
+    assert_eq!(cmd, Some("workspace-set-cwd".to_string()));
     assert!(!state.is_active(), "menu should close after a leaf select");
 }
 
@@ -1451,28 +1484,28 @@ fn agent_local_shift_c_resolves_to_claude_clear() {
 }
 
 #[test]
-fn menu_n_f_resolves_to_new_buffer_tile() {
-    // `n` opens the new submenu; `f` creates a new buffer tile (in Picking).
+fn menu_n_b_resolves_to_new_buffer_tile() {
+    // `n` opens the new submenu; `b` creates a new buffer tile (in Picking).
     let mut state = MenuState::new();
     state.open();
     let menu = gpui_menu();
     let after_n = state.process_key(KeyPress::new(Key::Char('n'), KMods::NONE), &menu);
     assert_eq!(after_n, None, "n alone should open the new submenu");
     assert!(state.is_active(), "submenu open keeps menu state active");
-    let cmd = state.process_key(KeyPress::new(Key::Char('f'), KMods::NONE), &menu);
+    let cmd = state.process_key(KeyPress::new(Key::Char('b'), KMods::NONE), &menu);
     assert_eq!(cmd, Some("new-buffer-tile".to_string()));
 }
 
 #[test]
 fn menu_root_submenus_resolve() {
-    // Root layout after the restructure: n=new, w=windows, s=workspace,
-    // l=layout — each a submenu; theme is gone entirely.
+    // Root layout (untitled.md "Workspace › Commands"): n=new, t=theme are
+    // the two submenus; the rest are leaves.
     let menu = gpui_menu();
     for (ch, follow, expected) in &[
-        ('w', 's', "split-h"),
-        ('s', 't', "new-tab"),
-        ('l', 'l', "cycle-layout"),
-        ('n', 'c', "new-agent-tile"),
+        ('n', 'a', "new-agent-tile"),
+        ('n', 'b', "new-buffer-tile"),
+        ('t', 'n', "theme-nightfox"),
+        ('t', 'f', "theme-folio"),
     ] {
         let mut state = MenuState::new();
         state.open();
@@ -1489,14 +1522,8 @@ fn menu_root_submenus_resolve() {
 
 #[test]
 fn menu_e_and_w_resolve_to_edit_views() {
-    // Phase 2 cleanup: enter-edit / enter-wp moved from the global menu
-    // to the Doc local menu; only `v` (back-to-doc) stays global.
-    let menu = gpui_menu();
-    let mut state = MenuState::new();
-    state.open();
-    let cmd = state.process_key(KeyPress::new(Key::Char('v'), KMods::NONE), &menu);
-    assert_eq!(cmd, Some("back-to-doc".to_string()));
-
+    // enter-edit / enter-wp live in the Doc local menu (the workspace menu
+    // no longer carries any tile-scoped entries).
     let local = doc_local_menu();
     for (ch, expected) in &[('e', "enter-edit"), ('w', "enter-wp")] {
         let mut state = MenuState::new();
