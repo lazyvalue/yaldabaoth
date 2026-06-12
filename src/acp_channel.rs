@@ -378,13 +378,15 @@ fn allow_tool_kind(mode: PermissionMode, kind: ToolKind) -> bool {
 }
 
 /// Ordered candidate list for an empty `command_str`. Tried in sequence;
-/// the first that successfully spawns wins. The adapter was renamed and
-/// moved to the ACP org — `@agentclientprotocol/claude-agent-acp` (binary
-/// `claude-agent-acp`), which bundles the modern Agent SDK 0.3.x runtime
-/// (Workflow + the full multi-agent toolset). We prefer it, falling back to
-/// the legacy `@zed-industries/claude-code-acp` (binary `claude-code-acp`,
-/// SDK 0.2.x, no Workflow) for anyone who only has the old package.
-pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-agent-acp", "claude-code-acp"];
+/// the first that successfully spawns wins. The only supported adapter is
+/// `@agentclientprotocol/claude-agent-acp` (binary `claude-agent-acp`), which
+/// bundles the modern Agent SDK 0.3.x runtime (Workflow + the full multi-agent
+/// toolset) and honors our `_meta.systemPrompt.append` tuning. The legacy
+/// `@zed-industries/claude-code-acp` (binary `claude-code-acp`, SDK 0.2.x) is
+/// deliberately NOT a fallback: it ignores the append and runs the untuned
+/// SDK prompt, so a stale install must fail loud ("no ACP agent on PATH")
+/// rather than silently launch a worse agent.
+pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-agent-acp"];
 
 /// How long to wait for `session/load` (resume) before giving up and spawning a
 /// fresh `session/new`. `session/load` returns only AFTER the agent re-emits the
@@ -1396,6 +1398,10 @@ async fn worker_async(
     // CLAUDE_CODE_* vars (SESSION_ID, ENTRYPOINT, etc.) are passed through
     // since the agent may key behavior off them.
     cmd.env_remove("CLAUDECODE");
+    // Reasoning depth is intentionally NOT configured here. The adapter/SDK
+    // already default to adaptive thinking at effort "high", so a raw
+    // `MAX_THINKING_TOKENS` budget would only fight the adaptive system. Do
+    // not re-introduce it — reasoning depth is not the capability lever.
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         // Pipe-and-discard the agent's stderr by default. Agents (including
@@ -1749,6 +1755,25 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         m.insert(
                             "systemPrompt".to_string(),
                             serde_json::json!({"append": claude_code_append.as_str()}),
+                        );
+                        // Pin the SDK's filesystem setting sources so the hosted
+                        // agent loads CLAUDE.md + .claude/settings.json (incl. the
+                        // `model` pin) exactly like the Claude Code TUI. The
+                        // adapter already DEFAULTS to ["user","project","local"]
+                        // (acp-agent.js: the hardcoded `settingSources` that
+                        // `...userProvidedOptions` only overrides when the client
+                        // sends `_meta.claudeCode.options`), but stating it here
+                        // makes yalda's intent durable against an adapter default
+                        // change. We set ONLY `settingSources` under `options` —
+                        // `tools`/`settings` stay unset so they keep the adapter's
+                        // own defaults (preset `claude_code` tools, etc.).
+                        m.insert(
+                            "claudeCode".to_string(),
+                            serde_json::json!({
+                                "options": {
+                                    "settingSources": ["user", "project", "local"]
+                                }
+                            }),
                         );
                         m
                     };
