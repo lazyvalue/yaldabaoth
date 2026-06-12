@@ -21,26 +21,27 @@ this is low-risk and unblocks 025/021.
 
 ## Subtasks
 
-- [ ] Delete `FingerprintedPanel` + `notify_if_changed` + `last_fp`; add
+- [x] Delete `FingerprintedPanel` + `notify_if_changed` + `last_fp`; add
       `cached_child(view)` / `cached_child_styled(view, style)`.
-- [ ] Rewrite module docs: facts 2–6 from `project.md` with gpui file:line
-      (`view.rs:102/170-176/209-218`, `window.rs:116/1304/1915/1018`,
-      `app.rs:1301`).
-- [ ] Counters (debug/`YALDA_PERF`): per-entity render count + cached hit/miss
+- [x] Rewrite module docs: facts 2–6 from `project.md` with gpui file:line
+      (`view.rs:103/170-176/209-212`, `window.rs:116/1304/1926/128`,
+      `app.rs:780/1301`).
+- [x] Counters (debug/`YALDA_PERF`): per-entity render count + cached hit/miss
       with miss reason (dirtied / bounds / text-style / refresh — infer: we
       can't see inside gpui, so count renders + record last-notify reason at
       our notify sites; document the inference limits).
-- [ ] Tests in `verify_harness.rs`:
-  - [ ] Keep the render-skip proof (parent notify does not re-render the
-        cached child) — passes today, keep green.
-  - [ ] **Canonical protocol:** mutate a model entity inside `update` →
-        `cx.observe` callback notifies the view → next frame re-renders fresh.
-  - [ ] **Timing-law pin:** a `cx.notify` issued from *inside* a render does
+- [x] Tests in `verify_harness.rs`:
+  - [x] Keep the render-skip proof (parent notify does not re-render the
+        cached child) — rewritten to the rev-2 API
+        (`cached_panel_skips_render_until_child_is_notified`), green.
+  - [x] **Canonical protocol:** mutate a model entity inside `update` →
+        `cx.observe` callback notifies the view → next frame re-renders fresh
+        (`cached_observe_protocol_busts_cache_fresh`).
+  - [x] **Timing-law pin:** a `cx.notify` issued from *inside* a render does
         NOT invalidate that frame and does NOT schedule a redraw on its own
-        (assert the child's render count stays flat until an external notify).
-        This pins the gpui behavior rev 1 tripped over; if a gpui upgrade
-        changes it, fail loudly here.
-- [ ] Build + full test suite.
+        (`cached_notify_from_render_is_parked`). Pins the gpui behavior rev 1
+        tripped over; a gpui upgrade that changes it fails loudly here.
+- [x] Build + full test suite (177 bin tests + full workspace suite green).
 
 ## Verification
 

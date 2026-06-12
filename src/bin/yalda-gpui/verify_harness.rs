@@ -2611,30 +2611,45 @@ fn multi_session_persistence_round_trips_distinct_sids() {
     assert!(loaded[1].tasklist_open);
 }
 
-// ---- Render-skip keystone (CachedPanel) ----------------------------------
+// ---- Render-skip keystone + invalidation model (rev 2) -------------------
 //
 // The single most important mechanism of the responsiveness refactor: a child
 // panel embedded as a *cached* `AnyView` must have its `render()` SKIPPED when
-// the parent re-renders but the child was never notified (its inputs unchanged),
-// and re-run only when its fingerprint moves and `CachedPanel::notify_if_changed`
-// dirties it. This test proves the GPUI `cached()` wiring actually skips render
-// — not just that a counter increments. The negative leg (step b) is the proof:
-// if `element()` forgot `.cached()`, the parent re-render WOULD re-run the
-// child's render and the step-(b) assert would catch it (see the in-test note).
+// the parent re-renders but the child was never notified (its inputs
+// unchanged), and re-run only when the child entity is itself dirtied — the
+// rev-2 way: a `cx.observe(model) -> cx.notify()` on the view, or a notify at
+// the model's mutation site. (Rev 1's fingerprint poll from inside `render()`
+// is retired — see `project.md` "Design history" and `cached_panel.rs` docs.)
+//
+// Three tests pin the model:
+//   * `cached_panel_skips_render_until_child_is_notified` — the render-skip
+//     proof: a parent-only notify does NOT re-render the cached child; a notify
+//     on the child entity does. (Adapted from the old fingerprint test.)
+//   * `cached_observe_protocol_busts_cache_fresh` — the CANONICAL protocol:
+//     mutate a model entity inside `update`, the view's `cx.observe` callback
+//     notifies the view, and the next frame re-renders fresh (zero frames late).
+//   * `cached_notify_from_render_is_parked` — the TIMING-LAW pin: a `cx.notify`
+//     issued from INSIDE a `render()` does NOT invalidate that frame and does
+//     NOT schedule a redraw (`project.md` fact 4 / `window.rs:116`). This pins
+//     the gpui behavior rev 1 tripped over; a gpui upgrade that changes it
+//     fails loudly here.
 
 #[cfg(test)]
 thread_local! {
-    /// Incremented inside `Probe::render`. The render-skip proof reads this
+    /// Incremented inside `Probe::render`. The render-skip proofs read this
     /// across notify cycles (mirrors the `VIEW_MODEL_REBUILDS` counter idiom).
     static PROBE_RENDERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Test-only leaf view: counts its own renders and exposes a settable
-/// fingerprint. Its `render()` returns a SIZED div (cached layout is sized from
-/// the style, but the content still must be a real element).
+/// Test-only leaf view: counts its own renders. Its `render()` returns a SIZED
+/// div (cached layout is sized from the style, but the content still must be a
+/// real element). Also feeds the `cached_panel` perf counter under a label so
+/// the instrumentation path is exercised headlessly.
 #[cfg(test)]
 struct Probe {
-    fp: u64,
+    /// Optional model the probe observes; mutating it (via the observe wiring
+    /// in `cached_observe_protocol_busts_cache_fresh`) busts the cache.
+    _model: Option<gpui::Entity<u64>>,
 }
 
 #[cfg(test)]
@@ -2646,23 +2661,18 @@ impl gpui::Render for Probe {
     ) -> impl gpui::IntoElement {
         use gpui::Styled;
         PROBE_RENDERS.with(|c| c.set(c.get() + 1));
+        crate::record_render("test-probe");
         gpui::div().size_full()
     }
 }
 
-#[cfg(test)]
-impl crate::FingerprintedPanel for Probe {
-    fn render_fp(&self) -> u64 {
-        self.fp
-    }
-}
-
-/// Parent test view: holds the child `Entity<Probe>` and its `CachedPanel`, and
-/// renders the cached panel inside a sized container. The parent re-renders
-/// every frame (root always does); the cached child must not, unless dirtied.
+/// Parent test view: holds the child `Entity<Probe>` and embeds it via the
+/// rev-2 [`cached_child`] helper inside a sized container. The parent
+/// re-renders every frame (root always does); the cached child must not, unless
+/// its own entity is dirtied.
 #[cfg(test)]
 struct CachedHost {
-    panel: crate::CachedPanel<Probe>,
+    child: gpui::Entity<Probe>,
 }
 
 #[cfg(test)]
@@ -2677,26 +2687,25 @@ impl gpui::Render for CachedHost {
         gpui::div()
             .w(px(400.0))
             .h(px(300.0))
-            .child(self.panel.element(crate::size_full_style()))
+            .child(crate::cached_child(self.child.clone()))
     }
 }
 
-/// THE keystone proof. Three legs:
+/// THE keystone proof, rev 2. Three legs:
 ///   (a) first frame populates the cache: render-count == 1.
 ///   (b) notify the PARENT only + re-render: the child's render-count MUST stay
 ///       at 1 — a parent re-render does NOT re-render the un-dirtied cached
-///       child. This is the core render-skip guarantee.
-///   (c) change the Probe's fp and call `notify_if_changed` (dirties the child)
-///       + re-render: render-count MUST increment to 2 (cache invalidated).
+///       child. This is the core render-skip guarantee (parent notify dirties
+///       the parent + its ancestors, NOT the child — `window.rs:1304`).
+///   (c) notify the CHILD entity + re-render: render-count MUST increment to 2
+///       (the cached entity is in `dirty_views`, so its render runs).
 #[gpui::test]
-fn cached_panel_skips_render_until_fingerprint_changes(cx: &mut TestAppContext) {
+fn cached_panel_skips_render_until_child_is_notified(cx: &mut TestAppContext) {
     PROBE_RENDERS.with(|c| c.set(0));
 
     let (host, vcx) = cx.add_window_view(|_window, cx| {
-        // Build the child entity, seed a CachedPanel from it.
-        let probe = cx.new(|_cx| Probe { fp: 1 });
-        let panel = crate::CachedPanel::new(probe, cx);
-        CachedHost { panel }
+        let child = cx.new(|_cx| Probe { _model: None });
+        CachedHost { child }
     });
 
     // --- (a) Initial frame populates the cache. ---
@@ -2708,7 +2717,7 @@ fn cached_panel_skips_render_until_fingerprint_changes(cx: &mut TestAppContext) 
     );
 
     // --- (b) Notify the PARENT only. The child is NOT in dirty_views, so its
-    //     cached prepaint is reused and render() is SKIPPED. If `element()`
+    //     cached prepaint is reused and render() is SKIPPED. If `cached_child`
     //     forgot `.cached()`, the parent re-render would re-run the child here
     //     and this assert would fail — so it is NOT a tautology. ---
     host.update(vcx, |_v, cx| cx.notify());
@@ -2720,35 +2729,137 @@ fn cached_panel_skips_render_until_fingerprint_changes(cx: &mut TestAppContext) 
          (render-skip is the whole point); render-count went to {after_parent_notify}"
     );
 
-    // Sanity: notify_if_changed with an UNCHANGED fingerprint must return false
-    // and must NOT dirty the child — render stays skipped.
-    let changed = host.update(vcx, |v, cx| v.panel.notify_if_changed(cx));
-    assert!(
-        !changed,
-        "notify_if_changed must return false when the fingerprint is unchanged"
+    // --- (c) Notify the CHILD entity. It enters `dirty_views`, so cached()
+    //     re-runs its render. This is the rev-2 invalidation: notify the view
+    //     itself (what a `cx.observe` callback or mutation site would do). ---
+    host.update(vcx, |v, cx| v.child.update(cx, |_p, cx| cx.notify()));
+    vcx.run_until_parked();
+    let after_child_notify = PROBE_RENDERS.with(|c| c.get());
+    assert_eq!(
+        after_child_notify, 2,
+        "notifying the cached child entity must re-run its render exactly once more, \
+         got {after_child_notify}"
     );
+}
+
+/// CANONICAL OBSERVE-PROTOCOL test. A view `cx.observe`s a model entity; the
+/// callback `cx.notify()`s the VIEW. Mutating the model inside `cx.update` (the
+/// mutation site notifies the model) fires the observer OUTSIDE the draw
+/// (`apply_notify_effect`, `app.rs:1301`), which notifies the view, dirtying it
+/// — so the NEXT frame re-renders the cached child fresh, zero frames late.
+/// This is the rev-2 cache-busting path (`project.md` fact 5 / component model).
+#[gpui::test]
+fn cached_observe_protocol_busts_cache_fresh(cx: &mut TestAppContext) {
+    PROBE_RENDERS.with(|c| c.set(0));
+
+    let (host, vcx) = cx.add_window_view(|_window, cx| {
+        // The domain model: a plain entity standing in for an AgentSession.
+        let model = cx.new(|_cx| 0u64);
+        // The cached child observes the model and self-notifies on change —
+        // the canonical `cx.observe(model) -> cx.notify(view)` wiring.
+        let child = cx.new(|cx| {
+            cx.observe(&model, |_probe, _model, cx| {
+                // Outside the draw (effect flush): legitimate to notify the view.
+                crate::record_notify("test-probe", crate::MissReason::Dirtied);
+                cx.notify();
+            })
+            .detach();
+            Probe {
+                _model: Some(model.clone()),
+            }
+        });
+        CachedHost { child }
+    });
+
+    // First frame populates the cache.
     vcx.run_until_parked();
     assert_eq!(
         PROBE_RENDERS.with(|c| c.get()),
         1,
-        "an unchanged fingerprint must not invalidate the cache"
+        "first frame renders the child once"
     );
 
-    // --- (c) Move the fingerprint, then notify_if_changed (dirties the child).
-    //     The cache is invalidated and render() runs again. ---
-    let changed = host.update(vcx, |v, cx| {
-        v.panel.view().update(cx, |p, _cx| p.fp = 2);
-        v.panel.notify_if_changed(cx)
+    // Mutate the MODEL at its mutation site (notify the model). The view's
+    // observe callback fires in effect flush and notifies the view; the next
+    // frame re-renders the cached child — fresh, not a frame late.
+    host.update(vcx, |v, cx| {
+        let model = v.child.read(cx)._model.clone().expect("model");
+        model.update(cx, |n, cx| {
+            *n += 1;
+            cx.notify();
+        });
     });
-    assert!(
-        changed,
-        "notify_if_changed must return true after the fingerprint moves"
-    );
     vcx.run_until_parked();
-    let after_invalidate = PROBE_RENDERS.with(|c| c.get());
     assert_eq!(
-        after_invalidate, 2,
-        "a changed fingerprint (child dirtied) must re-run the child's render exactly once more, \
-         got {after_invalidate}"
+        PROBE_RENDERS.with(|c| c.get()),
+        2,
+        "mutating the observed model must bust the cached child's cache via the \
+         observe->notify protocol — exactly one extra render, zero frames late"
+    );
+}
+
+/// TIMING-LAW PIN. A `cx.notify` issued from INSIDE a `render()` is parked
+/// (`invalidate_view` under `draw_phase != None`, `window.rs:116`): it does NOT
+/// dirty the current frame (`dirty_views` is drained at draw start,
+/// `window.rs:1926`) and does NOT schedule a next frame (the loop draws only
+/// when `is_dirty()`, `window.rs:128`). So a view that notifies itself from
+/// render renders ONCE and then goes quiet — the render count stays flat until
+/// an EXTERNAL notify arrives. This pins the exact gpui behavior rev 1 tripped
+/// over; a gpui change that makes mid-draw notify self-perpetuate (or schedule
+/// a frame) would spin the render loop and fail loudly here.
+#[gpui::test]
+fn cached_notify_from_render_is_parked(cx: &mut TestAppContext) {
+    use std::cell::Cell;
+    thread_local! {
+        static SELF_NOTIFY_RENDERS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    // A view that (illegally) notifies itself from inside render().
+    struct SelfNotifier;
+    impl gpui::Render for SelfNotifier {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use gpui::Styled;
+            SELF_NOTIFY_RENDERS.with(|c| c.set(c.get() + 1));
+            // THE forbidden call. Under the timing law this is parked: it must
+            // not re-dirty this view for another frame.
+            cx.notify();
+            gpui::div().size_full()
+        }
+    }
+
+    SELF_NOTIFY_RENDERS.with(|c| c.set(0));
+    let (view, vcx) = cx.add_window_view(|_window, _cx| SelfNotifier);
+
+    // Drive frames. If the mid-draw notify scheduled a redraw, the render loop
+    // would spin and this count would climb past 1.
+    vcx.run_until_parked();
+    let after_first = SELF_NOTIFY_RENDERS.with(|c| c.get());
+    assert_eq!(
+        after_first, 1,
+        "a notify issued from render must NOT schedule another frame on its own; \
+         render ran {after_first} times (loop is spinning => timing law broken)"
+    );
+
+    // Park again to be sure no deferred frame is pending. Still flat.
+    vcx.run_until_parked();
+    assert_eq!(
+        SELF_NOTIFY_RENDERS.with(|c| c.get()),
+        1,
+        "mid-draw notify is parked: no redraw is scheduled, count stays flat"
+    );
+
+    // An EXTERNAL notify (outside the draw — the legitimate path) DOES schedule
+    // a redraw: exactly one more render. Proves the view is still wired, the
+    // first assertions weren't passing because rendering was somehow disabled.
+    view.update(vcx, |_v, cx| cx.notify());
+    vcx.run_until_parked();
+    let after_external = SELF_NOTIFY_RENDERS.with(|c| c.get());
+    assert_eq!(
+        after_external, 2,
+        "an external (non-draw) notify must schedule exactly one redraw, got {after_external}"
     );
 }
