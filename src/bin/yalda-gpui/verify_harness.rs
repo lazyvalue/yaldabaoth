@@ -2610,3 +2610,145 @@ fn multi_session_persistence_round_trips_distinct_sids() {
     assert_eq!(loaded[1].mode, InputModeKind::Worksheet);
     assert!(loaded[1].tasklist_open);
 }
+
+// ---- Render-skip keystone (CachedPanel) ----------------------------------
+//
+// The single most important mechanism of the responsiveness refactor: a child
+// panel embedded as a *cached* `AnyView` must have its `render()` SKIPPED when
+// the parent re-renders but the child was never notified (its inputs unchanged),
+// and re-run only when its fingerprint moves and `CachedPanel::notify_if_changed`
+// dirties it. This test proves the GPUI `cached()` wiring actually skips render
+// — not just that a counter increments. The negative leg (step b) is the proof:
+// if `element()` forgot `.cached()`, the parent re-render WOULD re-run the
+// child's render and the step-(b) assert would catch it (see the in-test note).
+
+#[cfg(test)]
+thread_local! {
+    /// Incremented inside `Probe::render`. The render-skip proof reads this
+    /// across notify cycles (mirrors the `VIEW_MODEL_REBUILDS` counter idiom).
+    static PROBE_RENDERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only leaf view: counts its own renders and exposes a settable
+/// fingerprint. Its `render()` returns a SIZED div (cached layout is sized from
+/// the style, but the content still must be a real element).
+#[cfg(test)]
+struct Probe {
+    fp: u64,
+}
+
+#[cfg(test)]
+impl gpui::Render for Probe {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::Styled;
+        PROBE_RENDERS.with(|c| c.set(c.get() + 1));
+        gpui::div().size_full()
+    }
+}
+
+#[cfg(test)]
+impl crate::FingerprintedPanel for Probe {
+    fn render_fp(&self) -> u64 {
+        self.fp
+    }
+}
+
+/// Parent test view: holds the child `Entity<Probe>` and its `CachedPanel`, and
+/// renders the cached panel inside a sized container. The parent re-renders
+/// every frame (root always does); the cached child must not, unless dirtied.
+#[cfg(test)]
+struct CachedHost {
+    panel: crate::CachedPanel<Probe>,
+}
+
+#[cfg(test)]
+impl gpui::Render for CachedHost {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{ParentElement, Styled};
+        // A sized container so the cached child has real bounds to fill.
+        gpui::div()
+            .w(px(400.0))
+            .h(px(300.0))
+            .child(self.panel.element(crate::size_full_style()))
+    }
+}
+
+/// THE keystone proof. Three legs:
+///   (a) first frame populates the cache: render-count == 1.
+///   (b) notify the PARENT only + re-render: the child's render-count MUST stay
+///       at 1 — a parent re-render does NOT re-render the un-dirtied cached
+///       child. This is the core render-skip guarantee.
+///   (c) change the Probe's fp and call `notify_if_changed` (dirties the child)
+///       + re-render: render-count MUST increment to 2 (cache invalidated).
+#[gpui::test]
+fn cached_panel_skips_render_until_fingerprint_changes(cx: &mut TestAppContext) {
+    PROBE_RENDERS.with(|c| c.set(0));
+
+    let (host, vcx) = cx.add_window_view(|_window, cx| {
+        // Build the child entity, seed a CachedPanel from it.
+        let probe = cx.new(|_cx| Probe { fp: 1 });
+        let panel = crate::CachedPanel::new(probe, cx);
+        CachedHost { panel }
+    });
+
+    // --- (a) Initial frame populates the cache. ---
+    vcx.run_until_parked();
+    let after_first = PROBE_RENDERS.with(|c| c.get());
+    assert_eq!(
+        after_first, 1,
+        "first frame must render the child exactly once (cache populated), got {after_first}"
+    );
+
+    // --- (b) Notify the PARENT only. The child is NOT in dirty_views, so its
+    //     cached prepaint is reused and render() is SKIPPED. If `element()`
+    //     forgot `.cached()`, the parent re-render would re-run the child here
+    //     and this assert would fail — so it is NOT a tautology. ---
+    host.update(vcx, |_v, cx| cx.notify());
+    vcx.run_until_parked();
+    let after_parent_notify = PROBE_RENDERS.with(|c| c.get());
+    assert_eq!(
+        after_parent_notify, 1,
+        "a PARENT re-render must NOT re-render the un-dirtied cached child \
+         (render-skip is the whole point); render-count went to {after_parent_notify}"
+    );
+
+    // Sanity: notify_if_changed with an UNCHANGED fingerprint must return false
+    // and must NOT dirty the child — render stays skipped.
+    let changed = host.update(vcx, |v, cx| v.panel.notify_if_changed(cx));
+    assert!(
+        !changed,
+        "notify_if_changed must return false when the fingerprint is unchanged"
+    );
+    vcx.run_until_parked();
+    assert_eq!(
+        PROBE_RENDERS.with(|c| c.get()),
+        1,
+        "an unchanged fingerprint must not invalidate the cache"
+    );
+
+    // --- (c) Move the fingerprint, then notify_if_changed (dirties the child).
+    //     The cache is invalidated and render() runs again. ---
+    let changed = host.update(vcx, |v, cx| {
+        v.panel.view().update(cx, |p, _cx| p.fp = 2);
+        v.panel.notify_if_changed(cx)
+    });
+    assert!(
+        changed,
+        "notify_if_changed must return true after the fingerprint moves"
+    );
+    vcx.run_until_parked();
+    let after_invalidate = PROBE_RENDERS.with(|c| c.get());
+    assert_eq!(
+        after_invalidate, 2,
+        "a changed fingerprint (child dirtied) must re-run the child's render exactly once more, \
+         got {after_invalidate}"
+    );
+}
