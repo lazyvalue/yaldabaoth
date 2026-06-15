@@ -680,19 +680,12 @@ pub(crate) fn anchor_for_new_tool_call(editor: &mut Editor) -> LineAnchor {
 /// Returns `Vec<(start, end)>` where `start..end` covers the full block
 /// including delimiters. Ranges are non-overlapping and sorted.
 /// Pure follow-tail policy (F4, INV-13), factored out of `AgentState` so it
-/// can be unit-tested without a GPUI editor/list. In Chatbox mode the user's
-/// cursor is outside the transcript, so following is purely the sticky-bottom
-/// `follow_output` flag; in Worksheet mode the viewport tracks the cursor and
-/// follows only when the cursor is at EOF.
-pub(crate) fn should_follow_tail(
-    input_mode: InputModeKind,
-    follow_output: bool,
-    cursor_at_eof: bool,
-) -> bool {
-    match input_mode {
-        InputModeKind::Chatbox => follow_output,
-        InputModeKind::Worksheet => cursor_at_eof,
-    }
+/// can be unit-tested without a GPUI editor/list. Model C: the user's cursor is
+/// in the compose buffer (outside the transcript) in BOTH placements — the
+/// transcript is read-only — so following is purely the sticky-bottom
+/// `follow_output` flag regardless of placement.
+pub(crate) fn should_follow_tail(follow_output: bool) -> bool {
+    follow_output
 }
 
 /// 64-bit content hash of a detected block range's source lines — the
@@ -2744,13 +2737,7 @@ impl AgentState {
     /// re-reveal all consult, replacing the byte-identical copy that used to
     /// live at each site (and drift independently).
     pub(crate) fn follow_tail(&self) -> bool {
-        let line_count = self.editor.document().line_count();
-        let cursor_at_eof = self.editor.cursor().line + 1 >= line_count;
-        should_follow_tail(
-            self.input_surface.mode(),
-            self.follow_output.get(),
-            cursor_at_eof,
-        )
+        should_follow_tail(self.follow_output.get())
     }
 
     /// Fold the replay cursor back into the live counter at end-of-replay

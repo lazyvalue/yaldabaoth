@@ -2863,22 +2863,12 @@ impl YaldaGpuiView {
         let agent_bound = self.focused_bound_session();
         let pasted = if let Some(id) = agent_bound {
             self.with_session(id, cx, |c| {
-                if c.input_surface.is_chatbox() {
-                    if let Some(cb) = c.input_surface.chatbox_mut() {
-                        if cb.mode == EditMode::Insert {
-                            for ch in text.chars() {
-                                cb.editor.insert_char(ch);
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else if c.mode == EditMode::Insert {
+                // Model C: paste always targets the compose buffer (the transcript
+                // is read-only in both placements — INV-1).
+                let cb = c.input_surface.compose_mut();
+                if cb.mode == EditMode::Insert {
                     for ch in text.chars() {
-                        c.editor.insert_char(ch);
+                        cb.editor.insert_char(ch);
                     }
                     true
                 } else {
@@ -2922,13 +2912,14 @@ impl YaldaGpuiView {
         // the store, so resolve the bound id first.
         let text = if let Some(id) = self.focused_bound_session() {
             self.read_session(id, cx, |c| {
-                if c.input_surface.is_chatbox() {
-                    c.input_surface
-                        .chatbox()
-                        .and_then(|cb| cb.editor.selection_text())
-                } else {
-                    c.editor.selection_text()
-                }
+                // Prefer the compose selection (the editable surface); fall back to
+                // a transcript selection (read-only copy is fine — INV-1 forbids
+                // writes, not reads).
+                c.input_surface
+                    .compose()
+                    .editor
+                    .selection_text()
+                    .or_else(|| c.editor.selection_text())
             })
             .flatten()
         } else {

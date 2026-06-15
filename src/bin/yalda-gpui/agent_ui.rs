@@ -3037,27 +3037,16 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Submit the user's draft to the agent. Dispatches on `input_mode`:
-    /// Worksheet sweep (§12) sweeps every editable line in document order,
-    /// freezes them with `TurnId::User(k)`, and sends the non-blank lines.
-    /// Chatbox submit (§18) takes the chatbox text, appends + freezes it
-    /// at EOF of the transcript, then sends and clears the chatbox.
+    /// Submit the user's draft to the agent. Model C: both placements share one
+    /// path — the compose text is appended + frozen at the transcript EOF and
+    /// sent (`submit_compose`). No per-placement dispatch.
     pub(crate) fn submit_agent(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.focused_bound_session() else {
             return;
         };
-        let is_chatbox = self
-            .with_session(id, cx, |c| {
-                // Re-enable auto-scroll when the user sends a message.
-                c.follow_output.set(true);
-                c.input_surface.is_chatbox()
-            })
-            .unwrap_or(false);
-        if is_chatbox {
-            self.submit_chatbox(cx);
-        } else {
-            self.submit_worksheet(cx);
-        }
+        // Re-enable auto-scroll when the user sends a message.
+        self.with_session(id, cx, |c| c.follow_output.set(true));
+        self.submit_compose(cx);
     }
 
     /// Whether any agent slot (across all tabs/tiles) is mid-turn. Cheap
@@ -3238,126 +3227,26 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Worksheet submit per §12. Sweep every editable line in document
-    /// order, build the prompt body from those with non-whitespace content
-    /// (`\n`-joined), freeze every collected line — including blank
-    /// spacers — and tag each with `TurnId::User(k)` so the gutter shows
-    /// `Uk`. If the body is empty, no-op with a footer hint.
-    pub(crate) fn submit_worksheet(&mut self, cx: &mut Context<Self>) {
+    /// Submit the compose draft (Model C — unified for both placements). Reads
+    /// `compose().text()`, sends, and on success appends + freezes it at the
+    /// transcript EOF via `insert_user_turn` (the reconciler — dedups the server
+    /// echo, single-sources turn numbering), then resets the compose preserving
+    /// placement. This is correct for worksheet only because the draft now lives
+    /// in a separate buffer (INV-1/2), not in the transcript — so there is no
+    /// in-place per-line freeze; `submit_worksheet`/`commit_worksheet_turn` are
+    /// deleted (design-c.md §4.1).
+    pub(crate) fn submit_compose(&mut self, cx: &mut Context<Self>) {
         // Capture server path info before borrowing the session.
         let server_sid = self.active_server_session_id();
         let Some(id) = self.focused_bound_session() else {
             return;
         };
 
-        // Validate sendability + collect the editable lines inside one session
-        // borrow, returning the prompt body (or `None` to early-out with a
-        // status already set on the session).
-        let collected_and_body = self.with_session(id, cx, |claude| {
-            // Check sendability: either direct channel or server session.
-            if claude.channel.is_none() && server_sid.is_none() {
-                claude.status = Some("no channel attached".into());
-                return None;
-            }
-
-            // Walk every line, classify editable vs frozen.
-            let line_count = claude.editor.document().line_count();
-            let mut collected: Vec<(usize, String)> = Vec::new();
-            for l in 0..line_count {
-                if claude.editor.is_frozen_line(l) {
-                    continue;
-                }
-                let line_text = claude.editor.document().line_text(l);
-                let stripped = line_text.trim_end_matches('\n').to_string();
-                collected.push((l, stripped));
-            }
-
-            // Build prompt body from lines with non-whitespace content.
-            let prompt_body: String = collected
-                .iter()
-                .filter(|(_, t)| !t.trim().is_empty())
-                .map(|(_, t)| t.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            if prompt_body.is_empty() {
-                claude.status = Some("nothing to send".into());
-                return None;
-            }
-            Some((collected, prompt_body))
-        });
-        let Some(Some((collected, prompt_body))) = collected_and_body else {
-            cx.notify();
-            return;
-        };
-
-        // Send FIRST, then freeze the authored lines only on success — mirroring
-        // submit_chatbox. The old order computed `last_seen_turns + 1` by hand
-        // and froze the lines BEFORE the send check, which (a) bypassed the
-        // reconciler chokepoint so the server/agent echo of this prompt
-        // re-rendered it (the double-render bug) and (b) left a phantom frozen
-        // turn in place when the send failed. `collected`/`prompt_body` are
-        // owned, captured above, so they survive the agent re-borrow; the send
-        // is fire-and-forget over a socket and never touches the editor, so the
-        // captured line indices stay valid for the post-send freeze.
-        let sent = if let Some(sid) = &server_sid {
-            // Server path: prompt via session server (fire-and-forget; `Ok`
-            // means written, not accepted — ownership is reasserted on resume).
-            self.session_server
-                .as_ref()
-                .and_then(|s| s.prompt(sid, &prompt_body).ok())
-                .is_some()
-        } else if let Some(mut claude) = self.agent_mut(cx) {
-            // Direct path: send via AcpChannelClient.
-            if let Some(channel) = claude.channel.as_mut() {
-                channel.send(&prompt_body).is_ok()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        if sent {
-            if let Some(mut claude) = self.agent_mut(cx) {
-                // Derive `k` + arm dedup through the shared reconciler core and
-                // freeze the authored lines in place. Registering `prompt_body`
-                // as a LocalSubmit is what suppresses the echo. `None` means the
-                // M3 tripwire fired — leave the lines editable rather than
-                // freeze an unattributed turn.
-                claude.commit_worksheet_turn(&collected, &prompt_body);
-                claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
-            }
-        } else if let Some(mut claude) = self.agent_mut(cx) {
-            // Send failed: keep the authored lines editable so the user can
-            // retry, and surface it rather than dropping the prompt silently.
-            claude.status = Some("send failed — reconnecting; press ⏎ to retry".into());
-        }
-        if let Some(mut claude) = self.agent_mut(cx) {
-            claude.editor.clear_selection();
-        }
-        cx.notify();
-    }
-
-    /// Chatbox submit per §18. Take the full chatbox text, append it at
-    /// EOF of the transcript as new lines, immediately freeze them with
-    /// `TurnId::User(k)`, send via the channel, clear the chatbox. Mode
-    /// stays `Chatbox`.
-    pub(crate) fn submit_chatbox(&mut self, cx: &mut Context<Self>) {
-        // Capture server path info before borrowing the session.
-        let server_sid = self.active_server_session_id();
-        let Some(id) = self.focused_bound_session() else {
-            return;
-        };
-
-        // Read the chatbox draft + validate sendability inside one session
+        // Read the compose draft + validate sendability inside one session
         // borrow. `Some(None)` ⇒ early-out with a status already set; `None` ⇒
-        // no chatbox / no session (no status); `Some(Some(text))` ⇒ proceed.
+        // no session (no status); `Some(Some(text))` ⇒ proceed.
         let text = match self.with_session(id, cx, |claude| {
-            let text = match claude.input_surface.chatbox() {
-                Some(cb) => cb.text(),
-                None => return None,
-            };
+            let text = claude.input_surface.compose().text();
             if text.trim().is_empty() {
                 claude.status = Some("nothing to send".into());
                 return Some(None);
@@ -3541,29 +3430,16 @@ impl YaldaGpuiView {
             return;
         }
 
-        // Chatbox-mode intercept: input routes to the chatbox editor when
-        // we're in Chatbox mode; the transcript is read-only (§17). In
-        // Worksheet mode the transcript IS the editing surface and the
-        // chatbox doesn't exist.
-        let in_chatbox = self
-            .agent_read(cx, |c| c.input_surface.is_chatbox())
-            .unwrap_or(false);
+        // Model C: input routes to the compose buffer in both placements; the
+        // transcript is read-only in both (INV-1).
 
         // Bare `m`/`'` in NORMAL mode starts a mark chord — agent tiles are
         // markable/jumpable like any other tile. Insert mode is untouched so
-        // typing `m`/`'` into the chatbox/worksheet still works.
-        let in_normal = if in_chatbox {
-            self.agent_read(cx, |c| {
-                c.input_surface
-                    .chatbox()
-                    .map(|cb| cb.mode == EditMode::Normal)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false)
-        } else {
-            self.agent_read(cx, |c| c.mode == EditMode::Normal)
-                .unwrap_or(false)
-        };
+        // typing `m`/`'` into the compose still works. Model C: the compose's
+        // mode governs normal/insert in BOTH placements.
+        let in_normal = self
+            .agent_read(cx, |c| c.input_surface.compose().mode == EditMode::Normal)
+            .unwrap_or(false);
         if in_normal && self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
             return;
         }
@@ -3579,53 +3455,22 @@ impl YaldaGpuiView {
         let Some(focused_id) = self.focused_bound_session() else {
             return;
         };
-        if in_chatbox {
-            let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
-                claude.status = None;
-                let cb = claude.input_surface.chatbox_mut().unwrap();
-                match cb.mode {
-                    EditMode::Insert => {
-                        Self::dispatch_insert_core(&mut cb.editor, &mut cb.mode, press);
-                        NormalOutcome::Handled
-                    }
-                    EditMode::Normal => Self::dispatch_normal_core(
-                        &mut cb.editor,
-                        &mut cb.mode,
-                        &mut claude.keybinds,
-                        press,
-                    ),
-                }
-            }) else {
-                return;
-            };
-            match outcome {
-                NormalOutcome::OpenMenu => self.open_menu_inner(cx),
-                NormalOutcome::Quit => cx.quit(),
-                NormalOutcome::Paste { before } => {
-                    if let Some(mut c) = self.agent_mut(cx)
-                        && let Some(cb) = c.input_surface.chatbox_mut()
-                    {
-                        Self::apply_paste(&mut cb.editor, before);
-                    }
-                    cx.notify();
-                }
-                _ => cx.notify(),
-            }
-            return;
-        }
-
+        // Model C: keystrokes route to the COMPOSE buffer in both placements —
+        // the transcript is read-only (INV-1) and worksheet no longer edits it
+        // in place. `compose_mut()` is total, so there is no per-placement branch.
+        // (Compose has its own scroll/list_state, so no `pending_reveal_cursor`
+        // transcript-reveal is needed for typing.)
         let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
-            // Any non-shortcut keystroke clears the transient status.
             claude.status = None;
-
-            match claude.mode {
+            let cb = claude.input_surface.compose_mut();
+            match cb.mode {
                 EditMode::Insert => {
-                    Self::dispatch_insert_core(&mut claude.editor, &mut claude.mode, press);
+                    Self::dispatch_insert_core(&mut cb.editor, &mut cb.mode, press);
                     NormalOutcome::Handled
                 }
                 EditMode::Normal => Self::dispatch_normal_core(
-                    &mut claude.editor,
-                    &mut claude.mode,
+                    &mut cb.editor,
+                    &mut cb.mode,
                     &mut claude.keybinds,
                     press,
                 ),
@@ -3633,28 +3478,8 @@ impl YaldaGpuiView {
         }) else {
             return;
         };
-
-        // Reveal the cursor's line after every key — but do NO transcript-
-        // sized work here. The previous implementation rebuilt a per-line
-        // gutter `Vec` and re-derived the cursor's flat-item index on EVERY
-        // keystroke (O(transcript)), which is exactly why Worksheet typing
-        // degraded as a session grew. Now the key handler only records intent;
-        // the render path resolves the scroll target via the O(1) build-time
-        // line→item index (`AgentViewModel::item_for_line`, INV-RV / ADR-0020).
-        //
-        // Gate on a non-`Skipped` outcome: `Skipped` (unmatched key / partial
-        // chord) neither moves the cursor nor calls `cx.notify()`, so setting
-        // the flag there would leave it armed to fire a spurious scroll-to-
-        // cursor on the next UNRELATED render (e.g. an agent stream tick).
-        if !matches!(outcome, NormalOutcome::Skipped)
-            && let Some(mut c) = self.agent_mut(cx)
-        {
-            c.pending_reveal_cursor = true;
-        }
-
         match outcome {
-            NormalOutcome::Skipped => {}
-            NormalOutcome::Handled => cx.notify(),
+            NormalOutcome::Skipped | NormalOutcome::Handled => cx.notify(),
             NormalOutcome::Yanked => {
                 if let Some(mut c) = self.agent_mut(cx) {
                     c.status = Some("yanked".into());
@@ -3664,10 +3489,9 @@ impl YaldaGpuiView {
             NormalOutcome::Quit => cx.quit(),
             NormalOutcome::OpenMenu => self.open_menu_inner(cx),
             NormalOutcome::Paste { before } => {
-                if let Some(mut c) = self.agent_mut(cx)
-                    && Self::apply_paste(&mut c.editor, before)
-                {
-                    c.status = Some("put".into());
+                if let Some(mut c) = self.agent_mut(cx) {
+                    let cb = c.input_surface.compose_mut();
+                    Self::apply_paste(&mut cb.editor, before);
                 }
                 cx.notify();
             }
