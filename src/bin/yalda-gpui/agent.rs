@@ -176,6 +176,50 @@ pub(crate) enum TurnRole {
     User,
 }
 
+/// Next user-turn jump ordinal from `cur`, clamped to `[0, count-1]`. `to_last`
+/// parks on the most recent turn (toggle-on / "what I wrote last"); otherwise
+/// `delta` steps (`+1` = newer/`j`, `-1` = older/`k`), saturating at both ends.
+/// Caller guards `count == 0`. Pure — unit-tested.
+pub(crate) fn next_jump_ord(cur: usize, count: usize, delta: i32, to_last: bool) -> usize {
+    let last = count.saturating_sub(1);
+    let cur = cur.min(last);
+    if to_last {
+        last
+    } else if delta >= 0 {
+        (cur + delta as usize).min(last)
+    } else {
+        cur.saturating_sub((-delta) as usize)
+    }
+}
+
+/// True when a jump step should drop the viewport at the buffer's page end
+/// instead of on a user-turn header: a forward (`j`) step — not the toggle-on
+/// "jump to last" — that can't advance because the cursor is already parked on
+/// the newest turn. `k` (older) and toggle-on keep their per-turn behavior.
+/// Pure — unit-tested.
+pub(crate) fn jump_lands_at_page_end(
+    prev: usize,
+    next: usize,
+    count: usize,
+    delta: i32,
+    to_last: bool,
+) -> bool {
+    delta > 0 && !to_last && next == prev && next == count.saturating_sub(1)
+}
+
+/// Flat-item indices of the user input turns (`TurnHeader { role: User }`) in
+/// render order. The single source for user-turn jump navigation (agent `.`
+/// menu): the handler reads the count to clamp the ordinal, and `build_body`
+/// resolves the Nth entry to the scroll target. Pure — unit-tested.
+pub(crate) fn user_turn_item_indices(flat_items: &[FlatItem]) -> Vec<usize> {
+    flat_items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| matches!(it, FlatItem::TurnHeader { role: TurnRole::User }))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Free-function variant of `YaldaGpuiView::build_tool_block` that
 /// works without an active `&Context<Self>`. Used inside `gpui::list`'s
 /// per-item render closure (which only gets `&mut Window, &mut GpuiApp`).
@@ -650,7 +694,21 @@ pub(crate) fn truncate_lines(body: &str, max_lines: usize) -> String {
 /// the document, per spec-agent-window.md §E1. The renderer resolves it to
 /// a line index via `editor.line_for_anchor(a)`; a `None` (line consumed)
 /// falls back to EOF rendering.
-pub(crate) fn anchor_for_new_tool_call(editor: &mut Editor) -> LineAnchor {
+pub(crate) fn anchor_for_new_tool_call(editor: &mut Editor, floor_char: usize) -> LineAnchor {
+    let eof = editor.document().rope().len_chars();
+    if floor_char < eof {
+        // A user worksheet draft sits below `floor_char` (its untagged top).
+        // Splice the tool's dedicated blank anchor line at the top of that
+        // draft so the tool block renders ABOVE the user's in-progress text
+        // instead of under it (the interspersed-tool-group bug). `floor_char`
+        // is at a line start, so the char before it is the prior agent line's
+        // trailing '\n' — inserting "\n" here opens a clean blank line and
+        // shifts the draft down by one.
+        let line = editor.document().rope().char_to_line(floor_char);
+        editor.programmatic_insert(floor_char, "\n");
+        return editor.anchor_for_line(line);
+    }
+    // No pending draft — append the anchor line at EOF (original behavior).
     // Perf (finding 5): O(1) tail probe instead of cloning the whole transcript
     // (`full_text`) just to test emptiness + trailing newline per tool call.
     if !editor.document().is_empty() && editor.document().last_char() != Some('\n') {
@@ -671,6 +729,47 @@ pub(crate) fn anchor_for_new_tool_call(editor: &mut Editor) -> LineAnchor {
     // empty doc, where the tool block just anchors at the top.
     let line = line_count.saturating_sub(2);
     editor.anchor_for_line(line)
+}
+
+/// Char index at the TOP of the user's in-progress worksheet draft — the
+/// contiguous run of *untagged*, unfrozen lines at EOF that holds at least one
+/// non-blank line. Agent content (LLM chunks via
+/// [`Editor::append_llm_chunk_floored`], tool anchors via
+/// [`anchor_for_new_tool_call`]) splices here so a turn streaming in while the
+/// user composes lands ABOVE their text rather than below it.
+///
+/// Frozen and turn-tagged lines (`Llm`/`User`/`Tool`/`System`) are agent-owned
+/// and stop the upward walk. When the trailing region is all blank — Chatbox,
+/// or an untouched worksheet tail — this returns EOF, so the splice is
+/// byte-for-byte unchanged from the pre-floor behavior.
+pub(crate) fn agent_tail_floor_char(editor: &Editor) -> usize {
+    let doc = editor.document();
+    let eof = doc.rope().len_chars();
+    let line_count = doc.line_count();
+    let turn_meta = editor.metadata::<TurnId>();
+    let mut floor = line_count;
+    let mut has_user_text = false;
+    while floor > 0 {
+        let l = floor - 1;
+        if editor.is_frozen_line(l) {
+            break;
+        }
+        let tagged = editor
+            .anchor_for_line_opt(l)
+            .is_some_and(|a| turn_meta.get(a).is_some());
+        if tagged {
+            break;
+        }
+        if !doc.line_text(l).trim().is_empty() {
+            has_user_text = true;
+        }
+        floor -= 1;
+    }
+    if !has_user_text || floor >= line_count {
+        eof
+    } else {
+        doc.line_col_to_char(floor, 0)
+    }
 }
 
 /// Detect line ranges in `lines` that should be rendered as structured
@@ -1608,7 +1707,10 @@ pub(crate) struct Chatbox {
     /// draft every keystroke was O(draft) element assembly — the Message Box
     /// typing lag. `gpui::list` then builds only the visible rows (INV-2,
     /// matching the transcript + Edit view).
-    pub(crate) list_state: gpui::ListState,
+    /// Reconciled by splicing the changed range (never `reset()`) so scroll
+    /// stays anchored — `reset()` snapped the box to its top on any newline in a
+    /// >8-line draft. See `ScrollAnchoredList`.
+    pub(crate) list: ScrollAnchoredList<String>,
 }
 
 impl Chatbox {
@@ -1617,7 +1719,7 @@ impl Chatbox {
             editor: Editor::new(String::new(), std::path::PathBuf::from("*chatbox*")),
             mode: EditMode::Insert,
             scroll_handle: ScrollHandle::new(),
-            list_state: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(64.0)),
+            list: ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(64.0)),
         }
     }
 
@@ -2107,9 +2209,21 @@ pub(crate) fn rebuild_agent_view_model(
     // (b) strip blank Lines adjacent to ToolGroup / TurnHeader /
     // Block items, and (c) collapse runs of consecutive blank
     // user Lines to at most one.
+    //
+    // EXCEPTION: in Worksheet mode the editable tail lives in the
+    // transcript, so the caret can sit on one of these blank Lines
+    // (e.g. you press Enter on the empty tail). Stripping that Line
+    // makes the caret vanish — `line_idx == cursor_line` never matches
+    // a rendered row — and routes the cursor-reveal to the wrong item
+    // (`item_for_line` falls back to the last item), so the viewport
+    // scrolls past where the cursor actually is. Never collapse the
+    // line the cursor is on.
     {
+        let protect_line: Option<usize> = matches!(c.input_surface, InputSurface::Worksheet)
+            .then(|| c.editor.cursor().line);
         let is_blank_line = |item: &FlatItem| -> bool {
-            matches!(item, FlatItem::Line(idx) if lines.get(*idx).is_none_or(|s| s.trim().is_empty()))
+            matches!(item, FlatItem::Line(idx)
+                if Some(*idx) != protect_line && lines.get(*idx).is_none_or(|s| s.trim().is_empty()))
         };
         let is_frozen_line = |item: &FlatItem| -> bool {
             matches!(item, FlatItem::Line(idx) if frozen_ranges.iter().any(|&(s, e)| *idx >= s && *idx < e))
@@ -2253,6 +2367,25 @@ pub(crate) struct AgentState {
     /// handler itself does NO transcript-sized work, which is what keeps
     /// Worksheet typing flat as the session grows (ADR-0020).
     pub(crate) pending_reveal_cursor: bool,
+    /// User-turn jump mode (agent `.` menu → "jump between user turns"): when
+    /// on, bare `j`/`k` in Normal mode move the viewport between the user's
+    /// input turns (`TurnHeader { role: User }`) instead of moving the editor
+    /// cursor — for finding "what I wrote last" amid a wall of agent output.
+    pub(crate) user_turn_jump_mode: bool,
+    /// Which user turn (0-based ordinal among the transcript's user
+    /// `TurnHeader`s) the jump cursor is currently parked on. Clamped to the
+    /// live count each step; `k` decrements (older), `j` increments (newer).
+    pub(crate) user_turn_jump_ord: usize,
+    /// Set by a jump keystroke to request "reveal the Nth user turn on the next
+    /// render". The render path resolves the ordinal to a flat-item index
+    /// against the FRESH list and issues the scroll (same INV-RV discipline as
+    /// `pending_reveal_cursor`). `None` = no pending jump.
+    pub(crate) pending_jump_ord: Option<usize>,
+    /// Set alongside `pending_jump_ord` when the jump lands at the buffer's
+    /// page end (a `j` pressed while already on the newest user turn) rather
+    /// than on a user-turn header. The render path reveals the LAST flat item
+    /// instead of resolving the ordinal. Consumed (`take`) with the ordinal.
+    pub(crate) pending_jump_end: bool,
     /// The memoized `render_agent` view-model caches (block cache, flat-items,
     /// gutter tags, fingerprint, seq) — one owner instead of six sibling
     /// fields (A.7). See [`AgentViewModel`].
@@ -2496,6 +2629,10 @@ impl AgentState {
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
             pending_reveal_cursor: false,
+            user_turn_jump_mode: false,
+            user_turn_jump_ord: 0,
+            pending_jump_ord: None,
+            pending_jump_end: false,
             view_model: AgentViewModel::new(),
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
@@ -2543,6 +2680,10 @@ impl AgentState {
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
             pending_reveal_cursor: false,
+            user_turn_jump_mode: false,
+            user_turn_jump_ord: 0,
+            pending_jump_ord: None,
+            pending_jump_end: false,
             view_model: AgentViewModel::new(),
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,

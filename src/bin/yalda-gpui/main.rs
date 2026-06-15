@@ -183,6 +183,7 @@ actions!(
         OpenLinear,
         OpenMenu,
         OpenLocalMenu,
+        OpenGlobalMenu,
         Quit,
         Restart,
         // Buffer cycling
@@ -430,17 +431,13 @@ struct DocState {
     blocks: Vec<RenderedBlock>,
     file_label: SharedString,
     cursor_block: usize,
-    /// Variable-height virtualized list driving the doc body. Only the
-    /// visible block window is built/laid-out per frame (not one element
-    /// per block, as the old `overflow_y_scroll` container did), so render
-    /// is O(visible) instead of O(blocks+spans). j/k/g/G/ctrl-d/u navigation
-    /// reveals the focused block via `scroll_to_reveal_item`. Spliced/reset
-    /// to `blocks.len()` each render.
-    list_state: gpui::ListState,
-    /// Item count currently registered in `list_state`; lets render splice
-    /// only when the block count changed. `Cell` because `render_doc` takes
-    /// `&DocState` (the list itself splices through `&self`).
-    list_item_count: std::cell::Cell<usize>,
+    /// Variable-height virtualized list driving the doc body. Only the visible
+    /// block window is built/laid-out per frame (not one element per block), so
+    /// render is O(visible). j/k/g/G/ctrl-d/u nav reveals the focused block via
+    /// `scroll_to_reveal_item`. Reconciled by splicing the changed block range
+    /// (never `reset()`) so scroll stays anchored across a live edit-flush — see
+    /// `ScrollAnchoredList`. Gated on `blocks_seq` (the `reconcile`'s version).
+    list: ScrollAnchoredList<RenderedBlock>,
     /// Monotonic version of `blocks`, bumped by `set_blocks` on every
     /// reassignment. Plays the role `Document.edit_seq` plays for
     /// `EditState.lines_cache` — the key the render snapshot is memoized on,
@@ -507,11 +504,29 @@ impl DocSource {
 }
 
 impl DocState {
-    /// A fresh, empty variable-height `ListState` for a new Doc tile. Mirrors
-    /// the agent transcript's list construction; `Top` alignment keeps the
-    /// document anchored at its first block (unlike the agent's `Bottom`).
-    fn new_list_state(count: usize) -> gpui::ListState {
-        gpui::ListState::new(count, gpui::ListAlignment::Top, gpui::px(512.0))
+    /// Build a `Viewing` Doc from rendered blocks — the SINGLE construction path
+    /// for every Doc tile (load / reload / split / restore / theme re-render).
+    /// Centralizing it keeps the list-reconcile bookkeeping in one place instead
+    /// of re-spelling ~10 struct literals (each of which would have to stay in
+    /// lockstep with field changes — the trap that made the scroll-anchor fix
+    /// touch a dozen sites).
+    fn viewing(
+        blocks: Vec<RenderedBlock>,
+        file_label: SharedString,
+        source: Option<DocSource>,
+    ) -> Self {
+        DocState {
+            blocks,
+            file_label,
+            cursor_block: 0,
+            // Top-aligned: a doc reads from its first block (the agent transcript
+            // tails the bottom). 512px default item-height estimate as before.
+            list: ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(512.0)),
+            blocks_seq: 0,
+            blocks_snapshot: RefCell::new(None),
+            last_cursor_block: std::cell::Cell::new(None),
+            source,
+        }
     }
 
     /// Replace `blocks` and bump `blocks_seq`. The render snapshot is keyed on
@@ -571,9 +586,16 @@ impl DocState {
     /// index past the registered count). The next render also re-reveals via
     /// `last_cursor_block`, so an early no-op here is harmless.
     fn reveal_block(&self, idx: usize) {
-        if idx < self.list_item_count.get() {
-            self.list_state.scroll_to_reveal_item(idx);
+        if idx < self.list.len() {
+            self.list.state().scroll_to_reveal_item(idx);
         }
+    }
+
+    /// Reconcile the virtualized block list to the current `blocks`, preserving
+    /// scroll. Delegates to `ScrollAnchoredList`, gated on `blocks_seq` so an
+    /// idle frame (no edit) does zero work.
+    fn reconcile_list(&self) {
+        self.list.reconcile(&self.blocks_rc(), self.blocks_seq);
     }
 }
 
@@ -590,6 +612,9 @@ impl DocState {
 struct BrowserWindow {
     fb: FileBrowser,
     underlying: Option<Box<BufferApp>>,
+    /// Scroll position of the entry list, so the viewport follows the cursor
+    /// (`scroll_to_item(selected)` each render). UI state, not persisted.
+    scroll: ScrollHandle,
 }
 
 impl BrowserWindow {
@@ -598,6 +623,7 @@ impl BrowserWindow {
         Self {
             fb: FileBrowser::new(dir),
             underlying: None,
+            scroll: ScrollHandle::new(),
         }
     }
 }
@@ -1087,11 +1113,10 @@ struct EditState {
     lines_cache: std::rc::Rc<Vec<String>>,
     /// Virtualized line list — only the visible rows are built/laid-out each
     /// frame instead of one element per document line. Variable height (lines
-    /// wrap), so a `ListState` (the agent-transcript pattern) rather than a
-    /// fixed-row viewport. Spliced/reset to the line count each render.
-    list_state: gpui::ListState,
-    /// Item count `list_state` was last sized to; drives incremental splice.
-    list_item_count: usize,
+    /// wrap), so a `ListState` rather than a fixed-row viewport. Reconciled by
+    /// splicing the changed range (never `reset()`) so scroll stays anchored
+    /// across edits — see `ScrollAnchoredList`.
+    list: ScrollAnchoredList<String>,
     /// `(edit_seq, cursor_line)` at the last render. When either changes we
     /// scroll the list to reveal the cursor line (so typing/motion keeps the
     /// caret on-screen) without fighting the user's manual scroll on idle
@@ -1117,8 +1142,7 @@ impl EditState {
             lines_cache: std::rc::Rc::new(Vec::new()),
             // Top-aligned: editing reads from the top of the buffer, unlike the
             // agent transcript which tails the bottom.
-            list_state: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(256.0)),
-            list_item_count: 0,
+            list: ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(256.0)),
             last_cursor_anchor: None,
             pending_replace: false,
         }
@@ -1368,8 +1392,21 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("f", "folio", "theme-folio"),
             ],
         ),
+        MenuNode::submenu(
+            "l",
+            "layout",
+            vec![
+                MenuNode::entry("m", "manual", "layout-manual"),
+                MenuNode::entry("s", "master stack", "layout-master-stack"),
+                MenuNode::entry("o", "monocle", "layout-monocle"),
+                MenuNode::entry("c", "columns", "layout-columns"),
+                MenuNode::entry("d", "desktop", "layout-desktop"),
+            ],
+        ),
         MenuNode::entry("r", "rebuild and restart gui", "dev-restart-gui"),
+        MenuNode::entry("R", "rebuild and restart all", "dev-restart-all"),
         MenuNode::entry("m", "mark tile", "mark-tile"),
+        MenuNode::entry("x", "close tile", "close-window"),
     ]
 }
 
@@ -1386,6 +1423,7 @@ fn doc_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("e", "edit (raw markdown)", "enter-edit"),
         MenuNode::entry("w", "edit (word processor)", "enter-wp"),
         MenuNode::entry("r", "reload from disk", "reload-file"),
+        MenuNode::entry("b", "file browser", "open-browser"),
         MenuNode::entry("o", "outline", "rail-outline"),
         MenuNode::separator(),
         MenuNode::submenu(
@@ -1415,6 +1453,7 @@ fn edit_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("v", "back to doc view", "back-to-doc"),
         MenuNode::entry("w", "toggle code/word-processor", "wp-toggle"),
         MenuNode::entry("r", "reload from disk", "reload-file"),
+        MenuNode::entry("b", "file browser", "open-browser"),
         MenuNode::separator(),
         MenuNode::entry("a", "select all", "select-all"),
         MenuNode::entry("y", "yank selection", "yank-selection"),
@@ -1446,6 +1485,16 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("r", "rename session", "claude-rename"),
         MenuNode::entry("S", "send selection", "claude-send-selection"),
         MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
+        MenuNode::entry("h", "toggle heading markers", "agent-toggle-heading-markers"),
+        MenuNode::entry("j", "jump between user turns (j/k)", "agent-toggle-jump-mode"),
+    ]
+}
+
+fn linear_local_menu() -> Vec<MenuNode> {
+    vec![
+        MenuNode::entry("i", "edit query", "linear-edit"),
+        MenuNode::entry("o", "open in browser", "linear-open-url"),
+        MenuNode::entry("y", "copy URL", "linear-copy-url"),
     ]
 }
 
@@ -1469,6 +1518,12 @@ struct YaldaGpuiView {
     /// the unzoomed default; clamped to [MIN_TEXT_SCALE, MAX_TEXT_SCALE] on
     /// every adjustment.
     text_scale: f32,
+    /// Agent-chat-only: when true, headings in the transcript render with their
+    /// literal markdown markers (`## `, `### `) shown before the rendered text.
+    /// Default on; toggled via the agent `.` menu ("heading markers"). A global
+    /// (all transcripts), pushed to `TranscriptView`s via `notify_transcript_
+    /// views` (not a seq). The doc/edit views never show markers.
+    show_agent_heading_markers: bool,
     /// Desktop-mode tile size in mono cells (spec-desktop-mode.md
     /// Behavior 6) — one global setting for all tiles in all tabs,
     /// persisted in `Preferences`, clamped to [20, 400] × [5, 200].
@@ -1564,22 +1619,14 @@ impl YaldaGpuiView {
         let syntect_hl =
             Rc::new(yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme()));
         let label: SharedString = file_label.into();
-        let initial = App::Buffer(BufferApp::Viewing(DocState {
-            blocks,
-            file_label: label.clone(),
-            cursor_block: 0,
-            list_state: DocState::new_list_state(0),
-            list_item_count: std::cell::Cell::new(0),
-            blocks_seq: 0,
-            blocks_snapshot: RefCell::new(None),
-            last_cursor_block: std::cell::Cell::new(None),
-            source: None,
-        }));
+        let initial =
+            App::Buffer(BufferApp::Viewing(DocState::viewing(blocks, label.clone(), None)));
         Self {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
+            show_agent_heading_markers: true,
             desktop_grid_cols: 2,
             desktop_grid_rows: 2,
             desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
@@ -1611,6 +1658,7 @@ impl YaldaGpuiView {
             body_font: SharedString::new_static(".SystemUIFont"),
             code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
+            show_agent_heading_markers: true,
             desktop_grid_cols: 2,
             desktop_grid_rows: 2,
             desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
@@ -1789,34 +1837,51 @@ impl YaldaGpuiView {
                 match persisted.get(i).cloned() {
                     Some(slot) => {
                         // Bind this leaf to its OWN persisted sid via the store's
-                        // idempotent choke. AlreadyOpen ⇒ focus (a duplicate sid
-                        // across leaves can't double-bind, INV-2).
+                        // idempotent choke. `Created` ⇒ this leaf owns the sid.
+                        // `AlreadyOpen` ⇒ a DUPLICATE sid across persisted leaves;
+                        // strict 1:1 forbids binding a second tile to it (that is
+                        // exactly how the same session showed up in two
+                        // workspaces), so this leaf falls to the free selector.
                         let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
                         let label = slot.label.clone();
+                        let make_cwd = slot_cwd.clone();
                         let bind = self.sessions.open_or_focus(&slot.id, |_id| {
                             cx.new(|_| AgentSession {
                                 state: AgentState::new_server_managed(Some(
                                     "reconnecting…".into(),
                                 )),
                                 label,
-                                cwd: slot_cwd,
+                                cwd: make_cwd,
                                 resume_id: Some(slot.id.clone()),
                             })
                         });
-                        let sid_id = bind.id();
-                        self.with_session(sid_id, cx, |state| {
-                            if slot.mode == InputModeKind::Worksheet {
-                                state.input_surface = InputSurface::Worksheet;
+                        match bind {
+                            agent_sessions::Bind::Created(sid_id) => {
+                                self.with_session(sid_id, cx, |state| {
+                                    if slot.mode == InputModeKind::Worksheet {
+                                        state.input_surface = InputSurface::Worksheet;
+                                    }
+                                    state.tasklist_open = slot.tasklist_open;
+                                    state.subagents_open = slot.subagents_open;
+                                });
+                                if let Some(tile) = self.agent_tile_mut() {
+                                    tile.bound = Some(sid_id);
+                                    tile.picker = None;
+                                }
+                                attach_sids.push(slot.id.clone());
                             }
-                            state.tasklist_open = slot.tasklist_open;
-                            state.subagents_open = slot.subagents_open;
-                        });
-                        if let Some(tile) = self.agent_tile_mut() {
-                            tile.bound = Some(sid_id);
-                            tile.picker = None;
-                        }
-                        if matches!(bind, agent_sessions::Bind::Created(_)) {
-                            attach_sids.push(slot.id.clone());
+                            agent_sessions::Bind::AlreadyOpen(_) => {
+                                if let Some(tile) = self.agent_tile_mut() {
+                                    tile.bound = None;
+                                    tile.picker =
+                                        Some(SessionPicker::loading(slot_cwd.clone()));
+                                }
+                                self.spawn_list_sessions_for_picker(
+                                    Some(leaf_id),
+                                    slot_cwd,
+                                    cx,
+                                );
+                            }
                         }
                     }
                     None => {
@@ -2155,17 +2220,11 @@ impl YaldaGpuiView {
             &self.theme,
             Some(path),
         );
-        Some(App::Buffer(BufferApp::Viewing(DocState {
+        Some(App::Buffer(BufferApp::Viewing(DocState::viewing(
             blocks,
-            file_label: canon.into(),
-            cursor_block: 0,
-            list_state: DocState::new_list_state(0),
-            list_item_count: std::cell::Cell::new(0),
-            blocks_seq: 0,
-            blocks_snapshot: RefCell::new(None),
-            last_cursor_block: std::cell::Cell::new(None),
-            source: Some(DocSource::new(buf_id, core)),
-        })))
+            canon.into(),
+            Some(DocSource::new(buf_id, core)),
+        ))))
     }
 
     fn open_file(&mut self, path: PathBuf) -> bool {
@@ -2362,6 +2421,24 @@ impl YaldaGpuiView {
     /// On a `Buffer` tile it transitions the focused `BufferApp` to `Picking`,
     /// stashing the prior mode (`Viewing`/`Editing`) on `BrowserWindow.underlying`
     /// so Esc/q restores it (B4). Already-`Picking` is a no-op.
+    /// The directory a freshly-opened file browser should land in.
+    ///
+    /// Continuity rule (untitled.md): when the picker opens over a Buffer that
+    /// is viewing/editing a real file, land in that file's parent dir so the
+    /// browser sits where the file lives. Otherwise fall back to the workspace
+    /// base — the registry `"cwd"` if set, else Yalda's process dir.
+    fn browser_start_dir(&self) -> PathBuf {
+        if let Some(label) = self.workspace.focused_content().and_then(screen_file_label) {
+            let parent = PathBuf::from(label.as_ref())
+                .parent()
+                .map(std::path::Path::to_path_buf);
+            if let Some(parent) = parent.filter(|p| p.is_dir()) {
+                return parent;
+            }
+        }
+        self.active_workspace_cwd().unwrap_or_else(process_cwd)
+    }
+
     fn open_browser_inner(&mut self, cx: &mut Context<Self>) {
         match self.workspace.focused_content().expect("no focused window") {
             // Already picking — nothing to do.
@@ -2374,15 +2451,17 @@ impl YaldaGpuiView {
             }
             App::Buffer(_) => {}
         }
+        // Where the picker lands: parent dir of the file we're leaving for
+        // continuity, else the workspace cwd, else the process dir. Computed
+        // BEFORE `replace_focused_content` moves the prior buffer out.
+        let dir = self.browser_start_dir();
         // Transition the focused Buffer to Picking IN PLACE, stashing the prior
         // mode on `BrowserWindow.underlying` so Esc/q restores it (B4). Picking
         // a file discards the underlying and replaces the picker with the picked
         // file in this same tile (see `open_file`'s `replace_in_place` branch).
         // This keeps the picker tile-scoped instead of tab-scoped so
         // splits/tabs aren't disrupted by file picking.
-        let placeholder = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        )));
+        let placeholder = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(dir.clone())));
         let prior = self
             .workspace
             .replace_focused_content(placeholder)
@@ -2392,8 +2471,9 @@ impl YaldaGpuiView {
         // typed `BufferApp` (D3/C4) and an Agent can never end up behind a
         // picker.
         self.set_screen(App::Buffer(BufferApp::Picking(BrowserWindow {
-            fb: FileBrowser::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+            fb: FileBrowser::new(dir),
             underlying: prior.into_buffer_stash(),
+            scroll: ScrollHandle::new(),
         })));
         self.save_workspace_state();
         cx.notify();
@@ -2446,55 +2526,103 @@ impl YaldaGpuiView {
     /// NEEDS-RUNTIME: GPUI can't be driven headlessly, so this is compile-
     /// verified only — the actual rebuild/relaunch/re-attach must be checked by
     /// a human.
+    /// `dev-restart-gui` — rebuild + relaunch just the GUI, mirroring
+    /// `./dev-gui.sh` (the GUI slice of `./dev-all.sh`): build RELEASE (a debug
+    /// GPUI build stutters on text input), leave the running session server
+    /// untouched, and relaunch the freshly-built release binary. The new GUI
+    /// reconnects to the existing server and re-attaches its sessions, so live
+    /// agents survive the bounce.
     fn dev_rebuild_restart_gui(&mut self, cx: &mut Context<Self>) {
-        self.set_agent_status("rebuilding gui: cargo build --bin yalda-gpui…", cx);
+        self.dev_rebuild_restart(false, cx);
+    }
+
+    /// `dev-restart-all` — rebuild + restart BOTH the GUI and the session
+    /// server, mirroring `./dev-all.sh`: build RELEASE for both bins, kill the
+    /// running server + clear its stale socket/pid so the relaunched GUI spawns
+    /// the freshly-built server, then relaunch. Live sessions reconnect from the
+    /// WAL on the new server's startup (ADR-0009/-0018); only an in-flight,
+    /// un-persisted turn is at risk.
+    fn dev_rebuild_restart_all(&mut self, cx: &mut Context<Self>) {
+        self.dev_rebuild_restart(true, cx);
+    }
+
+    /// Shared rebuild-and-relaunch loop behind `dev-restart-gui` /
+    /// `dev-restart-all`. Always RELEASE and always relaunches the freshly-built
+    /// `target/release/yalda-gpui` (NOT `current_exe`, which may be a debug
+    /// build), so this matches the `dev-*.sh` scripts regardless of how the
+    /// running process was started. With `restart_server`, it also rebuilds
+    /// `yalda-session-server` and tears the old one down.
+    fn dev_rebuild_restart(&mut self, restart_server: bool, cx: &mut Context<Self>) {
+        let what = if restart_server { "gui + server" } else { "gui" };
+        self.set_agent_status(&format!("rebuilding {what} (release): cargo build…"), cx);
 
         let manifest_dir = env!("CARGO_MANIFEST_DIR").to_string();
-        let exe = std::env::current_exe().ok();
+        let gui_bin = PathBuf::from(&manifest_dir).join("target/release/yalda-gpui");
         let args: Vec<String> = std::env::args().skip(1).collect();
 
         cx.spawn(async move |this, cx| {
-            // Run the (slow, blocking) build on a background thread.
+            // Run the (slow, blocking) build on a background thread, then — for
+            // the "all" path — tear the old server down so the relaunched GUI
+            // brings up the newly-built one (mirrors `dev-all.sh`).
             let built = cx
                 .background_executor()
                 .spawn(async move {
-                    std::process::Command::new("cargo")
-                        .args(["build", "--bin", "yalda-gpui"])
+                    let mut build_args: Vec<&str> =
+                        vec!["build", "--release", "--bin", "yalda-gpui"];
+                    if restart_server {
+                        build_args.extend_from_slice(&["--bin", "yalda-session-server"]);
+                    }
+                    let out = std::process::Command::new("cargo")
+                        .args(&build_args)
                         .current_dir(&manifest_dir)
-                        .output()
+                        .output();
+
+                    if restart_server
+                        && let Ok(o) = &out
+                        && o.status.success()
+                    {
+                        // Kill any running server (both profiles) and clear the
+                        // stale socket/pid so the fresh GUI launches the server
+                        // it just built instead of reconnecting to the old one.
+                        for pat in [
+                            "target/debug/yalda-session-server",
+                            "target/release/yalda-session-server",
+                        ] {
+                            let _ = std::process::Command::new("pkill")
+                                .args(["-f", pat])
+                                .status();
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        let _ = std::fs::remove_file(yalda::session_proto::socket_path());
+                        let _ = std::fs::remove_file(yalda::session_proto::pid_file_path());
+                    }
+                    out
                 })
                 .await;
 
             let _ = this.update(cx, |this, cx| match built {
-                Ok(out) if out.status.success() => match exe {
-                    Some(exe) => {
-                        // Fresh instance: same args. A plain relaunch.
-                        let mut cmd = std::process::Command::new(exe);
-                        cmd.args(&args);
-                        cmd.stdin(std::process::Stdio::null());
-                        cmd.stdout(std::process::Stdio::null());
-                        // stderr inherited so post-restart logs reach the dev
-                        // terminal (unlike reboot_into_claude's fully-detached
-                        // stdio).
-                        cmd.stderr(std::process::Stdio::inherit());
-                        match cmd.spawn() {
-                            Ok(_) => {
-                                this.set_agent_status(
-                                    "rebuilt — relaunching gui, this window will close",
-                                    cx,
-                                );
-                                // Quit promptly: the new instance re-attaches to
-                                // every server session on startup (strict 1:1),
-                                // so we don't need to linger.
-                                cx.quit();
-                            }
-                            Err(e) => {
-                                this.set_agent_status(&format!("relaunch spawn failed: {e}"), cx)
-                            }
+                Ok(out) if out.status.success() => {
+                    // Relaunch the freshly-built RELEASE binary. stderr is
+                    // inherited so post-restart logs reach the dev terminal
+                    // (unlike reboot_into_claude's fully-detached stdio).
+                    let mut cmd = std::process::Command::new(&gui_bin);
+                    cmd.args(&args);
+                    cmd.stdin(std::process::Stdio::null());
+                    cmd.stdout(std::process::Stdio::null());
+                    cmd.stderr(std::process::Stdio::inherit());
+                    match cmd.spawn() {
+                        Ok(_) => {
+                            this.set_agent_status(
+                                "rebuilt — relaunching, this window will close",
+                                cx,
+                            );
+                            // Quit promptly: the new instance re-attaches to
+                            // every server session on startup (strict 1:1).
+                            cx.quit();
                         }
+                        Err(e) => this.set_agent_status(&format!("relaunch spawn failed: {e}"), cx),
                     }
-                    None => this.set_agent_status("cannot locate current executable", cx),
-                },
+                }
                 Ok(out) => {
                     // Surface the tail of stderr so the failure is actionable.
                     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2541,6 +2669,94 @@ impl YaldaGpuiView {
     /// event context, outside any draw (timing-correct, fact 4) — bust each
     /// cached transcript directly rather than relying on a session observe.
     /// `reason` is logged for the `YALDA_PERF` notify-reason counter.
+    /// Flip the agent-chat heading-marker toggle (agent `.` menu → "toggle
+    /// heading markers"). Global across all transcripts; pushed to every live
+    /// `TranscriptView` via `notify_transcript_views` (a global render input,
+    /// not a per-session seq — see the `RootSnapshot` note). Default on.
+    fn toggle_agent_heading_markers(&mut self, cx: &mut Context<Self>) {
+        self.show_agent_heading_markers = !self.show_agent_heading_markers;
+        let on = self.show_agent_heading_markers;
+        self.transient_status = Some(if on {
+            "heading markers on".into()
+        } else {
+            "heading markers off".into()
+        });
+        self.notify_transcript_views(MissReason::Refresh, cx);
+        cx.notify();
+    }
+
+    /// Toggle the focused agent tile's user-turn jump mode (agent `.` menu →
+    /// "jump between user turns"). While on, `j`/`k` in Normal mode step the
+    /// viewport between the user's input turns (see `on_key_down`). Turning it
+    /// ON jumps straight to the most recent user turn ("what I wrote last").
+    /// Per-session state on `AgentState` — toggling in one tile leaves others
+    /// untouched.
+    fn toggle_agent_jump_mode(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.focused_bound_session() else {
+            self.transient_status = Some("no agent here".into());
+            cx.notify();
+            return;
+        };
+        let Some(ent) = self.sessions.get(id).cloned() else {
+            return;
+        };
+        let now_on = ent.update(cx, |s, scx| {
+            s.state.user_turn_jump_mode = !s.state.user_turn_jump_mode;
+            scx.notify();
+            s.state.user_turn_jump_mode
+        });
+        if now_on {
+            // Jump straight to the most recent user input.
+            self.jump_user_turn(0, true, cx);
+            self.transient_status = Some("user-turn jump: j/k to move".into());
+        } else {
+            self.transient_status = Some("user-turn jump off".into());
+        }
+        cx.notify();
+    }
+
+    /// Move the focused agent transcript's jump cursor between user turns and
+    /// queue a reveal. `to_last` ignores `delta` and parks on the most recent
+    /// user turn; otherwise the ordinal steps by `delta` (clamped to the live
+    /// count). Parks `follow_output` so streaming output doesn't yank the
+    /// viewport back, then notifies the session so its cached transcript
+    /// re-renders and resolves+scrolls the reveal (INV-RV; see `build_body`).
+    fn jump_user_turn(&mut self, delta: i32, to_last: bool, cx: &mut Context<Self>) {
+        let Some(id) = self.focused_bound_session() else {
+            return;
+        };
+        let Some(ent) = self.sessions.get(id).cloned() else {
+            return;
+        };
+        ent.update(cx, |s, scx| {
+            let c = &mut s.state;
+            let count = user_turn_item_indices(&c.view_model.flat_items_cache).len();
+            if count == 0 {
+                c.status = Some("no user turns yet".into());
+                scx.notify();
+                return;
+            }
+            let prev = c.user_turn_jump_ord;
+            let next = next_jump_ord(prev, count, delta, to_last);
+            // A `j` pressed while already parked on the newest user turn (the
+            // ordinal can't advance) means "go past the last turn" — drop the
+            // viewport at the page end of the buffer instead of re-revealing
+            // the last header. `k`/toggle-on keep their per-turn behavior.
+            let to_end = jump_lands_at_page_end(prev, next, count, delta, to_last);
+            c.user_turn_jump_ord = next;
+            c.pending_jump_ord = Some(next);
+            c.pending_jump_end = to_end;
+            c.follow_output.set(false);
+            c.status = Some(if to_end {
+                "page end".into()
+            } else {
+                format!("user turn {}/{}", next + 1, count).into()
+            });
+            scx.notify();
+        });
+        cx.notify();
+    }
+
     fn notify_transcript_views(&mut self, reason: MissReason, cx: &mut Context<Self>) {
         for v in self.transcript_views.values() {
             let label = v.read(cx).perf_label;
@@ -3017,9 +3233,10 @@ impl YaldaGpuiView {
     /// no-arg `:tabnew` / `Cmd-T` creates a browser tab so the user can pick
     /// what to load.
     fn new_tab(&mut self, _: &NewTab, _w: &mut Window, cx: &mut Context<Self>) {
+        let cwd = self.active_workspace_cwd().unwrap_or_else(process_cwd);
         self.workspace
             .push_initial_tab(App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cwd,
             ))));
         self.save_workspace_state();
         cx.notify();
@@ -3083,7 +3300,7 @@ impl YaldaGpuiView {
     /// natural file tile to clone (Claude) or when reading the source
     /// file fails.
     fn split_focused_with_browser(&mut self, dir: workspace::SplitDir) {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = self.active_workspace_cwd().unwrap_or_else(process_cwd);
         let content = self.clone_focused_for_split(&cwd);
         let _ = self.workspace.split_focused(dir, content);
     }
@@ -3126,17 +3343,11 @@ impl YaldaGpuiView {
                         &self.theme,
                         Some(&path),
                     );
-                    App::Buffer(BufferApp::Viewing(DocState {
+                    App::Buffer(BufferApp::Viewing(DocState::viewing(
                         blocks,
-                        file_label: label,
-                        cursor_block: 0,
-                        list_state: DocState::new_list_state(0),
-                        list_item_count: std::cell::Cell::new(0),
-                        blocks_seq: 0,
-                        blocks_snapshot: RefCell::new(None),
-                        last_cursor_block: std::cell::Cell::new(None),
-                        source: Some(DocSource::new(id, core)),
-                    }))
+                        label,
+                        Some(DocSource::new(id, core)),
+                    )))
                 }
                 Err(_) => browser_fallback(),
             }
@@ -3273,6 +3484,12 @@ impl YaldaGpuiView {
     /// start a mark chord.
     fn handle_doc_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
         let press = keystroke_to_keypress(&ev.keystroke);
+
+        // Universal leaders: the doc view is never text entry, so `<space>`/`.`/
+        // `?` always open the menus (with top priority).
+        if self.leader_intercept(&press, cx) {
+            return;
+        }
 
         // Ctrl-S: save the backing buffer from doc view (same as edit view).
         if press.modifiers.contains(KMods::CONTROL)
@@ -3838,8 +4055,7 @@ impl YaldaGpuiView {
             Some(App::Buffer(BufferApp::Editing(_))) => (edit_local_menu(), "EDIT"),
             Some(App::Agent(_)) => (agent_local_menu(), "AGENT"),
             Some(App::Buffer(BufferApp::Picking(_))) => (browser_local_menu(), "BROWSE"),
-            // Linear has no `.` local menu (its keys are the input line itself).
-            Some(App::Linear(_)) => return,
+            Some(App::Linear(_)) => (linear_local_menu(), "LINEAR"),
             None => return,
         };
         self.transient_status = None;
@@ -3857,6 +4073,117 @@ impl YaldaGpuiView {
 
     fn open_local_menu(&mut self, _: &OpenLocalMenu, _w: &mut Window, cx: &mut Context<Self>) {
         self.open_local_menu_inner(cx);
+    }
+
+    /// `?` — open the global (Yaldabaoth) scope menu (untitled.md "Yalda aka
+    /// Global Scope › Commands"). Yalda owns the set of workspaces, so the global
+    /// commands manage them: jump to a workspace by number, name the current
+    /// one, or make a new one. Built dynamically from the live workspace list.
+    fn global_menu(&self) -> Vec<MenuNode> {
+        let mut items = Vec::new();
+        // Workspaces by number — 1..=9 then `0` for a tenth. Every workspace
+        // holds ≥1 tile (so it's "inhabited"); a named-but-empty one would show
+        // too. The active workspace is marked.
+        for (i, tab) in self.workspace.tabs.iter().enumerate().take(10) {
+            let digit = if i == 9 { '0' } else { (b'1' + i as u8) as char };
+            let marker = if i == self.workspace.active_tab { "● " } else { "  " };
+            items.push(MenuNode::entry(
+                &digit.to_string(),
+                &format!("{marker}{}: {}", i + 1, tab.display_label()),
+                &format!("goto-workspace-{i}"),
+            ));
+        }
+        items.push(MenuNode::separator());
+        items.push(MenuNode::entry("n", "name workspace", "rename-tab"));
+        items.push(MenuNode::entry("c", "new workspace", "new-tab"));
+        items
+    }
+
+    fn open_global_menu_inner(&mut self, cx: &mut Context<Self>) {
+        if self.overlay_is_menu() {
+            return;
+        }
+        let Some(opened_from) = self.workspace.focused_window_id() else {
+            return;
+        };
+        self.transient_status = None;
+        let mut state = MenuState::new();
+        state.open();
+        let menu = self.global_menu();
+        self.open_overlay(ActiveOverlay::Menu(MenuOverlay {
+            state,
+            menu,
+            header: "GLOBAL",
+            opened_from,
+            disabled: HashSet::new(),
+        }));
+        cx.notify();
+    }
+
+    fn open_global_menu(&mut self, _: &OpenGlobalMenu, _w: &mut Window, cx: &mut Context<Self>) {
+        self.open_global_menu_inner(cx);
+    }
+
+    /// Does the focused tile currently want raw text input? This is a property
+    /// of the App/tile (untitled.md "tiles flag whether they are in an insert
+    /// mode"): leaders are intercepted as menu-openers ONLY when this is false,
+    /// so a tile in a navigation/selection state always reaches the menus while
+    /// one in text entry keeps those characters. The session / project pickers
+    /// are navigation, never text entry.
+    fn focused_in_insert_mode(&self, cx: &GpuiApp) -> bool {
+        match self.workspace.focused_content() {
+            Some(App::Buffer(BufferApp::Editing(e))) => e.mode == EditMode::Insert,
+            Some(App::Buffer(BufferApp::Picking(b))) => {
+                b.fb.filter_mode || b.fb.rename.is_some()
+            }
+            Some(App::Agent(tile)) => {
+                if tile.bound.is_none() {
+                    false // unbound = session picker = navigation
+                } else if self
+                    .agent_read(cx, |c| c.input_surface.is_chatbox())
+                    .unwrap_or(false)
+                {
+                    self.agent_read(cx, |c| {
+                        c.input_surface
+                            .chatbox()
+                            .map(|cb| cb.mode == EditMode::Insert)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+                } else {
+                    self.agent_read(cx, |c| c.mode == EditMode::Insert)
+                        .unwrap_or(false)
+                }
+            }
+            Some(App::Linear(tile)) => {
+                let picker = tile
+                    .view
+                    .as_ref()
+                    .map(|v| v.read(cx).is_picker())
+                    .unwrap_or(false);
+                !picker && tile.mode == LinearMode::Insert
+            }
+            Some(App::Buffer(BufferApp::Viewing(_))) | None => false,
+        }
+    }
+
+    /// Universal leader dispatch: when the focused tile is NOT in text entry, the
+    /// bare leader keys open their menus with TOP priority, before any
+    /// tile-specific key handling. Returns true if it consumed the key (the
+    /// caller then returns early). Every tile's `on_key_down` calls this first,
+    /// so the menus are reachable from any tile that isn't capturing text —
+    /// including the agent session picker and the Linear project picker.
+    fn leader_intercept(&mut self, press: &KeyPress, cx: &mut Context<Self>) -> bool {
+        if !press.modifiers.is_empty() || self.focused_in_insert_mode(cx) {
+            return false;
+        }
+        match press.key {
+            Key::Char(' ') => self.open_menu_inner(cx),
+            Key::Char('.') => self.open_local_menu_inner(cx),
+            Key::Char('?') => self.open_global_menu_inner(cx),
+            _ => return false,
+        }
+        true
     }
 
     /// Menu's key handler. Esc pops a level (or closes from root). Any
@@ -3951,9 +4278,12 @@ impl YaldaGpuiView {
             "claude-new-here" => self.open_new_agent_session_cwd_overlay(cx),
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
             "dev-restart-gui" => self.dev_rebuild_restart_gui(cx),
+            "dev-restart-all" => self.dev_rebuild_restart_all(cx),
             "rail-files" => self.toggle_file_browser_rail_impl(cx),
             "rail-outline" => self.toggle_outline_rail_impl(cx),
             "rail-flip" => self.flip_rail_side_impl(cx),
+            "agent-toggle-heading-markers" => self.toggle_agent_heading_markers(cx),
+            "agent-toggle-jump-mode" => self.toggle_agent_jump_mode(cx),
             "compose-toggle" | "agent-input-toggle" => {
                 if matches!(
                     self.workspace.focused_content().expect("no focused window"),
@@ -3962,6 +4292,9 @@ impl YaldaGpuiView {
                     self.toggle_agent_input_mode(cx);
                 }
             }
+            "linear-edit" => self.linear_set_mode(LinearMode::Insert, cx),
+            "linear-open-url" => self.linear_open_url(cx),
+            "linear-copy-url" => self.linear_copy_url(cx),
             "back-to-doc" => self.back_to_doc(cx),
             "reload-file" => self.reload_focused_from_disk(cx),
             "rename-tab" => self.open_rename_active_tab_overlay(cx),
@@ -4192,7 +4525,7 @@ impl YaldaGpuiView {
             // with no restore target (a standalone picker). Cancelling it closes
             // the tile (B4), subject to the sole-tile floor.
             "new-buffer-tile" => {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let cwd = self.active_workspace_cwd().unwrap_or_else(process_cwd);
                 let _ = self.workspace.split_focused(
                     workspace::SplitDir::V,
                     App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
@@ -4205,7 +4538,7 @@ impl YaldaGpuiView {
                 // Split with a placeholder browser (focus lands on the new
                 // tile), then let `open_agent_inner` swap the focused tile
                 // for the agent ring — reusing all the session machinery.
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let cwd = self.active_workspace_cwd().unwrap_or_else(process_cwd);
                 if self
                     .workspace
                     .split_focused(
@@ -4352,6 +4685,12 @@ impl YaldaGpuiView {
                 }
             }
             "quit" | "force-quit" => cx.quit(),
+            // Global menu: jump to workspace N (the index is encoded in the name).
+            name if name.starts_with("goto-workspace-") => {
+                if let Ok(idx) = name["goto-workspace-".len()..].parse::<usize>() {
+                    self.select_tab(idx, cx);
+                }
+            }
             _ => {
                 // Unknown command — keep the menu closed but no-op so the
                 // user gets visual feedback that the entry "did something".
@@ -4580,7 +4919,7 @@ impl YaldaGpuiView {
             layout: workspace::Layout::Empty,
             focused: 0,
             rail: None,
-            layout_mode: workspace::LayoutMode::Manual,
+            layout_mode: workspace::LayoutMode::default(),
             saved_manual_layout: None,
             master_ratio: 0.6,
             master_count: 1,
@@ -6186,12 +6525,8 @@ impl Render for YaldaGpuiView {
         let screen_view: AnyElement =
             self.render_focused_window(screen_root, leaf_attach_focus, !has_overlay, cx);
 
-        // When there's more than one tab, stack the tab strip above the
-        // screen view. Single-tab workspaces render no strip — matches the
-        // spec for "always show strip when >= 1 tab" but conservatively
-        // suppresses it for the most common case (one-tab session) while
-        // tab-creation commands are still landing.
-        let screen_view = self.wrap_with_tab_strip(screen_view, cx);
+        // (The side workspace/tab strip was removed — workspaces are switched
+        // from the `?` global menu now.)
 
         // Tag bar: thin strip above content showing tag labels when any
         // buffers have tags. Active-view tags get accent background.
@@ -6751,11 +7086,10 @@ fn register_keymap(app: &mut GpuiApp) {
         KeyBinding::new("ctrl-shift-e", EnterWp, Some("YaldaView")),
         KeyBinding::new("ctrl-k", OpenAgent, Some("YaldaView")),
         KeyBinding::new("ctrl-l", OpenLinear, Some("YaldaView")),
-        KeyBinding::new("space", OpenMenu, Some("YaldaView")),
-        // Local leader (spec-menu-scopes.md): `.` opens the content-kind
-        // local menu. Edit/Agent views intercept `.` in their key handlers
-        // instead (insert mode must keep `.` as a text character).
-        KeyBinding::new(".", OpenLocalMenu, Some("YaldaView")),
+        // Leaders (`<space>` / `.` / `?`) are handled UNIVERSALLY in every
+        // tile's `on_key_down` via `leader_intercept` — gated on the tile's
+        // insert-mode flag — not by per-context keybindings, so they reach the
+        // menus from any tile that isn't capturing text (incl. the pickers).
         // Doc-view Esc and bare `q` used to dispatch `Quit` — that
         // made it too easy to lose the app by mashing keys. Quit now
         // lives only on Cmd-Q (the macOS-standard chord). Esc in the
@@ -6871,11 +7205,11 @@ fn register_keymap(app: &mut GpuiApp) {
         KeyBinding::new("h", BrowserParent, Some("BrowserView")),
         KeyBinding::new("left", BrowserParent, Some("BrowserView")),
         KeyBinding::new("-", BrowserParent, Some("BrowserView")),
-        // `.` was BrowserToggleHidden; it's now the local leader
-        // (spec-menu-scopes.md) — toggle-hidden lives in the local menu (`. .`).
-        KeyBinding::new(".", OpenLocalMenu, Some("BrowserView")),
+        // `.`/`<space>`/`?` are leaders — handled universally in
+        // `handle_browser_filter_key` via `leader_intercept` (suppressed while
+        // filtering/renaming), so they're not keybindings here. (`.` was
+        // BrowserToggleHidden; toggle-hidden now lives in the local menu `. .`.)
         KeyBinding::new("s", BrowserCycleSort, Some("BrowserView")),
-        KeyBinding::new("space", OpenMenu, Some("BrowserView")),
         KeyBinding::new("q", BrowserClose, Some("BrowserView")),
         KeyBinding::new("escape", BrowserClose, Some("BrowserView")),
         KeyBinding::new("w", BrowserWorktrees, Some("BrowserView")),

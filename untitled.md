@@ -27,6 +27,14 @@
 ### Owns
 - A set of workspaces
 
+### Commands
+
+- Leader key is ?
+- Number (1..0) will open that workspace. The workspaces are listed in the menu that pops up IF they are inhabited by ANY tiles OR named.
+- Name workspace. Names the current workspace. That name appears besides the number in the menu. 
+- I think that is about it.
+
+
 ## Workspace
 
 Each workspace has a name and a number index. If no name is given, they default to 'ws-{num}' where {num} matches its index.
@@ -52,6 +60,7 @@ Only these commands should be in the workspace:
  - Folio
 - Rebuild and Restart GUI 
 - Mark tile 
+- Close tile
 
 
 ### Workspace TODO

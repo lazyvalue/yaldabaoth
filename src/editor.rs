@@ -1337,10 +1337,23 @@ impl Editor {
     where
         T: Any + Send + Sync + Clone + PartialEq,
     {
+        self.append_llm_chunk_floored(turn_tag, chunk, usize::MAX);
+    }
+
+    /// Like [`append_llm_chunk`] but never splices below `floor_char` — the
+    /// char at the top of the user's in-progress worksheet draft (the
+    /// contiguous untagged tail). `find_llm_insertion_point` falls back to EOF
+    /// for a new turn or a tool-broken tail; clamping to `floor_char` keeps
+    /// that streamed content ABOVE the user's pending text instead of below
+    /// it. Pass `usize::MAX` for "no floor" (the plain EOF behavior).
+    pub fn append_llm_chunk_floored<T>(&mut self, turn_tag: T, chunk: &str, floor_char: usize)
+    where
+        T: Any + Send + Sync + Clone + PartialEq,
+    {
         if chunk.is_empty() {
             return;
         }
-        let insertion_char = self.find_llm_insertion_point::<T>(&turn_tag);
+        let insertion_char = self.find_llm_insertion_point::<T>(&turn_tag).min(floor_char);
         self.core.programmatic_insert(insertion_char, chunk);
 
         let chunk_chars = chunk.chars().count();

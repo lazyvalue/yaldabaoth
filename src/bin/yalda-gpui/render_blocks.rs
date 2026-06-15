@@ -497,6 +497,12 @@ pub(crate) struct RenderCtx<'a> {
     /// boundaries while scrolling. `0` where unknown (agent chat, nested
     /// contexts) — the gutter falls back to per-block math.
     pub(crate) block_count: usize,
+    /// When true, headings render with their literal markdown markers (`## `,
+    /// `### `) prepended to the styled text. Used only by the agent transcript
+    /// (toggle: agent menu "heading markers"); the doc/edit views always pass
+    /// `false`. Nested ctxes propagate it so headings inside blockquotes/lists
+    /// stay consistent.
+    pub(crate) show_heading_markers: bool,
 }
 
 /// A transparent element wrapper that registers a doc line's `TextLayout` into
@@ -680,6 +686,7 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
         weak_view: ctx.weak_view.clone(),
         doc_dir: ctx.doc_dir.clone(),
         block_count: ctx.block_count,
+        show_heading_markers: ctx.show_heading_markers,
     };
     let base = block_inner(&inner_ctx, block);
 
@@ -712,6 +719,23 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
     .into_any_element()
 }
 
+/// Prepend the literal markdown heading markers (`## ` for h2, `### ` for h3,
+/// …) to a heading's already-parsed styled line. pulldown strips the markers
+/// during parse, so this re-inserts them as a leading span carrying the heading
+/// style. Pure; the agent transcript calls it when its heading-marker toggle is
+/// on (the doc/edit views never do). Level is clamped to 1..=6.
+pub(crate) fn heading_line_with_markers(
+    level: u8,
+    content: &StyledLine,
+    style: yalda::style::Style,
+) -> StyledLine {
+    let marker = format!("{} ", "#".repeat((level as usize).clamp(1, 6)));
+    let mut spans = Vec::with_capacity(content.spans.len() + 1);
+    spans.push(StyledSpan::new(marker, style));
+    spans.extend(content.spans.iter().cloned());
+    StyledLine::new(spans)
+}
+
 pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElement {
     match block {
         RenderedBlock::Heading { level, content } => {
@@ -724,6 +748,17 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                 4 => 18.0,
                 5 => 16.0,
                 _ => 15.0,
+            };
+            // Optionally prepend the literal markdown markers (`## `, `### `)
+            // ahead of the rendered heading text — pulldown strips them during
+            // parse, so we re-insert a span carrying the same heading style.
+            // Agent-transcript-only (doc/edit pass `show_heading_markers: false`).
+            let with_markers;
+            let content: &StyledLine = if ctx.show_heading_markers {
+                with_markers = heading_line_with_markers(*level, content, style);
+                &with_markers
+            } else {
+                content
             };
             div()
                 .text_size(px(size_px * ctx.text_scale))
@@ -869,6 +904,7 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                         weak_view: ctx.weak_view.clone(),
                         doc_dir: ctx.doc_dir.clone(),
                         block_count: 0,
+                        show_heading_markers: ctx.show_heading_markers,
                     },
                     b,
                 ));
@@ -957,6 +993,7 @@ pub(crate) fn list_item_element(
                 weak_view: ctx.weak_view.clone(),
                 doc_dir: ctx.doc_dir.clone(),
                 block_count: 0,
+                show_heading_markers: ctx.show_heading_markers,
             },
             b,
         ));

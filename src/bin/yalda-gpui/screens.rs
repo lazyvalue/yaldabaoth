@@ -48,25 +48,21 @@ impl YaldaGpuiView {
         // holds the visible lines, so `doc_pos_at`'s scan collapses to
         // O(visible) too.
 
-        // Splice the list to the current block count. `blocks` only changes on
-        // load / reload / edit-flush (each builds a fresh `DocState`) or theme
-        // switch (`set_blocks` bumps `blocks_seq`), so a count change is the
-        // reliable trigger; a plain `reset` is correct
-        // and cheap relative to the per-row work it gates. Must run EVERY frame.
-        let new_count = d.blocks.len();
-        if new_count != d.list_item_count.get() {
-            d.list_state.reset(new_count);
-            d.list_item_count.set(new_count);
-            // Force a re-reveal below (the reset cleared scroll position).
-            d.last_cursor_block.set(None);
-        }
+        // Reconcile the list to the current `blocks` by splicing ONLY the
+        // changed range — never `reset()` (that drops scroll + measurements and
+        // snaps the viewport to the top whenever the block count changes, e.g. a
+        // live edit-flush from a sibling Edit tile). Scroll stays anchored; the
+        // reveal below keeps the focused block on-screen. Must run EVERY frame
+        // (the `blocks_seq` gate makes an idle frame a no-op).
+        d.reconcile_list();
+        let new_count = d.list.len();
         // Keep the focused block on-screen when it changed (this also catches
         // nav actions whose `reveal_block` ran against a stale count before the
         // list was first populated).
         if d.last_cursor_block.get() != Some(d.cursor_block) {
             d.last_cursor_block.set(Some(d.cursor_block));
             if d.cursor_block < new_count {
-                d.list_state.scroll_to_reveal_item(d.cursor_block);
+                d.list.state().scroll_to_reveal_item(d.cursor_block);
             }
         }
 
@@ -102,6 +98,8 @@ impl YaldaGpuiView {
                 weak_view: Some(weak_view.clone()),
                 doc_dir: doc_dir.clone(),
                 block_count: blocks_rc.len(),
+                // Doc view never shows raw markdown markers — agent chat only.
+                show_heading_markers: false,
             };
             block_element(&ctx, idx, block)
         };
@@ -147,7 +145,7 @@ impl YaldaGpuiView {
                 // agent + Edit lists already use the default; the doc body's
                 // parent is `flex_1().min_h_0()`, so the list fills the viewport
                 // and scrolls without needing to size to content.
-                gpui::list(d.list_state.clone(), render_fn)
+                gpui::list(d.list.state().clone(), render_fn)
                     .flex_1()
                     .w_full(),
             );
@@ -240,6 +238,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::open_linear))
             .on_action(cx.listener(Self::open_menu))
             .on_action(cx.listener(Self::open_local_menu))
+            .on_action(cx.listener(Self::open_global_menu))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::next_buffer))
@@ -477,23 +476,18 @@ impl YaldaGpuiView {
         // Incremental highlight: only changed lines are re-tokenized; unchanged
         // frames recompute zero. `lines_rc`/`hl_snap` are cheap Rc clones.
         let (lines_rc, hl_snap) = e.highlight_snapshot(&self.theme, &self.syntect_hl);
-        let line_count = lines_rc.len();
 
-        // Splice the list to the current line count (cheap; preserves the
-        // height cache for unchanged rows) and keep the cursor on-screen when
-        // the buffer or caret moved.
-        let new_count = line_count.max(1);
-        if new_count != e.list_item_count {
-            // Line count can shrink (delete) or grow (insert/paste); a plain
-            // reset is correct and cheap relative to the per-row work it gates.
-            e.list_state.reset(new_count);
-            e.list_item_count = new_count;
-        }
+        // Reconcile the list to the current lines by splicing ONLY the changed
+        // range — never `reset()` (that drops scroll + measurements and snaps
+        // the viewport to the top on every newline edit). Scroll stays anchored;
+        // the reveal below keeps the caret on-screen.
+        e.list.reconcile(&lines_rc, edit_seq);
+        let new_count = e.list.len();
         let anchor = (edit_seq, cursor_line);
         if e.last_cursor_anchor != Some(anchor) {
             e.last_cursor_anchor = Some(anchor);
             if cursor_line < new_count {
-                e.list_state.scroll_to_reveal_item(cursor_line);
+                e.list.state().scroll_to_reveal_item(cursor_line);
             }
         }
 
@@ -569,7 +563,7 @@ impl YaldaGpuiView {
             .font_family(self.code_font.clone())
             .text_color(editor_fg)
             .child(
-                gpui::list(e.list_state.clone(), render_fn)
+                gpui::list(e.list.state().clone(), render_fn)
                     .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
                     .flex_1()
                     .w_full(),
@@ -611,18 +605,15 @@ impl YaldaGpuiView {
             kinds.push(kind);
         }
 
-        // Splice the list to line count and keep the cursor visible on edits /
-        // motion (mirrors the Code view).
-        let new_count = line_count.max(1);
-        if new_count != e.list_item_count {
-            e.list_state.reset(new_count);
-            e.list_item_count = new_count;
-        }
+        // Reconcile by splicing the changed range (mirrors the Code view); never
+        // `reset()`, which would snap the viewport to the top on newline edits.
+        e.list.reconcile(&lines_rc, edit_seq);
+        let new_count = e.list.len();
         let anchor = (edit_seq, cursor_line);
         if e.last_cursor_anchor != Some(anchor) {
             e.last_cursor_anchor = Some(anchor);
             if cursor_line < new_count {
-                e.list_state.scroll_to_reveal_item(cursor_line);
+                e.list.state().scroll_to_reveal_item(cursor_line);
             }
         }
 
@@ -747,7 +738,7 @@ impl YaldaGpuiView {
             .font_family(self.body_font.clone())
             .text_color(editor_fg)
             .child(
-                gpui::list(e.list_state.clone(), render_fn)
+                gpui::list(e.list.state().clone(), render_fn)
                     .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
                     .flex_1()
                     .w_full(),
@@ -850,7 +841,7 @@ impl YaldaGpuiView {
         // ---- Status Strip (spec §30) ----
         // Single-row header showing agent label, sub-agent breadcrumb
         // (when focused), model id, permission mode, context-window
-        // usage + cost (when present), and turn / elapsed. Any field
+        // usage, and turn / elapsed. Any field
         // whose underlying signal is absent renders nothing — no
         // placeholder, no `?`. The strip is at most as wide as the
         // data it has.
@@ -1013,7 +1004,7 @@ impl YaldaGpuiView {
 
         // Context-window usage — a subtle progress bar plus a compact number.
         // The bar fills proportionally and shifts to the warm/danger accent as
-        // the window approaches full; cost (when present) trails it.
+        // the window approaches full.
         if let Some(usage) = &c.usage {
             let used_k = (usage.tokens_used as f64) / 1000.0;
             let total_k = (usage.tokens_total as f64) / 1000.0;
@@ -1053,14 +1044,6 @@ impl YaldaGpuiView {
                             .child(SharedString::from(label)),
                     ),
             );
-            if let Some(cost) = usage.cost_usd {
-                strip = strip.child(
-                    div()
-                        .pr_2()
-                        .text_color(strip_dim)
-                        .child(SharedString::from(format!("${:.2}", cost))),
-                );
-            }
         }
 
         // Active sub-agents — the one readout that used to live only in the
@@ -1275,8 +1258,11 @@ impl YaldaGpuiView {
                             .collect(),
                     )
                 };
-                tb.list_state.reset(line_count);
-                tb.list_state.scroll_to_reveal_item(compose_cursor_line);
+                // Splice the changed range (never `reset()`, which snaps the box
+                // to its top on every newline); then reveal the caret line.
+                let compose_edit_seq = tb.editor.document().edit_seq();
+                tb.list.reconcile(&lines_snap, compose_edit_seq);
+                tb.list.state().scroll_to_reveal_item(compose_cursor_line);
                 let font = compose_code_font.clone();
                 let cur_color = compose_cursor_color;
                 let fg = compose_fg;
@@ -1318,7 +1304,7 @@ impl YaldaGpuiView {
                     .text_size(px(13.0))
                     .text_color(compose_fg)
                     .child(
-                        gpui::list(tb.list_state.clone(), render_fn)
+                        gpui::list(tb.list.state().clone(), render_fn)
                             .flex_1()
                             .w_full(),
                     )
@@ -1630,6 +1616,32 @@ impl YaldaGpuiView {
         let accent = nc(self.theme.agent.warm_accent);
         let fg = self.editor_fg();
         let bg = self.editor_bg();
+        // Modal: Insert shows a blinking-block caret and types into the query;
+        // Normal hides the caret and a hint advertises the menu / motion keys
+        // (so `<space>`/`.` are discoverable as menu openers, not typed text).
+        let normal = matches!(tile.mode, LinearMode::Normal);
+        let (badge, badge_bg) = if normal {
+            ("NORMAL", accent)
+        } else {
+            ("INSERT", nc(self.theme.agent.user_bar))
+        };
+        let input_text = if normal {
+            tile.input.clone()
+        } else {
+            format!("{}\u{2588}", tile.input)
+        };
+        let trailing: AnyElement = if normal {
+            div()
+                .flex_none()
+                .pl_2()
+                .text_color(dim)
+                .child(SharedString::from(
+                    "space menu · . menu · i edit · j/k browse · ⏎ open",
+                ))
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
         let input_row = div()
             .flex()
             .flex_row()
@@ -1645,6 +1657,16 @@ impl YaldaGpuiView {
             .child(
                 div()
                     .flex_none()
+                    .mr_2()
+                    .px_1()
+                    .text_color(bg)
+                    .bg(badge_bg)
+                    .font_weight(FontWeight::BOLD)
+                    .child(SharedString::from(badge)),
+            )
+            .child(
+                div()
+                    .flex_none()
                     .pr_1()
                     .text_color(accent)
                     .font_weight(FontWeight::BOLD)
@@ -1652,11 +1674,11 @@ impl YaldaGpuiView {
             )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .flex_none()
                     .text_color(fg)
-                    .child(SharedString::from(format!("{}\u{2588}", tile.input))),
-            );
+                    .child(SharedString::from(input_text)),
+            )
+            .child(trailing);
 
         // ── Body (cached child; fills the remaining height) ──────────────
         let body_area = div()
@@ -2082,9 +2104,21 @@ impl YaldaGpuiView {
                         .child(SharedString::new_static(msg)),
                 );
             } else {
-                let visible_rows = 80usize;
-                let scroll = scroll_to_keep_visible(selected, visible_rows, entries.len());
-                for (i, entry) in entries.iter().enumerate().skip(scroll).take(visible_rows) {
+                // Entry rows live in their OWN scrollable container (separate
+                // from the filter bar above) so a `scroll_to_item(selected)`
+                // index lines up exactly with row indices. The viewport follows
+                // the cursor instead of letting it run off the bottom edge — the
+                // old fixed 80-row window let the caret clip when the real
+                // viewport showed fewer rows than that.
+                let mut rows = div()
+                    .id("browser-rows")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&b.scroll);
+                for (i, entry) in entries.iter().enumerate() {
                     if i == selected
                         && let Some(r) = &b.fb.rename
                     {
@@ -2107,11 +2141,13 @@ impl YaldaGpuiView {
                                     .child(SharedString::from(err.clone())),
                             );
                         }
-                        list = list.child(input_row);
+                        rows = rows.child(input_row);
                     } else {
-                        list = list.child(browser_row(entry, i == selected, &self.code_font, ov));
+                        rows = rows.child(browser_row(entry, i == selected, &self.code_font, ov));
                     }
                 }
+                b.scroll.scroll_to_item(selected);
+                list = list.child(rows);
             }
 
             let hint = if b.fb.filter_mode {
@@ -2160,6 +2196,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::browser_cycle_sort))
             .on_action(cx.listener(Self::open_menu))
             .on_action(cx.listener(Self::open_local_menu))
+            .on_action(cx.listener(Self::open_global_menu))
             .on_action(cx.listener(Self::browser_close))
             .on_action(cx.listener(Self::browser_worktrees))
             .on_action(cx.listener(Self::browser_filter))

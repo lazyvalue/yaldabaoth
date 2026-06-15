@@ -28,10 +28,25 @@ pub(crate) enum LinearViewState {
     Error(String),
 }
 
+/// A selectable cross-reference in the loaded body that the browse cursor can
+/// jump to. Activating one re-fetches it into the same tile (see
+/// `linear_activate_selected` in `linear_ui.rs`).
+#[derive(Clone)]
+pub(crate) enum NavTarget {
+    /// An issue, by its `<TEAM>-<n>` identifier (e.g. "FUL-19").
+    Issue(String),
+    /// A project, by name (an issue only carries its project's name, so we
+    /// re-run the name search — which auto-opens a unique match).
+    Project(String),
+}
+
 /// The cached body view. One per Linear tile (owned by the tile via
 /// `Entity<LinearView>`, so it drops when the tile closes — no registry).
 pub(crate) struct LinearView {
     state: LinearViewState,
+    /// Browse cursor over the body's [`NavTarget`]s. `None` = typing mode (the
+    /// input line edits normally); `Some(i)` = browsing, row `i` highlighted.
+    cursor: Option<usize>,
     scroll: ScrollHandle,
     root: WeakEntity<YaldaGpuiView>,
     perf_label: &'static str,
@@ -41,6 +56,7 @@ impl LinearView {
     pub(crate) fn new(root: WeakEntity<YaldaGpuiView>) -> Self {
         LinearView {
             state: LinearViewState::Empty,
+            cursor: None,
             scroll: ScrollHandle::new(),
             root,
             perf_label: "linear",
@@ -49,9 +65,80 @@ impl LinearView {
 
     /// Replace the payload and reset scroll to the top. The caller notifies
     /// (mutation-site notify — the only thing that busts this cached view).
+    /// The browse cursor is cleared; the tile's mode decides whether to show it
+    /// (Normal re-enters browse via `enter_select`, Insert leaves it hidden), so
+    /// the cursor never appears while typing.
     pub(crate) fn set_state(&mut self, state: LinearViewState) {
         self.state = state;
         self.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        self.cursor = None;
+    }
+
+    /// The web URL of the loaded issue/project, if any (open-in-browser / copy).
+    pub(crate) fn current_url(&self) -> Option<String> {
+        match &self.state {
+            LinearViewState::Issue(i) => i.url.clone(),
+            LinearViewState::Project(p) => p.url.clone(),
+            _ => None,
+        }
+    }
+
+    /// The ordered selectable targets in the current body. The order MUST match
+    /// the body builders' render order, since `cursor` indexes the highlighted
+    /// row: a project → its issues list (top to bottom); an issue → its project
+    /// link. Other states have none.
+    pub(crate) fn nav_targets(&self) -> Vec<NavTarget> {
+        match &self.state {
+            LinearViewState::Project(p) => {
+                let empty: &[IssueRef] = &[];
+                p.issues
+                    .as_ref()
+                    .map(|l| l.nodes.as_slice())
+                    .unwrap_or(empty)
+                    .iter()
+                    .map(|it| NavTarget::Issue(it.identifier.clone().unwrap_or_default()))
+                    .collect()
+            }
+            LinearViewState::Issue(i) => i
+                .project
+                .as_ref()
+                .and_then(|p| p.name.clone())
+                .filter(|n| !n.trim().is_empty())
+                .map(|n| vec![NavTarget::Project(n)])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Begin browsing the body's targets (cursor on the first), if any exist.
+    pub(crate) fn enter_select(&mut self) {
+        if self.cursor.is_none() && !self.nav_targets().is_empty() {
+            self.cursor = Some(0);
+        }
+    }
+
+    /// Return to typing mode (the loaded body is kept).
+    pub(crate) fn exit_select(&mut self) {
+        self.cursor = None;
+    }
+
+    /// Move the browse cursor by `delta` rows, wrapping. No-op when not browsing;
+    /// drops back to typing mode if the body has no targets.
+    pub(crate) fn nav_move(&mut self, delta: i32) {
+        let n = self.nav_targets().len() as i32;
+        if n == 0 {
+            self.cursor = None;
+            return;
+        }
+        if let Some(c) = self.cursor {
+            self.cursor = Some((c as i32 + delta).rem_euclid(n) as usize);
+        }
+    }
+
+    /// The target under the browse cursor, if any.
+    pub(crate) fn selected_target(&self) -> Option<NavTarget> {
+        let c = self.cursor?;
+        self.nav_targets().into_iter().nth(c)
     }
 
     /// Scroll the body by `down` px (negative scrolls up), clamped at the top.
@@ -156,8 +243,12 @@ impl Render for LinearView {
                 )
                 .child(multiline_text(e, st.err, &st.prose, st.base))
                 .into_any_element(),
-            LinearViewState::Issue(i) => linear_issue_body(i, &st).into_any_element(),
-            LinearViewState::Project(p) => linear_project_body(p, &st).into_any_element(),
+            LinearViewState::Issue(i) => {
+                linear_issue_body(i, self.cursor, &st).into_any_element()
+            }
+            LinearViewState::Project(p) => {
+                linear_project_body(p, self.cursor, &st).into_any_element()
+            }
             LinearViewState::ProjectPicker {
                 candidates,
                 selected,
@@ -183,6 +274,44 @@ impl Render for LinearView {
 }
 
 // ── Domain body builders (Linear-specific; composed from yux primitives) ─────
+
+/// Translucent highlight for the browse cursor's selected row (matches the
+/// project picker's selected-row tint).
+fn nav_sel_bg(st: &DetailStyle) -> Hsla {
+    let mut bg = st.accent;
+    bg.a = 0.16;
+    bg
+}
+
+/// A [`kv_row`](kv_row)-shaped row that highlights when it's the selected
+/// [`NavTarget`]. Used for the issue body's project link.
+fn nav_kv_row(label: &str, value: String, is_sel: bool, st: &DetailStyle) -> gpui::Div {
+    let transparent: Hsla = rgba(0x00000000).into();
+    div()
+        .flex()
+        .flex_row()
+        .gap_2()
+        .items_start()
+        .w_full()
+        .px_1()
+        .text_size(st.base)
+        .font_family(st.mono.clone())
+        .bg(if is_sel { nav_sel_bg(st) } else { transparent })
+        .child(
+            div()
+                .w(px(96.0))
+                .flex_none()
+                .text_color(st.dim)
+                .child(SharedString::from(label.to_string())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(if is_sel { st.accent } else { st.fg })
+                .child(SharedString::from(value)),
+        )
+}
 
 fn linear_empty_body(st: &DetailStyle) -> gpui::Div {
     div()
@@ -259,7 +388,7 @@ fn linear_picker_body(candidates: &[ProjectCandidate], selected: usize, st: &Det
     col
 }
 
-fn linear_issue_body(i: &IssueDetail, st: &DetailStyle) -> gpui::Div {
+fn linear_issue_body(i: &IssueDetail, cursor: Option<usize>, st: &DetailStyle) -> gpui::Div {
     let mut col = div().flex().flex_col().w_full().gap_2();
 
     let ident = i.identifier.clone().unwrap_or_default();
@@ -306,8 +435,14 @@ fn linear_issue_body(i: &IssueDetail, st: &DetailStyle) -> gpui::Div {
     if let Some(p) = i.priority_label.clone().filter(|s| !s.is_empty()) {
         meta = meta.child(kv_row("Priority", p, st));
     }
-    if let Some(pr) = i.project.as_ref().and_then(|p| p.name.clone()) {
-        meta = meta.child(kv_row("Project", pr, st));
+    if let Some(pr) = i
+        .project
+        .as_ref()
+        .and_then(|p| p.name.clone())
+        .filter(|n| !n.trim().is_empty())
+    {
+        // The project link is the issue body's sole NavTarget (index 0).
+        meta = meta.child(nav_kv_row("Project", pr, cursor == Some(0), st));
     }
     if let Some(m) = i.milestone.as_ref().and_then(|m| m.name.clone()) {
         meta = meta.child(kv_row("Milestone", m, st));
@@ -356,7 +491,7 @@ fn linear_issue_body(i: &IssueDetail, st: &DetailStyle) -> gpui::Div {
     col
 }
 
-fn linear_project_body(p: &ProjectDetail, st: &DetailStyle) -> gpui::Div {
+fn linear_project_body(p: &ProjectDetail, cursor: Option<usize>, st: &DetailStyle) -> gpui::Div {
     let mut col = div().flex().flex_col().w_full().gap_2();
 
     let name = p.name.clone().unwrap_or_else(|| "(unnamed project)".into());
@@ -449,7 +584,11 @@ fn linear_project_body(p: &ProjectDetail, st: &DetailStyle) -> gpui::Div {
                 .child(SharedString::from("No issues.")),
         );
     } else {
-        for it in issues {
+        let transparent: Hsla = rgba(0x00000000).into();
+        // Issues are this body's NavTargets, indexed in render order — so the
+        // row index IS the cursor index (see `LinearView::nav_targets`).
+        for (idx, it) in issues.iter().enumerate() {
+            let is_sel = cursor == Some(idx);
             let id = it.identifier.clone().unwrap_or_default();
             let state = it
                 .state
@@ -464,8 +603,10 @@ fn linear_project_body(p: &ProjectDetail, st: &DetailStyle) -> gpui::Div {
                     .gap_2()
                     .items_start()
                     .w_full()
+                    .px_1()
                     .text_size(st.base)
                     .font_family(st.mono.clone())
+                    .bg(if is_sel { nav_sel_bg(st) } else { transparent })
                     .child(
                         div()
                             .w(px(84.0))

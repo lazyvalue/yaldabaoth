@@ -295,6 +295,17 @@ pub(crate) enum LinearFetch {
 
 // ── Tile (layout-tree content) ──────────────────────────────────────────────
 
+/// Input mode for a Linear tile. Mirrors the Edit view's modality so the tile
+/// isn't a keystroke trap: `Insert` types the query, `Normal` frees the
+/// printable keys to be commands — `<space>` opens the global menu, `.` the
+/// Linear local menu, j/k browse the body's links, Enter jumps. Without this
+/// the input line swallowed `<space>`/`.` and no menu was reachable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinearMode {
+    Insert,
+    Normal,
+}
+
 /// A Linear viewport. Lives in the workspace layout tree as `App::Linear`.
 /// Holds the cheap, frequently-edited bits (the input line, the request id, a
 /// denormalized title for the tab strip) inline; the EXPENSIVE part — the
@@ -310,6 +321,9 @@ pub(crate) struct LinearTile {
     pub(crate) req: u64,
     pub(crate) title: String,
     pub(crate) view: Option<Entity<LinearView>>,
+    /// Insert (typing the query) vs Normal (vim/command). A fresh tile opens in
+    /// Insert so you can type an identifier immediately; Esc drops to Normal.
+    pub(crate) mode: LinearMode,
 }
 
 impl LinearTile {
@@ -319,6 +333,7 @@ impl LinearTile {
             req: 0,
             title: "Linear".into(),
             view: None,
+            mode: LinearMode::Insert,
         }
     }
 

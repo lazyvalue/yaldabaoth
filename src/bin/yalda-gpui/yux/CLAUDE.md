@@ -37,6 +37,20 @@ style bundle so a caller themes once:
   multiline body (comments, updates, log entries).
 - **`fmt_iso_datetime(&Option<String>)`** — ISO-8601 → `YYYY-MM-DD HH:MM`.
 
+### `list.rs` — virtualized scroll surfaces
+- **`ScrollAnchoredList<T>`** — a `gpui::list` that re-syncs to a new item
+  sequence by SPLICING the changed range (shared prefix/suffix trimmed), never
+  `reset()`. `reset()` nulls the scroll offset + unmeasures every row, so a
+  same-frame `scroll_to_reveal_item` lands at item 0 — the "viewport jumps to
+  the top on every newline" bug. One per scroll surface (Edit view, Doc view,
+  compose box). All methods take `&self` (interior-mutable), so a `&self` render
+  path reconciles fine. `reconcile(items, seq)` is gated on `seq` (idle frames
+  are no-ops). Consume via `.state()` (paint/reveal/scroll) + `.len()`.
+- **`splice_list_to_items(&ListState, old, new)`** — the bare splice primitive,
+  unit-testable against a raw `ListState`. The agent transcript's
+  `TranscriptScroll` reconciles by item COUNT (streaming tail + follow-output),
+  not a content diff, so it stays separate — don't force it onto this.
+
 ## Efficiency practices (non-negotiable)
 
 1. **O(changed), never O(whole tree).** An expensive surface that is usually

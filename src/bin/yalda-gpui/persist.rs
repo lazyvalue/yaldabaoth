@@ -678,17 +678,11 @@ pub(crate) fn restore_content(
                 Ok((id, core)) => {
                     let blocks =
                         render_with_wiki(&core.borrow().document().full_text(), theme, Some(&path));
-                    App::Buffer(BufferApp::Viewing(DocState {
+                    App::Buffer(BufferApp::Viewing(DocState::viewing(
                         blocks,
-                        file_label: label,
-                        cursor_block: 0,
-                        list_state: DocState::new_list_state(0),
-                        list_item_count: std::cell::Cell::new(0),
-                        blocks_seq: 0,
-                        blocks_snapshot: RefCell::new(None),
-                        last_cursor_block: std::cell::Cell::new(None),
-                        source: Some(DocSource::new(id, core)),
-                    }))
+                        label,
+                        Some(DocSource::new(id, core)),
+                    )))
                 }
                 Err(_) => App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
                     path.parent()

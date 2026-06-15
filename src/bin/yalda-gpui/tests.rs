@@ -2,6 +2,92 @@
 
 use super::*;
 
+/// Agent-chat heading-marker toggle (the only markdown the user wants visible
+/// in transcripts): `heading_line_with_markers` re-inserts the literal `#`
+/// markers pulldown strips, as a leading span, with one space before the text.
+/// `##` for h2, `###` for h3, level clamped to 1..=6, and existing spans kept.
+#[test]
+fn heading_line_with_markers_prepends_markers() {
+    let style = yalda::style::Style::default();
+    let h2 = heading_line_with_markers(2, &StyledLine::plain("Overview"), style);
+    assert_eq!(h2.text_content(), "## Overview", "h2 shows ##");
+
+    let h3 = heading_line_with_markers(3, &StyledLine::plain("Details"), style);
+    assert_eq!(h3.text_content(), "### Details", "h3 shows ###");
+
+    // The marker is a distinct leading span (so it carries the heading style),
+    // ahead of the original content spans.
+    assert_eq!(h2.spans.len(), 2, "marker span + content span");
+    assert_eq!(h2.spans[0].text, "## ");
+
+    // Level clamps to the 1..=6 heading range (mirrors `block_inner`).
+    let h7 = heading_line_with_markers(7, &StyledLine::plain("X"), style);
+    assert_eq!(h7.text_content(), "###### X", "level clamps at 6");
+}
+
+/// User-turn jump navigation (agent `.` menu): `user_turn_item_indices` returns
+/// the flat-item index of every user `TurnHeader` in render order — the single
+/// source the handler clamps against and `build_body` resolves the jump ordinal
+/// through. Claude turns and plain lines are skipped; order is preserved.
+#[test]
+fn user_turn_item_indices_picks_only_user_headers() {
+    let items = vec![
+        FlatItem::TurnHeader { role: TurnRole::User }, // 0
+        FlatItem::Line(0),                              // 1
+        FlatItem::TurnHeader { role: TurnRole::Claude }, // 2
+        FlatItem::Line(1),                              // 3
+        FlatItem::TurnHeader { role: TurnRole::User }, // 4
+        FlatItem::Line(2),                              // 5
+        FlatItem::TurnHeader { role: TurnRole::User }, // 6
+    ];
+    let idx = user_turn_item_indices(&items);
+    assert_eq!(idx, vec![0, 4, 6], "only user TurnHeaders, in order");
+    // The Nth-user-turn resolution `build_body` performs: ordinal → flat index.
+    assert_eq!(idx.get(0).copied(), Some(0), "first user turn");
+    assert_eq!(idx.get(2).copied(), Some(6), "last user turn");
+    assert_eq!(idx.get(3).copied(), None, "out-of-range ordinal yields no reveal");
+
+    // No user turns → empty (the handler's "no user turns yet" guard).
+    assert!(user_turn_item_indices(&[FlatItem::Line(0)]).is_empty());
+}
+
+/// User-turn jump stepping (`next_jump_ord`): `k`/`j` step by ∓1 and saturate at
+/// both ends; `to_last` parks on the most recent turn; a stale `cur` past the
+/// end is clamped before stepping.
+#[test]
+fn next_jump_ord_steps_and_clamps() {
+    // 3 user turns → ordinals 0,1,2.
+    assert_eq!(next_jump_ord(0, 3, 1, false), 1, "j: newer");
+    assert_eq!(next_jump_ord(1, 3, 1, false), 2, "j: newer");
+    assert_eq!(next_jump_ord(2, 3, 1, false), 2, "j: saturates at last");
+    assert_eq!(next_jump_ord(2, 3, -1, false), 1, "k: older");
+    assert_eq!(next_jump_ord(0, 3, -1, false), 0, "k: saturates at first");
+    // to_last ignores delta → most recent.
+    assert_eq!(next_jump_ord(0, 3, 0, true), 2, "to_last → last turn");
+    // A stale ordinal (turns removed/replayed) clamps to the live range first.
+    assert_eq!(next_jump_ord(9, 3, -1, false), 1, "stale cur clamps to last, then steps");
+    // Single turn: every step stays put.
+    assert_eq!(next_jump_ord(0, 1, 1, false), 0);
+    assert_eq!(next_jump_ord(0, 1, -1, false), 0);
+}
+
+/// `j` pressed while already parked on the newest user turn means "go past the
+/// last turn" → drop at the buffer's page end. Every other step stays on a
+/// user-turn header.
+#[test]
+fn jump_lands_at_page_end_only_on_j_at_newest() {
+    // 3 turns (ordinals 0,1,2). At the last, a `j` that can't advance → page end.
+    assert!(jump_lands_at_page_end(2, 2, 3, 1, false), "j at newest → page end");
+    // Mid-list `j` advances to a header, not the page end.
+    assert!(!jump_lands_at_page_end(1, 2, 3, 1, false), "j mid-list → header");
+    // `k` (older) never lands at the page end, even at the last turn.
+    assert!(!jump_lands_at_page_end(2, 2, 3, -1, false), "k never page-ends");
+    // toggle-on ("jump to last") parks on the last header, not the page end.
+    assert!(!jump_lands_at_page_end(2, 2, 3, 0, true), "to_last → header");
+    // Single turn: a `j` there (already newest) goes to the page end.
+    assert!(jump_lands_at_page_end(0, 0, 1, 1, false), "lone turn: j → page end");
+}
+
 /// 5c / ADR-0007: a theme switch re-renders Doc blocks via `re_render_one_doc`.
 /// For a pool-bound Doc the authority is the LIVE shared core (unsaved edits
 /// from a sibling Edit view), not the file on disk. The old code read disk
@@ -21,17 +107,11 @@ fn re_render_one_doc_sources_live_core_not_disk() {
 
     // A pool-bound Doc, rendered at the disk content (rendered_seq stamped at
     // the pristine core).
-    let mut doc = DocState {
-        blocks: render_with_wiki("disk only\n", &Theme::default(), Some(&path)),
-        file_label: path.display().to_string().into(),
-        cursor_block: 0,
-        list_state: DocState::new_list_state(0),
-        list_item_count: std::cell::Cell::new(0),
-        blocks_seq: 0,
-        blocks_snapshot: RefCell::new(None),
-        last_cursor_block: std::cell::Cell::new(None),
-        source: Some(DocSource::new(id, core.clone())),
-    };
+    let mut doc = DocState::viewing(
+        render_with_wiki("disk only\n", &Theme::default(), Some(&path)),
+        path.display().to_string().into(),
+        Some(DocSource::new(id, core.clone())),
+    );
     assert_eq!(doc.blocks.len(), 1, "disk content is one block");
 
     // Simulate an unsaved edit through a sibling view: append two more
@@ -408,6 +488,48 @@ fn rebuild_renders_unparsed_range_as_lines() {
         "every source line of an unparsed range must render as a Line \
          (plus the editable tail — a lone user blank not adjacent to a \
          structural item is kept, not collapsed)"
+    );
+}
+
+/// Worksheet caret-on-blank-tail regression: the blank-line collapse pass
+/// strips/collapses blank user Lines, but in Worksheet mode the caret can sit
+/// on one (e.g. you press Enter twice on the empty tail). If that Line is
+/// stripped the caret vanishes (`line_idx == cursor_line` matches no rendered
+/// row) and the cursor-reveal routes to the wrong item (`item_for_line` falls
+/// back to the last item, scrolling past the caret). The cursor's line must
+/// survive collapse — but ONLY in Worksheet mode (in Chatbox the editable tail
+/// is a separate surface, so a stray blank tail Line is just noise).
+#[test]
+fn rebuild_keeps_worksheet_cursor_line_through_collapse() {
+    let theme = Theme::default();
+    // Agent text, then two consecutive blank tail lines — the "Enter twice"
+    // repro. Cursor parks on the SECOND blank (line 2).
+    let lines: Vec<String> = vec!["agent text".to_string(), String::new(), String::new()];
+    let frozen = vec![(0usize, 1)];
+
+    // Chatbox (default): the second consecutive blank collapses away.
+    let mut chat = AgentState::new_for_test();
+    chat.editor.cursor_mut().line = 2;
+    let (flat_chat, _) = rebuild_agent_view_model(&mut chat, &lines, &frozen, 1, &theme, 1);
+    assert!(
+        !flat_chat.iter().any(|f| matches!(f, FlatItem::Line(2))),
+        "Chatbox mode collapses the consecutive blank tail line"
+    );
+
+    // Worksheet: the caret's line (2) is protected from collapse and the
+    // reverse index points reveal straight at it.
+    let mut ws = AgentState::new_for_test();
+    ws.input_surface = InputSurface::Worksheet;
+    ws.editor.cursor_mut().line = 2;
+    let (flat_ws, _) = rebuild_agent_view_model(&mut ws, &lines, &frozen, 1, &theme, 1);
+    let pos = flat_ws
+        .iter()
+        .position(|f| matches!(f, FlatItem::Line(2)))
+        .expect("Worksheet keeps the caret's blank line so the caret can render");
+    assert_eq!(
+        ws.view_model.item_for_line(2),
+        pos,
+        "cursor-reveal must target the caret's real flat position, not a fallback"
     );
 }
 
@@ -1316,9 +1438,10 @@ fn gpui_menu_has_required_entries() {
     let mut leaf_actions: Vec<&str> = Vec::new();
     collect_leaves(&menu, &mut leaf_actions);
     // The expected leaf actions — change here if gpui_menu changes.
-    // Per untitled.md "Workspace › Commands (12 jun)" the workspace menu
-    // is pruned to exactly these: set cwd, new agent/buffer, theme
-    // nightfox/folio, rebuild+restart, mark tile.
+    // Per untitled.md "Workspace › Commands (12 jun)" the workspace menu holds:
+    // set cwd, new agent/buffer/linear, theme nightfox/folio, layout
+    // manual/master-stack/monocle/columns/desktop, rebuild+restart, mark tile,
+    // close tile.
     let expected = [
         "workspace-set-cwd",
         "new-agent-tile",
@@ -1326,8 +1449,15 @@ fn gpui_menu_has_required_entries() {
         "new-linear-tile",
         "theme-nightfox",
         "theme-folio",
+        "layout-manual",
+        "layout-master-stack",
+        "layout-monocle",
+        "layout-columns",
+        "layout-desktop",
         "dev-restart-gui",
+        "dev-restart-all",
         "mark-tile",
+        "close-window",
     ];
     for e in expected {
         assert!(
@@ -1344,11 +1474,9 @@ fn gpui_menu_has_required_entries() {
         "open-browser",
         "buffer-list",
         "split-h",
-        "close-window",
         "new-tab",
         "move-tile",
         "cycle-layout",
-        "layout-manual",
         "tag-add",
         "list-marks",
         "back-to-doc",
@@ -1584,6 +1712,79 @@ fn append_llm_chunk_chains_turns_above_draft() {
     assert!(pos_ok < pos_yes, "ok before Yes! ({:?})", text);
 }
 
+#[test]
+fn agent_content_floors_above_worksheet_draft() {
+    // The interspersed-tool-group bug: while the agent streams a turn, the
+    // user composes a worksheet draft at the tail. Tool anchors (and the LLM
+    // EOF fallback) must splice ABOVE that untagged draft, never below it.
+    let mut ed = Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+    ed.append_llm_chunk(TurnId::Llm(1), "Agent prose.\n");
+    let a0 = ed.anchor_for_line(0);
+    ed.metadata_mut::<TurnId>().insert(a0, TurnId::Llm(1));
+    finalize_agent_turn(&mut ed);
+
+    // User types a draft on the editable tail (worksheet compose).
+    ed.cursor_mut().line = ed.document().line_count().saturating_sub(1);
+    ed.cursor_mut().col = 0;
+    for ch in "draft".chars() {
+        ed.insert_char(ch);
+    }
+    fn draft_line(ed: &Editor) -> usize {
+        ed.document()
+            .full_text()
+            .lines()
+            .position(|l| l.contains("draft"))
+            .unwrap()
+    }
+
+    // A tool call arrives mid-compose. With the draft present the floor is
+    // above it, so the anchor lands above the draft line.
+    let floor = agent_tail_floor_char(&ed);
+    assert!(
+        floor < ed.document().rope().len_chars(),
+        "a non-blank draft must push the floor above EOF"
+    );
+    let anchor = anchor_for_new_tool_call(&mut ed, floor);
+    ed.metadata_mut::<TurnId>().insert(anchor, TurnId::Tool(1));
+    let tool_line = ed.line_for_anchor(anchor).expect("tool anchor resolves");
+    assert!(
+        tool_line < draft_line(&ed),
+        "tool anchor must render above the user draft, not below it: {:?}",
+        ed.document().full_text()
+    );
+
+    // A same-turn LLM chunk also floors above the draft.
+    let floor = agent_tail_floor_char(&ed);
+    ed.append_llm_chunk_floored(TurnId::Llm(1), "More prose.\n", floor);
+    let text = ed.document().full_text();
+    let pos_more = text.find("More prose.").unwrap();
+    let pos_draft = text.find("draft").unwrap();
+    assert!(
+        pos_more < pos_draft,
+        "streamed prose must stay above the draft: {text:?}"
+    );
+    assert!(
+        text.trim_end().ends_with("draft"),
+        "the user's draft stays at the tail: {text:?}"
+    );
+}
+
+#[test]
+fn agent_tail_floor_is_eof_without_draft() {
+    // No-op guarantee for Chatbox / an untouched worksheet tail: an all-blank
+    // trailing region keeps the floor at EOF, so the splice is unchanged.
+    let mut ed = Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+    ed.append_llm_chunk(TurnId::Llm(1), "Agent prose.\n");
+    let a0 = ed.anchor_for_line(0);
+    ed.metadata_mut::<TurnId>().insert(a0, TurnId::Llm(1));
+    finalize_agent_turn(&mut ed);
+    assert_eq!(
+        agent_tail_floor_char(&ed),
+        ed.document().rope().len_chars(),
+        "blank trailing region ⇒ floor is EOF (no behavior change)"
+    );
+}
+
 /// Source files must split into one CodeBlock per line: the doc view scrolls
 /// and focuses by block (j/k move `cursor_block`) and `gpui::list`
 /// virtualizes by item, so a whole file as ONE block can neither scroll nor
@@ -1665,4 +1866,46 @@ fn line_outside_selection_is_unchanged() {
     let segs = vec![("text".to_string(), style)];
     let out = apply_line_selection(&segs, "text", ((0, 0), (0, 4)), 3, style, NColor::Rgb(1, 2, 3));
     assert_eq!(out, segs, "line 3 is outside a line-0 selection");
+}
+
+/// Regression (doc scroll anchoring): a block-count change (e.g. a live
+/// edit-flush re-parse from a sibling Edit tile) must keep the Doc viewport
+/// anchored — `DocState::reconcile_list` splices the changed range instead of
+/// `reset()`-ing the list, which would snap the viewport to the top. Mirrors
+/// the Edit view's `edit_list_splice_preserves_scroll_anchor`.
+#[test]
+fn doc_list_splice_preserves_scroll_anchor() {
+    let path = std::path::PathBuf::from("test.md");
+    let mut src = String::new();
+    for i in 0..40 {
+        src.push_str(&format!("paragraph {i}\n\n"));
+    }
+    let blocks = render_with_wiki(&src, &Theme::default(), Some(&path));
+    let n = blocks.len();
+    assert!(n >= 30, "expected many blocks, got {n}");
+
+    let mut doc = DocState::viewing(blocks, "test.md".into(), None);
+
+    // First reconcile populates the list to N items.
+    doc.reconcile_list();
+    assert_eq!(doc.list.len(), n, "list synced to block count");
+
+    // Scroll into the middle of the document.
+    doc.list.state().scroll_to(gpui::ListOffset {
+        item_ix: 20,
+        offset_in_item: gpui::px(0.),
+    });
+
+    // Remove a block BELOW the viewport top (an edit-flush re-parse).
+    let mut new_blocks = doc.blocks.clone();
+    new_blocks.remove(30);
+    doc.set_blocks(new_blocks);
+    doc.reconcile_list();
+
+    assert_eq!(doc.list.len(), n - 1, "one block removed");
+    assert_eq!(
+        doc.list.state().logical_scroll_top().item_ix,
+        20,
+        "a block change below the viewport top must leave the doc anchored, not jump to 0"
+    );
 }

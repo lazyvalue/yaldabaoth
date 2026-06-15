@@ -41,27 +41,30 @@ impl YaldaGpuiView {
         // Agent and Buffer are orthogonal; the pooled file buffers stay
         // reachable via Cmd+O).
         let mut tile = AgentTile::new();
-        let proc_cwd = process_cwd();
+        // Inherit the active workspace's CWD (untitled.md "Agent inherits the
+        // workspace CWD"); fall back to the process dir only when unset. Seeds
+        // both the session-list query and the picker's "start new" cwd.
+        let base_cwd = self.agent_base_cwd();
 
         if self.session_server.is_some() {
             // ── Session-server path: in-tile session picker ──────────
             // Open the tile straight into the picker (unbound). The picker
             // lists the FREE sessions for the cwd + "start new"; the user
             // decides. The list round-trip runs off the paint thread.
-            tile.picker = Some(SessionPicker::loading(proc_cwd.clone()));
+            tile.picker = Some(SessionPicker::loading(base_cwd.clone()));
             self.start_server_pump(cx);
             self.set_screen(App::Agent(tile));
             cx.notify();
 
             // The picker lives on the tile we just made focused content.
             let target = self.workspace.focused_window_id();
-            self.spawn_list_sessions_for_picker(target, proc_cwd, cx);
+            self.spawn_list_sessions_for_picker(target, base_cwd, cx);
             return;
         }
 
         // ── Direct-spawn path (legacy): bind one session to the tile ──
         self.set_screen(App::Agent(tile));
-        let persisted = load_persisted_acp_sessions(&proc_cwd);
+        let persisted = load_persisted_acp_sessions(&base_cwd);
         let chosen = persisted
             .iter()
             .find(|s| s.active)
@@ -70,19 +73,19 @@ impl YaldaGpuiView {
         let id = match chosen {
             None => {
                 let label = self.next_agent_label(cx);
-                let state = self.create_agent_session(None, proc_cwd.clone(), cx);
+                let state = self.create_agent_session(None, base_cwd.clone(), cx);
                 self.show_local_session(
                     AgentSession {
                         state,
                         label,
-                        cwd: proc_cwd.clone(),
+                        cwd: base_cwd.clone(),
                         resume_id: None,
                     },
                     cx,
                 )
             }
             Some(slot) => {
-                let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
+                let slot_cwd = slot.cwd.clone().unwrap_or_else(|| base_cwd.clone());
                 let mut state =
                     self.create_agent_session(Some(slot.id.clone()), slot_cwd.clone(), cx);
                 if slot.mode == InputModeKind::Worksheet {
@@ -403,6 +406,11 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
+        // Leaders first: the picker is navigation, not text entry, so `<space>`/
+        // `.`/`?` open the menus instead of being swallowed.
+        if self.leader_intercept(&press, cx) {
+            return;
+        }
         match press.key {
             Key::Up | Key::Char('k') => self.agent_picker_move(-1, cx),
             Key::Down | Key::Char('j') => self.agent_picker_move(1, cx),
@@ -484,7 +492,7 @@ impl YaldaGpuiView {
                     }
                     bound_sids.push(sid);
                 }
-                BindOutcome::Focused(owner) => self.focus_existing_session(owner),
+                BindOutcome::Focused(owner) => self.focus_existing_session(owner, cx),
             },
             OpenResolution::Attached(attached) => {
                 // Strict 1:1: a tile shows exactly one session. Bind the FIRST
@@ -512,7 +520,7 @@ impl YaldaGpuiView {
                             }
                             bound_sids.push(sid);
                         }
-                        BindOutcome::Focused(owner) => self.focus_existing_session(owner),
+                        BindOutcome::Focused(owner) => self.focus_existing_session(owner, cx),
                     }
                 }
             }
@@ -633,14 +641,43 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Point the focused tile at `owner` (the existing session that already
-    /// holds the sid we tried to bind) — the focus half of the AlreadyBound
-    /// path. Clears the picker/token so the tile shows the live transcript.
-    fn focus_existing_session(&mut self, owner: SessionId) {
-        if let Some(tile) = self.agent_tile_mut() {
-            tile.bound = Some(owner);
-            tile.picker = None;
-            tile.pending_open_token = None;
+    /// Resolve an AlreadyBound conflict: the sid we tried to bind is already
+    /// owned by `owner`, which some tile may already display. Strict 1:1 (a
+    /// session is shown by at most ONE tile) means we must NOT bind a second
+    /// tile to it — the old code did exactly that, which let the same session
+    /// appear in two workspaces. Instead: if another tile already binds `owner`,
+    /// return THIS tile to a fresh selector (no duplicate) and navigate to the
+    /// owner. Only when no other tile binds `owner` (or it's this very tile) do
+    /// we bind here.
+    pub(crate) fn focus_existing_session(&mut self, owner: SessionId, cx: &mut Context<Self>) {
+        let current = self.workspace.focused_window_id();
+        match self.agent_tile_id_bound_to(owner) {
+            Some(owner_win) if Some(owner_win) != current => {
+                let cwd = self
+                    .sessions
+                    .get(owner)
+                    .map(|s| s.read(cx).cwd.clone())
+                    .unwrap_or_else(process_cwd);
+                if let Some(tile) = self.agent_tile_mut() {
+                    tile.bound = None;
+                    tile.pending_open_token = None;
+                    tile.picker = Some(SessionPicker::loading(cwd.clone()));
+                }
+                // Re-list THIS tile's selector (owner is now filtered out as
+                // bound), addressed by its own id (INV-PR), then reveal the
+                // owner's tile (possibly in another workspace).
+                self.spawn_list_sessions_for_picker(current, cwd, cx);
+                self.transient_status =
+                    Some("session already open in another workspace — switched to it".into());
+                self.focus_window_for_restore(owner_win);
+            }
+            _ => {
+                if let Some(tile) = self.agent_tile_mut() {
+                    tile.bound = Some(owner);
+                    tile.picker = None;
+                    tile.pending_open_token = None;
+                }
+            }
         }
     }
 
@@ -754,6 +791,15 @@ impl YaldaGpuiView {
             .map(PathBuf::from)
     }
 
+    /// The CWD a new agent session inherits when the caller gives no explicit
+    /// one: the active workspace's `"cwd"`, else the process dir. The single
+    /// resolution every agent-creation entry point (open / new / bootstrap)
+    /// shares, so opening an agent in workspace 2 lands in workspace 2's dir,
+    /// not the app's launch dir.
+    pub(crate) fn agent_base_cwd(&self) -> PathBuf {
+        self.active_workspace_cwd().unwrap_or_else(process_cwd)
+    }
+
     pub(crate) fn new_agent_session(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
         // Not on an Agent tile yet — bootstrap one AND create a brand-new
         // session (never re-attach an existing per-cwd one).
@@ -767,9 +813,7 @@ impl YaldaGpuiView {
         // local placeholder mid-open — that would orphan its in-flight create
         // (no tile would match its token), so close it.
         let label = self.next_agent_label(cx);
-        let slot_cwd = cwd
-            .or_else(|| self.active_workspace_cwd())
-            .unwrap_or_else(process_cwd);
+        let slot_cwd = cwd.unwrap_or_else(|| self.agent_base_cwd());
         self.release_focused_session_for_rebind();
 
         if self.session_server.is_some() {
@@ -832,9 +876,7 @@ impl YaldaGpuiView {
         // Agent and Buffer are orthogonal).
         let tile = AgentTile::new();
         self.set_screen(App::Agent(tile));
-        let slot_cwd = cwd
-            .or_else(|| self.active_workspace_cwd())
-            .unwrap_or_else(process_cwd);
+        let slot_cwd = cwd.unwrap_or_else(|| self.agent_base_cwd());
         let label = self.next_agent_label(cx);
 
         if self.session_server.is_some() {
@@ -1233,6 +1275,10 @@ impl YaldaGpuiView {
             tools: ToolCalls::default(),
             block_ranges: Vec::new(),
             pending_reveal_cursor: false,
+            user_turn_jump_mode: false,
+            user_turn_jump_ord: 0,
+            pending_jump_ord: None,
+            pending_jump_end: false,
             view_model: AgentViewModel::new(),
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
@@ -2187,7 +2233,13 @@ impl YaldaGpuiView {
             claude.editor.programmatic_insert(eof, "\n");
         }
         let notice_line = format!("― {msg}\n");
-        claude.editor.append_llm_chunk(TurnId::System, &notice_line);
+        // Floor the splice to the top of any user worksheet draft so a notice
+        // arriving mid-compose lands above it, not below (interspersed-content
+        // bug — same invariant as LLM chunks and tool anchors).
+        let floor = agent_tail_floor_char(&claude.editor);
+        claude
+            .editor
+            .append_llm_chunk_floored(TurnId::System, &notice_line, floor);
     }
 
     /// Apply a batch of reply events to the AgentState. Text chunks are
@@ -2232,13 +2284,17 @@ impl YaldaGpuiView {
                     // Real content means a retry (if any) succeeded — drop
                     // the transient "retrying…" notice.
                     claude.status = None;
-                    claude
-                        .editor
-                        .append_llm_chunk(TurnId::Llm(current_turn), text.as_str());
+                    let floor = agent_tail_floor_char(&claude.editor);
+                    claude.editor.append_llm_chunk_floored(
+                        TurnId::Llm(current_turn),
+                        text.as_str(),
+                        floor,
+                    );
                 }
                 ReplyEvent::ToolCallStarted(mut tc) => {
                     cap_tool_call_payloads(&mut tc);
-                    let anchor = anchor_for_new_tool_call(&mut claude.editor);
+                    let floor = agent_tail_floor_char(&claude.editor);
+                    let anchor = anchor_for_new_tool_call(&mut claude.editor, floor);
                     // Parse the protocol id into the domain key ONCE here, at
                     // the boundary where a ToolCall enters apply_reply_events
                     // (Finding 7). All tool maps below are keyed on it.
@@ -2273,7 +2329,8 @@ impl YaldaGpuiView {
                         );
                         tc.update(upd.fields);
                         cap_tool_call_payloads(&mut tc);
-                        let anchor = anchor_for_new_tool_call(&mut claude.editor);
+                        let floor = agent_tail_floor_char(&claude.editor);
+                        let anchor = anchor_for_new_tool_call(&mut claude.editor, floor);
                         claude
                             .editor
                             .metadata_mut::<TurnId>()
@@ -2427,11 +2484,17 @@ impl YaldaGpuiView {
             }
             AgentEventKind::Chunk { text, role } => {
                 claude.status = None;
+                // Both roles share the LLM-turn surface; floor the splice to
+                // the top of any user worksheet draft (see
+                // `agent_tail_floor_char`) so streamed content lands above it.
+                let floor = agent_tail_floor_char(&claude.editor);
                 match role {
                     ChunkRole::Message => {
-                        claude
-                            .editor
-                            .append_llm_chunk(TurnId::Llm(turn), text.as_str());
+                        claude.editor.append_llm_chunk_floored(
+                            TurnId::Llm(turn),
+                            text.as_str(),
+                            floor,
+                        );
                     }
                     ChunkRole::Thought => {
                         // Thought text un-parks the parked `AgentThoughtChunk`
@@ -2439,9 +2502,11 @@ impl YaldaGpuiView {
                         // the LLM-turn surface (tagged by the same turn) so the
                         // reasoning is still attributed to the right turn and
                         // never silently dropped.
-                        claude
-                            .editor
-                            .append_llm_chunk(TurnId::Llm(turn), text.as_str());
+                        claude.editor.append_llm_chunk_floored(
+                            TurnId::Llm(turn),
+                            text.as_str(),
+                            floor,
+                        );
                     }
                 }
                 AgentEventEffect::None
@@ -2449,7 +2514,8 @@ impl YaldaGpuiView {
             AgentEventKind::ToolCallStarted(tc) => {
                 let mut tc = tc.clone();
                 cap_tool_call_payloads(&mut tc);
-                let anchor = anchor_for_new_tool_call(&mut claude.editor);
+                let floor = agent_tail_floor_char(&claude.editor);
+                let anchor = anchor_for_new_tool_call(&mut claude.editor, floor);
                 let id = ToolCallKey::from_id(&tc.tool_call_id);
                 claude
                     .editor
@@ -2468,7 +2534,8 @@ impl YaldaGpuiView {
                         yalda::acp_channel::ToolCall::new(upd.tool_call_id.clone(), String::new());
                     tc.update(upd.fields.clone());
                     cap_tool_call_payloads(&mut tc);
-                    let anchor = anchor_for_new_tool_call(&mut claude.editor);
+                    let floor = agent_tail_floor_char(&claude.editor);
+                    let anchor = anchor_for_new_tool_call(&mut claude.editor, floor);
                     claude
                         .editor
                         .metadata_mut::<TurnId>()
@@ -3531,6 +3598,12 @@ impl YaldaGpuiView {
             return;
         }
 
+        // Universal leaders: when NOT in text entry (worksheet/chatbox Normal),
+        // `<space>`/`.`/`?` open the menus with top priority.
+        if self.leader_intercept(&press, cx) {
+            return;
+        }
+
         // Esc with a focused sub-agent: return to the parent transcript
         // (§27). Otherwise Esc falls through — the project rule is
         // "Esc never quits / never closes", so an unfocused-sub-agent
@@ -3589,11 +3662,19 @@ impl YaldaGpuiView {
             return;
         }
 
-        // Local leader: bare `.` in NORMAL mode opens the Agent local menu
-        // (spec-menu-scopes.md Behavior 3 — `.` stays a text character in
-        // the compose box / worksheet insert mode).
-        if in_normal && press.modifiers.is_empty() && press.key == Key::Char('.') {
-            self.open_local_menu_inner(cx);
+        // User-turn jump mode (agent `.` menu → "jump between user turns"): when
+        // on, bare `j`/`k` in Normal mode move the viewport between the user's
+        // input turns (`k` = older/up, `j` = newer/down) instead of the editor
+        // cursor. Normal-mode only, so Insert typing of j/k is untouched.
+        if in_normal
+            && press.modifiers.is_empty()
+            && matches!(press.key, Key::Char('j') | Key::Char('k'))
+            && self
+                .agent_read(cx, |c| c.user_turn_jump_mode)
+                .unwrap_or(false)
+        {
+            let delta = if press.key == Key::Char('j') { 1 } else { -1 };
+            self.jump_user_turn(delta, false, cx);
             return;
         }
 

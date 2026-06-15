@@ -69,6 +69,11 @@ pub(crate) struct TranscriptSeqs {
     /// Worksheet cursor-reveal intent latched by a key handler. A toggle to
     /// `true` must re-render so the reveal is consumed.
     pub(crate) pending_reveal: bool,
+    /// User-turn jump reveal intent (agent `.` menu jump mode). Like
+    /// `pending_reveal`: a pending jump must re-render so build_body resolves
+    /// the ordinal to a flat-item index and scrolls. `is_some()` ⇒ a jump is
+    /// queued.
+    pub(crate) pending_jump: bool,
 }
 
 impl TranscriptSeqs {
@@ -86,6 +91,7 @@ impl TranscriptSeqs {
             selection: c.editor.selection_range(),
             awaiting: c.turn_phase.is_awaiting(),
             pending_reveal: c.pending_reveal_cursor,
+            pending_jump: c.pending_jump_ord.is_some(),
         }
     }
 
@@ -204,6 +210,7 @@ impl TranscriptView {
             editor_fg_u32,
             frozen_fg_u32,
             syntect_hl,
+            show_heading_markers,
         } = {
             let root = root_ent.read(cx);
             RootSnapshot {
@@ -216,6 +223,7 @@ impl TranscriptView {
                 editor_fg_u32: ncolor_to_u32(root.theme.editor_fg, DEFAULT_FG),
                 frozen_fg_u32: ncolor_to_u32(root.theme.agent.frozen_fg, DEFAULT_FG),
                 syntect_hl: root.syntect_hl.clone(),
+                show_heading_markers: root.show_agent_heading_markers,
             }
         };
 
@@ -324,9 +332,22 @@ impl TranscriptView {
             let block_ranges_active = !c.block_ranges.is_empty();
             let follow_tail = c.follow_tail();
 
-            // Worksheet cursor-reveal intent (INV-RV): consume here, return the
-            // O(1) target so `self.scroll` can issue the scroll after the update.
-            let pending_reveal_line = if c.pending_reveal_cursor {
+            // Worksheet cursor-reveal AND user-turn-jump intent (INV-RV):
+            // consume here, return the target item index so `self.scroll` can
+            // issue the scroll after the update. A queued jump (agent `.` menu
+            // jump mode) takes precedence — it resolves the stored ordinal to
+            // the Nth user `TurnHeader` index in the FRESH flat-item list (tail
+            // growth keeps earlier indices stable, but resolving here mirrors
+            // `item_for_line`'s render-time discipline).
+            let pending_reveal_line = if let Some(ord) = c.pending_jump_ord.take() {
+                if std::mem::take(&mut c.pending_jump_end) {
+                    // `j` past the newest turn → reveal the buffer's page end
+                    // (the last flat item: latest output + the editable tail).
+                    Some(flat_items_arc.len().saturating_sub(1))
+                } else {
+                    user_turn_item_indices(&flat_items_arc).get(ord).copied()
+                }
+            } else if c.pending_reveal_cursor {
                 c.pending_reveal_cursor = false;
                 let cl = c.editor.cursor().line;
                 Some(c.view_model.item_for_line(cl))
@@ -398,6 +419,7 @@ impl TranscriptView {
             let expanded_snap = expanded_snap.clone();
             let code_font_snap = code_font.clone();
             let body_font_snap = body_font.clone();
+            let show_heading_markers = show_heading_markers;
             let theme_snap = theme.clone();
             let at_snap = at_snap.clone();
             let self_editor_fg = editor_fg;
@@ -693,6 +715,7 @@ impl TranscriptView {
                             weak_view: None,
                             doc_dir: None,
                             block_count: 0,
+                            show_heading_markers,
                         };
                         let inner = block_inner(&ctx, rendered_block);
                         div()
@@ -839,6 +862,10 @@ struct RootSnapshot {
     editor_fg_u32: u32,
     frozen_fg_u32: u32,
     syntect_hl: std::rc::Rc<yalda::highlight::Highlighter>,
+    /// Global heading-marker toggle (agent-chat-only). Pushed via
+    /// `notify_transcript_views`, so it busts the cache without a per-session
+    /// seq. Threaded into the `FlatItem::Block` `RenderCtx`.
+    show_heading_markers: bool,
 }
 
 /// Everything the row-render closure + reconcile/reveal consume, computed inside

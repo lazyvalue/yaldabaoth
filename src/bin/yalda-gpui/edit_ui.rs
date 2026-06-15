@@ -64,17 +64,11 @@ impl YaldaGpuiView {
     #[cfg(test)]
     pub(crate) fn test_open_doc(&mut self, markdown: &str) {
         let blocks = render_with_wiki(markdown, &self.theme, None);
-        self.set_screen(App::Buffer(BufferApp::Viewing(DocState {
+        self.set_screen(App::Buffer(BufferApp::Viewing(DocState::viewing(
             blocks,
-            file_label: SharedString::new_static("harness.md"),
-            cursor_block: 0,
-            list_state: DocState::new_list_state(0),
-            list_item_count: std::cell::Cell::new(0),
-            blocks_seq: 0,
-            blocks_snapshot: RefCell::new(None),
-            last_cursor_block: std::cell::Cell::new(None),
-            source: None,
-        })));
+            SharedString::new_static("harness.md"),
+            None,
+        ))));
         // The real doc body only renders once the splash deadline passes; clear
         // it so the harness exercises the list path immediately.
         self.splash_until = None;
@@ -166,17 +160,11 @@ impl YaldaGpuiView {
             .workspace
             .replace_focused_content(
                 // Placeholder; overwritten in every match arm below.
-                App::Buffer(BufferApp::Viewing(DocState {
-                    blocks: Vec::new(),
-                    file_label: SharedString::new_static(""),
-                    cursor_block: 0,
-                    list_state: DocState::new_list_state(0),
-                    list_item_count: std::cell::Cell::new(0),
-                    blocks_seq: 0,
-                    blocks_snapshot: RefCell::new(None),
-                    last_cursor_block: std::cell::Cell::new(None),
-                    source: None,
-                })),
+                App::Buffer(BufferApp::Viewing(DocState::viewing(
+                    Vec::new(),
+                    SharedString::new_static(""),
+                    None,
+                ))),
             )
             .expect("workspace has no focused window");
         match prev {
@@ -188,17 +176,11 @@ impl YaldaGpuiView {
                 // 5c: the new Doc keeps the SAME pooled core the Edit view held
                 // (shared text + undo). No stash — the core IS the live state.
                 let source = DocSource::new(edit.editor.buffer_id, edit.editor.core.clone());
-                self.set_screen(App::Buffer(BufferApp::Viewing(DocState {
+                self.set_screen(App::Buffer(BufferApp::Viewing(DocState::viewing(
                     blocks,
                     file_label,
-                    cursor_block: 0,
-                    list_state: DocState::new_list_state(0),
-                    list_item_count: std::cell::Cell::new(0),
-                    blocks_seq: 0,
-                    blocks_snapshot: RefCell::new(None),
-                    last_cursor_block: std::cell::Cell::new(None),
-                    source: Some(source),
-                })));
+                    Some(source),
+                ))));
             }
             other => {
                 self.set_screen(other);
@@ -269,17 +251,11 @@ impl YaldaGpuiView {
             &self.theme,
             Some(&path),
         );
-        self.set_screen(App::Buffer(BufferApp::Viewing(DocState {
+        self.set_screen(App::Buffer(BufferApp::Viewing(DocState::viewing(
             blocks,
-            file_label: label,
-            cursor_block: 0,
-            list_state: DocState::new_list_state(0),
-            list_item_count: std::cell::Cell::new(0),
-            blocks_seq: 0,
-            blocks_snapshot: RefCell::new(None),
-            last_cursor_block: std::cell::Cell::new(None),
-            source: Some(DocSource::new(buf_id, core)),
-        })));
+            label,
+            Some(DocSource::new(buf_id, core)),
+        ))));
         self.doc_selection = None;
         self.save_workspace_state();
         cx.notify();
@@ -368,17 +344,9 @@ impl YaldaGpuiView {
                         (blocks, None)
                     }
                 };
-                self.set_screen(App::Buffer(BufferApp::Viewing(DocState {
-                    blocks,
-                    file_label: label,
-                    cursor_block: 0,
-                    list_state: DocState::new_list_state(0),
-                    list_item_count: std::cell::Cell::new(0),
-                    blocks_seq: 0,
-                    blocks_snapshot: RefCell::new(None),
-                    last_cursor_block: std::cell::Cell::new(None),
-                    source,
-                })));
+                self.set_screen(App::Buffer(BufferApp::Viewing(DocState::viewing(
+                    blocks, label, source,
+                ))));
             }
         }
         self.doc_selection = None;
@@ -399,6 +367,12 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
+
+        // Universal leaders: in normal mode, `<space>`/`.`/`?` open the menus
+        // with top priority (insert mode keeps them as text).
+        if self.leader_intercept(&press, cx) {
+            return;
+        }
 
         // Mode-independent shortcuts.
         if press.modifiers.contains(KMods::CONTROL)
@@ -455,13 +429,6 @@ impl YaldaGpuiView {
 
         // In normal mode, intercept bare `m`/`'` to start a mark chord.
         if mode == EditMode::Normal && self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
-            return;
-        }
-
-        // Local leader: bare `.` in normal mode opens the Edit local menu
-        // (spec-menu-scopes.md Behavior 3 — insert mode keeps `.` as text).
-        if mode == EditMode::Normal && press.modifiers.is_empty() && press.key == Key::Char('.') {
-            self.open_local_menu_inner(cx);
             return;
         }
 

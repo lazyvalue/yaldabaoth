@@ -109,6 +109,92 @@ fn workspace_kv_cwd_inheritance(cx: &mut TestAppContext) {
     });
     let empty = view.read_with(vcx, |v, _| v.active_workspace_cwd());
     assert_eq!(empty, None, "empty cwd key yields None");
+
+    // `agent_base_cwd` is what every no-explicit-cwd creation path (open / new /
+    // bootstrap) actually uses — it must surface the workspace cwd, not the
+    // process dir. (Regression: opening an agent in workspace 2 launched in the
+    // app's launch dir because `open_agent_inner` read `process_cwd` directly.)
+    view.update(vcx, |v, _cx| {
+        v.workspace
+            .active_tab_mut()
+            .expect("active tab")
+            .kv_set("cwd", "/Users/scott/ws/fulcrum");
+    });
+    let base = view.read_with(vcx, |v, _| v.agent_base_cwd());
+    assert_eq!(
+        base,
+        PathBuf::from("/Users/scott/ws/fulcrum"),
+        "a new agent inherits the active workspace's cwd"
+    );
+
+    // With no workspace cwd, the base falls back to the process dir.
+    view.update(vcx, |v, _cx| {
+        v.workspace.active_tab_mut().expect("active tab").kv_set("cwd", "");
+    });
+    let fallback = view.read_with(vcx, |v, _| v.agent_base_cwd());
+    assert_eq!(
+        fallback,
+        crate::process_cwd(),
+        "no workspace cwd falls back to the process dir"
+    );
+}
+
+/// Browser start dir (untitled.md "New buffers ... root dir based on CWD key
+/// set for workspace ... File browser should default to CWD of buffers ... when
+/// moving from file view/editor to browser, the browser's directory should be
+/// the parent directory of the file we just left"). Three rules, in priority
+/// order: (1) continuity — leaving a file-backed buffer lands in that file's
+/// parent dir; (2) else the workspace registry `"cwd"`; (3) else the process
+/// dir. Pins the resolution `open_browser_inner` / new-tile paths share.
+#[gpui::test]
+fn browser_start_dir_resolution(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+
+    // (3) No workspace cwd, focused on a standalone browser (no file) →
+    // process dir.
+    let fallback = view.read_with(vcx, |v, _| v.browser_start_dir());
+    assert_eq!(
+        fallback,
+        crate::process_cwd(),
+        "no cwd, no file → process dir"
+    );
+
+    // (2) Workspace cwd set, still no file-backed buffer → the registry cwd.
+    let ws_dir = std::env::temp_dir();
+    view.update(vcx, |v, _cx| {
+        v.workspace
+            .active_tab_mut()
+            .expect("active tab")
+            .kv_set("cwd", ws_dir.display().to_string());
+    });
+    let from_ws = view.read_with(vcx, |v, _| v.browser_start_dir());
+    assert_eq!(from_ws, ws_dir, "workspace cwd wins over process dir");
+
+    // (1) Continuity: open a real file, then the browser lands in its parent
+    // dir — overriding even the workspace cwd.
+    let mut file = std::env::temp_dir();
+    file.push("yalda-browser-start-dir-test.md");
+    std::fs::write(&file, "# hi\n").expect("write temp file");
+    let parent = file.parent().expect("temp file has parent").to_path_buf();
+    view.update(vcx, |v, _cx| {
+        assert!(v.open_file(file.clone()), "open temp file");
+    });
+    let from_file = view.read_with(vcx, |v, _| v.browser_start_dir());
+    assert_eq!(
+        from_file,
+        std::fs::canonicalize(&parent).unwrap_or(parent),
+        "leaving a file lands in its parent dir"
+    );
+    let _ = std::fs::remove_file(&file);
 }
 
 /// Tier-3 latency gate: prove the Edit view does **O(changed)** highlight work
@@ -188,6 +274,112 @@ fn edit_view_keystroke_is_o_changed(cx: &mut TestAppContext) {
     assert_eq!(
         edit_recomputed, 1,
         "a single-char edit into a {N}-line doc must re-highlight exactly 1 line, got {edit_recomputed}"
+    );
+}
+
+/// Regression (scroll anchoring): `splice_list_to_items` must keep the
+/// viewport anchored across a line edit, NOT snap it to item 0. The old path
+/// `ListState::reset()`-ed on every line-count change, which nulls
+/// `logical_scroll_top`; the same-frame `scroll_to_reveal_item` then computed
+/// against unmeasured (zero-height) rows and jumped to the top of the file —
+/// the "view jumps to the top whenever a newline is added/removed" bug.
+#[gpui::test]
+fn edit_list_splice_preserves_scroll_anchor(_cx: &mut TestAppContext) {
+    // Case A: an edit BELOW the viewport top leaves the top line anchored.
+    let list = gpui::ListState::new(0, gpui::ListAlignment::Top, px(20.));
+    let old: Vec<usize> = (0..100).collect();
+    crate::splice_list_to_items(&list, &[], &old); // populate the list: 0 → 100
+    list.scroll_to(gpui::ListOffset {
+        item_ix: 80,
+        offset_in_item: px(0.),
+    });
+    let mut new = old.clone();
+    new.remove(90); // delete a line below the viewport top
+    crate::splice_list_to_items(&list, &old, &new);
+    assert_eq!(list.item_count(), 99, "one line removed");
+    assert_eq!(
+        list.logical_scroll_top().item_ix,
+        80,
+        "an edit below the viewport top must leave the top line anchored, not jump to 0"
+    );
+
+    // Case B: a deletion ABOVE the viewport top shifts the anchor down by the
+    // number of removed lines (same content stays under the top edge) — and
+    // still never collapses to 0.
+    let list2 = gpui::ListState::new(0, gpui::ListAlignment::Top, px(20.));
+    let old2: Vec<usize> = (0..100).collect();
+    crate::splice_list_to_items(&list2, &[], &old2);
+    list2.scroll_to(gpui::ListOffset {
+        item_ix: 80,
+        offset_in_item: px(0.),
+    });
+    let mut new2 = old2.clone();
+    new2.remove(10); // delete a line above the viewport top
+    crate::splice_list_to_items(&list2, &old2, &new2);
+    assert_eq!(
+        list2.logical_scroll_top().item_ix,
+        79,
+        "deleting a line above the viewport shifts the anchor down by one, never to 0"
+    );
+}
+
+/// Regression (end-to-end): a newline DELETE (line merge) deep in the buffer
+/// must keep the viewport where it was — it must NOT jump to the top of the
+/// file leaving the caret off-screen. Drives the real Edit render path.
+#[gpui::test]
+fn edit_newline_delete_keeps_viewport_anchored(cx: &mut TestAppContext) {
+    const N: usize = 200;
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        let mut v = YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        );
+        let mut buf = String::new();
+        for i in 0..N {
+            buf.push_str(&format!("line {i}"));
+            buf.push('\n');
+        }
+        v.test_open_edit(&buf);
+        v
+    });
+    vcx.run_until_parked();
+
+    // Scroll the viewport into the middle of the file.
+    let count_before = view.update(vcx, |v, _cx| {
+        let e = v.edit_mut().expect("edit view");
+        e.list.state().scroll_to(gpui::ListOffset {
+            item_ix: 80,
+            offset_in_item: px(0.),
+        });
+        e.list.len()
+    });
+
+    // Backspace at column 0, well below the viewport top: a line MERGE (the line
+    // count shrinks). The old reset() path snapped the viewport to item 0 here.
+    view.update(vcx, |v, cx| {
+        use crate::EditOps;
+        let e = v.edit_mut().expect("edit view");
+        e.editor.set_cursor(120, 0);
+        e.editor.backspace();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    let (top, count) = view.update(vcx, |v, _cx| {
+        let e = v.edit_mut().expect("edit view");
+        (
+            e.list.state().logical_scroll_top().item_ix,
+            e.list.len(),
+        )
+    });
+    assert_eq!(count, count_before - 1, "a line merge removes exactly one line");
+    assert!(
+        top >= 80,
+        "after a newline delete below the fold the viewport must stay anchored \
+         (was item 80), not jump to the top of the file — got item {top}"
     );
 }
 
@@ -482,6 +674,54 @@ fn install_agent_slot(
         }
         let _ = id;
     });
+}
+
+/// Strict 1:1: a server session is bound by at most ONE tile, even across
+/// workspaces. Resolving an AlreadyBound conflict must NOT bind a second tile to
+/// the owner — that regression let the same session show in two workspaces. The
+/// duplicate tile returns to a selector and focus navigates to the owner.
+#[gpui::test]
+fn agent_session_binds_at_most_one_tile(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App};
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+
+    // Workspace 0: an agent tile bound to session "S1".
+    install_agent_slot(&view, vcx, Some("S1"));
+    let owner = view.update(vcx, |v, _| v.sessions.locate("S1").expect("S1 bound"));
+
+    // Workspace 1: a fresh agent tile, now focused.
+    view.update(vcx, |v, _cx| {
+        v.workspace
+            .push_initial_tab(App::Agent(AgentTile::new()));
+    });
+
+    // Attempt to bind the already-owned session from workspace 1's tile.
+    view.update(vcx, |v, cx| v.focus_existing_session(owner, cx));
+
+    let (bound_tiles, active) = view.update(vcx, |v, _| {
+        let mut n = 0;
+        for tab in v.workspace.tabs.iter() {
+            tab.layout.for_each_leaf(&mut |w| {
+                if let App::Agent(t) = &w.content
+                    && t.bound == Some(owner)
+                {
+                    n += 1;
+                }
+            });
+        }
+        (n, v.workspace.active_tab)
+    });
+    assert_eq!(bound_tiles, 1, "a session binds at most one tile");
+    assert_eq!(active, 0, "focus navigated to the owning workspace");
 }
 
 #[cfg(test)]
@@ -3129,6 +3369,87 @@ fn transcript_021_theme_and_zoom_bust_cache(cx: &mut TestAppContext) {
     );
 }
 
+/// Heading-marker toggle is a GLOBAL transcript render input (agent `.` menu →
+/// "toggle heading markers"), pushed via `notify_transcript_views(Refresh)` like
+/// theme/zoom — not a per-session seq. Flipping it must re-render the transcript
+/// exactly once and flip the root flag. Default on, so the first toggle is off.
+#[gpui::test]
+fn transcript_021_heading_marker_toggle_busts_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    // Default on.
+    assert!(
+        view.read_with(vcx, |v, _| v.show_agent_heading_markers),
+        "heading markers default on"
+    );
+
+    // Toggle off → one transcript re-render, flag flips.
+    view.update(vcx, |v, cx| v.toggle_agent_heading_markers(cx));
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("transcript");
+    assert_eq!(
+        after,
+        base + 1,
+        "toggling heading markers must re-render the transcript once (base {base}), got {after}"
+    );
+    assert!(
+        !view.read_with(vcx, |v, _| v.show_agent_heading_markers),
+        "toggle flips the flag off"
+    );
+}
+
+/// User-turn jump mode (agent `.` menu → "jump between user turns"): the toggle
+/// handler flips the per-session `user_turn_jump_mode` flag, and `pending_jump`
+/// is a covered `TranscriptSeqs` render input — setting `pending_jump_ord`
+/// self-notifies the cached transcript (the observe slice-filter sees the seq
+/// move). With no user turns yet, toggling-on reports the empty case via the
+/// session status and leaves no jump queued.
+#[gpui::test]
+fn transcript_021_user_turn_jump_toggle(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (view, vcx, _id, session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+
+    // Toggle: per-session flag flips off → on.
+    assert!(
+        !session.read_with(vcx, |s, _| s.state.user_turn_jump_mode),
+        "jump mode default off"
+    );
+    view.update(vcx, |v, cx| v.toggle_agent_jump_mode(cx));
+    vcx.run_until_parked();
+    assert!(
+        session.read_with(vcx, |s, _| s.state.user_turn_jump_mode),
+        "toggle turns jump mode on"
+    );
+    // No user turns in a fresh transcript → no jump queued, empty-case status.
+    assert_eq!(
+        session.read_with(vcx, |s, _| s.state.pending_jump_ord),
+        None,
+        "no user turns ⇒ nothing to jump to"
+    );
+
+    // Toggle off again.
+    view.update(vcx, |v, cx| v.toggle_agent_jump_mode(cx));
+    vcx.run_until_parked();
+    assert!(
+        !session.read_with(vcx, |s, _| s.state.user_turn_jump_mode),
+        "toggle turns jump mode back off"
+    );
+
+    // SEQ-COVERAGE for `pending_jump` (CLAUDE.md rule 2): a queued jump must be
+    // visible to the observe slice-filter, i.e. `TranscriptSeqs::of` must move
+    // when `pending_jump_ord` becomes `Some`. Assert the fingerprint directly
+    // (independent of the headless redraw scheduler).
+    let before = session.read_with(vcx, |s, _| crate::TranscriptSeqs::of(&s.state).pending_jump);
+    session.update(vcx, |s, _cx| s.state.pending_jump_ord = Some(0));
+    let after = session.read_with(vcx, |s, _| crate::TranscriptSeqs::of(&s.state).pending_jump);
+    assert!(!before, "no jump queued ⇒ pending_jump seq is false");
+    assert!(after, "a queued jump ⇒ pending_jump seq flips true (busts the cache)");
+}
+
 /// (e) Follow-tail still reveals grown content: after a streaming append while
 /// following, the list's registered item count grows to match the freshly
 /// built flat-items (the reconcile + reveal path runs in TranscriptView's
@@ -3391,4 +3712,186 @@ fn linear_picker_move_busts_cache(cx: &mut TestAppContext) {
     );
     let sel = lv.update(vcx, |v, _| v.selected_candidate().and_then(|c| c.name));
     assert_eq!(sel.as_deref(), Some("Beta"), "picker_move advanced the selection");
+}
+
+/// Entering browse on a loaded project body puts the cursor on its first issue,
+/// and moving the browse cursor (a body-owned mutation) busts the cached body
+/// exactly once. (The tile's Normal mode calls `enter_select`; here we drive the
+/// view directly, so we call it explicitly.)
+#[gpui::test]
+fn linear_nav_move_busts_cache(cx: &mut TestAppContext) {
+    crate::perf_reset("linear");
+    let (_view, vcx, lv) = boot_with_linear(cx);
+    vcx.run_until_parked();
+
+    // Seed a project with two issues — the body's NavTargets.
+    lv.update(vcx, |v, cx| {
+        let issue = |id: &str| crate::IssueRef {
+            identifier: Some(id.into()),
+            title: Some(format!("{id} title")),
+            state: None,
+        };
+        v.set_state(crate::LinearViewState::Project(Box::new(crate::ProjectDetail {
+            name: Some("Fulcrum".into()),
+            description: None,
+            content: None,
+            state: None,
+            url: None,
+            lead: None,
+            target_date: None,
+            milestones: None,
+            issues: Some(crate::NodeList {
+                nodes: vec![issue("FUL-19"), issue("FUL-620")],
+            }),
+            updates: None,
+        })));
+        v.enter_select();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("linear");
+
+    // enter_select put the cursor on the first target.
+    let target0 = lv.update(vcx, |v, _| match v.selected_target() {
+        Some(crate::NavTarget::Issue(id)) => Some(id),
+        _ => None,
+    });
+    assert_eq!(target0.as_deref(), Some("FUL-19"), "browse starts on first issue");
+
+    // One move → one body re-render; cursor advanced to the next issue.
+    lv.update(vcx, |v, cx| {
+        v.nav_move(1);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    let after = crate::perf_render_count("linear");
+    assert_eq!(
+        after,
+        base + 1,
+        "a browse-cursor move must re-render the cached body exactly once (base {base}), got {after}"
+    );
+    let target1 = lv.update(vcx, |v, _| match v.selected_target() {
+        Some(crate::NavTarget::Issue(id)) => Some(id),
+        _ => None,
+    });
+    assert_eq!(target1.as_deref(), Some("FUL-620"), "nav_move advanced the cursor");
+}
+
+/// The Linear tile is modal: in Normal mode printable keys are commands, not
+/// text — `<space>` opens the global menu (so menus are reachable at all), and a
+/// non-bound letter is a no-op (never typed into the query). Regression for the
+/// "can't access any menus, every key types into the input" trap.
+#[gpui::test]
+fn linear_normal_mode_frees_keys_for_menus(cx: &mut TestAppContext) {
+    use crate::{Key, KMods, KeyPress, LinearMode};
+    let kp = |c: char| KeyPress::new(Key::Char(c), KMods::NONE);
+    let (view, vcx, _lv) = boot_with_linear(cx);
+
+    // Default mode is Insert: a letter types into the query.
+    view.update(vcx, |v, cx| {
+        v.handle_linear_insert_key(kp('x'), cx);
+    });
+    let typed = view.update(vcx, |v, _| match v.workspace.focused_content() {
+        Some(crate::App::Linear(t)) => t.input.clone(),
+        _ => String::new(),
+    });
+    assert_eq!(typed, "x", "Insert mode types printable keys into the query");
+
+    // Switch to Normal: a letter is now a no-op (NOT appended), and `<space>`
+    // opens the global menu instead of inserting a space.
+    view.update(vcx, |v, cx| {
+        v.linear_set_mode(LinearMode::Normal, cx);
+        v.handle_linear_normal_key(kp('z'), cx);
+    });
+    let after_letter = view.update(vcx, |v, _| match v.workspace.focused_content() {
+        Some(crate::App::Linear(t)) => t.input.clone(),
+        _ => String::new(),
+    });
+    assert_eq!(after_letter, "x", "Normal mode does NOT type unbound letters");
+
+    // `<space>` in Normal mode is intercepted as a leader (universal path) and
+    // opens the workspace menu — the tile is not in text entry.
+    let (consumed, opened) = view.update(vcx, |v, cx| {
+        let consumed = v.leader_intercept(&kp(' '), cx);
+        (consumed, v.overlay_is_menu())
+    });
+    assert!(consumed, "`<space>` is consumed as a leader in Normal mode");
+    assert!(opened, "`<space>` in Normal mode opens the menu");
+}
+
+/// The universal leader rule: when a tile is NOT in text entry, `<space>`/`.`/
+/// `?` are intercepted as menu-openers; when it IS (e.g. Linear Insert mode),
+/// they are left for the tile to type. Covers the "leaders have highest
+/// priority when not in insert mode" property.
+#[gpui::test]
+fn leader_intercept_respects_insert_mode(cx: &mut TestAppContext) {
+    use crate::{Key, KMods, KeyPress, LinearMode};
+    let kp = |c: char| KeyPress::new(Key::Char(c), KMods::NONE);
+    let (view, vcx, _lv) = boot_with_linear(cx);
+
+    // Linear opens in Insert: a leader is NOT intercepted (it's text).
+    let insert = view.update(vcx, |v, cx| v.leader_intercept(&kp(' '), cx));
+    assert!(!insert, "in Insert mode a leader is left to the tile as text");
+
+    // Switch to Normal: now the leader IS intercepted.
+    let normal = view.update(vcx, |v, cx| {
+        v.linear_set_mode(LinearMode::Normal, cx);
+        v.leader_intercept(&kp('.'), cx)
+    });
+    assert!(normal, "in Normal mode a leader is intercepted as a menu-opener");
+}
+
+/// The global (Yaldabaoth) menu lists every workspace by number with a
+/// `goto-workspace-N` command, plus name/new entries; dispatching one switches
+/// the active workspace. Covers untitled.md "Global Scope › Commands".
+#[gpui::test]
+fn global_menu_lists_and_switches_workspaces(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+
+    // Add two more workspaces (3 total). A bare Linear tile needs no args.
+    view.update(vcx, |v, _cx| {
+        v.workspace
+            .push_initial_tab(crate::App::Linear(crate::LinearTile::new()));
+        v.workspace
+            .push_initial_tab(crate::App::Linear(crate::LinearTile::new()));
+    });
+
+    // The menu enumerates each workspace + the name/new commands.
+    let cmds: Vec<String> = view.update(vcx, |v, _| {
+        v.global_menu()
+            .iter()
+            .filter_map(|n| match &n.action {
+                crate::MenuAction::Command(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect()
+    });
+    for expect in [
+        "goto-workspace-0",
+        "goto-workspace-1",
+        "goto-workspace-2",
+        "rename-tab",
+        "new-tab",
+    ] {
+        assert!(cmds.contains(&expect.to_string()), "global menu missing {expect}: {cmds:?}");
+    }
+
+    // Dispatching a goto command switches the active workspace.
+    view.update(vcx, |v, cx| v.dispatch_menu_command("goto-workspace-2", cx));
+    let active = view.update(vcx, |v, _| v.workspace.active_tab);
+    assert_eq!(active, 2, "goto-workspace-2 activated the third workspace");
+
+    view.update(vcx, |v, cx| v.dispatch_menu_command("goto-workspace-0", cx));
+    let active = view.update(vcx, |v, _| v.workspace.active_tab);
+    assert_eq!(active, 0, "goto-workspace-0 activated the first workspace");
 }

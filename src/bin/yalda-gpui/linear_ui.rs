@@ -164,19 +164,25 @@ impl YaldaGpuiView {
     }
 
     /// Push a new body state onto the tile's cached view (mutation-site notify),
-    /// then notify the root for the tab-strip title.
+    /// then notify the root for the tab-strip title. If the tile is in Normal
+    /// mode, re-enter browse so the cursor is on the first link of the freshly
+    /// loaded body (Insert leaves it hidden — you're typing).
     fn linear_set_view(
         &mut self,
         target: workspace::WindowId,
         state: LinearViewState,
         cx: &mut Context<Self>,
     ) {
-        let view = self
-            .linear_tile_by_id_mut(target)
-            .and_then(|t| t.view.clone());
+        let (view, normal) = match self.linear_tile_by_id_mut(target) {
+            Some(t) => (t.view.clone(), t.mode == LinearMode::Normal),
+            None => (None, false),
+        };
         if let Some(v) = view {
             v.update(cx, |lv, vcx| {
                 lv.set_state(state);
+                if normal {
+                    lv.enter_select();
+                }
                 vcx.notify();
             });
         }
@@ -231,6 +237,24 @@ impl YaldaGpuiView {
             });
         })
         .detach();
+    }
+
+    /// Jump to the body cursor's target: set the input to the target string and
+    /// run the normal submit path, which fetches the issue (or runs the
+    /// project-name search) and renders it into THIS tile.
+    fn linear_activate_selected(&mut self, cx: &mut Context<Self>) {
+        let target = self
+            .linear_focused_tile_view()
+            .and_then(|v| v.read(cx).selected_target());
+        let query = match target {
+            Some(NavTarget::Issue(id)) if !id.trim().is_empty() => id,
+            Some(NavTarget::Project(name)) => name,
+            _ => return,
+        };
+        if let Some(t) = self.linear_focused_tile_mut() {
+            t.input = query;
+        }
+        self.linear_submit(cx);
     }
 
     /// Open the project highlighted in the focused tile's picker.
@@ -316,9 +340,74 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Key handler for a focused Linear tile. Printable keys edit the input line
-    /// (which lives on the tile ⇒ only the input row re-renders, body stays
-    /// cached); Enter fetches; Esc clears; arrows / PageUp-Down scroll the body.
+    /// The focused Linear tile's current mode (Insert if not a Linear tile).
+    fn linear_focused_mode(&self) -> LinearMode {
+        match self.workspace.focused_content() {
+            Some(App::Linear(t)) => t.mode,
+            _ => LinearMode::Insert,
+        }
+    }
+
+    /// Switch the focused Linear tile's mode. Entering Normal shows the browse
+    /// cursor (on the body's first link, if any); entering Insert hides it so
+    /// the caret-blinking input is the only focus.
+    pub(crate) fn linear_set_mode(&mut self, mode: LinearMode, cx: &mut Context<Self>) {
+        let view = match self.linear_focused_tile_mut() {
+            Some(t) => {
+                t.mode = mode;
+                t.view.clone()
+            }
+            None => return,
+        };
+        if let Some(v) = view {
+            v.update(cx, |lv, c| {
+                match mode {
+                    LinearMode::Normal => lv.enter_select(),
+                    LinearMode::Insert => lv.exit_select(),
+                }
+                c.notify();
+            });
+        }
+        cx.notify();
+    }
+
+    /// Move the browse cursor (Normal mode), entering browse on the first link
+    /// if it wasn't already.
+    fn linear_nav(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if let Some(view) = self.linear_focused_tile_view() {
+            view.update(cx, |lv, c| {
+                lv.enter_select();
+                lv.nav_move(delta);
+                c.notify();
+            });
+        }
+    }
+
+    /// Open the loaded issue/project in the system browser (macOS `open`).
+    pub(crate) fn linear_open_url(&mut self, cx: &mut Context<Self>) {
+        let url = self
+            .linear_focused_tile_view()
+            .and_then(|v| v.read(cx).current_url());
+        if let Some(url) = url {
+            let _ = std::process::Command::new("open").arg(url).spawn();
+        }
+    }
+
+    /// Copy the loaded issue/project URL to the clipboard.
+    pub(crate) fn linear_copy_url(&mut self, cx: &mut Context<Self>) {
+        let url = self
+            .linear_focused_tile_view()
+            .and_then(|v| v.read(cx).current_url());
+        if let Some(url) = url {
+            cx.write_to_clipboard(ClipboardItem::new_string(url));
+        }
+    }
+
+    /// Key handler for a focused Linear tile. The tile is **modal**: in Insert
+    /// the printable keys edit the query line (only the input row re-renders —
+    /// the body stays cached); in Normal they are commands, so `<space>`/`.`
+    /// reach the global / local menus and j/k browse the body's links. The
+    /// project picker is its own transient sub-modal, handled first.
     pub(crate) fn handle_linear_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -330,6 +419,12 @@ impl YaldaGpuiView {
             return;
         }
         let press = keystroke_to_keypress(&ev.keystroke);
+
+        // Universal leaders: in Normal mode (and the project picker — both are
+        // navigation, not text entry), `<space>`/`.`/`?` open the menus first.
+        if self.leader_intercept(&press, cx) {
+            return;
+        }
 
         // Picker mode: the body is a list of project candidates — reinterpret
         // navigation keys to move/select within it (Esc returns to editing).
@@ -369,14 +464,18 @@ impl YaldaGpuiView {
             return;
         }
 
+        match self.linear_focused_mode() {
+            LinearMode::Insert => self.handle_linear_insert_key(press, cx),
+            LinearMode::Normal => self.handle_linear_normal_key(press, cx),
+        }
+    }
+
+    /// Insert mode: type the query. Enter fetches; Esc drops to Normal (so the
+    /// menus and motions become reachable); arrows / PageUp-Down scroll the body.
+    pub(crate) fn handle_linear_insert_key(&mut self, press: KeyPress, cx: &mut Context<Self>) {
         match press.key {
             Key::Enter => self.linear_submit(cx),
-            Key::Esc => {
-                if let Some(t) = self.linear_focused_tile_mut() {
-                    t.input.clear();
-                }
-                cx.notify();
-            }
+            Key::Esc => self.linear_set_mode(LinearMode::Normal, cx),
             Key::Backspace => {
                 if let Some(t) = self.linear_focused_tile_mut() {
                     t.input.pop();
@@ -390,6 +489,43 @@ impl YaldaGpuiView {
             Key::Char(c) => {
                 if let Some(t) = self.linear_focused_tile_mut() {
                     t.input.push(c);
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// Normal mode: printable keys are commands, not text. `<space>` opens the
+    /// global menu, `.` the Linear local menu, `i`/`a`/`/` return to Insert,
+    /// j/k browse the body's links and Enter jumps to the selected one. Unbound
+    /// keys are no-ops (never typed) — that's what keeps `<space>`/`.` free.
+    pub(crate) fn handle_linear_normal_key(&mut self, press: KeyPress, cx: &mut Context<Self>) {
+        match press.key {
+            // Leaders (space/./?) are handled universally in `handle_linear_key`.
+            Key::Char('i') | Key::Char('a') | Key::Char('/') => {
+                self.linear_set_mode(LinearMode::Insert, cx)
+            }
+            Key::Char('j') | Key::Down => self.linear_nav(1, cx),
+            Key::Char('k') | Key::Up => self.linear_nav(-1, cx),
+            Key::Enter | Key::Char('o') => self.linear_activate_selected(cx),
+            Key::PageDown => self.linear_scroll(400.0, cx),
+            Key::PageUp => self.linear_scroll(-400.0, cx),
+            // Esc clears the query and the browse cursor (a reset), staying in
+            // Normal — Insert's Esc is what entered Normal in the first place.
+            Key::Esc => {
+                let view = match self.linear_focused_tile_mut() {
+                    Some(t) => {
+                        t.input.clear();
+                        t.view.clone()
+                    }
+                    None => return,
+                };
+                if let Some(v) = view {
+                    v.update(cx, |lv, c| {
+                        lv.exit_select();
+                        c.notify();
+                    });
                 }
                 cx.notify();
             }

@@ -424,19 +424,19 @@ impl MarkTable {
 // Automatic layouts (spec-layout-patterns.md Phase 2)
 // ---------------------------------------------------------------------------
 
-/// Layout mode for a tab. `Manual` is the default (user-built split tree);
-/// the automatic modes compute the tree algorithmically on each structural
-/// change (split/close/mode-switch). `Desktop` (spec-desktop-mode.md) keeps
-/// the tree as the CONTENT owner and takes geometry from the tab's
-/// [`DesktopState`] slot map instead — it never drains/rebuilds the tree.
+/// Layout mode for a tab. `Desktop` (spec-desktop-mode.md) is the default: it
+/// keeps the split tree as the CONTENT owner and takes geometry from the tab's
+/// [`DesktopState`] slot map, never draining/rebuilding the tree. `Manual` is a
+/// user-built split tree; the automatic modes (MasterStack/Monocle/Columns)
+/// compute the tree algorithmically on each structural change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutMode {
-    #[default]
     Manual,
     MasterStack,
     Monocle,
     Columns,
+    #[default]
     Desktop,
 }
 
@@ -963,7 +963,7 @@ pub struct Tab<C> {
     /// Per-tab — switching tabs shows/hides the arriving/departing tab's rail.
     pub rail: Option<RailState>,
     // --- Layout patterns (spec-layout-patterns.md) ---
-    /// Current layout algorithm. `Manual` is the default (hand-built splits).
+    /// Current layout algorithm. `Desktop` is the default (free tile placement).
     pub layout_mode: LayoutMode,
     /// Saved manual tree shape. When switching from Manual to an automatic
     /// mode, the manual tree's skeleton is saved here so it can be restored.
@@ -1127,7 +1127,8 @@ impl<C> Workspace<C> {
             layout: Layout::Leaf(Window { id, content }),
             focused: id,
             rail: None,
-            layout_mode: LayoutMode::Manual,
+            // New workspaces default to Desktop (free tile placement).
+            layout_mode: LayoutMode::default(),
             saved_manual_layout: None,
             master_ratio: 0.6,
             master_count: 1,

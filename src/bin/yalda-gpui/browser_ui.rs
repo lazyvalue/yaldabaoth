@@ -195,6 +195,12 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
+        // Universal leaders: when NOT filtering/renaming (navigation), `<space>`/
+        // `.`/`?` open the menus first; while filtering/renaming they stay text.
+        if self.leader_intercept(&press, cx) {
+            cx.stop_propagation();
+            return;
+        }
         // Rename input takes precedence over every other browser key while it's
         // open — intercept here so the `j`/`r`/etc. action bindings don't fire.
         let renaming = self.browser_mut().is_some_and(|b| b.fb.rename.is_some());
@@ -350,7 +356,11 @@ impl YaldaGpuiView {
             existing => {
                 let side = existing.as_ref().map(|r| r.side).unwrap_or_default();
                 let pinned_to = tab.focused;
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let cwd = tab
+                    .kv_get("cwd")
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(process_cwd);
                 let content = workspace::RailContent::FileBrowser(FileBrowser::new(cwd));
                 tab.rail = Some(workspace::RailState::new(content, side, pinned_to));
             }
@@ -538,8 +548,8 @@ impl YaldaGpuiView {
                     // The Edit body is now a virtualized `gpui::list`; reveal
                     // through the ListState (the old ScrollHandle drove the
                     // pre-virtualization overflow container).
-                    if line < e.list_item_count {
-                        e.list_state.scroll_to_reveal_item(line);
+                    if line < e.list.len() {
+                        e.list.state().scroll_to_reveal_item(line);
                     }
                 }
                 _ => {}
