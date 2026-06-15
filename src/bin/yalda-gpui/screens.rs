@@ -831,9 +831,8 @@ impl YaldaGpuiView {
             session_ent.update(cx, |session_payload, _scx| {
                 let c: &mut AgentState = &mut session_payload.state;
 
-        let cursor = c.editor.cursor();
-        let cursor_line = cursor.line;
-        let cursor_col = cursor.col;
+        // (Model C: the transcript is read-only and renders no caret; the active
+        // cursor lives in the compose, read in the status strip / compose body.)
         let at = &self.theme.agent; // shorthand for agent theme
         let dim_fg: Hsla = nc(at.dim);
         // Theme-derived background tints for turn cards. Blend a faint
@@ -882,31 +881,36 @@ impl YaldaGpuiView {
         // note. This is the primary "what am I doing" readout, so it sits at the
         // top next to the agent identity.
         {
+            // Model C: the active edit surface is the COMPOSE buffer in both
+            // placements; the placement only changes the label (CHATBOX vs
+            // WORKSHEET). Mode + cursor read the compose, not the read-only
+            // transcript.
             let in_chatbox = c.input_surface.is_chatbox();
-            let mode_label = if in_chatbox {
-                match c.input_surface.chatbox().unwrap().mode {
-                    EditMode::Normal => "CHATBOX",
-                    EditMode::Insert => "CHATBOX INSERT",
-                }
-            } else {
-                match c.mode {
-                    EditMode::Normal => "WORKSHEET",
-                    EditMode::Insert => "WORKSHEET INSERT",
-                }
+            let compose = c.input_surface.compose();
+            let mode_label = match (in_chatbox, compose.mode) {
+                (true, EditMode::Normal) => "CHATBOX",
+                (true, EditMode::Insert) => "CHATBOX INSERT",
+                (false, EditMode::Normal) => "WORKSHEET",
+                (false, EditMode::Insert) => "WORKSHEET INSERT",
             };
-            let dirty_mark = if c.editor.document().is_modified() {
+            let dirty_mark = if compose.editor.document().is_modified() {
                 "•"
             } else {
                 ""
             };
-            let extend_mark = if c.editor.extend_mode() { " EXT" } else { "" };
+            let extend_mark = if compose.editor.extend_mode() {
+                " EXT"
+            } else {
+                ""
+            };
+            let compose_cursor = compose.editor.cursor();
             let mut status_text = format!(
                 "{}{}{} · L{}:C{}",
                 dirty_mark,
                 mode_label,
                 extend_mark,
-                cursor_line + 1,
-                cursor_col + 1,
+                compose_cursor.line + 1,
+                compose_cursor.col + 1,
             );
             if c.turn_phase.is_awaiting() {
                 status_text.push_str(" · …awaiting reply");
@@ -1190,9 +1194,12 @@ impl YaldaGpuiView {
         // via a negative pixel margin so the caret stays visible. The clip
         // container inherits its width from the flex layout — no need to
         // know the pixel width at render time.
-        // Pinned compose panel: rendered only in Chatbox placement. (Worksheet's
-        // inline compose render is a separate path — design-c.md §3 / ticket #8.)
-        let compose_panel = if c.input_surface.is_chatbox() {
+        // Compose panel — rendered below the transcript in BOTH placements
+        // (Model C). Chatbox = pinned box; Worksheet = inline at the tail. The
+        // inline-flush styling (no box chrome, conversation typography, `›`
+        // gutter) + the cached-child promotion are a runtime-tuning follow-up;
+        // for now both placements render the same panel so worksheet is usable.
+        let compose_panel = {
             let tb = c.input_surface.compose_mut();
             // Logical lines shown before the box caps height + scrolls. At/below
             // this the panel renders every line directly (grows to content,
@@ -1344,8 +1351,6 @@ impl YaldaGpuiView {
                     .child(separator)
                     .child(compose_body),
             )
-        } else {
-            None
         };
 
         // ---- Right-side sidebars (Tasklist / Subagents) ----
