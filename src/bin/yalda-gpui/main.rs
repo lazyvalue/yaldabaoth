@@ -1806,7 +1806,7 @@ impl YaldaGpuiView {
                         let sid_id = bind.id();
                         self.with_session(sid_id, cx, |state| {
                             if slot.mode == InputModeKind::Worksheet {
-                                state.input_surface = InputSurface::Worksheet;
+                                state.input_surface = InputSurface::new(InputModeKind::Worksheet);
                             }
                             state.tasklist_open = slot.tasklist_open;
                             state.subagents_open = slot.subagents_open;
@@ -1859,7 +1859,7 @@ impl YaldaGpuiView {
                         let mut state =
                             self.create_agent_session(Some(slot.id.clone()), slot_cwd.clone(), cx);
                         if slot.mode == InputModeKind::Worksheet {
-                            state.input_surface = InputSurface::Worksheet;
+                            state.input_surface = InputSurface::new(InputModeKind::Worksheet);
                         }
                         state.tasklist_open = slot.tasklist_open;
                         state.subagents_open = slot.subagents_open;

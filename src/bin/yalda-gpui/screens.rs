@@ -1190,7 +1190,10 @@ impl YaldaGpuiView {
         // via a negative pixel margin so the caret stays visible. The clip
         // container inherits its width from the flex layout — no need to
         // know the pixel width at render time.
-        let compose_panel = if let InputSurface::Chatbox(tb) = &mut c.input_surface {
+        // Pinned compose panel: rendered only in Chatbox placement. (Worksheet's
+        // inline compose render is a separate path — design-c.md §3 / ticket #8.)
+        let compose_panel = if c.input_surface.is_chatbox() {
+            let tb = c.input_surface.compose_mut();
             // Logical lines shown before the box caps height + scrolls. At/below
             // this the panel renders every line directly (grows to content,
             // cheap — nothing to virtualise). ABOVE it, building the whole draft

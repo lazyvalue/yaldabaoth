@@ -711,7 +711,7 @@ fn seed_worksheet_line(
 ) {
     view.update(vcx, |v, cx| {
         let mut claude = v.agent_mut(cx).expect("active agent slot");
-        claude.input_surface = crate::InputSurface::Worksheet;
+        claude.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
         for ch in token.chars() {
             claude.editor.insert_char(ch);
         }

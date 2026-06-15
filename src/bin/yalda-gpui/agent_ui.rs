@@ -86,7 +86,7 @@ impl YaldaGpuiView {
                 let mut state =
                     self.create_agent_session(Some(slot.id.clone()), slot_cwd.clone(), cx);
                 if slot.mode == InputModeKind::Worksheet {
-                    state.input_surface = InputSurface::Worksheet;
+                    state.input_surface = InputSurface::new(InputModeKind::Worksheet);
                 }
                 state.tasklist_open = slot.tasklist_open;
                 state.subagents_open = slot.subagents_open;
@@ -1237,7 +1237,7 @@ impl YaldaGpuiView {
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
-            input_surface: InputSurface::Chatbox(Chatbox::new()),
+            input_surface: InputSurface::new(InputModeKind::Chatbox),
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -1974,7 +1974,7 @@ impl YaldaGpuiView {
                         if let Some(cb) = slot.state.input_surface.chatbox_mut()
                             && cb.text().trim().is_empty()
                         {
-                            let mut fresh = Chatbox::new();
+                            let mut fresh = Compose::new();
                             for ch in text.chars() {
                                 fresh.editor.insert_char(ch);
                             }
@@ -3025,36 +3025,14 @@ impl YaldaGpuiView {
             return;
         };
         self.with_session(id, cx, |claude| {
-        match &claude.input_surface {
-            // Read the draft text out (last use of `cb`) BEFORE reassigning the
-            // field, so the match's shared borrow ends and the write is clean.
-            InputSurface::Chatbox(cb) => {
-                let text = cb.text();
-                claude.input_surface = InputSurface::Worksheet;
-                if !text.is_empty() {
-                    // Ensure the transcript ends with a `\n` so the
-                    // appended draft starts on its own line, then drop
-                    // the trailing newline of `text` so we don't leave a
-                    // dangling blank below the cursor.
-                    let needs_nl = !claude.editor.document().full_text().ends_with('\n');
-                    let eof = claude.editor.document().rope().len_chars();
-                    if needs_nl {
-                        claude.editor.programmatic_insert(eof, "\n");
-                    }
-                    let to_append = text.strip_suffix('\n').unwrap_or(&text).to_string();
-                    let eof2 = claude.editor.document().rope().len_chars();
-                    claude.editor.programmatic_insert(eof2, &to_append);
-                    let new_eof = claude.editor.document().rope().len_chars();
-                    let (cl, cc) = doc_char_to_line_col(claude.editor.document(), new_eof);
-                    claude.editor.cursor_mut().line = cl;
-                    claude.editor.cursor_mut().col = cc;
-                }
-                claude.editor.clear_selection();
-            }
-            InputSurface::Worksheet => {
-                claude.input_surface = InputSurface::Chatbox(Chatbox::new());
-            }
-        }
+            // Model C (`design-c.md` §4.3): toggling is purely a placement flip.
+            // The compose buffer (draft text, cursor, undo) never moves — so the
+            // toggle is lossless by construction, the old "move the draft into the
+            // transcript / drop it" dance is gone.
+            claude.input_surface.mode = match claude.input_surface.mode {
+                InputModeKind::Worksheet => InputModeKind::Chatbox,
+                InputModeKind::Chatbox => InputModeKind::Worksheet,
+            };
         });
         cx.notify();
     }
@@ -3436,8 +3414,9 @@ impl YaldaGpuiView {
                     false,
                 );
                 claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
-                // Reset the chatbox to empty; cursor stays inside.
-                claude.input_surface = InputSurface::Chatbox(Chatbox::new());
+                // Reset the compose to empty, PRESERVING the current placement
+                // (a worksheet submit stays in worksheet — Model C §4.1).
+                claude.input_surface = InputSurface::new(claude.input_surface.mode);
             }
         } else if let Some(mut claude) = self.agent_mut(cx) {
             // Send failed: leave the chatbox text intact so the user can retry,

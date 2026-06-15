@@ -1444,42 +1444,57 @@ pub(crate) enum InputModeKind {
     Chatbox,
 }
 
-/// The single live input surface of an agent window (§4–§5). Replaces the old
-/// `input_mode: InputMode` + `chatbox: Option<Chatbox>` pair: the Chatbox data
-/// lives INSIDE the `Chatbox` variant, so the illegal states (Chatbox-mode with
-/// no box, or Worksheet with a stranded box) are unrepresentable. New sessions
-/// start at `Chatbox` (compose-box-first); `Ctrl-Alt-Enter` toggles. NOT `Copy`
-/// (it owns a `Chatbox`).
-// wire/event enum — boxing the large variant would ripple through serialization + every match site
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum InputSurface {
-    Worksheet,
-    Chatbox(Chatbox),
+/// The live input surface of an agent window (Model C — `design-c.md`). There is
+/// ONE model — a focusable read-only transcript plus a [`Compose`] buffer — and a
+/// single mode axis, **placement**: `mode == Worksheet` renders the compose inline
+/// at the transcript tail (the base case); `mode == Chatbox` renders it in a pinned
+/// box (the diminutive case). The compose buffer therefore exists in BOTH modes —
+/// the old enum (`Worksheet` unit | `Chatbox(Chatbox)`) is replaced by a struct so
+/// "the compose exists iff in chatbox mode" is no longer the model. Toggling flips
+/// `mode`; the `compose` value never moves (lossless). `Ctrl-Alt-Enter` toggles.
+pub(crate) struct InputSurface {
+    pub(crate) compose: Compose,
+    /// The placement discriminant (`design-c.md` `Placement`): which side the
+    /// editable buffer sits on. Persisted as the `PersistedSlot.mode` string;
+    /// read by `should_follow_tail` and the render path.
+    pub(crate) mode: InputModeKind,
 }
 
 impl InputSurface {
+    /// A fresh surface in `mode` with an empty compose buffer.
+    pub(crate) fn new(mode: InputModeKind) -> Self {
+        Self {
+            compose: Compose::new(),
+            mode,
+        }
+    }
     pub(crate) fn is_chatbox(&self) -> bool {
-        matches!(self, InputSurface::Chatbox(_))
+        self.mode == InputModeKind::Chatbox
     }
-    pub(crate) fn chatbox(&self) -> Option<&Chatbox> {
-        match self {
-            InputSurface::Chatbox(cb) => Some(cb),
-            InputSurface::Worksheet => None,
+    /// The compose buffer — present in every mode (Model C). New code reads this.
+    pub(crate) fn compose(&self) -> &Compose {
+        &self.compose
+    }
+    pub(crate) fn compose_mut(&mut self) -> &mut Compose {
+        &mut self.compose
+    }
+    /// Back-compat shim: `Some` only in Chatbox mode, matching the old enum's
+    /// `chatbox()` so the pinned-box call sites stay behavior-identical during the
+    /// migration. New code (inline render, submit, paste) uses `compose()`.
+    pub(crate) fn chatbox(&self) -> Option<&Compose> {
+        self.is_chatbox().then_some(&self.compose)
+    }
+    pub(crate) fn chatbox_mut(&mut self) -> Option<&mut Compose> {
+        if self.is_chatbox() {
+            Some(&mut self.compose)
+        } else {
+            None
         }
     }
-    pub(crate) fn chatbox_mut(&mut self) -> Option<&mut Chatbox> {
-        match self {
-            InputSurface::Chatbox(cb) => Some(cb),
-            InputSurface::Worksheet => None,
-        }
-    }
-    /// The Copy discriminant, for the persisted mode string and
-    /// `should_follow_tail` (which must not borrow the owned `Chatbox`).
+    /// The Copy placement discriminant, for the persisted mode string and
+    /// `should_follow_tail`.
     pub(crate) fn mode(&self) -> InputModeKind {
-        match self {
-            InputSurface::Worksheet => InputModeKind::Worksheet,
-            InputSurface::Chatbox(_) => InputModeKind::Chatbox,
-        }
+        self.mode
     }
 }
 
@@ -1592,13 +1607,12 @@ impl HeaderRole {
     }
 }
 
-/// Standalone input editor used when `InputMode == Chatbox`. Has its own
-/// document, cursor, undo stack, and modal state (§16). The chatbox is
-/// dropped on a `Chatbox → Worksheet` toggle (§6) and re-constructed empty
-/// on a `Worksheet → Chatbox` toggle (§7) — undo history doesn't survive
-/// the round trip; the previous draft is recoverable as transcript
-/// content if the user already submitted.
-pub(crate) struct Chatbox {
+/// The editable draft buffer (Model C — `design-c.md`). Has its own document,
+/// cursor, undo stack, and modal state. Shared by both placements: rendered
+/// inline at the transcript tail in Worksheet mode, in a pinned box in Chatbox
+/// mode. Its value survives a placement toggle untouched (the draft is never lost).
+/// Renamed from `Chatbox` — it is the *compose surface*, not a mode.
+pub(crate) struct Compose {
     pub(crate) editor: Editor,
     pub(crate) mode: EditMode,
     pub(crate) scroll_handle: ScrollHandle,
@@ -1611,10 +1625,10 @@ pub(crate) struct Chatbox {
     pub(crate) list_state: gpui::ListState,
 }
 
-impl Chatbox {
+impl Compose {
     pub(crate) fn new() -> Self {
         Self {
-            editor: Editor::new(String::new(), std::path::PathBuf::from("*chatbox*")),
+            editor: Editor::new(String::new(), std::path::PathBuf::from("*compose*")),
             mode: EditMode::Insert,
             scroll_handle: ScrollHandle::new(),
             list_state: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(64.0)),
@@ -2500,7 +2514,7 @@ impl AgentState {
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
-            input_surface: InputSurface::Chatbox(Chatbox::new()),
+            input_surface: InputSurface::new(InputModeKind::Chatbox),
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -2547,7 +2561,7 @@ impl AgentState {
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
-            input_surface: InputSurface::Chatbox(Chatbox::new()),
+            input_surface: InputSurface::new(InputModeKind::Chatbox),
             current_plan: None,
             agent_mode: None,
             agent_model: None,
