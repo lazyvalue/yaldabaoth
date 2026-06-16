@@ -85,9 +85,9 @@ impl YaldaGpuiView {
                 let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
                 let mut state =
                     self.create_agent_session(Some(slot.id.clone()), slot_cwd.clone(), cx);
-                if slot.mode == InputModeKind::Worksheet {
-                    state.input_surface = InputSurface::new(InputModeKind::Worksheet);
-                }
+                // Restore placement + seed the persisted compose draft (Model C).
+                state.input_surface =
+                    InputSurface::with_draft(slot.mode, slot.compose_draft.as_deref().unwrap_or(""));
                 state.tasklist_open = slot.tasklist_open;
                 state.subagents_open = slot.subagents_open;
                 self.show_local_session(
@@ -1175,6 +1175,7 @@ impl YaldaGpuiView {
                         .clone()
                         .or_else(|| session.state.channel.as_ref().and_then(|c| c.session_id()));
                     if let Some(rid) = resolved_id {
+                        let draft = session.state.input_surface.compose().text();
                         snaps.push(SessionSnapshot {
                             id: rid,
                             label: session.label.clone(),
@@ -1183,6 +1184,7 @@ impl YaldaGpuiView {
                             tasklist_open: session.state.tasklist_open,
                             subagents_open: session.state.subagents_open,
                             cwd: session.cwd.clone(),
+                            compose_draft: (!draft.trim().is_empty()).then_some(draft),
                         });
                     }
                 }

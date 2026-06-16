@@ -997,8 +997,12 @@ fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
 /// the Ctrl-Alt-Enter toggle flips between the two — destroying the box on the
 /// way to Worksheet and minting a fresh one on the way back (unchanged
 /// behavior, now unrepresentable-illegal-state).
+// Model C: toggling is a pure placement flip — the `Compose` value (draft text,
+// cursor) is preserved across the round trip, never stranded or dropped. This
+// replaces the old asymmetry assertion ("a chatbox exists iff Chatbox variant"),
+// which no longer holds: the compose exists in both placements.
 #[gpui::test]
-fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
+fn toggle_preserves_compose_value(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
@@ -1011,31 +1015,36 @@ fn input_surface_toggle_round_trips(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     install_agent_slot(&view, &mut *vcx, Some("S1"));
 
-    // New session starts in Chatbox — a box exists.
+    // New session starts in Chatbox. Type a draft into the compose.
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).unwrap();
         assert!(c.input_surface.is_chatbox());
-        assert!(
-            c.input_surface.chatbox().is_some(),
-            "chatbox exists iff Chatbox variant"
-        );
+        let cb = c.input_surface.compose_mut();
+        for ch in "hello draft".chars() {
+            cb.editor.insert_char(ch);
+        }
+        assert_eq!(c.input_surface.compose().text(), "hello draft");
     });
 
-    // Toggle -> Worksheet: the box is gone (no stranded Some).
+    // Toggle -> Worksheet: placement flips, the draft is preserved (not moved
+    // into the transcript, not dropped).
     view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).unwrap();
-        assert!(!c.input_surface.is_chatbox());
-        assert!(
-            c.input_surface.chatbox().is_none(),
-            "worksheet carries no chatbox"
+        assert!(!c.input_surface.is_chatbox(), "now in worksheet placement");
+        assert_eq!(
+            c.input_surface.compose().text(),
+            "hello draft",
+            "draft survives the placement flip untouched"
         );
     });
 
-    // Toggle back -> Chatbox: a fresh box.
+    // Toggle back -> Chatbox: still the same draft.
     view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
     view.update(vcx, |v, cx| {
-        assert!(v.agent_mut(cx).unwrap().input_surface.is_chatbox());
+        let mut c = v.agent_mut(cx).unwrap();
+        assert!(c.input_surface.is_chatbox());
+        assert_eq!(c.input_surface.compose().text(), "hello draft");
     });
 }
 
@@ -2642,6 +2651,7 @@ fn multi_session_persistence_round_trips_distinct_sids() {
             tasklist_open: false,
             subagents_open: false,
             cwd: cwd.clone(),
+            compose_draft: None,
         },
         SessionSnapshot {
             id: "SID-B".into(),
@@ -2651,6 +2661,7 @@ fn multi_session_persistence_round_trips_distinct_sids() {
             tasklist_open: true,
             subagents_open: false,
             cwd: cwd.clone(),
+            compose_draft: None,
         },
     ];
 

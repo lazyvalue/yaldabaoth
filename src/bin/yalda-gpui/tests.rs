@@ -1244,19 +1244,6 @@ fn classify_wp_line_paragraph_fallback() {
     );
 }
 
-// ---- doc_char_to_line_col ----
-
-#[test]
-fn doc_char_to_line_col_basic_mapping() {
-    let ed = Editor::new("ab\ncd\nef".into(), std::path::PathBuf::from("/t"));
-    assert_eq!(doc_char_to_line_col(ed.document(), 0), (0, 0));
-    assert_eq!(doc_char_to_line_col(ed.document(), 1), (0, 1));
-    // Char 2 is the '\n' between line 0 and line 1.
-    assert_eq!(doc_char_to_line_col(ed.document(), 3), (1, 0));
-    assert_eq!(doc_char_to_line_col(ed.document(), 6), (2, 0));
-    // Past EOF clamps to len.
-    assert_eq!(doc_char_to_line_col(ed.document(), 999), (2, 2));
-}
 
 // ---- Menu rendering helpers ----
 

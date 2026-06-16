@@ -847,6 +847,11 @@ pub(crate) struct PersistedSlot {
     pub(crate) tasklist_open: bool,
     pub(crate) subagents_open: bool,
     pub(crate) cwd: Option<PathBuf>,
+    /// The unsent compose draft (Model C — `design-c.md` §4.4). `None`/absent =
+    /// no draft. Seeded into the compose buffer on restore so a draft survives an
+    /// app restart (it already survives a reconnect, since replay rebuilds only
+    /// the transcript, not the compose).
+    pub(crate) compose_draft: Option<String>,
 }
 
 /// Load the persisted slot list for `cwd`. Returns an empty vec if no
@@ -883,6 +888,7 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
             tasklist_open: false,
             subagents_open: false,
             cwd: None,
+            compose_draft: None,
         }];
     }
     let Some(arr) = entry.as_array() else {
@@ -921,6 +927,11 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
             // file, or pre-spec save) is loaded as None so the restore
             // path can fall back to process cwd per §1.
             let cwd = obj.get("cwd").and_then(|c| c.as_str()).map(PathBuf::from);
+            // Model C: the unsent compose draft. Absent (old file) => None.
+            let compose_draft = obj
+                .get("compose_draft")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string());
             Some(PersistedSlot {
                 id,
                 label,
@@ -929,6 +940,7 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
                 tasklist_open,
                 subagents_open,
                 cwd,
+                compose_draft,
             })
         })
         .collect()
@@ -1033,6 +1045,9 @@ pub(crate) struct SessionSnapshot {
     pub(crate) tasklist_open: bool,
     pub(crate) subagents_open: bool,
     pub(crate) cwd: PathBuf,
+    /// The unsent compose draft (Model C — `design-c.md` §4.4). `None`/empty is
+    /// not written; a non-empty draft round-trips through `compose_draft`.
+    pub(crate) compose_draft: Option<String>,
 }
 
 pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[SessionSnapshot]) {
@@ -1077,6 +1092,13 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[Sessio
                 "cwd".into(),
                 serde_json::Value::String(snap.cwd.display().to_string()),
             );
+            // Model C: persist a non-empty compose draft so it survives restart.
+            if let Some(draft) = snap.compose_draft.as_ref().filter(|d| !d.is_empty()) {
+                obj.insert(
+                    "compose_draft".into(),
+                    serde_json::Value::String(draft.clone()),
+                );
+            }
             serde_json::Value::Object(obj)
         })
         .collect();

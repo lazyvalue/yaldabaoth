@@ -410,17 +410,6 @@ fn format_menu_key(seq: &[KeyPress]) -> String {
 // ----------------------------------------------------------------------------
 
 /// Convert a rope char index to (line, col). Document doesn't expose this
-/// directly but Document::rope() is public. Mirrors editor.rs's private
-/// `char_to_line_col`.
-fn doc_char_to_line_col(doc: &Document, char_idx: usize) -> (usize, usize) {
-    let rope = doc.rope();
-    let len = rope.len_chars();
-    let i = char_idx.min(len);
-    let line = rope.char_to_line(i);
-    let line_start = rope.line_to_char(line);
-    (line, i - line_start)
-}
-
 // ----------------------------------------------------------------------------
 // Root view
 // ----------------------------------------------------------------------------
@@ -1805,9 +1794,10 @@ impl YaldaGpuiView {
                         });
                         let sid_id = bind.id();
                         self.with_session(sid_id, cx, |state| {
-                            if slot.mode == InputModeKind::Worksheet {
-                                state.input_surface = InputSurface::new(InputModeKind::Worksheet);
-                            }
+                            state.input_surface = InputSurface::with_draft(
+                                slot.mode,
+                                slot.compose_draft.as_deref().unwrap_or(""),
+                            );
                             state.tasklist_open = slot.tasklist_open;
                             state.subagents_open = slot.subagents_open;
                         });
@@ -1858,9 +1848,10 @@ impl YaldaGpuiView {
                         let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
                         let mut state =
                             self.create_agent_session(Some(slot.id.clone()), slot_cwd.clone(), cx);
-                        if slot.mode == InputModeKind::Worksheet {
-                            state.input_surface = InputSurface::new(InputModeKind::Worksheet);
-                        }
+                        state.input_surface = InputSurface::with_draft(
+                            slot.mode,
+                            slot.compose_draft.as_deref().unwrap_or(""),
+                        );
                         state.tasklist_open = slot.tasklist_open;
                         state.subagents_open = slot.subagents_open;
                         self.show_local_session(

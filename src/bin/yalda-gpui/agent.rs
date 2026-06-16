@@ -1461,6 +1461,15 @@ impl InputSurface {
             mode,
         }
     }
+
+    /// A surface in `mode` whose compose is seeded with a persisted `draft`
+    /// (Model C restore — `design-c.md` §4.4). Empty `draft` ⇒ empty compose.
+    pub(crate) fn with_draft(mode: InputModeKind, draft: &str) -> Self {
+        Self {
+            compose: Compose::seeded(draft),
+            mode,
+        }
+    }
     pub(crate) fn is_chatbox(&self) -> bool {
         self.mode == InputModeKind::Chatbox
     }
@@ -1471,12 +1480,9 @@ impl InputSurface {
     pub(crate) fn compose_mut(&mut self) -> &mut Compose {
         &mut self.compose
     }
-    /// Back-compat shim: `Some` only in Chatbox mode, matching the old enum's
-    /// `chatbox()` so the pinned-box call sites stay behavior-identical during the
-    /// migration. New code (inline render, submit, paste) uses `compose()`.
-    pub(crate) fn chatbox(&self) -> Option<&Compose> {
-        self.is_chatbox().then_some(&self.compose)
-    }
+    /// Back-compat shim: `Some` only in Chatbox mode. Retained for the
+    /// not-delivered resubmit path, which only refills the box in chatbox mode.
+    /// New code uses the total `compose()`/`compose_mut()`.
     pub(crate) fn chatbox_mut(&mut self) -> Option<&mut Compose> {
         if self.is_chatbox() {
             Some(&mut self.compose)
@@ -1630,6 +1636,16 @@ impl Compose {
 
     pub(crate) fn text(&self) -> String {
         self.editor.document().full_text()
+    }
+
+    /// A fresh compose seeded with `text` (cursor at the end). Used on restore to
+    /// re-apply a persisted draft, and on the not-delivered resubmit path.
+    pub(crate) fn seeded(text: &str) -> Self {
+        let mut c = Self::new();
+        for ch in text.chars() {
+            c.editor.insert_char(ch);
+        }
+        c
     }
 }
 
