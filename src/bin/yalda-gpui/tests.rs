@@ -1653,3 +1653,120 @@ fn line_outside_selection_is_unchanged() {
     let out = apply_line_selection(&segs, "text", ((0, 0), (0, 4)), 3, style, NColor::Rgb(1, 2, 3));
     assert_eq!(out, segs, "line 3 is outside a line-0 selection");
 }
+
+// ============================================================================
+// Model C — worksheet/compose agent-buffer invariants (design-c.md §6)
+// ============================================================================
+
+/// INV (§4.4): a reconnect/replay rebuilds the TRANSCRIPT editor only; the
+/// compose draft lives in `input_surface` and must survive untouched. Pins the
+/// "draft lost on reconnect" failure mode the redesign fixes for free.
+#[test]
+fn compose_draft_survives_reset_for_replay() {
+    let mut st = AgentState::new_for_test();
+    for ch in "half-typed prompt".chars() {
+        st.input_surface.compose_mut().editor.insert_char(ch);
+    }
+    // Put some committed content in the transcript so the reset has work to do.
+    st.editor.programmatic_insert(0, "old transcript\n");
+
+    st.reset_for_replay();
+
+    assert_eq!(
+        st.input_surface.compose().text(),
+        "half-typed prompt",
+        "compose draft must survive a replay reset"
+    );
+    assert_eq!(
+        st.editor.document().full_text(),
+        "",
+        "the transcript editor is wiped for replay"
+    );
+}
+
+/// INV (§4.5): the follow-tail policy is `follow_output` in BOTH placements —
+/// the cursor lives in the compose, never the (read-only) transcript, so the
+/// old `Worksheet => cursor_at_eof` arm is gone.
+#[test]
+fn should_follow_tail_is_follow_output_only() {
+    assert!(should_follow_tail(true), "follow when follow_output is set");
+    assert!(
+        !should_follow_tail(false),
+        "don't follow when follow_output is clear"
+    );
+}
+
+/// `Compose::seeded` round-trips multi-line text (used by draft restore +
+/// the not-delivered resubmit path).
+#[test]
+fn compose_seeded_roundtrips_text() {
+    assert_eq!(Compose::seeded("alpha\nbeta").text(), "alpha\nbeta");
+    assert_eq!(Compose::seeded("").text(), "");
+}
+
+/// `InputSurface::with_draft` sets BOTH placement and the seeded draft — the
+/// shape the three restore sites rely on (a mechanical `Compose::new()` would
+/// silently drop the draft).
+#[test]
+fn input_surface_with_draft_sets_mode_and_draft() {
+    let s = InputSurface::with_draft(InputModeKind::Worksheet, "resumed");
+    assert_eq!(s.mode(), InputModeKind::Worksheet);
+    assert!(!s.is_chatbox());
+    assert_eq!(s.compose().text(), "resumed");
+
+    let empty = InputSurface::with_draft(InputModeKind::Chatbox, "");
+    assert!(empty.is_chatbox());
+    assert_eq!(empty.compose().text(), "");
+}
+
+/// Persistence round-trip (§4.4): a non-empty compose draft survives
+/// save→load; an empty draft is not written (absent → None on load). Uses the
+/// `with_acp_persist_path` seam so it never touches `~/.yalda`.
+#[test]
+fn compose_draft_persist_roundtrip() {
+    let dir = std::env::temp_dir().join(format!("yalda_compose_persist_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("acp_sessions.json");
+    let cwd = std::path::Path::new("/tmp/yalda-test-cwd");
+
+    persist::with_acp_persist_path(path.clone(), || {
+        let snaps = vec![
+            persist::SessionSnapshot {
+                id: "S-with-draft".into(),
+                label: "claude-1".into(),
+                active: true,
+                mode: InputModeKind::Worksheet,
+                tasklist_open: false,
+                subagents_open: false,
+                cwd: cwd.to_path_buf(),
+                compose_draft: Some("persisted draft".into()),
+            },
+            persist::SessionSnapshot {
+                id: "S-empty".into(),
+                label: "claude-2".into(),
+                active: false,
+                mode: InputModeKind::Chatbox,
+                tasklist_open: false,
+                subagents_open: false,
+                cwd: cwd.to_path_buf(),
+                compose_draft: None,
+            },
+        ];
+        persist::save_persisted_acp_sessions(cwd, &snaps);
+
+        let loaded = persist::load_persisted_acp_sessions(cwd);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded[0].compose_draft.as_deref(),
+            Some("persisted draft"),
+            "non-empty draft round-trips"
+        );
+        assert_eq!(
+            loaded[1].compose_draft, None,
+            "empty draft is not written / loads as None"
+        );
+        assert_eq!(loaded[0].mode, InputModeKind::Worksheet);
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

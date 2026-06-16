@@ -1048,6 +1048,82 @@ fn toggle_preserves_compose_value(cx: &mut TestAppContext) {
     });
 }
 
+/// Model C §4.5: `toggle_agent_focus` flips between compose and the read-only
+/// transcript and back. Default focus is `Compose`.
+#[gpui::test]
+fn toggle_agent_focus_round_trips(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    view.update(vcx, |v, cx| {
+        assert_eq!(v.agent_mut(cx).unwrap().focus, crate::AgentFocus::Compose);
+    });
+    view.update(vcx, |v, cx| v.toggle_agent_focus(cx));
+    view.update(vcx, |v, cx| {
+        assert_eq!(v.agent_mut(cx).unwrap().focus, crate::AgentFocus::Transcript);
+    });
+    view.update(vcx, |v, cx| v.toggle_agent_focus(cx));
+    view.update(vcx, |v, cx| {
+        assert_eq!(v.agent_mut(cx).unwrap().focus, crate::AgentFocus::Compose);
+    });
+}
+
+/// Model C INV-1: in worksheet placement, a blank submit is a no-op and the
+/// transcript stays empty — the draft is never written into the transcript
+/// (it lives in the separate compose). Also pins that submit with no channel
+/// surfaces a status rather than freezing a phantom turn.
+#[gpui::test]
+fn worksheet_blank_submit_is_noop(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    // Switch to worksheet placement; leave the compose blank.
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
+        assert!(!c.input_surface.is_chatbox());
+        assert!(c.input_surface.compose().text().trim().is_empty());
+    });
+
+    let before = view
+        .update(vcx, |v, cx| {
+            v.agent_mut(cx).unwrap().editor.document().full_text()
+        })
+        ;
+    view.update(vcx, |v, cx| v.submit_compose(cx));
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
+        assert_eq!(
+            c.editor.document().full_text(),
+            before,
+            "a blank submit must not write the transcript"
+        );
+        assert_eq!(
+            c.input_surface.mode(),
+            crate::InputModeKind::Worksheet,
+            "submit preserves placement"
+        );
+    });
+}
+
 // ---- Phase 8 Stage C: AgentEvent TOTAL reducer (NEEDS-RUNTIME) ------------
 //
 // These drive the canonical `AgentEvent` stream through the REAL

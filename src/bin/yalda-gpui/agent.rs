@@ -2742,6 +2742,13 @@ impl AgentState {
     /// hand-rolled `last_seen_turns + 1`, which silently diverged from the
     /// chokepoint and never armed dedup. Returns the committed `k`, or `None` if
     /// the M3 tripwire fired (no lines frozen; the caller still clears/notifies).
+    ///
+    /// Model C: the live worksheet submit no longer freezes in place — it routes
+    /// through `submit_compose` → `insert_user_turn` (append at EOF), since the
+    /// draft now lives in a separate `Compose` buffer, not in the transcript.
+    /// This in-place freeze is retained only as the reconciler-dedup SEAM that
+    /// the `agent_seam_*` tests drive directly; hence `#[cfg(test)]`.
+    #[cfg(test)]
     pub(crate) fn commit_worksheet_turn(
         &mut self,
         collected: &[(usize, String)],
