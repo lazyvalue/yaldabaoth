@@ -1,7 +1,18 @@
 # Tech Design — Worksheet Mode Redesign (Model C)
 
-Status: **Draft (pre-review)** · Implements: `PRD.md` · Supersedes: `design.md` (Model A)
-Surface: `yalda-gpui` · Base: worktree `worksheet-redesign` (clean HEAD `0d062db`)
+Status: **Implemented** (branch `worksheet-redesign`) · Implements: `PRD.md` · Supersedes: `design.md` (Model A)
+Surface: `yalda-gpui` · Base: worktree `worksheet-redesign` (from HEAD `0d062db`)
+
+**Implementation status (2026-06-16):** foundation (struct `InputSurface` +
+`Chatbox`→`Compose`), unified `submit_compose`, compose key-routing, transcript
+read-only + paste/copy fixes, `should_follow_tail` collapse, inline compose render
+in both placements, `AgentFocus` transcript-focus model + selection-send,
+`compose_draft` persistence, and the agent-buffer invariant test suite are all
+landed and committed; 198 tests pass, builds clean. **Deferred to runtime tuning
+(`docs/projects` ticket / task #12 — needs the GPUI loop, can't run headless):**
+fuller inline-flush worksheet styling (only an accent-border cue landed) and the
+`Compose` cached-child promotion (compose is already O(visible) via the
+`ListState` virtualization, so this is a perf refinement, not a correctness fix).
 
 Read `PRD.md` for product intent and `design.md §0` for why Model A was rejected.
 This is the design we implement.
