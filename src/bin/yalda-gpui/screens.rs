@@ -1200,6 +1200,11 @@ impl YaldaGpuiView {
         // gutter) + the cached-child promotion are a runtime-tuning follow-up;
         // for now both placements render the same panel so worksheet is usable.
         let compose_panel = {
+            // Placement-aware accent: Worksheet (inline) tints the compose border
+            // with the cursor/accent color so it reads as the user's inline draft
+            // attached to the conversation; Chatbox keeps the neutral pinned box.
+            // (Fuller inline-flush styling is a runtime-tuning follow-up.)
+            let is_worksheet = !c.input_surface.is_chatbox();
             let tb = c.input_surface.compose_mut();
             // Logical lines shown before the box caps height + scrolls. At/below
             // this the panel renders every line directly (grows to content,
@@ -1219,6 +1224,12 @@ impl YaldaGpuiView {
             let compose_sel = tb.editor.selection_range();
             let sep_color: Hsla = nc(at.compose_separator);
             let compose_cursor_color: Hsla = nc(at.cursor);
+            // Worksheet tints the box border with the accent; chatbox stays neutral.
+            let compose_border: Hsla = if is_worksheet {
+                compose_cursor_color
+            } else {
+                dim_fg
+            };
             let compose_code_font = self.code_font.clone();
             let separator = div().w_full().h(px(1.0)).bg(dim_fg);
 
@@ -1248,7 +1259,7 @@ impl YaldaGpuiView {
                     .py(px(8.0))
                     .bg(compose_panel_bg)
                     .border_1()
-                    .border_color(dim_fg)
+                    .border_color(compose_border)
                     .rounded_md()
                     .mx_2()
                     .mb_1()
@@ -1320,7 +1331,7 @@ impl YaldaGpuiView {
                     .py(px(8.0))
                     .bg(compose_panel_bg)
                     .border_1()
-                    .border_color(dim_fg)
+                    .border_color(compose_border)
                     .rounded_md()
                     .mx_2()
                     .mb_1()
