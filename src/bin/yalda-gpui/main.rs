@@ -1433,6 +1433,7 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("x", "close session", "claude-close"),
         MenuNode::entry("C", "clear session", "claude-clear"),
         MenuNode::entry("r", "rename session", "claude-rename"),
+        MenuNode::entry("f", "focus transcript ⇄ compose", "agent-focus-toggle"),
         MenuNode::entry("S", "send selection", "claude-send-selection"),
         MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
     ]
@@ -4269,6 +4270,11 @@ impl YaldaGpuiView {
             "claude-send-selection" => {
                 if matches!(self.workspace.focused_content(), Some(App::Agent(_))) {
                     self.send_agent_selection(cx);
+                }
+            }
+            "agent-focus-toggle" => {
+                if matches!(self.workspace.focused_content(), Some(App::Agent(_))) {
+                    self.toggle_agent_focus(cx);
                 }
             }
             "browser-open-workspace" => {

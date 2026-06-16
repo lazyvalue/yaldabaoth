@@ -1240,6 +1240,7 @@ impl YaldaGpuiView {
             lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
             input_surface: InputSurface::new(InputModeKind::Chatbox),
+            focus: AgentFocus::default(),
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -3039,6 +3040,27 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// Toggle keyboard focus between the compose draft and the read-only
+    /// transcript (Model C §4.5). Entering `Transcript` lets the user navigate
+    /// and select committed history (then `S` sends the selection); `Esc` (or
+    /// this toggle again) returns to the compose. The transcript editor is
+    /// pinned to Normal mode for read-only navigation.
+    pub(crate) fn toggle_agent_focus(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.focused_bound_session() else {
+            return;
+        };
+        self.with_session(id, cx, |claude| {
+            claude.focus = match claude.focus {
+                AgentFocus::Compose => {
+                    claude.mode = EditMode::Normal;
+                    AgentFocus::Transcript
+                }
+                AgentFocus::Transcript => AgentFocus::Compose,
+            };
+        });
+        cx.notify();
+    }
+
     /// Submit the user's draft to the agent. Model C: both placements share one
     /// path — the compose text is appended + frozen at the transcript EOF and
     /// sent (`submit_compose`). No per-placement dispatch.
@@ -3376,6 +3398,9 @@ impl YaldaGpuiView {
                 );
                 claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
                 claude.editor.clear_selection();
+                // Model C: hand focus back to the compose after sending a
+                // selection, so the user is ready to type the next prompt.
+                claude.focus = AgentFocus::Compose;
             }
         } else if let Some(mut claude) = self.agent_mut(cx) {
             claude.status = Some("send failed — selection not sent".into());
@@ -3439,8 +3464,13 @@ impl YaldaGpuiView {
         // markable/jumpable like any other tile. Insert mode is untouched so
         // typing `m`/`'` into the compose still works. Model C: the compose's
         // mode governs normal/insert in BOTH placements.
+        // Normal-like context: the compose is in Normal mode, OR focus is on the
+        // read-only transcript (always navigation, never insert).
         let in_normal = self
-            .agent_read(cx, |c| c.input_surface.compose().mode == EditMode::Normal)
+            .agent_read(cx, |c| {
+                c.focus == AgentFocus::Transcript
+                    || c.input_surface.compose().mode == EditMode::Normal
+            })
             .unwrap_or(false);
         if in_normal && self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
             return;
@@ -3457,6 +3487,60 @@ impl YaldaGpuiView {
         let Some(focused_id) = self.focused_bound_session() else {
             return;
         };
+
+        // Transcript focus (Model C §4.5): keystrokes drive READ-ONLY navigation
+        // and selection over the committed transcript; `Esc` returns to the
+        // compose. This is the base "workspace" capability — select history, then
+        // `S` sends the selection. Edits are inert: the transcript is all frozen
+        // (guards no-op them) and we pin the editor to Normal so `i`/`a` can't
+        // enter Insert.
+        let transcript_focused = self
+            .agent_read(cx, |c| c.focus == AgentFocus::Transcript)
+            .unwrap_or(false);
+        if transcript_focused {
+            if press.modifiers.is_empty() && press.key == Key::Esc {
+                if let Some(mut c) = self.agent_mut(cx) {
+                    c.focus = AgentFocus::Compose;
+                }
+                cx.notify();
+                return;
+            }
+            let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
+                claude.status = None;
+                claude.mode = EditMode::Normal;
+                let out = Self::dispatch_normal_core(
+                    &mut claude.editor,
+                    &mut claude.mode,
+                    &mut claude.keybinds,
+                    press,
+                );
+                // Never leave the read-only transcript in Insert mode.
+                claude.mode = EditMode::Normal;
+                out
+            }) else {
+                return;
+            };
+            if !matches!(outcome, NormalOutcome::Skipped)
+                && let Some(mut c) = self.agent_mut(cx)
+            {
+                c.pending_reveal_cursor = true;
+            }
+            match outcome {
+                NormalOutcome::Skipped | NormalOutcome::Handled => cx.notify(),
+                NormalOutcome::Yanked => {
+                    if let Some(mut c) = self.agent_mut(cx) {
+                        c.status = Some("yanked".into());
+                    }
+                    cx.notify();
+                }
+                NormalOutcome::Quit => cx.quit(),
+                NormalOutcome::OpenMenu => self.open_menu_inner(cx),
+                // No paste into the read-only transcript.
+                NormalOutcome::Paste { .. } => cx.notify(),
+            }
+            return;
+        }
+
         // Model C: keystrokes route to the COMPOSE buffer in both placements —
         // the transcript is read-only (INV-1) and worksheet no longer edits it
         // in place. `compose_mut()` is total, so there is no per-placement branch.

@@ -69,6 +69,10 @@ pub(crate) struct TranscriptSeqs {
     /// Worksheet cursor-reveal intent latched by a key handler. A toggle to
     /// `true` must re-render so the reveal is consumed.
     pub(crate) pending_reveal: bool,
+    /// Model C §4.5: whether focus is on the transcript. The transcript caret +
+    /// cursor-row bar render ONLY when focused; flipping focus must bust the
+    /// cache so the caret appears/disappears.
+    pub(crate) transcript_focused: bool,
 }
 
 impl TranscriptSeqs {
@@ -86,6 +90,7 @@ impl TranscriptSeqs {
             selection: c.editor.selection_range(),
             awaiting: c.turn_phase.is_awaiting(),
             pending_reveal: c.pending_reveal_cursor,
+            transcript_focused: c.focus == AgentFocus::Transcript,
         }
     }
 
@@ -259,9 +264,18 @@ impl TranscriptView {
         } = session.update(cx, |sp, _scx| {
             let c: &mut AgentState = &mut sp.state;
 
+            // Model C §4.5: the transcript caret + cursor-row bar + selection band
+            // render ONLY when focus is on the transcript. Off-focus, a sentinel
+            // line (never matches any row) suppresses the caret/row-bar, and the
+            // selection band is dropped.
+            let transcript_focused = c.focus == AgentFocus::Transcript;
             let cursor = c.editor.cursor();
-            let cursor_line = cursor.line;
-            let cursor_col = cursor.col;
+            let cursor_line = if transcript_focused {
+                cursor.line
+            } else {
+                usize::MAX
+            };
+            let cursor_col = if transcript_focused { cursor.col } else { 0 };
             let line_count = c.editor.document().line_count();
             let edit_seq = c.editor.document().edit_seq();
 
@@ -339,7 +353,12 @@ impl TranscriptView {
             let tool_calls_snap = c.tools.calls_snapshot();
             let expanded_snap = c.tools.expanded_snapshot();
             let lockable_through_snap = c.editor.lockable_through_line();
-            let sel_snap = c.editor.selection_range();
+            // Selection band renders only when the transcript is focused (§4.5).
+            let sel_snap = if transcript_focused {
+                c.editor.selection_range()
+            } else {
+                None
+            };
             let mode_snap = c.mode;
             let turn_started_snap = c.turn_phase.turn_started();
             let last_event_at_snap = c.turn_phase.last_event_at();

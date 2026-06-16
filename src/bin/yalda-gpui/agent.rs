@@ -1437,6 +1437,17 @@ pub(crate) enum InputModeKind {
     Chatbox,
 }
 
+/// Which surface holds keyboard focus in an agent tile (Model C — `design-c.md`
+/// §4.5). Default `Compose`. `Transcript` is the read-only navigation/selection
+/// mode (the base "workspace" capability), entered via the local menu and exited
+/// with `Esc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AgentFocus {
+    #[default]
+    Compose,
+    Transcript,
+}
+
 /// The live input surface of an agent window (Model C — `design-c.md`). There is
 /// ONE model — a focusable read-only transcript plus a [`Compose`] buffer — and a
 /// single mode axis, **placement**: `mode == Worksheet` renders the compose inline
@@ -2293,12 +2304,17 @@ pub(crate) struct AgentState {
     /// lines that changed between renders instead of the whole buffer every
     /// `cx.notify()`. Bypassed when `YALDA_HL_CACHE=0`.
     pub(crate) highlight_cache: HighlightCache,
-    /// The active input surface (§4). The `Chatbox` draft editor lives INSIDE
-    /// the `Chatbox` variant — make-illegal-states-unrepresentable, so the old
-    /// "`chatbox` is `Some` iff `input_mode == Chatbox`" invariant (two
-    /// hand-synced fields) is now enforced by the type. New sessions start at
-    /// `Chatbox`; `Ctrl-Alt-Enter` toggles (§5).
+    /// The active input surface (Model C — `design-c.md`): the `Compose` draft
+    /// buffer + the placement (`Worksheet` inline / `Chatbox` pinned). New
+    /// sessions start in `Chatbox`; `Ctrl-Alt-Enter` toggles placement.
     pub(crate) input_surface: InputSurface,
+    /// Which surface holds keyboard focus (Model C — `design-c.md` §4.5).
+    /// `Compose` (default): keystrokes edit the draft. `Transcript`: keystrokes
+    /// drive read-only navigation/selection over the committed transcript, and
+    /// the transcript renders a caret. This is the base capability that makes
+    /// Worksheet a *workspace* (select history, `S` = send selection), shared by
+    /// both placements. `Esc` from `Transcript` returns to `Compose`.
+    pub(crate) focus: AgentFocus,
     /// Last-seen full snapshot of the agent's plan. Updated on every ACP
     /// `Plan` notification (which carries a complete plan, not a delta —
     /// see spec-agent-window.md §21). Consumed by the Tasklist sidebar.
@@ -2524,6 +2540,7 @@ impl AgentState {
             lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
             input_surface: InputSurface::new(InputModeKind::Chatbox),
+            focus: AgentFocus::default(),
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -2571,6 +2588,7 @@ impl AgentState {
             lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
             input_surface: InputSurface::new(InputModeKind::Chatbox),
+            focus: AgentFocus::default(),
             current_plan: None,
             agent_mode: None,
             agent_model: None,
