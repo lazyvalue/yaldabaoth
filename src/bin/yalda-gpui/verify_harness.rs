@@ -4152,6 +4152,80 @@ fn global_menu_lists_and_switches_workspaces(cx: &mut TestAppContext) {
     assert_eq!(active, 0, "goto-workspace-0 activated the first workspace");
 }
 
+/// The universal agent roster (universal-agent-list), driven through the REAL
+/// `apply_server_batch`: a `SessionCreated` broadcast for a session this GUI has
+/// NEVER opened makes it appear in the jump panel's agent rows (always-visible
+/// active sessions); a `SessionRenamed` updates its label in place; a
+/// `SessionClosed` removes it. This is the end-to-end wire the no-op hook used
+/// to drop on the floor.
+#[gpui::test]
+fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppContext) {
+    use yalda::session_proto::Notification as ServerNotification;
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+
+    let info = SessionInfo {
+        session_id: "srv-1".into(),
+        acp_session_id: Some("acp-1".into()),
+        label: "claude-7".into(),
+        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        turns: 0,
+        connected: true,
+        permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
+    };
+
+    // A session created elsewhere on the server — never opened in this GUI.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionCreated {
+                session: info.clone(),
+            }],
+            cx,
+        );
+    });
+    let rows = view.update(vcx, |v, cx| v.jump_panel_agent_rows(cx));
+    assert_eq!(rows.len(), 1, "roster session appears in the jump panel");
+    assert_eq!(rows[0].label, "claude-7");
+    assert!(!rows[0].bound, "an unopened session is free (no tile binds it)");
+    assert!(matches!(rows[0].target, crate::JumpTarget::Roster(ref s) if s == "srv-1"));
+
+    // A rename broadcast updates the label in place.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionRenamed {
+                session_id: "srv-1".into(),
+                label: "renamed-session".into(),
+            }],
+            cx,
+        );
+    });
+    let rows = view.update(vcx, |v, cx| v.jump_panel_agent_rows(cx));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label, "renamed-session", "rename updates the row label");
+
+    // A close broadcast removes it from the roster (and so from the panel).
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionClosed {
+                session_id: "srv-1".into(),
+            }],
+            cx,
+        );
+    });
+    let rows = view.update(vcx, |v, cx| v.jump_panel_agent_rows(cx));
+    assert!(rows.is_empty(), "closed session is gone from the roster");
+}
+
 /// The jump panel can be hidden/summoned via `cmd-j` / the `?` menu
 /// (jump-panel; spec-jump-panel.md). It defaults visible and renders; toggling
 /// it off stops it rendering (and flips the menu label); toggling on brings it

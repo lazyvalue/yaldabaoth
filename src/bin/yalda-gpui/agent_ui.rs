@@ -126,6 +126,31 @@ impl YaldaGpuiView {
     /// forces every caller to state which tile it set the loading picker on:
     /// routing one picker's result onto another tile is what made a restored
     /// tile hang on "loading sessions…" forever while a sibling got its list.
+    /// Refresh the universal roster (universal-agent-list) from the server's
+    /// full session list. Unlike `spawn_list_sessions_for_picker`, this targets
+    /// NO tile — it replaces the whole roster cache and notifies if it changed.
+    /// Called at boot/connect to seed; the Created/Closed/Renamed broadcasts
+    /// keep it live between refreshes (so this is a seed, not a poll).
+    pub(crate) fn refresh_roster(&self, cx: &mut Context<Self>) {
+        let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result: Result<Vec<_>, String> = cx
+                .background_executor()
+                .spawn(async move { handle.list_sessions().map_err(|e| e.to_string()) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(sessions) = result
+                    && this.agent_roster.replace_all(sessions)
+                {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn spawn_list_sessions_for_picker(
         &self,
         target: Option<workspace::WindowId>,
@@ -598,6 +623,49 @@ impl YaldaGpuiView {
             tile.bound = Some(sid);
             self.workspace.open_ephemeral_tab(App::Agent(tile));
         }
+        cx.notify();
+    }
+
+    /// Jump-panel selection dispatcher (universal-agent-list). A row may target
+    /// a session already opened here (`Local`) or one that lives only in the
+    /// universal roster — running on the server but never opened in this GUI
+    /// (`Roster`).
+    pub(crate) fn jump_to_agent(&mut self, target: JumpTarget, cx: &mut Context<Self>) {
+        match target {
+            JumpTarget::Local(id) => self.jump_to_session(id, cx),
+            JumpTarget::Roster(sid) => self.jump_to_roster_session(sid, cx),
+        }
+    }
+
+    /// Open a roster session (one not yet in this GUI's store) by its server
+    /// sid. If it's already opened here, delegate to `jump_to_session` (focus
+    /// its tile, or an ephemeral tab if free). Otherwise open a fresh ephemeral
+    /// virtual workspace (ADR-0021) and attach the session into it, reusing the
+    /// picker's bind+attach path (`picker_attach_existing`).
+    pub(crate) fn jump_to_roster_session(&mut self, sid: String, cx: &mut Context<Self>) {
+        if let Some(id) = self.sessions.locate(&sid) {
+            self.jump_to_session(id, cx);
+            return;
+        }
+        let Some(info) = self.agent_roster.get(&sid).cloned() else {
+            return;
+        };
+        if self.session_server.is_none() {
+            return;
+        }
+        // Fresh ephemeral workspace holding one unbound agent tile, now focused;
+        // the attach path binds the session into that focused tile.
+        self.workspace
+            .open_ephemeral_tab(App::Agent(AgentTile::new()));
+        self.picker_attach_existing(
+            info.cwd,
+            info.session_id,
+            info.acp_session_id,
+            info.label,
+            info.connected,
+            info.permission_mode,
+            cx,
+        );
         cx.notify();
     }
 
@@ -2005,21 +2073,21 @@ impl YaldaGpuiView {
                     warn_unrouted(routed, &session_id);
                 }
                 ServerNotification::SessionCreated { session } => {
-                    // List-level signal that some connection created a session.
-                    // The primary GUI does not auto-add it to unrelated tiles
-                    // (a new session belongs to the tile that opened it, which
-                    // already has its slot from the create response). Kept as a
-                    // no-op hook for a future "available sessions" view / for
-                    // mirror GUIs that want to surface every live session.
-                    let _ = &session;
+                    // A session was created by some connection (this GUI, a CLI,
+                    // cron, another window). Fold it into the universal roster
+                    // (universal-agent-list) so the jump panel + every selector
+                    // surface it immediately — even though no tile here binds it.
+                    self.agent_roster.upsert(session);
                 }
                 ServerNotification::SessionClosed { session_id } => {
                     // A session closed somewhere (this GUI, another tile, or
-                    // another GUI instance). Drop it from the store and land its
-                    // tile in a live selector.
+                    // another GUI instance). Drop it from the roster, then from
+                    // the store + land its tile (if any) in a live selector.
+                    self.agent_roster.remove(&session_id);
                     self.reconcile_session_closed(&session_id, cx);
                 }
                 ServerNotification::SessionRenamed { session_id, label } => {
+                    self.agent_roster.rename(&session_id, &label);
                     self.reconcile_session_renamed(&session_id, &label, cx);
                 }
                 ServerNotification::PromptRejected {
