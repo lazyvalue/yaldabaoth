@@ -1898,27 +1898,22 @@ impl YaldaGpuiView {
                             agent_sessions::Bind::AlreadyOpen(_) => {
                                 if let Some(tile) = self.agent_tile_mut() {
                                     tile.bound = None;
-                                    tile.picker =
-                                        Some(SessionPicker::loading(slot_cwd.clone()));
+                                    tile.picker = Some(SessionPicker::new(slot_cwd));
                                 }
-                                self.spawn_list_sessions_for_picker(
-                                    Some(leaf_id),
-                                    slot_cwd,
-                                    cx,
-                                );
+                                // Selector projects from the roster; seed it.
+                                self.refresh_roster(cx);
                             }
                         }
                     }
                     None => {
                         // More agent leaves than persisted sessions: open this
-                        // one straight into the free-session selector.
+                        // one straight into the free-session selector (it
+                        // projects from the universal roster — seed it).
                         if let Some(tile) = self.agent_tile_mut() {
                             tile.bound = None;
-                            tile.picker = Some(SessionPicker::loading(proc_cwd.clone()));
+                            tile.picker = Some(SessionPicker::new(proc_cwd.clone()));
                         }
-                        // Address the list back to THIS leaf (INV-PR), not
-                        // whatever ends up focused once all leaves are restored.
-                        self.spawn_list_sessions_for_picker(Some(leaf_id), proc_cwd.clone(), cx);
+                        self.refresh_roster(cx);
                     }
                 }
             }
@@ -2146,25 +2141,6 @@ impl YaldaGpuiView {
             App::Agent(tile) => Some(tile),
             _ => None,
         }
-    }
-
-    /// Compute the set of FREE sessions: those in the store that no tile binds
-    /// (spec-agent-session-ownership.md). Cheap scan — tiles are few.
-    fn free_session_ids(&self) -> Vec<SessionId> {
-        let mut bound: HashSet<SessionId> = HashSet::new();
-        for tab in self.workspace.tabs.iter() {
-            tab.layout.for_each_leaf(&mut |w| {
-                if let App::Agent(tile) = &w.content
-                    && let Some(id) = tile.bound
-                {
-                    bound.insert(id);
-                }
-            });
-        }
-        self.sessions
-            .ids()
-            .filter(|id| !bound.contains(id))
-            .collect()
     }
 
     /// THE single bind choke (spec-agent-session-ownership.md). Show the

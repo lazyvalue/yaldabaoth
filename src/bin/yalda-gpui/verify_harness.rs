@@ -2560,41 +2560,38 @@ fn agent_reducer_replay_end_does_not_steal_live_turn_finalize(cx: &mut TestAppCo
 // navigation must wrap, and activating a row must bind the ring's first slot
 // and clear the picker.
 
-/// Install an empty agent ring in picker mode on `view`. When `sessions` is
-/// non-empty the list is marked loaded; otherwise the picker stays in its
-/// "loading" state (`sessions: None`).
+/// Install an unbound agent tile in selector mode on `view`, seeding the
+/// universal roster (universal-agent-list) with `sessions` (cwd ".") so the
+/// selector — which now PROJECTS from the roster — has rows to show.
 #[cfg(test)]
 fn install_agent_picker(
     view: &gpui::Entity<YaldaGpuiView>,
     vcx: &mut gpui::VisualTestContext,
     sessions: &[(&str, &str)],
 ) {
-    use crate::{AgentTile, App, PickerSession, SessionPicker};
-    let sessions: Vec<PickerSession> = sessions
-        .iter()
-        .map(|(sid, label)| PickerSession {
-            sid: sid.to_string(),
-            acp_id: None,
-            label: label.to_string(),
-            turns: 3,
-            connected: true,
-            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
-        })
-        .collect();
+    use crate::{AgentTile, App, SessionPicker};
+    use yalda::session_proto::SessionInfo;
     view.update(vcx, |v, cx| {
-        let mut tile = AgentTile::new();
-        let mut picker = SessionPicker::loading(PathBuf::from("."));
-        if !sessions.is_empty() {
-            picker.sessions = Some(sessions);
+        for (sid, label) in sessions {
+            v.agent_roster.upsert(SessionInfo {
+                session_id: sid.to_string(),
+                acp_session_id: None,
+                label: label.to_string(),
+                cwd: PathBuf::from("."),
+                turns: 3,
+                connected: true,
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            });
         }
-        tile.picker = Some(picker);
+        let mut tile = AgentTile::new();
+        tile.picker = Some(SessionPicker::new(PathBuf::from(".")));
         v.set_screen(App::Agent(tile));
     });
 }
 
-/// The empty-ring picker renders headlessly in BOTH its loading and loaded
-/// states without panicking on `ring.active()`, and `apply_picker_sessions`
-/// wires a list result into the focused picker.
+/// The empty-ring selector renders headlessly without panicking on
+/// `ring.active()`, and projects the FREE sessions from the universal roster
+/// (universal-agent-list) for its cwd.
 #[gpui::test]
 fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     let (view, vcx) = cx.add_window_view(|window, cx| {
@@ -2608,145 +2605,83 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    // Loading state (sessions: None) renders without panic.
+    // Empty roster → only the "start new" row; renders without panic.
     install_agent_picker(&view, &mut *vcx, &[]);
     vcx.run_until_parked();
     view.read_with(vcx, |v, cx| {
         let tile = v.agent_tile().expect("agent tile");
         assert!(tile.bound.is_none(), "tile stays unbound until a row binds");
-        let p = tile.picker.as_ref().expect("picker present");
-        assert!(p.sessions.is_none(), "still loading");
-        assert_eq!(p.row_count(), 1, "only the 'new session' row while loading");
+        let cwd = tile.picker.as_ref().unwrap().cwd.clone();
+        assert!(v.picker_projection(&cwd).0.is_empty(), "no free rows yet");
     });
 
-    // Fold in a list result through the real reducer, then render again. The
-    // result is addressed to the originating tile by its WindowId (INV-PR).
-    let target = view.read_with(vcx, |v, cx| v.workspace.focused_window_id());
-    view.update(vcx, |v, cx| {
-        v.apply_picker_sessions(
-            target,
-            PathBuf::from("."),
-            Ok((
-                vec![
-                    crate::PickerSession {
-                        sid: "S1".into(),
-                        acp_id: None,
-                        label: "claude-1".into(),
-                        turns: 2,
-                        connected: true,
-                        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
-                    },
-                    crate::PickerSession {
-                        sid: "S2".into(),
-                        acp_id: None,
-                        label: "claude-2".into(),
-                        turns: 9,
-                        connected: false,
-                        permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
-                    },
-                ],
-                // One bound session — informational column, not a selectable row.
-                vec![crate::PickerSession {
-                    sid: "S3".into(),
-                    acp_id: None,
-                    label: "claude-3".into(),
-                    turns: 1,
-                    connected: true,
-                    permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
-                }],
-            )),
-            cx,
-        );
-    });
+    // Seed two roster sessions for this cwd → the selector projects two FREE
+    // rows (plus the "start new" row = 3 total). No async reducer, no per-tile
+    // cache — a pure view of the shared roster.
+    install_agent_picker(&view, &mut *vcx, &[("S1", "claude-1"), ("S2", "claude-2")]);
     vcx.run_until_parked();
     view.read_with(vcx, |v, cx| {
-        let p = v.agent_tile().unwrap().picker.as_ref().unwrap();
-        assert_eq!(
-            p.row_count(),
-            3,
-            "new-session row + two FREE sessions = 3 rows (bound ones don't count)"
-        );
-        assert_eq!(p.bound.len(), 1, "the bound session is stored separately");
+        let cwd = v.agent_tile().unwrap().picker.as_ref().unwrap().cwd.clone();
+        let (free, bound) = v.picker_projection(&cwd);
+        assert_eq!(free.len(), 2, "two FREE sessions projected from the roster");
+        assert!(bound.is_empty(), "none bound to a tile yet");
     });
 }
 
-/// INV-PR regression: a `list_sessions` result lands on the tile that
-/// REQUESTED it (addressed by WindowId), not on whichever tile is focused when
-/// the async result arrives. This is the "two restored agent tiles — one hangs
-/// on 'loading sessions…' forever while the other fills, and picking in one
-/// opens a session in the other" bug. With two unbound picker tiles in a split,
-/// we deliver tile A's result while tile B is focused and assert A (not B) is
-/// the one that fills.
+/// The selector is a live projection of the shared roster (universal-agent-list,
+/// ADR-0022): selecting/binding a session in ONE tile immediately moves it from
+/// FREE → bound in ANOTHER tile's selector — no per-tile cache to go stale, and
+/// no per-tile async result to misroute (the property ADR-0020's INV-PR routing
+/// previously protected is now designed out).
 #[gpui::test]
-fn picker_list_result_routes_to_originating_tile_not_focused(cx: &mut TestAppContext) {
-    use crate::{AgentTile, App, PickerSession, SessionPicker};
+fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App, SessionPicker};
+    use yalda::session_proto::SessionInfo;
     let (view, vcx) = cx.add_window_view(hermetic_browser_view);
     vcx.run_until_parked();
 
-    let mk_tile = || {
-        let mut t = AgentTile::new();
-        t.picker = Some(SessionPicker::loading(PathBuf::from(".")));
-        t
-    };
-
-    // Tile A (focused) gets a loading picker; record its WindowId.
-    let win_a = view.update(vcx, |v, cx| {
-        v.set_screen(App::Agent(mk_tile()));
-        v.workspace.focused_window_id().expect("focused window A")
-    });
-    // Split off tile B with its own loading picker — focus moves to B.
-    let win_b = view.update(vcx, |v, cx| {
-        v.workspace
-            .split_focused(crate::workspace::SplitDir::H, App::Agent(mk_tile()));
-        v.workspace.focused_window_id().expect("focused window B")
-    });
-    assert_ne!(win_a, win_b, "the split produced two distinct tiles");
-
-    // Deliver tile A's list result WHILE B is focused. The pre-fix reducer
-    // routed by `agent_tile_mut()` (focus) and would have filled B and left A
-    // loading forever.
+    // Two server sessions in the roster (cwd ".").
     view.update(vcx, |v, cx| {
-        v.apply_picker_sessions(
-            Some(win_a),
-            PathBuf::from("."),
-            Ok((
-                vec![PickerSession {
-                    sid: "S1".into(),
-                    acp_id: None,
-                    label: "claude-1".into(),
-                    turns: 1,
-                    connected: true,
-                    permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
-                }],
-                vec![],
-            )),
-            cx,
-        );
+        for (sid, label) in [("S1", "claude-1"), ("S2", "claude-2")] {
+            v.agent_roster.upsert(SessionInfo {
+                session_id: sid.into(),
+                acp_session_id: None,
+                label: label.into(),
+                cwd: PathBuf::from("."),
+                turns: 0,
+                connected: true,
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            });
+        }
     });
+
+    // An unbound selector tile. Both sessions are FREE.
+    view.update(vcx, |v, cx| {
+        let mut t = AgentTile::new();
+        t.picker = Some(SessionPicker::new(PathBuf::from(".")));
+        v.set_screen(App::Agent(t));
+    });
+    let cwd = view.read_with(vcx, |v, _| {
+        v.agent_tile().unwrap().picker.as_ref().unwrap().cwd.clone()
+    });
+    view.read_with(vcx, |v, _| {
+        let (free, bound) = v.picker_projection(&cwd);
+        assert_eq!(free.len(), 2, "both sessions free before any binding");
+        assert!(bound.is_empty());
+    });
+
+    // Bind S1 to a (different) tile — the canonical "a session was selected".
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
     vcx.run_until_parked();
 
-    // Read a specific tile's picker-loaded state by WindowId.
-    let loaded = |v: &YaldaGpuiView, id: crate::workspace::WindowId| -> Option<bool> {
-        for tab in v.workspace.tabs.iter() {
-            if let Some(w) = tab.layout.find_leaf(id)
-                && let App::Agent(t) = &w.content
-            {
-                return t.picker.as_ref().map(|p| p.sessions.is_some());
-            }
-        }
-        None
-    };
-    view.read_with(vcx, |v, cx| {
-        assert_eq!(
-            loaded(v, win_a),
-            Some(true),
-            "A's list must land on A — the tile that requested it"
-        );
-        assert_eq!(
-            loaded(v, win_b),
-            Some(false),
-            "B must be untouched — still loading, NOT hijacked because it holds focus"
-        );
+    // The selector projection now shows S1 as bound (in use), S2 still free —
+    // WITHOUT any explicit refresh of the selector itself.
+    view.read_with(vcx, |v, _| {
+        let (free, bound) = v.picker_projection(&cwd);
+        assert_eq!(free.len(), 1, "S1 left the free list once it was bound");
+        assert_eq!(free[0].sid, "S2");
+        assert_eq!(bound.len(), 1, "S1 now shows in the IN USE column");
+        assert_eq!(bound[0].sid, "S1");
     });
 }
 

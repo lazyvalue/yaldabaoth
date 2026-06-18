@@ -1,6 +1,6 @@
 # Spec: Universal agent-session list
 
-Status: Draft (2026-06-18) — Phase 1 implemented.
+Status: Implemented (2026-06-18) — Phase 1 + Phase 2 landed.
 Related: ADR-0022, spec-jump-panel.md, spec-agent-session-ownership.md, ADR-0020.
 
 ## Problem
@@ -52,15 +52,19 @@ updates both at once.
   roster-only free → open an ephemeral virtual workspace and attach via the
   picker's bind path (`jump_to_roster_session` → `picker_attach_existing`).
 
-## Phase 2 (planned) — selector is a roster projection
+## Phase 2 (done) — selector is a roster projection
 
-Make `SessionPicker` derive its free/bound rows from the shared roster (filtered
-by the tile's cwd, partitioned by `bound_sid_set`) instead of its own per-tile
-`list_sessions` cache, so the selector auto-updates on rename, add/close, and on
-a session being selected in another tile. This retires the per-tile async
-`spawn_list_sessions_for_picker` / `apply_picker_sessions` round-trip and its
-INV-PR `WindowId` routing (ADR-0020): a single shared roster has no per-tile
-async race to misroute. See ADR-0022 "Consequences" for the migration care.
+`SessionPicker` is reduced to UI state only (`selected`, `cwd`). Its free/bound
+rows are derived from the shared roster via `picker_projection(cwd)` at **render
+and select time** (`render_agent_picker`, `agent_picker_activate`,
+`agent_picker_move`) — never cached on the tile — so the selector auto-updates
+on rename, add/close, and on a session being selected in another tile (its sid
+moves from free → bound for everyone). `next_agent_label` dedups against the
+roster too. This retired the per-tile async `spawn_list_sessions_for_picker` /
+`apply_picker_sessions` round-trip and its INV-PR `WindowId` routing (ADR-0020):
+a single shared roster has no per-tile async result to misroute, so that failure
+mode is designed out. Opening a selector calls `refresh_roster` to re-seed in
+case it's stale.
 
 ## Invariants
 

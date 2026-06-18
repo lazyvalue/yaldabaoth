@@ -1,6 +1,6 @@
 # ADR-0022: A single universal agent-session roster, projected by every list
 
-Status: Accepted (2026-06-18) — Phase 1 landed; Phase 2 (selector projection) planned.
+Status: Accepted (2026-06-18) — Phase 1 + Phase 2 landed (jump panel + selector both project from the roster).
 Related: spec-universal-agent-list.md, spec-jump-panel.md, ADR-0020, spec-agent-session-ownership.md.
 
 ## Context

@@ -3221,46 +3221,20 @@ pub(crate) struct PickerSession {
 /// `bound == None` ⇒ the tile renders this picker; selecting a row binds the
 /// tile, after which `render_agent` renders the normal transcript.
 pub(crate) struct SessionPicker {
-    /// `None` while the background `list_sessions` round-trip is in flight;
-    /// `Some` once it lands (possibly empty — only the "new session" row).
-    /// These are the FREE sessions — selectable rows `1..=N`.
-    pub(crate) sessions: Option<Vec<PickerSession>>,
-    /// Sessions already BOUND to some tile (cwd-matched). Rendered in a
-    /// separate, NON-selectable column — informational only, since a session
-    /// is bound by at most one tile and can't be attached from here.
-    pub(crate) bound: Vec<PickerSession>,
-    /// Set if the list round-trip failed; rendered in place of the list.
-    pub(crate) error: Option<SharedString>,
-    /// Highlighted row. Row 0 is always "start a new session"; rows `1..=N`
-    /// map to `sessions[row - 1]`.
+    /// Highlighted row. Row 0 is always "start a new session"; rows `1..=N` map
+    /// to the FREE sessions projected from the universal roster for this cwd
+    /// (`picker_projection`, universal-agent-list). UI state only — the rows
+    /// themselves are derived from the roster at render/select time, not cached
+    /// here, so the selector auto-tracks rename/add/close/selection.
     pub(crate) selected: usize,
-    /// The cwd this picker was opened for, threaded into create/attach.
+    /// The cwd this picker was opened for: selects which roster sessions show
+    /// and threads into create/attach.
     pub(crate) cwd: PathBuf,
 }
 
 impl SessionPicker {
-    pub(crate) fn loading(cwd: PathBuf) -> Self {
-        Self {
-            sessions: None,
-            bound: Vec::new(),
-            error: None,
-            selected: 0,
-            cwd,
-        }
-    }
-
-    /// Selectable rows: the "new session" row plus one per listed session.
-    pub(crate) fn row_count(&self) -> usize {
-        1 + self.sessions.as_ref().map(|s| s.len()).unwrap_or(0)
-    }
-
-    /// Move the highlight by `delta`, wrapping at both ends.
-    pub(crate) fn move_selection(&mut self, delta: isize) {
-        let n = self.row_count() as isize;
-        if n <= 0 {
-            return;
-        }
-        self.selected = (self.selected as isize + delta).rem_euclid(n) as usize;
+    pub(crate) fn new(cwd: PathBuf) -> Self {
+        Self { selected: 0, cwd }
     }
 }
 
