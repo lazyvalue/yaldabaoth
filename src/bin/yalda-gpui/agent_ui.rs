@@ -580,6 +580,27 @@ impl YaldaGpuiView {
         None
     }
 
+    /// Jump-panel selection of an agent session (jump-panel; ADR-0021). If the
+    /// session is **bound** to a tile somewhere, focus that tile in place (no new
+    /// tile — preserves the 1:1 invariant). If it is **free** (no tile binds it),
+    /// open it in an **ephemeral virtual workspace** whose single tile binds it;
+    /// that workspace is torn down the instant the user navigates away
+    /// (`Workspace::set_active_tab`), returning the session to free. No-op if the
+    /// session id is no longer in the store.
+    pub(crate) fn jump_to_session(&mut self, sid: SessionId, cx: &mut Context<Self>) {
+        if !self.sessions.contains(sid) {
+            return;
+        }
+        if let Some(wid) = self.agent_tile_id_bound_to(sid) {
+            self.jump_to_window(wid);
+        } else {
+            let mut tile = AgentTile::new();
+            tile.bound = Some(sid);
+            self.workspace.open_ephemeral_tab(App::Agent(tile));
+        }
+        cx.notify();
+    }
+
     /// Resolve an agent tile by its stable `WindowId`, scanning every tab's
     /// layout (ids are unique workspace-wide). The canonical way for an async
     /// reducer to reach the tile that originated its work — `agent_tile_mut()`

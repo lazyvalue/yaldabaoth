@@ -733,10 +733,16 @@ pub(crate) fn restore_content(
 
 /// Snapshot a live workspace into a fully serializable shape.
 pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<App>) -> PersistedWorkspace {
+    // Ephemeral virtual workspaces (ADR-0021) are transient and never persisted;
+    // they're always the last tab, so filtering them keeps the remaining indices
+    // contiguous. `active_tab` is clamped into the surviving range so a restore
+    // never points past the saved list.
+    let non_ephemeral = ws.tabs.iter().filter(|t| !t.ephemeral).count();
     PersistedWorkspace {
         tabs: ws
             .tabs
             .iter()
+            .filter(|t| !t.ephemeral)
             .map(|t| PersistedTab {
                 auto_name: t.auto_name.clone(),
                 display_name: t.display_name.clone(),
@@ -762,7 +768,7 @@ pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<App>) -> PersistedWor
                 kv: t.kv.clone(),
             })
             .collect(),
-        active_tab: ws.active_tab,
+        active_tab: ws.active_tab.min(non_ephemeral.saturating_sub(1)),
         marks: ws.marks.all_marks().into_iter().collect(),
         tag_shortcuts: ws.tag_shortcuts.clone(),
         buffer_tags: {

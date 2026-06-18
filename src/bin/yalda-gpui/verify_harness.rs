@@ -605,6 +605,13 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
         v.test_open_doc(&md);
         v
     });
+    // Settle the one-time geometry change the always-on jump panel induces (it
+    // insets the content area) before reading painted bounds — otherwise the
+    // drag endpoints would be sampled from the pre-settle (wider) layout and the
+    // simulated clicks would miss the re-laid lines. See the matching note in
+    // `transcript_021_chatbox_keystroke_is_render_flat`.
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
 
     // Pick drag endpoints from the REAL painted bounds: top-most painted line →
@@ -733,6 +740,183 @@ fn install_agent_slot(
             v.sessions.bind_sid(id, sid).expect("fresh sid binds");
         }
         let _ = id;
+    });
+}
+
+/// Boot a hermetic browser view (no agent tile focused) so a session created on
+/// it lands **free** (no tile binds it) — the jump-panel "open elsewhere" case.
+#[cfg(test)]
+fn boot_browser<'a>(
+    cx: &'a mut TestAppContext,
+) -> (gpui::Entity<YaldaGpuiView>, &'a mut gpui::VisualTestContext) {
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    // Dismiss the splash so `render` reaches the real screen (incl. the jump
+    // panel) — wall-clock doesn't advance under `run_until_parked`, so the
+    // splash deadline never expires headlessly.
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    (view, vcx)
+}
+
+/// Add a **free** agent session to the store (the focused tile is a browser, so
+/// `show_local_session` binds nothing). Returns its `SessionId`.
+#[cfg(test)]
+fn add_free_session(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    label: &str,
+) -> crate::SessionId {
+    use crate::{AgentSession, AgentState};
+    let label = label.to_string();
+    view.update(vcx, |v, cx| {
+        let session = AgentSession {
+            state: AgentState::new_server_managed(None),
+            label,
+            cwd: PathBuf::from("."),
+            resume_id: None,
+        };
+        let id = v.show_local_session(session, cx);
+        // Mirror production: session lifecycle changes notify the root.
+        cx.notify();
+        id
+    })
+}
+
+/// The inline jump panel renders without disturbing the cached transcript: a
+/// chatbox keystroke (compose-only session mutation) must still leave the
+/// TRANSCRIPT render-flat even though the panel shares the root render. (The
+/// panel itself is intentionally not cached — see `render_jump_panel`; the
+/// guarantee that matters is that it doesn't bloat expensive cached surfaces,
+/// which `transcript_021_*` / `linear_*_is_render_flat` enforce.) This test
+/// pins that the panel is actually live in the tree by rendering with sessions
+/// present.
+#[gpui::test]
+fn jump_panel_renders_with_sessions(cx: &mut TestAppContext) {
+    crate::perf_reset("jump_panel");
+    let (_view, vcx, _id, _session) = boot_with_transcript(cx);
+    vcx.run_until_parked();
+    assert!(
+        crate::perf_render_count("jump_panel") >= 1,
+        "the jump panel must render as part of the root frame"
+    );
+}
+
+/// Jump-panel selection of a FREE session opens an ephemeral virtual workspace
+/// (ADR-0021): a new single-tile tab bound to the session, made active. Leaving
+/// it (any workspace switch) tears it down and returns the session to free —
+/// the session itself survives in the store the whole time.
+#[gpui::test]
+fn jump_to_free_session_opens_then_tears_down_ephemeral(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let sid = add_free_session(&view, vcx, "claude-1");
+
+    // Precondition: one real tab, session is free.
+    view.update(vcx, |v, _| {
+        assert_eq!(v.workspace.tabs.len(), 1, "starts with one workspace");
+        assert!(
+            v.agent_tile_id_bound_to(sid).is_none(),
+            "session starts free"
+        );
+    });
+
+    // Jump to the free session → ephemeral virtual workspace.
+    view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
+    view.update(vcx, |v, _| {
+        assert_eq!(v.workspace.tabs.len(), 2, "ephemeral workspace added");
+        assert!(
+            v.workspace.active_is_ephemeral(),
+            "the ephemeral workspace is active"
+        );
+        assert!(
+            v.agent_tile_id_bound_to(sid).is_some(),
+            "the ephemeral tile binds the session"
+        );
+    });
+
+    // Jump away (back to the real workspace 0) → ephemeral torn down, free again.
+    view.update(vcx, |v, cx| v.select_tab(0, cx));
+    view.update(vcx, |v, _| {
+        assert_eq!(v.workspace.tabs.len(), 1, "ephemeral workspace torn down");
+        assert!(
+            !v.workspace.active_is_ephemeral(),
+            "no ephemeral workspace remains"
+        );
+        assert!(
+            v.agent_tile_id_bound_to(sid).is_none(),
+            "session returned to free"
+        );
+        assert!(v.sessions.contains(sid), "session itself survives the teardown");
+    });
+}
+
+/// Selecting a *different* free session while a virtual workspace is open
+/// REPLACES it (we never accumulate more than one ephemeral tab), and the first
+/// session returns to free.
+#[gpui::test]
+fn jump_to_second_free_session_replaces_ephemeral(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let a = add_free_session(&view, vcx, "claude-1");
+    let b = add_free_session(&view, vcx, "claude-2");
+
+    view.update(vcx, |v, cx| v.jump_to_session(a, cx));
+    view.update(vcx, |v, cx| v.jump_to_session(b, cx));
+    view.update(vcx, |v, _| {
+        assert_eq!(v.workspace.tabs.len(), 2, "still exactly one ephemeral tab");
+        assert!(
+            v.agent_tile_id_bound_to(b).is_some(),
+            "the second session is now shown"
+        );
+        assert!(
+            v.agent_tile_id_bound_to(a).is_none(),
+            "the first session returned to free"
+        );
+        assert!(v.sessions.contains(a) && v.sessions.contains(b));
+    });
+}
+
+/// Jump-panel selection of a BOUND session focuses its existing tile in place —
+/// no new tile, no ephemeral workspace (the 1:1 invariant is preserved).
+#[gpui::test]
+fn jump_to_bound_session_focuses_existing_tile(cx: &mut TestAppContext) {
+    use crate::{App, BrowserWindow, BufferApp};
+    let (view, vcx) = boot_browser(cx);
+    // Workspace 0: an agent tile bound to S1.
+    install_agent_slot(&view, vcx, Some("S1"));
+    let (sid, owner_tab, owner_wid) = view.update(vcx, |v, _| {
+        let sid = v.sessions.locate("S1").expect("S1 bound");
+        let wid = v.agent_tile_id_bound_to(sid).expect("S1 has a tile");
+        let tab = v.workspace.tab_containing(wid).expect("tile in a tab");
+        (sid, tab, wid)
+    });
+    // Add a second workspace and switch to it, so jumping must cross back.
+    view.update(vcx, |v, cx| {
+        v.workspace
+            .push_initial_tab(App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
+                PathBuf::from("."),
+            ))));
+        cx.notify();
+    });
+    let tabs_before = view.update(vcx, |v, _| v.workspace.tabs.len());
+
+    view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
+    view.update(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.tabs.len(),
+            tabs_before,
+            "no new tile/workspace created for a bound session"
+        );
+        assert_eq!(
+            v.workspace.active_tab, owner_tab,
+            "focus moved to the owner's workspace"
+        );
+        assert_eq!(
+            v.agent_tile_id_bound_to(sid),
+            Some(owner_wid),
+            "still the same single bound tile"
+        );
     });
 }
 
@@ -3285,6 +3469,13 @@ fn transcript_021_chatbox_keystroke_is_render_flat(cx: &mut TestAppContext) {
     let (_view, vcx, _id, session) = boot_with_transcript(cx);
 
     // First real frame: render_agent runs, creates + renders the transcript.
+    // The always-on jump panel (jump-panel; spec-jump-panel.md) insets the
+    // content area, so the transcript re-measures ONCE as the window geometry
+    // settles. Drive that one-time bounds settle to completion (an extra forced
+    // frame) BEFORE capturing the baseline, so what we measure below is purely
+    // the keystroke's effect — not chrome layout settling.
+    vcx.run_until_parked();
+    _view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     let base = crate::perf_render_count("transcript");
     assert!(base >= 1, "transcript must render at least once on first frame");
@@ -3681,6 +3872,11 @@ fn boot_with_linear<'a>(
 fn linear_input_keystroke_is_render_flat(cx: &mut TestAppContext) {
     crate::perf_reset("linear");
     let (view, vcx, _lv) = boot_with_linear(cx);
+    // Absorb the one-time bounds settle the always-on jump panel induces
+    // (it insets the content area) before baselining — see the matching note in
+    // `transcript_021_chatbox_keystroke_is_render_flat`.
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
     let base = crate::perf_render_count("linear");
     assert!(base >= 1, "linear body must render at least once on first frame");

@@ -962,6 +962,13 @@ pub struct Tab<C> {
     /// Persistent side column (spec-rail.md). `None` when no rail is open.
     /// Per-tab — switching tabs shows/hides the arriving/departing tab's rail.
     pub rail: Option<RailState>,
+    /// Ephemeral *virtual workspace* marker (jump-panel; ADR-0021). `true` for a
+    /// transient single-tile tab created to display a free agent session; such a
+    /// tab is invisible to the jump panel's Workspaces section, the `?`
+    /// workspace menu, and persistence, and is torn down (the session returning
+    /// to free) the moment the active workspace switches away from it via
+    /// [`Workspace::set_active_tab`]. `false` for every real workspace.
+    pub ephemeral: bool,
     // --- Layout patterns (spec-layout-patterns.md) ---
     /// Current layout algorithm. `Desktop` is the default (free tile placement).
     pub layout_mode: LayoutMode,
@@ -1127,6 +1134,7 @@ impl<C> Workspace<C> {
             layout: Layout::Leaf(Window { id, content }),
             focused: id,
             rail: None,
+            ephemeral: false,
             // New workspaces default to Desktop (free tile placement).
             layout_mode: LayoutMode::default(),
             saved_manual_layout: None,
@@ -1161,24 +1169,93 @@ impl<C> Workspace<C> {
         }
     }
 
-    /// Cycle to the next tab (wraps).
+    /// Is the tab at `idx` an ephemeral virtual workspace (ADR-0021)?
+    pub fn is_ephemeral(&self, idx: usize) -> bool {
+        self.tabs.get(idx).is_some_and(|t| t.ephemeral)
+    }
+
+    /// Is the *active* tab an ephemeral virtual workspace? (Equivalently: does a
+    /// virtual workspace currently exist — by invariant it is always the active
+    /// one, created active and torn down the instant focus leaves it.)
+    pub fn active_is_ephemeral(&self) -> bool {
+        self.is_ephemeral(self.active_tab)
+    }
+
+    /// THE workspace-switch chokepoint (ADR-0021). Activate the tab at `idx`,
+    /// first tearing down a departing **ephemeral** virtual workspace: if the
+    /// currently-active tab is ephemeral and we are leaving it, that tab is
+    /// removed (dropping its single agent tile, which returns the session to
+    /// *free* in the store — the tile holds only a `SessionId` key). Index math
+    /// accounts for the removal so `idx` still lands on its intended tab. No-op
+    /// if `idx` is out of range. Does NOT notify — callers do.
+    pub fn set_active_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let cur = self.active_tab;
+        if cur != idx && self.is_ephemeral(cur) {
+            self.tabs.remove(cur);
+            // The ephemeral tab is gone; shift `idx` down if it sat after it.
+            let target = if idx > cur { idx - 1 } else { idx };
+            self.active_tab = target.min(self.tabs.len().saturating_sub(1));
+        } else {
+            self.active_tab = idx;
+        }
+    }
+
+    /// Open an **ephemeral virtual workspace** (ADR-0021): a transient,
+    /// single-tile tab holding `content`, made active. If a virtual workspace is
+    /// already open it is replaced (we never accumulate more than one). Returns
+    /// the new tile's window id. Does NOT notify — callers do.
+    pub fn open_ephemeral_tab(&mut self, content: C) -> WindowId {
+        // Replace any existing virtual workspace rather than stacking.
+        if self.active_is_ephemeral() {
+            let cur = self.active_tab;
+            self.tabs.remove(cur);
+        }
+        let id = self.alloc_window_id();
+        let name = auto_tab_name(self.next_tab_index);
+        self.next_tab_index += 1;
+        self.tabs.push(Tab {
+            auto_name: name,
+            display_name: None,
+            layout: Layout::Leaf(Window { id, content }),
+            focused: id,
+            rail: None,
+            ephemeral: true,
+            layout_mode: LayoutMode::default(),
+            saved_manual_layout: None,
+            master_ratio: 0.6,
+            master_count: 1,
+            tag_view: BTreeSet::new(),
+            desktop: DesktopState::default(),
+            kv: HashMap::new(),
+        });
+        self.active_tab = self.tabs.len() - 1;
+        id
+    }
+
+    /// Cycle to the next tab (wraps). Routes through [`set_active_tab`] so a
+    /// departing virtual workspace is torn down.
     pub fn next_tab(&mut self) {
         if self.tabs.is_empty() {
             return;
         }
-        self.active_tab = (self.active_tab + 1) % self.tabs.len();
+        let next = (self.active_tab + 1) % self.tabs.len();
+        self.set_active_tab(next);
     }
 
-    /// Cycle to the previous tab (wraps).
+    /// Cycle to the previous tab (wraps). Routes through [`set_active_tab`].
     pub fn prev_tab(&mut self) {
         if self.tabs.is_empty() {
             return;
         }
-        self.active_tab = if self.active_tab == 0 {
+        let prev = if self.active_tab == 0 {
             self.tabs.len() - 1
         } else {
             self.active_tab - 1
         };
+        self.set_active_tab(prev);
     }
 
     /// Allocate the next stable window id.
@@ -2455,6 +2532,7 @@ mod tests {
             layout,
             focused,
             rail: None,
+            ephemeral: false,
             layout_mode: LayoutMode::Manual,
             saved_manual_layout: None,
             master_ratio: 0.6,
@@ -2848,6 +2926,7 @@ mod tests {
             layout: Layout::Empty,
             focused: 0,
             rail: None,
+            ephemeral: false,
             layout_mode: LayoutMode::Manual,
             saved_manual_layout: None,
             master_ratio: 0.6,
@@ -2877,6 +2956,7 @@ mod tests {
             layout: leaf(5, "x"),
             focused: 5,
             rail: None,
+            ephemeral: false,
             layout_mode: LayoutMode::Manual,
             saved_manual_layout: None,
             master_ratio: 0.6,
@@ -2915,6 +2995,7 @@ mod tests {
             layout: Layout::Empty,
             focused: 0,
             rail: None,
+            ephemeral: false,
             layout_mode: LayoutMode::Manual,
             saved_manual_layout: None,
             master_ratio: 0.6,

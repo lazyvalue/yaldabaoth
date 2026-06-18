@@ -72,6 +72,7 @@ mod browser_ui;
 mod chrome;
 mod edit_ui;
 mod highlight_cache;
+mod jump_panel_view;
 mod linear;
 mod linear_ui;
 mod linear_view;
@@ -86,6 +87,7 @@ mod verify_harness;
 mod yux;
 pub(crate) use agent::*;
 pub(crate) use agent_sessions::*;
+pub(crate) use jump_panel_view::*;
 pub(crate) use linear::*;
 pub(crate) use linear_view::*;
 pub(crate) use persist::*;
@@ -1606,6 +1608,10 @@ struct YaldaGpuiView {
     /// `AgentSessions::close`. The 1:1 session↔tile invariant means one view
     /// per session suffices — multi-tile splits need no extra logic.
     transcript_views: HashMap<SessionId, Entity<TranscriptView>>,
+    /// Scroll state for the always-visible root-level jump panel (jump-panel;
+    /// spec-jump-panel.md). The panel itself is rendered inline (it's cheap —
+    /// see `render_jump_panel`), so only its scroll position is retained here.
+    jump_panel_scroll: ScrollHandle,
 }
 
 impl YaldaGpuiView {
@@ -1645,6 +1651,7 @@ impl YaldaGpuiView {
             pending_tag_chord: None,
             sessions: AgentSessions::new(),
             transcript_views: HashMap::new(),
+            jump_panel_scroll: ScrollHandle::new(),
         }
     }
 
@@ -1677,6 +1684,7 @@ impl YaldaGpuiView {
             pending_tag_chord: None,
             sessions: AgentSessions::new(),
             transcript_views: HashMap::new(),
+            jump_panel_scroll: ScrollHandle::new(),
         }
     }
 
@@ -1721,6 +1729,7 @@ impl YaldaGpuiView {
                 focused: ptab.focused_window,
                 layout,
                 rail: ptab.rail.map(|r| restore_rail(r, ptab.focused_window)),
+                ephemeral: false,
                 layout_mode: ptab.layout_mode,
                 saved_manual_layout: None,
                 master_ratio: ptab.master_ratio,
@@ -2236,7 +2245,7 @@ impl YaldaGpuiView {
         // Already open? Switch to that tab.
         if let Some(idx) = self.find_tab_by_doc_label(&canon) {
             if idx != self.workspace.active_tab {
-                self.workspace.active_tab = idx;
+                self.workspace.set_active_tab(idx);
             }
             return true;
         }
@@ -2286,7 +2295,7 @@ impl YaldaGpuiView {
         if idx >= self.workspace.tabs.len() || idx == self.workspace.active_tab {
             return;
         }
-        self.workspace.active_tab = idx;
+        self.workspace.set_active_tab(idx);
     }
 
     /// Close the tab at `idx`. Returns false if the tab's content has unsaved
@@ -3215,7 +3224,7 @@ impl YaldaGpuiView {
         if idx >= self.workspace.tabs.len() || idx == self.workspace.active_tab {
             return;
         }
-        self.workspace.active_tab = idx;
+        self.workspace.set_active_tab(idx);
         self.save_workspace_state();
         cx.notify();
     }
@@ -3561,7 +3570,10 @@ impl YaldaGpuiView {
             if let Some(wid) = current_wid {
                 self.workspace.marks.prev_jump = Some(wid);
             }
-            self.workspace.active_tab = tab_idx;
+            // Route through the switch chokepoint so a departing virtual
+            // workspace is torn down (ADR-0021); the index math inside accounts
+            // for the removal so `active_tab` still lands on `target_id`'s tab.
+            self.workspace.set_active_tab(tab_idx);
         }
 
         if let Some(tab) = self.workspace.active_tab_mut() {
@@ -4065,8 +4077,17 @@ impl YaldaGpuiView {
         let mut items = Vec::new();
         // Workspaces by number — 1..=9 then `0` for a tenth. Every workspace
         // holds ≥1 tile (so it's "inhabited"); a named-but-empty one would show
-        // too. The active workspace is marked.
-        for (i, tab) in self.workspace.tabs.iter().enumerate().take(10) {
+        // too. The active workspace is marked. Ephemeral virtual workspaces
+        // (ADR-0021) are excluded — they're transient and always last, so the
+        // surviving `i` values stay contiguous and match the real tab indices.
+        for (i, tab) in self
+            .workspace
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.ephemeral)
+            .take(10)
+        {
             let digit = if i == 9 { '0' } else { (b'1' + i as u8) as char };
             let marker = if i == self.workspace.active_tab { "● " } else { "  " };
             items.push(MenuNode::entry(
@@ -4901,6 +4922,7 @@ impl YaldaGpuiView {
             layout: workspace::Layout::Empty,
             focused: 0,
             rail: None,
+            ephemeral: false,
             layout_mode: workspace::LayoutMode::default(),
             saved_manual_layout: None,
             master_ratio: 0.6,
@@ -6322,6 +6344,29 @@ impl Render for YaldaGpuiView {
         } else {
             screen_view
         };
+
+        // Jump panel (jump-panel; spec-jump-panel.md): a permanent root-level
+        // left sidebar laid out as a flex row BEFORE the chord/overlay returns,
+        // so every render path keeps it visible across workspaces. Rendered
+        // inline (it's cheap — see `render_jump_panel`) in a fixed-width cell;
+        // the existing content takes the remaining width. The panel insets the
+        // content area, so a surface beneath it re-measures ONCE as geometry
+        // settles (a benign one-time bounds render, not a per-keystroke cost —
+        // see the settle notes on the `*_is_render_flat` harness tests).
+        let panel_el = self.render_jump_panel(cx);
+        let screen_view: AnyElement = div()
+            .flex()
+            .flex_row()
+            .size_full()
+            .child(
+                div()
+                    .w(px(JUMP_PANEL_WIDTH))
+                    .h_full()
+                    .flex_none()
+                    .child(panel_el),
+            )
+            .child(div().flex_1().min_w_0().h_full().child(screen_view))
+            .into_any_element();
 
         // When a mark chord or tag chord is pending, capture the next
         // keypress to complete the chord before any action dispatch can fire.
