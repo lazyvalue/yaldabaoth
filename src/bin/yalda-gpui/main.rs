@@ -265,6 +265,8 @@ actions!(
         ToggleFileBrowserRail,
         ToggleOutlineRail,
         FlipRailSide,
+        // Jump panel (jump-panel; spec-jump-panel.md). Global, `None` context.
+        ToggleJumpPanel,
         // Rail-focused navigation (`RailView` context):
         RailDown,
         RailUp,
@@ -1608,10 +1610,13 @@ struct YaldaGpuiView {
     /// `AgentSessions::close`. The 1:1 session↔tile invariant means one view
     /// per session suffices — multi-tile splits need no extra logic.
     transcript_views: HashMap<SessionId, Entity<TranscriptView>>,
-    /// Scroll state for the always-visible root-level jump panel (jump-panel;
+    /// Scroll state for the root-level jump panel (jump-panel;
     /// spec-jump-panel.md). The panel itself is rendered inline (it's cheap —
     /// see `render_jump_panel`), so only its scroll position is retained here.
     jump_panel_scroll: ScrollHandle,
+    /// Whether the jump panel is shown. Toggled by `cmd-j` / the `?` menu and
+    /// persisted (`Preferences::jump_panel_visible`). Defaults to `true`.
+    jump_panel_visible: bool,
 }
 
 impl YaldaGpuiView {
@@ -1652,6 +1657,7 @@ impl YaldaGpuiView {
             sessions: AgentSessions::new(),
             transcript_views: HashMap::new(),
             jump_panel_scroll: ScrollHandle::new(),
+            jump_panel_visible: true,
         }
     }
 
@@ -1685,6 +1691,7 @@ impl YaldaGpuiView {
             sessions: AgentSessions::new(),
             transcript_views: HashMap::new(),
             jump_panel_scroll: ScrollHandle::new(),
+            jump_panel_visible: true,
         }
     }
 
@@ -2835,7 +2842,20 @@ impl YaldaGpuiView {
             text_scale: Some(self.text_scale),
             desktop_grid_cols: Some(self.desktop_grid_cols),
             desktop_grid_rows: Some(self.desktop_grid_rows),
+            jump_panel_visible: Some(self.jump_panel_visible),
         });
+    }
+
+    /// Toggle the jump panel's visibility (`cmd-j` / `?` menu). Global action —
+    /// wired with `on_action` on every screen root. Persisted via `save_settings`.
+    fn toggle_jump_panel(&mut self, _: &ToggleJumpPanel, _w: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_jump_panel_impl(cx);
+    }
+
+    pub(crate) fn toggle_jump_panel_impl(&mut self, cx: &mut Context<Self>) {
+        self.jump_panel_visible = !self.jump_panel_visible;
+        self.save_settings();
+        cx.notify();
     }
 
     /// Screen background pulled from the active theme. Used by every
@@ -4099,6 +4119,12 @@ impl YaldaGpuiView {
         items.push(MenuNode::separator());
         items.push(MenuNode::entry("n", "name workspace", "rename-tab"));
         items.push(MenuNode::entry("c", "new workspace", "new-tab"));
+        let jp_label = if self.jump_panel_visible {
+            "hide jump panel"
+        } else {
+            "show jump panel"
+        };
+        items.push(MenuNode::entry("j", jp_label, "toggle-jump-panel"));
         items
     }
 
@@ -4301,6 +4327,7 @@ impl YaldaGpuiView {
             "back-to-doc" => self.back_to_doc(cx),
             "reload-file" => self.reload_focused_from_disk(cx),
             "rename-tab" => self.open_rename_active_tab_overlay(cx),
+            "toggle-jump-panel" => self.toggle_jump_panel_impl(cx),
             "workspace-set-cwd" => self.open_set_workspace_cwd_overlay(cx),
             "theme-dracula" => self.set_theme(ThemeName::Dracula, cx),
             "theme-nightfox" => self.set_theme(ThemeName::Nightfox, cx),
@@ -6353,20 +6380,24 @@ impl Render for YaldaGpuiView {
         // content area, so a surface beneath it re-measures ONCE as geometry
         // settles (a benign one-time bounds render, not a per-keystroke cost —
         // see the settle notes on the `*_is_render_flat` harness tests).
-        let panel_el = self.render_jump_panel(cx);
-        let screen_view: AnyElement = div()
-            .flex()
-            .flex_row()
-            .size_full()
-            .child(
-                div()
-                    .w(px(JUMP_PANEL_WIDTH))
-                    .h_full()
-                    .flex_none()
-                    .child(panel_el),
-            )
-            .child(div().flex_1().min_w_0().h_full().child(screen_view))
-            .into_any_element();
+        let screen_view: AnyElement = if self.jump_panel_visible {
+            let panel_el = self.render_jump_panel(cx);
+            div()
+                .flex()
+                .flex_row()
+                .size_full()
+                .child(
+                    div()
+                        .w(px(JUMP_PANEL_WIDTH))
+                        .h_full()
+                        .flex_none()
+                        .child(panel_el),
+                )
+                .child(div().flex_1().min_w_0().h_full().child(screen_view))
+                .into_any_element()
+        } else {
+            screen_view
+        };
 
         // When a mark chord or tag chord is pending, capture the next
         // keypress to complete the chord before any action dispatch can fire.
@@ -6976,6 +7007,8 @@ fn register_keymap(app: &mut GpuiApp) {
         KeyBinding::new("cmd-b", ToggleFileBrowserRail, None),
         KeyBinding::new("cmd-shift-o", ToggleOutlineRail, None),
         KeyBinding::new("cmd-shift-b", FlipRailSide, None),
+        // Jump panel (jump-panel; spec-jump-panel.md). Global.
+        KeyBinding::new("cmd-j", ToggleJumpPanel, None),
     ]);
 
     // Browser-view bindings.
@@ -7154,6 +7187,9 @@ fn main() {
                         }
                         if let Some(r) = prefs.desktop_grid_rows {
                             view.desktop_grid_rows = r.clamp(1, 12);
+                        }
+                        if let Some(v) = prefs.jump_panel_visible {
+                            view.jump_panel_visible = v;
                         }
                         // If we were launched with no explicit file arg, try to
                         // restore the saved workspace for this cwd. With an

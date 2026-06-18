@@ -1188,6 +1188,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::move_tile))
             .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
+            .on_action(cx.listener(Self::toggle_jump_panel))
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
             // Tile focus motion — without these the ctrl-w h/j/k/l chords

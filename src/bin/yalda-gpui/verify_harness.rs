@@ -4151,3 +4151,61 @@ fn global_menu_lists_and_switches_workspaces(cx: &mut TestAppContext) {
     let active = view.update(vcx, |v, _| v.workspace.active_tab);
     assert_eq!(active, 0, "goto-workspace-0 activated the first workspace");
 }
+
+/// The jump panel can be hidden/summoned via `cmd-j` / the `?` menu
+/// (jump-panel; spec-jump-panel.md). It defaults visible and renders; toggling
+/// it off stops it rendering (and flips the menu label); toggling on brings it
+/// back. The toggle routes through `toggle_jump_panel_impl`, the same path the
+/// `cmd-j` action and the `toggle-jump-panel` menu command use.
+#[gpui::test]
+fn jump_panel_toggle_hides_and_summons(cx: &mut TestAppContext) {
+    crate::perf_reset("jump_panel");
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    // Dismiss the startup splash — it short-circuits `render` before the panel
+    // embed (wall-clock doesn't advance under `run_until_parked`).
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    // Defaults visible, renders, and the menu offers to hide it.
+    assert!(view.update(vcx, |v, _| v.jump_panel_visible), "defaults visible");
+    let rendered = crate::perf_render_count("jump_panel");
+    assert!(rendered >= 1, "visible panel renders at least once");
+    let menu_has = |v: &mut YaldaGpuiView, label: &str| {
+        v.global_menu().iter().any(|n| n.label == label)
+    };
+    assert!(view.update(vcx, |v, _| menu_has(v, "hide jump panel")));
+
+    // Hide it (via the menu command). It stops rendering; menu now offers show.
+    view.update(vcx, |v, cx| v.dispatch_menu_command("toggle-jump-panel", cx));
+    assert!(!view.update(vcx, |v, _| v.jump_panel_visible), "now hidden");
+    let base = crate::perf_render_count("jump_panel");
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::perf_render_count("jump_panel"),
+        base,
+        "a hidden jump panel is not rendered"
+    );
+    assert!(view.update(vcx, |v, _| menu_has(v, "show jump panel")));
+
+    // Summon it again — it renders once more.
+    view.update(vcx, |v, cx| v.dispatch_menu_command("toggle-jump-panel", cx));
+    assert!(view.update(vcx, |v, _| v.jump_panel_visible), "visible again");
+    vcx.run_until_parked();
+    assert!(
+        crate::perf_render_count("jump_panel") > base,
+        "summoned panel renders again"
+    );
+}

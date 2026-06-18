@@ -327,6 +327,10 @@ pub(crate) struct Preferences {
     pub(crate) desktop_grid_cols: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) desktop_grid_rows: Option<u32>,
+    /// Jump-panel visibility (jump-panel; `cmd-j` / `?` menu). `None` means
+    /// "no saved preference; show it" (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) jump_panel_visible: Option<bool>,
 }
 
 pub(crate) fn load_preferences() -> Preferences {
