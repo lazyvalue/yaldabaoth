@@ -808,6 +808,21 @@ pub(crate) fn block_content_hash(lines: &[String]) -> u64 {
     h.finish()
 }
 
+/// 64-bit fingerprint of the frozen-line *layout* (the ranges themselves, in
+/// order). Gates structural-block re-detection: it changes when a frozen block
+/// is added, removed, OR shifted — unlike a bare line-count, which misses an
+/// insert-between-blocks that moves a block without changing the total.
+pub(crate) fn frozen_ranges_fp(frozen_ranges: &[(usize, usize)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    frozen_ranges.len().hash(&mut h);
+    for &(s, e) in frozen_ranges {
+        s.hash(&mut h);
+        e.hash(&mut h);
+    }
+    h.finish()
+}
+
 pub(crate) fn detect_block_ranges(
     lines: &[String],
     frozen_ranges: &[(usize, usize)],
@@ -1881,8 +1896,14 @@ pub(crate) struct AgentViewModel {
     /// A 64-bit collision would render the wrong block — per-session and
     /// transient, the same accepted risk as `view_model_fp`.
     pub(crate) block_cache: std::collections::HashMap<u64, std::rc::Rc<RenderedBlock>>,
-    /// Frozen line count when `block_cache` was last (re)validated.
-    pub(crate) block_cache_frozen_count: usize,
+    /// Fingerprint of the frozen-line *layout* (ranges, not just count) when
+    /// `block_cache` / `resolved_blocks` / the editor's atomic-block set were
+    /// last (re)validated. A hash of the ranges, so re-detection fires when a
+    /// frozen block *moves* (e.g. the user inserts an editable line between two
+    /// frozen blocks) and not only when the frozen line count changes — a count
+    /// gate alone leaves `resolved_blocks` pointing at stale line indices after
+    /// such an insert. `None` forces a rebuild (cold / theme-invalidated).
+    pub(crate) block_cache_frozen_fp: Option<u64>,
     /// The detected ranges resolved to their parsed blocks (`None` = rejected
     /// by `parse_block_range`, renders as plain source lines per INV-10).
     /// Sorted by start, disjoint. Rebuilt only when the frozen line count
@@ -1902,6 +1923,13 @@ pub(crate) struct AgentViewModel {
     /// drift from what's actually rendered. This is what makes Worksheet
     /// typing O(changed) instead of O(transcript) — see ADR-0020 / INV-RV.
     pub(crate) line_to_item_cache: std::rc::Rc<Vec<u32>>,
+    /// Sorted doc lines the WORKSHEET caret is allowed to rest on (block-paged
+    /// navigation): every editable line, plus the first line of each frozen
+    /// PROSE run. Tool groups, code/table blocks and interior/blank frozen lines
+    /// are deliberately absent — they're crossed in a single keystroke and never
+    /// host the caret (they render as one element with no per-line caret). Built
+    /// from the same final `flat_items` as `line_to_item_cache`.
+    pub(crate) nav_stops_cache: std::rc::Rc<Vec<usize>>,
     /// Fingerprint of the structural inputs the cached view-model was built
     /// from. `None` = never built (forces a rebuild on first render).
     pub(crate) view_model_fp: Option<u64>,
@@ -1927,7 +1955,7 @@ impl AgentViewModel {
     /// them. Call on `set_theme` for every live session.
     pub(crate) fn invalidate_theme(&mut self) {
         self.block_cache.clear();
-        self.block_cache_frozen_count = usize::MAX;
+        self.block_cache_frozen_fp = None;
         self.view_model_fp = None;
     }
 
@@ -1957,6 +1985,7 @@ impl AgentViewModel {
         flat_items: Vec<FlatItem>,
         gutter: Vec<Option<TurnId>>,
         line_to_item: Vec<u32>,
+        nav_stops: Vec<usize>,
     ) -> (std::rc::Rc<Vec<FlatItem>>, std::rc::Rc<Vec<Option<TurnId>>>) {
         #[cfg(test)]
         {
@@ -1967,6 +1996,7 @@ impl AgentViewModel {
         self.flat_items_cache = flat_rc.clone();
         self.gutter_cache = gutter_rc.clone();
         self.line_to_item_cache = std::rc::Rc::new(line_to_item);
+        self.nav_stops_cache = std::rc::Rc::new(nav_stops);
         self.view_model_fp = Some(fp);
         self.view_model_seq = self.view_model_seq.wrapping_add(1);
         (flat_rc, gutter_rc)
@@ -1982,6 +2012,25 @@ impl AgentViewModel {
             .or_else(|| m.last())
             .copied()
             .unwrap_or(0) as usize
+    }
+
+    /// Snap a worksheet vertical-move landing line to the nearest navigable stop
+    /// in the move direction (block-paged navigation). `down` picks the first
+    /// stop at-or-after `line`; otherwise the last stop at-or-before it. `None`
+    /// when there is no stop in that direction (caller leaves the cursor put).
+    /// Empty cache (no render yet) ⇒ `None`, so motion falls back to raw.
+    pub(crate) fn snap_nav_stop(&self, line: usize, down: bool) -> Option<usize> {
+        // `nav_stops_cache` is sorted ascending — binary-search so a vertical
+        // keystroke on a huge transcript stays O(log n), not O(stops).
+        let s = &self.nav_stops_cache;
+        if down {
+            // first stop >= line
+            s.get(s.partition_point(|&l| l < line)).copied()
+        } else {
+            // last stop <= line
+            let n = s.partition_point(|&l| l <= line);
+            (n > 0).then(|| s[n - 1])
+        }
     }
 }
 
@@ -2038,6 +2087,54 @@ fn build_line_to_item(flat_items: &[FlatItem], resolved: &[ResolvedBlock], line_
     map
 }
 
+/// Doc lines the worksheet caret may rest on, in ascending order (the
+/// frozen-BLOCK navigation model). A line is a stop iff it renders as a
+/// caret-bearing `FlatItem::Line` that is EITHER editable (every editable line
+/// is its own stop, so text editing keeps per-line motion) OR a non-blank frozen
+/// PROSE line — and per the model "a single frozen line terminated by a newline
+/// is a block," EVERY such prose line is its own stop. That is what lets the
+/// caret land between any two adjacent frozen prose lines to insert there.
+///
+/// What is NOT a stop, and so is crossed in a single keystroke: `FlatItem::Block`
+/// (a fenced code block / table — one atomic block, no `FlatItem::Line`s for its
+/// interior), `FlatItem::ToolGroup`, turn headers, the thinking indicator, and
+/// blank frozen padding (stripped from the render). Because a structural block
+/// emits no `Line`, it naturally contributes no stop; the caret jumps over it to
+/// the next prose/editable stop.
+pub(crate) fn build_nav_stops(
+    flat_items: &[FlatItem],
+    lines: &[String],
+    frozen: &[(usize, usize)],
+) -> Vec<usize> {
+    let is_frozen = |idx: usize| frozen.iter().any(|&(s, e)| idx >= s && idx < e);
+    let mut stops = Vec::new();
+    // (1) Rendered text lines: every non-blank frozen prose line is a stop;
+    // blank frozen padding is not. Tool groups / blocks own no `Line` item, so
+    // they're skipped (crossed in one keystroke).
+    for item in flat_items {
+        if let FlatItem::Line(idx) = item {
+            let blank_frozen =
+                is_frozen(*idx) && lines.get(*idx).is_none_or(|s| s.trim().is_empty());
+            if !blank_frozen {
+                stops.push(*idx);
+            }
+        }
+    }
+    // (2) EVERY editable line is a stop, independent of `flat_items` — so the
+    // editable tail is always reachable even when it's a lone blank line the
+    // blank-collapse pass stripped from the rendered list. Without this you
+    // could navigate up into the transcript and never get the caret back down
+    // to where you type (and then `i` lands on a frozen line → can't insert).
+    for l in 0..lines.len() {
+        if !is_frozen(l) {
+            stops.push(l);
+        }
+    }
+    stops.sort_unstable();
+    stops.dedup();
+    stops
+}
+
 /// S1 view-model rebuild — the `cached()` miss path of `render_agent`: the
 /// gutter-tag scan, tool-anchor resolution, frozen-block partition, flat
 /// build and blank-collapse. A top-level fn (not inlined in `render_agent`)
@@ -2048,7 +2145,6 @@ pub(crate) fn rebuild_agent_view_model(
     c: &mut AgentState,
     lines: &[String],
     frozen_ranges: &[(usize, usize)],
-    frozen_line_count: usize,
     theme: &Theme,
     view_model_fp: u64,
 ) -> (std::rc::Rc<Vec<FlatItem>>, std::rc::Rc<Vec<Option<TurnId>>>) {
@@ -2097,14 +2193,17 @@ pub(crate) fn rebuild_agent_view_model(
 
     // Detect tables and fenced code blocks in frozen content for
     // block-level rendering; everything else stays line-by-line.
-    // Re-validated only when the frozen line count changes (a
-    // streamed chunk / submit) — a worksheet keystroke in the
-    // editable tail leaves all of this untouched. Parses are
-    // reused by CONTENT (see `AgentViewModel::block_cache`), so a
-    // chunk that shifts every range only re-parses ranges whose
-    // text actually changed. Rejected ranges resolve to `None`
-    // and render as their source lines (Finding 10, INV-10).
-    if frozen_line_count != c.view_model.block_cache_frozen_count {
+    // Re-validated whenever the frozen *layout* changes — a streamed
+    // chunk, a submit, OR an editable line inserted between two frozen
+    // blocks (which shifts a block's line indices without changing the
+    // frozen line count). A worksheet keystroke in the editable tail
+    // leaves the layout (and this) untouched. Parses are reused by
+    // CONTENT (see `AgentViewModel::block_cache`), so a chunk that
+    // shifts every range only re-parses ranges whose text actually
+    // changed. Rejected ranges resolve to `None` and render as their
+    // source lines (Finding 10, INV-10).
+    let frozen_layout_fp = frozen_ranges_fp(frozen_ranges);
+    if Some(frozen_layout_fp) != c.view_model.block_cache_frozen_fp {
         let block_ranges = detect_block_ranges(lines, frozen_ranges);
         let mut new_cache: std::collections::HashMap<u64, std::rc::Rc<RenderedBlock>> =
             std::collections::HashMap::new();
@@ -2123,10 +2222,17 @@ pub(crate) fn rebuild_agent_view_model(
             }
             resolved.push(((start, end), parsed));
         }
+        // Seed the editor's atomic-block set so `can_insert_char_at` forbids
+        // splitting these multi-line structural blocks. Detected ranges are the
+        // atomic blocks whether or not they parsed (an unparsed-but-detected
+        // fence/table is still structural and must stay whole); single frozen
+        // prose lines are never detected, so they remain individually
+        // insertable-between.
+        c.editor.set_atomic_blocks(block_ranges.clone());
         c.block_ranges = block_ranges;
         c.view_model.block_cache = new_cache;
         c.view_model.resolved_blocks = resolved;
-        c.view_model.block_cache_frozen_count = frozen_line_count;
+        c.view_model.block_cache_frozen_fp = Some(frozen_layout_fp);
     }
 
     // The block/line partition reads `resolved_blocks` directly —
@@ -2168,16 +2274,35 @@ pub(crate) fn rebuild_agent_view_model(
             }
         } else if prev_turn.is_some() {
             // Editable (untagged) lines after frozen content = user input.
-            // Suppress the "You" header when the editable tail is all
-            // blank — in Chatbox mode the compose area is separate, so
-            // an empty transcript tail is just whitespace, not a turn.
-            let remaining_non_empty = (line_idx..lines.len()).any(|j| !lines[j].trim().is_empty());
-            if remaining_non_empty {
+            // Emit the "You" header only when THIS editable run actually holds
+            // text. The run is the contiguous untagged region starting here, up
+            // to the next header-bearing (Llm/User) line — NOT the whole rest of
+            // the document. Scanning to EOF made any blank editable gap wedged
+            // above downstream Claude content sprout a phantom "You" header
+            // (the reported bug): the downstream Claude lines are non-blank, so
+            // the gap looked like a user turn. Tool/System lines carry a tag but
+            // no header role, so they don't bound the run.
+            let run_end = (line_idx..lines.len())
+                .find(|&j| {
+                    gutter_tag_per_line
+                        .get(j)
+                        .copied()
+                        .flatten()
+                        .and_then(HeaderRole::from_turn)
+                        .is_some()
+                })
+                .unwrap_or(lines.len());
+            let run_non_empty = (line_idx..run_end).any(|j| !lines[j].trim().is_empty());
+            if run_non_empty {
                 flat_items.push(FlatItem::TurnHeader {
                     role: TurnRole::User,
                 });
+                // A real user interjection ends the prior turn; the next Llm line
+                // re-opens with its own header.
+                prev_turn = None;
             }
-            prev_turn = None;
+            // All-blank gap: leave `prev_turn` intact so an abandoned editable
+            // gap inserted mid-Claude-turn doesn't split it into two headers.
         }
 
         // Advance the resolved-range cursor past ranges that
@@ -2301,9 +2426,15 @@ pub(crate) fn rebuild_agent_view_model(
     // blank-collapse, tool-group merge, and the tail indicator) so it matches
     // the rendered list exactly.
     let line_to_item = build_line_to_item(&flat_items, resolved, lines.len());
+    let nav_stops = build_nav_stops(&flat_items, lines, frozen_ranges);
 
-    c.view_model
-        .store(view_model_fp, flat_items, gutter_tag_per_line, line_to_item)
+    c.view_model.store(
+        view_model_fp,
+        flat_items,
+        gutter_tag_per_line,
+        line_to_item,
+        nav_stops,
+    )
 }
 
 /// State held while the user is conversing with an ACP-attached Claude
@@ -2852,7 +2983,15 @@ impl AgentState {
             yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
             false,
         )?;
-        for (l, _) in collected {
+        // Freeze ONLY the lines that actually contributed to `prompt_body` (the
+        // non-blank ones). A blank spacer line collected here but filtered out of
+        // the sent body must NOT be frozen as part of the turn — doing so paints
+        // an empty "You" region into the transcript (the reported bug). Blank
+        // lines stay editable and collapse in render.
+        for (l, t) in collected {
+            if t.trim().is_empty() {
+                continue;
+            }
             self.editor.add_frozen_lines(*l, *l + 1);
             let anchor = self.editor.anchor_for_line(*l);
             self.editor

@@ -1117,11 +1117,15 @@ struct EditState {
     /// splicing the changed range (never `reset()`) so scroll stays anchored
     /// across edits — see `ScrollAnchoredList`.
     list: ScrollAnchoredList<String>,
-    /// `(edit_seq, cursor_line)` at the last render. When either changes we
-    /// scroll the list to reveal the cursor line (so typing/motion keeps the
-    /// caret on-screen) without fighting the user's manual scroll on idle
-    /// frames.
-    last_cursor_anchor: Option<(u64, usize)>,
+    /// `(edit_seq, cursor_line, cursor_col)` at the last render. When any
+    /// changes we scroll the list to reveal the cursor line (so typing/motion
+    /// keeps the caret on-screen) without fighting the user's manual scroll on
+    /// idle frames. The COLUMN is part of the key because a horizontal move
+    /// along a wide soft-wrapped line (e.g. a markdown table row, which is one
+    /// long source line) changes the caret's *visual* row without changing
+    /// `cursor_line` — without the column here that move never re-revealed and
+    /// the caret drifted off the bottom of the wrapped rows.
+    last_cursor_anchor: Option<(u64, usize, usize)>,
     /// Set after `r` in normal mode: the *next* keypress is consumed as the
     /// replacement character (vim `r{char}`) rather than a normal-mode action.
     /// Cleared after that next key (Esc / non-char cancels).
@@ -1254,10 +1258,6 @@ struct BufferSwitcher {
     filter_text: String,
 }
 
-struct SessionSwitcher {
-    selected: usize,
-}
-
 /// What the workspace picker will do with the chosen target. Drives the
 /// header copy and the commit branch so one picker overlay serves both
 /// "move tile" (Ctrl-W m) and "also-show tile" (Ctrl-W M).
@@ -1340,7 +1340,6 @@ enum ActiveOverlay {
     None,
     Menu(MenuOverlay),
     BufferSwitcher(BufferSwitcher),
-    SessionSwitcher(SessionSwitcher),
     WorkspacePicker(WorkspacePicker),
     Rename(RenameOverlay),
     TagInput(TagInputOverlay),
@@ -3893,9 +3892,6 @@ impl YaldaGpuiView {
     fn overlay_is_buffer(&self) -> bool {
         matches!(self.active_overlay, ActiveOverlay::BufferSwitcher(_))
     }
-    fn overlay_is_session(&self) -> bool {
-        matches!(self.active_overlay, ActiveOverlay::SessionSwitcher(_))
-    }
     fn overlay_is_workspace(&self) -> bool {
         matches!(self.active_overlay, ActiveOverlay::WorkspacePicker(_))
     }
@@ -3933,20 +3929,6 @@ impl YaldaGpuiView {
     fn buffer_mut(&mut self) -> Option<&mut BufferSwitcher> {
         if let ActiveOverlay::BufferSwitcher(b) = &mut self.active_overlay {
             Some(b)
-        } else {
-            None
-        }
-    }
-    fn session_ref(&self) -> Option<&SessionSwitcher> {
-        if let ActiveOverlay::SessionSwitcher(s) = &self.active_overlay {
-            Some(s)
-        } else {
-            None
-        }
-    }
-    fn session_mut(&mut self) -> Option<&mut SessionSwitcher> {
-        if let ActiveOverlay::SessionSwitcher(s) = &mut self.active_overlay {
-            Some(s)
         } else {
             None
         }
@@ -4990,9 +4972,6 @@ impl YaldaGpuiView {
     /// rebinds this tile to the chosen free session (freeing, not killing, its
     /// previous one).
     fn open_session_picker_rebind(&mut self, cx: &mut Context<Self>) {
-        if self.overlay_is_session() {
-            return;
-        }
         // Must be on an agent tile. (If not, open one first.)
         if self.agent_tile().is_none() {
             self.open_agent_inner(cx);
@@ -5000,239 +4979,18 @@ impl YaldaGpuiView {
                 return;
             }
         }
-        self.open_overlay(ActiveOverlay::SessionSwitcher(SessionSwitcher {
-            selected: 0,
-        }));
+        // The free-session listing lists from a cwd: use the current session's,
+        // else the process cwd.
+        let cwd = self
+            .focused_bound_session()
+            .and_then(|id| self.sessions.get(id).map(|s| s.read(cx).cwd.clone()))
+            .unwrap_or_else(process_cwd);
+        // Free the current session (kept running in the store) and land the tile
+        // in the live in-tile selector — the same UI an unbound agent tile shows
+        // (free sessions + "start new"). No bespoke overlay.
+        self.release_focused_session_for_rebind();
+        self.show_selector_on_focused_tile(cwd, cx);
         cx.notify();
-    }
-
-    fn close_session_switcher(&mut self) {
-        self.clear_overlay();
-    }
-
-    /// Row count of the switcher: a "new session" row plus one per free
-    /// session (those the store holds that no tile binds).
-    fn switcher_row_count(&self) -> usize {
-        1 + self.free_session_ids().len()
-    }
-
-    fn handle_session_switcher_key(
-        &mut self,
-        ev: &KeyDownEvent,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let press = keystroke_to_keypress(&ev.keystroke);
-        let selected = match self.session_ref() {
-            Some(ss) => ss.selected,
-            None => return,
-        };
-        let count = self.switcher_row_count();
-
-        match press.key {
-            Key::Esc | Key::Char('q') => {
-                self.close_session_switcher();
-            }
-            Key::Char('j') | Key::Down => {
-                if let Some(ss) = self.session_mut()
-                    && count > 0
-                {
-                    ss.selected = (ss.selected + 1) % count;
-                }
-            }
-            Key::Char('k') | Key::Up => {
-                if let Some(ss) = self.session_mut()
-                    && count > 0
-                {
-                    ss.selected = if ss.selected == 0 {
-                        count - 1
-                    } else {
-                        ss.selected - 1
-                    };
-                }
-            }
-            Key::Char('g') => {
-                if let Some(ss) = self.session_mut() {
-                    ss.selected = 0;
-                }
-            }
-            Key::Char('G') => {
-                if let Some(ss) = self.session_mut()
-                    && count > 0
-                {
-                    ss.selected = count - 1;
-                }
-            }
-            Key::Enter | Key::Char('l') => {
-                self.close_session_switcher();
-                if selected == 0 {
-                    // "new session" row: rebind this tile to a fresh session
-                    // (release_focused_session_for_rebind runs inside).
-                    self.new_agent_session(None, cx);
-                } else {
-                    // Rebind to the chosen free session. Release the current one
-                    // first (closes a mid-open placeholder; frees a live one).
-                    let free = self.free_session_ids();
-                    if let Some(&id) = free.get(selected - 1) {
-                        self.release_focused_session_for_rebind();
-                        if let Some(tile) = self.agent_tile_mut() {
-                            tile.bound = Some(id);
-                            tile.picker = None;
-                        }
-                        self.save_agent_ring(cx);
-                    }
-                }
-            }
-            Key::Char('x') => {
-                // Kill the selected free session (store close + server close).
-                if selected >= 1 {
-                    let free = self.free_session_ids();
-                    if let Some(&id) = free.get(selected - 1) {
-                        let sid = self.sessions.sid_of(id).map(|s| s.to_string());
-                        if let Some(sid) = sid {
-                            self.spawn_close_session(sid, cx);
-                        }
-                        self.transcript_views.remove(&id);
-                        self.sessions.close(id);
-                    }
-                    let new_count = self.switcher_row_count();
-                    if let Some(ss) = self.session_mut()
-                        && ss.selected >= new_count
-                    {
-                        ss.selected = new_count.saturating_sub(1);
-                    }
-                }
-            }
-            _ => {}
-        }
-        cx.notify();
-    }
-
-    fn render_session_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let ss = match self.session_ref() {
-            Some(ss) => ss,
-            None => unreachable!(),
-        };
-        let free = self.free_session_ids();
-
-        let ov = &self.theme.overlay;
-        let menu_bg: Hsla = nc(ov.bg);
-        let label_fg: Hsla = nc(ov.label);
-        let active_fg: Hsla = nc(ov.accent);
-        let selected_bg: Hsla = nc(ov.selected_bg);
-        let normal_fg: Hsla = nc(ov.fg);
-        let popup_border: Hsla = nc(ov.border);
-        let busy_fg: Hsla = nc(ov.modified);
-
-        let header_text = format!("FREE SESSIONS ({})", free.len());
-        let header_row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .px_4()
-            .py_1()
-            .h(px(28.0))
-            .text_color(label_fg)
-            .font_weight(FontWeight::BOLD)
-            .child(header_text);
-
-        let mut entries_col = div()
-            .flex()
-            .flex_col()
-            .px_4()
-            .py_2()
-            .text_size(px(14.0))
-            .font_family(self.code_font.clone());
-
-        // Row 0: start a new session.
-        {
-            let is_selected = ss.selected == 0;
-            let marker = if is_selected { "\u{25b8} " } else { "  " };
-            let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
-            if is_selected {
-                row = row.bg(selected_bg);
-            }
-            row = row
-                .child(
-                    div()
-                        .text_color(label_fg)
-                        .child(SharedString::from(marker.to_string())),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_color(active_fg)
-                        .child(SharedString::from("+ start a new session".to_string())),
-                );
-            entries_col = entries_col.child(row);
-        }
-
-        for (i, &id) in free.iter().enumerate() {
-            let Some(ent) = self.sessions.get(id) else {
-                continue;
-            };
-            let session = ent.read(cx);
-            let is_selected = i + 1 == ss.selected;
-            let is_busy = session.state.turn_phase.is_awaiting();
-
-            let marker = if is_selected { "\u{25b8} " } else { "  " };
-            let busy_mark = if is_busy { " \u{2026}" } else { "" };
-            let cwd_display = shorten_cwd_for_display(&session.cwd);
-            let label_text = format!("{}{}", session.label, busy_mark);
-
-            let name_color = if is_busy { busy_fg } else { normal_fg };
-
-            let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
-            if is_selected {
-                row = row.bg(selected_bg);
-            }
-
-            row = row
-                .child(
-                    div()
-                        .text_color(label_fg)
-                        .child(SharedString::from(marker.to_string())),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_color(name_color)
-                        .child(SharedString::from(label_text)),
-                )
-                .child(
-                    div()
-                        .text_color(label_fg)
-                        .child(SharedString::from(format!("  {cwd_display}"))),
-                );
-
-            entries_col = entries_col.child(row);
-        }
-
-        let hints_row = div()
-            .px_4()
-            .py_1()
-            .text_size(px(11.0))
-            .text_color(label_fg)
-            .child("j/k move · enter bind · x kill · q/esc cancel");
-
-        div()
-            .id("session-switcher")
-            .absolute()
-            .top(px(34.0))
-            .left(px(40.0))
-            .right(px(40.0))
-            .max_h(px(400.0))
-            .bg(menu_bg)
-            .border_1()
-            .border_color(popup_border)
-            .rounded_md()
-            .shadow_lg()
-            .overflow_y_scroll()
-            .child(header_row)
-            .child(entries_col)
-            .child(hints_row)
     }
 
     fn render_workspace_picker(&self, _cx: &mut Context<Self>) -> impl IntoElement {
@@ -6656,22 +6414,6 @@ impl Render for YaldaGpuiView {
                 }))
                 .child(screen_view)
                 .child(self.render_buffer_switcher(cx))
-                .into_any_element();
-        }
-
-        // Session switcher takes priority over menu.
-        if self.overlay_is_session() {
-            return div()
-                .track_focus(&self.focus_handle)
-                .key_context("SessionSwitcherView")
-                .size_full()
-                .bg(editor_bg)
-                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
-                    this.handle_session_switcher_key(ev, w, cx);
-                    cx.stop_propagation();
-                }))
-                .child(screen_view)
-                .child(self.render_session_switcher(cx))
                 .into_any_element();
         }
 

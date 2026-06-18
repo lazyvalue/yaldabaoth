@@ -370,6 +370,26 @@ user**; the rest is `NEEDS-RUNTIME`. Follow-ups below are off `integration`,
   ~5 mutation sites with `Rc::make_mut`; outside the memoized boundary, so
   orthogonal. Low risk but not yet worth the churn.
 
+## Worksheet frozen-block model (branch `main`, this session)
+
+- **Worksheet insert/render fixes** — `NEEDS-RUNTIME`. Five fixes from a
+  4-personality subagent sweep (`docs/projects/worksheet-frozen-blocks/`):
+  (1) atomic structural blocks (code/table) can no longer be split by an insert —
+  the "butchers Claude text" bug, guarded in `can_insert_char_at` via a new
+  `EditorCore::atomic_blocks` seeded from the render-time block detector;
+  (2) blank lines are no longer frozen as empty "You" turns on submit;
+  (3) the phantom "You" header scan is bounded to the current editable run;
+  (4) each frozen prose line is its own nav stop (insert between any two);
+  (5) `snap_nav_stop` no longer strands the caret on a block-interior line.
+  Builds + 217 gpui tests + full suite green; needs human runtime check (GPUI
+  can't run headless).
+- **Worksheet deep bugs (deferred)** — `READY`. `001-ticket-deferred-deep-bugs`:
+  streaming cursor-drift (cursor not shifted on `programmatic_insert`),
+  floor-only-EOF (`agent_tail_floor_char` misses mid-transcript drafts), undo
+  wipes `TurnId` metadata, `view_model_fingerprint` excludes cursor/content.
+  Real, higher-scope, NOT the reported repro — each needs runtime repro + a
+  separately-tested fix.
+
 ## Needs decision (you)
 
 - **Workspaces multi-membership for agents** — `NEEDS-DECISION`. Needs the

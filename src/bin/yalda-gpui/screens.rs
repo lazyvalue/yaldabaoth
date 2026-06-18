@@ -483,7 +483,7 @@ impl YaldaGpuiView {
         // the reveal below keeps the caret on-screen.
         e.list.reconcile(&lines_rc, edit_seq);
         let new_count = e.list.len();
-        let anchor = (edit_seq, cursor_line);
+        let anchor = (edit_seq, cursor_line, cursor_col);
         if e.last_cursor_anchor != Some(anchor) {
             e.last_cursor_anchor = Some(anchor);
             if cursor_line < new_count {
@@ -609,7 +609,7 @@ impl YaldaGpuiView {
         // `reset()`, which would snap the viewport to the top on newline edits.
         e.list.reconcile(&lines_rc, edit_seq);
         let new_count = e.list.len();
-        let anchor = (edit_seq, cursor_line);
+        let anchor = (edit_seq, cursor_line, cursor_col);
         if e.last_cursor_anchor != Some(anchor) {
             e.last_cursor_anchor = Some(anchor);
             if cursor_line < new_count {

@@ -71,6 +71,63 @@ fn next_jump_ord_steps_and_clamps() {
     assert_eq!(next_jump_ord(0, 1, -1, false), 0);
 }
 
+/// Worksheet frozen-BLOCK navigation: the caret may rest on EVERY editable line
+/// and EVERY non-blank frozen prose line (each such line is its own block, so the
+/// caret can land between any two to insert there), but NOT on tool groups,
+/// structural blocks, or blank frozen padding — those are crossed in one
+/// keystroke.
+#[test]
+fn build_nav_stops_per_frozen_prose_line() {
+    use crate::FlatItem;
+    // Lines 0..4 are a frozen agent turn (prose, prose, blank tool anchor,
+    // prose); lines 4..6 are the editable user tail.
+    let lines: Vec<String> = ["alpha", "beta", "", "gamma", "", "draft"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let frozen = [(0usize, 4usize)]; // lines 0,1,2,3 frozen
+    let flat = vec![
+        FlatItem::Line(0),                                  // frozen prose → stop
+        FlatItem::Line(1),                                  // frozen prose → stop (its own block)
+        FlatItem::Line(2),                                  // blank frozen padding → skip
+        FlatItem::ToolGroup { anchor_line: 2, ids: vec![] }, // crossed → skip
+        FlatItem::Line(3),                                  // frozen prose → stop
+        FlatItem::Line(4),                                  // editable → stop
+        FlatItem::Line(5),                                  // editable → stop
+    ];
+    let stops = crate::build_nav_stops(&flat, &lines, &frozen);
+    assert_eq!(
+        stops,
+        vec![0, 1, 3, 4, 5],
+        "stops: every non-blank frozen prose line (0,1,3) + editable lines (4,5); \
+         tool group + blank frozen padding are crossed"
+    );
+}
+
+/// FIX 5 contract: `snap_nav_stop` returns `None` when there is no stop in the
+/// move direction. The worksheet key handler relies on this `None` to fall the
+/// caret back to its pre-motion stop instead of stranding it on an unrenderable
+/// block-interior / blank line (Finding E).
+#[test]
+fn snap_nav_stop_none_when_no_stop_in_direction() {
+    use crate::FlatItem;
+    let mut st = AgentState::new_for_test();
+    // Single navigable stop at line 5 (e.g. a lone editable line below a leading
+    // code block whose interior lines are not stops).
+    st.view_model
+        .store(1, vec![FlatItem::Line(5)], vec![None], vec![5], vec![5]);
+    assert_eq!(st.view_model.snap_nav_stop(5, true), Some(5));
+    assert_eq!(st.view_model.snap_nav_stop(5, false), Some(5));
+    // Moving down past the last stop, or up before the first, finds nothing.
+    assert_eq!(st.view_model.snap_nav_stop(6, true), None);
+    assert_eq!(st.view_model.snap_nav_stop(4, false), None);
+    // Empty cache (no render yet) → None in both directions → motion left to the
+    // caller's fallback.
+    let empty = AgentState::new_for_test();
+    assert_eq!(empty.view_model.snap_nav_stop(0, true), None);
+    assert_eq!(empty.view_model.snap_nav_stop(0, false), None);
+}
+
 /// `j` pressed while already parked on the newest user turn means "go past the
 /// last turn" → drop at the buffer's page end. Every other step stays on a
 /// user-turn header.
@@ -409,14 +466,14 @@ fn worksheet_rebuild_reuses_parsed_blocks_by_identity() {
     let theme = Theme::default();
     let (lines, frozen, frozen_len) = synthetic_transcript(3, 4);
 
-    let (flat1, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &theme, 1);
+    let (flat1, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, &theme, 1);
     let blocks1 = block_ptrs(&flat1);
     assert_eq!(blocks1.len(), 3, "three fenced blocks must parse");
 
     // Keystroke in the editable tail: new fingerprint, same frozen count.
     let mut lines2 = lines.clone();
     *lines2.last_mut().unwrap() = "x".to_string();
-    let (flat2, _) = rebuild_agent_view_model(&mut st, &lines2, &frozen, frozen_len, &theme, 2);
+    let (flat2, _) = rebuild_agent_view_model(&mut st, &lines2, &frozen, &theme, 2);
     assert_eq!(
         blocks1,
         block_ptrs(&flat2),
@@ -437,7 +494,7 @@ fn streamed_shift_reuses_parses_by_content() {
     let theme = Theme::default();
     let (lines, frozen, frozen_len) = synthetic_transcript(3, 4);
 
-    let (flat1, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &theme, 1);
+    let (flat1, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, &theme, 1);
     let blocks1 = block_ptrs(&flat1);
     assert_eq!(blocks1.len(), 3);
 
@@ -447,7 +504,7 @@ fn streamed_shift_reuses_parses_by_content() {
     lines2.extend(lines.iter().cloned());
     let frozen2 = vec![(0usize, frozen_len + 1)];
     let (flat2, _) =
-        rebuild_agent_view_model(&mut st, &lines2, &frozen2, frozen_len + 1, &theme, 2);
+        rebuild_agent_view_model(&mut st, &lines2, &frozen2, &theme, 2);
     assert_eq!(
         blocks1,
         block_ptrs(&flat2),
@@ -470,7 +527,7 @@ fn rebuild_renders_unparsed_range_as_lines() {
         String::new(), // editable tail
     ];
     let frozen = vec![(0usize, 3)];
-    let (flat, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, 3, &theme, 1);
+    let (flat, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, &theme, 1);
     assert!(
         !flat.iter().any(|f| matches!(f, FlatItem::Block(_))),
         "rejected range must emit no Block item"
@@ -510,7 +567,7 @@ fn rebuild_keeps_worksheet_cursor_line_through_collapse() {
     // Chatbox (default): the second consecutive blank collapses away.
     let mut chat = AgentState::new_for_test();
     chat.editor.cursor_mut().line = 2;
-    let (flat_chat, _) = rebuild_agent_view_model(&mut chat, &lines, &frozen, 1, &theme, 1);
+    let (flat_chat, _) = rebuild_agent_view_model(&mut chat, &lines, &frozen, &theme, 1);
     assert!(
         !flat_chat.iter().any(|f| matches!(f, FlatItem::Line(2))),
         "Chatbox mode collapses the consecutive blank tail line"
@@ -521,7 +578,7 @@ fn rebuild_keeps_worksheet_cursor_line_through_collapse() {
     let mut ws = AgentState::new_for_test();
     ws.input_surface = InputSurface::Worksheet;
     ws.editor.cursor_mut().line = 2;
-    let (flat_ws, _) = rebuild_agent_view_model(&mut ws, &lines, &frozen, 1, &theme, 1);
+    let (flat_ws, _) = rebuild_agent_view_model(&mut ws, &lines, &frozen, &theme, 1);
     let pos = flat_ws
         .iter()
         .position(|f| matches!(f, FlatItem::Line(2)))
@@ -530,6 +587,146 @@ fn rebuild_keeps_worksheet_cursor_line_through_collapse() {
         ws.view_model.item_for_line(2),
         pos,
         "cursor-reveal must target the caret's real flat position, not a fallback"
+    );
+}
+
+/// FIX 2 (no empty "You" region): a worksheet submit that collected a blank
+/// spacer line between two authored lines must freeze ONLY the non-blank lines.
+/// Freezing the blank too painted an empty frozen "You" turn into the transcript
+/// (the reported bug).
+#[test]
+fn commit_worksheet_skips_blank_lines() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.programmatic_insert(0, "hello\n\nworld\n");
+    let collected = vec![
+        (0usize, "hello".to_string()),
+        (1usize, String::new()),
+        (2usize, "world".to_string()),
+    ];
+    st.commit_worksheet_turn(&collected, "hello\nworld")
+        .expect("worksheet turn commits");
+    assert!(st.editor.is_frozen_line(0), "non-blank line is frozen");
+    assert!(
+        !st.editor.is_frozen_line(1),
+        "the blank spacer must stay editable — no empty frozen You region"
+    );
+    assert!(st.editor.is_frozen_line(2), "non-blank line is frozen");
+    let a1 = st.editor.anchor_for_line(1);
+    assert!(
+        st.editor.metadata::<TurnId>().get(a1).is_none(),
+        "the blank spacer must carry no User turn tag"
+    );
+}
+
+/// FIX 1 end-to-end: the render-time block detector must seed the editor's
+/// atomic-block set, so an `o`/`O`/Enter on the interior of a frozen code block
+/// is rejected (the "butchers Claude text" guard) — not just in a hand-built
+/// unit but through the real `rebuild_agent_view_model` wiring.
+#[test]
+fn rebuild_seeds_atomic_blocks_and_blocks_interior_insert() {
+    let theme = Theme::default();
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.programmatic_insert(0, "intro\n```\ncode\n```\n\n");
+    for l in 0..4usize {
+        st.editor.add_frozen_lines(l, l + 1);
+        let a = st.editor.anchor_for_line(l);
+        st.editor.metadata_mut::<TurnId>().insert(a, TurnId::Llm(1));
+    }
+    let lines: Vec<String> = (0..st.editor.document().line_count())
+        .map(|i| {
+            st.editor
+                .document()
+                .line_text(i)
+                .trim_end_matches('\n')
+                .to_string()
+        })
+        .collect();
+    let frozen = st.editor.frozen_lines().to_vec();
+    let frozen_len: usize = frozen.iter().map(|(s, e)| e - s).sum();
+    rebuild_agent_view_model(&mut st, &lines, &frozen, &theme, 1);
+    assert_eq!(
+        st.editor.atomic_blocks(),
+        &[(1usize, 4usize)],
+        "rebuild seeds the detected ```code``` block (lines 1..4) as atomic"
+    );
+    // An interior split (col 0 of the code line) is now a no-op.
+    let before = st.editor.document().line_count();
+    st.editor.cursor_mut().line = 2;
+    st.editor.cursor_mut().col = 0;
+    st.editor.open_line_above();
+    assert_eq!(
+        st.editor.document().line_count(),
+        before,
+        "interior code-block split is rejected end-to-end after rebuild seeds atomic blocks"
+    );
+}
+
+/// FIX 3 (phantom "You" header): a blank editable gap wedged between two frozen
+/// Claude turns must NOT sprout a "You" header. The old whole-rest-of-doc scan
+/// saw the downstream Claude lines as non-blank and emitted one; the scan is now
+/// bounded to the current editable run (all blank here).
+#[test]
+fn rebuild_blank_gap_between_claude_turns_has_no_you_header() {
+    let theme = Theme::default();
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.programmatic_insert(0, "answer one\n\nanswer two\n");
+    for (l, turn) in [(0usize, TurnId::Llm(1)), (2usize, TurnId::Llm(2))] {
+        st.editor.add_frozen_lines(l, l + 1);
+        let a = st.editor.anchor_for_line(l);
+        st.editor.metadata_mut::<TurnId>().insert(a, turn);
+    }
+    let lines: Vec<String> = (0..st.editor.document().line_count())
+        .map(|i| {
+            st.editor
+                .document()
+                .line_text(i)
+                .trim_end_matches('\n')
+                .to_string()
+        })
+        .collect();
+    let frozen = st.editor.frozen_lines().to_vec();
+    let frozen_len: usize = frozen.iter().map(|(s, e)| e - s).sum();
+    let (flat, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, &theme, 1);
+    assert!(
+        !flat
+            .iter()
+            .any(|f| matches!(f, FlatItem::TurnHeader { role: TurnRole::User })),
+        "a blank gap between two Claude turns must not emit a phantom You header"
+    );
+}
+
+/// FIX 3 inverse: a NON-blank editable interjection between two Claude turns is a
+/// real user turn and DOES get a "You" header.
+#[test]
+fn rebuild_text_gap_between_claude_turns_gets_you_header() {
+    let theme = Theme::default();
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.programmatic_insert(0, "answer one\nmy note\nanswer two\n");
+    for (l, turn) in [(0usize, TurnId::Llm(1)), (2usize, TurnId::Llm(2))] {
+        st.editor.add_frozen_lines(l, l + 1);
+        let a = st.editor.anchor_for_line(l);
+        st.editor.metadata_mut::<TurnId>().insert(a, turn);
+    }
+    let lines: Vec<String> = (0..st.editor.document().line_count())
+        .map(|i| {
+            st.editor
+                .document()
+                .line_text(i)
+                .trim_end_matches('\n')
+                .to_string()
+        })
+        .collect();
+    let frozen = st.editor.frozen_lines().to_vec();
+    let frozen_len: usize = frozen.iter().map(|(s, e)| e - s).sum();
+    let (flat, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, &theme, 1);
+    assert!(
+        flat.iter()
+            .any(|f| matches!(f, FlatItem::TurnHeader { role: TurnRole::User })),
+        "a real text interjection between Claude turns must get a You header"
     );
 }
 
@@ -560,12 +757,12 @@ fn theme_switch_invalidate_reparses_code_blocks() {
     let dark = Theme::nightfox();
     let (lines, frozen, frozen_len) = synthetic_transcript(1, 4);
 
-    let (flat1, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &light, 1);
+    let (flat1, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, &light, 1);
     let bg_light = first_code_block_bg(&flat1).expect("a parsed code block under the light theme");
 
     // No invalidate: same frozen count ⇒ the stale light-theme parse is reused
     // even though we rebuild under the dark theme. This is the bug.
-    let (flat2, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &dark, 2);
+    let (flat2, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, &dark, 2);
     assert_eq!(
         first_code_block_bg(&flat2),
         Some(bg_light),
@@ -575,7 +772,7 @@ fn theme_switch_invalidate_reparses_code_blocks() {
     // Invalidate, then rebuild under the dark theme: the block re-parses and
     // its baked background must now differ from the light theme's.
     st.view_model.invalidate_theme();
-    let (flat3, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &dark, 3);
+    let (flat3, _) = rebuild_agent_view_model(&mut st, &lines, &frozen, &dark, 3);
     let bg_dark = first_code_block_bg(&flat3).expect("a re-parsed code block under the dark theme");
     assert_ne!(
         bg_dark, bg_light,
@@ -595,14 +792,14 @@ fn worksheet_rebuild_cost_probe() {
     let (mut lines, frozen, frozen_len) = synthetic_transcript(50, 60);
 
     // Warm: parse all blocks once.
-    let _ = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &theme, 0);
+    let _ = rebuild_agent_view_model(&mut st, &lines, &frozen, &theme, 0);
 
     const ROUNDS: u64 = 200;
     let t0 = std::time::Instant::now();
     for k in 0..ROUNDS {
         let n = lines.len();
         lines[n - 1] = format!("typing {k}");
-        let _ = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &theme, k + 1);
+        let _ = rebuild_agent_view_model(&mut st, &lines, &frozen, &theme, k + 1);
     }
     let per = t0.elapsed() / ROUNDS as u32;
     eprintln!(
@@ -634,7 +831,7 @@ fn reveal_index_mirrors_flat_items_and_is_o1() {
     let (lines, frozen, frozen_len) = synthetic_transcript(4, 6);
 
     VIEW_MODEL_REBUILDS.with(|n| n.set(0));
-    let (flat, _gut) = rebuild_agent_view_model(&mut st, &lines, &frozen, frozen_len, &theme, 1);
+    let (flat, _gut) = rebuild_agent_view_model(&mut st, &lines, &frozen, &theme, 1);
 
     // (a) Every `Line(idx)` is reachable in O(1) at its REAL flat position —
     // the reverse index mirrors the canonical list exactly.
@@ -712,7 +909,7 @@ fn view_model_memoization_fast_skip() {
     assert!(st.view_model.cached(fp1).is_none(), "cold cache must miss");
     let (flat1, gut1) = st
         .view_model
-        .store(fp1, vec![FlatItem::Line(0)], vec![None], vec![0]);
+        .store(fp1, vec![FlatItem::Line(0)], vec![None], vec![0], vec![0]);
     assert_eq!(
         VIEW_MODEL_REBUILDS.with(|n| n.get()),
         1,
@@ -757,7 +954,7 @@ fn view_model_memoization_fast_skip() {
     );
     let (flat3, _gut3) = st
         .view_model
-        .store(fp2, vec![FlatItem::ThinkingIndicator], vec![None], vec![0]);
+        .store(fp2, vec![FlatItem::ThinkingIndicator], vec![None], vec![0], vec![]);
     assert_eq!(
         VIEW_MODEL_REBUILDS.with(|n| n.get()),
         2,

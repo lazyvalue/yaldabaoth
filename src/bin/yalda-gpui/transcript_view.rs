@@ -318,14 +318,7 @@ impl TranscriptView {
             let view_model_fp: u64 = c.view_model_fingerprint(line_count, frozen_line_count);
             let (flat_items_arc, gutter_tag_snap) = match c.view_model.cached(view_model_fp) {
                 Some(hit) => hit,
-                None => rebuild_agent_view_model(
-                    c,
-                    lines,
-                    &frozen_ranges,
-                    frozen_line_count,
-                    &theme,
-                    view_model_fp,
-                ),
+                None => rebuild_agent_view_model(c, lines, &frozen_ranges, &theme, view_model_fp),
             };
 
             let new_count = flat_items_arc.len();

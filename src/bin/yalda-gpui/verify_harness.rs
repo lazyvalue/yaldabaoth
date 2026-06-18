@@ -383,6 +383,66 @@ fn edit_newline_delete_keeps_viewport_anchored(cx: &mut TestAppContext) {
     );
 }
 
+/// A pure COLUMN move (cursor_line unchanged) must re-reveal the cursor's line.
+/// The reveal anchor used to be `(edit_seq, cursor_line)` only, so moving the
+/// caret horizontally along a wide soft-wrapped line (e.g. a markdown table row)
+/// never scrolled — the caret on a wrapped continuation row drifted off-screen.
+/// With `cursor_col` in the anchor, the column move scrolls the line back into
+/// view.
+#[gpui::test]
+fn edit_column_move_reveals_cursor_line(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        let mut v = YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        );
+        // Line 0 is a wide (wrapping) row; many short lines follow it.
+        let mut buf = String::new();
+        buf.push_str(&"word ".repeat(60));
+        buf.push('\n');
+        for i in 0..80 {
+            buf.push_str(&format!("line {i}\n"));
+        }
+        v.test_open_edit(&buf);
+        v
+    });
+    vcx.run_until_parked();
+
+    // Scroll the viewport far below line 0 (so line 0 is off-screen), WITHOUT a
+    // cursor change — the reveal must not fire yet (cursor still at 0,0).
+    view.update(vcx, |v, _cx| {
+        let e = v.edit_mut().expect("edit view");
+        e.list.state().scroll_to(gpui::ListOffset {
+            item_ix: 50,
+            offset_in_item: px(0.),
+        });
+    });
+
+    // A column-only move on line 0 (no edit, same line) must re-reveal it.
+    view.update(vcx, |v, cx| {
+        let e = v.edit_mut().expect("edit view");
+        e.editor.set_cursor(0, 30);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    let top = view.update(vcx, |v, _| {
+        v.edit_mut()
+            .expect("edit view")
+            .list
+            .state()
+            .logical_scroll_top()
+            .item_ix
+    });
+    assert_eq!(
+        top, 0,
+        "a column move on line 0 must scroll it back into view (item 0), got {top}"
+    );
+}
+
 /// Latency gate (audit #1/#2): prove the Doc view renders **O(visible)**, not
 /// O(document). Open a 3000-block doc and render it — the virtualized
 /// `gpui::list` must build only the visible block window (a few dozen
@@ -1184,7 +1244,7 @@ fn agent_seam_unsuppressed_echo_during_inflight_turn_gets_distinct_k(cx: &mut Te
 /// (a menu stranded behind a rename) is no longer representable.
 #[gpui::test]
 fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
-    use crate::{ActiveOverlay, BufferSwitcher, SessionSwitcher};
+    use crate::{ActiveOverlay, BufferSwitcher, WorkspacePicker, WorkspacePickerMode};
 
     let (view, vcx) = cx.add_window_view(|window, cx| {
         let focus_handle = cx.focus_handle();
@@ -1210,17 +1270,17 @@ fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
         assert!(
             v.menu_ref().is_none()
                 && v.rename_ref().is_none()
-                && v.session_ref().is_none()
                 && v.workspace_picker_ref().is_none(),
             "exactly one variant active — mutual exclusion is type-enforced"
         );
 
         // open REPLACES, never stacks: opening a different overlay drops the
         // previous one (the tab-double-click-behind-menu case can't strand).
-        v.open_overlay(ActiveOverlay::SessionSwitcher(SessionSwitcher {
+        v.open_overlay(ActiveOverlay::WorkspacePicker(WorkspacePicker {
+            mode: WorkspacePickerMode::Move,
             selected: 0,
         }));
-        assert!(v.overlay_is_session());
+        assert!(v.overlay_is_workspace());
         assert!(
             v.buffer_ref().is_none(),
             "buffer overlay dropped on replace"

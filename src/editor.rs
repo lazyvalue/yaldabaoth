@@ -215,6 +215,17 @@ pub struct EditorCore {
     /// turn finalize / anchor reset. Treated as a hint: the caller re-validates
     /// the tag before trusting it and falls back to the full scan on a miss.
     last_llm_line: Option<usize>,
+    /// Half-open line ranges of *atomic* frozen blocks — multi-line structural
+    /// units (fenced code blocks, tables) that must NEVER be split by an insert,
+    /// because they only render correctly as a whole. A SUBSET of `frozen_lines`.
+    /// Each single frozen *prose* line is its own block and is deliberately
+    /// absent here, so inserting *between* two prose lines stays legal (the
+    /// "insert between frozen blocks" gesture); only the *interior* of an atomic
+    /// block is locked. Re-seeded from the render-time block detector whenever
+    /// the frozen layout changes (`set_atomic_blocks`); shifted in lock-step with
+    /// `frozen_lines` by the insert/delete paths so it stays current between
+    /// re-seeds. Sorted, non-overlapping.
+    atomic_blocks: Vec<(usize, usize)>,
 }
 
 /// Per-window cursor, selection, and insert-mode state attached to an
@@ -259,6 +270,7 @@ impl EditorCore {
             line_anchors: LineAnchorStore::default(),
             line_metadata: LineMetadataStore::default(),
             last_llm_line: None,
+            atomic_blocks: Vec::new(),
         }
     }
 
@@ -412,6 +424,23 @@ impl EditorCore {
 
     pub fn clear_frozen_ranges(&mut self) {
         self.frozen_lines.clear();
+        self.atomic_blocks.clear();
+    }
+
+    /// Replace the atomic-block ranges (fenced code blocks / tables) — the
+    /// indivisible structural subset of `frozen_lines`. Called from the render
+    /// path's block detector whenever the frozen layout changes, so the insert
+    /// guard (`can_insert_char_at`) reflects the current structure. Ranges are
+    /// clamped to in-bounds and stored sorted; an out-of-range or empty range is
+    /// dropped defensively.
+    pub fn set_atomic_blocks(&mut self, mut ranges: Vec<(usize, usize)>) {
+        ranges.retain(|&(s, e)| s < e);
+        ranges.sort_unstable_by_key(|&(s, _)| s);
+        self.atomic_blocks = ranges;
+    }
+
+    pub fn atomic_blocks(&self) -> &[(usize, usize)] {
+        &self.atomic_blocks
     }
 
     /// Drop every allocated anchor and all `LineMetadata`. Used by undo/redo,
@@ -459,7 +488,14 @@ impl EditorCore {
     ///   - the line is past the locked prefix, AND
     ///   - the line is editable, OR the insert is `\n` at a line boundary of a
     ///     frozen line (col 0 or end-of-line) — opens a new editable line
-    ///     before/after the frozen line without splitting it.
+    ///     before/after the frozen line without splitting it, AND
+    ///   - that boundary is NOT the interior of an atomic block (a fenced code
+    ///     block or table): those are one indivisible frozen block, so a `\n` is
+    ///     legal only at the very top (col 0 of the first line, inserts above) or
+    ///     the very bottom (end of the last line, inserts below) — never between
+    ///     two interior lines, which would split the block and corrupt its render.
+    ///     Single frozen *prose* lines are not atomic, so inserting between two of
+    ///     them stays legal (the "insert between frozen blocks" gesture).
     fn can_insert_char_at(&self, line: usize, col: usize, ch: char) -> bool {
         if line < self.lockable_through_line {
             return false;
@@ -476,7 +512,19 @@ impl EditorCore {
         } else {
             0
         });
-        col == 0 || col >= line_end
+        let at_line_start = col == 0;
+        let at_line_end = col >= line_end;
+        if !(at_line_start || at_line_end) {
+            return false;
+        }
+        // Atomic-block interior guard: if this line belongs to an atomic block,
+        // only its outer boundaries are insertable.
+        if let Some(&(s, e)) = self.atomic_blocks.iter().find(|&&(s, e)| line >= s && line < e) {
+            let above_block = at_line_start && line == s;
+            let below_block = at_line_end && line + 1 == e;
+            return above_block || below_block;
+        }
+        true
     }
 
     /// Delete of `[del_s, del_e)` (char indices) is allowed iff:
@@ -556,6 +604,20 @@ impl EditorCore {
             self.lockable_through_line += inserted_nl;
         }
 
+        // Atomic blocks shift wholesale (they are never split — the insert guard
+        // forbids interior inserts), so a range is either entirely below the
+        // insert (move down) or entirely above (unchanged). The straddle branch
+        // is unreachable via the guarded path; defensively grow the range so it
+        // keeps covering its lines rather than stranding the tail.
+        for (s, e) in self.atomic_blocks.iter_mut() {
+            if *s >= eff_line {
+                *s += inserted_nl;
+                *e += inserted_nl;
+            } else if *e > eff_line {
+                *e += inserted_nl;
+            }
+        }
+
         self.line_anchors
             .shift_for_insert(eff_line, eff_col, inserted_nl);
 
@@ -587,6 +649,15 @@ impl EditorCore {
         }
         let (start_line, start_col) = char_to_line_col(&self.document, del_s);
         for (s, e) in self.frozen_lines.iter_mut() {
+            if *s > start_line {
+                *s = s.saturating_sub(deleted_nl);
+                *e = e.saturating_sub(deleted_nl);
+            }
+        }
+        // Atomic blocks mirror the frozen-range shift (a delete can never touch a
+        // frozen/atomic line per `can_delete_range`, so a block only moves up
+        // when editable lines above it are removed).
+        for (s, e) in self.atomic_blocks.iter_mut() {
             if *s > start_line {
                 *s = s.saturating_sub(deleted_nl);
                 *e = e.saturating_sub(deleted_nl);
@@ -1273,6 +1344,14 @@ impl Editor {
         self.core.clear_frozen_ranges();
     }
 
+    pub fn set_atomic_blocks(&mut self, ranges: Vec<(usize, usize)>) {
+        self.core.set_atomic_blocks(ranges);
+    }
+
+    pub fn atomic_blocks(&self) -> &[(usize, usize)] {
+        self.core.atomic_blocks()
+    }
+
     pub fn is_frozen_line(&self, line: usize) -> bool {
         self.core.is_frozen_line(line)
     }
@@ -1955,6 +2034,103 @@ mod tests {
         // Past-the-end clamps to the last line.
         ed.jump_to_line(999);
         assert_eq!(ed.cursor().line, ed.document().line_count() - 1);
+    }
+
+    /// A multi-line atomic frozen block (fenced code / table) must not be split
+    /// by an insert: a newline is legal only above the first line or below the
+    /// last, never between two interior lines. This is the "butchers Claude text"
+    /// guard — `o`/`O`/Enter on a block interior is a no-op.
+    #[test]
+    fn atomic_block_interior_insert_is_rejected() {
+        // lines 0..3 = an atomic code block; line 3 = editable tail.
+        let mut ed = new_editor("```\ncode\n```\n\n");
+        ed.add_frozen_lines(0, 3);
+        ed.set_atomic_blocks(vec![(0, 3)]);
+        let before = ed.document().line_count();
+
+        // `o` at end of line 0 (between fence and body) → interior split → reject.
+        ed.cursor_mut().line = 0;
+        ed.cursor_mut().col = ed.document().line_len_chars(0);
+        ed.open_line_below();
+        assert_eq!(
+            ed.document().line_count(),
+            before,
+            "interior split via open-line-below must be rejected"
+        );
+
+        // `O` at col 0 of an interior line → interior split → reject.
+        ed.cursor_mut().line = 1;
+        ed.cursor_mut().col = 0;
+        ed.open_line_above();
+        assert_eq!(
+            ed.document().line_count(),
+            before,
+            "col-0 interior split via open-line-above must be rejected"
+        );
+
+        // A bare typed newline mid-interior is likewise rejected.
+        ed.cursor_mut().line = 1;
+        ed.cursor_mut().col = 0;
+        ed.insert_char('\n');
+        assert_eq!(
+            ed.document().line_count(),
+            before,
+            "interior newline insert must be rejected"
+        );
+    }
+
+    /// The atomic block's OUTER boundaries stay insertable — you can open an
+    /// editable line above the whole block or below it, just not inside.
+    #[test]
+    fn atomic_block_outer_boundaries_allow_insert() {
+        let mut ed = new_editor("```\ncode\n```\nx\n");
+        ed.add_frozen_lines(0, 3);
+        ed.set_atomic_blocks(vec![(0, 3)]);
+
+        // Above the block: col 0 of the first line.
+        ed.cursor_mut().line = 0;
+        ed.cursor_mut().col = 0;
+        let before = ed.document().line_count();
+        ed.open_line_above();
+        assert_eq!(
+            ed.document().line_count(),
+            before + 1,
+            "insert above the block is allowed"
+        );
+
+        // Below the block: end of the last block line (now line 3 after the
+        // insert above shifted everything down by one).
+        ed.cursor_mut().line = 3;
+        ed.cursor_mut().col = ed.document().line_len_chars(3);
+        let before2 = ed.document().line_count();
+        ed.open_line_below();
+        assert_eq!(
+            ed.document().line_count(),
+            before2 + 1,
+            "insert below the block is allowed"
+        );
+    }
+
+    /// Single frozen PROSE lines are NOT atomic — inserting an editable line
+    /// *between* two of them is the intended "insert between frozen blocks"
+    /// gesture and must be allowed, leaving the new line editable.
+    #[test]
+    fn frozen_prose_lines_stay_insertable_between() {
+        let mut ed = new_editor("alpha\nbeta\n\n");
+        ed.add_frozen_lines(0, 2); // lines 0,1 are frozen prose; no atomic blocks
+        ed.cursor_mut().line = 0;
+        ed.cursor_mut().col = ed.document().line_len_chars(0);
+        let before = ed.document().line_count();
+        ed.open_line_below();
+        assert_eq!(
+            ed.document().line_count(),
+            before + 1,
+            "insert between two frozen prose lines is allowed"
+        );
+        assert!(
+            !ed.is_frozen_line(1),
+            "the line opened between prose lines is editable"
+        );
     }
 
     #[test]

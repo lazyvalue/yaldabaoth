@@ -3115,8 +3115,17 @@ impl YaldaGpuiView {
                     let (cl, cc) = doc_char_to_line_col(claude.editor.document(), new_eof);
                     claude.editor.cursor_mut().line = cl;
                     claude.editor.cursor_mut().col = cc;
+                } else {
+                    // Empty draft: drop the caret on the editable tail at the
+                    // bottom of the transcript, so entering Worksheet mode lands
+                    // you where you type rather than wherever the caret happened
+                    // to be in the frozen history above.
+                    let last = claude.editor.document().line_count().saturating_sub(1);
+                    claude.editor.jump_to_line(last);
                 }
                 claude.editor.clear_selection();
+                // Scroll the transcript to the caret (the bottom) on the next render.
+                claude.pending_reveal_cursor = true;
             }
             InputSurface::Worksheet => {
                 claude.input_surface = InputSurface::Chatbox(Chatbox::new());
@@ -3592,12 +3601,6 @@ impl YaldaGpuiView {
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
 
-        // Session switcher overlay intercepts all keys when open.
-        if self.overlay_is_session() {
-            self.handle_session_switcher_key(ev, _w, cx);
-            return;
-        }
-
         // Universal leaders: when NOT in text entry (worksheet/chatbox Normal),
         // `<space>`/`.`/`?` open the menus with top priority.
         if self.leader_intercept(&press, cx) {
@@ -3725,12 +3728,43 @@ impl YaldaGpuiView {
                     Self::dispatch_insert_core(&mut claude.editor, &mut claude.mode, press);
                     NormalOutcome::Handled
                 }
-                EditMode::Normal => Self::dispatch_normal_core(
-                    &mut claude.editor,
-                    &mut claude.mode,
-                    &mut claude.keybinds,
-                    press,
-                ),
+                EditMode::Normal => {
+                    let before = claude.editor.cursor().line;
+                    let before_seq = claude.editor.document().edit_seq();
+                    let outcome = Self::dispatch_normal_core(
+                        &mut claude.editor,
+                        &mut claude.mode,
+                        &mut claude.keybinds,
+                        press,
+                    );
+                    // Block-paged navigation (option B): snap a PURE vertical move
+                    // to the nearest navigable stop in the move direction, so tool
+                    // groups / code blocks / interior frozen lines are crossed in
+                    // one keystroke and the caret only rests on real (editable /
+                    // frozen-prose-start) lines. Gate HARD on "pure navigation":
+                    //   * still Normal mode → excludes o/O/i/a (insert entry), and
+                    //   * no document edit (edit_seq unchanged) → excludes paste /
+                    //     dd / x …, whose new lines aren't in the (stale) stop list
+                    //     yet and would otherwise yank the caret onto a frozen line
+                    //     so you can't type — the "can't insert after `o`" bug.
+                    // Every editable line is a stop, so the editable tail is always
+                    // reachable; `None` only on a leading block with nothing above,
+                    // where staying put is correct.
+                    let landed = claude.editor.cursor().line;
+                    if claude.mode == EditMode::Normal
+                        && claude.editor.document().edit_seq() == before_seq
+                        && landed != before
+                    {
+                        match claude.view_model.snap_nav_stop(landed, landed >= before) {
+                            Some(target) if target != landed => {
+                                claude.editor.jump_to_line(target);
+                            }
+                            Some(_) => {}
+                            None => claude.editor.jump_to_line(before),
+                        }
+                    }
+                    outcome
+                }
             }
         }) else {
             return;
