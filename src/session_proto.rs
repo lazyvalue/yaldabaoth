@@ -165,7 +165,7 @@ pub enum ResponseData {
 }
 
 /// Metadata about a managed session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: ServerSessionId,
     pub acp_session_id: Option<String>,

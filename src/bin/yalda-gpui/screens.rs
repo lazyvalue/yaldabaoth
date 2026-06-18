@@ -1748,7 +1748,23 @@ impl YaldaGpuiView {
         // header rule, a single full-width row list, and a hint footer —
         // not the old two-column card layout.
         let ov = &self.theme.overlay;
-        let selected = tile.picker.as_ref().map(|p| p.selected).unwrap_or(0);
+        // Rows are PROJECTED from the universal roster (universal-agent-list)
+        // for this picker's cwd — not a per-tile cache — so the selector
+        // auto-tracks rename / add / close / selection. `free` = selectable rows
+        // 1..=N; `bound` = sessions in use by some tile (informational).
+        let picker_cwd = tile.picker.as_ref().map(|p| p.cwd.clone());
+        let (free, bound): (Vec<PickerSession>, Vec<PickerSession>) = picker_cwd
+            .as_ref()
+            .map(|cwd| self.picker_projection(cwd))
+            .unwrap_or_default();
+        // Clamp the highlight to the current row count (the projection may have
+        // shrunk since the user last moved).
+        let row_count = 1 + free.len();
+        let selected = tile
+            .picker
+            .as_ref()
+            .map(|p| p.selected.min(row_count.saturating_sub(1)))
+            .unwrap_or(0);
 
         let header = div()
             .flex()
@@ -1781,51 +1797,39 @@ impl YaldaGpuiView {
             cx,
         ));
 
-        match tile.picker.as_ref().and_then(|p| p.sessions.as_ref()) {
-            None => {
-                list = list.child(
-                    div()
-                        .px_2()
-                        .py_0p5()
-                        .text_color(nc(ov.label))
-                        .child(SharedString::new_static("  loading sessions…")),
+        if free.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_0p5()
+                    .text_color(nc(ov.label))
+                    .child(SharedString::new_static(
+                        "  No existing sessions for this folder.",
+                    )),
+            );
+        } else {
+            for (i, s) in free.iter().enumerate() {
+                let row = i + 1;
+                let liveness = if s.connected { "live" } else { "idle" };
+                let sub = format!(
+                    "{} turn{} · {}",
+                    s.turns,
+                    if s.turns == 1 { "" } else { "s" },
+                    liveness,
                 );
-            }
-            Some(sessions) if sessions.is_empty() => {
-                let msg = tile
-                    .picker
-                    .as_ref()
-                    .and_then(|p| p.error.clone())
-                    .unwrap_or_else(|| {
-                        SharedString::new_static("  No existing sessions for this folder.")
-                    });
-                list = list.child(div().px_2().py_0p5().text_color(nc(ov.label)).child(msg));
-            }
-            Some(sessions) => {
-                for (i, s) in sessions.iter().enumerate() {
-                    let row = i + 1;
-                    let liveness = if s.connected { "live" } else { "idle" };
-                    let sub = format!(
-                        "{} turn{} · {}",
-                        s.turns,
-                        if s.turns == 1 { "" } else { "s" },
-                        liveness,
-                    );
-                    list = list.child(self.picker_row(
-                        row,
-                        selected == row,
-                        SharedString::from(s.label.clone()),
-                        Some(SharedString::from(sub)),
-                        ov,
-                        cx,
-                    ));
-                }
+                list = list.child(self.picker_row(
+                    row,
+                    selected == row,
+                    SharedString::from(s.label.clone()),
+                    Some(SharedString::from(sub)),
+                    ov,
+                    cx,
+                ));
             }
         }
 
-        // Bound sessions (bound to another tile): listed dim and non-
-        // interactive — they can't be attached from here (1:1 binding).
-        let bound = tile.picker.as_ref().map(|p| p.bound.as_slice()).unwrap_or(&[]);
+        // Bound sessions (bound to some tile): listed dim and non-interactive —
+        // they can't be attached from here (1:1 binding).
         if !bound.is_empty() {
             list = list.child(
                 div()

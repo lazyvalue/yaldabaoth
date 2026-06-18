@@ -66,6 +66,7 @@
 //!     q / Esc              close browser (returns to doc, or quits)
 
 mod agent;
+mod agent_roster;
 mod agent_sessions;
 mod agent_ui;
 mod browser_ui;
@@ -86,6 +87,7 @@ mod verify_harness;
 /// All UX work is built from here; see `yux/CLAUDE.md`.
 mod yux;
 pub(crate) use agent::*;
+pub(crate) use agent_roster::*;
 pub(crate) use agent_sessions::*;
 pub(crate) use jump_panel_view::*;
 pub(crate) use linear::*;
@@ -1603,6 +1605,12 @@ struct YaldaGpuiView {
     /// store; the store enforces strict 1:1 session↔sid and is the single
     /// source of truth for session existence (placement is the tiles).
     sessions: AgentSessions,
+    /// Universal agent-session roster (universal-agent-list): a live cache of
+    /// EVERY session the server knows about (incl. ones never opened here),
+    /// keyed by sid. Seeded by `list_sessions`, kept live by the server's
+    /// Created/Closed/Renamed broadcasts. The single source the jump panel + the
+    /// per-tile selector both project from. See `agent_roster.rs`.
+    agent_roster: AgentRoster,
     /// One [`TranscriptView`] per session (ticket 021): the cached, self-
     /// invalidating transcript widget. Lazily created on the first
     /// `render_agent` of a bound tile (the constructor registers the
@@ -1655,6 +1663,7 @@ impl YaldaGpuiView {
             pending_mark_chord: None,
             pending_tag_chord: None,
             sessions: AgentSessions::new(),
+            agent_roster: AgentRoster::default(),
             transcript_views: HashMap::new(),
             jump_panel_scroll: ScrollHandle::new(),
             jump_panel_visible: true,
@@ -1689,6 +1698,7 @@ impl YaldaGpuiView {
             pending_mark_chord: None,
             pending_tag_chord: None,
             sessions: AgentSessions::new(),
+            agent_roster: AgentRoster::default(),
             transcript_views: HashMap::new(),
             jump_panel_scroll: ScrollHandle::new(),
             jump_panel_visible: true,
@@ -1888,27 +1898,22 @@ impl YaldaGpuiView {
                             agent_sessions::Bind::AlreadyOpen(_) => {
                                 if let Some(tile) = self.agent_tile_mut() {
                                     tile.bound = None;
-                                    tile.picker =
-                                        Some(SessionPicker::loading(slot_cwd.clone()));
+                                    tile.picker = Some(SessionPicker::new(slot_cwd));
                                 }
-                                self.spawn_list_sessions_for_picker(
-                                    Some(leaf_id),
-                                    slot_cwd,
-                                    cx,
-                                );
+                                // Selector projects from the roster; seed it.
+                                self.refresh_roster(cx);
                             }
                         }
                     }
                     None => {
                         // More agent leaves than persisted sessions: open this
-                        // one straight into the free-session selector.
+                        // one straight into the free-session selector (it
+                        // projects from the universal roster — seed it).
                         if let Some(tile) = self.agent_tile_mut() {
                             tile.bound = None;
-                            tile.picker = Some(SessionPicker::loading(proc_cwd.clone()));
+                            tile.picker = Some(SessionPicker::new(proc_cwd.clone()));
                         }
-                        // Address the list back to THIS leaf (INV-PR), not
-                        // whatever ends up focused once all leaves are restored.
-                        self.spawn_list_sessions_for_picker(Some(leaf_id), proc_cwd.clone(), cx);
+                        self.refresh_roster(cx);
                     }
                 }
             }
@@ -2136,25 +2141,6 @@ impl YaldaGpuiView {
             App::Agent(tile) => Some(tile),
             _ => None,
         }
-    }
-
-    /// Compute the set of FREE sessions: those in the store that no tile binds
-    /// (spec-agent-session-ownership.md). Cheap scan — tiles are few.
-    fn free_session_ids(&self) -> Vec<SessionId> {
-        let mut bound: HashSet<SessionId> = HashSet::new();
-        for tab in self.workspace.tabs.iter() {
-            tab.layout.for_each_leaf(&mut |w| {
-                if let App::Agent(tile) = &w.content
-                    && let Some(id) = tile.bound
-                {
-                    bound.insert(id);
-                }
-            });
-        }
-        self.sessions
-            .ids()
-            .filter(|id| !bound.contains(id))
-            .collect()
     }
 
     /// THE single bind choke (spec-agent-session-ownership.md). Show the
@@ -7190,6 +7176,15 @@ fn main() {
                         }
                         if let Some(v) = prefs.jump_panel_visible {
                             view.jump_panel_visible = v;
+                        }
+                        // Universal agent roster (universal-agent-list): start
+                        // the server pump + seed the roster at boot (not only
+                        // when an agent tile opens), so the jump panel shows
+                        // every active session from the first frame and stays
+                        // live via the Created/Closed/Renamed broadcasts.
+                        if view.session_server.is_some() {
+                            view.start_server_pump(cx);
+                            view.refresh_roster(cx);
                         }
                         // If we were launched with no explicit file arg, try to
                         // restore the saved workspace for this cwd. With an

@@ -27,6 +27,75 @@ use super::*;
 /// document zoom (consistent with the tab strip / rail).
 pub(crate) const JUMP_PANEL_WIDTH: f32 = 220.0;
 
+/// What a jump-panel agent row points at (universal-agent-list). A session may
+/// be opened here (`Local`, keyed by store `SessionId`) or known only to the
+/// server via the roster (`Roster`, keyed by server sid) — running but never
+/// opened in this GUI.
+#[derive(Clone)]
+pub(crate) enum JumpTarget {
+    Local(SessionId),
+    Roster(String),
+}
+
+/// One row in the jump panel's "Agent sessions" section.
+pub(crate) struct AgentRow {
+    pub(crate) target: JumpTarget,
+    pub(crate) label: String,
+    /// A tile in this GUI currently binds the session (in use).
+    pub(crate) bound: bool,
+    /// The agent subprocess is live (from the roster's `connected`); local-only
+    /// pre-attach sessions are treated as connected.
+    pub(crate) connected: bool,
+}
+
+impl YaldaGpuiView {
+    /// Build the deduped agent-session rows for the jump panel: the universal
+    /// roster (every server session) unioned with local-only sessions not yet
+    /// represented in the roster (mid-create placeholders). Sessions opened here
+    /// prefer their live store label; binding status comes from the tiles.
+    pub(crate) fn jump_panel_agent_rows(&self, cx: &gpui::App) -> Vec<AgentRow> {
+        let bound_sids = self.bound_sid_set();
+        let mut rows: Vec<AgentRow> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for info in self.agent_roster.entries_by_label() {
+            seen.insert(info.session_id.clone());
+            let bound = bound_sids.contains(&info.session_id);
+            // Prefer the live store label if this session is opened here (kept in
+            // sync by SessionRenamed either way, but the entity is authoritative).
+            let label = self
+                .sessions
+                .locate(&info.session_id)
+                .and_then(|id| self.sessions.get(id))
+                .map(|e| e.read(cx).label.clone())
+                .unwrap_or_else(|| info.label.clone());
+            rows.push(AgentRow {
+                target: JumpTarget::Roster(info.session_id.clone()),
+                label,
+                bound,
+                connected: info.connected,
+            });
+        }
+
+        // Local-only sessions the roster hasn't caught up to (e.g. a just-created
+        // placeholder whose sid isn't bound yet, or before the first refresh).
+        for (id, ent) in self.sessions.iter() {
+            if let Some(sid) = self.sessions.sid_of(id)
+                && seen.contains(sid)
+            {
+                continue;
+            }
+            rows.push(AgentRow {
+                target: JumpTarget::Local(id),
+                label: ent.read(cx).label.clone(),
+                bound: self.agent_tile_id_bound_to(id).is_some(),
+                connected: true,
+            });
+        }
+        rows
+    }
+}
+
 impl YaldaGpuiView {
     /// Build the jump-panel sidebar element (inline; see the module note).
     /// Reads workspaces + agent sessions + theme directly off `self`; row clicks
@@ -60,20 +129,10 @@ impl YaldaGpuiView {
             .map(|(idx, t)| (idx, t.display_label().to_string(), idx == self.workspace.active_tab))
             .collect();
 
-        // Sessions: every store id, its label, and whether a tile binds it.
-        let session_ids: Vec<SessionId> = self.sessions.ids().collect();
-        let sessions: Vec<(SessionId, String, bool)> = session_ids
-            .into_iter()
-            .map(|id| {
-                let bound = self.agent_tile_id_bound_to(id).is_some();
-                let label = self
-                    .sessions
-                    .get(id)
-                    .map(|ent| ent.read(cx).label.clone())
-                    .unwrap_or_default();
-                (id, label, bound)
-            })
-            .collect();
+        // Agent sessions: the UNIVERSAL roster (universal-agent-list) — every
+        // session the server knows about, opened here or not — unioned with any
+        // local-only sessions still mid-create. See `jump_panel_agent_rows`.
+        let rows = self.jump_panel_agent_rows(cx);
 
         let mut col = div()
             .id("jump-panel")
@@ -114,7 +173,7 @@ impl YaldaGpuiView {
 
         // ── Agent sessions ─────────────────────────────────────────────────—
         col = col.child(section_heading("Agent sessions", &st).px_3());
-        if sessions.is_empty() {
+        if rows.is_empty() {
             col = col.child(
                 div()
                     .px_3()
@@ -125,16 +184,20 @@ impl YaldaGpuiView {
                     .child(SharedString::from("No sessions.")),
             );
         }
-        for (sid, label, bound) in sessions {
-            // Bound sessions jump to their existing tile; free ones open in an
-            // ephemeral virtual workspace. A small glyph distinguishes them.
-            let badge = if bound { "●" } else { "○" };
-            let row_id = SharedString::from(format!("jump-sess-{}", sid.0));
-            col = col.child(
-                jump_nav_row(row_id, &label, false, false, Some(badge), &st, sel_bg).on_click(
-                    cx.listener(move |this, _ev, _window, cx| this.jump_to_session(sid, cx)),
-                ),
-            );
+        for (i, row) in rows.into_iter().enumerate() {
+            // Bound (in-use) sessions jump to their existing tile; free ones
+            // open in an ephemeral virtual workspace. ● = in use, ○ = free; a
+            // disconnected (agent not running) session is dimmed.
+            let badge = if row.bound { "●" } else { "○" };
+            let row_id = SharedString::from(format!("jump-sess-{i}"));
+            let target = row.target.clone();
+            let mut r = jump_nav_row(row_id, &row.label, false, false, Some(badge), &st, sel_bg);
+            if !row.connected {
+                r = r.text_color(st.dim);
+            }
+            col = col.child(r.on_click(
+                cx.listener(move |this, _ev, _window, cx| this.jump_to_agent(target.clone(), cx)),
+            ));
         }
 
         col.into_any_element()
