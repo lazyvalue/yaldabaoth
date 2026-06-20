@@ -2566,7 +2566,7 @@ fn install_agent_picker(
             });
         }
         let mut tile = AgentTile::new();
-        tile.picker = Some(SessionPicker::new(PathBuf::from(".")));
+        tile.picker = Some(SessionPicker::new());
         v.set_screen(App::Agent(tile));
     });
 }
@@ -2593,7 +2593,9 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     view.read_with(vcx, |v, cx| {
         let tile = v.agent_tile().expect("agent tile");
         assert!(tile.bound.is_none(), "tile stays unbound until a row binds");
-        let cwd = tile.picker.as_ref().unwrap().cwd.clone();
+        // The picker has no cached cwd — it projects from the active workspace's
+        // live cwd (`agent_base_cwd`).
+        let cwd = v.agent_base_cwd();
         assert!(v.picker_projection(&cwd).0.is_empty(), "no free rows yet");
     });
 
@@ -2603,8 +2605,7 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     install_agent_picker(&view, &mut *vcx, &[("S1", "claude-1"), ("S2", "claude-2")]);
     vcx.run_until_parked();
     view.read_with(vcx, |v, cx| {
-        let cwd = v.agent_tile().unwrap().picker.as_ref().unwrap().cwd.clone();
-        let (free, bound) = v.picker_projection(&cwd);
+        let (free, bound) = v.picker_projection(&v.agent_base_cwd());
         assert_eq!(free.len(), 2, "two FREE sessions projected from the roster");
         assert!(bound.is_empty(), "none bound to a tile yet");
     });
@@ -2640,12 +2641,10 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
     // An unbound selector tile. Both sessions are FREE.
     view.update(vcx, |v, cx| {
         let mut t = AgentTile::new();
-        t.picker = Some(SessionPicker::new(PathBuf::from(".")));
+        t.picker = Some(SessionPicker::new());
         v.set_screen(App::Agent(t));
     });
-    let cwd = view.read_with(vcx, |v, _| {
-        v.agent_tile().unwrap().picker.as_ref().unwrap().cwd.clone()
-    });
+    let cwd = view.read_with(vcx, |v, _| v.agent_base_cwd());
     view.read_with(vcx, |v, _| {
         let (free, bound) = v.picker_projection(&cwd);
         assert_eq!(free.len(), 2, "both sessions free before any binding");
@@ -2665,6 +2664,92 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
         assert_eq!(bound.len(), 1, "S1 now shows in the IN USE column");
         assert_eq!(bound[0].sid, "S1");
     });
+}
+
+/// The workspace cwd (`Set CWD`) is PERSISTED: it survives a save→restore
+/// (process restart). Hermetic — the workspace file is redirected to a tempdir
+/// (no touch to `~/.yalda`). Save writes `PersistedTab.cwd`; restore reads it
+/// back into the typed `Tab.cwd` (ADR-0023).
+#[gpui::test]
+fn workspace_cwd_persists_across_restart(cx: &mut TestAppContext) {
+    use crate::persist::with_workspace_path;
+    use crate::workspace::WorkspaceCwd;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("workspace.json");
+    let set = std::env::temp_dir().join("yalda-persisted-cwd");
+
+    // Session 1: Set CWD on the active workspace, then save to disk.
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+    with_workspace_path(file.clone(), || {
+        view.update(vcx, |v, _cx| {
+            v.workspace
+                .active_tab_mut()
+                .expect("active tab")
+                .set_cwd(WorkspaceCwd::new(set.clone()));
+            v.save_workspace_state();
+        });
+    });
+
+    // Session 2 ("restart"): a fresh view restores from the same file — the cwd
+    // we set is back, so a new agent would again inherit it.
+    let (view2, vcx2) = cx.add_window_view(hermetic_browser_view);
+    vcx2.run_until_parked();
+    let restored = with_workspace_path(file.clone(), || {
+        view2.update(vcx2, |v, cx| {
+            assert!(v.restore_workspace_from_disk(cx), "a snapshot was restored");
+            v.active_workspace_cwd()
+        })
+    });
+    assert_eq!(
+        restored,
+        Some(set),
+        "the workspace cwd set via Set CWD survives a save→restore"
+    );
+}
+
+/// A new agent inherits the workspace's LIVE cwd at create time — including a
+/// `Set CWD` done AFTER the selector was already open. Regression: the selector
+/// cached its cwd when it opened, so "open agent → Set CWD → Start a new
+/// session" created the agent in the OLD dir. The picker no longer caches a cwd;
+/// `Start a new session` reads `agent_base_cwd` live.
+#[gpui::test]
+fn new_agent_uses_live_workspace_cwd_after_set_cwd(cx: &mut TestAppContext) {
+    use crate::workspace::WorkspaceCwd;
+    use crate::{AgentTile, App, SessionPicker};
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    // An agent tile sitting in its selector (picker open) BEFORE any Set CWD.
+    view.update(vcx, |v, _cx| {
+        let mut t = AgentTile::new();
+        t.picker = Some(SessionPicker::new());
+        v.set_screen(App::Agent(t));
+    });
+
+    // Now Set CWD on the active workspace — AFTER the selector is already open.
+    let target = PathBuf::from("/tmp/yalda-live-cwd-test");
+    view.update(vcx, |v, _cx| {
+        v.workspace
+            .active_tab_mut()
+            .expect("active tab")
+            .set_cwd(WorkspaceCwd::new(target.clone()));
+    });
+
+    // Activate row 0 ("Start a new session"). Hermetic: the create round-trip is
+    // a no-op, but the placeholder session is bound synchronously with its cwd.
+    view.update(vcx, |v, cx| v.agent_picker_activate(0, cx));
+    vcx.run_until_parked();
+
+    let session_cwd = view.read_with(vcx, |v, cx| {
+        let id = v.agent_tile().expect("agent tile").bound.expect("a session bound");
+        v.sessions.get(id).expect("session").read(cx).cwd.clone()
+    });
+    assert_eq!(
+        session_cwd, target,
+        "a new agent must use the cwd set on the workspace, not the one cached \
+         when the selector opened"
+    );
 }
 
 /// INV-PR regression (the close path the adversarial review flagged): when a

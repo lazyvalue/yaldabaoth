@@ -1718,7 +1718,7 @@ impl YaldaGpuiView {
     /// after every structural mutation (tab add/remove, split, close,
     /// focus change, etc.). Best-effort — failures are silent so a
     /// read-only cache_dir or full disk doesn't break the editor.
-    fn save_workspace_state(&mut self) {
+    pub(crate) fn save_workspace_state(&mut self) {
         // Reap pooled buffers no window references anymore. This is the buffer
         // pool's liveness sweep — called after every structural mutation, so a
         // closed/relocated Edit tile's clean buffer is dropped promptly while
@@ -1733,7 +1733,7 @@ impl YaldaGpuiView {
     /// windows reattach to their saved dir; Claude windows are temporarily
     /// restored as Browser stubs, then replaced with live agent sessions in
     /// a post-pass. Returns `true` if a snapshot was loaded.
-    fn restore_workspace_from_disk(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn restore_workspace_from_disk(&mut self, cx: &mut Context<Self>) -> bool {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let Some(snap) = load_persisted_workspace(&cwd) else {
             return false;
@@ -1909,7 +1909,7 @@ impl YaldaGpuiView {
                             agent_sessions::Bind::AlreadyOpen(_) => {
                                 if let Some(tile) = self.agent_tile_mut() {
                                     tile.bound = None;
-                                    tile.picker = Some(SessionPicker::new(slot_cwd));
+                                    tile.picker = Some(SessionPicker::new());
                                 }
                                 // Selector projects from the roster; seed it.
                                 self.refresh_roster(cx);
@@ -1922,7 +1922,7 @@ impl YaldaGpuiView {
                         // projects from the universal roster — seed it).
                         if let Some(tile) = self.agent_tile_mut() {
                             tile.bound = None;
-                            tile.picker = Some(SessionPicker::new(proc_cwd.clone()));
+                            tile.picker = Some(SessionPicker::new());
                         }
                         self.refresh_roster(cx);
                     }
@@ -5022,16 +5022,11 @@ impl YaldaGpuiView {
             }
         }
         // The free-session listing lists from a cwd: use the current session's,
-        // else the process cwd.
-        let cwd = self
-            .focused_bound_session()
-            .and_then(|id| self.sessions.get(id).map(|s| s.read(cx).cwd.clone()))
-            .unwrap_or_else(process_cwd);
         // Free the current session (kept running in the store) and land the tile
         // in the live in-tile selector — the same UI an unbound agent tile shows
         // (free sessions + "start new"). No bespoke overlay.
         self.release_focused_session_for_rebind();
-        self.show_selector_on_focused_tile(cwd, cx);
+        self.show_selector_on_focused_tile(cx);
         cx.notify();
     }
 

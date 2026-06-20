@@ -3222,19 +3222,18 @@ pub(crate) struct PickerSession {
 /// tile, after which `render_agent` renders the normal transcript.
 pub(crate) struct SessionPicker {
     /// Highlighted row. Row 0 is always "start a new session"; rows `1..=N` map
-    /// to the FREE sessions projected from the universal roster for this cwd
-    /// (`picker_projection`, universal-agent-list). UI state only — the rows
-    /// themselves are derived from the roster at render/select time, not cached
-    /// here, so the selector auto-tracks rename/add/close/selection.
+    /// to the FREE sessions projected from the universal roster for the active
+    /// workspace's cwd (`picker_projection`, universal-agent-list). UI state
+    /// ONLY — neither the rows NOR the cwd are cached here: a rendered picker is
+    /// always on the active tab, so its cwd is read live from `agent_base_cwd`
+    /// at render/select time. (Caching the cwd here is what made "Set CWD, then
+    /// Start a new session" create the agent in the *old* dir.)
     pub(crate) selected: usize,
-    /// The cwd this picker was opened for: selects which roster sessions show
-    /// and threads into create/attach.
-    pub(crate) cwd: PathBuf,
 }
 
 impl SessionPicker {
-    pub(crate) fn new(cwd: PathBuf) -> Self {
-        Self { selected: 0, cwd }
+    pub(crate) fn new() -> Self {
+        Self { selected: 0 }
     }
 }
 
