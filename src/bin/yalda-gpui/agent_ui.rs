@@ -52,7 +52,7 @@ impl YaldaGpuiView {
             // projects the FREE sessions for the cwd + "start new" from the
             // universal roster (universal-agent-list); refresh it in case it's
             // stale since the last seed.
-            tile.picker = Some(SessionPicker::new(base_cwd));
+            tile.picker = Some(SessionPicker::new());
             self.start_server_pump(cx);
             self.set_screen(App::Agent(tile));
             self.refresh_roster(cx);
@@ -216,14 +216,12 @@ impl YaldaGpuiView {
 
     /// Move the picker highlight (j/k or ↑/↓). No-op outside picker mode.
     pub(crate) fn agent_picker_move(&mut self, delta: isize, cx: &mut Context<Self>) {
-        // Row count = "start new" + the FREE roster rows for this cwd.
-        let Some(cwd) = self
-            .agent_tile()
-            .and_then(|t| t.picker.as_ref())
-            .map(|p| p.cwd.clone())
-        else {
+        if self.agent_tile().and_then(|t| t.picker.as_ref()).is_none() {
             return;
-        };
+        }
+        // Row count = "start new" + the FREE roster rows for the active
+        // workspace's LIVE cwd (same source the picker renders/creates from).
+        let cwd = self.agent_base_cwd();
         let n = (1 + self.picker_projection(&cwd).0.len()) as isize;
         if let Some(picker) = self.agent_tile_mut().and_then(|t| t.picker.as_mut()) {
             if n > 0 {
@@ -250,20 +248,21 @@ impl YaldaGpuiView {
             },
         }
         // The picker's rows are PROJECTED from the universal roster at this
-        // moment (universal-agent-list) — the same list `render_agent_picker`
-        // shows — so row indices resolve against the current roster, never a
-        // stale per-tile cache.
-        let cwd = self
-            .agent_tile()
-            .and_then(|t| t.picker.as_ref())
-            .map(|p| p.cwd.clone());
-        let choice = cwd.and_then(|cwd| {
+        // cwd is read LIVE from the active workspace (`agent_base_cwd`), never a
+        // value cached when the picker opened — so "Set CWD, then Start a new
+        // session" creates the agent in the dir you just set. Rows are PROJECTED
+        // from the universal roster for that same cwd (the list
+        // `render_agent_picker` shows), so row indices resolve against it.
+        let has_picker = self.agent_tile().and_then(|t| t.picker.as_ref()).is_some();
+        let choice = if !has_picker {
+            None
+        } else {
+            let cwd = self.agent_base_cwd();
             if row == 0 {
                 Some(Choice::New(cwd))
             } else {
                 let free = self.picker_projection(&cwd).0;
-                let s = free.get(row - 1)?;
-                Some(Choice::Attach {
+                free.get(row - 1).map(|s| Choice::Attach {
                     cwd,
                     sid: s.sid.clone(),
                     acp_id: s.acp_id.clone(),
@@ -272,7 +271,7 @@ impl YaldaGpuiView {
                     permission_mode: s.permission_mode,
                 })
             }
-        });
+        };
         match choice {
             Some(Choice::New(cwd)) => self.picker_start_new(cwd, cx),
             Some(Choice::Attach {
@@ -694,15 +693,10 @@ impl YaldaGpuiView {
         let current = self.workspace.focused_window_id();
         match self.agent_tile_id_bound_to(owner) {
             Some(owner_win) if Some(owner_win) != current => {
-                let cwd = self
-                    .sessions
-                    .get(owner)
-                    .map(|s| s.read(cx).cwd.clone())
-                    .unwrap_or_else(process_cwd);
                 if let Some(tile) = self.agent_tile_mut() {
                     tile.bound = None;
                     tile.pending_open_token = None;
-                    tile.picker = Some(SessionPicker::new(cwd));
+                    tile.picker = Some(SessionPicker::new());
                 }
                 // The selector projects from the roster; the owner is now
                 // filtered out as bound. Refresh the roster, then reveal the
@@ -1152,11 +1146,11 @@ impl YaldaGpuiView {
     /// install a loading `SessionPicker` and kick off the server list (server
     /// mode), so Enter/j/k are immediately usable — NOT a dead `picker == None`
     /// state with no usable keys. Used by close / reconcile.
-    pub(crate) fn show_selector_on_focused_tile(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
+    pub(crate) fn show_selector_on_focused_tile(&mut self, cx: &mut Context<Self>) {
         if let Some(tile) = self.agent_tile_mut() {
             tile.bound = None;
             tile.pending_open_token = None;
-            tile.picker = Some(SessionPicker::new(cwd));
+            tile.picker = Some(SessionPicker::new());
         }
         // The selector projects from the roster; refresh in case it's stale.
         self.refresh_roster(cx);
@@ -1174,16 +1168,11 @@ impl YaldaGpuiView {
         if let Some(sid) = server_sid {
             self.spawn_close_session(sid, cx);
         }
-        let cwd = self
-            .sessions
-            .get(id)
-            .map(|s| s.read(cx).cwd.clone())
-            .unwrap_or_else(process_cwd);
         // Drop the session from the store (its channel/pump cancel on drop) and
         // land the tile in a live selector.
         self.transcript_views.remove(&id);
         self.sessions.close(id);
-        self.show_selector_on_focused_tile(cwd, cx);
+        self.show_selector_on_focused_tile(cx);
         // Wipe the cwd entry so reboot doesn't resurrect the closed session.
         if let Ok(cwd) = std::env::current_dir() {
             forget_persisted_acp_sessions(&cwd);
@@ -1714,12 +1703,6 @@ impl YaldaGpuiView {
         let Some(id) = self.sessions.locate(sid) else {
             return false;
         };
-        // The session's cwd seeds the replacement selector's list.
-        let cwd = self
-            .sessions
-            .get(id)
-            .map(|s| s.read(cx).cwd.clone())
-            .unwrap_or_else(process_cwd);
         // Find the tile that showed this session (at most one, INV-2). Skip a
         // tile mid-respawn (pending_open_token in flight). The replacement
         // selector projects from the roster (no per-tile async list to
@@ -1736,7 +1719,7 @@ impl YaldaGpuiView {
                         tile_was_respawning = true;
                     } else {
                         tile.bound = None;
-                        tile.picker = Some(SessionPicker::new(cwd.clone()));
+                        tile.picker = Some(SessionPicker::new());
                     }
                 }
             });

@@ -1749,14 +1749,12 @@ impl YaldaGpuiView {
         // not the old two-column card layout.
         let ov = &self.theme.overlay;
         // Rows are PROJECTED from the universal roster (universal-agent-list)
-        // for this picker's cwd — not a per-tile cache — so the selector
-        // auto-tracks rename / add / close / selection. `free` = selectable rows
-        // 1..=N; `bound` = sessions in use by some tile (informational).
-        let picker_cwd = tile.picker.as_ref().map(|p| p.cwd.clone());
-        let (free, bound): (Vec<PickerSession>, Vec<PickerSession>) = picker_cwd
-            .as_ref()
-            .map(|cwd| self.picker_projection(cwd))
-            .unwrap_or_default();
+        // for the active workspace's LIVE cwd (`agent_base_cwd`) — not a per-tile
+        // cache — so the selector auto-tracks rename / add / close / selection AND
+        // a `Set CWD` while it's open. `free` = selectable rows 1..=N; `bound` =
+        // sessions in use by some tile (informational).
+        let (free, bound): (Vec<PickerSession>, Vec<PickerSession>) =
+            self.picker_projection(&self.agent_base_cwd());
         // Clamp the highlight to the current row count (the projection may have
         // shrunk since the user last moved).
         let row_count = 1 + free.len();
