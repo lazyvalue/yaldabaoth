@@ -2666,6 +2666,48 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
     });
 }
 
+/// The workspace cwd (`Set CWD`) is PERSISTED: it survives a save→restore
+/// (process restart). Hermetic — the workspace file is redirected to a tempdir
+/// (no touch to `~/.yalda`). Save writes `PersistedTab.cwd`; restore reads it
+/// back into the typed `Tab.cwd` (ADR-0023).
+#[gpui::test]
+fn workspace_cwd_persists_across_restart(cx: &mut TestAppContext) {
+    use crate::persist::with_workspace_path;
+    use crate::workspace::WorkspaceCwd;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("workspace.json");
+    let set = std::env::temp_dir().join("yalda-persisted-cwd");
+
+    // Session 1: Set CWD on the active workspace, then save to disk.
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+    with_workspace_path(file.clone(), || {
+        view.update(vcx, |v, _cx| {
+            v.workspace
+                .active_tab_mut()
+                .expect("active tab")
+                .set_cwd(WorkspaceCwd::new(set.clone()));
+            v.save_workspace_state();
+        });
+    });
+
+    // Session 2 ("restart"): a fresh view restores from the same file — the cwd
+    // we set is back, so a new agent would again inherit it.
+    let (view2, vcx2) = cx.add_window_view(hermetic_browser_view);
+    vcx2.run_until_parked();
+    let restored = with_workspace_path(file.clone(), || {
+        view2.update(vcx2, |v, cx| {
+            assert!(v.restore_workspace_from_disk(cx), "a snapshot was restored");
+            v.active_workspace_cwd()
+        })
+    });
+    assert_eq!(
+        restored,
+        Some(set),
+        "the workspace cwd set via Set CWD survives a save→restore"
+    );
+}
+
 /// A new agent inherits the workspace's LIVE cwd at create time — including a
 /// `Set CWD` done AFTER the selector was already open. Regression: the selector
 /// cached its cwd when it opened, so "open agent → Set CWD → Start a new

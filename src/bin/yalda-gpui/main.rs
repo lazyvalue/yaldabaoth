@@ -1718,7 +1718,7 @@ impl YaldaGpuiView {
     /// after every structural mutation (tab add/remove, split, close,
     /// focus change, etc.). Best-effort — failures are silent so a
     /// read-only cache_dir or full disk doesn't break the editor.
-    fn save_workspace_state(&mut self) {
+    pub(crate) fn save_workspace_state(&mut self) {
         // Reap pooled buffers no window references anymore. This is the buffer
         // pool's liveness sweep — called after every structural mutation, so a
         // closed/relocated Edit tile's clean buffer is dropped promptly while
@@ -1733,7 +1733,7 @@ impl YaldaGpuiView {
     /// windows reattach to their saved dir; Claude windows are temporarily
     /// restored as Browser stubs, then replaced with live agent sessions in
     /// a post-pass. Returns `true` if a snapshot was loaded.
-    fn restore_workspace_from_disk(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn restore_workspace_from_disk(&mut self, cx: &mut Context<Self>) -> bool {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let Some(snap) = load_persisted_workspace(&cwd) else {
             return false;
