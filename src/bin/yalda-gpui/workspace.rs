@@ -986,35 +986,80 @@ pub struct Tab<C> {
     /// layout tree above remains the content owner. Kept (not cleared) when
     /// switching away from Desktop so the arrangement survives round-trips.
     pub desktop: DesktopState,
-    /// Per-workspace key-value registry (untitled.md "Workspace"). Apps read
-    /// it during render (so a write + `cx.notify()` is the "all apps notified"
-    /// mechanism) and at lifecycle moments — e.g. an agent tile reads the
-    /// `"cwd"` key when spawning a session. Persisted in `PersistedTab`.
-    pub kv: HashMap<String, String>,
+    /// The workspace's working directory (spec-agent-cwd.md). **Private and
+    /// required**: a `Tab` cannot be constructed without one (build via
+    /// [`Tab::with_layout`]), so no workspace — real or ephemeral — can exist
+    /// without a cwd. An agent created in this workspace inherits it
+    /// (`agent_base_cwd`); read via [`Tab::cwd`], changed via [`Tab::set_cwd`]
+    /// ("Set CWD"). Replaced a stringly `kv["cwd"]` whose omission silently fell
+    /// back to the process dir — the cwd-inheritance regression (ADR-0023).
+    cwd: WorkspaceCwd,
+}
+
+/// A workspace's working directory: a required, typed wrapper around a path.
+/// Exists so "a workspace without a cwd" is **unrepresentable** — every [`Tab`]
+/// holds one and every creation path must supply it. The process-dir default is
+/// chosen once by the binary at the root workspace's creation, never silently at
+/// read time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceCwd(PathBuf);
+
+impl WorkspaceCwd {
+    pub fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+    pub fn to_path_buf(&self) -> PathBuf {
+        self.0.clone()
+    }
 }
 
 impl<C> Tab<C> {
+    /// THE `Tab` constructor (the cwd field is private, so this is the only way
+    /// to build one outside this module). Requires a [`WorkspaceCwd`] — that is
+    /// what makes a cwd-less workspace unrepresentable. Non-cwd fields default
+    /// (no rail, not ephemeral, Desktop layout, empty tags); callers set the
+    /// public ones they need afterward (e.g. restore sets rail/desktop, the
+    /// ephemeral path sets `ephemeral = true`).
+    pub fn with_layout(
+        auto_name: String,
+        layout: Layout<C>,
+        focused: WindowId,
+        cwd: WorkspaceCwd,
+    ) -> Self {
+        Self {
+            auto_name,
+            display_name: None,
+            layout,
+            focused,
+            rail: None,
+            ephemeral: false,
+            layout_mode: LayoutMode::default(),
+            saved_manual_layout: None,
+            master_ratio: 0.6,
+            master_count: 1,
+            tag_view: BTreeSet::new(),
+            desktop: DesktopState::default(),
+            cwd,
+        }
+    }
+
     pub fn display_label(&self) -> &str {
         self.display_name.as_deref().unwrap_or(&self.auto_name)
     }
 
-    /// Read a registry value. Empty strings are treated as present (the
-    /// caller decides whether empty is meaningful).
-    pub fn kv_get(&self, key: &str) -> Option<&str> {
-        self.kv.get(key).map(String::as_str)
+    /// The workspace's working directory. Always present (the type guarantees
+    /// it). An agent created here inherits this (`agent_base_cwd`).
+    pub fn cwd(&self) -> &WorkspaceCwd {
+        &self.cwd
     }
 
-    /// Set a registry value. Caller is responsible for `cx.notify()` + persist
-    /// so all apps re-render against the new value.
-    pub fn kv_set(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.kv.insert(key.into(), value.into());
-    }
-
-    /// Remove a registry value, returning the prior value if any. Kept for
-    /// API symmetry — no command clears the registry yet.
-    #[allow(dead_code)]
-    pub fn kv_remove(&mut self, key: &str) -> Option<String> {
-        self.kv.remove(key)
+    /// Change the working directory ("Set CWD"). Caller is responsible for
+    /// `cx.notify()` + persist.
+    pub fn set_cwd(&mut self, cwd: WorkspaceCwd) {
+        self.cwd = cwd;
     }
 }
 
@@ -1061,9 +1106,18 @@ pub struct Workspace<C> {
     /// Shortcut keys bound to tag names (Phase 3). `Ctrl-W t {key}` views
     /// the tag mapped to `{key}`.
     pub tag_shortcuts: HashMap<char, String>,
+    /// The cwd a newly-created tab inherits when there is no active tab to copy
+    /// from (the first/root tab). Set once by the binary at construction
+    /// (`with_initial`); thereafter new tabs inherit the *active* tab's cwd.
+    /// Keeps `workspace.rs` free of any process-dir knowledge.
+    default_cwd: WorkspaceCwd,
 }
 
 impl<C> Workspace<C> {
+    /// Bare workspace with no tabs. `default_cwd` is a last-resort placeholder
+    /// (`.`) only ever read if a tab is created before any exists AND without an
+    /// explicit cwd — in practice the first tab comes via `with_initial` (real
+    /// cwd) or restore (per-tab cwd), so it is never the live source.
     pub fn new() -> Self {
         Self {
             tabs: Vec::new(),
@@ -1075,7 +1129,15 @@ impl<C> Workspace<C> {
             next_tab_index: 1,
             marks: MarkTable::new(),
             tag_shortcuts: HashMap::new(),
+            default_cwd: WorkspaceCwd::new(PathBuf::from(".")),
         }
+    }
+
+    /// The cwd a new tab should inherit: the active tab's, else `default_cwd`.
+    pub fn inherited_cwd(&self) -> WorkspaceCwd {
+        self.active_tab()
+            .map(|t| t.cwd().clone())
+            .unwrap_or_else(|| self.default_cwd.clone())
     }
 
     pub fn active_tab(&self) -> Option<&Tab<C>> {
@@ -1116,34 +1178,25 @@ impl<C> Workspace<C> {
 
     /// Construct a workspace pre-populated with one tab containing one
     /// window of `content`. Tab name is auto-assigned to `tab-1`.
-    pub fn with_initial(content: C) -> Self {
+    pub fn with_initial(content: C, cwd: WorkspaceCwd) -> Self {
         let mut ws = Self::new();
-        ws.push_initial_tab(content);
+        // This cwd seeds the root tab AND becomes the fallback every later tab
+        // inherits from when there's nothing active to copy.
+        ws.default_cwd = cwd.clone();
+        ws.push_initial_tab(content, cwd);
         ws
     }
 
-    /// Append a new tab containing a single window with `content`. Becomes
-    /// the active tab. Returns the new window's id.
-    pub fn push_initial_tab(&mut self, content: C) -> WindowId {
+    /// Append a new tab containing a single window with `content`, with working
+    /// directory `cwd`. Becomes the active tab. Returns the new window's id.
+    /// (Callers wanting "inherit the current workspace's cwd" pass
+    /// [`Workspace::inherited_cwd`].)
+    pub fn push_initial_tab(&mut self, content: C, cwd: WorkspaceCwd) -> WindowId {
         let id = self.alloc_window_id();
         let name = auto_tab_name(self.next_tab_index);
         self.next_tab_index += 1;
-        self.tabs.push(Tab {
-            auto_name: name,
-            display_name: None,
-            layout: Layout::Leaf(Window { id, content }),
-            focused: id,
-            rail: None,
-            ephemeral: false,
-            // New workspaces default to Desktop (free tile placement).
-            layout_mode: LayoutMode::default(),
-            saved_manual_layout: None,
-            master_ratio: 0.6,
-            master_count: 1,
-            tag_view: BTreeSet::new(),
-            desktop: DesktopState::default(),
-            kv: HashMap::new(),
-        });
+        self.tabs
+            .push(Tab::with_layout(name, Layout::Leaf(Window { id, content }), id, cwd));
         self.active_tab = self.tabs.len() - 1;
         id
     }
@@ -1208,6 +1261,11 @@ impl<C> Workspace<C> {
     /// already open it is replaced (we never accumulate more than one). Returns
     /// the new tile's window id. Does NOT notify — callers do.
     pub fn open_ephemeral_tab(&mut self, content: C) -> WindowId {
+        // Inherit the spawning workspace's cwd BEFORE we (possibly) drop it, so
+        // an agent created in the virtual workspace lands in the same dir as the
+        // workspace you jumped from — not the process dir (the regression this
+        // typed cwd makes impossible; ADR-0023).
+        let cwd = self.inherited_cwd();
         // Replace any existing virtual workspace rather than stacking.
         if self.active_is_ephemeral() {
             let cur = self.active_tab;
@@ -1216,21 +1274,9 @@ impl<C> Workspace<C> {
         let id = self.alloc_window_id();
         let name = auto_tab_name(self.next_tab_index);
         self.next_tab_index += 1;
-        self.tabs.push(Tab {
-            auto_name: name,
-            display_name: None,
-            layout: Layout::Leaf(Window { id, content }),
-            focused: id,
-            rail: None,
-            ephemeral: true,
-            layout_mode: LayoutMode::default(),
-            saved_manual_layout: None,
-            master_ratio: 0.6,
-            master_count: 1,
-            tag_view: BTreeSet::new(),
-            desktop: DesktopState::default(),
-            kv: HashMap::new(),
-        });
+        let mut tab = Tab::with_layout(name, Layout::Leaf(Window { id, content }), id, cwd);
+        tab.ephemeral = true;
+        self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         id
     }
@@ -2539,7 +2585,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
-            kv: HashMap::new(),
+            cwd: WorkspaceCwd::new(PathBuf::from(".")),
         });
         // Ensure window-id allocator skips past the ids we hand-rolled.
         let max_id = ws.tabs[0].layout.leaf_ids().into_iter().max().unwrap_or(0);
@@ -2933,7 +2979,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
-            kv: HashMap::new(),
+            cwd: WorkspaceCwd::new(PathBuf::from(".")),
         });
         let w = Window {
             id: 9,
@@ -2963,7 +3009,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
-            kv: HashMap::new(),
+            cwd: WorkspaceCwd::new(PathBuf::from(".")),
         });
         let w = Window {
             id: 9,
@@ -3002,7 +3048,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
-            kv: HashMap::new(),
+            cwd: WorkspaceCwd::new(PathBuf::from(".")),
         });
         let (window, empty) = ws.detach_focused().unwrap();
         assert!(!empty);
