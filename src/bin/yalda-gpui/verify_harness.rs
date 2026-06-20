@@ -63,62 +63,37 @@ fn constructs_and_renders_real_view(cx: &mut TestAppContext) {
     );
 }
 
-/// Workspace KV registry → agent CWD inheritance (untitled.md Workspace +
-/// Agent TODOs). A `"cwd"` written into the active workspace's registry is
-/// what `active_workspace_cwd` surfaces — the value an agent session created
-/// without an explicit cwd inherits before falling back to the process cwd.
-/// Absent / empty keys yield `None` so the call site falls through to
-/// `process_cwd`.
+/// Workspace → agent CWD inheritance (untitled.md Workspace + Agent TODOs;
+/// ADR-0023). The cwd is a required, typed field on every `Tab`
+/// ([`WorkspaceCwd`]) — "no cwd" is unrepresentable — so `agent_base_cwd` is
+/// total and always surfaces the active workspace's dir. Includes the
+/// regression that motivated the type: an **ephemeral** virtual workspace
+/// (jump-panel) inherits the spawning workspace's cwd instead of silently
+/// falling back to the process dir.
 #[gpui::test]
-fn workspace_kv_cwd_inheritance(cx: &mut TestAppContext) {
-    let (view, vcx) = cx.add_window_view(|window, cx| {
-        let focus_handle = cx.focus_handle();
-        focus_handle.focus(window);
-        YaldaGpuiView::new_browser(
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            Theme::default(),
-            focus_handle,
-        )
+fn workspace_cwd_inheritance(cx: &mut TestAppContext) {
+    use crate::workspace::WorkspaceCwd;
+    let start = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let (view, vcx) = cx.add_window_view({
+        let start = start.clone();
+        move |window, cx| {
+            let focus_handle = cx.focus_handle();
+            focus_handle.focus(window);
+            YaldaGpuiView::new_browser(start, Theme::default(), focus_handle)
+        }
     });
     vcx.run_until_parked();
 
-    // No registry entry → None (caller uses process cwd).
-    let none = view.read_with(vcx, |v, _| v.active_workspace_cwd());
-    assert_eq!(none, None, "absent cwd key yields None");
+    // A browser workspace boots with its start dir as the cwd — always present.
+    let booted = view.read_with(vcx, |v, _| v.active_workspace_cwd());
+    assert_eq!(booted, Some(start.clone()), "workspace boots with a real cwd");
 
-    // Write a cwd into the active tab's registry → inherited.
+    // Set CWD → both the surfaced cwd and what a new agent inherits move.
     view.update(vcx, |v, _cx| {
         v.workspace
             .active_tab_mut()
             .expect("active tab")
-            .kv_set("cwd", "/tmp/example-ws");
-    });
-    let got = view.read_with(vcx, |v, _| v.active_workspace_cwd());
-    assert_eq!(
-        got,
-        Some(PathBuf::from("/tmp/example-ws")),
-        "registry cwd is inherited"
-    );
-
-    // Empty string is treated as unset.
-    view.update(vcx, |v, _cx| {
-        v.workspace
-            .active_tab_mut()
-            .expect("active tab")
-            .kv_set("cwd", "");
-    });
-    let empty = view.read_with(vcx, |v, _| v.active_workspace_cwd());
-    assert_eq!(empty, None, "empty cwd key yields None");
-
-    // `agent_base_cwd` is what every no-explicit-cwd creation path (open / new /
-    // bootstrap) actually uses — it must surface the workspace cwd, not the
-    // process dir. (Regression: opening an agent in workspace 2 launched in the
-    // app's launch dir because `open_agent_inner` read `process_cwd` directly.)
-    view.update(vcx, |v, _cx| {
-        v.workspace
-            .active_tab_mut()
-            .expect("active tab")
-            .kv_set("cwd", "/Users/scott/ws/fulcrum");
+            .set_cwd(WorkspaceCwd::new(PathBuf::from("/Users/scott/ws/fulcrum")));
     });
     let base = view.read_with(vcx, |v, _| v.agent_base_cwd());
     assert_eq!(
@@ -127,15 +102,20 @@ fn workspace_kv_cwd_inheritance(cx: &mut TestAppContext) {
         "a new agent inherits the active workspace's cwd"
     );
 
-    // With no workspace cwd, the base falls back to the process dir.
+    // The regression (ADR-0023): opening an ephemeral virtual workspace (what a
+    // jump-panel free-session click does) must inherit the spawning workspace's
+    // cwd — NOT reset to the process dir. With the old empty-`kv` ephemeral tab,
+    // `agent_base_cwd` here returned the launch dir.
     view.update(vcx, |v, _cx| {
-        v.workspace.active_tab_mut().expect("active tab").kv_set("cwd", "");
+        v.workspace
+            .open_ephemeral_tab(crate::App::Agent(crate::AgentTile::new()));
     });
-    let fallback = view.read_with(vcx, |v, _| v.agent_base_cwd());
+    let in_ephemeral = view.read_with(vcx, |v, _| v.agent_base_cwd());
     assert_eq!(
-        fallback,
-        crate::process_cwd(),
-        "no workspace cwd falls back to the process dir"
+        in_ephemeral,
+        PathBuf::from("/Users/scott/ws/fulcrum"),
+        "an agent created in an ephemeral virtual workspace inherits the \
+         spawning workspace's cwd, not the process dir"
     );
 }
 
@@ -168,13 +148,13 @@ fn browser_start_dir_resolution(cx: &mut TestAppContext) {
         "no cwd, no file → process dir"
     );
 
-    // (2) Workspace cwd set, still no file-backed buffer → the registry cwd.
+    // (2) Workspace cwd set, still no file-backed buffer → the workspace cwd.
     let ws_dir = std::env::temp_dir();
     view.update(vcx, |v, _cx| {
         v.workspace
             .active_tab_mut()
             .expect("active tab")
-            .kv_set("cwd", ws_dir.display().to_string());
+            .set_cwd(crate::workspace::WorkspaceCwd::new(ws_dir.clone()));
     });
     let from_ws = view.read_with(vcx, |v, _| v.browser_start_dir());
     assert_eq!(from_ws, ws_dir, "workspace cwd wins over process dir");
@@ -893,10 +873,10 @@ fn jump_to_bound_session_focuses_existing_tile(cx: &mut TestAppContext) {
     });
     // Add a second workspace and switch to it, so jumping must cross back.
     view.update(vcx, |v, cx| {
-        v.workspace
-            .push_initial_tab(App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
-                PathBuf::from("."),
-            ))));
+        v.workspace.push_initial_tab(
+            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(PathBuf::from(".")))),
+            crate::workspace::WorkspaceCwd::new(PathBuf::from(".")),
+        );
         cx.notify();
     });
     let tabs_before = view.update(vcx, |v, _| v.workspace.tabs.len());
@@ -944,8 +924,10 @@ fn agent_session_binds_at_most_one_tile(cx: &mut TestAppContext) {
 
     // Workspace 1: a fresh agent tile, now focused.
     view.update(vcx, |v, _cx| {
-        v.workspace
-            .push_initial_tab(App::Agent(AgentTile::new()));
+        v.workspace.push_initial_tab(
+            App::Agent(AgentTile::new()),
+            crate::workspace::WorkspaceCwd::new(PathBuf::from(".")),
+        );
     });
 
     // Attempt to bind the already-owned session from workspace 1's tile.
@@ -4051,10 +4033,11 @@ fn global_menu_lists_and_switches_workspaces(cx: &mut TestAppContext) {
 
     // Add two more workspaces (3 total). A bare Linear tile needs no args.
     view.update(vcx, |v, _cx| {
+        let cwd = crate::workspace::WorkspaceCwd::new(PathBuf::from("."));
         v.workspace
-            .push_initial_tab(crate::App::Linear(crate::LinearTile::new()));
+            .push_initial_tab(crate::App::Linear(crate::LinearTile::new()), cwd.clone());
         v.workspace
-            .push_initial_tab(crate::App::Linear(crate::LinearTile::new()));
+            .push_initial_tab(crate::App::Linear(crate::LinearTile::new()), cwd);
     });
 
     // The menu enumerates each workspace + the name/new commands.

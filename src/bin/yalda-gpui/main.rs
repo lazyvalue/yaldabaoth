@@ -1653,7 +1653,10 @@ impl YaldaGpuiView {
             focus_handle,
             active_overlay: ActiveOverlay::None,
             transient_status: None,
-            workspace: workspace::Workspace::with_initial(initial),
+            workspace: workspace::Workspace::with_initial(
+                initial,
+                workspace::WorkspaceCwd::new(process_cwd()),
+            ),
             doc_selection: None,
             line_layouts: Rc::new(RefCell::new(HashMap::new())),
             session_server: connect_session_server(),
@@ -1673,6 +1676,7 @@ impl YaldaGpuiView {
     fn new_browser(start_dir: PathBuf, theme: Theme, focus_handle: FocusHandle) -> Self {
         let syntect_hl =
             Rc::new(yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme()));
+        let cwd = workspace::WorkspaceCwd::new(start_dir.clone());
         let initial = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(start_dir)));
         Self {
             theme,
@@ -1688,7 +1692,7 @@ impl YaldaGpuiView {
             focus_handle,
             active_overlay: ActiveOverlay::None,
             transient_status: None,
-            workspace: workspace::Workspace::with_initial(initial),
+            workspace: workspace::Workspace::with_initial(initial, cwd),
             doc_selection: None,
             line_layouts: Rc::new(RefCell::new(HashMap::new())),
             session_server: connect_session_server(),
@@ -1740,44 +1744,51 @@ impl YaldaGpuiView {
             let (layout, max_id, agents) = restore_layout(&mut ws, &self.theme, ptab.layout);
             ws.next_window_id = ws.next_window_id.max(max_id + 1);
             agent_leaf_ids.extend(agents);
-            ws.tabs.push(workspace::Tab {
-                auto_name: ptab.auto_name,
-                display_name: ptab.display_name,
-                focused: ptab.focused_window,
+            // Working directory: typed field if present, else migrate from the
+            // legacy `kv["cwd"]`, else the process dir (ADR-0023).
+            let cwd = workspace::WorkspaceCwd::new(
+                ptab.cwd
+                    .map(PathBuf::from)
+                    .or_else(|| ptab.legacy_kv.get("cwd").map(PathBuf::from))
+                    .unwrap_or_else(process_cwd),
+            );
+            let mut tab = workspace::Tab::with_layout(
+                ptab.auto_name,
                 layout,
-                rail: ptab.rail.map(|r| restore_rail(r, ptab.focused_window)),
-                ephemeral: false,
-                layout_mode: ptab.layout_mode,
-                saved_manual_layout: None,
-                master_ratio: ptab.master_ratio,
-                master_count: ptab.master_count,
-                tag_view: ptab.tag_view,
-                desktop: workspace::DesktopState {
-                    // Restored leaves keep their persisted WindowIds, so the
-                    // id-keyed slots round-trip with no mapping. Stale ids
-                    // (or an absent field) are handled by the first desktop
-                    // render's reconcile/seed (spec Behavior 7).
-                    slots: {
-                        let mut v: Vec<(workspace::WindowId, workspace::Slot)> = ptab
-                            .desktop_slots
-                            .into_iter()
-                            .map(|(id, row, col)| (id, workspace::Slot::new(row, col)))
-                            .collect();
-                        v.sort_by_key(|&(_, s)| s);
-                        v
-                    },
-                    spans: ptab
-                        .desktop_spans
+                ptab.focused_window,
+                cwd,
+            );
+            tab.display_name = ptab.display_name;
+            tab.rail = ptab.rail.map(|r| restore_rail(r, ptab.focused_window));
+            tab.layout_mode = ptab.layout_mode;
+            tab.master_ratio = ptab.master_ratio;
+            tab.master_count = ptab.master_count;
+            tab.tag_view = ptab.tag_view;
+            tab.desktop = workspace::DesktopState {
+                // Restored leaves keep their persisted WindowIds, so the
+                // id-keyed slots round-trip with no mapping. Stale ids (or an
+                // absent field) are handled by the first desktop render's
+                // reconcile/seed (spec Behavior 7).
+                slots: {
+                    let mut v: Vec<(workspace::WindowId, workspace::Slot)> = ptab
+                        .desktop_slots
                         .into_iter()
-                        .map(|(id, rows, cols)| (id, workspace::Span::new(rows, cols)))
-                        .collect(),
-                    pan: (0.0, 0.0),
-                    drag: None,
-                    resize: None,
-                    last_reveal: None,
+                        .map(|(id, row, col)| (id, workspace::Slot::new(row, col)))
+                        .collect();
+                    v.sort_by_key(|&(_, s)| s);
+                    v
                 },
-                kv: ptab.kv,
-            });
+                spans: ptab
+                    .desktop_spans
+                    .into_iter()
+                    .map(|(id, rows, cols)| (id, workspace::Span::new(rows, cols)))
+                    .collect(),
+                pan: (0.0, 0.0),
+                drag: None,
+                resize: None,
+                last_reveal: None,
+            };
+            ws.tabs.push(tab);
             ws.next_tab_index += 1;
         }
         if !ws.tabs.is_empty() {
@@ -2257,7 +2268,8 @@ impl YaldaGpuiView {
         if replace_in_place {
             self.set_screen(new_content);
         } else {
-            self.workspace.push_initial_tab(new_content);
+            let cwd = self.workspace.inherited_cwd();
+            self.workspace.push_initial_tab(new_content, cwd);
         }
         self.save_workspace_state();
         true
@@ -3248,10 +3260,10 @@ impl YaldaGpuiView {
     /// what to load.
     fn new_tab(&mut self, _: &NewTab, _w: &mut Window, cx: &mut Context<Self>) {
         let cwd = self.active_workspace_cwd().unwrap_or_else(process_cwd);
-        self.workspace
-            .push_initial_tab(App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
-                cwd,
-            ))));
+        self.workspace.push_initial_tab(
+            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
+            workspace::WorkspaceCwd::new(cwd),
+        );
         self.save_workspace_state();
         cx.notify();
     }
@@ -4406,10 +4418,11 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             "new-tab" => {
-                self.workspace
-                    .push_initial_tab(App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                    ))));
+                let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                self.workspace.push_initial_tab(
+                    App::Buffer(BufferApp::Picking(BrowserWindow::standalone(dir.clone()))),
+                    workspace::WorkspaceCwd::new(dir),
+                );
                 self.save_workspace_state();
                 cx.notify();
             }
@@ -4645,7 +4658,8 @@ impl YaldaGpuiView {
                 match sel {
                     Some((path, false)) => {
                         if let Some(content) = self.make_doc_content(&path) {
-                            self.workspace.push_initial_tab(content);
+                            let cwd = self.workspace.inherited_cwd();
+                            self.workspace.push_initial_tab(content, cwd);
                             self.save_workspace_state();
                             cx.notify();
                         }
@@ -4929,21 +4943,14 @@ impl YaldaGpuiView {
     fn push_empty_workspace(&mut self) {
         let name = workspace::auto_tab_name(self.workspace.next_tab_index);
         self.workspace.next_tab_index += 1;
-        self.workspace.tabs.push(workspace::Tab {
-            auto_name: name,
-            display_name: None,
-            layout: workspace::Layout::Empty,
-            focused: 0,
-            rail: None,
-            ephemeral: false,
-            layout_mode: workspace::LayoutMode::default(),
-            saved_manual_layout: None,
-            master_ratio: 0.6,
-            master_count: 1,
-            tag_view: std::collections::BTreeSet::new(),
-            desktop: workspace::DesktopState::default(),
-            kv: std::collections::HashMap::new(),
-        });
+        // A new workspace inherits the current one's cwd (ADR-0023).
+        let cwd = self.workspace.inherited_cwd();
+        self.workspace.tabs.push(workspace::Tab::with_layout(
+            name,
+            workspace::Layout::Empty,
+            0,
+            cwd,
+        ));
     }
 
     /// MOVE: relocate the focused leaf out of the active workspace into
@@ -5261,11 +5268,7 @@ impl YaldaGpuiView {
         let Some(tab) = self.workspace.tabs.get(idx) else {
             return;
         };
-        let text = tab
-            .kv_get("cwd")
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| process_cwd().display().to_string());
+        let text = tab.cwd().path().display().to_string();
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
             text,
             target: RenameTarget::WorkspaceCwd { index: idx },
@@ -5372,7 +5375,7 @@ impl YaldaGpuiView {
                     self.close_rename_overlay();
                     let path = resolved.display().to_string();
                     if let Some(tab) = self.workspace.tabs.get_mut(index) {
-                        tab.kv_set("cwd", path.clone());
+                        tab.set_cwd(workspace::WorkspaceCwd::new(resolved));
                     }
                     self.transient_status = Some(format!("workspace cwd → {path}").into());
                     self.save_workspace_state();

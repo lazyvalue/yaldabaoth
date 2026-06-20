@@ -477,10 +477,16 @@ pub(crate) struct PersistedTab {
     /// 1 × 1 and span-free arrangements omit it entirely. `(id, rows, cols)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) desktop_spans: Vec<(workspace::WindowId, u32, u32)>,
-    /// Per-workspace key-value registry (untitled.md "Workspace"). Holds e.g.
-    /// the workspace `"cwd"`. Absent in old snapshots → empty registry.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub(crate) kv: HashMap<String, String>,
+    /// The workspace's working directory (ADR-0023). `None` in old snapshots
+    /// (pre-typed-cwd) → migrated from `legacy_kv["cwd"]` on restore, else the
+    /// process dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cwd: Option<String>,
+    /// Legacy per-workspace registry (the old `kv` that held `"cwd"`). Read on
+    /// restore for back-compat with pre-ADR-0023 snapshots; never written again
+    /// (cwd is now a typed field), so it disappears from snapshots over time.
+    #[serde(default, rename = "kv", skip_serializing)]
+    pub(crate) legacy_kv: HashMap<String, String>,
 }
 
 pub(crate) fn default_master_ratio() -> f32 {
@@ -769,7 +775,8 @@ pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<App>) -> PersistedWor
                     .iter()
                     .map(|(&id, sp)| (id, sp.rows, sp.cols))
                     .collect(),
-                kv: t.kv.clone(),
+                cwd: Some(t.cwd().path().display().to_string()),
+                legacy_kv: HashMap::new(),
             })
             .collect(),
         active_tab: ws.active_tab.min(non_ephemeral.saturating_sub(1)),

@@ -818,25 +818,22 @@ impl YaldaGpuiView {
     /// new slot's cwd — the caller (typically the `:claude-new <path>`
     /// command handler) is responsible for running the input through
     /// `resolve_agent_cwd_arg` first.
-    /// The active workspace's registry `"cwd"`, if set and non-empty. An agent
-    /// session created without an explicit cwd inherits this (untitled.md Agent
-    /// TODO: "inherit CWD from workspace. If none, inherit CWD from app"), with
-    /// `process_cwd` — the app/process directory — as the final fallback. The
-    /// path is whatever `Set CWD` resolved+validated at write time; a since-
-    /// deleted dir surfaces as a spawn error (spec-agent-cwd.md §9), not here.
+    /// The active workspace's working directory. `None` only when there is no
+    /// active tab at all (a transient pre-first-tab state); a workspace that
+    /// exists always carries a cwd (the typed [`WorkspaceCwd`] makes "no cwd"
+    /// unrepresentable — ADR-0023). The path is whatever `Set CWD` resolved at
+    /// write time; a since-deleted dir surfaces as a spawn error
+    /// (spec-agent-cwd.md §9), not here.
     pub(crate) fn active_workspace_cwd(&self) -> Option<PathBuf> {
-        self.workspace
-            .active_tab()
-            .and_then(|t| t.kv_get("cwd"))
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
+        self.workspace.active_tab().map(|t| t.cwd().to_path_buf())
     }
 
     /// The CWD a new agent session inherits when the caller gives no explicit
-    /// one: the active workspace's `"cwd"`, else the process dir. The single
-    /// resolution every agent-creation entry point (open / new / bootstrap)
-    /// shares, so opening an agent in workspace 2 lands in workspace 2's dir,
-    /// not the app's launch dir.
+    /// one: the active workspace's cwd. The single resolution every
+    /// agent-creation entry point (open / new / bootstrap) shares, so opening an
+    /// agent in workspace 2 lands in workspace 2's dir, not the app's launch
+    /// dir. Total — the workspace always has a cwd; the `process_cwd` fallback
+    /// only covers the degenerate no-tab state.
     pub(crate) fn agent_base_cwd(&self) -> PathBuf {
         self.active_workspace_cwd().unwrap_or_else(process_cwd)
     }

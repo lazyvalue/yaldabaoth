@@ -2,7 +2,16 @@
 
 **Status:** DRAFT.
 
-**Last updated:** 2026-05-22
+**Last updated:** 2026-06-18
+
+> **Workspace cwd is now a required, typed field (ADR-0023).** The directory a
+> new agent session inherits (`agent_base_cwd`) is the active workspace's cwd,
+> held as `Tab.cwd: WorkspaceCwd` — a required, private field, not a stringly
+> `kv["cwd"]`. A workspace cannot be constructed without one (build via
+> `Tab::with_layout`), so "no cwd → silently use the process dir" is
+> unrepresentable; ephemeral virtual workspaces (ADR-0021) inherit the spawning
+> workspace's cwd. This closed the cwd-inheritance regression where a new
+> `Tab` literal omitted the cwd key.
 
 ## Builds On
 

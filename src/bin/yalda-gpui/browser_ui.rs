@@ -356,11 +356,7 @@ impl YaldaGpuiView {
             existing => {
                 let side = existing.as_ref().map(|r| r.side).unwrap_or_default();
                 let pinned_to = tab.focused;
-                let cwd = tab
-                    .kv_get("cwd")
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(process_cwd);
+                let cwd = tab.cwd().to_path_buf();
                 let content = workspace::RailContent::FileBrowser(FileBrowser::new(cwd));
                 tab.rail = Some(workspace::RailState::new(content, side, pinned_to));
             }
