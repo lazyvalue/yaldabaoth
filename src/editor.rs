@@ -215,6 +215,15 @@ pub struct EditorCore {
     /// turn finalize / anchor reset. Treated as a hint: the caller re-validates
     /// the tag before trusting it and falls back to the full scan on a miss.
     last_llm_line: Option<usize>,
+    /// Companion to `last_llm_line`: true when that line is still *mid-stream*
+    /// (the last appended chunk did NOT end with `\n`), false when the chunk
+    /// closed the line with a hard break. Only consulted by the floored
+    /// draft-coexistence path (`append_llm_chunk_floored`) to tell an artificial
+    /// "separated from the draft" newline apart from a genuine paragraph break,
+    /// so mid-stream chunks keep flowing onto one agent line above the draft
+    /// while real breaks still start a fresh line. Shifted/reset in lock-step
+    /// with `last_llm_line`.
+    last_llm_open: bool,
     /// Half-open line ranges of *atomic* frozen blocks — multi-line structural
     /// units (fenced code blocks, tables) that must NEVER be split by an insert,
     /// because they only render correctly as a whole. A SUBSET of `frozen_lines`.
@@ -270,6 +279,7 @@ impl EditorCore {
             line_anchors: LineAnchorStore::default(),
             line_metadata: LineMetadataStore::default(),
             last_llm_line: None,
+            last_llm_open: false,
             atomic_blocks: Vec::new(),
         }
     }
@@ -452,6 +462,7 @@ impl EditorCore {
         self.line_metadata = LineMetadataStore::default();
         // Perf cache: the anchors it referenced are gone.
         self.last_llm_line = None;
+        self.last_llm_open = false;
     }
 
     /// Perf cache accessor: cached tail line of the in-progress LLM turn.
@@ -459,14 +470,22 @@ impl EditorCore {
         self.last_llm_line
     }
 
-    /// Perf cache mutator: record the LLM turn's tail line after appending.
-    fn set_cached_llm_line(&mut self, line: usize) {
+    /// True when the cached LLM tail line is still mid-stream (see field docs).
+    fn cached_llm_open(&self) -> bool {
+        self.last_llm_open
+    }
+
+    /// Perf cache mutator: record the LLM turn's tail line after appending,
+    /// plus whether that line is still open (no trailing `\n`).
+    fn set_cached_llm_line(&mut self, line: usize, open: bool) {
         self.last_llm_line = Some(line);
+        self.last_llm_open = open;
     }
 
     /// Perf cache: clear the LLM-tail hint (called on turn finalize).
     pub fn clear_cached_llm_line(&mut self) {
         self.last_llm_line = None;
+        self.last_llm_open = false;
     }
 
     /// True if `line` is in any frozen range.
@@ -686,6 +705,7 @@ impl EditorCore {
             let consumed_hi = start_line + deleted_nl; // inclusive
             if llm >= consumed_lo && llm <= consumed_hi {
                 self.last_llm_line = None;
+                self.last_llm_open = false;
             } else if llm > consumed_hi {
                 self.last_llm_line = Some(llm - deleted_nl);
             }
@@ -1432,7 +1452,48 @@ impl Editor {
         if chunk.is_empty() {
             return;
         }
-        let insertion_char = self.find_llm_insertion_point::<T>(&turn_tag).min(floor_char);
+        let eof = self.core.document().rope().len_chars();
+        let natural = self.find_llm_insertion_point::<T>(&turn_tag);
+        let insertion_char = if floor_char >= eof || natural < floor_char {
+            // No draft below the insertion point, or `natural` already lands in
+            // the agent region ABOVE the user's draft (a mid-line streaming
+            // continuation). Either way the plain clamp is safe.
+            natural.min(floor_char)
+        } else {
+            // `natural` is at/below the draft top (`floor_char`): a NEW turn, or
+            // this turn's last agent line ended with a newline that sits directly
+            // above the draft. Inserting at `floor_char` would fuse the chunk into
+            // the user's draft line and freeze it as agent content (the draft-
+            // corruption / out-of-order bug). Keep the chunk on its own agent line
+            // ABOVE the draft instead.
+            //
+            // Continue the agent line immediately above the draft ONLY when it is
+            // this turn AND still mid-stream (`cached_llm_open`) — i.e. its
+            // trailing newline is the artificial "separated from the draft" break,
+            // not a real paragraph break. Otherwise (new turn, or the last chunk
+            // closed the line with its own `\n`) open a clean blank line at the
+            // floor (mirrors `anchor_for_new_tool_call`), so genuine paragraph
+            // breaks stay on separate lines.
+            let draft_top = self.core.document().rope().char_to_line(floor_char);
+            let continue_above = draft_top
+                .checked_sub(1)
+                .filter(|_| self.core.cached_llm_open())
+                .filter(|&la| self.core.cached_llm_line() == Some(la))
+                .filter(|&la| self.line_tagged_this_turn::<T>(la, &turn_tag));
+            match continue_above {
+                Some(la) => {
+                    // End of that agent line's content, before its trailing '\n'.
+                    let len = self.core.document().line_len_chars(la);
+                    self.core.document().line_col_to_char(la, len)
+                }
+                None => {
+                    // Open a clean blank line at the floor (shifts the draft
+                    // down by one) and write the chunk into it.
+                    self.core.programmatic_insert(floor_char, "\n");
+                    floor_char
+                }
+            }
+        };
         self.core.programmatic_insert(insertion_char, chunk);
 
         let chunk_chars = chunk.chars().count();
@@ -1452,9 +1513,11 @@ impl Editor {
 
         // Perf cache (finding 2): record this turn's tail line so the next chunk
         // can find its insertion point in O(1) instead of reverse-scanning the
-        // whole anchor store. The tail is the last line we just tagged.
+        // whole anchor store. The tail is the last line we just tagged; it stays
+        // OPEN (continuable on one line) until a chunk closes it with a `\n`.
         if end_line > start_line {
-            self.core.set_cached_llm_line(end_line - 1);
+            self.core
+                .set_cached_llm_line(end_line - 1, !chunk.ends_with('\n'));
         }
     }
 
@@ -2390,8 +2453,9 @@ mod tests {
             let a = ed.anchor_for_line(l);
             ed.metadata_mut::<TurnId>().insert(a, TurnId::Llm(turn));
         }
-        // Prime the cache as `append_llm_chunk` would after its first chunk.
-        ed.core.set_cached_llm_line(last);
+        // Prime the cache as `append_llm_chunk` would after its first chunk
+        // (the inflight tail ends without a newline, so it's still open).
+        ed.core.set_cached_llm_line(last, true);
         ed
     }
 

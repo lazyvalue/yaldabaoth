@@ -543,10 +543,9 @@ fn rebuild_renders_unparsed_range_as_lines() {
         .collect();
     assert_eq!(
         line_items,
-        vec![0, 1, 2, 3],
-        "every source line of an unparsed range must render as a Line \
-         (plus the editable tail — a lone user blank not adjacent to a \
-         structural item is kept, not collapsed)"
+        vec![0, 1, 2],
+        "every source line of an unparsed range must render as a Line; the \
+         trailing blank editable tail is stripped (no stray empty bottom row)"
     );
 }
 
@@ -729,6 +728,369 @@ fn rebuild_text_gap_between_claude_turns_gets_you_header() {
         flat.iter()
             .any(|f| matches!(f, FlatItem::TurnHeader { role: TurnRole::User })),
         "a real text interjection between Claude turns must get a You header"
+    );
+}
+
+/// Rebuild the agent view model and return the flat-item list for `st`'s
+/// current editor document. Mirrors the cached-render miss path.
+fn flat_of(st: &mut AgentState) -> std::rc::Rc<Vec<FlatItem>> {
+    let lines: Vec<String> = (0..st.editor.document().line_count())
+        .map(|i| {
+            st.editor
+                .document()
+                .line_text(i)
+                .trim_end_matches('\n')
+                .to_string()
+        })
+        .collect();
+    let frozen = st.editor.frozen_lines().to_vec();
+    rebuild_agent_view_model(st, &lines, &frozen, &Theme::default(), 1).0
+}
+
+fn has_user_header(flat: &[FlatItem]) -> bool {
+    flat.iter()
+        .any(|f| matches!(f, FlatItem::TurnHeader { role: TurnRole::User }))
+}
+
+/// Issue 1, content-driven contract: the "You" divider appears the instant the
+/// editable run holds non-whitespace text (the first real keystroke, no Enter
+/// needed) and is ABSENT while the run is empty — so a blank draft shows none.
+#[test]
+fn rebuild_worksheet_blank_tail_has_no_header_until_text() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.append_llm_chunk(TurnId::Llm(1), "answer\n");
+    let tail = st.editor.document().line_count() - 1;
+    st.editor.cursor_mut().line = tail;
+    st.editor.cursor_mut().col = 0;
+    assert!(
+        !has_user_header(&flat_of(&mut st)),
+        "a blank editable tail (nothing written yet) must show no You divider"
+    );
+    // First real keystroke surfaces it immediately.
+    st.editor.insert_char('h');
+    assert!(
+        has_user_header(&flat_of(&mut st)),
+        "the You divider appears on the first non-whitespace character"
+    );
+}
+
+/// Issue 1 follow-up: if the user writes nothing but whitespace, the divider
+/// stays gone; clearing real text back to whitespace/empty removes it again.
+#[test]
+fn rebuild_worksheet_whitespace_only_run_has_no_header() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.append_llm_chunk(TurnId::Llm(1), "answer\n");
+    let tail = st.editor.document().line_count() - 1;
+    st.editor.cursor_mut().line = tail;
+    st.editor.cursor_mut().col = 0;
+    // Only whitespace.
+    for ch in "   \t".chars() {
+        st.editor.insert_char(ch);
+    }
+    assert!(
+        !has_user_header(&flat_of(&mut st)),
+        "a whitespace-only draft must show no You divider"
+    );
+    // Type a real char (divider on), then delete it back to whitespace (divider off).
+    st.editor.insert_char('x');
+    assert!(
+        has_user_header(&flat_of(&mut st)),
+        "a real character turns the divider on"
+    );
+    st.editor.backspace();
+    assert!(
+        !has_user_header(&flat_of(&mut st)),
+        "deleting back to whitespace-only turns the divider off again"
+    );
+}
+
+/// Issue 1: opening a blank interjection line shows NO divider until real text
+/// is typed there (then it appears immediately).
+#[test]
+fn rebuild_worksheet_interjection_header_tracks_text() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.append_llm_chunk(TurnId::Llm(1), "line one\nline two\n");
+    st.editor.cursor_mut().line = 0;
+    st.editor.cursor_mut().col = 8;
+    st.editor.open_line_below(); // blank editable line 1, caret on it
+    assert!(
+        !has_user_header(&flat_of(&mut st)),
+        "a freshly-opened blank interjection line shows no You divider yet"
+    );
+    for ch in "note".chars() {
+        st.editor.insert_char(ch);
+    }
+    assert!(
+        has_user_header(&flat_of(&mut st)),
+        "typing into the interjection surfaces the You divider"
+    );
+}
+
+/// Issue 2: a trailing blank editable line the caret has moved off of must NOT
+/// render as a stray empty row at the bottom of the transcript.
+#[test]
+fn rebuild_strips_trailing_blank_editable_tail() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.append_llm_chunk(TurnId::Llm(1), "answer\n");
+    // User text on line 1, then a trailing blank line 2; caret rests on line 1.
+    st.editor.cursor_mut().line = 1;
+    st.editor.cursor_mut().col = 0;
+    for ch in "hello\n".chars() {
+        st.editor.insert_char(ch);
+    }
+    st.editor.cursor_mut().line = 1; // caret back on "hello", off the blank tail
+    st.editor.cursor_mut().col = 5;
+    let flat = flat_of(&mut st);
+    let blank_tail = (0..st.editor.document().line_count())
+        .rfind(|&l| {
+            !st.editor.is_frozen_line(l)
+                && st.editor.document().line_text(l).trim().is_empty()
+        })
+        .expect("there is a trailing blank editable line in the doc");
+    assert!(
+        !flat
+            .iter()
+            .any(|f| matches!(f, FlatItem::Line(i) if *i == blank_tail)),
+        "the trailing blank editable line must not render (no extra blank newline)"
+    );
+}
+
+/// Issue 2 guard: the caret's OWN blank line still renders (it must, so the
+/// caret has a row), even though it's a trailing blank.
+#[test]
+fn rebuild_keeps_trailing_blank_when_caret_is_on_it() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.append_llm_chunk(TurnId::Llm(1), "answer\n");
+    for ch in "hello\n".chars() {
+        st.editor.cursor_mut().line = st.editor.document().line_count() - 1;
+        st.editor.cursor_mut().col = 0;
+        // (rebuild not needed between chars; we just need the final doc)
+        st.editor.insert_char(ch);
+    }
+    // Caret left on the trailing blank line (line 2).
+    let tail = st.editor.document().line_count() - 1;
+    st.editor.cursor_mut().line = tail;
+    st.editor.cursor_mut().col = 0;
+    let flat = flat_of(&mut st);
+    assert!(
+        flat.iter()
+            .any(|f| matches!(f, FlatItem::Line(i) if *i == tail)),
+        "the caret's own blank line must still render so the caret has a row"
+    );
+}
+
+// Mimic agent_ui chunk handling: floor + floored append for `turn`.
+fn sim_chunk(st: &mut AgentState, turn: usize, text: &str) {
+    let floor = agent_tail_floor_char(&st.editor);
+    st.editor
+        .append_llm_chunk_floored(TurnId::Llm(turn), text, floor);
+}
+// Mimic agent_ui ToolCallStarted handling: floor + anchor + register.
+fn sim_tool(st: &mut AgentState, turn: usize, id: &str, title: &str) {
+    let floor = agent_tail_floor_char(&st.editor);
+    let anchor = anchor_for_new_tool_call(&mut st.editor, floor);
+    let tcid: yalda::acp_channel::ToolCallId = id.to_string().into();
+    let key = ToolCallKey::from_id(&tcid);
+    st.editor
+        .metadata_mut::<TurnId>()
+        .insert(anchor, TurnId::Tool(turn));
+    let tc = yalda::acp_channel::ToolCall::new(tcid, title.to_string());
+    st.tools.register(key, tc, anchor);
+}
+
+fn doc_lines(st: &AgentState) -> Vec<String> {
+    (0..st.editor.document().line_count())
+        .map(|i| {
+            st.editor
+                .document()
+                .line_text(i)
+                .trim_end_matches('\n')
+                .to_string()
+        })
+        .collect()
+}
+
+/// Issue 3 (the out-of-order / corruption root cause): a new agent turn that
+/// streams its first chunk while the user has a worksheet draft must NOT fuse
+/// the chunk into the draft line or freeze the draft as agent content. The
+/// draft stays its own editable line at the tail; the agent content lands above.
+#[test]
+fn floored_first_chunk_never_merges_into_draft() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.append_llm_chunk(TurnId::Llm(1), "ok\n");
+    st.editor.cursor_mut().line = st.editor.document().line_count() - 1;
+    st.editor.cursor_mut().col = 0;
+    for ch in "my draft".chars() {
+        st.editor.insert_char(ch);
+    }
+    // New turn (Llm 2) streams a sub-line first chunk.
+    sim_chunk(&mut st, 2, "Let me look. ");
+    let lines = doc_lines(&st);
+    // The draft survives intact on its own editable line.
+    let draft_line = lines
+        .iter()
+        .position(|l| l == "my draft")
+        .expect("the draft must survive as its own line");
+    assert!(
+        !st.editor.is_frozen_line(draft_line),
+        "the draft line must stay editable, not frozen as agent content"
+    );
+    // The chunk is above the draft and does not share its line.
+    let chunk_line = lines
+        .iter()
+        .position(|l| l.contains("Let me look."))
+        .expect("the chunk must be present");
+    assert!(chunk_line < draft_line, "agent content stays above the draft");
+    assert!(
+        !lines[chunk_line].contains("my draft"),
+        "the chunk must not be fused onto the draft line: {lines:?}"
+    );
+}
+
+/// Issue 3: consecutive sub-line chunks of one turn (no trailing newlines,
+/// nothing between them) flow onto ONE agent line above the draft — the
+/// open-stream bit prevents the per-chunk choppiness the naive floor produced.
+#[test]
+fn floored_subline_chunks_merge_onto_one_line() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.append_llm_chunk(TurnId::Llm(1), "ok\n");
+    st.editor.cursor_mut().line = st.editor.document().line_count() - 1;
+    st.editor.cursor_mut().col = 0;
+    for ch in "draft".chars() {
+        st.editor.insert_char(ch);
+    }
+    sim_chunk(&mut st, 2, "Let me ");
+    sim_chunk(&mut st, 2, "look ");
+    sim_chunk(&mut st, 2, "at it. ");
+    let lines = doc_lines(&st);
+    assert!(
+        lines.iter().any(|l| l.trim() == "Let me look at it."),
+        "sub-line chunks must coalesce onto one agent line: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "draft"),
+        "the draft survives at the tail: {lines:?}"
+    );
+}
+
+/// Issue 3: a chunk that ends with a newline is a real paragraph break, so the
+/// next same-turn chunk starts a fresh agent line (not merged), even while the
+/// draft sits below.
+#[test]
+fn floored_hard_break_starts_new_line_above_draft() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.append_llm_chunk(TurnId::Llm(1), "ok\n");
+    st.editor.cursor_mut().line = st.editor.document().line_count() - 1;
+    st.editor.cursor_mut().col = 0;
+    for ch in "draft".chars() {
+        st.editor.insert_char(ch);
+    }
+    sim_chunk(&mut st, 2, "First para.\n");
+    sim_chunk(&mut st, 2, "Second para.");
+    let lines = doc_lines(&st);
+    let p1 = lines.iter().position(|l| l == "First para.");
+    let p2 = lines.iter().position(|l| l == "Second para.");
+    assert!(
+        p1.is_some() && p2.is_some() && p1 != p2,
+        "a hard \\n break keeps paragraphs on separate lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "draft"),
+        "the draft survives at the tail: {lines:?}"
+    );
+}
+
+/// Issue 3: tools interleaved with agent text while a draft is present keep
+/// document order — text, tool, text, tool, text — all above the preserved draft.
+#[test]
+fn floored_tools_and_text_stay_in_order_above_draft() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.append_llm_chunk(TurnId::Llm(1), "ok\n");
+    st.editor.cursor_mut().line = st.editor.document().line_count() - 1;
+    st.editor.cursor_mut().col = 0;
+    for ch in "my draft".chars() {
+        st.editor.insert_char(ch);
+    }
+    sim_chunk(&mut st, 2, "Let me look. ");
+    sim_tool(&mut st, 2, "t1", "grep");
+    sim_chunk(&mut st, 2, "Found it. ");
+    sim_tool(&mut st, 2, "t2", "read");
+    sim_chunk(&mut st, 2, "Done.");
+    let flat = flat_of(&mut st);
+    // Collapse the flat list to a coarse ordered signature.
+    let mut sig: Vec<&str> = Vec::new();
+    for f in flat.iter() {
+        match f {
+            FlatItem::ToolGroup { .. } => sig.push("tool"),
+            FlatItem::Line(i) => {
+                let t = st.editor.document().line_text(*i);
+                if t.contains("Let me look.") {
+                    sig.push("look")
+                } else if t.contains("Found it.") {
+                    sig.push("found")
+                } else if t.contains("Done.") {
+                    sig.push("done")
+                } else if t.contains("my draft") {
+                    sig.push("draft")
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        sig,
+        vec!["look", "tool", "found", "tool", "done", "draft"],
+        "tools/text must stay in document order with the draft last"
+    );
+}
+
+/// After an agent turn settles in Worksheet mode, the caret drops to the
+/// editable tail (last line) so the user composes their next message at the
+/// bottom, and a reveal is queued so the viewport follows.
+#[test]
+fn worksheet_turn_end_moves_caret_to_tail() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.append_llm_chunk(TurnId::Llm(1), "a long\nmulti-line\nreply");
+    // Caret parked up in the transcript (as if the user scrolled to read).
+    st.editor.cursor_mut().line = 0;
+    st.editor.cursor_mut().col = 0;
+    st.pending_reveal_cursor = false;
+    assert!(st.finalize_agent_turn_idem(0, 1), "first finalize runs");
+    let last = st.editor.document().line_count() - 1;
+    assert_eq!(
+        st.editor.cursor().line,
+        last,
+        "the caret drops to the editable tail after the turn"
+    );
+    assert!(
+        st.pending_reveal_cursor,
+        "a reveal is queued so the viewport scrolls to the tail"
+    );
+}
+
+/// Chatbox composes in a separate surface, so a turn end must NOT yank the
+/// transcript caret.
+#[test]
+fn chatbox_turn_end_leaves_caret_put() {
+    let mut st = AgentState::new_for_test(); // defaults to Chatbox
+    st.editor.append_llm_chunk(TurnId::Llm(1), "a long\nmulti-line\nreply");
+    st.editor.cursor_mut().line = 0;
+    st.editor.cursor_mut().col = 0;
+    assert!(st.finalize_agent_turn_idem(0, 1), "first finalize runs");
+    assert_eq!(
+        st.editor.cursor().line,
+        0,
+        "the transcript caret stays put in Chatbox mode"
     );
 }
 
