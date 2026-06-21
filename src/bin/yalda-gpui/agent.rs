@@ -2292,6 +2292,11 @@ pub(crate) fn rebuild_agent_view_model(
                         .is_some()
                 })
                 .unwrap_or(lines.len());
+            // The "You" divider is purely CONTENT-driven: it appears the instant
+            // the run holds non-whitespace text and disappears the moment the
+            // user clears it back to empty or whitespace-only (no caret-presence
+            // trigger — an empty/whitespace draft must show no divider). Immediacy
+            // comes from the transcript busting its cache on every editor edit.
             let run_non_empty = (line_idx..run_end).any(|j| !lines[j].trim().is_empty());
             if run_non_empty {
                 flat_items.push(FlatItem::TurnHeader {
@@ -2301,8 +2306,8 @@ pub(crate) fn rebuild_agent_view_model(
                 // re-opens with its own header.
                 prev_turn = None;
             }
-            // All-blank gap: leave `prev_turn` intact so an abandoned editable
-            // gap inserted mid-Claude-turn doesn't split it into two headers.
+            // All-blank/whitespace gap: leave `prev_turn` intact so an abandoned
+            // editable gap mid-Claude-turn doesn't split it into two headers.
         }
 
         // Advance the resolved-range cursor past ranges that
@@ -2367,6 +2372,15 @@ pub(crate) fn rebuild_agent_view_model(
             // Blank frozen lines are always stripped — they're just
             // anchor padding inserted by the ACP splice logic.
             if is_frozen_line(&flat_items[i]) {
+                keep[i] = false;
+                continue;
+            }
+            // Drop a blank editable line that is the LAST rendered item — a
+            // trailing editable blank below the user's text renders as a stray
+            // empty row at the bottom of the transcript ("extra blank newline").
+            // The caret's own line is never blank here (it's `protect_line`), so
+            // this only strips a tail the caret has moved off of.
+            if i + 1 == flat_items.len() {
                 keep[i] = false;
                 continue;
             }
@@ -3046,7 +3060,28 @@ impl AgentState {
             return false; // already finalized this (generation, turn)
         }
         finalize_agent_turn(&mut self.editor);
+        // In Worksheet mode the caret IS the compose point, so once a turn
+        // settles drop it to the editable tail — the user composes their next
+        // message right below the agent's reply, and the viewport follows there.
+        // Chatbox composes in a separate surface, so its transcript caret is
+        // left where it is.
+        if matches!(self.input_surface, InputSurface::Worksheet) {
+            self.move_cursor_to_tail();
+        }
         true
+    }
+
+    /// Drop the worksheet caret to the end of the editable tail (the last line)
+    /// and queue a reveal so the viewport scrolls to it. `finalize_agent_turn`
+    /// guarantees a trailing newline, so the last line is the empty editable
+    /// compose row (or the end of an in-progress draft).
+    pub(crate) fn move_cursor_to_tail(&mut self) {
+        let last = self.editor.document().line_count().saturating_sub(1);
+        let col = self.editor.document().line_len_chars(last);
+        self.editor.cursor_mut().line = last;
+        self.editor.cursor_mut().col = col;
+        self.pending_reveal_cursor = true;
+        self.follow_output.set(true);
     }
 
     /// Settle the replayed history prefix exactly once on `ReplayEnd`, WITHOUT
