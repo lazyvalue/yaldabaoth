@@ -12,6 +12,19 @@ use std::path::{Path, PathBuf};
 /// O(edit) rather than O(document), so typing one character into a buffer that
 /// also holds a multi-thousand-line frozen transcript no longer snapshots the
 /// whole transcript per keystroke.
+/// A line-level shift an undo/redo applied to the rope, to be **replayed on the
+/// editor's anchor store** so frozen-line metadata (TurnId / tool tags) tracks
+/// the change instead of being reset. Fixes the worksheet "undo wiped the
+/// gutter / relocated tool calls to the bottom" bug (worksheet-frozen-blocks
+/// ticket 001 / C3): undo used to `reset_line_anchors`, dropping every tag;
+/// these ops let the editor SHIFT the anchors (metadata is keyed by stable
+/// anchor id, so it survives) exactly as a live insert/delete would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorShift {
+    Insert { line: usize, col: usize, nl: usize },
+    Delete { line: usize, col: usize, nl: usize },
+}
+
 #[derive(Debug, Clone)]
 struct Splice {
     /// Char index where the edit began (in the pre-splice rope).
@@ -421,38 +434,69 @@ impl Document {
         }
     }
 
+    // (AnchorShift defined at module scope below.)
+
+    /// `(line, col)` of a char index in the current rope.
+    fn line_col_of_char(&self, char_idx: usize) -> (usize, usize) {
+        let idx = char_idx.min(self.rope.len_chars());
+        let line = self.rope.char_to_line(idx);
+        (line, idx - self.rope.line_to_char(line))
+    }
+
+    fn count_nl(&self, s: usize, e: usize) -> usize {
+        self.rope.slice(s..e).chars().filter(|c| *c == '\n').count()
+    }
+
     /// Invert one group's splices in reverse application order, mutating the
     /// rope back to its pre-group state. Cost is O(sum of edit sizes), never
-    /// O(document). Used by `undo`.
-    fn apply_inverse(&mut self, entry: &UndoEntry) {
+    /// O(document). Used by `undo`. Returns the line-level [`AnchorShift`]s the
+    /// caller must replay on its anchor store so frozen-line metadata
+    /// (TurnId/tool tags) tracks the change instead of being reset (C3).
+    fn apply_inverse(&mut self, entry: &UndoEntry) -> Vec<AnchorShift> {
+        let mut ops = Vec::new();
         for sp in entry.splices.iter().rev() {
             let rm_end = (sp.start + sp.inserted.chars().count()).min(self.rope.len_chars());
             let rm_start = sp.start.min(rm_end);
             if rm_start < rm_end {
+                let (line, col) = self.line_col_of_char(rm_start);
+                let nl = self.count_nl(rm_start, rm_end);
                 self.rope.remove(rm_start..rm_end);
+                ops.push(AnchorShift::Delete { line, col, nl });
             }
             if !sp.removed.is_empty() {
                 let at = sp.start.min(self.rope.len_chars());
+                let (line, col) = self.line_col_of_char(at);
+                let nl = sp.removed.chars().filter(|c| *c == '\n').count();
                 self.rope.insert(at, &sp.removed);
+                ops.push(AnchorShift::Insert { line, col, nl });
             }
         }
+        ops
     }
 
     /// Re-apply one group's splices in forward application order, mutating the
     /// rope back to its post-group state. Cost is O(sum of edit sizes). Used by
-    /// `redo`.
-    fn apply_forward(&mut self, entry: &UndoEntry) {
+    /// `redo`. Returns anchor shifts to replay (see [`apply_inverse`]).
+    fn apply_forward(&mut self, entry: &UndoEntry) -> Vec<AnchorShift> {
+        let mut ops = Vec::new();
         for sp in entry.splices.iter() {
             let rm_end = (sp.start + sp.removed.chars().count()).min(self.rope.len_chars());
             let rm_start = sp.start.min(rm_end);
             if rm_start < rm_end {
+                let (line, col) = self.line_col_of_char(rm_start);
+                let nl = self.count_nl(rm_start, rm_end);
                 self.rope.remove(rm_start..rm_end);
+                ops.push(AnchorShift::Delete { line, col, nl });
             }
             if !sp.inserted.is_empty() {
                 let at = sp.start.min(self.rope.len_chars());
+                let (line, col) = self.line_col_of_char(at);
+                let nl = sp.inserted.chars().filter(|c| *c == '\n').count();
                 self.rope.insert(at, &sp.inserted);
+                ops.push(AnchorShift::Insert { line, col, nl });
             }
         }
+        ops
     }
 
     /// Undo the last action. Returns the cursor position to restore, plus the
@@ -463,11 +507,12 @@ impl Document {
         &mut self,
         current_frozen_lines: &[(usize, usize)],
         current_lockable_through_line: usize,
-    ) -> Option<(usize, usize, Vec<(usize, usize)>, usize)> {
+    ) -> Option<(usize, usize, Vec<(usize, usize)>, usize, Vec<AnchorShift>)> {
         let entry = self.undo_stack.pop()?;
         // Invert the group's splices to walk the rope back to its pre-group
-        // state — O(edit), not O(document) (finding #4).
-        self.apply_inverse(&entry);
+        // state — O(edit), not O(document) (finding #4). The shift ops let the
+        // editor track frozen-line metadata across the undo (C3).
+        let shifts = self.apply_inverse(&entry);
         // Push a redo record. The same splices replay forward on redo; we only
         // swap in the editor's CURRENT (post-group) frozen state as the state a
         // future redo should restore, mirroring the old snapshot behavior.
@@ -488,6 +533,7 @@ impl Document {
             entry.cursor_before_col,
             entry.frozen_lines_before,
             entry.lockable_through_line_before,
+            shifts,
         ))
     }
 
@@ -498,7 +544,7 @@ impl Document {
         &mut self,
         current_frozen_lines: &[(usize, usize)],
         current_lockable_through_line: usize,
-    ) -> Option<(usize, usize, Vec<(usize, usize)>, usize)> {
+    ) -> Option<(usize, usize, Vec<(usize, usize)>, usize, Vec<AnchorShift>)> {
         let entry = self.redo_stack.pop()?;
         // Push the undo record *before* re-applying, capturing the current
         // (pre-group) frozen state so a later undo restores it — matching the
@@ -514,7 +560,7 @@ impl Document {
         };
         self.undo_stack.push(undo_entry);
         // Replay the group's splices forward to the post-group rope — O(edit).
-        self.apply_forward(&entry);
+        let shifts = self.apply_forward(&entry);
         self.modified = true;
         self.edit_seq = self.edit_seq.wrapping_add(1);
         Some((
@@ -522,6 +568,7 @@ impl Document {
             entry.cursor_before_col,
             entry.frozen_lines_before,
             entry.lockable_through_line_before,
+            shifts,
         ))
     }
 
@@ -680,7 +727,7 @@ mod tests {
         d.end_undo_group(0, 0);
         // Undo with a *different* current frozen state; we should get the
         // snapshotted pre-group frozen back.
-        let (_l, _c, restored_frozen, restored_lockable) = d.undo(&[(0, 5)], 3).unwrap();
+        let (_l, _c, restored_frozen, restored_lockable, _shifts) = d.undo(&[(0, 5)], 3).unwrap();
         assert_eq!(restored_frozen, frozen);
         assert_eq!(restored_lockable, 1);
     }
