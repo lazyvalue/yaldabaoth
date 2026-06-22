@@ -8,8 +8,22 @@ separately-tested fixes.
 > ("can't find cursor / undo erased it / tool calls at the bottom").** Data was
 > safe (server WAL intact); the break was the worksheet's editor rebuild hitting
 > these deferred bugs. **Fixed: streaming cursor drift (F2) + undo wipes metadata
-> (C3)** — see checkboxes. The remaining two (floor-only-EOF, fingerprint) are
-> edge/perf-sensitive and intentionally NOT blind-patched (see notes).
+> (C3)** — see checkboxes. **2026-06-22: found + fixed the ACTUAL "undo erased
+> the buffer" cause (undo-group pollution, below) after a headless repro.** The
+> remaining two (floor-only-EOF, fingerprint) are edge/perf-sensitive and
+> intentionally NOT blind-patched (see notes).
+
+- [x] **Undo erases the whole transcript (THE "undo erased the buffer" repro) —
+  FIXED.** `begin_insert` opens ONE undo group for the entire insert session;
+  while it's open, an agent chunk's `programmatic_insert` → `record_splice`
+  folded the streamed content INTO the user's group (`pending_undo` was `Some`),
+  so exiting insert committed a group holding user text + agent turns and one
+  undo inverted ALL of it. Fix: programmatic (agent) splices go through
+  `Document::insert_str_at_char_no_undo` / `delete_range_no_undo` (NOT recorded
+  on the undo stack) and `shift_recorded_splices` keeps the user's own splices
+  position-correct across the interleave. Undo now reverts only the user's
+  edits, never agent content. Test
+  `worksheet_resume_undo_does_not_erase_transcript` (`verify_harness.rs`).
 
 - [x] **Streaming cursor drift — FIXED.** The cursor lived on `EditorView` while
   `EditorCore::programmatic_insert` shifted only frozen ranges/anchors, so a
