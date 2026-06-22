@@ -742,7 +742,12 @@ impl EditorCore {
     pub fn programmatic_insert(&mut self, char_idx: usize, text: &str) {
         let (line, col) = char_to_line_col(&self.document, char_idx);
         self.shift_frozen_lines_for_insert(line, col, text);
-        self.document.insert_str_at_char(char_idx, text);
+        // NON-undoable: agent/programmatic content must never be reachable by
+        // the user's undo (else a chunk streamed while the user is mid-insert
+        // folds into their open undo group and a later undo wipes the whole
+        // transcript). Recorded user splices are position-shifted to stay
+        // correct across the interleave.
+        self.document.insert_str_at_char_no_undo(char_idx, text);
     }
 
     /// Programmatic delete (bypasses both lockable AND frozen-overlap checks).
@@ -754,7 +759,7 @@ impl EditorCore {
             return;
         }
         self.shift_frozen_lines_for_delete(s, e);
-        self.document.delete_range(s, e);
+        self.document.delete_range_no_undo(s, e);
     }
 
     /// Walk the active region and collect contiguous runs of editable lines,

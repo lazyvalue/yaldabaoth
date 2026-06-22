@@ -351,6 +351,56 @@ impl Document {
         self.redo_stack.clear();
     }
 
+    /// Insert `text` at `char_idx` WITHOUT recording it as a user-undoable edit.
+    /// Agent-streamed / programmatic content must never be reachable by the
+    /// user's `undo`: otherwise a chunk that streams while the user is mid-insert
+    /// (one open undo group) gets folded into that group and a later undo wipes
+    /// the whole transcript ("undo erased the buffer"). Already-recorded user
+    /// splices at/after the insert are position-shifted so the user's own undo
+    /// still targets the right characters despite the interleaved content. Does
+    /// NOT clear the redo stack — agent content is orthogonal to user undo/redo.
+    pub fn insert_str_at_char_no_undo(&mut self, char_idx: usize, text: &str) {
+        let len = self.rope.len_chars();
+        let idx = char_idx.min(len);
+        self.note_pending_edit(idx, 0, text);
+        self.rope.insert(idx, text);
+        self.touch();
+        self.shift_recorded_splices(idx, text.chars().count() as isize);
+    }
+
+    /// Delete `[start_char, end_char)` WITHOUT recording a user-undoable edit
+    /// (programmatic/agent companion to `insert_str_at_char_no_undo`).
+    pub fn delete_range_no_undo(&mut self, start_char: usize, end_char: usize) {
+        let len = self.rope.len_chars();
+        let s = start_char.min(len);
+        let e = end_char.min(len);
+        if s < e {
+            self.note_pending_edit(s, e - s, "");
+            self.rope.remove(s..e);
+            self.touch();
+            self.shift_recorded_splices(s, -((e - s) as isize));
+        }
+    }
+
+    /// Position-shift every recorded user splice (the open group + both stacks)
+    /// at or after `at` by `delta`, after a non-recorded programmatic splice
+    /// changed the rope. Keeps user undo/redo targeting the right characters
+    /// across interleaved agent content. Cheap: O(recorded user splices), which
+    /// is small (a handful of user edits), not O(transcript).
+    fn shift_recorded_splices(&mut self, at: usize, delta: isize) {
+        let bump = |sp: &mut Splice| {
+            if sp.start >= at {
+                sp.start = (sp.start as isize + delta).max(0) as usize;
+            }
+        };
+        if let Some(entry) = self.pending_undo.as_mut() {
+            entry.splices.iter_mut().for_each(bump);
+        }
+        for entry in self.undo_stack.iter_mut().chain(self.redo_stack.iter_mut()) {
+            entry.splices.iter_mut().for_each(bump);
+        }
+    }
+
     pub fn delete_line(&mut self, line: usize) {
         if line >= self.rope.len_lines() {
             return;

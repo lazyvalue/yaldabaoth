@@ -1010,6 +1010,94 @@ fn worksheet_resume_multiturn_caret_on_editable_tail(cx: &mut TestAppContext) {
     });
 }
 
+/// REGRESSION (live report "undo erased the buffer"): agent content that
+/// streams while the user is mid-insert in Worksheet mode must NOT become
+/// user-undoable. The bug: `begin_insert` opens ONE undo group for the whole
+/// insert session; an agent chunk's `programmatic_insert` recorded into that
+/// open group, so undoing the user's edit reverted the ENTIRE transcript. Fix:
+/// programmatic (agent) splices are non-undoable and only shift the user's own
+/// recorded splices. Here undo must remove the USER's text but keep every agent
+/// turn.
+#[gpui::test]
+fn worksheet_resume_undo_does_not_erase_transcript(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{ReplyEvent, ToolCall};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    // Worksheet mode, and the user is in INSERT mode (composing / hunting for
+    // the caret) — which opens ONE undo group for the whole insert session.
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
+        c.editor.begin_insert();
+        for ch in "my reply".chars() {
+            c.editor.insert_char(ch);
+        }
+    });
+
+    // Now the agent streams (a new turn / a resume replay) WHILE that group is
+    // still open. Each programmatic chunk records into the USER's group.
+    view.update(vcx, |v, cx| {
+        let tc = ToolCall::new("tool-1", "Read");
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("agent turn one reply\n".into())),
+                ev(ReplyEvent::ToolCallStarted(tc)),
+                ev(ReplyEvent::Chunk("agent turn two after the tool\n".into())),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    // User drops back to Normal (Esc) — this COMMITS the insert group, which now
+    // holds the user's text AND the agent chunks that streamed into it.
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().editor.end_insert();
+    });
+
+    let before = view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().editor.document().full_text()
+    });
+    // Undo a bunch, exactly as the user did.
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).unwrap();
+        for _ in 0..15 {
+            c.editor.undo();
+        }
+    });
+    let after = view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().editor.document().full_text()
+    });
+    assert!(
+        before.contains("my reply"),
+        "sanity: the user's typed text was present before undo.\n{before}"
+    );
+    assert!(
+        after.contains("agent turn one reply") && after.contains("agent turn two after the tool"),
+        "undo MUST NOT erase the agent transcript.\nBEFORE:\n{before}\n---\nAFTER:\n{after}"
+    );
+    assert!(
+        !after.contains("my reply"),
+        "undo SHOULD still revert the user's OWN edit (just not the agent's).\nAFTER:\n{after}"
+    );
+}
+
 #[cfg(test)]
 fn active_transcript_text(
     view: &gpui::Entity<YaldaGpuiView>,
