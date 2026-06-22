@@ -950,6 +950,66 @@ fn agent_session_binds_at_most_one_tile(cx: &mut TestAppContext) {
     assert_eq!(active, 0, "focus navigated to the owning workspace");
 }
 
+/// Reopening a multiturn session into Worksheet mode lands the caret on an
+/// EDITABLE tail with the transcript intact and in order. Replays a transcript
+/// (agent text + a tool call + more text) ending in `ReplayComplete` — exactly
+/// what attaching to an existing session does — then switches to Worksheet and
+/// asserts the caret is findable on a non-frozen last line. Guards the basic
+/// resume→worksheet path the user reported broken (the actual repro needs a
+/// more specific trigger; this pins that the happy path stays correct).
+#[gpui::test]
+fn worksheet_resume_multiturn_caret_on_editable_tail(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{ReplyEvent, ToolCall};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        let tc = ToolCall::new("tool-1", "Read");
+        let batch = vec![
+            ev(ReplyEvent::Chunk("agent turn one reply\n".into())),
+            ev(ReplyEvent::UserMessage("user second prompt\n".into())),
+            ev(ReplyEvent::ToolCallStarted(tc)),
+            ev(ReplyEvent::Chunk("agent turn two after the tool\n".into())),
+            ev(ReplyEvent::ReplayComplete),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        let text = c.editor.document().full_text();
+        assert!(text.contains("agent turn one reply"), "turn-one text present");
+        assert!(
+            text.contains("agent turn two after the tool"),
+            "turn-two text present and ordered after the tool"
+        );
+        let last = c.editor.document().line_count().saturating_sub(1);
+        assert_eq!(c.editor.cursor().line, last, "caret on the last line");
+        assert!(
+            !c.editor.is_frozen_line(last),
+            "the caret's last line is an EDITABLE tail — the user can find it and type"
+        );
+    });
+}
+
 #[cfg(test)]
 fn active_transcript_text(
     view: &gpui::Entity<YaldaGpuiView>,

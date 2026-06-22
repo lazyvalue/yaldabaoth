@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 
 use crate::cursor::CursorPos;
-use crate::document::Document;
+use crate::document::{AnchorShift, Document};
 use crate::tree::{BlockInfo, TreeState};
 
 // Test-only instrumentation for finding #9: counts every anchor visited by the
@@ -461,6 +461,31 @@ impl EditorCore {
         self.line_anchors = LineAnchorStore::default();
         self.line_metadata = LineMetadataStore::default();
         // Perf cache: the anchors it referenced are gone.
+        self.last_llm_line = None;
+        self.last_llm_open = false;
+    }
+
+    /// Replay an undo/redo's line-level [`AnchorShift`]s on the anchor store so
+    /// frozen-line metadata (TurnId / tool tags) tracks the rope change — the
+    /// fix for "undo wiped the gutter / tool calls jumped to the bottom"
+    /// (worksheet-frozen-blocks ticket 001 / C3). The metadata is keyed by
+    /// stable anchor id, so SHIFTING the anchors (instead of the old
+    /// `reset_line_anchors`) preserves every surviving tag; only anchors on
+    /// lines a delete actually consumed are dropped. The LLM-tail perf hint is
+    /// line-derived, so it's safely invalidated (re-derived on next use).
+    pub fn apply_anchor_shifts(&mut self, shifts: &[AnchorShift]) {
+        for op in shifts {
+            match *op {
+                AnchorShift::Insert { line, col, nl } => {
+                    self.line_anchors.shift_for_insert(line, col, nl);
+                }
+                AnchorShift::Delete { line, col, nl } => {
+                    for a in self.line_anchors.shift_for_delete(line, col, nl) {
+                        self.line_metadata.drop_anchor(a);
+                    }
+                }
+            }
+        }
         self.last_llm_line = None;
         self.last_llm_open = false;
     }
@@ -1205,10 +1230,14 @@ impl EditorView {
     pub fn undo(&mut self, core: &mut EditorCore) {
         let cur_frozen = core.frozen_lines.clone();
         let cur_lockable = core.lockable_through_line;
-        if let Some((line, col, frozen, lockable)) = core.document.undo(&cur_frozen, cur_lockable) {
+        if let Some((line, col, frozen, lockable, shifts)) =
+            core.document.undo(&cur_frozen, cur_lockable)
+        {
             core.frozen_lines = frozen;
             core.lockable_through_line = lockable;
-            core.reset_line_anchors();
+            // C3: SHIFT the anchors to track the rope change (preserving
+            // TurnId/tool metadata) instead of resetting them.
+            core.apply_anchor_shifts(&shifts);
             self.cursor.line = line.min(core.document.line_count().saturating_sub(1));
             self.cursor.col = col;
             self.clamp_cursor_col(core, false);
@@ -1219,10 +1248,12 @@ impl EditorView {
     pub fn redo(&mut self, core: &mut EditorCore) {
         let cur_frozen = core.frozen_lines.clone();
         let cur_lockable = core.lockable_through_line;
-        if let Some((line, col, frozen, lockable)) = core.document.redo(&cur_frozen, cur_lockable) {
+        if let Some((line, col, frozen, lockable, shifts)) =
+            core.document.redo(&cur_frozen, cur_lockable)
+        {
             core.frozen_lines = frozen;
             core.lockable_through_line = lockable;
-            core.reset_line_anchors();
+            core.apply_anchor_shifts(&shifts);
             self.cursor.line = line.min(core.document.line_count().saturating_sub(1));
             self.cursor.col = col;
             self.clamp_cursor_col(core, false);
@@ -1380,8 +1411,56 @@ impl Editor {
         self.core.is_in_frozen_range(char_idx)
     }
 
-    pub fn programmatic_insert(&mut self, char_idx: usize, text: &str) {
+    /// Programmatic insert that ALSO keeps the view cursor anchored to the
+    /// user's text: an insert at or before the cursor shifts the cursor right by
+    /// the inserted length. Without this, a chunk streamed ABOVE the caret (a
+    /// new agent turn while the user has a worksheet draft, or a long replay on
+    /// resume) strands the caret on what is now agent content — the
+    /// streaming-cursor-drift bug (worksheet-frozen-blocks ticket 001 / F2). The
+    /// `core` shifts frozen ranges + anchors for the same splice; this is the
+    /// missing cursor half, applied here because the wrapper holds view + core.
+    /// EVERY Editor-level programmatic insert routes through this.
+    fn splice_insert(&mut self, char_idx: usize, text: &str) {
+        let (cl, cc) = {
+            let c = self.view.cursor();
+            (c.line, c.col)
+        };
+        let cursor_char = self.core.document().line_col_to_char(cl, cc);
         self.core.programmatic_insert(char_idx, text);
+        if char_idx <= cursor_char {
+            let shifted = cursor_char + text.chars().count();
+            let (l, c) = char_to_line_col(self.core.document(), shifted);
+            let cur = self.view.cursor_mut();
+            cur.line = l;
+            cur.col = c;
+        }
+    }
+
+    /// Splice-delete companion to [`splice_insert`]: a delete before the cursor
+    /// shifts it left; a delete spanning the cursor clamps it to the deletion
+    /// start. Keeps the caret anchored through agent-driven deletes.
+    fn splice_delete(&mut self, del_s: usize, del_e: usize) {
+        let (cl, cc) = {
+            let c = self.view.cursor();
+            (c.line, c.col)
+        };
+        let cursor_char = self.core.document().line_col_to_char(cl, cc);
+        self.core.programmatic_delete(del_s, del_e);
+        let new_char = if cursor_char >= del_e {
+            cursor_char - del_e.saturating_sub(del_s)
+        } else if cursor_char > del_s {
+            del_s
+        } else {
+            cursor_char
+        };
+        let (l, c) = char_to_line_col(self.core.document(), new_char);
+        let cur = self.view.cursor_mut();
+        cur.line = l;
+        cur.col = c;
+    }
+
+    pub fn programmatic_insert(&mut self, char_idx: usize, text: &str) {
+        self.splice_insert(char_idx, text);
     }
 
     /// Perf cache (finding 2): drop the in-progress LLM-tail hint at turn end so
@@ -1391,7 +1470,7 @@ impl Editor {
     }
 
     pub fn programmatic_delete(&mut self, del_s: usize, del_e: usize) {
-        self.core.programmatic_delete(del_s, del_e);
+        self.splice_delete(del_s, del_e);
     }
 
     pub fn extract_editable_inserts(&self) -> String {
@@ -1489,12 +1568,12 @@ impl Editor {
                 None => {
                     // Open a clean blank line at the floor (shifts the draft
                     // down by one) and write the chunk into it.
-                    self.core.programmatic_insert(floor_char, "\n");
+                    self.splice_insert(floor_char, "\n");
                     floor_char
                 }
             }
         };
-        self.core.programmatic_insert(insertion_char, chunk);
+        self.splice_insert(insertion_char, chunk);
 
         let chunk_chars = chunk.chars().count();
         let chunk_end_char = insertion_char + chunk_chars;
@@ -1537,16 +1616,16 @@ impl Editor {
         // starts on its own line. O(1) tail probe instead of full_text().
         if !self.core.document().is_empty() && self.core.document().last_char() != Some('\n') {
             let eof = self.core.document().rope().len_chars();
-            self.core.programmatic_insert(eof, "\n");
+            self.splice_insert(eof, "\n");
         }
         let start_line = self.core.document().line_count().saturating_sub(1);
         let to_append = text.strip_suffix('\n').unwrap_or(text);
         let eof = self.core.document().rope().len_chars();
-        self.core.programmatic_insert(eof, to_append);
+        self.splice_insert(eof, to_append);
         // Ensure a terminating newline so the next chunk starts cleanly.
         if self.core.document().last_char() != Some('\n') {
             let eof2 = self.core.document().rope().len_chars();
-            self.core.programmatic_insert(eof2, "\n");
+            self.splice_insert(eof2, "\n");
         }
         let end_line = self.core.document().line_count();
         self.core.add_frozen_lines(start_line, end_line);
@@ -2356,6 +2435,85 @@ mod tests {
         assert!(!ed.is_frozen_line(2));
         // The new chunk line (line 1) should be frozen.
         assert!(ed.is_frozen_line(1));
+    }
+
+    #[test]
+    fn append_llm_chunk_keeps_caret_on_draft_pushed_down() {
+        // F2 (worksheet-frozen-blocks ticket 001 — streaming cursor drift): a
+        // chunk streamed ABOVE the user's worksheet draft must carry the caret
+        // DOWN with the draft, not strand it on the freshly-inserted agent line.
+        // This is the "couldn't find my cursor" report on a resumed session.
+        let mut ed = new_editor("Hi from agent.\nuser draft here\n");
+        ed.add_frozen_lines(0, 1);
+        let a0 = ed.anchor_for_line(0);
+        ed.metadata_mut::<TurnId>().insert(a0, TurnId::Llm(1));
+        // Caret sits inside the draft (line 1, col 5 = just after "user ").
+        ed.cursor_mut().line = 1;
+        ed.cursor_mut().col = 5;
+
+        ed.append_llm_chunk(TurnId::Llm(1), "And more!\n");
+
+        // The draft moved to line 2; the caret must have followed it — NOT stuck
+        // on line 1, which is now the agent's "And more!" content.
+        assert_eq!(ed.document().line_text(2), "user draft here\n");
+        assert_eq!(
+            ed.cursor().line,
+            2,
+            "caret tracked the draft down past the streamed chunk (no drift)"
+        );
+        assert_eq!(ed.cursor().col, 5, "caret column preserved within the draft");
+    }
+
+    #[test]
+    fn undo_preserves_frozen_line_metadata() {
+        // C3 (worksheet-frozen-blocks ticket 001 — undo wipes TurnId/tool tags):
+        // a user edit above a tagged agent turn, then undo, must NOT blank the
+        // tag or lose it — the "undo erased it / tool calls jumped to the
+        // bottom" report. Before the fix, undo called reset_line_anchors,
+        // dropping every TurnId tag, so the gutter blanked and a later stream
+        // appended at EOF.
+        let mut ed = new_editor("draft\nagent turn\n");
+        ed.add_frozen_lines(1, 2); // line 1 is the frozen agent turn
+        let a1 = ed.anchor_for_line(1);
+        ed.metadata_mut::<TurnId>().insert(a1, TurnId::Llm(7));
+
+        // User splits the editable draft with a newline (one undo group, exactly
+        // as the GUI key handler wraps a keystroke). The frozen tagged turn
+        // shifts DOWN to line 2.
+        {
+            let Editor { core, view } = &mut ed;
+            view.cursor_mut().line = 0;
+            view.cursor_mut().col = 5; // end of "draft"
+            let fl = core.frozen_lines.clone();
+            let lk = core.lockable_through_line;
+            let (cl, cc) = {
+                let c = view.cursor();
+                (c.line, c.col)
+            };
+            core.document.begin_undo_group(cl, cc, &fl, lk);
+            view.insert_char(core, '\n');
+            let (al, ac) = {
+                let c = view.cursor();
+                (c.line, c.col)
+            };
+            core.document.end_undo_group(al, ac);
+        }
+        let shifted = ed.anchor_for_line(2);
+        assert_eq!(
+            ed.metadata::<TurnId>().get(shifted),
+            Some(&TurnId::Llm(7)),
+            "tag tracked its line down past the user's inserted newline"
+        );
+
+        // Undo. The tag MUST survive and be back on line 1 (gutter not blanked,
+        // tag not lost to a reset — the C3 fix).
+        ed.undo();
+        let restored = ed.anchor_for_line(1);
+        assert_eq!(
+            ed.metadata::<TurnId>().get(restored),
+            Some(&TurnId::Llm(7)),
+            "agent-turn tag survives undo and is back on its line"
+        );
     }
 
     // ---- Finding #2: freeze_as_user_turn (user-side mirror) -----
