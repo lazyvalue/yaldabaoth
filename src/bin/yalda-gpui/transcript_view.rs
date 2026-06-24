@@ -384,7 +384,7 @@ impl TranscriptView {
         // ── Reconcile (count parity → splice/reset) + follow-scroll, on the
         // view-owned `TranscriptScroll`. The session borrow is dropped. ──
         self.scroll
-            .reconcile_list(block_ranges_active, new_count, edit_seq);
+            .reconcile_list(block_ranges_active, &flat_items_arc, edit_seq);
         debug_assert!(
             self.scroll.list_item_count == flat_items_arc.len(),
             "list_item_count ({}) out of sync with flat_items ({})",

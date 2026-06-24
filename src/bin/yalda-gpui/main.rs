@@ -64,7 +64,7 @@
 //!   Enter / l            open entry (descend into dir, or open file)
 //!   - / h                go to parent directory
 //!     .                    toggle hidden files
-//!     s                    cycle sort order (name / date↓ / date↑)
+//!     s                    cycle sort order (name / date↓ / date↑); remembered per tile
 //!     q / Esc              close browser (returns to doc, or quits)
 
 mod agent;
@@ -125,7 +125,7 @@ pub(crate) use yalda::blocks::{ColumnAlignment, ListItem, RenderedBlock, StyledL
 pub(crate) use yalda::cursor::CursorPos;
 pub(crate) use yalda::document::Document;
 pub(crate) use yalda::editor::{Editor, EditorCore, EditorView, LineAnchor};
-pub(crate) use yalda::file_browser::{BrowserEntry, FileBrowser};
+pub(crate) use yalda::file_browser::{BrowserEntry, FileBrowser, SortOrder};
 pub(crate) use yalda::keybind::KeybindManager;
 pub(crate) use yalda::keys::{Key, KeyPress, Modifiers as KMods};
 pub(crate) use yalda::md_highlight::{
@@ -1543,6 +1543,15 @@ struct YaldaGpuiView {
     /// persisted in `Preferences`, clamped to [20, 400] × [5, 200].
     desktop_grid_cols: u32,
     desktop_grid_rows: u32,
+    /// Per-tile remembered file-explorer sort order, keyed by the tile's
+    /// `WindowId`. A picker is short-lived (it's replaced by the picked file /
+    /// the restored underlying buffer when closed), so its `SortOrder` would
+    /// otherwise reset to `Name` every time the explorer is reopened in the
+    /// same tile. Recorded on `browser_cycle_sort`, seeded back when the tile
+    /// re-enters Picking (`open_browser_inner`). In-memory only; sparse (only
+    /// tiles whose sort was changed from the default appear). Stale entries for
+    /// closed tiles are harmless and tiny.
+    browser_sort: HashMap<workspace::WindowId, SortOrder>,
     /// Desktop canvas bounds `(x, y, w, h)` in window coordinates, captured
     /// during paint (same idiom as `line_layouts`). Mouse listeners use it
     /// to convert window coords → desktop coords; the render pass uses the
@@ -1656,6 +1665,7 @@ impl YaldaGpuiView {
             show_agent_heading_markers: true,
             desktop_grid_cols: 2,
             desktop_grid_rows: 2,
+            browser_sort: HashMap::new(),
             desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
             viewport_height_px: 0.0,
             viewport_width_px: 800.0,
@@ -1695,6 +1705,7 @@ impl YaldaGpuiView {
             show_agent_heading_markers: true,
             desktop_grid_cols: 2,
             desktop_grid_rows: 2,
+            browser_sort: HashMap::new(),
             desktop_canvas_bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
             viewport_height_px: 0.0,
             viewport_width_px: 800.0,
@@ -2488,12 +2499,22 @@ impl YaldaGpuiView {
             .workspace
             .replace_focused_content(placeholder)
             .expect("workspace has no focused window");
+        // Seed the picker from this tile's remembered sort order (set last time
+        // its explorer was open). Absent = the FileBrowser default (Name).
+        let mut fb = FileBrowser::new(dir);
+        if let Some(&order) = self
+            .workspace
+            .focused_window_id()
+            .and_then(|id| self.browser_sort.get(&id))
+        {
+            fb.set_sort_order(order);
+        }
         // Narrow the prior App to its BufferApp mode. The match above
         // guarantees `prior` is a Buffer (Viewing/Editing), so the stash is
         // typed `BufferApp` (D3/C4) and an Agent can never end up behind a
         // picker.
         self.set_screen(App::Buffer(BufferApp::Picking(BrowserWindow {
-            fb: FileBrowser::new(dir),
+            fb,
             underlying: prior.into_buffer_stash(),
             scroll: ScrollHandle::new(),
         })));

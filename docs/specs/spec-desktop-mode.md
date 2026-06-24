@@ -32,8 +32,9 @@ Named entities introduced here:
   top-left, growth rightward/downward). The **anchor** (top-left) of a tile.
 - **Span** — a tile's extent in cells, `(rows, cols)`, each ≥ 1 (default
   1 × 1). A tile at anchor `(r, c)` with span `(rows, cols)` **occupies the
-  rectangle** `[r, r+rows) × [c, c+cols)`. Spans grow only east/south, so the
-  anchor never moves under resize.
+  rectangle** `[r, r+rows) × [c, c+cols)`. East/south resize grows the far
+  edge (anchor fixed); west/north resize moves the anchor toward the origin
+  (Behavior 4b). Window/zoom/grid changes never move an anchor.
 - **DesktopState** — per-tab state: the sorted slot assignment
   (`Vec<(WindowId, Slot)>`, row-major order by anchor — placement *and*
   sequence in one structure), the per-tile span map (absent = 1 × 1), the
@@ -141,9 +142,10 @@ incrementally — one ring of slots per drag, by design.
 
 `Esc` cancel is handled at the canvas root (the dragged tile may not be
 the focused one), and arming a drag also focuses the grabbed tile. Stored
-anchors change only through drops, insertion-reconciliation, and seeding —
-never as a side effect of resize, zoom, or tile-size changes. (Span changes
-through edge resize, Behavior 4b, never move the anchor.)
+anchors change only through drops, insertion-reconciliation, seeding, and
+**west/north edge resize** (Behavior 4b — a pull-to-enlarge that moves the
+anchor toward the origin without rippling neighbours) — never as a side effect
+of window resize, zoom, or tile-size changes.
 
 **Spans and the ripple.** Occupancy is rectangle-aware: a slot is "occupied"
 if it falls inside any tile's rectangle. The insert-and-shift run collects
@@ -158,22 +160,28 @@ the *push* model — is deferred; v1 grows into free desktop only.)
 
 ### 4b · Edge resize — spanning a tile across slots [DRAFT]
 
-The **east** and **south** edges of every tile carry a thin (~6px) resize
-band; the cursor changes to a resize affordance there, while the title bar
-(drag-move, Behavior 4) and tile content keep their semantics. Dragging the
-east band changes the tile's **colspan**, the south band its **rowspan**, in
-whole-slot increments snapped to the grid pitch. Only east/south growth is
-offered in v1, so the tile's **anchor never moves** (Behavior 4's stored-slot
-stability holds).
+**All four** edges of every tile carry a thin (~6px) resize band; the cursor
+changes to a resize affordance there, while the title bar (drag-move,
+Behavior 4) and tile content keep their semantics. Dragging the **east**/**west**
+band changes the tile's **colspan**, the **south**/**north** band its
+**rowspan**, in whole-slot increments snapped to the grid pitch.
+
+The two edge families differ in which side stays put. **East/south** hold the
+**anchor** fixed and grow the far edge — Behavior 4's stored-slot stability
+holds. **West/north** are *pull-to-enlarge*: they hold the **far** edge fixed
+and move the **anchor** toward the origin (the only anchor change allowed by
+resize; it never ripples a neighbor, since the Block rule guarantees the
+vacated/entered cells are free). The anchor cannot cross the `0` wall.
 
 Span is clamped by the **Block rule**: a tile may grow only into slots that
 are empty or already its own. Growth stops at the first slot inside another
-tile's rectangle — the candidate span is clamped to the largest rectangle
-from the anchor that overlaps no other tile. To grow past a neighbor, move
-the neighbor first (Behavior 4). Shrinking is always allowed down to the
-1 × 1 minimum; freed slots become gaps. While resizing, a preview outline
-shows the candidate rectangle; `Esc` cancels (the span returns to its prior
-value); mouse-up commits the clamped span. A spanned tile that loses its
+tile's rectangle (or the `0` wall) — the candidate rectangle is clamped to the
+largest one, anchored on the fixed edge, that overlaps no other tile. To grow
+past a neighbor, move the neighbor first (Behavior 4). Shrinking is always
+allowed down to the 1 × 1 minimum; freed slots become gaps. While resizing, a
+preview shows the candidate rectangle (the live tile renders at its clamped
+anchor + span); `Esc` cancels (placement returns to its prior value); mouse-up
+commits the clamped anchor + span. A spanned tile that loses its
 backing leaf (closed) drops its anchor and span together, leaving the whole
 rectangle as gaps (Behavior 2). New tiles (seed, reconcile, split, open) are
 always 1 × 1.
@@ -248,8 +256,8 @@ accepted, and noted for the `:promote` blue-green loop.
     the boundary.
   - `drag: Option<DragState>` — dragged id, grab offset, pointer position,
     resolved drop target; never persisted.
-  - `resize: Option<ResizeState>` — resized id, edge (East/South), pointer;
-    never persisted.
+  - `resize: Option<ResizeState>` — resized id, edge (East/South/West/North),
+    pointer; never persisted.
 - `Preferences { desktop_grid_cols, desktop_grid_rows, .. }`.
 - `PersistedTab { desktop_slots: Option<Vec<(u64, u32, u32)>>,
   desktop_spans: Option<Vec<(u64, u32, u32)>>, .. }` — `(id, row, col)` and
@@ -268,8 +276,10 @@ called by the GPUI view layer):
   only if its whole rectangle is free).
 - `occupant(slot) -> Option<WindowId>` / `rect_of(id) -> (Slot, Span)` —
   rectangle-aware occupancy used by drops, hit-testing, and resize clamping.
-- `clamp_span(slots, spans, id, edge, desired) -> Span` — Behavior-4b Block-rule
-  clamp: the largest east/south growth from the anchor overlapping no other tile.
+- `clamp_resize(id, edge, desired) -> (Slot, Span)` — Behavior-4b Block-rule
+  clamp: the largest rectangle anchored on the fixed edge overlapping no other
+  tile. East/south return the unchanged anchor; west/north return the moved one.
+- `set_anchor(id, slot)` — direct, ripple-free anchor move (west/north commit).
 - `spatial_neighbor(slots, from, direction) -> Option<WindowId>` — Behavior-5.
 - `tile_rect(slot, span, tile_px, gutter) -> Bounds` / `drop_target(point, pan,
   tile_px, gutter) -> Slot` — geometry, *external* to the render path.
@@ -296,8 +306,9 @@ content; `Preferences` owns tile size.
 - Tile rectangles never overlap — every drop, resize, reconcile, and seed
   preserves it. The Block rule (Behavior 4b) and the wall semantics
   (Behavior 4) enforce non-overlap by *clamping or rejecting*, never by
-  silently truncating a tile. Resize changes span only; it never moves an
-  anchor or another tile.
+  silently truncating a tile. East/south resize changes span only; west/north
+  resize also moves the resized tile's own anchor (Behavior 4b), but never
+  another tile's anchor or span.
 
 ## Revision History
 
@@ -327,3 +338,12 @@ content; `Preferences` owns tile size.
   the same day** — engine is headlessly unit-tested (9 cases: rectangle-aware
   occupancy, Block clamp, wall-rejected inserts, span persistence); the
   east/south bands + live clamped preview were confirmed by hand.
+- 2026-06-24 — **West/north edge resize (pull-to-enlarge).** All four edges now
+  carry a resize band. East/south keep their anchor-fixed grow; west/north hold
+  the far edge and move the anchor toward the origin (the resized tile's own
+  anchor — never a neighbour's; Block-clamped against other tiles and the `0`
+  wall). `clamp_span -> Span` became `clamp_resize -> (Slot, Span)`; commit adds
+  a ripple-free `set_anchor`. The live preview carries the moved anchor so the
+  tile renders where it will land. Engine unit-tested (2 new cases: anchor move
+  + wall/neighbour clamp + free shrink); GUI bands runtime-unverified (human
+  check pending — GPUI can't be driven headlessly).

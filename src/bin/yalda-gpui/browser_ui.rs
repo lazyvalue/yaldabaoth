@@ -98,10 +98,18 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(b) = self.browser_mut() {
+        let id = self.workspace.focused_window_id();
+        let order = self.browser_mut().map(|b| {
             b.fb.cycle_sort();
-            cx.notify();
+            b.fb.sort_order
+        });
+        let Some(order) = order else { return };
+        // Remember this tile's chosen order so reopening the explorer in the
+        // same tile restores it (the picker itself is short-lived).
+        if let Some(id) = id {
+            self.browser_sort.insert(id, order);
         }
+        cx.notify();
     }
     pub(crate) fn browser_close(
         &mut self,

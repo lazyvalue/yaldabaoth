@@ -1152,6 +1152,79 @@ fn chatbox_turn_end_leaves_caret_put() {
     );
 }
 
+/// THE permanent guard against the 15×-recurring "chatbox caret/text scrolls
+/// off-screen" bug (spec-chatbox-caret-containment.md Constraint 4): drive a real
+/// `Chatbox` editor through every Behavior-7 edit path and, after each, assert
+/// `compute_window` keeps the caret CELL inside the visible box on BOTH axes for
+/// a range of extents (including the degenerate 1×1). This tests the integration
+/// (cursor + tab-expanded line-length read), not just the pure window math.
+#[test]
+fn chatbox_caret_cell_stays_in_window_for_every_edit_path() {
+    // After a given edit, the live caret cell must be inside the window the
+    // box would render at, for several visible extents.
+    fn assert_contained(cb: &Chatbox, label: &str) {
+        for &rows in &[1usize, 8] {
+            for &cols in &[1usize, 4, 20, 80] {
+                let w = cb.compute_window(rows, cols);
+                let cur = cb.editor.cursor();
+                assert!(
+                    cur.line >= w.top_line && cur.line < w.top_line + rows,
+                    "[{label}] caret line {} escaped vertical window {w:?} (rows={rows})",
+                    cur.line,
+                );
+                let inner = cols.saturating_sub(1).max(1);
+                assert!(
+                    cur.col >= w.left_col && cur.col <= w.left_col + inner,
+                    "[{label}] caret col {} escaped horizontal window {w:?} (cols={cols})",
+                    cur.col,
+                );
+            }
+        }
+    }
+
+    let mut cb = Chatbox::new();
+    assert_contained(&cb, "empty");
+
+    // Type a single VERY long line — the caret rides off the right edge unless
+    // the horizontal window scrolls (the reported "text goes off screen").
+    for ch in "the quick brown fox jumps over the lazy dog ".chars().cycle().take(400) {
+        cb.editor.insert_char(ch);
+    }
+    assert_contained(&cb, "long-line-EOL");
+
+    // Walk the caret back to the start of the line (caret left of the window).
+    cb.editor.move_cursor_first_non_blank();
+    assert_contained(&cb, "long-line-home");
+
+    // Jump back to end of that line.
+    cb.editor.move_cursor_line_end(true);
+    assert_contained(&cb, "long-line-end");
+
+    // Add many newlines so the draft exceeds the visible rows — the vertical
+    // half (newline at EOL of a full window is exactly the reported jump).
+    for _ in 0..30 {
+        cb.editor.insert_char('\n');
+        for ch in "another reply line that is also quite wide ".chars() {
+            cb.editor.insert_char(ch);
+        }
+    }
+    assert_contained(&cb, "many-lines-EOL");
+
+    // Move the caret to the very top (caret above the window).
+    cb.editor.jump_to_line(0);
+    assert_contained(&cb, "jump-top");
+
+    // ...and to the very bottom.
+    cb.editor.jump_cursor_bottom();
+    assert_contained(&cb, "jump-bottom");
+
+    // Backspace a run of chars (delete path, caret tracks left).
+    for _ in 0..50 {
+        cb.editor.backspace();
+    }
+    assert_contained(&cb, "after-backspace");
+}
+
 /// Pull the background color baked into the first span of the first code
 /// block in a flat-items list (the syntect/`code_block_bg` bake that goes
 /// stale on a theme switch).
@@ -1486,25 +1559,60 @@ fn reconcile_list_keeps_count_in_sync_and_reports_growth() {
     // `TranscriptView`. The reconcile logic is unchanged and still pure-
     // testable — `block_ranges_active` is now passed in rather than read off
     // `AgentState`.
+    // `n` distinct line items — distinct so the block-mode key diff is exercised.
+    let lines = |n: usize| -> Vec<FlatItem> { (0..n).map(FlatItem::Line).collect() };
+
     let mut sc = TranscriptScroll::new();
     assert_eq!(sc.list_item_count, 0);
 
     // Growth: count rises, reports grew=true, splices.
-    assert!(sc.reconcile_list(false, 5, 0), "0 -> 5 must report growth");
+    assert!(sc.reconcile_list(false, &lines(5), 0), "0 -> 5 must report growth");
     assert_eq!(sc.list_item_count, 5, "count tracks the requested length");
 
     // No change: same count, reports grew=false, count unchanged.
-    assert!(!sc.reconcile_list(false, 5, 0), "5 -> 5 is not growth");
+    assert!(!sc.reconcile_list(false, &lines(5), 0), "5 -> 5 is not growth");
     assert_eq!(sc.list_item_count, 5);
 
     // Shrink: count falls, reports grew=false, resets.
-    assert!(!sc.reconcile_list(false, 2, 0), "5 -> 2 is not growth");
+    assert!(!sc.reconcile_list(false, &lines(2), 0), "5 -> 2 is not growth");
     assert_eq!(sc.list_item_count, 2, "count tracks a shrink too");
 
-    // With block ranges active, even growth resets (height cache can't be
-    // spliced) — but parity must still hold.
-    assert!(sc.reconcile_list(true, 9, 0));
+    // With block ranges active, growth now SPLICES (preserving the prefix's
+    // scroll anchor) instead of reset — but parity must still hold.
+    assert!(sc.reconcile_list(true, &lines(9), 0));
     assert_eq!(sc.list_item_count, 9);
+}
+
+/// The worksheet "newline jumps to the top of the viewport" regression
+/// (project_chatbox_offscreen_recurring sibling): with block ranges active, a
+/// structural edit must SPLICE the changed range — preserving the unchanged
+/// prefix above the edit so the scroll anchor survives — NOT `reset()`. We can't
+/// observe GPUI scroll headlessly, but we pin the count-parity contract across a
+/// mid-list insert (the newline case) and a delete, which the splice path must
+/// keep exact for the reveal to land on measured rows.
+#[test]
+fn worksheet_reconcile_splices_structural_edits_keeping_parity() {
+    let lines = |n: usize| -> Vec<FlatItem> { (0..n).map(FlatItem::Line).collect() };
+    let mut sc = TranscriptScroll::new();
+
+    // Seed a long worksheet transcript.
+    assert!(sc.reconcile_list(true, &lines(40), 1));
+    assert_eq!(sc.list_item_count, 40);
+
+    // Insert a line in the MIDDLE (a newline at line 20): the new item list is
+    // 41 long. Splice must keep parity exact (the old code reset to top here).
+    let mut after_insert = lines(20);
+    after_insert.push(FlatItem::Line(999)); // the freshly-inserted editable line
+    after_insert.extend((20..40).map(FlatItem::Line));
+    assert!(
+        sc.reconcile_list(true, &after_insert, 2),
+        "structural growth reports grew=true",
+    );
+    assert_eq!(sc.list_item_count, 41, "count parity after a mid-list insert");
+
+    // Delete it again → shrink, parity holds.
+    assert!(!sc.reconcile_list(true, &lines(40), 3), "shrink is not growth");
+    assert_eq!(sc.list_item_count, 40);
 }
 
 /// F10 / INV-10 (block/line partition is total): a range

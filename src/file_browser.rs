@@ -221,6 +221,17 @@ impl FileBrowser {
         self.selected = 0;
     }
 
+    /// Set the sort order directly (used to seed a freshly-opened picker from
+    /// the tile's remembered order). No-op if already that order.
+    pub fn set_sort_order(&mut self, order: SortOrder) {
+        if self.sort_order == order {
+            return;
+        }
+        self.sort_order = order;
+        self.refresh();
+        self.selected = 0;
+    }
+
     /// Reload `entries` from disk, then rebuild the derived filtered/search
     /// lists so they always reflect the current `(entries, filter_text)`.
     fn refresh(&mut self) {

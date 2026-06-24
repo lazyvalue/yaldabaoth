@@ -1142,15 +1142,17 @@ pub(crate) fn build_wrapped_line(
     row.into_any_element()
 }
 
-/// Build the cursor caret element. Pulled out so the empty-line, mid-line,
-/// and end-of-line code paths all produce identical-looking carets.
+/// Render a single chatbox logical line as a NON-WRAPPING, horizontally-scrolled
+/// row (spec-chatbox-caret-containment.md Behavior 5).
 ///
-/// Render a single chatbox logical line as a wrapping row.
-///
-/// Long lines wrap at whitespace boundaries (flex_wrap), so the cursor stays
-/// visible without horizontal scrolling. The caret is emitted inline as its
-/// own flex child between the before/after halves of the containing token,
-/// so wrap behaviour stays consistent across cursor and non-cursor lines.
+/// The line is sliced to the visible column window `[left_col, left_col +
+/// visible_cols)` and rendered from the row's left edge — NOT pixel-offset.
+/// Slicing relies on the string boundary, so there is no per-column pixel drift
+/// (the drift that, with an inexact `char_w`, scrolls the caret off the edge —
+/// the recurring bug). A long unbreakable token therefore scrolls instead of
+/// wrapping or overflowing. The caret is injected at `cursor_col - left_col`
+/// within the slice, preserving Normal (block over the char) vs Insert
+/// (zero-width beam before it) semantics.
 // builder/render fn — arg count is inherent, splitting would obscure
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_chatbox_line(
@@ -1165,6 +1167,8 @@ pub(crate) fn build_chatbox_line(
     code_font: &SharedString,
     text_color: Hsla,
     selection_bg: Hsla,
+    left_col: usize,
+    visible_cols: usize,
 ) -> AnyElement {
     let line_h = px(18.0);
     let fg: Hsla = text_color;
@@ -1177,40 +1181,29 @@ pub(crate) fn build_chatbox_line(
     let chars: Vec<char> = full_text.chars().collect();
     let char_count = chars.len();
 
-    // Selection range projected onto this line.
+    // ── Horizontal window: slice the line to the visible columns. ──
+    // `vs..ve` is the char range shown; rendering it from the row's LEFT edge
+    // (not a pixel offset) is what makes the approximate `char_w` safe — no
+    // per-column drift can accumulate (spec Behavior 5).
+    let vs = left_col.min(char_count);
+    let ve = left_col.saturating_add(visible_cols.max(1)).min(char_count);
+    let slice: Vec<char> = chars[vs..ve].to_vec();
+    let slice_len = slice.len();
+
+    // Selection projected onto this line, then intersected with the slice and
+    // shifted into slice-local columns.
     let line_sel = sel
         .and_then(|s| line_selection_range(s, line_idx, total_line_chars))
+        .and_then(|(s, e)| if e > s { Some((s, e)) } else { None })
         .and_then(|(s, e)| {
-            if e > s {
-                Some((s.min(char_count), e.min(char_count)))
+            let ss = s.max(vs).saturating_sub(vs);
+            let se = e.min(ve).saturating_sub(vs);
+            if se > ss {
+                Some((ss.min(slice_len), se.min(slice_len)))
             } else {
                 None
             }
         });
-
-    // Tokenize into whitespace vs non-whitespace runs so flex_wrap can break
-    // at token boundaries. Each token becomes its own flex child.
-    let mut tokens: Vec<String> = Vec::new();
-    {
-        let mut current = String::new();
-        let mut current_ws = false;
-        for ch in chars.iter().copied() {
-            let is_ws = ch == ' ' || ch == '\t';
-            if current.is_empty() {
-                current_ws = is_ws;
-                current.push(ch);
-            } else if current_ws == is_ws {
-                current.push(ch);
-            } else {
-                tokens.push(std::mem::take(&mut current));
-                current_ws = is_ws;
-                current.push(ch);
-            }
-        }
-        if !current.is_empty() {
-            tokens.push(current);
-        }
-    }
 
     let mut row = div()
         .flex()
@@ -1221,30 +1214,30 @@ pub(crate) fn build_chatbox_line(
         .min_h(line_h)
         // Pin the text line-box to the caret height (18px) so a line carrying
         // a glyph is exactly as tall as the empty/placeholder line (which only
-        // holds the fixed-height caret). Without this, the font's default
-        // line-height makes a one-character chatbox a hair taller than an
-        // empty one.
+        // holds the fixed-height caret).
         .line_height(line_h)
+        // Belt-and-suspenders clip: the slice is sized to fit by construction,
+        // but a fractional last column never spills past the box edge.
+        .overflow_hidden()
         .font_family(code_font.clone())
         .text_size(px(13.0))
         .text_color(fg);
 
-    // Emit a chunk of text with the on-line selection highlight painted
-    // through any overlapping range. `chunk_start_col` is the column at
-    // which `text` begins on the logical line.
-    let emit_chunk = |row: gpui::Div, text: String, chunk_start_col: usize| -> gpui::Div {
+    // Emit a chunk of the SLICE with the selection highlight painted through any
+    // overlapping range. `start` is the chunk's slice-local start column.
+    let emit_chunk = |row: gpui::Div, text: String, start: usize| -> gpui::Div {
         if text.is_empty() {
             return row;
         }
         let chunk_chars: Vec<char> = text.chars().collect();
         let chunk_len = chunk_chars.len();
-        let chunk_end_col = chunk_start_col + chunk_len;
+        let end = start + chunk_len;
         if let Some((ss, se)) = line_sel
-            && se > chunk_start_col
-            && ss < chunk_end_col
+            && se > start
+            && ss < end
         {
-            let local_ss = ss.saturating_sub(chunk_start_col).min(chunk_len);
-            let local_se = se.saturating_sub(chunk_start_col).min(chunk_len);
+            let local_ss = ss.saturating_sub(start).min(chunk_len);
+            let local_se = se.saturating_sub(start).min(chunk_len);
             let mut r = row;
             if local_ss > 0 {
                 let pre: String = chunk_chars[..local_ss].iter().collect();
@@ -1263,110 +1256,41 @@ pub(crate) fn build_chatbox_line(
         row.child(text)
     };
 
-    // Empty line: just emit a placeholder space + (cursor if needed) so the
-    // row still occupies a visual line.
-    if tokens.is_empty() {
-        if is_cursor_line {
-            row = row.child(make_caret(mode, ' ', cursor_color));
-        } else {
-            row = row.child(" ");
-        }
-        return row.into_any_element();
-    }
+    // Caret column within the slice (cursor_col >= left_col by the containment
+    // invariant; saturating for safety). `None` when the caret isn't here.
+    let rel_caret = is_cursor_line.then(|| cursor_col.saturating_sub(vs));
 
-    if !is_cursor_line {
-        // ONE `StyledText` element for the whole line — NOT one flex child per
-        // token. GPUI's text shaper word-wraps a StyledText to the box width
-        // natively (the same primitive the transcript uses), so a long line
-        // wraps instead of clipping, and the selection highlight rides along as
-        // a run `background_color`. This is cheaper than the token-per-flex-
-        // child tree the profiler once flagged AND fixes the "doesn't wrap
-        // unless the cursor is on it" bug. The CURSOR line below keeps the
-        // token `flex_wrap` path so the caret can be injected mid-line.
-        let base_font = font_for(NStyle::default(), code_font);
-        let mut runs: Vec<TextRun> = Vec::new();
-        let mut push_run = |len_bytes: usize, bg: Option<Hsla>| {
-            if len_bytes == 0 {
-                return;
+    match rel_caret {
+        // Non-cursor line: one chunk for the whole visible slice (a placeholder
+        // space when empty so the row keeps its height).
+        None => {
+            if slice_len == 0 {
+                row = row.child(" ");
+            } else {
+                let text: String = slice.iter().collect();
+                row = emit_chunk(row, text, 0);
             }
-            runs.push(TextRun {
-                len: len_bytes,
-                font: base_font.clone(),
-                color: fg,
-                background_color: bg,
-                underline: None,
-                strikethrough: None,
-            });
-        };
-        // Empty lines are handled by the `tokens.is_empty()` early return
-        // above, so `full_text` is non-empty here.
-        let text: String = full_text.to_string();
-        if let Some((ss, se)) = line_sel {
-            // Map char-offset selection bounds to byte offsets for TextRun lens.
-            let byte_at = |col: usize| -> usize {
-                chars.iter().take(col).map(|c| c.len_utf8()).sum()
-            };
-            let pre = byte_at(ss);
-            let sel = byte_at(se) - pre;
-            let post = text.len() - pre - sel;
-            push_run(pre, None);
-            push_run(sel, Some(sel_bg));
-            push_run(post, None);
-        } else {
-            push_run(text.len(), None);
         }
-        let line = div()
-            .w_full()
-            .min_w_0()
-            .min_h(line_h)
-            .line_height(line_h)
-            .child(StyledText::new(text).with_runs(runs));
-        return line.into_any_element();
-    }
-
-    // Cursor line: keep word-wrap (so the caret can't scroll off the right
-    // edge) and walk tokens by column to inject the caret at the cursor's
-    // column boundary, splitting the containing token if needed.
-    let mut row = row.flex_wrap();
-    let cursor_col = cursor_col.min(char_count);
-    let mut col_so_far = 0usize;
-    let mut caret_emitted = false;
-    for token in &tokens {
-        let token_chars: Vec<char> = token.chars().collect();
-        let token_len = token_chars.len();
-        let token_end_col = col_so_far + token_len;
-        let caret_in_token =
-            !caret_emitted && cursor_col >= col_so_far && cursor_col <= token_end_col;
-
-        if caret_in_token {
-            let split_point = cursor_col - col_so_far;
-            let before: String = token_chars[..split_point].iter().collect();
+        // Cursor line: split the slice at the caret column and inject the caret.
+        Some(rel) => {
+            let rel = rel.min(slice_len);
+            let before: String = slice[..rel].iter().collect();
             if !before.is_empty() {
-                row = emit_chunk(row, before, col_so_far);
+                row = emit_chunk(row, before, 0);
             }
-            let cursor_char = token_chars.get(split_point).copied().unwrap_or(' ');
+            let cursor_char = slice.get(rel).copied().unwrap_or(' ');
             row = row.child(make_caret(mode, cursor_char, cursor_color));
-            caret_emitted = true;
-            // In Normal mode the cursor cell consumed the char at split_point;
-            // in Insert mode the caret is a zero-width beam so the char at
-            // split_point still belongs to the after-stream.
+            // Normal mode consumes the char under the caret; Insert is a
+            // zero-width beam so that char stays in the after-stream.
             let after_start = match mode {
-                EditMode::Normal => split_point + 1,
-                EditMode::Insert => split_point,
+                EditMode::Normal => rel + 1,
+                EditMode::Insert => rel,
             };
-            if after_start < token_len {
-                let after: String = token_chars[after_start..].iter().collect();
-                row = emit_chunk(row, after, col_so_far + after_start);
+            if after_start < slice_len {
+                let after: String = slice[after_start..].iter().collect();
+                row = emit_chunk(row, after, after_start);
             }
-        } else {
-            row = emit_chunk(row, token.clone(), col_so_far);
         }
-        col_so_far = token_end_col;
-    }
-
-    // Cursor sits past the last char (e.g., end-of-line in Insert mode).
-    if !caret_emitted {
-        row = row.child(make_caret(mode, ' ', cursor_color));
     }
 
     row.into_any_element()
@@ -1417,6 +1341,37 @@ pub(crate) struct TranscriptScroll {
     /// re-pins the viewport even when a chunk grows the last line without
     /// adding a row. `u64::MAX` = never scrolled.
     pub(crate) last_scrolled_edit_seq: u64,
+    /// Cheap per-item identity keys from the last reconcile, for the
+    /// block-ranges (worksheet) splice diff. Diffing keys lets the unchanged
+    /// PREFIX above an edit keep its measured heights + scroll anchor, instead
+    /// of `reset()`-ing the whole list (which nulled the scroll → the worksheet
+    /// "newline jumps to the top of the viewport" bug).
+    pub(crate) last_keys: Vec<FlatKey>,
+}
+
+/// A cheap, `Copy` identity for a [`FlatItem`] — enough to diff two item lists
+/// for the [`splice_list_to_items`] prefix/suffix match WITHOUT deep-comparing
+/// rendered blocks. `Block` keys on the `Rc` pointer (the S1 rebuild reuses the
+/// same `Rc` by refcount bump, so a stable block stays pointer-equal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlatKey {
+    Line(usize),
+    Tool(usize),
+    Block(usize),
+    Turn(TurnRole),
+    Thinking,
+}
+
+impl FlatKey {
+    pub(crate) fn of(item: &FlatItem) -> FlatKey {
+        match item {
+            FlatItem::Line(i) => FlatKey::Line(*i),
+            FlatItem::ToolGroup { anchor_line, .. } => FlatKey::Tool(*anchor_line),
+            FlatItem::Block(rc) => FlatKey::Block(std::rc::Rc::as_ptr(rc) as usize),
+            FlatItem::TurnHeader { role } => FlatKey::Turn(*role),
+            FlatItem::ThinkingIndicator => FlatKey::Thinking,
+        }
+    }
 }
 
 impl TranscriptScroll {
@@ -1426,26 +1381,57 @@ impl TranscriptScroll {
             list_item_count: 0,
             last_reconciled_edit_seq: 0,
             last_scrolled_edit_seq: u64::MAX,
+            last_keys: Vec::new(),
         }
     }
 
     /// Reconcile the `(list_state, list_item_count)` pair to a new flat-item
-    /// count, updating BOTH atomically so the GPUI `ListState` it paints and
-    /// the scalar we splice against can never drift (Finding 8, INV-12). When
-    /// block ranges are active the item count can shrink unpredictably, so we
-    /// reset rather than splice; an incremental splice preserves the height
-    /// cache on pure growth. Returns whether the list grew. This is the only
-    /// mutator that touches `list_item_count`, so parity is a property of the
-    /// method rather than discipline at each render surface.
+    /// list, updating BOTH atomically so the GPUI `ListState` it paints and the
+    /// scalar we splice against can never drift (Finding 8, INV-12). Returns
+    /// whether the list grew. This is the only mutator that touches
+    /// `list_item_count`, so parity is a property of the method.
+    ///
+    /// When block ranges are active (worksheet), an edit can restructure items
+    /// anywhere, but we still SPLICE the minimal changed range (by diffing cheap
+    /// per-item [`FlatKey`]s) rather than `reset()`. The unchanged prefix above
+    /// the edit keeps its measured heights AND the scroll anchor, so a worksheet
+    /// newline no longer snaps the viewport to the top (`reset()` nulled the
+    /// scroll — the recurring "cursor jumps to the top" bug). The streaming /
+    /// non-worksheet path keeps the count-based tail splice.
     pub(crate) fn reconcile_list(
         &mut self,
         block_ranges_active: bool,
-        new_count: usize,
+        items: &[FlatItem],
         edit_seq: u64,
     ) -> bool {
+        let new_count = items.len();
         let old_count = self.list_item_count;
+
+        if block_ranges_active {
+            let new_keys: Vec<FlatKey> = items.iter().map(FlatKey::of).collect();
+            // Splice the minimal changed range, preserving the prefix's heights
+            // + scroll anchor (no jump-to-top).
+            splice_list_to_items(&self.list_state, &self.last_keys, &new_keys);
+            // A count-stable text edit (typing on the editable tail line) leaves
+            // the keys identical, so the splice above is a no-op; re-measure the
+            // tail item like the streaming path so a wrap-induced height change
+            // isn't painted at the stale height.
+            if new_count == old_count
+                && new_count > 0
+                && edit_seq != self.last_reconciled_edit_seq
+                && new_keys == self.last_keys
+            {
+                let last = new_count - 1;
+                self.list_state.splice(last..last + 1, 1);
+            }
+            self.last_keys = new_keys;
+            self.list_item_count = new_count;
+            self.last_reconciled_edit_seq = edit_seq;
+            return new_count > old_count;
+        }
+
         if new_count != old_count {
-            if block_ranges_active || new_count < old_count {
+            if new_count < old_count {
                 self.list_state.reset(new_count);
             } else {
                 self.list_state
@@ -1453,6 +1439,9 @@ impl TranscriptScroll {
             }
             self.list_item_count = new_count;
             self.last_reconciled_edit_seq = edit_seq;
+            // Keep keys roughly in sync so a later switch INTO worksheet mode
+            // diffs against a recent snapshot instead of over-splicing once.
+            self.last_keys = items.iter().map(FlatKey::of).collect();
         } else if new_count > 0 && edit_seq != self.last_reconciled_edit_seq {
             // Mid-line append: item count unchanged but text grew inside the
             // last item (streaming agent prose before a `\n`). Invalidate
@@ -1720,7 +1709,6 @@ impl HeaderRole {
 pub(crate) struct Chatbox {
     pub(crate) editor: Editor,
     pub(crate) mode: EditMode,
-    pub(crate) scroll_handle: ScrollHandle,
     /// Virtualised scroll state for the compose panel, used ONLY once the draft
     /// exceeds the visible cap (`COMPOSE_MAX_VISIBLE_LINES`). Below that the
     /// panel renders every line directly (cheap); above it, building the whole
@@ -1731,25 +1719,84 @@ pub(crate) struct Chatbox {
     /// stays anchored — `reset()` snapped the box to its top on any newline in a
     /// >8-line draft. See `ScrollAnchoredList`.
     pub(crate) list: ScrollAnchoredList<String>,
+    /// The authoritative visible top-left grid cell (spec-chatbox-caret-
+    /// containment.md). Recomputed every render by `compose_window` from the
+    /// current caret + measured box width; the list scrolls *to* `top_line`
+    /// (never reads it back) and every row is sliced to the columns starting at
+    /// `left_col`. `Cell` so the `&Chatbox` (or `&mut`) render path can store
+    /// the new window without a wider borrow.
+    pub(crate) window: std::cell::Cell<ComposeWindow>,
+    /// Measured INNER content size `(x, y, w, h)` of the compose box, written
+    /// during paint via `CaptureBounds`, read next frame to derive
+    /// `visible_cols = floor(w / CHATBOX_CHAR_W)`. The real painted width — not
+    /// the whole-window `viewport_width_px`, which over-counts by the split tree
+    /// + sidebars + padding and would itself strand the caret (review B1).
+    pub(crate) bounds: std::rc::Rc<std::cell::Cell<(f32, f32, f32, f32)>>,
 }
+
+/// Conservative monospace column advance for the compose grid, in px. Set equal
+/// to the caret block width (`make_caret`, 8px) — slightly WIDER than the real
+/// ~7.8px advance of 13px SF Mono/Menlo — so `visible_cols = floor(box_w / this)`
+/// under-counts columns (never over-counts → the caret can't be scrolled to a
+/// column that's actually clipped) and the one reserved right column exactly
+/// covers the caret block (spec Behavior 2). Slicing (not pixel-offset) is what
+/// makes an approximate advance safe: rows render from the slice's left edge, so
+/// there is no per-column pixel drift to accumulate.
+pub(crate) const CHATBOX_CHAR_W: f32 = 8.0;
 
 impl Chatbox {
     pub(crate) fn new() -> Self {
         Self {
             editor: Editor::new(String::new(), std::path::PathBuf::from("*chatbox*")),
             mode: EditMode::Insert,
-            scroll_handle: ScrollHandle::new(),
             // Compose rows are uniform 18px and non-wrapping; the default item
             // height MUST match so an unmeasured (freshly-spliced) row estimates
             // its height correctly. A wrong default (was 64px, ~3.5× too tall)
             // throws off the list's height model and strands the caret off-screen
             // on reveal — the recurring "cursor offscreen in the chatbox" bug.
             list: ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(18.0)),
+            window: std::cell::Cell::new(ComposeWindow::default()),
+            bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
         }
     }
 
     pub(crate) fn text(&self) -> String {
         self.editor.document().full_text()
+    }
+
+    /// Recompute the caret-containment window from the CURRENT editor state and
+    /// the given visible extent, store it (authoritative), and return it
+    /// (spec-chatbox-caret-containment.md). The single integration point that
+    /// reads the cursor + the caret line's tab-expanded length and feeds
+    /// `compose_window` — kept here (not inline in the GPUI render path) so it is
+    /// headlessly testable over every edit path (Constraint 4).
+    pub(crate) fn compute_window(&self, visible_rows: usize, visible_cols: usize) -> ComposeWindow {
+        let line_count = self.editor.document().line_count().max(1);
+        let cursor = self.editor.cursor();
+        // Length of the caret's line in the SAME representation the rows render
+        // in (tabs expanded to 4 spaces), so the horizontal clamp matches what's
+        // painted.
+        let cursor_line_len = {
+            let cl = cursor.line.min(line_count.saturating_sub(1));
+            self.editor
+                .document()
+                .line_text(cl)
+                .trim_end_matches('\n')
+                .replace('\t', "    ")
+                .chars()
+                .count()
+        };
+        let win = compose_window(
+            cursor.line,
+            cursor.col,
+            cursor_line_len,
+            self.window.get(),
+            line_count,
+            visible_rows,
+            visible_cols,
+        );
+        self.window.set(win);
+        win
     }
 }
 

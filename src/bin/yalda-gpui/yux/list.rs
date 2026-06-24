@@ -86,6 +86,79 @@ pub(crate) fn compose_first_visible_line(
     first.min(max_top)
 }
 
+/// The left visible COLUMN that keeps the caret column in view — the exact
+/// horizontal mirror of [`compose_first_visible_line`], for the compose box's
+/// uniform-advance (monospace) grid (spec-chatbox-caret-containment.md
+/// Behavior 4). See that function for the why; this is the same minimal-scroll,
+/// clamp-to-content window on the column axis.
+///
+/// The ONE deliberate asymmetry: the vertical window keeps `cursor_line` in
+/// `[top, top + visible)` (exclusive far edge), but the horizontal window keeps
+/// `cursor_col` in `[left, left + visible - 1]` — it reserves the **rightmost
+/// column for the caret glyph**, which paints as a block slightly wider than one
+/// column advance. Without the reservation a caret at end-of-line overflows the
+/// right clip by ~one caret width (the recurring "text/caret off the right edge"
+/// half of the bug). `saturating_sub` floors every subtraction at 0 so an empty
+/// or short line yields `left = 0` (no underflow).
+pub(crate) fn compose_first_visible_col(
+    cursor_col: usize,
+    prev_left: usize,
+    line_len: usize,
+    visible: usize,
+) -> usize {
+    let visible = visible.max(1);
+    // The caret may sit one past the last char (EOL), so the scrollable extent
+    // is `line_len` columns wide with the caret allowed at column `line_len`.
+    let max_left = (line_len + 1).saturating_sub(visible);
+    let prev_left = prev_left.min(max_left);
+    // Usable columns before the reserved caret column.
+    let inner = visible.saturating_sub(1).max(1);
+    let left = if cursor_col < prev_left {
+        // Caret left of the window → it becomes the left column.
+        cursor_col
+    } else if cursor_col > prev_left + inner {
+        // Caret at/right of the reserved edge → scroll so it sits on it.
+        cursor_col - inner
+    } else {
+        prev_left
+    };
+    left.min(max_left)
+}
+
+/// The compose box's visible top-left grid cell — the single authoritative
+/// scroll offset for both axes (spec-chatbox-caret-containment.md). Recomputed
+/// every frame by [`compose_window`] from the current caret + measured extent;
+/// the list is scrolled *to* `top_line` (it is never read back from the list's
+/// own anchor) and every row is sliced to the column window starting at
+/// `left_col`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ComposeWindow {
+    pub(crate) top_line: usize,
+    pub(crate) left_col: usize,
+}
+
+/// The ONE chokepoint that decides the compose box's scroll offset on both axes
+/// (spec-chatbox-caret-containment.md Behavior 3). Pure: it calls the two
+/// axis-window functions and returns the new [`ComposeWindow`]. Every compose
+/// render builds the box from this result; no other code sets scroll offset.
+///
+/// `cursor_line_len` is the length (in chars) of the line the caret is on, so
+/// the horizontal clamp never scrolls past that line's end.
+pub(crate) fn compose_window(
+    cursor_line: usize,
+    cursor_col: usize,
+    cursor_line_len: usize,
+    prev: ComposeWindow,
+    line_count: usize,
+    visible_rows: usize,
+    visible_cols: usize,
+) -> ComposeWindow {
+    ComposeWindow {
+        top_line: compose_first_visible_line(cursor_line, prev.top_line, line_count, visible_rows),
+        left_col: compose_first_visible_col(cursor_col, prev.left_col, cursor_line_len, visible_cols),
+    }
+}
+
 /// A virtualized list that re-syncs to a new item sequence by splicing the
 /// changed range (see [`splice_list_to_items`]) so scroll stays anchored across
 /// edits. One per scrollable surface.
@@ -140,7 +213,91 @@ impl<T: PartialEq> ScrollAnchoredList<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::compose_first_visible_line;
+    use super::{
+        compose_first_visible_col, compose_first_visible_line, compose_window, ComposeWindow,
+    };
+
+    /// Horizontal mirror of `caret_is_always_within_the_chosen_window`: whatever
+    /// LEFT column the function picks, the caret column is inside the window AND
+    /// the rightmost column stays reserved for the caret glyph
+    /// (`cursor_col <= left + visible - 1`). The permanent guard against the
+    /// "caret/text off the RIGHT edge" half of the recurring bug.
+    #[test]
+    fn caret_col_is_always_within_window_with_caret_slack() {
+        for visible in [1usize, 2, 8, 40] {
+            for line_len in [0usize, 1, 7, 40, 200] {
+                for prev_left in [0usize, 3, 40, 199, 1000] {
+                    // Caret can sit anywhere from col 0 to col line_len (EOL).
+                    for cursor_col in 0..=line_len {
+                        let left =
+                            compose_first_visible_col(cursor_col, prev_left, line_len, visible);
+                        let inner = visible.saturating_sub(1).max(1);
+                        assert!(
+                            cursor_col >= left && cursor_col <= left + inner,
+                            "caret col {cursor_col} escaped window [{left}, {}] \
+                             (visible={visible}, line_len={line_len}, prev_left={prev_left})",
+                            left + inner,
+                        );
+                        // Never scroll past the end into blank space (caret may
+                        // be at column line_len, so extent is line_len + 1).
+                        let max_left = (line_len + 1).saturating_sub(visible);
+                        assert!(
+                            left <= max_left,
+                            "left {left} scrolled past end (line_len={line_len}, visible={visible})",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Boundary inputs the reviewer flagged (V2): empty line and a line shorter
+    /// than the window must both yield `left = 0` with no underflow.
+    #[test]
+    fn short_and_empty_lines_pin_left_to_zero() {
+        assert_eq!(compose_first_visible_col(0, 0, 0, 8), 0); // empty line
+        assert_eq!(compose_first_visible_col(0, 5, 0, 8), 0); // empty, stale prev
+        assert_eq!(compose_first_visible_col(3, 0, 3, 8), 0); // line_len < visible
+        assert_eq!(compose_first_visible_col(7, 99, 7, 8), 0); // fits exactly, stale prev
+    }
+
+    /// `compose_window` keeps the caret CELL inside the box on BOTH axes for a
+    /// wide sweep — the combined invariant the whole spec exists to guarantee.
+    #[test]
+    fn compose_window_contains_caret_cell_on_both_axes() {
+        for visible_rows in [1usize, 8] {
+            for visible_cols in [1usize, 20, 80] {
+                for line_count in [1usize, 8, 50] {
+                    for cursor_line in 0..line_count {
+                        for &line_len in &[0usize, 5, 120] {
+                            for &cursor_col in &[0usize, line_len / 2, line_len] {
+                                let w = compose_window(
+                                    cursor_line,
+                                    cursor_col,
+                                    line_len,
+                                    ComposeWindow { top_line: 999, left_col: 999 },
+                                    line_count,
+                                    visible_rows,
+                                    visible_cols,
+                                );
+                                assert!(
+                                    cursor_line >= w.top_line
+                                        && cursor_line < w.top_line + visible_rows,
+                                    "line {cursor_line} escaped {w:?} (rows={visible_rows})",
+                                );
+                                let inner = visible_cols.saturating_sub(1).max(1);
+                                assert!(
+                                    cursor_col >= w.left_col && cursor_col <= w.left_col + inner,
+                                    "col {cursor_col} escaped {w:?} (cols={visible_cols})",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 
     /// The load-bearing invariant: whatever window `compose_first_visible_line`
     /// picks, the caret line is ALWAYS within it `[first, first + visible)`.

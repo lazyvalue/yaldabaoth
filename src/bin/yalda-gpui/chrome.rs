@@ -135,12 +135,16 @@ impl YaldaGpuiView {
         // workspace lands here). Drag/resize/pan are meaningless with one
         // tile, so the maximized branch ignores slot geometry entirely.
         let maximized = slot_list.len() == 1;
-        // Live edge-resize preview (spec Behavior 4b): the clamped span the
-        // resized tile renders at this frame, which is also what commits.
-        let resize_preview: Option<(workspace::WindowId, workspace::Span)> = tab
+        // Live edge-resize preview (spec Behavior 4b): the clamped anchor +
+        // span the resized tile renders at this frame, which is also what
+        // commits. West/North move the anchor, so the preview carries it.
+        let resize_preview: Option<(workspace::WindowId, workspace::Slot, workspace::Span)> = tab
             .desktop
             .resize
-            .map(|r| (r.id, self.desktop_resize_target_span(r)));
+            .map(|r| {
+                let (slot, span) = self.desktop_resize_target(r);
+                (r.id, slot, span)
+            });
         let base_bg = self.editor_bg();
         let content_fg = self.editor_fg();
         let dim: Hsla = nc(self.theme.agent.dim);
@@ -243,11 +247,13 @@ impl YaldaGpuiView {
         }
 
         // ── Tiles. ──
-        for (id, slot, mut span) in slot_list {
-            // The tile being resized renders at its live clamped span so the
-            // grow/shrink is visible under the cursor (spec Behavior 4b).
-            if let Some((rid, rspan)) = resize_preview {
+        for (id, mut slot, mut span) in slot_list {
+            // The tile being resized renders at its live clamped anchor + span
+            // so the grow/shrink is visible under the cursor (spec Behavior 4b).
+            // West/North move the anchor, hence the slot override too.
+            if let Some((rid, rslot, rspan)) = resize_preview {
                 if rid == id {
+                    slot = rslot;
                     span = rspan;
                 }
             }
@@ -390,6 +396,46 @@ impl YaldaGpuiView {
                         );
                     }),
                 );
+            // West / north bands: pulling these moves the anchor out toward the
+            // origin (enlarge leftward/upward). The north band rides the very
+            // top — over the title bar's top strip — so the rest of the title
+            // bar still grabs-to-move.
+            let west_band = div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .w(px(DESKTOP_RESIZE_BAND))
+                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                        this.desktop_resize_grab(
+                            id,
+                            workspace::ResizeEdge::West,
+                            (f32::from(ev.position.x), f32::from(ev.position.y)),
+                            cx,
+                        );
+                    }),
+                );
+            let north_band = div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(DESKTOP_RESIZE_BAND))
+                .cursor(gpui::CursorStyle::ResizeUpDown)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
+                        this.desktop_resize_grab(
+                            id,
+                            workspace::ResizeEdge::North,
+                            (f32::from(ev.position.x), f32::from(ev.position.y)),
+                            cx,
+                        );
+                    }),
+                );
 
             let mut frame = div()
                 .absolute()
@@ -407,7 +453,11 @@ impl YaldaGpuiView {
                 .child(title_bar)
                 .child(div().flex_1().min_h_0().overflow_hidden().child(inner));
             if !maximized {
-                frame = frame.child(east_band).child(south_band);
+                frame = frame
+                    .child(east_band)
+                    .child(south_band)
+                    .child(west_band)
+                    .child(north_band);
             }
             if dragging.is_some() {
                 frame = frame.opacity(0.85);
@@ -530,28 +580,41 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// The Block-clamped span a live resize would commit, given its pointer
-    /// (spec Behavior 4b). Used both for the render preview and the commit, so
-    /// what you see is exactly what lands.
-    fn desktop_resize_target_span(&self, r: workspace::DesktopResize) -> workspace::Span {
+    /// The Block-clamped (anchor, span) a live resize would commit, given its
+    /// pointer (spec Behavior 4b). Used both for the render preview and the
+    /// commit, so what you see is exactly what lands. East/South keep the
+    /// anchor and grow the far edge; West/North move the anchor (the pulled
+    /// near edge follows the pointer, the far edge stays put).
+    fn desktop_resize_target(&self, r: workspace::DesktopResize) -> (workspace::Slot, workspace::Span) {
         let tile = self.desktop_tile_px();
         let g = DESKTOP_GUTTER;
         let tab = &self.workspace.tabs[self.workspace.active_tab];
         let Some(anchor) = tab.desktop.slot_of(r.id) else {
-            return tab.desktop.span_of(r.id);
+            return (workspace::Slot::new(0, 0), tab.desktop.span_of(r.id));
         };
+        let span = tab.desktop.span_of(r.id);
         let (ox, oy) = workspace::slot_origin(anchor, tile, g);
-        // Invert tile_rect: the far edge of `n` cells sits at
-        // origin + n*(tile+g) - g, so n = (edge_pos - origin + g) / (tile+g).
         let desired = match r.edge {
+            // Far edge from the anchor: n cells end at origin + n*(tile+g) - g,
+            // so n = (edge_pos - origin + g) / (tile+g).
             workspace::ResizeEdge::East => {
                 ((r.pointer.0 - ox + g) / (tile.0 + g)).round().max(1.0) as u32
             }
             workspace::ResizeEdge::South => {
                 ((r.pointer.1 - oy + g) / (tile.1 + g)).round().max(1.0) as u32
             }
+            // Near edge moves: the new total extent is (fixed far edge - the
+            // column/row the pointer lands on). Far edge sits at anchor + span.
+            workspace::ResizeEdge::West => {
+                let near = workspace::slot_at(r.pointer, tile, g).col;
+                (anchor.col + span.cols).saturating_sub(near).max(1)
+            }
+            workspace::ResizeEdge::North => {
+                let near = workspace::slot_at(r.pointer, tile, g).row;
+                (anchor.row + span.rows).saturating_sub(near).max(1)
+            }
         };
-        tab.desktop.clamp_span(r.id, r.edge, desired)
+        tab.desktop.clamp_resize(r.id, r.edge, desired)
     }
 
     /// Canvas mouse-move: advance the drag (threshold, pointer, drop target,
@@ -624,11 +687,14 @@ impl YaldaGpuiView {
         let eff_w = self.desktop_grid_cols.max(1);
         let tab_idx = self.workspace.active_tab;
 
-        // Commit a live edge resize (spec Behavior 4b) — the clamped span the
-        // preview showed becomes the stored span.
+        // Commit a live edge resize (spec Behavior 4b) — the clamped anchor +
+        // span the preview showed become the stored placement. West/North move
+        // the anchor; East/South leave it unchanged.
         if let Some(r) = self.workspace.tabs[tab_idx].desktop.resize.take() {
-            let span = self.desktop_resize_target_span(r);
-            self.workspace.tabs[tab_idx].desktop.set_span(r.id, span);
+            let (slot, span) = self.desktop_resize_target(r);
+            let d = &mut self.workspace.tabs[tab_idx].desktop;
+            d.set_anchor(r.id, slot);
+            d.set_span(r.id, span);
             self.save_workspace_state();
             cx.notify();
             return;

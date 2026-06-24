@@ -1201,8 +1201,27 @@ impl YaldaGpuiView {
             let compose_code_font = self.code_font.clone();
             let separator = div().w_full().h(px(1.0)).bg(dim_fg);
 
+            // ── Caret-containment window (spec-chatbox-caret-containment.md). ──
+            // ONE chokepoint computes the visible top-left grid cell from the
+            // current caret + the box's MEASURED inner width (written last frame
+            // by CaptureBounds), and stores it back. Both render paths read it;
+            // nothing else sets scroll offset.
+            let box_w = tb.bounds.get().2;
+            let visible_cols = if box_w > 1.0 {
+                (box_w / CHATBOX_CHAR_W).floor().max(1.0) as usize
+            } else {
+                // First frame before the box is measured: assume "very wide" so
+                // we don't scroll horizontally; the next frame self-corrects.
+                4096
+            };
+            let win = tb.compute_window(COMPOSE_MAX_VISIBLE_LINES, visible_cols);
+            let left_col = win.left_col;
+            let compose_bounds_sink = tb.bounds.clone();
+
             let compose_body: AnyElement = if line_count <= COMPOSE_MAX_VISIBLE_LINES {
-                // ── Small draft: render every line directly (unchanged). ──
+                // ── Small draft: render every line directly. Everything fits
+                //    vertically (line_count ≤ visible_rows ⇒ win.top_line == 0),
+                //    so no vertical scroll; horizontal scroll is per-line. ──
                 let compose_lines: Vec<String> = {
                     let doc = tb.editor.document();
                     (0..line_count)
@@ -1211,32 +1230,11 @@ impl YaldaGpuiView {
                         })
                         .collect()
                 };
-                let compose_scroll = tb.scroll_handle.clone();
-                compose_scroll.scroll_to_item(compose_cursor_line);
                 let min_compose_h = line_h + 16.0;
-                let mut body = div()
-                    .id("compose-scroll")
-                    .w_full()
-                    .min_w_0()
-                    .min_h(px(min_compose_h))
-                    .max_h(px(max_visible_h))
-                    .overflow_y_scroll()
-                    .overflow_x_hidden()
-                    .track_scroll(&compose_scroll)
-                    .px_4()
-                    .py(px(8.0))
-                    .bg(compose_panel_bg)
-                    .border_1()
-                    .border_color(dim_fg)
-                    .rounded_md()
-                    .mx_2()
-                    .mb_1()
-                    .font_family(compose_code_font.clone())
-                    .text_size(px(13.0))
-                    .text_color(compose_fg);
+                let mut inner = div().w_full().min_w_0().flex().flex_col();
                 for (i, line_text) in compose_lines.iter().enumerate() {
                     let total_chars = line_text.chars().count();
-                    body = body.child(build_chatbox_line(
+                    inner = inner.child(build_chatbox_line(
                         line_text,
                         i == compose_cursor_line,
                         compose_cursor_col,
@@ -1248,9 +1246,40 @@ impl YaldaGpuiView {
                         &compose_code_font,
                         compose_fg,
                         compose_selection_bg,
+                        left_col,
+                        visible_cols,
                     ));
                 }
-                body.into_any_element()
+                div()
+                    .id("compose-scroll")
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(min_compose_h))
+                    // +16 so the inner content area (after the 16px vertical
+                    // padding) fits all COMPOSE_MAX_VISIBLE_LINES rows — matching
+                    // the virtualized path. Without it `overflow_hidden` would
+                    // clip the 8th line of a full small draft (no scroll here).
+                    .max_h(px(max_visible_h + 16.0))
+                    .overflow_hidden()
+                    .px_4()
+                    .py(px(8.0))
+                    .bg(compose_panel_bg)
+                    .border_1()
+                    .border_color(dim_fg)
+                    .rounded_md()
+                    .mx_2()
+                    .mb_1()
+                    .font_family(compose_code_font.clone())
+                    .text_size(px(13.0))
+                    .text_color(compose_fg)
+                    // Capture the inner content width (inside px_4) so next
+                    // frame's `visible_cols` reflects the real box, not the
+                    // whole-window width.
+                    .child(CaptureBounds {
+                        inner: inner.into_any_element(),
+                        sink: compose_bounds_sink,
+                    })
+                    .into_any_element()
             } else {
                 // ── Long draft: virtualise. Fixed 8-line height; `gpui::list`
                 //    (default, visible-only sizing) builds ONLY the visible
@@ -1266,26 +1295,18 @@ impl YaldaGpuiView {
                     )
                 };
                 // Splice the changed range (never `reset()`, which snaps the box
-                // to its top on every newline); then reveal the caret line.
+                // to its top on every newline).
                 let compose_edit_seq = tb.editor.document().edit_seq();
                 tb.list.reconcile(&lines_snap, compose_edit_seq);
-                // Deterministic caret reveal. Rows are uniform 18px and
-                // non-wrapping, so the visible window is exact integer
-                // arithmetic — anchor the top item explicitly instead of
-                // GPUI's measurement-based `scroll_to_reveal_item`, which
-                // mis-fires on freshly-spliced (unmeasured) rows and strands
-                // the caret off-screen (the recurring chatbox-cursor bug).
-                // `prev_top` is read back from the list's own scroll anchor so
-                // the window only moves when the caret would leave it.
-                let prev_top = tb.list.state().logical_scroll_top().item_ix;
-                let first = compose_first_visible_line(
-                    compose_cursor_line,
-                    prev_top,
-                    line_count,
-                    COMPOSE_MAX_VISIBLE_LINES,
-                );
+                // Anchor the top item to the AUTHORITATIVE `win.top_line` — NOT
+                // read back from the list's own anchor, and NOT GPUI's
+                // measurement-based `scroll_to_reveal_item` (it mis-fires on
+                // freshly-spliced unmeasured rows and strands the caret — the
+                // recurring chatbox-cursor bug). `compose_window` already used
+                // the prior window as `prev`, so the box only moves when the
+                // caret would leave it.
                 tb.list.state().scroll_to(gpui::ListOffset {
-                    item_ix: first,
+                    item_ix: win.top_line,
                     offset_in_item: gpui::px(0.0),
                 });
                 let font = compose_code_font.clone();
@@ -1310,6 +1331,8 @@ impl YaldaGpuiView {
                             &font,
                             fg,
                             sel_bg,
+                            left_col,
+                            visible_cols,
                         )
                     };
                 div()
@@ -1330,11 +1353,13 @@ impl YaldaGpuiView {
                     .font_family(compose_code_font.clone())
                     .text_size(px(13.0))
                     .text_color(compose_fg)
-                    .child(
-                        gpui::list(tb.list.state().clone(), render_fn)
+                    .child(CaptureBounds {
+                        inner: gpui::list(tb.list.state().clone(), render_fn)
                             .flex_1()
-                            .w_full(),
-                    )
+                            .w_full()
+                            .into_any_element(),
+                        sink: compose_bounds_sink,
+                    })
                     .into_any_element()
             };
 

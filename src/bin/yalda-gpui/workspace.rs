@@ -563,12 +563,15 @@ impl Default for Span {
     }
 }
 
-/// Which edge a desktop resize drag is pulling (spec Behavior 4b). v1 grows
-/// east/south only, so the tile's anchor never moves.
+/// Which edge a desktop resize drag is pulling (spec Behavior 4b). East/South
+/// hold the anchor fixed and grow the far edge; West/North hold the FAR edge
+/// fixed and move the anchor (pull the left/top edge out to enlarge).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeEdge {
     East,
     South,
+    West,
+    North,
 }
 
 /// Transient edge-resize gesture. Like `DesktopDrag`: plain pixels in desktop
@@ -662,31 +665,94 @@ impl DesktopState {
         true
     }
 
-    /// Largest span reachable by growing `id`'s `edge` toward `desired` whole
-    /// slots, clamped so no other tile is overlapped (Block rule, spec
-    /// Behavior 4b). Shrinking is always allowed to the 1 × 1 minimum; the
-    /// other axis is held at its current value.
-    pub fn clamp_span(&self, id: WindowId, edge: ResizeEdge, desired: u32) -> Span {
+    /// The (anchor, span) a Block-rule-clamped edge resize would commit, given
+    /// the `desired` whole-slot extent ALONG the resize axis (cols for
+    /// East/West, rows for North/South). East/South hold the anchor and grow
+    /// the far edge; West/North hold the far edge and move the anchor toward
+    /// the origin (pull-to-enlarge). Growth stops at the first slot owned by
+    /// another tile or the `0` wall; shrinking is always allowed to 1 along the
+    /// axis. The off-axis extent is held at its current value.
+    pub fn clamp_resize(&self, id: WindowId, edge: ResizeEdge, desired: u32) -> (Slot, Span) {
         let cur = self.span_of(id);
         let Some(anchor) = self.slot_of(id) else {
-            return cur;
+            return (Slot::new(0, 0), cur);
         };
         let desired = desired.max(1);
-        let mut ext = 1;
-        while ext < desired {
-            let cand = match edge {
-                ResizeEdge::East => Span::new(cur.rows, ext + 1),
-                ResizeEdge::South => Span::new(ext + 1, cur.cols),
-            };
-            if self.rect_free(anchor, cand, id) {
-                ext += 1;
-            } else {
-                break;
+        match edge {
+            // Anchor-fixed: grow the far edge cell by cell while free.
+            ResizeEdge::East | ResizeEdge::South => {
+                let mut ext = 1;
+                while ext < desired {
+                    let cand = match edge {
+                        ResizeEdge::East => Span::new(cur.rows, ext + 1),
+                        _ => Span::new(ext + 1, cur.cols),
+                    };
+                    if self.rect_free(anchor, cand, id) {
+                        ext += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let span = match edge {
+                    ResizeEdge::East => Span::new(cur.rows, ext),
+                    _ => Span::new(ext, cur.cols),
+                };
+                (anchor, span)
+            }
+            // Far-edge-fixed: the anchor moves toward the origin. `desired` is
+            // the new total extent along the axis; the target near edge is the
+            // far edge minus that. Shrinking (target nearer the far edge) is
+            // always free; growing extends toward the target while each new
+            // line of cells is free.
+            ResizeEdge::West => {
+                let right = anchor.col + cur.cols;
+                let target_left = right.saturating_sub(desired.min(right));
+                let mut left = anchor.col;
+                if target_left >= anchor.col {
+                    left = target_left; // shrink toward the east edge
+                } else {
+                    while left > target_left
+                        && self.rect_free(
+                            Slot::new(anchor.row, left - 1),
+                            Span::new(cur.rows, right - (left - 1)),
+                            id,
+                        )
+                    {
+                        left -= 1;
+                    }
+                }
+                (Slot::new(anchor.row, left), Span::new(cur.rows, right - left))
+            }
+            ResizeEdge::North => {
+                let bottom = anchor.row + cur.rows;
+                let target_top = bottom.saturating_sub(desired.min(bottom));
+                let mut top = anchor.row;
+                if target_top >= anchor.row {
+                    top = target_top; // shrink toward the south edge
+                } else {
+                    while top > target_top
+                        && self.rect_free(
+                            Slot::new(top - 1, anchor.col),
+                            Span::new(bottom - (top - 1), cur.cols),
+                            id,
+                        )
+                    {
+                        top -= 1;
+                    }
+                }
+                (Slot::new(top, anchor.col), Span::new(bottom - top, cur.cols))
             }
         }
-        match edge {
-            ResizeEdge::East => Span::new(cur.rows, ext),
-            ResizeEdge::South => Span::new(ext, cur.cols),
+    }
+
+    /// Move a tile's anchor to `slot` directly, keeping the slot map sorted.
+    /// Unlike a drop (`insert_shift`), this performs NO ripple — the caller
+    /// (edge resize) has already Block-clamped the destination rectangle to be
+    /// free, so neighbors must not move.
+    pub fn set_anchor(&mut self, id: WindowId, slot: Slot) {
+        if let Some(entry) = self.slots.iter_mut().find(|(w, _)| *w == id) {
+            entry.1 = slot;
+            self.sort();
         }
     }
 
@@ -2255,23 +2321,23 @@ mod desktop_tests {
         let mut d = DesktopState::default();
         d.seed(&[1, 2], 5); // 1@(0,0), 2@(0,1)
         // Tile 1 wants to grow east a lot, but tile 2 sits at (0,1).
-        assert_eq!(d.clamp_span(1, ResizeEdge::East, 4), Span::new(1, 1));
+        assert_eq!(d.clamp_resize(1, ResizeEdge::East, 4).1, Span::new(1, 1));
         // Move 2 out of the way; now 1 can grow east up to the requested cols.
         d.insert_shift(2, Slot::new(0, 4), 5);
-        assert_eq!(d.clamp_span(1, ResizeEdge::East, 3), Span::new(1, 3));
+        assert_eq!(d.clamp_resize(1, ResizeEdge::East, 3).1, Span::new(1, 3));
         // ...but not past the relocated neighbor at col 4.
-        assert_eq!(d.clamp_span(1, ResizeEdge::East, 9), Span::new(1, 4));
+        assert_eq!(d.clamp_resize(1, ResizeEdge::East, 9).1, Span::new(1, 4));
     }
 
     #[test]
     fn resize_south_independent_of_columns() {
         let mut d = DesktopState::default();
         d.slots.push((1, Slot::new(0, 0)));
-        assert_eq!(d.clamp_span(1, ResizeEdge::South, 3), Span::new(3, 1));
+        assert_eq!(d.clamp_resize(1, ResizeEdge::South, 3).1, Span::new(3, 1));
         d.set_span(1, Span::new(3, 1));
         // A blocker two rows down clamps further south growth.
         d.slots.push((2, Slot::new(3, 0)));
-        assert_eq!(d.clamp_span(1, ResizeEdge::South, 5), Span::new(3, 1));
+        assert_eq!(d.clamp_resize(1, ResizeEdge::South, 5).1, Span::new(3, 1));
     }
 
     #[test]
@@ -2282,8 +2348,8 @@ mod desktop_tests {
         // Even fully surrounded, a tile may shrink.
         d.slots.push((2, Slot::new(0, 3)));
         d.slots.push((3, Slot::new(3, 0)));
-        assert_eq!(d.clamp_span(1, ResizeEdge::East, 1), Span::new(3, 1));
-        assert_eq!(d.clamp_span(1, ResizeEdge::South, 1), Span::new(1, 3));
+        assert_eq!(d.clamp_resize(1, ResizeEdge::East, 1).1, Span::new(3, 1));
+        assert_eq!(d.clamp_resize(1, ResizeEdge::South, 1).1, Span::new(1, 3));
     }
 
     #[test]
@@ -2442,6 +2508,55 @@ mod tests {
             id,
             content: TestContent(c),
         })
+    }
+
+    // Edge resize (Behavior 4b). West/North move the anchor toward the origin
+    // (pull-to-enlarge) while the far edge stays put; East/South hold the
+    // anchor and grow the far edge. All four are Block-clamped against
+    // neighbours and the `0` wall.
+    #[test]
+    fn clamp_resize_west_north_move_anchor() {
+        let mut d = DesktopState::default();
+        // A 1×1 tile at (1,1) with open desktop around it.
+        d.seed(&[7], 100);
+        d.set_anchor(7, Slot::new(1, 1));
+
+        // Pull West two columns: anchor moves to col 0 (hits the wall), the
+        // east edge stays at col 2, span widens to 2.
+        let (a, s) = d.clamp_resize(7, ResizeEdge::West, 3);
+        assert_eq!(a, Slot::new(1, 0));
+        assert_eq!(s, Span::new(1, 2));
+
+        // Pull North two rows: anchor moves to row 0, span heightens to 2.
+        let (a, s) = d.clamp_resize(7, ResizeEdge::North, 3);
+        assert_eq!(a, Slot::new(0, 1));
+        assert_eq!(s, Span::new(2, 1));
+
+        // East/South keep the anchor fixed.
+        let (a, s) = d.clamp_resize(7, ResizeEdge::East, 3);
+        assert_eq!(a, Slot::new(1, 1));
+        assert_eq!(s, Span::new(1, 3));
+    }
+
+    #[test]
+    fn clamp_resize_blocks_on_neighbor_and_shrinks_freely() {
+        let mut d = DesktopState::default();
+        d.seed(&[1, 2], 100);
+        // Tile 1 at (0,0), tile 2 at (0,2). Tile 2 pulled West can only reach
+        // col 1 — col 0 is owned by tile 1 (Block rule).
+        d.set_anchor(1, Slot::new(0, 0));
+        d.set_anchor(2, Slot::new(0, 2));
+        let (a, s) = d.clamp_resize(2, ResizeEdge::West, 9);
+        assert_eq!(a, Slot::new(0, 1));
+        assert_eq!(s, Span::new(1, 2));
+
+        // Grow tile 2 west to (0,1) span 2, then shrink back: anchor returns
+        // east toward the fixed far edge, always free.
+        d.set_anchor(2, Slot::new(0, 1));
+        d.set_span(2, Span::new(1, 2));
+        let (a, s) = d.clamp_resize(2, ResizeEdge::West, 1);
+        assert_eq!(a, Slot::new(0, 2));
+        assert_eq!(s, Span::new(1, 1));
     }
 
     // 5c / ADR-0007: two views of the same file share ONE pooled core, so an
