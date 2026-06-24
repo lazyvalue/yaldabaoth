@@ -218,7 +218,7 @@ impl YaldaGpuiView {
                 }
             })
             .child(SharedString::new_static(
-                "j/k scroll · h/l block · g/G top/bot · Ctrl-O browse · Space menu",
+                "j/k scroll · h/l block · g/G top/bot · Ctrl-O browse · Space tile menu · . workspace menu",
             ));
 
         root.key_context("YaldaView")
@@ -1194,6 +1194,10 @@ impl YaldaGpuiView {
             let compose_sel = tb.editor.selection_range();
             let sep_color: Hsla = nc(at.compose_separator);
             let compose_cursor_color: Hsla = nc(at.cursor);
+            // Same theme selection color the edit view paints (see
+            // `build_edit_body_*` → `self.theme.agent.selection_bg`), so the
+            // chatbox highlight contrast matches the rest of the app.
+            let compose_selection_bg: Hsla = nc(at.selection_bg);
             let compose_code_font = self.code_font.clone();
             let separator = div().w_full().h(px(1.0)).bg(dim_fg);
 
@@ -1243,6 +1247,7 @@ impl YaldaGpuiView {
                         total_chars,
                         &compose_code_font,
                         compose_fg,
+                        compose_selection_bg,
                     ));
                 }
                 body.into_any_element()
@@ -1264,10 +1269,29 @@ impl YaldaGpuiView {
                 // to its top on every newline); then reveal the caret line.
                 let compose_edit_seq = tb.editor.document().edit_seq();
                 tb.list.reconcile(&lines_snap, compose_edit_seq);
-                tb.list.state().scroll_to_reveal_item(compose_cursor_line);
+                // Deterministic caret reveal. Rows are uniform 18px and
+                // non-wrapping, so the visible window is exact integer
+                // arithmetic — anchor the top item explicitly instead of
+                // GPUI's measurement-based `scroll_to_reveal_item`, which
+                // mis-fires on freshly-spliced (unmeasured) rows and strands
+                // the caret off-screen (the recurring chatbox-cursor bug).
+                // `prev_top` is read back from the list's own scroll anchor so
+                // the window only moves when the caret would leave it.
+                let prev_top = tb.list.state().logical_scroll_top().item_ix;
+                let first = compose_first_visible_line(
+                    compose_cursor_line,
+                    prev_top,
+                    line_count,
+                    COMPOSE_MAX_VISIBLE_LINES,
+                );
+                tb.list.state().scroll_to(gpui::ListOffset {
+                    item_ix: first,
+                    offset_in_item: gpui::px(0.0),
+                });
                 let font = compose_code_font.clone();
                 let cur_color = compose_cursor_color;
                 let fg = compose_fg;
+                let sel_bg = compose_selection_bg;
                 let render_fn =
                     move |idx: usize, _w: &mut Window, _a: &mut GpuiApp| -> AnyElement {
                         let Some(line_text) = lines_snap.get(idx) else {
@@ -1285,6 +1309,7 @@ impl YaldaGpuiView {
                             total_chars,
                             &font,
                             fg,
+                            sel_bg,
                         )
                     };
                 div()
@@ -1639,7 +1664,7 @@ impl YaldaGpuiView {
                 .pl_2()
                 .text_color(dim)
                 .child(SharedString::from(
-                    "space menu · . menu · i edit · j/k browse · ⏎ open",
+                    "space tile menu · . workspace menu · i edit · j/k browse · ⏎ open",
                 ))
                 .into_any_element()
         } else {

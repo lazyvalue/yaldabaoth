@@ -31,8 +31,9 @@ the work happens inside them:
   vanishes and never silently becomes a Buffer (Agent and Buffer are orthogonal;
   there is no nested `underlying` buffer, and no "leave agent" gesture — an
   agent tile stays an agent tile; you close it or open a Buffer tile normally).
-  Agent commands (`.` menu): select session · stop · send message · switch
-  Worksheet⇄Message Box.
+  Agent commands (space / tile menu): select session · stop · send message · switch
+  Worksheet⇄Message Box. (Leaders: space → tile/app menu, `.` → workspace menu,
+  `?` → global menu.)
 
 ## Dev system (read this for how we work)
 

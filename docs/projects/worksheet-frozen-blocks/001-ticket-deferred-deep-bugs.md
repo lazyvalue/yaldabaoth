@@ -49,11 +49,21 @@ separately-tested fixes.
   edge case (mid-document draft + live stream), not in the live report; the fix
   touches the delicate `append_llm_chunk_floored` path so it needs its own repro.
 
-- [ ] **`view_model_fingerprint` excludes cursor + `edit_seq`.** The memoized
-  flat build's blank-collapse `protect_line` and `build_nav_stops` read the
-  cursor line and per-line blank classification, neither of which is in the
-  fingerprint, so a cursor-only move (no `line_count` change) can reuse a flat
-  list built for a different cursor → caret on a collapsed line / stale nav-stops.
-  Fix: fold `cursor_line` (worksheet only) into the fingerprint, OR move the
-  cursor/content-sensitive passes out of the memoized build into the per-frame
-  closure. Mind the O(changed) typing-latency invariant (ADR-0020 / INV-RV).
+- [x] **`view_model_fingerprint` excludes cursor + `edit_seq` — FIXED**
+  (2026-06-22). The memoized flat build's blank-collapse `protect_line` is
+  mode-and-cursor-sensitive, but the fingerprint folded in neither, so toggling
+  Chatbox→Worksheet (which moves the caret to the trailing blank compose tail)
+  OR a worksheet cursor-only move onto a collapsible blank reused a flat list
+  built for the other state → caret on a stripped line, rendering **below the
+  visible buffer** (the live "cursor can go below the end of the buffer" report).
+  Fix (option 1, worksheet-scoped): `view_model_fingerprint` now folds in the
+  `InputSurface::Worksheet` discriminant + the worksheet caret line. Insert-mode
+  typing already busts via `edit_seq` (no added cost; `transcript_021_chatbox_
+  keystroke_is_render_flat` still flat), so this only adds an O(changed) S1
+  rebuild on Normal-mode worksheet navigation. Also: `finish_replay` now snaps
+  the caret to the editable tail in Worksheet mode so REOPENING a session lands
+  it on the last line explicitly (not via stream-shift ordering). Tests:
+  `view_model_fingerprint_busts_on_input_surface_and_worksheet_cursor` (tests.rs),
+  `worksheet_already_active_during_replay_lands_caret_on_tail` (verify_harness.rs).
+  ⚠️ NEEDS-RUNTIME: a `--release` `sample` while holding `j` in a huge worksheet
+  to confirm the per-nav rebuild is imperceptible (debug masks the real cost).

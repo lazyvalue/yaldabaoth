@@ -639,6 +639,10 @@ impl YaldaGpuiView {
                 editor.pre_move(false);
                 editor.cursor_move_line_start();
             }
+            "move-line-first-non-blank" => {
+                editor.pre_move(false);
+                editor.move_cursor_first_non_blank();
+            }
             "move-line-end" => {
                 editor.pre_move(false);
                 editor.move_cursor_line_end(false);

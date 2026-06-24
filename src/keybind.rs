@@ -40,6 +40,7 @@ pub enum Action {
     MoveWordBackward,
     MoveWordEnd,
     MoveLineStart,
+    MoveLineFirstNonBlank,
     MoveLineEnd,
     FindCharForward,
     FindCharBackward,
@@ -285,6 +286,7 @@ impl Default for KeybindManager {
         single.insert(key('t'), "till-char-forward".into());
         single.insert(key('T'), "till-char-backward".into());
         single.insert(key('0'), "move-line-start".into());
+        single.insert(key('^'), "move-line-first-non-blank".into());
         single.insert(key('$'), "move-line-end".into());
         single.insert(key('i'), "insert-mode".into());
         single.insert(key('a'), "insert-after".into());

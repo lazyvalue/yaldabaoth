@@ -1,0 +1,117 @@
+/* Yalda — Folio Dark color scheme
+ * A warm, muted dark theme: the Folio paper-and-ink palette inverted —
+ * dark sepia ground, warm off-white ink, accents lifted for contrast.
+ * Dark sibling of folio.css; same variable names, drop-in replacement.
+ */
+
+:root {
+  /* ── Base palette ───────────────────────────────────────────── */
+  --folio-paper:       #1f1c17; /* dark sepia background          */
+  --folio-linen:       #2a261f; /* subtle raised surface          */
+  --folio-parchment:   #34302a; /* bars / chrome                  */
+  --folio-ink:         #e8e3d8; /* primary text (warm off-white)  */
+  --folio-comment:     #9a9183; /* muted text                     */
+  --folio-tan:         #8a7d62; /* borders, rules, dim            */
+  --folio-navy:        #9aa0d0; /* headings (lifted periwinkle)   */
+  --folio-steel:       #7fa3c0; /* keywords, links, accents       */
+  --folio-teal:        #6fb0aa; /* types                          */
+  --folio-sage:        #8fb094; /* strings                        */
+  --folio-warm-gray:   #b8afa6;
+  --folio-error:       #d97070;
+  --folio-amber:       #d4a843; /* warm accent / in-progress      */
+  --folio-selection:   #3a4456; /* visual / selection background  */
+
+  /* ── Document / markdown ────────────────────────────────────── */
+  --folio-bg:                 var(--folio-paper);
+  --folio-fg:                 var(--folio-ink);
+  --folio-heading-1:          var(--folio-navy);
+  --folio-heading-2:          var(--folio-navy);
+  --folio-heading-3:          var(--folio-navy);
+  --folio-heading-4:          var(--folio-steel);
+  --folio-heading-5:          var(--folio-teal);
+  --folio-heading-6:          var(--folio-comment);
+  --folio-bold:               var(--folio-ink);
+  --folio-italic:             var(--folio-ink);
+  --folio-strikethrough:      var(--folio-tan);
+  --folio-code-inline-fg:     var(--folio-sage);
+  --folio-code-inline-bg:     var(--folio-linen);
+  --folio-code-block-bg:      var(--folio-linen);
+  --folio-blockquote-bar:     var(--folio-steel);
+  --folio-blockquote-text:    var(--folio-comment);
+  --folio-link:               var(--folio-steel);
+  --folio-table-border:       var(--folio-tan);
+  --folio-table-header:       var(--folio-navy);
+  --folio-hr:                 var(--folio-tan);
+  --folio-list-marker:        var(--folio-steel);
+  --folio-image-label:        var(--folio-teal);
+  --folio-cursor-line:        var(--folio-linen);
+
+  /* ── Chrome (top/bottom bars) ──────────────────────────────── */
+  --folio-top-bar-fg:         var(--folio-steel);
+  --folio-top-bar-bg:         var(--folio-parchment);
+  --folio-top-bar-mode-fg:    var(--folio-navy);
+  --folio-bottom-bar-fg:      var(--folio-comment);
+  --folio-bottom-bar-bg:      var(--folio-parchment);
+  --folio-mode-indicator:     var(--folio-steel);
+
+  /* ── Search ────────────────────────────────────────────────── */
+  --folio-search-match-fg:         var(--folio-ink);
+  --folio-search-match-bg:         var(--folio-selection);
+  --folio-search-current-fg:       var(--folio-paper);
+  --folio-search-current-bg:       var(--folio-steel);
+
+  /* ── Editor gutter ─────────────────────────────────────────── */
+  --folio-midpoint-marker:    var(--folio-tan);
+  --folio-line-number:        var(--folio-tan);
+  --folio-line-number-cur:    var(--folio-ink);
+  --folio-editor-bg:          var(--folio-paper);
+  --folio-editor-fg:          var(--folio-ink);
+
+  /* ── Agent transcript ──────────────────────────────────────── */
+  --folio-frozen-bar:         var(--folio-steel);
+  --folio-user-bar:           var(--folio-sage);
+  --folio-tool-label:         var(--folio-warm-gray);
+  --folio-dim:                var(--folio-tan);
+  --folio-agent-tint:         #aecadb; /* light steel */
+  --folio-user-tint:          var(--folio-ink);
+  --folio-frozen-fg:          #c4c8d2;
+  --folio-agent-turn-bg:      #24221c; /* barely lighter than ground */
+  --folio-user-turn-bg:       #232a22; /* green tint */
+  --folio-turn-header-agent:  var(--folio-steel);
+  --folio-turn-header-user:   var(--folio-sage);
+  --folio-turn-rule:          #3a352d;
+
+  --folio-tool-card-bg:       var(--folio-linen);
+  --folio-tool-card-border:   #3a352d;
+  --folio-tool-completed:     var(--folio-sage);
+  --folio-tool-in-progress:   var(--folio-amber);
+  --folio-tool-failed:        var(--folio-error);
+  --folio-tool-pending:       var(--folio-tan);
+  --folio-tool-body-bg:       var(--folio-linen);
+  --folio-tool-output-bg:     var(--folio-paper);
+  --folio-tool-body-fg:       var(--folio-warm-gray);
+
+  --folio-diff-add:           var(--folio-sage);
+  --folio-diff-remove:        var(--folio-error);
+  --folio-diff-header:        var(--folio-navy);
+
+  --folio-selection-bg:       var(--folio-selection);
+  --folio-compose-separator:  var(--folio-tan);
+  --folio-cursor:             var(--folio-error);
+
+  --folio-sidebar-bg:         var(--folio-linen);
+  --folio-sidebar-border:     #3a352d;
+  --folio-sidebar-header:     var(--folio-steel);
+  --folio-warm-accent:        var(--folio-amber);
+
+  /* ── Overlays / pickers ────────────────────────────────────── */
+  --folio-overlay-bg:          var(--folio-linen);
+  --folio-overlay-border:      #3a352d;
+  --folio-overlay-label:       var(--folio-tan);
+  --folio-overlay-fg:          var(--folio-ink);
+  --folio-overlay-key:         var(--folio-steel);
+  --folio-overlay-accent:      var(--folio-teal);
+  --folio-overlay-selected-bg: var(--folio-selection);
+  --folio-overlay-modified:    var(--folio-error);
+  --folio-overlay-input:       var(--folio-navy);
+}

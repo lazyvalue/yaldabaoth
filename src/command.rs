@@ -244,6 +244,12 @@ impl CommandRegistry {
                 description: "Move to start of line".into(),
             },
             CommandDef {
+                name: "move-line-first-non-blank".into(),
+                aliases: vec![],
+                action: Action::MoveLineFirstNonBlank,
+                description: "Move to first non-blank char of line".into(),
+            },
+            CommandDef {
                 name: "move-line-end".into(),
                 aliases: vec![],
                 action: Action::MoveLineEnd,
@@ -655,6 +661,7 @@ mod tests {
             "move-word-backward",
             "move-word-end",
             "move-line-start",
+            "move-line-first-non-blank",
             "move-line-end",
             "find-char-forward",
             "find-char-backward",

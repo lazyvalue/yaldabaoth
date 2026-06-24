@@ -15,7 +15,9 @@
 //!   l                    move cursor to next block
 //!   g                    top of document
 //!   G                    bottom of document
-//!   Space                open command menu (TUI-style picker)
+//!   Space                open the tile/app (content-kind) command menu
+//!   .                    open the workspace command menu
+//!   ?                    open the global (Yaldabaoth) menu
 //!   Ctrl-E               edit current file (raw markdown)
 //!   Ctrl-W               edit current file (word-processor view)
 //!   Ctrl-K               open Claude (ACP) chat screen
@@ -23,7 +25,7 @@
 //!   Tab / Shift-Tab      next / previous buffer
 //!   q / Esc              quit
 //!
-//! Menu (Space anywhere, or Edit/Claude Normal-mode):
+//! Menu (Space → tile/app menu, `.` → workspace menu, anywhere not in text entry):
 //!   * Single-key picker over a small set of commands (open browser,
 //!     enter edit/wp, open claude, back-to-doc, quit).
 //!   * Submenu nodes drill in; Esc pops one level (closes from root).
@@ -799,6 +801,7 @@ trait EditOps {
     fn move_right_clamped(&mut self, insert_mode: bool);
     fn clamp_cursor_col(&mut self, insert_mode: bool);
     fn move_cursor_line_end(&mut self, insert_mode: bool);
+    fn move_cursor_first_non_blank(&mut self);
     fn move_cursor_word_forward(&mut self);
     fn move_cursor_word_backward(&mut self);
     fn move_cursor_word_end(&mut self);
@@ -896,6 +899,9 @@ impl EditOps for Editor {
     }
     fn move_cursor_line_end(&mut self, insert_mode: bool) {
         Editor::move_cursor_line_end(self, insert_mode);
+    }
+    fn move_cursor_first_non_blank(&mut self) {
+        Editor::move_cursor_first_non_blank(self);
     }
     fn move_cursor_word_forward(&mut self) {
         Editor::move_cursor_word_forward(self);
@@ -1030,6 +1036,9 @@ impl EditOps for SharedEditor {
     fn move_cursor_line_end(&mut self, insert_mode: bool) {
         self.view
             .move_cursor_line_end(&self.core.borrow(), insert_mode);
+    }
+    fn move_cursor_first_non_blank(&mut self) {
+        self.view.move_cursor_first_non_blank(&self.core.borrow());
     }
     fn move_cursor_word_forward(&mut self) {
         self.view.move_cursor_word_forward(&self.core.borrow());
@@ -1373,9 +1382,9 @@ struct TagInputOverlay {
 /// (search, claude-attach via socket, save-quit, …) that have no GPUI
 /// counterpart yet.
 fn gpui_menu() -> Vec<MenuNode> {
-    // Workspace-scoped command menu (<space> leader). Per untitled.md
+    // Workspace-scoped command menu (`.` leader). Per untitled.md
     // "Workspace › Commands (12 jun)": only these commands belong in the
-    // workspace scope. Tile-scoped commands live in the `.` local menus;
+    // workspace scope. Tile-scoped commands live in the <space> local menus;
     // window/workspace/layout management lives on its Ctrl-W / Cmd chords;
     // quit is Cmd-Q.
     vec![
@@ -1417,7 +1426,7 @@ fn gpui_menu() -> Vec<MenuNode> {
 
 // ---- Local menus (spec-menu-scopes.md Behavior 2) --------------------------
 //
-// One static tree per content kind, opened with the `.` local leader. Same
+// One static tree per content kind, opened with the <space> local leader. Same
 // overlay machinery as the global menu — only the tree (and header) differ.
 // v1 contains only entries with existing GPUI backing; the spec's nav-*
 // (links/headings/list-items/code-blocks) and browser-open-* entries are
@@ -4052,7 +4061,7 @@ impl YaldaGpuiView {
         HashSet::new()
     }
 
-    /// `.` — open the content-kind-specific local menu (spec-menu-scopes.md
+    /// <space> — open the content-kind-specific local menu (spec-menu-scopes.md
     /// Behavior 2). Same overlay machinery as the global menu; only the tree
     /// and header differ.
     fn open_local_menu_inner(&mut self, cx: &mut Context<Self>) {
@@ -4117,6 +4126,9 @@ impl YaldaGpuiView {
         items.push(MenuNode::separator());
         items.push(MenuNode::entry("n", "name workspace", "rename-tab"));
         items.push(MenuNode::entry("c", "new workspace", "new-tab"));
+        // Spawn a free agent session (bound to no tile/workspace) — it lands in
+        // the roster and shows up in the jump panel for later binding.
+        items.push(MenuNode::entry("a", "new agent session", "new-free-agent-session"));
         let jp_label = if self.jump_panel_visible {
             "hide jump panel"
         } else {
@@ -4205,8 +4217,10 @@ impl YaldaGpuiView {
             return false;
         }
         match press.key {
-            Key::Char(' ') => self.open_menu_inner(cx),
-            Key::Char('.') => self.open_local_menu_inner(cx),
+            // space → per-tile / per-app (content-kind) menu;
+            // `.` → per-workspace menu; `?` → global (Yaldabaoth) menu.
+            Key::Char(' ') => self.open_local_menu_inner(cx),
+            Key::Char('.') => self.open_menu_inner(cx),
             Key::Char('?') => self.open_global_menu_inner(cx),
             _ => return false,
         }
@@ -4581,6 +4595,12 @@ impl YaldaGpuiView {
                     self.save_workspace_state();
                     cx.notify();
                 }
+            }
+            "new-free-agent-session" => {
+                // Global (`?`) menu: spawn an agent session bound to NO tile and
+                // NO workspace. It lands in the universal roster and shows up in
+                // the jump panel as an unbound, bindable row.
+                self.spawn_free_agent_session(cx);
             }
             "new-linear-tile" => {
                 // Split a new tile (focus lands on it), then swap it for a

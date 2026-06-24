@@ -73,6 +73,17 @@ impl CursorPos {
         self.desired_col = None;
     }
 
+    /// Move to the first non-blank character of the current line (vim `^`).
+    /// Skips leading whitespace; a blank or whitespace-only line lands on
+    /// column 0.
+    pub fn move_first_non_blank(&mut self, doc: &Document) {
+        let text = doc.line_text(self.line);
+        // `is_whitespace()` already excludes the trailing '\n', so the search
+        // never matches the line terminator.
+        self.col = text.chars().position(|c| !c.is_whitespace()).unwrap_or(0);
+        self.desired_col = None;
+    }
+
     pub fn move_line_end(&mut self, doc: &Document, insert_mode: bool) {
         let line_len = doc.line_len_chars(self.line);
         self.col = if insert_mode {
@@ -291,4 +302,40 @@ impl Default for CursorPos {
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::Document;
+    use std::path::PathBuf;
+
+    fn doc(text: &str) -> Document {
+        Document::from_text(text.to_string(), PathBuf::from("test.md"))
+    }
+
+    #[test]
+    fn first_non_blank_skips_leading_whitespace() {
+        // lines: 0="    foo", 1="bar", 2="   " (whitespace-only)
+        let d = doc("    foo\nbar\n   \n");
+        let mut c = CursorPos::new();
+
+        // indented line: `^` lands on the first non-blank char (col 4)
+        c.line = 0;
+        c.col = 6;
+        c.move_first_non_blank(&d);
+        assert_eq!(c.col, 4);
+
+        // no indent: `^` lands on col 0 (same as `0`)
+        c.line = 1;
+        c.col = 2;
+        c.move_first_non_blank(&d);
+        assert_eq!(c.col, 0);
+
+        // whitespace-only line: no non-blank char → col 0
+        c.line = 2;
+        c.col = 1;
+        c.move_first_non_blank(&d);
+        assert_eq!(c.col, 0);
+    }
 }

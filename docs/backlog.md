@@ -7,12 +7,33 @@ move. Past work lives in `docs/worklog/`; the *why* of choices lives in
 
 Status legend: `IN-FLIGHT` (agent/branch active) · `READY` (scoped, not started)
 · `DEFERRED` (deliberately not now, reason given) · `NEEDS-DECISION` (waiting on
-the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
+the user) · `NEEDS-RUNTIME` (built + state-tested headlessly; awaiting human
+confirmation of *pixels / timing / OS-behavior* specifically — not "no test was
+possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
 ## Features
 
+- **Jump panel (root-level navigator)** — `NEEDS-RUNTIME` (built 2026-06-22,
+  merged `e3fa254`/`720b7a0`; spec `spec-jump-panel.md`, ADR-0021). Always-visible
+  left sidebar (Pinned placeholder · Workspaces · Agent sessions), `cmd-j`/`?`
+  toggle (persisted), free-session select → ephemeral virtual workspace. Inline
+  render (cheap; a root-reading cached child double-leases). Human check: visible
+  across workspace switches, active workspace highlighted, free-session
+  open-then-vanish on jump-away.
+- **Universal agent roster** — `NEEDS-RUNTIME` (built 2026-06-22, merged
+  `4ec7a62`; spec `spec-universal-agent-list.md`, ADR-0022). One `AgentRoster`
+  (all server sessions, live on Created/Closed/Renamed broadcasts, seeded at
+  boot); jump panel + tile selector both project from it. Human check: a session
+  created/renamed/closed elsewhere updates both surfaces live; selecting one
+  moves it free↔bound in both.
+- **Workspace cwd is a required typed field** — `NEEDS-RUNTIME` (built
+  2026-06-22, merged `1329898`/`e942960`; ADR-0023). `Tab.cwd: WorkspaceCwd`
+  (private, required); a new agent inherits the LIVE active-workspace cwd; Set
+  CWD persists across restart. Human check: Set CWD → new agent runs in that dir;
+  survives relaunch. NOTE: pre-existing `~/.yalda/workspace.json` entries have no
+  stored cwd → the first Set CWD per workspace populates it going forward.
 - **Desktop mode** — `NEEDS-RUNTIME` (built 2026-06-10, spec
   `spec-desktop-mode.md`, engine `1f7c269^..1f7c269` on master). Fifth
   per-tab LayoutMode (`Ctrl-W Space` cycle, sigil `[#]`): fixed-size tiles
@@ -29,6 +50,32 @@ the user) · `NEEDS-RUNTIME` (built, awaiting human runtime verification).
 
 ## Bugs
 
+- **Worksheet resume: cursor lost / undo erased the buffer / tool calls at the
+  bottom** — `FIXED` + `NEEDS-RUNTIME` (2026-06-22, merged `1560db7`/`a7beb83`;
+  worksheet-frozen-blocks ticket 001). Data was always safe (server WAL). Three
+  fixes, headless-tested: (F2) `programmatic_insert` didn't shift the view caret
+  → `Editor::splice_insert/_delete`; (C3) `undo` reset line anchors → now SHIFTS
+  them; (THE repro) `begin_insert` opens one undo group and agent chunks streamed
+  mid-insert recorded into it → agent/programmatic splices are now non-undoable
+  (`*_no_undo` + `shift_recorded_splices`). Human check: reopen a multiturn
+  worksheet session, type, let it stream, undo — your edits revert, the
+  transcript stays; caret findable; `G` reaches the bottom.
+- **Worksheet caret rendered below the visible buffer (on entry / nav)** —
+  `FIXED` + `NEEDS-RUNTIME` (2026-06-22, ticket-001 fingerprint item).
+  `view_model_fingerprint` folded in neither the input surface nor the worksheet
+  caret line, so entering Worksheet mode (or moving the caret onto a collapsible
+  blank) reused a flat list that stripped the trailing editable tail → caret on
+  a roomless line. Fix: fold `InputSurface::Worksheet` + the worksheet caret line
+  into the fingerprint (option 1, worksheet-scoped — chatbox typing stays
+  render-flat); `finish_replay` snaps the caret to the editable tail on reopen.
+  Human check: a `--release` `sample` holding `j` in a huge worksheet to confirm
+  the per-nav S1 rebuild is imperceptible.
+- **Worksheet ticket-001 remaining (deferred deep)** — `DEFERRED` (reasoned,
+  2026-06-22). **floor-only-EOF**: `agent_tail_floor_char` only protects the
+  EOF tail, so a draft wedged between two frozen blocks can be overwritten by a
+  stream — edge case, not in the live report, fix touches the delicate
+  `append_llm_chunk_floored` path. (The `view_model_fingerprint` item is now
+  FIXED — see the entry above.)
 - **Mid-turn message drops (lease gate + invisible rejection)** — `FIXED`
   (2026-06-09, `b7bdcde` on master); `NEEDS-RUNTIME` for the GUI
   PromptRejected surfacing (notice + chatbox restore — headless tests cover
@@ -311,11 +358,19 @@ verified via the resilience+transcript harness. Worklogs:
   `fmt --all --check`) is now enabled too — the whole tree is clippy-clean and
   fmt-clean. Turns the human from the only oracle into the fallback.
 
-- **Verification harness** — `READY`. Highest leverage: agents can't drive the
-  GPUI app, so everything is human-verified. Build a headless/scripted render +
-  golden screenshots, a realistic-size perf bench as a gate, and a scripted-input
-  driver. See `docs/dev-system.md` § Verification harness. Until this lands,
-  every branch below is `NEEDS-RUNTIME`.
+- **Verification harness** — `PARTIAL`. The original premise ("agents can't
+  drive the GPUI app") is **stale**: `verify_harness.rs` (~40 `#[gpui::test]`s)
+  drives the real view headlessly — constructs it, presses real keys, streams
+  events through the real reducer, asserts state. The scripted-input driver is
+  done. Three gaps remain, in leverage order: (1) **full GUI↔server↔agent loop
+  in one process** — wire the GUI's real `SessionServerClient` to an in-process
+  fake server+agent (server-side fakes already exist); retires the most
+  `NEEDS-RUNTIME` flags. (2) **golden render output** — snapshot the element
+  tree / layout bounds from `run_until_parked` for the pixels/geometry class.
+  (3) **wall-clock perf gate** — `--release` criterion bench at realistic
+  transcript size (render-count proxy is already in CI). See
+  `docs/dev-system.md` § Verification harness. `NEEDS-RUNTIME` items below now
+  mean "owes a pixels/timing eyeball," not "untestable."
 
 ## State (2026-06-02)
 

@@ -297,8 +297,8 @@ pub(crate) enum LinearFetch {
 
 /// Input mode for a Linear tile. Mirrors the Edit view's modality so the tile
 /// isn't a keystroke trap: `Insert` types the query, `Normal` frees the
-/// printable keys to be commands — `<space>` opens the global menu, `.` the
-/// Linear local menu, j/k browse the body's links, Enter jumps. Without this
+/// printable keys to be commands — `<space>` opens the Linear (tile) local
+/// menu, `.` the workspace menu, j/k browse the body's links, Enter jumps. Without this
 /// the input line swallowed `<space>`/`.` and no menu was reachable.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinearMode {

@@ -1018,6 +1018,62 @@ impl YaldaGpuiView {
         .detach();
     }
 
+    /// Spawn a brand-new agent session that is bound to NO tile and NO
+    /// workspace — a *free* session (spec-agent-session-ownership.md). Used by
+    /// the global (`?`) menu's "new agent session" command.
+    ///
+    /// Unlike `new_agent_session` / `bootstrap_fresh_agent_session` (which place
+    /// a tile and bind the new sid to it), this only issues the server
+    /// `create_session` round-trip. The resulting session lands in the universal
+    /// roster via the `SessionCreated` broadcast (and an explicit
+    /// `refresh_roster` to make it appear immediately), so it shows up in the
+    /// jump panel as an unbound, bindable row — never auto-bound here. A user can
+    /// later bind it by selecting it (jump panel → `jump_to_roster_session`, or a
+    /// tile selector). It is server-only: with no session server there is no
+    /// roster to host a free session, so this no-ops with a status note.
+    pub(crate) fn spawn_free_agent_session(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
+            self.transient_status =
+                Some("no session server — free agent sessions need one".into());
+            cx.notify();
+            return;
+        };
+        // Reuse the same label allocator and cwd resolution as the tile-bound
+        // create paths so a free session is named/rooted identically.
+        let label = self.next_agent_label(cx);
+        let cwd = self.agent_base_cwd();
+        self.transient_status = Some(format!("creating free agent session {label}…").into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result: Result<String, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    handle
+                        .create_session(cwd, label, None)
+                        .map(|info| info.label)
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(label) => {
+                        this.transient_status =
+                            Some(format!("free agent session {label} created").into());
+                        // Pull it into the roster now so the jump panel lists it
+                        // without waiting on the (also-arriving) broadcast.
+                        this.refresh_roster(cx);
+                    }
+                    Err(e) => {
+                        this.transient_status =
+                            Some(format!("free agent session create failed: {e}").into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Respawn the slot identified by `slot_index` (monotonic
     /// `AgentSlot::index`) at a new working directory. Implements
     /// spec-agent-cwd.md §4 step-by-step: drop the current channel
@@ -2902,7 +2958,7 @@ impl YaldaGpuiView {
     /// persistence on the next save (per spec: "slots without a session id
     /// are not written").
     ///
-    /// No longer on the agent `.` menu (untitled.md removed detach/attach as
+    /// No longer on the agent (space) menu (untitled.md removed detach/attach as
     /// user commands); kept as internal machinery for a future re-wiring.
     #[allow(dead_code)]
     pub(crate) fn detach_active_agent_session(&mut self, cx: &mut Context<Self>) {
@@ -2938,7 +2994,7 @@ impl YaldaGpuiView {
     /// `resume_id` so persistence captures the new channel's id once it
     /// binds (rather than retrying the original-load id forever).
     ///
-    /// No longer on the agent `.` menu (untitled.md removed detach/attach as
+    /// No longer on the agent (space) menu (untitled.md removed detach/attach as
     /// user commands); kept as internal machinery for a future re-wiring.
     #[allow(dead_code)]
     pub(crate) fn attach_active_agent_session(&mut self, cx: &mut Context<Self>) {
@@ -3675,7 +3731,7 @@ impl YaldaGpuiView {
             return;
         }
 
-        // User-turn jump mode (agent `.` menu → "jump between user turns"): when
+        // User-turn jump mode (agent (space) menu → "jump between user turns"): when
         // on, bare `j`/`k` in Normal mode move the viewport between the user's
         // input turns (`k` = older/up, `j` = newer/down) instead of the editor
         // cursor. Normal-mode only, so Insert typing of j/k is untouched.

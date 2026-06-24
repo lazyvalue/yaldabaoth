@@ -1,17 +1,22 @@
 //! Verification harness — headless GPUI tests (see docs/dev-system.md § Verification harness).
 //!
-//! The binding constraint on agent throughput is that the GPUI app can't be
-//! driven headlessly, so a human is the verification oracle for every change.
-//! GPUI ships a real test harness (`#[gpui::test]` + `TestAppContext`, which
-//! simulates platform input and runs the async executor via `run_until_parked`)
-//! — this module builds on it to drive `YaldaGpuiView` (open agent, simulate
-//! keystrokes, stream synthetic events, assert state) without a display.
+//! The GPUI app **is** drivable headlessly: GPUI ships a real test harness
+//! (`#[gpui::test]` + `TestAppContext`, which simulates platform input and runs
+//! the async executor via `run_until_parked`), and this module builds on it to
+//! drive the real `YaldaGpuiView` (open agent, simulate keystrokes, stream
+//! synthetic events, assert state) without a display. So state-level behavior
+//! is no longer human-only — the human is the oracle for the three things a
+//! headless test still can't reach, not for every change.
 //!
 //! `test-support` is enabled via the `gpui` dev-dependency, so this compiles
 //! only for test builds — the production binary is unaffected.
 //!
-//! Stones laid here grow toward: (1) end-to-end action smokes, (2) the
-//! O(changed) perf gate at realistic transcript size, (3) golden render output.
+//! Solved here: driving the real view + real keystrokes + the agent reducer,
+//! and the O(changed) render-count proxy. The three remaining gaps (still
+//! human-verified): (1) the full GUI↔server↔agent loop in one process (seam
+//! tests drive cores directly because `sent` can't be true with no daemon);
+//! (2) golden render output (painted pixels / layout geometry); (3) wall-clock
+//! perf as a gate (count is a proxy; debug masks wins).
 
 #![cfg(test)]
 
@@ -1007,6 +1012,67 @@ fn worksheet_resume_multiturn_caret_on_editable_tail(cx: &mut TestAppContext) {
             !c.editor.is_frozen_line(last),
             "the caret's last line is an EDITABLE tail — the user can find it and type"
         );
+    });
+}
+
+/// REGRESSION (live report "the cursor can go below the end of the visible
+/// buffer"): when a session is ALREADY in Worksheet mode while replay populates
+/// the transcript — the restore path, where `slot.mode == Worksheet` is set on
+/// the fresh session BEFORE its history streams in — the caret must end on the
+/// editable tail (the last line), not stranded at line 0 where it was born.
+/// Unlike `worksheet_resume_multiturn_caret_on_editable_tail` (which toggles
+/// INTO worksheet after replay, exercising the toggle path), here worksheet is
+/// entered before any content, so only an end-of-replay snap lands the caret.
+#[gpui::test]
+fn worksheet_already_active_during_replay_lands_caret_on_tail(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    // Restore path: the persisted slot was in Worksheet mode, so the session is
+    // flipped to Worksheet BEFORE its history replays (mirrors agent_ui.rs:90 /
+    // main.rs:1898). The caret is at its birth position (line 0).
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.input_surface = crate::InputSurface::Worksheet;
+        assert_eq!(c.editor.cursor().line, 0, "caret starts at line 0");
+    });
+
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            ev(ReplyEvent::Chunk("agent reply line one\n".into())),
+            ev(ReplyEvent::Chunk("agent reply line two\n".into())),
+            ev(ReplyEvent::ReplayComplete),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        let last = c.editor.document().line_count().saturating_sub(1);
+        assert!(last > 0, "transcript actually grew during replay");
+        assert_eq!(
+            c.editor.cursor().line,
+            last,
+            "caret must snap to the editable tail at end of replay, not stay at line 0"
+        );
+        assert!(c.pending_reveal_cursor, "tail snap queues a viewport reveal");
     });
 }
 
@@ -4185,9 +4251,9 @@ fn linear_nav_move_busts_cache(cx: &mut TestAppContext) {
 }
 
 /// The Linear tile is modal: in Normal mode printable keys are commands, not
-/// text — `<space>` opens the global menu (so menus are reachable at all), and a
-/// non-bound letter is a no-op (never typed into the query). Regression for the
-/// "can't access any menus, every key types into the input" trap.
+/// text — `<space>` opens the tile/app (LINEAR) menu (so menus are reachable at
+/// all), and a non-bound letter is a no-op (never typed into the query).
+/// Regression for the "can't access any menus, every key types into the input" trap.
 #[gpui::test]
 fn linear_normal_mode_frees_keys_for_menus(cx: &mut TestAppContext) {
     use crate::{Key, KMods, KeyPress, LinearMode};
@@ -4217,13 +4283,23 @@ fn linear_normal_mode_frees_keys_for_menus(cx: &mut TestAppContext) {
     assert_eq!(after_letter, "x", "Normal mode does NOT type unbound letters");
 
     // `<space>` in Normal mode is intercepted as a leader (universal path) and
-    // opens the workspace menu — the tile is not in text entry.
-    let (consumed, opened) = view.update(vcx, |v, cx| {
+    // opens the tile/app (LINEAR) local menu — the tile is not in text entry.
+    let (consumed, opened, header) = view.update(vcx, |v, cx| {
         let consumed = v.leader_intercept(&kp(' '), cx);
-        (consumed, v.overlay_is_menu())
+        let header = v.menu_ref().map(|m| m.header);
+        (consumed, v.overlay_is_menu(), header)
     });
     assert!(consumed, "`<space>` is consumed as a leader in Normal mode");
     assert!(opened, "`<space>` in Normal mode opens the menu");
+    assert_eq!(header, Some("LINEAR"), "`<space>` opens the tile/app (LINEAR) local menu");
+
+    // And `.` (after closing the space menu) opens the per-workspace menu.
+    let dot_header = view.update(vcx, |v, cx| {
+        v.clear_overlay();
+        v.leader_intercept(&kp('.'), cx);
+        v.menu_ref().map(|m| m.header)
+    });
+    assert_eq!(dot_header, Some("MENU"), "`.` opens the per-workspace command menu");
 }
 
 /// The universal leader rule: when a tile is NOT in text entry, `<space>`/`.`/

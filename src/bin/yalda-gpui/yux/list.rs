@@ -47,6 +47,45 @@ pub(crate) fn splice_list_to_items<T: PartialEq>(list: &ListState, old: &[T], ne
     list.splice(old_changed, new_len);
 }
 
+/// The top visible line that keeps the caret in view, with MINIMAL scrolling —
+/// a text-editor-style window over uniform-height rows.
+///
+/// The compose box renders **non-wrapping, uniform-height** rows, so "which
+/// line sits at the top so the caret is visible" is exact integer arithmetic —
+/// it needs ZERO height measurement. This is the architectural fix for the
+/// recurring "caret scrolls off-screen in the chatbox" bug: GPUI's
+/// `scroll_to_reveal_item` derives the offset from cached/estimated row heights,
+/// and freshly-spliced rows are unmeasured (they fall back to the list's default
+/// item height) — so the reveal lands at the wrong offset and strands the caret.
+/// Anchoring the top item by this function instead makes caret-visibility hold
+/// **by construction**, independent of GPUI's measurement timing.
+///
+/// `prev_top` is the line currently at the top of the window (read back from the
+/// list's own scroll anchor, so the window only moves when the caret would
+/// otherwise leave it). The result is clamped so the window never scrolls past
+/// the end into blank space, while still always containing `cursor_line`.
+pub(crate) fn compose_first_visible_line(
+    cursor_line: usize,
+    prev_top: usize,
+    line_count: usize,
+    visible: usize,
+) -> usize {
+    let visible = visible.max(1);
+    let max_top = line_count.saturating_sub(visible);
+    let prev_top = prev_top.min(max_top);
+    let first = if cursor_line < prev_top {
+        // Caret above the window → scroll up so it's the top line.
+        cursor_line
+    } else if cursor_line >= prev_top + visible {
+        // Caret below the window → scroll down so it's the bottom line.
+        cursor_line + 1 - visible
+    } else {
+        // Already visible → don't move (stable, minimal scroll).
+        prev_top
+    };
+    first.min(max_top)
+}
+
 /// A virtualized list that re-syncs to a new item sequence by splicing the
 /// changed range (see [`splice_list_to_items`]) so scroll stays anchored across
 /// edits. One per scrollable surface.
@@ -96,5 +135,52 @@ impl<T: PartialEq> ScrollAnchoredList<T> {
         let old = self.synced.borrow().clone();
         splice_list_to_items(&self.state, &old, items);
         *self.synced.borrow_mut() = items.clone();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compose_first_visible_line;
+
+    /// The load-bearing invariant: whatever window `compose_first_visible_line`
+    /// picks, the caret line is ALWAYS within it `[first, first + visible)`.
+    /// This is the permanent guard against the "caret off-screen in the chatbox"
+    /// regression — it pins the property directly, for every caret position.
+    #[test]
+    fn caret_is_always_within_the_chosen_window() {
+        const VISIBLE: usize = 8;
+        for line_count in [1usize, 8, 9, 50, 200] {
+            for prev_top in [0usize, 3, 40, 199, 1000] {
+                for cursor_line in 0..line_count {
+                    let first =
+                        compose_first_visible_line(cursor_line, prev_top, line_count, VISIBLE);
+                    assert!(
+                        cursor_line >= first && cursor_line < first + VISIBLE,
+                        "caret {cursor_line} escaped window [{first}, {}) \
+                         (line_count={line_count}, prev_top={prev_top})",
+                        first + VISIBLE,
+                    );
+                    // Never scroll past the end into blank space.
+                    assert!(
+                        first <= line_count.saturating_sub(VISIBLE),
+                        "window top {first} scrolled past end (line_count={line_count})",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stable_when_caret_already_visible_and_minimal_otherwise() {
+        // Caret inside the current window → window doesn't move.
+        assert_eq!(compose_first_visible_line(12, 10, 100, 8), 10);
+        // Caret just below the window → scroll down exactly one line's worth.
+        assert_eq!(compose_first_visible_line(18, 10, 100, 8), 11);
+        // Caret above the window → caret becomes the top line.
+        assert_eq!(compose_first_visible_line(2, 10, 100, 8), 2);
+        // Caret at the very end of a long draft → window pinned to the tail.
+        assert_eq!(compose_first_visible_line(99, 0, 100, 8), 92);
+        // Everything fits → always top.
+        assert_eq!(compose_first_visible_line(5, 0, 6, 8), 0);
     }
 }

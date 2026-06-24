@@ -591,6 +591,64 @@ fn rebuild_keeps_worksheet_cursor_line_through_collapse() {
     );
 }
 
+/// REGRESSION ("the cursor can go below the end of the visible buffer when
+/// entering worksheet mode"): the blank-collapse pass that strips a trailing
+/// blank editable line is cursor-AND-mode sensitive (`protect_line` keeps the
+/// caret's line only in Worksheet mode), but `view_model_fingerprint` folded in
+/// NEITHER. So toggling Chatbox→Worksheet — which moves the caret to the tail
+/// (a blank compose row) — produced an identical fingerprint, the S1 memo
+/// returned the Chatbox-built flat list (tail stripped), and the caret rendered
+/// on a line with no row: below the visible buffer. The fingerprint must change
+/// when the input surface flips (and when the worksheet caret moves), so the
+/// memo busts and the rebuild protects the tail.
+#[test]
+fn view_model_fingerprint_busts_on_input_surface_and_worksheet_cursor() {
+    // Agent line + a trailing blank editable tail (the worksheet compose row).
+    let lines: Vec<String> = vec!["agent reply".to_string(), String::new()];
+    let frozen = vec![(0usize, 1)];
+    let (line_count, frozen_count) = (2usize, 1usize);
+
+    // Same content + same caret line, only the input surface differs.
+    let mut chat = AgentState::new_for_test(); // Chatbox by default
+    chat.editor.cursor_mut().line = 1;
+    let mut ws = AgentState::new_for_test();
+    ws.input_surface = InputSurface::Worksheet;
+    ws.editor.cursor_mut().line = 1;
+    assert_ne!(
+        chat.view_model_fingerprint(line_count, frozen_count),
+        ws.view_model_fingerprint(line_count, frozen_count),
+        "flipping into Worksheet mode must bust the S1 memo (protect_line differs)"
+    );
+
+    // Within Worksheet mode, moving the caret onto the (otherwise-collapsed)
+    // blank tail must also change the fingerprint, or the cached flat list
+    // (built with the caret elsewhere, tail stripped) leaves the caret roomless.
+    let fp_caret_up = ws.view_model_fingerprint(line_count, frozen_count);
+    ws.editor.cursor_mut().line = 0;
+    let fp_caret_frozen = ws.view_model_fingerprint(line_count, frozen_count);
+    assert_ne!(
+        fp_caret_up, fp_caret_frozen,
+        "a worksheet caret move on/off a collapsible blank must bust the memo"
+    );
+
+    // End-to-end through the real memo: build in Chatbox (tail stripped), then
+    // the worksheet build for the same content must render the caret's tail.
+    let theme = Theme::default();
+    let fp_chat = chat.view_model_fingerprint(line_count, frozen_count);
+    let (flat_chat, _) = rebuild_agent_view_model(&mut chat, &lines, &frozen, &theme, fp_chat);
+    assert!(
+        !flat_chat.iter().any(|f| matches!(f, FlatItem::Line(1))),
+        "Chatbox build strips the trailing blank tail"
+    );
+    ws.editor.cursor_mut().line = 1; // caret on the tail, as entering worksheet lands it
+    let fp_ws = ws.view_model_fingerprint(line_count, frozen_count);
+    let (flat_ws, _) = rebuild_agent_view_model(&mut ws, &lines, &frozen, &theme, fp_ws);
+    assert!(
+        flat_ws.iter().any(|f| matches!(f, FlatItem::Line(1))),
+        "Worksheet build keeps the caret's tail line so the caret has a row"
+    );
+}
+
 /// FIX 2 (no empty "You" region): a worksheet submit that collected a blank
 /// spacer line between two authored lines must freeze ONLY the non-blank lines.
 /// Freezing the blank too painted an empty frozen "You" turn into the transcript

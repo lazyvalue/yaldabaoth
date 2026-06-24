@@ -1291,6 +1291,10 @@ impl EditorView {
         self.cursor.move_line_end(&core.document, insert_mode);
     }
 
+    pub fn move_cursor_first_non_blank(&mut self, core: &EditorCore) {
+        self.cursor.move_first_non_blank(&core.document);
+    }
+
     pub fn move_cursor_word_forward(&mut self, core: &EditorCore) {
         self.cursor.move_word_forward(&core.document);
     }
@@ -1873,6 +1877,10 @@ impl Editor {
 
     pub fn move_cursor_line_end(&mut self, insert_mode: bool) {
         self.view.move_cursor_line_end(&self.core, insert_mode);
+    }
+
+    pub fn move_cursor_first_non_blank(&mut self) {
+        self.view.move_cursor_first_non_blank(&self.core);
     }
 
     pub fn move_cursor_word_forward(&mut self) {

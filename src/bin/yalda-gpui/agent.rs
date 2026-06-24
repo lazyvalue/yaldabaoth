@@ -1164,10 +1164,15 @@ pub(crate) fn build_chatbox_line(
     total_line_chars: usize,
     code_font: &SharedString,
     text_color: Hsla,
+    selection_bg: Hsla,
 ) -> AnyElement {
     let line_h = px(18.0);
     let fg: Hsla = text_color;
-    let sel_bg: Hsla = ncolor_to_hsla(SELECTION_BG, BG);
+    // Theme-driven selection background — the same color the edit view
+    // (`build_edit_body_*`) paints, so the chatbox highlight contrast tracks
+    // the active theme instead of a hardcoded Dracula swath that clashes on
+    // light/non-Dracula themes.
+    let sel_bg: Hsla = selection_bg;
 
     let chars: Vec<char> = full_text.chars().collect();
     let char_count = chars.len();
@@ -1734,7 +1739,12 @@ impl Chatbox {
             editor: Editor::new(String::new(), std::path::PathBuf::from("*chatbox*")),
             mode: EditMode::Insert,
             scroll_handle: ScrollHandle::new(),
-            list: ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(64.0)),
+            // Compose rows are uniform 18px and non-wrapping; the default item
+            // height MUST match so an unmeasured (freshly-spliced) row estimates
+            // its height correctly. A wrong default (was 64px, ~3.5× too tall)
+            // throws off the list's height model and strands the caret off-screen
+            // on reveal — the recurring "cursor offscreen in the chatbox" bug.
+            list: ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(18.0)),
         }
     }
 
@@ -2512,7 +2522,7 @@ pub(crate) struct AgentState {
     /// handler itself does NO transcript-sized work, which is what keeps
     /// Worksheet typing flat as the session grows (ADR-0020).
     pub(crate) pending_reveal_cursor: bool,
-    /// User-turn jump mode (agent `.` menu → "jump between user turns"): when
+    /// User-turn jump mode (agent (space) menu → "jump between user turns"): when
     /// on, bare `j`/`k` in Normal mode move the viewport between the user's
     /// input turns (`TurnHeader { role: User }`) instead of moving the editor
     /// cursor — for finding "what I wrote last" amid a wall of agent output.
@@ -2754,6 +2764,22 @@ impl AgentState {
             }
         }
         self.turn_phase.is_awaiting().hash(&mut h);
+        // The blank-collapse pass is mode- and cursor-sensitive: in Worksheet
+        // mode `protect_line` keeps the caret's (possibly blank) line so the
+        // caret has a row to render on, and toggling surfaces flips whether the
+        // trailing editable blank is the compose tail (kept) or stray noise
+        // (stripped). Both are genuine inputs to the build, so the memo key must
+        // name them — otherwise entering Worksheet mode (or moving the worksheet
+        // caret onto the collapsible tail) reuses a flat list built for the
+        // other state and the caret lands on a stripped line "below the visible
+        // buffer". Folded in WORKSHEET ONLY: a chatbox transcript caret never
+        // drives collapse, and insert-mode typing already busts the memo via
+        // `edit_seq`, so this adds rebuilds only on Normal-mode worksheet
+        // navigation (cheap — O(changed) S1 rebuild, INV-RV).
+        matches!(self.input_surface, InputSurface::Worksheet).hash(&mut h);
+        if matches!(self.input_surface, InputSurface::Worksheet) {
+            self.editor.cursor().line.hash(&mut h);
+        }
         h.finish()
     }
 
@@ -3037,6 +3063,15 @@ impl AgentState {
     /// (Finding 13, INV-4).
     pub(crate) fn finish_replay(&mut self) {
         self.replay_turns.finish_replay();
+        // Reopening a session that was in Worksheet mode rebuilds the transcript
+        // from the replayed event_log; land the caret on the editable tail (the
+        // last line) so the user finds it where they compose, not stranded at
+        // its line-0 birth position or on replayed agent content. Worksheet only
+        // — Chatbox composes in a separate surface and leaves the transcript
+        // caret untouched (mirrors `finalize_agent_turn_idem`).
+        if matches!(self.input_surface, InputSurface::Worksheet) {
+            self.move_cursor_to_tail();
+        }
     }
 
     /// Idempotent turn finalize keyed on `(generation, turn)` (spec §7/H5).

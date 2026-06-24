@@ -406,7 +406,7 @@ impl YaldaGpuiView {
     /// Key handler for a focused Linear tile. The tile is **modal**: in Insert
     /// the printable keys edit the query line (only the input row re-renders —
     /// the body stays cached); in Normal they are commands, so `<space>`/`.`
-    /// reach the global / local menus and j/k browse the body's links. The
+    /// reach the tile / workspace menus and j/k browse the body's links. The
     /// project picker is its own transient sub-modal, handled first.
     pub(crate) fn handle_linear_key(
         &mut self,
@@ -497,7 +497,7 @@ impl YaldaGpuiView {
     }
 
     /// Normal mode: printable keys are commands, not text. `<space>` opens the
-    /// global menu, `.` the Linear local menu, `i`/`a`/`/` return to Insert,
+    /// Linear (tile) local menu, `.` the workspace menu, `i`/`a`/`/` return to Insert,
     /// j/k browse the body's links and Enter jumps to the selected one. Unbound
     /// keys are no-ops (never typed) — that's what keeps `<space>`/`.` free.
     pub(crate) fn handle_linear_normal_key(&mut self, press: KeyPress, cx: &mut Context<Self>) {

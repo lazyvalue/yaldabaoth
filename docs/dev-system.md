@@ -23,9 +23,12 @@ spec ──▶ decision ──▶ scaffold ──▶ implement ──▶ verify 
 - **scaffold** — a git worktree under `.claude/worktrees/<slug>` on its own
   branch (see ADR-0001). Substantial / multi-file / agent-run work gets one.
 - **implement** — directly or via subagents. See "Parallel work" below.
-- **verify** — the gate (see "Definition of done"). The weak link today: the
-  GUI can't be driven headlessly, so most verification is still manual. See
-  "Verification harness" — closing this is the highest-leverage investment.
+- **verify** — the gate (see "Definition of done"). The GUI **is** drivable
+  headlessly now (`#[gpui::test]` + `TestAppContext`: construct the real view,
+  press real keys, stream events, assert state — see "Verification harness").
+  What's still manual is narrower: painted pixels/geometry, the full
+  GUI↔server↔agent loop in one process, and wall-clock perf. Closing those is
+  the highest-leverage remaining investment.
 - **integrate** — merge feature branches into one buildable branch in
   dependency order, resolving conflicts. Use `/integrate`. Behavior-changing
   branches are flagged for human review before folding, not auto-merged.
@@ -49,7 +52,7 @@ A branch is **done** when:
 1. **Builds** — `cargo build --bin yalda-gpui --bin yalda-session-server`, no new errors.
 2. **Tests pass** — `cargo test --bin yalda-gpui` and `cargo test --lib`, green, with new tests for new behavior.
 3. **Evidence pasted** — the agent shows the actual command output, not a claim. Claims get independently re-verified (agents are confidently wrong sometimes).
-4. **Runtime-checked OR explicitly flagged** — either exercised against the running app, or the report states exactly what a human must run (see harness gap).
+4. **Runtime-checked OR explicitly flagged** — either exercised against the running app (a headless `#[gpui::test]` driving the real view counts), or the report states exactly what a human must run. `NEEDS-RUNTIME` means a human must confirm *pixels / timing / OS-behavior* — not "no test was possible"; state-level behavior is testable headlessly.
 5. **Artifacts updated** — spec/decision touched if design changed; worklog + backlog updated at session end.
 
 "Compiles" is not done. "Tests pass" is not done if the change is a UX/perf change that only a runtime check can confirm — say so.
@@ -81,22 +84,45 @@ Fanning out N agents is not free — they have to converge.
   - The verification harness is the empirical backstop that doesn't care about
     framing — it catches what a misframed prompt can't.
 
-## Verification harness (the top gap)
+## Verification harness (state-level: solved; three gaps remain)
 
-The binding constraint on throughput is that **agents can't confirm runtime
-behavior** — so the human is the verification oracle for every change, and
-parallelism just defers work to review. Closing this compounds everything else.
+The original framing — "agents can't confirm runtime behavior, so the human is
+the oracle for every change" — is **no longer accurate**. `verify_harness.rs`
+(~40 `#[gpui::test]`s on `TestAppContext`) drives the **real** `YaldaGpuiView`
+headlessly: it constructs the production view, installs the production keymap,
+simulates real keystrokes (`cmd_b_toggles_file_browser_rail`,
+`edit_view_keystroke_is_o_changed`), streams synthetic agent events through the
+real reducer, and asserts post-action state through entity handles —
+`run_until_parked` runs a real layout/paint pass. "Drive the view, press keys,
+assert state" is **done**. The scripted-input driver below already exists.
 
 What exists to build on:
-- Snapshot tests (`tests/snapshots/`, `cargo test --lib`).
-- `YALDA_DEBUG=1` → per-frame ground-truth JSON log (TUI; see CLAUDE.md).
+- The headless GPUI harness (`verify_harness.rs`, `cargo test --bin yalda-gpui`).
+- Server-side fakes (`FakeTransport`/`FakeAgentSpawner`, phase 6) +
+  `tests/session_resilience_test.rs` driving the **real** server binary.
+- Render-count instrumentation (`record_render`, read via `perf_render_count`)
+  as an O(changed) proxy, gated in CI.
 - `YALDA_PERF=1` / `YALDA_HL_CACHE` → render/pump timing + the `perf_report` bench.
 
-What to build (backlog item #1):
-- A headless/scripted render mode + golden screenshots for the GPUI surface.
-- A perf benchmark over a realistic transcript size, run as a gate (not small-N).
-- A scripted-input driver so "Cmd-B opens the rail" / "tokens stream in order"
-  become tests, not manual checks.
+The three remaining gaps (what `NEEDS-RUNTIME` actually means now):
+1. **Pixels / geometry.** The harness asserts state, not what's painted —
+   "spinner clears," "panel didn't collapse," "right color after theme switch"
+   need a human eyeball. Close it with golden output: snapshot the element
+   tree / computed layout bounds from `run_until_parked` (the high-leverage 80%),
+   or offscreen-render + hash regions.
+2. **The full GUI↔server↔agent loop in one process.** Seam tests note `sent`
+   can never be true headlessly (no daemon, no channel), so they drive the
+   dedup core directly + add a negative control. The server half already has
+   in-process fakes; the missing wire is the GUI's real `SessionServerClient`
+   against an in-process fake server+agent, so submit→stream→reduce→render runs
+   for real. This retires the largest batch of `NEEDS-RUNTIME` flags.
+3. **Wall-clock perf as a gate.** Render *count* is in CI, but it's a proxy and
+   debug masks wins — real latency is still a human `sample --release`. Close it
+   with a `--release` criterion bench over a realistic transcript as a threshold
+   gate (not small-N).
+
+Recommended order: (2) in-process loop first (retires the most flags, the seam
+already exists server-side) → (1) element-tree snapshots → (3) perf gate.
 
 ## Skills
 

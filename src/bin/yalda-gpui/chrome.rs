@@ -130,6 +130,11 @@ impl YaldaGpuiView {
             .iter()
             .map(|&(id, s)| (id, s, tab.desktop.span_of(id)))
             .collect();
+        // A lone tile fills the canvas — a desktop with one window shouldn't
+        // strand it in a single grid quadrant (the jump-panel virtual
+        // workspace lands here). Drag/resize/pan are meaningless with one
+        // tile, so the maximized branch ignores slot geometry entirely.
+        let maximized = slot_list.len() == 1;
         // Live edge-resize preview (spec Behavior 4b): the clamped span the
         // resized tile renders at this frame, which is also what commits.
         let resize_preview: Option<(workspace::WindowId, workspace::Span)> = tab
@@ -246,10 +251,10 @@ impl YaldaGpuiView {
                     span = rspan;
                 }
             }
-            let (_, _, tw, th) = workspace::tile_rect(slot, span, tile, g);
+            let (_, _, mut tw, mut th) = workspace::tile_rect(slot, span, tile, g);
             let dragging = drag.filter(|d| d.active && d.id == id);
             let (sx, sy) = workspace::slot_origin(slot, tile, g);
-            let (x, y) = match dragging {
+            let (mut x, mut y) = match dragging {
                 // The dragged tile itself follows the pointer — the real
                 // content rides along semi-transparent (no separate ghost).
                 Some(d) => (
@@ -258,6 +263,12 @@ impl YaldaGpuiView {
                 ),
                 None => (sx - pan.0, sy - pan.1),
             };
+            if maximized {
+                x = g;
+                y = g;
+                tw = (canvas_w - 2.0 * g).max(160.0);
+                th = (canvas_h - 2.0 * g).max(120.0);
+            }
             let visible = x + tw > 0.0 && x < canvas_w && y + th > 0.0 && y < canvas_h;
             let is_focused = id == focused_id;
             // Focused tile is exempt from culling — its element tree holds
@@ -321,8 +332,11 @@ impl YaldaGpuiView {
                 .bg(title_bg)
                 .text_size(px(11.0))
                 .text_color(if is_focused { accent } else { dim })
-                .cursor_grab()
-                .on_mouse_down(
+                .child(title);
+            // A maximized lone tile has nowhere to be dragged or resized to,
+            // so it's pinned: no grab cursor, no move/resize handlers.
+            if !maximized {
+                title_bar = title_bar.cursor_grab().on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
                         this.desktop_grab(
@@ -331,8 +345,8 @@ impl YaldaGpuiView {
                             cx,
                         );
                     }),
-                )
-                .child(title);
+                );
+            }
             if let Some(m) = mark {
                 title_bar =
                     title_bar.child(div().px_1().text_color(accent).child(format!("[{m}]")));
@@ -391,9 +405,10 @@ impl YaldaGpuiView {
                 .border_1()
                 .border_color(if is_focused { accent } else { dim.opacity(0.4) })
                 .child(title_bar)
-                .child(div().flex_1().min_h_0().overflow_hidden().child(inner))
-                .child(east_band)
-                .child(south_band);
+                .child(div().flex_1().min_h_0().overflow_hidden().child(inner));
+            if !maximized {
+                frame = frame.child(east_band).child(south_band);
+            }
             if dragging.is_some() {
                 frame = frame.opacity(0.85);
             }
