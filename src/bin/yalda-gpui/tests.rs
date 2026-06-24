@@ -731,6 +731,7 @@ fn rebuild_blank_gap_between_claude_turns_has_no_you_header() {
     let theme = Theme::default();
     let mut st = AgentState::new_for_test();
     st.input_surface = InputSurface::Worksheet;
+    st.mode = EditMode::Normal; // content-driven: a blank gap must not self-header
     st.editor.programmatic_insert(0, "answer one\n\nanswer two\n");
     for (l, turn) in [(0usize, TurnId::Llm(1)), (2usize, TurnId::Llm(2))] {
         st.editor.add_frozen_lines(l, l + 1);
@@ -810,20 +811,22 @@ fn has_user_header(flat: &[FlatItem]) -> bool {
         .any(|f| matches!(f, FlatItem::TurnHeader { role: TurnRole::User }))
 }
 
-/// Issue 1, content-driven contract: the "You" divider appears the instant the
-/// editable run holds non-whitespace text (the first real keystroke, no Enter
-/// needed) and is ABSENT while the run is empty — so a blank draft shows none.
+/// Content-driven half (NORMAL mode): with the caret parked in Normal mode, the
+/// "You" divider tracks content — absent while the editable run is empty,
+/// present once it holds non-whitespace text. (The presence-driven Insert-mode
+/// behavior is `rebuild_worksheet_divider_on_insert_entry`.)
 #[test]
 fn rebuild_worksheet_blank_tail_has_no_header_until_text() {
     let mut st = AgentState::new_for_test();
     st.input_surface = InputSurface::Worksheet;
+    st.mode = EditMode::Normal; // not composing — content-driven case
     st.editor.append_llm_chunk(TurnId::Llm(1), "answer\n");
     let tail = st.editor.document().line_count() - 1;
     st.editor.cursor_mut().line = tail;
     st.editor.cursor_mut().col = 0;
     assert!(
         !has_user_header(&flat_of(&mut st)),
-        "a blank editable tail (nothing written yet) must show no You divider"
+        "a blank editable tail in Normal mode (nothing written) shows no You divider"
     );
     // First real keystroke surfaces it immediately.
     st.editor.insert_char('h');
@@ -833,12 +836,47 @@ fn rebuild_worksheet_blank_tail_has_no_header_until_text() {
     );
 }
 
-/// Issue 1 follow-up: if the user writes nothing but whitespace, the divider
-/// stays gone; clearing real text back to whitespace/empty removes it again.
+/// PRESENCE-driven contract (user instruction): entering Insert mode on the
+/// editable tail shows the "You" divider IMMEDIATELY — before any text — and it
+/// vanishes on leaving Insert with the run still empty (no phantom "You").
+#[test]
+fn rebuild_worksheet_divider_on_insert_entry() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::Worksheet;
+    st.editor.append_llm_chunk(TurnId::Llm(1), "answer\n");
+    let tail = st.editor.document().line_count() - 1;
+    st.editor.cursor_mut().line = tail;
+    st.editor.cursor_mut().col = 0;
+
+    // Normal mode, empty tail: no divider yet.
+    st.mode = EditMode::Normal;
+    assert!(
+        !has_user_header(&flat_of(&mut st)),
+        "Normal mode on an empty tail: no You divider"
+    );
+    // Enter Insert (still no text typed): the divider appears NOW.
+    st.mode = EditMode::Insert;
+    assert!(
+        has_user_header(&flat_of(&mut st)),
+        "entering Insert mode shows the You divider before any text is typed"
+    );
+    // Leave Insert with the run still empty: the divider goes away (no phantom).
+    st.mode = EditMode::Normal;
+    assert!(
+        !has_user_header(&flat_of(&mut st)),
+        "leaving Insert with an empty draft removes the You divider (no phantom)"
+    );
+}
+
+/// Content-driven half (NORMAL mode): a whitespace-only draft shows no divider;
+/// real text turns it on, clearing it back to whitespace turns it off. (Asserted
+/// in Normal mode, where the divider is purely content-driven — in Insert mode
+/// presence would show it regardless, per `rebuild_worksheet_divider_on_insert_entry`.)
 #[test]
 fn rebuild_worksheet_whitespace_only_run_has_no_header() {
     let mut st = AgentState::new_for_test();
     st.input_surface = InputSurface::Worksheet;
+    st.mode = EditMode::Normal; // content-driven case
     st.editor.append_llm_chunk(TurnId::Llm(1), "answer\n");
     let tail = st.editor.document().line_count() - 1;
     st.editor.cursor_mut().line = tail;
@@ -873,17 +911,19 @@ fn rebuild_worksheet_interjection_header_tracks_text() {
     st.editor.append_llm_chunk(TurnId::Llm(1), "line one\nline two\n");
     st.editor.cursor_mut().line = 0;
     st.editor.cursor_mut().col = 8;
-    st.editor.open_line_below(); // blank editable line 1, caret on it
+    st.editor.open_line_below(); // blank editable line 1, caret on it, Insert mode
+    // PRESENCE-driven: opening a blank interjection line to compose between two
+    // Claude turns shows the You divider immediately (you're composing there).
     assert!(
-        !has_user_header(&flat_of(&mut st)),
-        "a freshly-opened blank interjection line shows no You divider yet"
+        has_user_header(&flat_of(&mut st)),
+        "opening an interjection line in Insert shows the You divider"
     );
     for ch in "note".chars() {
         st.editor.insert_char(ch);
     }
     assert!(
         has_user_header(&flat_of(&mut st)),
-        "typing into the interjection surfaces the You divider"
+        "the interjection divider persists once it holds text"
     );
 }
 
