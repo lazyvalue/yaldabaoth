@@ -2260,6 +2260,15 @@ pub(crate) fn rebuild_agent_view_model(
     // TurnHeader items are inserted at turn boundaries (role changes).
     let mut flat_items: Vec<FlatItem> = Vec::with_capacity(lines.len() * 2);
     let mut prev_turn: Option<TurnId> = None;
+    // "You" divider: presence-driven. It appears the moment you enter Insert mode
+    // on an editable run (you're composing a turn there), even before you type,
+    // and vanishes when you leave Insert without committing text (so no phantom
+    // "You"). `composing` + the caret line are folded into
+    // `view_model_fingerprint` (caret only WHILE composing) so this updates live
+    // without busting the memo on Normal-mode navigation.
+    let composing =
+        matches!(c.input_surface, InputSurface::Worksheet) && c.mode == EditMode::Insert;
+    let caret_line = c.editor.cursor().line;
     for line_idx in 0..lines.len() {
         // Insert a TurnHeader whenever the dominant turn changes.
         let cur_turn = gutter_tag_per_line.get(line_idx).copied().flatten();
@@ -2302,22 +2311,25 @@ pub(crate) fn rebuild_agent_view_model(
                         .is_some()
                 })
                 .unwrap_or(lines.len());
-            // The "You" divider is purely CONTENT-driven: it appears the instant
-            // the run holds non-whitespace text and disappears the moment the
-            // user clears it back to empty or whitespace-only (no caret-presence
-            // trigger — an empty/whitespace draft must show no divider). Immediacy
-            // comes from the transcript busting its cache on every editor edit.
+            // The "You" divider is PRESENCE-driven (user contract): it appears
+            // when this editable run holds non-whitespace text OR when the user is
+            // composing in it (Insert mode with the caret inside the run) — so it
+            // shows the instant you enter Insert, before you've typed. An empty
+            // run with no caret shows none; leaving Insert without committing text
+            // makes it vanish (no phantom "You"). Caret/Insert are folded into
+            // `view_model_fingerprint` so this updates live.
             let run_non_empty = (line_idx..run_end).any(|j| !lines[j].trim().is_empty());
-            if run_non_empty {
+            let caret_in_run = composing && (line_idx..run_end).contains(&caret_line);
+            if run_non_empty || caret_in_run {
                 flat_items.push(FlatItem::TurnHeader {
                     role: TurnRole::User,
                 });
-                // A real user interjection ends the prior turn; the next Llm line
-                // re-opens with its own header.
+                // A real user turn (or one being composed) ends the prior turn;
+                // the next Llm line re-opens with its own header.
                 prev_turn = None;
             }
-            // All-blank/whitespace gap: leave `prev_turn` intact so an abandoned
-            // editable gap mid-Claude-turn doesn't split it into two headers.
+            // All-blank/whitespace gap with no caret: leave `prev_turn` intact so
+            // an abandoned editable gap mid-Claude-turn doesn't split it.
         }
 
         // Advance the resolved-range cursor past ranges that
@@ -2779,6 +2791,12 @@ impl AgentState {
         matches!(self.input_surface, InputSurface::Worksheet).hash(&mut h);
         if matches!(self.input_surface, InputSurface::Worksheet) {
             self.editor.cursor().line.hash(&mut h);
+            // Insert vs Normal flips the PRESENCE-driven "You" divider: it shows
+            // while composing (Insert mode with the caret in an editable run),
+            // even before any text. Entering/leaving Insert without moving the
+            // caret or editing changes nothing else in this key, so the memo must
+            // name the mode or the divider wouldn't appear/disappear live.
+            (self.mode == EditMode::Insert).hash(&mut h);
         }
         h.finish()
     }
