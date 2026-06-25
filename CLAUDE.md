@@ -42,6 +42,15 @@ implement → verify → integrate → log lifecycle, the definition of done, pa
 work discipline, and the verification-harness plan. Key artifacts:
 
 - `docs/specs/` — design (what). Skill: `/spec`.
+- **`docs/specs/spec-ux-invariants.md` — the canonical, cross-cutting UX
+  behavior contract (cursor always visible + tracks text, compose word-wrap,
+  …).** LIVING and AUTHORITATIVE: **every code change that touches a tile / view
+  / editor / scroll / caret / input surface MUST be checked against it and MUST
+  NOT violate an invariant** — if a change seems to require violating one, stop
+  and reconcile the spec first. **Update it whenever new UX is designed** (add or
+  extend the relevant `INV-UX-N`, name its test or runtime check). It is the one
+  place that says e.g. "the cursor is always visible" without re-deriving it per
+  surface.
 - `docs/decisions/` — ADRs (why a path was chosen). Skill: `/decision`.
 - `docs/worklog/` + `docs/backlog.md` — what happened / what's open. Skill: `/worklog`.
 - `docs/projects/` — **multi-session project tickets** (see below).
