@@ -78,13 +78,19 @@ a merge of the stale branch.
 
 | # | Ticket | Status |
 |---|--------|--------|
-| M1 | InputSurface struct + Compose rename | pending |
-| M2 | unify submit_compose; delete rope machinery | pending |
-| M3 | read-only transcript call-site fixes (paste/copy/status/follow-tail/seqs) | pending |
-| M4 | compose_draft persistence (4-site) | pending |
-| M5 | inline compose render + divider integration | pending |
-| M6 | keystone ordering/replay invariant test + port suite | pending |
-| M7 | build + full test + worklog/ADR + merge | pending |
+| M1 | InputSurface struct + Compose rename | ✅ done |
+| M2 | unify submit_compose; delete rope machinery | ✅ done |
+| M3 | read-only transcript call-site fixes (paste/copy/status/follow-tail/seqs) | ✅ done |
+| M4 | compose_draft persistence (4-site) | ✅ done |
+| M5 | inline compose render + "You" divider | ✅ done |
+| M6 | keystone ordering/replay invariant test + port suite | ✅ done |
+| M7 | build + full test + worklog/ADR + merge | ✅ done |
+
+**Outcome:** re-derived onto `main` via a conflict-surfacing 3-way merge (11
+hunks). 256 gpui + 142 lib tests pass. INV-ORDER pinned by
+`inv_order_*` tests (drive the real floor path; would fail against the old
+shared-rope model). See ADR-0024 + `docs/worklog/2026-06-24-worksheet-modelc-ordering.md`.
+Runtime-unverified (GPUI headless gap) — see the worklog's human-check list.
 
 ## Definition of done
 
