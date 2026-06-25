@@ -779,19 +779,12 @@ pub(crate) fn agent_tail_floor_char(editor: &Editor) -> usize {
 /// Returns `Vec<(start, end)>` where `start..end` covers the full block
 /// including delimiters. Ranges are non-overlapping and sorted.
 /// Pure follow-tail policy (F4, INV-13), factored out of `AgentState` so it
-/// can be unit-tested without a GPUI editor/list. In Chatbox mode the user's
-/// cursor is outside the transcript, so following is purely the sticky-bottom
-/// `follow_output` flag; in Worksheet mode the viewport tracks the cursor and
-/// follows only when the cursor is at EOF.
-pub(crate) fn should_follow_tail(
-    input_mode: InputModeKind,
-    follow_output: bool,
-    cursor_at_eof: bool,
-) -> bool {
-    match input_mode {
-        InputModeKind::Chatbox => follow_output,
-        InputModeKind::Worksheet => cursor_at_eof,
-    }
+/// can be unit-tested without a GPUI editor/list. Model C: the user's cursor is
+/// in the compose buffer (outside the transcript) in BOTH placements — the
+/// transcript is read-only — so following is purely the sticky-bottom
+/// `follow_output` flag regardless of placement.
+pub(crate) fn should_follow_tail(follow_output: bool) -> bool {
+    follow_output
 }
 
 /// 64-bit content hash of a detected block range's source lines — the
@@ -1552,42 +1545,74 @@ pub(crate) enum InputModeKind {
     Chatbox,
 }
 
-/// The single live input surface of an agent window (§4–§5). Replaces the old
-/// `input_mode: InputMode` + `chatbox: Option<Chatbox>` pair: the Chatbox data
-/// lives INSIDE the `Chatbox` variant, so the illegal states (Chatbox-mode with
-/// no box, or Worksheet with a stranded box) are unrepresentable. New sessions
-/// start at `Chatbox` (compose-box-first); `Ctrl-Alt-Enter` toggles. NOT `Copy`
-/// (it owns a `Chatbox`).
-// wire/event enum — boxing the large variant would ripple through serialization + every match site
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum InputSurface {
-    Worksheet,
-    Chatbox(Chatbox),
+/// Which surface holds keyboard focus in an agent tile (Model C — `design-c.md`
+/// §4.5). Default `Compose`. `Transcript` is the read-only navigation/selection
+/// mode (the base "workspace" capability), entered via the local menu and exited
+/// with `Esc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AgentFocus {
+    #[default]
+    Compose,
+    Transcript,
+}
+
+/// The live input surface of an agent window (Model C — `design-c.md`). There is
+/// ONE model — a focusable read-only transcript plus a [`Compose`] buffer — and a
+/// single mode axis, **placement**: `mode == Worksheet` renders the compose inline
+/// at the transcript tail (the base case); `mode == Chatbox` renders it in a pinned
+/// box (the diminutive case). The compose buffer therefore exists in BOTH modes —
+/// the old enum (`Worksheet` unit | `Chatbox(Chatbox)`) is replaced by a struct so
+/// "the compose exists iff in chatbox mode" is no longer the model. Toggling flips
+/// `mode`; the `compose` value never moves (lossless). `Ctrl-Alt-Enter` toggles.
+pub(crate) struct InputSurface {
+    pub(crate) compose: Compose,
+    /// The placement discriminant (`design-c.md` `Placement`): which side the
+    /// editable buffer sits on. Persisted as the `PersistedSlot.mode` string;
+    /// read by `should_follow_tail` and the render path.
+    pub(crate) mode: InputModeKind,
 }
 
 impl InputSurface {
+    /// A fresh surface in `mode` with an empty compose buffer.
+    pub(crate) fn new(mode: InputModeKind) -> Self {
+        Self {
+            compose: Compose::new(),
+            mode,
+        }
+    }
+
+    /// A surface in `mode` whose compose is seeded with a persisted `draft`
+    /// (Model C restore — `design-c.md` §4.4). Empty `draft` ⇒ empty compose.
+    pub(crate) fn with_draft(mode: InputModeKind, draft: &str) -> Self {
+        Self {
+            compose: Compose::seeded(draft),
+            mode,
+        }
+    }
     pub(crate) fn is_chatbox(&self) -> bool {
-        matches!(self, InputSurface::Chatbox(_))
+        self.mode == InputModeKind::Chatbox
     }
-    pub(crate) fn chatbox(&self) -> Option<&Chatbox> {
-        match self {
-            InputSurface::Chatbox(cb) => Some(cb),
-            InputSurface::Worksheet => None,
+    /// The compose buffer — present in every mode (Model C). New code reads this.
+    pub(crate) fn compose(&self) -> &Compose {
+        &self.compose
+    }
+    pub(crate) fn compose_mut(&mut self) -> &mut Compose {
+        &mut self.compose
+    }
+    /// Back-compat shim: `Some` only in Chatbox mode. Retained for the
+    /// not-delivered resubmit path, which only refills the box in chatbox mode.
+    /// New code uses the total `compose()`/`compose_mut()`.
+    pub(crate) fn chatbox_mut(&mut self) -> Option<&mut Compose> {
+        if self.is_chatbox() {
+            Some(&mut self.compose)
+        } else {
+            None
         }
     }
-    pub(crate) fn chatbox_mut(&mut self) -> Option<&mut Chatbox> {
-        match self {
-            InputSurface::Chatbox(cb) => Some(cb),
-            InputSurface::Worksheet => None,
-        }
-    }
-    /// The Copy discriminant, for the persisted mode string and
-    /// `should_follow_tail` (which must not borrow the owned `Chatbox`).
+    /// The Copy placement discriminant, for the persisted mode string and
+    /// `should_follow_tail`.
     pub(crate) fn mode(&self) -> InputModeKind {
-        match self {
-            InputSurface::Worksheet => InputModeKind::Worksheet,
-            InputSurface::Chatbox(_) => InputModeKind::Chatbox,
-        }
+        self.mode
     }
 }
 
@@ -1700,13 +1725,12 @@ impl HeaderRole {
     }
 }
 
-/// Standalone input editor used when `InputMode == Chatbox`. Has its own
-/// document, cursor, undo stack, and modal state (§16). The chatbox is
-/// dropped on a `Chatbox → Worksheet` toggle (§6) and re-constructed empty
-/// on a `Worksheet → Chatbox` toggle (§7) — undo history doesn't survive
-/// the round trip; the previous draft is recoverable as transcript
-/// content if the user already submitted.
-pub(crate) struct Chatbox {
+/// The editable draft buffer (Model C — `design-c.md`). Has its own document,
+/// cursor, undo stack, and modal state. Shared by both placements: rendered
+/// inline at the transcript tail in Worksheet mode, in a pinned box in Chatbox
+/// mode. Its value survives a placement toggle untouched (the draft is never lost).
+/// Renamed from `Chatbox` — it is the *compose surface*, not a mode.
+pub(crate) struct Compose {
     pub(crate) editor: Editor,
     pub(crate) mode: EditMode,
     /// Virtualised scroll state for the compose panel, used ONLY once the draft
@@ -1744,10 +1768,10 @@ pub(crate) struct Chatbox {
 /// there is no per-column pixel drift to accumulate.
 pub(crate) const CHATBOX_CHAR_W: f32 = 8.0;
 
-impl Chatbox {
+impl Compose {
     pub(crate) fn new() -> Self {
         Self {
-            editor: Editor::new(String::new(), std::path::PathBuf::from("*chatbox*")),
+            editor: Editor::new(String::new(), std::path::PathBuf::from("*compose*")),
             mode: EditMode::Insert,
             // Compose rows are uniform 18px and non-wrapping; the default item
             // height MUST match so an unmeasured (freshly-spliced) row estimates
@@ -1797,6 +1821,16 @@ impl Chatbox {
         );
         self.window.set(win);
         win
+    }
+
+    /// A fresh compose seeded with `text` (cursor at the end). Used on restore to
+    /// re-apply a persisted draft, and on the not-delivered resubmit path.
+    pub(crate) fn seeded(text: &str) -> Self {
+        let mut c = Self::new();
+        for ch in text.chars() {
+            c.editor.insert_char(ch);
+        }
+        c
     }
 }
 
@@ -2313,8 +2347,13 @@ pub(crate) fn rebuild_agent_view_model(
     // "You"). `composing` + the caret line are folded into
     // `view_model_fingerprint` (caret only WHILE composing) so this updates live
     // without busting the memo on Normal-mode navigation.
-    let composing =
-        matches!(c.input_surface, InputSurface::Worksheet) && c.mode == EditMode::Insert;
+    // Model C: the transcript is READ-ONLY and the user draft lives in the
+    // separate Compose buffer — so the transcript never hosts a presence-driven
+    // "You" divider (that boundary is the inline compose's own gutter/border,
+    // rendered in screens.rs). `composing` is therefore always false here: the
+    // editable-run divider is a Model-A artifact and must not inject spurious
+    // "You" headers into the frozen transcript.
+    let composing = false;
     let caret_line = c.editor.cursor().line;
     for line_idx in 0..lines.len() {
         // Insert a TurnHeader whenever the dominant turn changes.
@@ -2418,7 +2457,7 @@ pub(crate) fn rebuild_agent_view_model(
     // scrolls past where the cursor actually is. Never collapse the
     // line the cursor is on.
     {
-        let protect_line: Option<usize> = matches!(c.input_surface, InputSurface::Worksheet)
+        let protect_line: Option<usize> = (!c.input_surface.is_chatbox())
             .then(|| c.editor.cursor().line);
         let is_blank_line = |item: &FlatItem| -> bool {
             matches!(item, FlatItem::Line(idx)
@@ -2617,12 +2656,17 @@ pub(crate) struct AgentState {
     /// lines that changed between renders instead of the whole buffer every
     /// `cx.notify()`. Bypassed when `YALDA_HL_CACHE=0`.
     pub(crate) highlight_cache: HighlightCache,
-    /// The active input surface (§4). The `Chatbox` draft editor lives INSIDE
-    /// the `Chatbox` variant — make-illegal-states-unrepresentable, so the old
-    /// "`chatbox` is `Some` iff `input_mode == Chatbox`" invariant (two
-    /// hand-synced fields) is now enforced by the type. New sessions start at
-    /// `Chatbox`; `Ctrl-Alt-Enter` toggles (§5).
+    /// The active input surface (Model C — `design-c.md`): the `Compose` draft
+    /// buffer + the placement (`Worksheet` inline / `Chatbox` pinned). New
+    /// sessions start in `Chatbox`; `Ctrl-Alt-Enter` toggles placement.
     pub(crate) input_surface: InputSurface,
+    /// Which surface holds keyboard focus (Model C — `design-c.md` §4.5).
+    /// `Compose` (default): keystrokes edit the draft. `Transcript`: keystrokes
+    /// drive read-only navigation/selection over the committed transcript, and
+    /// the transcript renders a caret. This is the base capability that makes
+    /// Worksheet a *workspace* (select history, `S` = send selection), shared by
+    /// both placements. `Esc` from `Transcript` returns to `Compose`.
+    pub(crate) focus: AgentFocus,
     /// Last-seen full snapshot of the agent's plan. Updated on every ACP
     /// `Plan` notification (which carries a complete plan, not a delta —
     /// see spec-agent-window.md §21). Consumed by the Tasklist sidebar.
@@ -2835,8 +2879,8 @@ impl AgentState {
         // drives collapse, and insert-mode typing already busts the memo via
         // `edit_seq`, so this adds rebuilds only on Normal-mode worksheet
         // navigation (cheap — O(changed) S1 rebuild, INV-RV).
-        matches!(self.input_surface, InputSurface::Worksheet).hash(&mut h);
-        if matches!(self.input_surface, InputSurface::Worksheet) {
+        (!self.input_surface.is_chatbox()).hash(&mut h);
+        if !self.input_surface.is_chatbox() {
             self.editor.cursor().line.hash(&mut h);
             // Insert vs Normal flips the PRESENCE-driven "You" divider: it shows
             // while composing (Insert mode with the caret in an editable run),
@@ -2873,7 +2917,8 @@ impl AgentState {
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
-            input_surface: InputSurface::Chatbox(Chatbox::new()),
+            input_surface: InputSurface::new(InputModeKind::Chatbox),
+            focus: AgentFocus::default(),
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -2924,7 +2969,8 @@ impl AgentState {
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
-            input_surface: InputSurface::Chatbox(Chatbox::new()),
+            input_surface: InputSurface::new(InputModeKind::Chatbox),
+            focus: AgentFocus::default(),
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -3078,6 +3124,13 @@ impl AgentState {
     /// hand-rolled `last_seen_turns + 1`, which silently diverged from the
     /// chokepoint and never armed dedup. Returns the committed `k`, or `None` if
     /// the M3 tripwire fired (no lines frozen; the caller still clears/notifies).
+    ///
+    /// Model C: the live worksheet submit no longer freezes in place — it routes
+    /// through `submit_compose` → `insert_user_turn` (append at EOF), since the
+    /// draft now lives in a separate `Compose` buffer, not in the transcript.
+    /// This in-place freeze is retained only as the reconciler-dedup SEAM that
+    /// the `agent_seam_*` tests drive directly; hence `#[cfg(test)]`.
+    #[cfg(test)]
     pub(crate) fn commit_worksheet_turn(
         &mut self,
         collected: &[(usize, String)],
@@ -3115,13 +3168,7 @@ impl AgentState {
     /// re-reveal all consult, replacing the byte-identical copy that used to
     /// live at each site (and drift independently).
     pub(crate) fn follow_tail(&self) -> bool {
-        let line_count = self.editor.document().line_count();
-        let cursor_at_eof = self.editor.cursor().line + 1 >= line_count;
-        should_follow_tail(
-            self.input_surface.mode(),
-            self.follow_output.get(),
-            cursor_at_eof,
-        )
+        should_follow_tail(self.follow_output.get())
     }
 
     /// Fold the replay cursor back into the live counter at end-of-replay
@@ -3134,7 +3181,7 @@ impl AgentState {
         // its line-0 birth position or on replayed agent content. Worksheet only
         // — Chatbox composes in a separate surface and leaves the transcript
         // caret untouched (mirrors `finalize_agent_turn_idem`).
-        if matches!(self.input_surface, InputSurface::Worksheet) {
+        if !self.input_surface.is_chatbox() {
             self.move_cursor_to_tail();
         }
     }
@@ -3165,7 +3212,7 @@ impl AgentState {
         // message right below the agent's reply, and the viewport follows there.
         // Chatbox composes in a separate surface, so its transcript caret is
         // left where it is.
-        if matches!(self.input_surface, InputSurface::Worksheet) {
+        if !self.input_surface.is_chatbox() {
             self.move_cursor_to_tail();
         }
         true

@@ -577,7 +577,7 @@ fn rebuild_keeps_worksheet_cursor_line_through_collapse() {
     // Worksheet: the caret's line (2) is protected from collapse and the
     // reverse index points reveal straight at it.
     let mut ws = AgentState::new_for_test();
-    ws.input_surface = InputSurface::Worksheet;
+    ws.input_surface = InputSurface::new(InputModeKind::Worksheet);
     ws.editor.cursor_mut().line = 2;
     let (flat_ws, _) = rebuild_agent_view_model(&mut ws, &lines, &frozen, &theme, 1);
     let pos = flat_ws
@@ -612,7 +612,7 @@ fn view_model_fingerprint_busts_on_input_surface_and_worksheet_cursor() {
     let mut chat = AgentState::new_for_test(); // Chatbox by default
     chat.editor.cursor_mut().line = 1;
     let mut ws = AgentState::new_for_test();
-    ws.input_surface = InputSurface::Worksheet;
+    ws.input_surface = InputSurface::new(InputModeKind::Worksheet);
     ws.editor.cursor_mut().line = 1;
     assert_ne!(
         chat.view_model_fingerprint(line_count, frozen_count),
@@ -656,7 +656,7 @@ fn view_model_fingerprint_busts_on_input_surface_and_worksheet_cursor() {
 #[test]
 fn commit_worksheet_skips_blank_lines() {
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.editor.programmatic_insert(0, "hello\n\nworld\n");
     let collected = vec![
         (0usize, "hello".to_string()),
@@ -686,7 +686,7 @@ fn commit_worksheet_skips_blank_lines() {
 fn rebuild_seeds_atomic_blocks_and_blocks_interior_insert() {
     let theme = Theme::default();
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.editor.programmatic_insert(0, "intro\n```\ncode\n```\n\n");
     for l in 0..4usize {
         st.editor.add_frozen_lines(l, l + 1);
@@ -730,7 +730,7 @@ fn rebuild_seeds_atomic_blocks_and_blocks_interior_insert() {
 fn rebuild_blank_gap_between_claude_turns_has_no_you_header() {
     let theme = Theme::default();
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.mode = EditMode::Normal; // content-driven: a blank gap must not self-header
     st.editor.programmatic_insert(0, "answer one\n\nanswer two\n");
     for (l, turn) in [(0usize, TurnId::Llm(1)), (2usize, TurnId::Llm(2))] {
@@ -764,7 +764,7 @@ fn rebuild_blank_gap_between_claude_turns_has_no_you_header() {
 fn rebuild_text_gap_between_claude_turns_gets_you_header() {
     let theme = Theme::default();
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.editor.programmatic_insert(0, "answer one\nmy note\nanswer two\n");
     for (l, turn) in [(0usize, TurnId::Llm(1)), (2usize, TurnId::Llm(2))] {
         st.editor.add_frozen_lines(l, l + 1);
@@ -818,7 +818,7 @@ fn has_user_header(flat: &[FlatItem]) -> bool {
 #[test]
 fn rebuild_worksheet_blank_tail_has_no_header_until_text() {
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.mode = EditMode::Normal; // not composing — content-driven case
     st.editor.append_llm_chunk(TurnId::Llm(1), "answer\n");
     let tail = st.editor.document().line_count() - 1;
@@ -836,37 +836,13 @@ fn rebuild_worksheet_blank_tail_has_no_header_until_text() {
     );
 }
 
-/// PRESENCE-driven contract (user instruction): entering Insert mode on the
-/// editable tail shows the "You" divider IMMEDIATELY — before any text — and it
-/// vanishes on leaving Insert with the run still empty (no phantom "You").
-#[test]
-fn rebuild_worksheet_divider_on_insert_entry() {
-    let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
-    st.editor.append_llm_chunk(TurnId::Llm(1), "answer\n");
-    let tail = st.editor.document().line_count() - 1;
-    st.editor.cursor_mut().line = tail;
-    st.editor.cursor_mut().col = 0;
-
-    // Normal mode, empty tail: no divider yet.
-    st.mode = EditMode::Normal;
-    assert!(
-        !has_user_header(&flat_of(&mut st)),
-        "Normal mode on an empty tail: no You divider"
-    );
-    // Enter Insert (still no text typed): the divider appears NOW.
-    st.mode = EditMode::Insert;
-    assert!(
-        has_user_header(&flat_of(&mut st)),
-        "entering Insert mode shows the You divider before any text is typed"
-    );
-    // Leave Insert with the run still empty: the divider goes away (no phantom).
-    st.mode = EditMode::Normal;
-    assert!(
-        !has_user_header(&flat_of(&mut st)),
-        "leaving Insert with an empty draft removes the You divider (no phantom)"
-    );
-}
+// NOTE (Model C): the Model-A test `rebuild_worksheet_divider_on_insert_entry`
+// was removed. It asserted a presence-driven "You" divider as a *transcript
+// flat-item* keyed on the transcript editor's mode. Under Model C the transcript
+// is read-only and the draft lives in the separate Compose buffer, so the
+// transcript never hosts that divider — the "You" boundary is the inline
+// compose's own gutter/border (screens.rs). The replacement coverage is the
+// render-side compose-boundary test (ticket M5).
 
 /// Content-driven half (NORMAL mode): a whitespace-only draft shows no divider;
 /// real text turns it on, clearing it back to whitespace turns it off. (Asserted
@@ -875,7 +851,7 @@ fn rebuild_worksheet_divider_on_insert_entry() {
 #[test]
 fn rebuild_worksheet_whitespace_only_run_has_no_header() {
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.mode = EditMode::Normal; // content-driven case
     st.editor.append_llm_chunk(TurnId::Llm(1), "answer\n");
     let tail = st.editor.document().line_count() - 1;
@@ -902,37 +878,19 @@ fn rebuild_worksheet_whitespace_only_run_has_no_header() {
     );
 }
 
-/// Issue 1: opening a blank interjection line shows NO divider until real text
-/// is typed there (then it appears immediately).
-#[test]
-fn rebuild_worksheet_interjection_header_tracks_text() {
-    let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
-    st.editor.append_llm_chunk(TurnId::Llm(1), "line one\nline two\n");
-    st.editor.cursor_mut().line = 0;
-    st.editor.cursor_mut().col = 8;
-    st.editor.open_line_below(); // blank editable line 1, caret on it, Insert mode
-    // PRESENCE-driven: opening a blank interjection line to compose between two
-    // Claude turns shows the You divider immediately (you're composing there).
-    assert!(
-        has_user_header(&flat_of(&mut st)),
-        "opening an interjection line in Insert shows the You divider"
-    );
-    for ch in "note".chars() {
-        st.editor.insert_char(ch);
-    }
-    assert!(
-        has_user_header(&flat_of(&mut st)),
-        "the interjection divider persists once it holds text"
-    );
-}
+// NOTE (Model C): the Model-A test `rebuild_worksheet_interjection_header_tracks_text`
+// was removed. It interjected user text directly INTO the transcript
+// (`open_line_below` between two Claude turns) and asserted the presence-driven
+// "You" divider. Under Model C the transcript is read-only — you never interject
+// inside it; you compose in the separate buffer rendered below it — so that flow
+// and its divider no longer exist here (M5 covers the compose boundary).
 
 /// Issue 2: a trailing blank editable line the caret has moved off of must NOT
 /// render as a stray empty row at the bottom of the transcript.
 #[test]
 fn rebuild_strips_trailing_blank_editable_tail() {
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.editor.append_llm_chunk(TurnId::Llm(1), "answer\n");
     // User text on line 1, then a trailing blank line 2; caret rests on line 1.
     st.editor.cursor_mut().line = 1;
@@ -962,7 +920,7 @@ fn rebuild_strips_trailing_blank_editable_tail() {
 #[test]
 fn rebuild_keeps_trailing_blank_when_caret_is_on_it() {
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.editor.append_llm_chunk(TurnId::Llm(1), "answer\n");
     for ch in "hello\n".chars() {
         st.editor.cursor_mut().line = st.editor.document().line_count() - 1;
@@ -1020,7 +978,7 @@ fn doc_lines(st: &AgentState) -> Vec<String> {
 #[test]
 fn floored_first_chunk_never_merges_into_draft() {
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.editor.append_llm_chunk(TurnId::Llm(1), "ok\n");
     st.editor.cursor_mut().line = st.editor.document().line_count() - 1;
     st.editor.cursor_mut().col = 0;
@@ -1057,7 +1015,7 @@ fn floored_first_chunk_never_merges_into_draft() {
 #[test]
 fn floored_subline_chunks_merge_onto_one_line() {
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.editor.append_llm_chunk(TurnId::Llm(1), "ok\n");
     st.editor.cursor_mut().line = st.editor.document().line_count() - 1;
     st.editor.cursor_mut().col = 0;
@@ -1084,7 +1042,7 @@ fn floored_subline_chunks_merge_onto_one_line() {
 #[test]
 fn floored_hard_break_starts_new_line_above_draft() {
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.editor.append_llm_chunk(TurnId::Llm(1), "ok\n");
     st.editor.cursor_mut().line = st.editor.document().line_count() - 1;
     st.editor.cursor_mut().col = 0;
@@ -1111,7 +1069,7 @@ fn floored_hard_break_starts_new_line_above_draft() {
 #[test]
 fn floored_tools_and_text_stay_in_order_above_draft() {
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.editor.append_llm_chunk(TurnId::Llm(1), "ok\n");
     st.editor.cursor_mut().line = st.editor.document().line_count() - 1;
     st.editor.cursor_mut().col = 0;
@@ -1157,7 +1115,7 @@ fn floored_tools_and_text_stay_in_order_above_draft() {
 #[test]
 fn worksheet_turn_end_moves_caret_to_tail() {
     let mut st = AgentState::new_for_test();
-    st.input_surface = InputSurface::Worksheet;
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
     st.editor.append_llm_chunk(TurnId::Llm(1), "a long\nmulti-line\nreply");
     // Caret parked up in the transcript (as if the user scrolled to read).
     st.editor.cursor_mut().line = 0;
@@ -1202,7 +1160,7 @@ fn chatbox_turn_end_leaves_caret_put() {
 fn chatbox_caret_cell_stays_in_window_for_every_edit_path() {
     // After a given edit, the live caret cell must be inside the window the
     // box would render at, for several visible extents.
-    fn assert_contained(cb: &Chatbox, label: &str) {
+    fn assert_contained(cb: &Compose, label: &str) {
         for &rows in &[1usize, 8] {
             for &cols in &[1usize, 4, 20, 80] {
                 let w = cb.compute_window(rows, cols);
@@ -1222,7 +1180,7 @@ fn chatbox_caret_cell_stays_in_window_for_every_edit_path() {
         }
     }
 
-    let mut cb = Chatbox::new();
+    let mut cb = Compose::new();
     assert_contained(&cb, "empty");
 
     // Type a single VERY long line — the caret rides off the right edge unless
@@ -2133,19 +2091,6 @@ fn classify_wp_line_paragraph_fallback() {
     );
 }
 
-// ---- doc_char_to_line_col ----
-
-#[test]
-fn doc_char_to_line_col_basic_mapping() {
-    let ed = Editor::new("ab\ncd\nef".into(), std::path::PathBuf::from("/t"));
-    assert_eq!(doc_char_to_line_col(ed.document(), 0), (0, 0));
-    assert_eq!(doc_char_to_line_col(ed.document(), 1), (0, 1));
-    // Char 2 is the '\n' between line 0 and line 1.
-    assert_eq!(doc_char_to_line_col(ed.document(), 3), (1, 0));
-    assert_eq!(doc_char_to_line_col(ed.document(), 6), (2, 0));
-    // Past EOF clamps to len.
-    assert_eq!(doc_char_to_line_col(ed.document(), 999), (2, 2));
-}
 
 // ---- Menu rendering helpers ----
 
@@ -2674,5 +2619,244 @@ fn doc_list_splice_preserves_scroll_anchor() {
         doc.list.state().logical_scroll_top().item_ix,
         20,
         "a block change below the viewport top must leave the doc anchored, not jump to 0"
+    );
+}
+
+// ============================================================================
+// Model C — worksheet/compose agent-buffer invariants (design-c.md §6)
+// ============================================================================
+
+/// INV (§4.4): a reconnect/replay rebuilds the TRANSCRIPT editor only; the
+/// compose draft lives in `input_surface` and must survive untouched. Pins the
+/// "draft lost on reconnect" failure mode the redesign fixes for free.
+#[test]
+fn compose_draft_survives_reset_for_replay() {
+    let mut st = AgentState::new_for_test();
+    for ch in "half-typed prompt".chars() {
+        st.input_surface.compose_mut().editor.insert_char(ch);
+    }
+    // Put some committed content in the transcript so the reset has work to do.
+    st.editor.programmatic_insert(0, "old transcript\n");
+
+    st.reset_for_replay();
+
+    assert_eq!(
+        st.input_surface.compose().text(),
+        "half-typed prompt",
+        "compose draft must survive a replay reset"
+    );
+    assert_eq!(
+        st.editor.document().full_text(),
+        "",
+        "the transcript editor is wiped for replay"
+    );
+}
+
+/// INV (§4.5): the follow-tail policy is `follow_output` in BOTH placements —
+/// the cursor lives in the compose, never the (read-only) transcript, so the
+/// old `Worksheet => cursor_at_eof` arm is gone.
+#[test]
+fn should_follow_tail_is_follow_output_only() {
+    assert!(should_follow_tail(true), "follow when follow_output is set");
+    assert!(
+        !should_follow_tail(false),
+        "don't follow when follow_output is clear"
+    );
+}
+
+/// `Compose::seeded` round-trips multi-line text (used by draft restore +
+/// the not-delivered resubmit path).
+#[test]
+fn compose_seeded_roundtrips_text() {
+    assert_eq!(Compose::seeded("alpha\nbeta").text(), "alpha\nbeta");
+    assert_eq!(Compose::seeded("").text(), "");
+}
+
+/// `InputSurface::with_draft` sets BOTH placement and the seeded draft — the
+/// shape the three restore sites rely on (a mechanical `Compose::new()` would
+/// silently drop the draft).
+#[test]
+fn input_surface_with_draft_sets_mode_and_draft() {
+    let s = InputSurface::with_draft(InputModeKind::Worksheet, "resumed");
+    assert_eq!(s.mode(), InputModeKind::Worksheet);
+    assert!(!s.is_chatbox());
+    assert_eq!(s.compose().text(), "resumed");
+
+    let empty = InputSurface::with_draft(InputModeKind::Chatbox, "");
+    assert!(empty.is_chatbox());
+    assert_eq!(empty.compose().text(), "");
+}
+
+/// Persistence round-trip (§4.4): a non-empty compose draft survives
+/// save→load; an empty draft is not written (absent → None on load). Uses the
+/// `with_acp_persist_path` seam so it never touches `~/.yalda`.
+#[test]
+fn compose_draft_persist_roundtrip() {
+    let dir = std::env::temp_dir().join(format!("yalda_compose_persist_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("acp_sessions.json");
+    let cwd = std::path::Path::new("/tmp/yalda-test-cwd");
+
+    persist::with_acp_persist_path(path.clone(), || {
+        let snaps = vec![
+            persist::SessionSnapshot {
+                id: "S-with-draft".into(),
+                label: "claude-1".into(),
+                active: true,
+                mode: InputModeKind::Worksheet,
+                tasklist_open: false,
+                subagents_open: false,
+                cwd: cwd.to_path_buf(),
+                compose_draft: Some("persisted draft".into()),
+            },
+            persist::SessionSnapshot {
+                id: "S-empty".into(),
+                label: "claude-2".into(),
+                active: false,
+                mode: InputModeKind::Chatbox,
+                tasklist_open: false,
+                subagents_open: false,
+                cwd: cwd.to_path_buf(),
+                compose_draft: None,
+            },
+        ];
+        persist::save_persisted_acp_sessions(cwd, &snaps);
+
+        let loaded = persist::load_persisted_acp_sessions(cwd);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded[0].compose_draft.as_deref(),
+            Some("persisted draft"),
+            "non-empty draft round-trips"
+        );
+        assert_eq!(
+            loaded[1].compose_draft, None,
+            "empty draft is not written / loads as None"
+        );
+        assert_eq!(loaded[0].mode, InputModeKind::Worksheet);
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ----------------------------------------------------------------------------
+// INV-ORDER (the keystone) — the ordering invariant the old model lacked.
+//
+//   The transcript is append-only/read-only; the draft is a SEPARATE buffer.
+//   The only cross-buffer transfer is text, never a position. ⇒ a turn's
+//   chunks can only extend the transcript at EOF; a draft is never inside
+//   history. Ordering corruption is unrepresentable.
+//
+// These reproduce the reported failure ("a newer agent turn renders above an
+// older exchange; my draft sits in the middle of history") and would FAIL
+// against the old shared-rope model (draft in the transcript ⇒ streaming had to
+// insert ABOVE it via a stale floor/tag, landing mid-document).
+// ----------------------------------------------------------------------------
+
+/// Streaming a NEW agent turn while the user is mid-draft appends at transcript
+/// EOF and leaves the compose untouched. Drives the REAL floor path
+/// (`agent_tail_floor_char` + `append_llm_chunk_floored`) the live pump uses, so
+/// a regression to mid-document insertion is caught. Pins design-c §6 #7.
+#[test]
+fn inv_order_streaming_with_draft_appends_at_eof() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
+
+    // Prior exchange: U1 then its answer, both frozen/tagged in the transcript.
+    st.insert_user_turn(
+        "first question",
+        yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
+        false,
+    );
+    st.editor.append_llm_chunk(TurnId::Llm(1), "first answer\n");
+    let transcript_before = st.editor.document().full_text();
+
+    // The user is composing the NEXT prompt — it lives in the SEPARATE compose
+    // buffer, NOT in the transcript (this is the exact text from the report).
+    for ch in "did we activate /spec".chars() {
+        st.input_surface.compose_mut().editor.insert_char(ch);
+    }
+
+    // A new agent turn streams in. The live pump computes the floor and uses the
+    // floored append; replay that here exactly.
+    let floor = agent_tail_floor_char(&st.editor);
+    assert_eq!(
+        floor,
+        st.editor.document().rope().len_chars(),
+        "no user draft in the transcript ⇒ the floor is EOF (the structural core \
+         of the fix: there is nothing to stream ABOVE)"
+    );
+    st.editor
+        .append_llm_chunk_floored(TurnId::Llm(2), "second answer\n", floor);
+
+    // The new turn appended at the bottom; the prior exchange is untouched and
+    // still ABOVE it; the draft never entered the transcript.
+    assert_eq!(
+        st.editor.document().full_text(),
+        format!("{transcript_before}second answer\n"),
+        "the new agent turn must append at EOF, below the older exchange — not \
+         mid-document, and never fused with the draft"
+    );
+    assert_eq!(
+        st.input_surface.compose().text(),
+        "did we activate /spec",
+        "the draft stays in the compose buffer, out of the transcript (INV-3)"
+    );
+}
+
+/// Several interleaved user/agent turns land in the transcript in the order they
+/// occurred — even with a non-empty draft held throughout. The old model could
+/// place a turn's continuation at its (stale) tag position, rendering a newer
+/// turn above an older one; the append-only transcript makes that impossible.
+#[test]
+fn inv_order_interleaved_turns_stay_chronological() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
+
+    // Hold a draft for the whole sequence — it must never perturb ordering.
+    for ch in "scratch draft".chars() {
+        st.input_surface.compose_mut().editor.insert_char(ch);
+    }
+
+    let submit = |st: &mut AgentState, body: &str| {
+        st.insert_user_turn(
+            body,
+            yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
+            false,
+        );
+    };
+    let stream = |st: &mut AgentState, k: usize, body: &str| {
+        let floor = agent_tail_floor_char(&st.editor);
+        st.editor.append_llm_chunk_floored(TurnId::Llm(k), body, floor);
+    };
+
+    submit(&mut st, "q1");
+    stream(&mut st, 1, "a1\n");
+    submit(&mut st, "q2");
+    stream(&mut st, 2, "a2\n");
+    submit(&mut st, "q3");
+    stream(&mut st, 3, "a3\n");
+
+    let text = st.editor.document().full_text();
+    let order: Vec<&str> = ["q1", "a1", "q2", "a2", "q3", "a3"]
+        .into_iter()
+        .filter(|tok| text.contains(tok))
+        .collect();
+    assert_eq!(
+        order,
+        vec!["q1", "a1", "q2", "a2", "q3", "a3"],
+        "transcript content must be in chronological order; got:\n{text}"
+    );
+    // Each marker appears strictly after the previous one (no reordering).
+    let mut last = 0usize;
+    for tok in ["q1", "a1", "q2", "a2", "q3", "a3"] {
+        let at = text.find(tok).unwrap_or_else(|| panic!("missing {tok}"));
+        assert!(at >= last, "out-of-order: {tok} at {at} precedes {last}\n{text}");
+        last = at;
+    }
+    assert_eq!(
+        st.input_surface.compose().text(),
+        "scratch draft",
+        "the draft is untouched by any number of turns (INV-2)"
     );
 }

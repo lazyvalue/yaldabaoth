@@ -419,17 +419,6 @@ fn format_menu_key(seq: &[KeyPress]) -> String {
 // ----------------------------------------------------------------------------
 
 /// Convert a rope char index to (line, col). Document doesn't expose this
-/// directly but Document::rope() is public. Mirrors editor.rs's private
-/// `char_to_line_col`.
-fn doc_char_to_line_col(doc: &Document, char_idx: usize) -> (usize, usize) {
-    let rope = doc.rope();
-    let len = rope.len_chars();
-    let i = char_idx.min(len);
-    let line = rope.char_to_line(i);
-    let line_start = rope.line_to_char(line);
-    (line, i - line_start)
-}
-
 // ----------------------------------------------------------------------------
 // Root view
 // ----------------------------------------------------------------------------
@@ -1497,6 +1486,7 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("x", "close session", "claude-close"),
         MenuNode::entry("C", "clear session", "claude-clear"),
         MenuNode::entry("r", "rename session", "claude-rename"),
+        MenuNode::entry("f", "focus transcript ⇄ compose", "agent-focus-toggle"),
         MenuNode::entry("S", "send selection", "claude-send-selection"),
         MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
         MenuNode::entry("h", "toggle heading markers", "agent-toggle-heading-markers"),
@@ -1914,9 +1904,14 @@ impl YaldaGpuiView {
                         match bind {
                             agent_sessions::Bind::Created(sid_id) => {
                                 self.with_session(sid_id, cx, |state| {
-                                    if slot.mode == InputModeKind::Worksheet {
-                                        state.input_surface = InputSurface::Worksheet;
-                                    }
+                                    // Model C (design-c.md §4.4): restore the
+                                    // persisted compose draft + its placement into
+                                    // the separate Compose buffer (the transcript is
+                                    // rebuilt by replay, untouched here).
+                                    state.input_surface = InputSurface::with_draft(
+                                        slot.mode,
+                                        slot.compose_draft.as_deref().unwrap_or(""),
+                                    );
                                     state.tasklist_open = slot.tasklist_open;
                                     state.subagents_open = slot.subagents_open;
                                 });
@@ -1974,9 +1969,10 @@ impl YaldaGpuiView {
                         let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
                         let mut state =
                             self.create_agent_session(Some(slot.id.clone()), slot_cwd.clone(), cx);
-                        if slot.mode == InputModeKind::Worksheet {
-                            state.input_surface = InputSurface::Worksheet;
-                        }
+                        state.input_surface = InputSurface::with_draft(
+                            slot.mode,
+                            slot.compose_draft.as_deref().unwrap_or(""),
+                        );
                         state.tasklist_open = slot.tasklist_open;
                         state.subagents_open = slot.subagents_open;
                         self.show_local_session(
@@ -3135,22 +3131,12 @@ impl YaldaGpuiView {
         let agent_bound = self.focused_bound_session();
         let pasted = if let Some(id) = agent_bound {
             self.with_session(id, cx, |c| {
-                if c.input_surface.is_chatbox() {
-                    if let Some(cb) = c.input_surface.chatbox_mut() {
-                        if cb.mode == EditMode::Insert {
-                            for ch in text.chars() {
-                                cb.editor.insert_char(ch);
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else if c.mode == EditMode::Insert {
+                // Model C: paste always targets the compose buffer (the transcript
+                // is read-only in both placements — INV-1).
+                let cb = c.input_surface.compose_mut();
+                if cb.mode == EditMode::Insert {
                     for ch in text.chars() {
-                        c.editor.insert_char(ch);
+                        cb.editor.insert_char(ch);
                     }
                     true
                 } else {
@@ -3194,13 +3180,14 @@ impl YaldaGpuiView {
         // the store, so resolve the bound id first.
         let text = if let Some(id) = self.focused_bound_session() {
             self.read_session(id, cx, |c| {
-                if c.input_surface.is_chatbox() {
-                    c.input_surface
-                        .chatbox()
-                        .and_then(|cb| cb.editor.selection_text())
-                } else {
-                    c.editor.selection_text()
-                }
+                // Prefer the compose selection (the editable surface); fall back to
+                // a transcript selection (read-only copy is fine — INV-1 forbids
+                // writes, not reads).
+                c.input_surface
+                    .compose()
+                    .editor
+                    .selection_text()
+                    .or_else(|| c.editor.selection_text())
             })
             .flatten()
         } else {
@@ -4204,10 +4191,7 @@ impl YaldaGpuiView {
                     .unwrap_or(false)
                 {
                     self.agent_read(cx, |c| {
-                        c.input_surface
-                            .chatbox()
-                            .map(|cb| cb.mode == EditMode::Insert)
-                            .unwrap_or(false)
+                        c.input_surface.compose().mode == EditMode::Insert
                     })
                     .unwrap_or(false)
                 } else {
@@ -4690,6 +4674,11 @@ impl YaldaGpuiView {
             "claude-send-selection" => {
                 if matches!(self.workspace.focused_content(), Some(App::Agent(_))) {
                     self.send_agent_selection(cx);
+                }
+            }
+            "agent-focus-toggle" => {
+                if matches!(self.workspace.focused_content(), Some(App::Agent(_))) {
+                    self.toggle_agent_focus(cx);
                 }
             }
             "browser-open-workspace" => {
