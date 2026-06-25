@@ -619,16 +619,28 @@ impl ManagedSession {
     /// unarmed channel never emits the marker, and a fence with no marker
     /// coming never clears — discarding every live event forever (the
     /// resume-hang bug).
+    /// Install the (re)spawned channel. Returns the queued prompts that FAILED
+    /// to flush onto the new channel as `(text, reason)` so the caller can
+    /// surface a `PromptRejected` for each — these were optimistically echoed in
+    /// the GUI when the user typed them while the channel was down, so a silent
+    /// drop here is invisible data loss (spec-session-recall-integrity B1/B2: the
+    /// "I see the message, the agent doesn't" bug). Empty on the happy path.
+    #[must_use]
     fn apply_channel_state(
         &mut self,
         mut handle: TransportHandle,
         is_respawn: bool,
         resumed: bool,
-    ) {
+    ) -> Vec<(String, String)> {
         handle.set_permission_mode(self.permission_mode);
+        let mut undelivered: Vec<(String, String)> = Vec::new();
         for text in std::mem::take(&mut self.pending_prompts) {
             if let Err(e) = handle.send(&text) {
-                tracing::error!(error = %e, "failed to flush queued prompt");
+                tracing::error!(error = %e, "queued prompt failed to flush — notifying submitter");
+                undelivered.push((
+                    text,
+                    format!("queued message was not delivered on reconnect: {e}"),
+                ));
             }
         }
         let acp_session_id = handle.session_id();
@@ -692,6 +704,7 @@ impl ManagedSession {
             session_id: self.id.clone(),
             acp_session_id,
         });
+        undelivered
     }
 }
 
@@ -1172,18 +1185,34 @@ impl Manager {
                 resumed,
                 reply,
             } => {
-                let published = match self.sessions.get_mut(&sid) {
+                let (published, undelivered) = match self.sessions.get_mut(&sid) {
                     Some(s) => {
-                        s.apply_channel_state(handle, is_respawn, resumed);
-                        Some((
-                            s.channel_generation,
-                            s.gen_watch.subscribe(),
-                            s.replay_fence,
-                            s.turns,
-                        ))
+                        let undelivered = s.apply_channel_state(handle, is_respawn, resumed);
+                        (
+                            Some((
+                                s.channel_generation,
+                                s.gen_watch.subscribe(),
+                                s.replay_fence,
+                                s.turns,
+                            )),
+                            undelivered,
+                        )
                     }
-                    None => None,
+                    None => (None, Vec::new()),
                 };
+                // Queued prompts that failed to flush onto the (re)spawned channel
+                // were optimistically echoed in the GUI — surface each as a
+                // transient `PromptRejected` (the manager broadcast reaches the
+                // session's subscribers) so the user learns it didn't land and
+                // gets the text back, instead of silent data loss
+                // (spec-session-recall-integrity B1/B2).
+                for (text, reason) in undelivered {
+                    let _ = self.events.send(Notification::PromptRejected {
+                        session_id: sid.clone(),
+                        reason,
+                        text,
+                    });
+                }
                 let _ = reply.send(published);
             }
             Command::SpawnFailed { sid, reason } => {
