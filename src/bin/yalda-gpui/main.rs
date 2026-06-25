@@ -1130,6 +1130,14 @@ struct EditState {
     /// `cursor_line` — without the column here that move never re-revealed and
     /// the caret drifted off the bottom of the wrapped rows.
     last_cursor_anchor: Option<(u64, usize, usize)>,
+    /// Per-line WordProcessor typographic kinds, cached on `edit_seq` (mirrors
+    /// `lines_cache`). `classify_wp_line` is folded over the WHOLE buffer; without
+    /// this the WP render re-scanned every line on every idle frame (cursor blink,
+    /// selection, theme/scroll, cross-tile notify). Now only an edit recomputes;
+    /// idle frames reuse the `Rc` (O(changed), not O(document)).
+    wp_kinds_cache: std::rc::Rc<Vec<WpLineKind>>,
+    /// `edit_seq` the `wp_kinds_cache` was built at; `u64::MAX` = never built.
+    wp_kinds_cache_seq: u64,
     /// Set after `r` in normal mode: the *next* keypress is consumed as the
     /// replacement character (vim `r{char}`) rather than a normal-mode action.
     /// Cleared after that next key (Esc / non-char cancels).
@@ -1153,7 +1161,35 @@ impl EditState {
             list: ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(256.0)),
             last_cursor_anchor: None,
             pending_replace: false,
+            wp_kinds_cache: std::rc::Rc::new(Vec::new()),
+            wp_kinds_cache_seq: u64::MAX,
         }
+    }
+
+    /// Per-line WordProcessor typographic kinds, cached on `edit_seq` (mirrors
+    /// `highlight_snapshot`/`lines_cache`). `classify_wp_line` carries fence
+    /// state so it must be folded in order over the whole buffer; this makes that
+    /// fold run once per edit instead of once per frame, so idle frames (cursor
+    /// blink, selection, scroll, theme, cross-tile notify) reuse the `Rc`.
+    fn wp_kinds_snapshot(
+        &mut self,
+        lines: &std::rc::Rc<Vec<String>>,
+        edit_seq: u64,
+    ) -> std::rc::Rc<Vec<WpLineKind>> {
+        if self.wp_kinds_cache_seq != edit_seq {
+            let mut kinds = Vec::with_capacity(lines.len());
+            let mut in_fence = false;
+            for line_str in lines.iter() {
+                let kind = classify_wp_line(line_str, in_fence);
+                if matches!(kind, WpLineKind::CodeFence) {
+                    in_fence = !in_fence;
+                }
+                kinds.push(kind);
+            }
+            self.wp_kinds_cache = std::rc::Rc::new(kinds);
+            self.wp_kinds_cache_seq = edit_seq;
+        }
+        self.wp_kinds_cache.clone()
     }
 
     /// Extract + highlight the buffer's source lines incrementally. Returns the
