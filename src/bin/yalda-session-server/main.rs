@@ -2377,6 +2377,14 @@ async fn main() -> io::Result<()> {
         )
         .init();
 
+    // Reap ACP adapters orphaned by a previously crashed/killed yalda (parent
+    // reparented to PID 1) before doing anything else — graceful exits already
+    // reap via kill_on_drop; this catches the SIGKILL/panic path.
+    let reaped = yalda::acp_channel::reap_orphaned_adapters();
+    if reaped > 0 {
+        tracing::info!("reaped {reaped} orphaned ACP adapter process(es) at startup");
+    }
+
     // Relocate any state written by older builds under <cache_dir>/yalda into
     // the durable `~/.yalda` home (ADR-0018), BEFORE the WAL dir is read below.
     // One-time, idempotent, best-effort.

@@ -388,6 +388,68 @@ fn allow_tool_kind(mode: PermissionMode, kind: ToolKind) -> bool {
 /// rather than silently launch a worse agent.
 pub const DEFAULT_AGENT_FALLBACKS: &[&str] = &["claude-agent-acp"];
 
+/// Command-name needles identifying an ACP adapter subprocess, for the
+/// orphan reaper. Covers the current binary + the legacy one.
+pub const ADAPTER_PROCESS_NEEDLES: &[&str] = &["claude-agent-acp", "claude-code-acp"];
+
+/// Parse `ps -axo pid=,ppid=,command=` output and return the PIDs of ORPHANED
+/// ACP adapter processes — those whose parent is PID 1 (the spawner died and the
+/// kernel reparented them) AND whose command matches an adapter needle. Pure +
+/// testable: the side-effecting reaper feeds it real `ps` output.
+///
+/// `ppid == 1` is the safety property: an orphan has no live yalda owning it, so
+/// killing it can never touch a running session's adapter. (A live adapter's
+/// parent is its yalda-gpui / yalda-session-server process, never 1.)
+pub fn orphaned_adapter_pids(ps_output: &str, needles: &[&str]) -> Vec<i32> {
+    let mut pids = Vec::new();
+    for line in ps_output.lines() {
+        let mut it = line.split_whitespace();
+        let pid = it.next().and_then(|s| s.parse::<i32>().ok());
+        let ppid = it.next().and_then(|s| s.parse::<i32>().ok());
+        let (Some(pid), Some(ppid)) = (pid, ppid) else {
+            continue;
+        };
+        if ppid != 1 || pid <= 1 {
+            continue;
+        }
+        if needles.iter().any(|n| line.contains(n)) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Best-effort startup reaper: SIGKILL ACP adapter subprocesses orphaned by a
+/// crashed/killed parent (a graceful exit already reaps them via
+/// `kill_on_drop`; a SIGKILL/panic does not, leaving the adapter reparented to
+/// PID 1 — the observed ~70-adapter accumulation). Call once at the start of
+/// `main()` in both binaries. Unix-only; a no-op (returns 0) elsewhere or if
+/// `ps` is unavailable. Returns the number killed.
+#[cfg(unix)]
+pub fn reap_orphaned_adapters() -> usize {
+    let output = match std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return 0,
+    };
+    let text = String::from_utf8_lossy(&output);
+    let pids = orphaned_adapter_pids(&text, ADAPTER_PROCESS_NEEDLES);
+    for &pid in &pids {
+        // SAFETY: a plain kill(2) syscall with a validated positive pid.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    pids.len()
+}
+
+#[cfg(not(unix))]
+pub fn reap_orphaned_adapters() -> usize {
+    0
+}
+
 /// How long to wait for `session/load` (resume) before giving up and spawning a
 /// fresh `session/new`. `session/load` returns only AFTER the agent re-emits the
 /// session's ENTIRE prior conversation as `session/update` notifications, so a
@@ -2065,6 +2127,27 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::process::Stdio;
+
+    /// The orphan reaper only targets adapters whose parent is PID 1 (the spawner
+    /// died) AND whose command matches an adapter needle — so it can never kill a
+    /// live session's adapter (ppid != 1) or an unrelated process.
+    #[test]
+    fn orphaned_adapter_pids_targets_only_reparented_adapters() {
+        let ps = "\
+  4321     1 node /opt/homebrew/bin/claude-agent-acp --stdio
+  4400  4321 node (child of a live adapter, not an orphan)
+  5555     1 node /usr/local/bin/claude-code-acp
+  6000     1 /Applications/Foo.app/Contents/MacOS/Foo
+  7000  2999 node /opt/homebrew/bin/claude-agent-acp --stdio
+     1     0 /sbin/launchd";
+        let pids = orphaned_adapter_pids(ps, ADAPTER_PROCESS_NEEDLES);
+        // 4321 (agent-acp, ppid 1) and 5555 (code-acp, ppid 1) only.
+        assert_eq!(pids, vec![4321, 5555]);
+        // 7000 is an adapter but owned (ppid 2999) → never killed.
+        assert!(!pids.contains(&7000), "a live (owned) adapter must be spared");
+        // 6000 is orphaned but not an adapter → never killed.
+        assert!(!pids.contains(&6000), "a non-adapter orphan must be spared");
+    }
 
     /// The escalation contract: explicit Yolo DOES allow shell execution.
     /// The default is now Yolo (config-overridable), so this also pins the

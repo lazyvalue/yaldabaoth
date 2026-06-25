@@ -70,12 +70,12 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   render-flat); `finish_replay` snaps the caret to the editable tail on reopen.
   Human check: a `--release` `sample` holding `j` in a huge worksheet to confirm
   the per-nav S1 rebuild is imperceptible.
-- **Worksheet ticket-001 remaining (deferred deep)** — `DEFERRED` (reasoned,
-  2026-06-22). **floor-only-EOF**: `agent_tail_floor_char` only protects the
-  EOF tail, so a draft wedged between two frozen blocks can be overwritten by a
-  stream — edge case, not in the live report, fix touches the delicate
-  `append_llm_chunk_floored` path. (The `view_model_fingerprint` item is now
-  FIXED — see the entry above.)
+- **Worksheet ticket-001 remaining (deferred deep)** — `SUPERSEDED by Model C`
+  (2026-06-24, ADR-0024). The **floor-only-EOF** edge case no longer exists: the
+  user draft lives in a separate `Compose` buffer, never in the transcript, so
+  there's no mid-document draft for a stream to overwrite; `agent_tail_floor_char`
+  always returns EOF and the `append_llm_chunk_floored` path is inert. Pinned by
+  `inv_order_*`. Ticket closed.
 - **Mid-turn message drops (lease gate + invisible rejection)** — `FIXED`
   (2026-06-09, `b7bdcde` on master); `NEEDS-RUNTIME` for the GUI
   PromptRejected surfacing (notice + chatbox restore — headless tests cover
@@ -105,14 +105,13 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   (debug). Identity/INV-10/probe tests in the gpui tests mod.
   Left open (minor): tag-bar `all_tags()` walk + per-leaf `mark_for_window()`
   scan per frame (new in 09e266b, small constants).
-- **Theme switch leaves agent transcript caches stale** — `READY` (found
-  during the perf fix, pre-existing). `set_theme` re-renders Doc layouts only;
-  the agent tile's S1 fingerprint, highlight cache, and block parses (which
-  bake theme colors) are never invalidated, so a live theme switch keeps old
-  colors in the transcript until the next edit/chunk — and block parses now
-  persist even harder (content-keyed). Fix: clear/reseed agent caches (or
-  fold a theme id into `view_model_fp` + `block_content_hash`) in
-  `set_theme`.
+- **Theme switch leaves agent transcript caches stale** — `FIXED` (2026-06-12,
+  `91a6885`; re-confirmed 2026-06-25). `set_theme` calls
+  `AgentViewModel::invalidate_theme()` (clears `block_cache` +
+  `block_cache_frozen_fp` + `view_model_fp`) for every live session, rebuilds the
+  edit-view syntect highlighter, and busts every transcript view via
+  `notify_transcript_views`. The READY entry was stale; the fix landed right after
+  it was filed.
 
 - **Resume hang (replay fence never cleared)** — `FIXED` (2026-06-09,
   `9112188` on master). After a server restart, a recovered session's pump
@@ -128,11 +127,15 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   `recovered_session_is_drivable_after_resume` (red pre-fix, green post-fix).
   Residual hazard noted in code: a timed-out `session/load`'s late replay
   notifications can record as live events (bounded duplication, not a wedge).
-- **Leaked `claude-code-acp` adapter processes** — `READY`. ~70 idle adapter
-  processes observed (2026-06-09) dating back 2 weeks, surviving their parent
-  yalda/server exits. Something on the teardown path (GUI direct-spawn drops?
-  server crash-kills?) doesn't kill the child. Inventory: `pgrep -fl
-  claude-code-acp`. Needs a teardown audit + maybe a startup reaper.
+- **Leaked `claude-code-acp` adapter processes** — `FIXED` (2026-06-25,
+  `fd858d7`). Graceful exits already reap via `kill_on_drop`; the leak was the
+  crash/SIGKILL/panic path where Drop never runs and the adapter reparents to
+  PID 1. Fix: a startup reaper in both binaries' `main()`
+  (`acp_channel::reap_orphaned_adapters`) SIGKILLs adapter processes with
+  `ppid == 1` (definitively orphaned — can't hit a live session's adapter) whose
+  command matches an adapter needle. Pure parser `orphaned_adapter_pids` is
+  unit-tested. (A deeper per-close pump-join was considered unnecessary — the
+  graceful path already reaps; the reaper covers the rest.)
 - **Reconnect bursts at GUI launch** — `NEEDS-RUNTIME` (probable root cause
   fixed 2026-06-10, `3f85365`). The shared server pump was stored in an agent
   SLOT; every slot-state replacement during startup (restore → re-bootstrap →
@@ -148,11 +151,14 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   (`d32edf9`); then full-parse-per-keystroke was slow → proper incremental
   reparse, fuzz-guarded, 10–20× faster (`413da19`). See worklog
   `2026-06-06-reparse-segfault-and-incremental.md`.
-- **Reparse may be wasted work** — `READY` (small). The adversarial verifier
-  noted the tree-sitter tree might be consumed "only in tests, not GPUI
-  rendering." If true, the per-keystroke `reparse` could be made lazy/skipped
-  for an even bigger win. Quick code-read, no runtime needed. (Incremental
-  reparse already cut the cost 10–20×, so lower priority now.)
+- **Reparse may be wasted work** — `CONFIRMED + READY` (verified 2026-06-25).
+  The tree-sitter tree (`tree_state` / `block_boundaries`) is consumed ONLY
+  inside `tree.rs` + `editor.rs` + tests — nothing in the GPUI render path reads
+  it. So the per-edit `reparse` (editor.rs:1029/1065/1136/1169/1197) maintains a
+  tree the live app never renders from. Making it lazy/skippable would remove
+  that cost. NOT done here: it touches the editor hot path and the incremental
+  reparse already cut the cost 10–20×, so low priority — but the premise is now
+  confirmed, not speculative.
 
 - **Session-server reconnect storm** — `ROOT-CAUSED + FIXED on branch
   session-resilience` (2026-06-07); `NEEDS-RUNTIME` for the GUI reconnect path.

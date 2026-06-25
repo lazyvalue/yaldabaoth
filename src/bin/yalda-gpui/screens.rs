@@ -590,22 +590,12 @@ impl YaldaGpuiView {
         // Incremental highlight: only changed lines are re-tokenized; unchanged
         // frames recompute zero. `lines_rc`/`hl_snap` are cheap Rc clones.
         let (lines_rc, hl_snap) = e.highlight_snapshot(&self.theme, &self.syntect_hl);
-        let line_count = lines_rc.len();
 
-        // Per-line typographic kind. `classify_wp_line` carries a running fence
-        // state, so it must be folded over the buffer in order — but it's a
-        // cheap byte scan (no highlighting), and precomputing it lets the
-        // virtualized render closure index any visible line directly. Cheaper
-        // than the per-row *element layout* the list now skips.
-        let mut kinds: Vec<WpLineKind> = Vec::with_capacity(line_count);
-        let mut in_fence = false;
-        for line_str in lines_rc.iter() {
-            let kind = classify_wp_line(line_str, in_fence);
-            if matches!(kind, WpLineKind::CodeFence) {
-                in_fence = !in_fence;
-            }
-            kinds.push(kind);
-        }
+        // Per-line typographic kind, cached on `edit_seq` (012): the fold runs
+        // once per edit, not once per frame, so idle frames (cursor blink,
+        // selection, scroll, theme, cross-tile notify) recompute zero. The
+        // virtualized render closure indexes any visible line off the `Rc`.
+        let kinds = e.wp_kinds_snapshot(&lines_rc, edit_seq);
 
         // Reconcile by splicing the changed range (mirrors the Code view); never
         // `reset()`, which would snap the viewport to the top on newline edits.

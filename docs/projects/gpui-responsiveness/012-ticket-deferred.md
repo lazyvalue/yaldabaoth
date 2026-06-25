@@ -5,10 +5,10 @@ reasons). Each is build+test gated; none need the `CachedPanel` helper.
 
 ## Subtasks
 
-- [ ] **WP-classify cache.** `render_edit` WordProcessor runs `classify_wp_line`
-      over the whole document every render (~`screens.rs:592`). Cache the
-      resulting `Vec` on `EditState` keyed by `edit_seq`. Deferred from 010
-      because `EditState` lives in `main.rs` (was outside that unit's file scope).
+- [x] **WP-classify cache.** DONE (2026-06-25, `4b025f8`). `EditState::
+      wp_kinds_snapshot` caches the `Vec<WpLineKind>` keyed by `edit_seq` (mirrors
+      `lines_cache`/`highlight_snapshot`); `render_edit` reads it. Idle frames now
+      recompute zero instead of O(document).
 - [ ] **Browser filter debounce + background walk** (audit #2). Each filter
       keystroke runs a synchronous recursive `fs::read_dir`/`metadata` walk
       (depth 8, 200 cap) on the input thread (`file_browser.rs` `rebuild_filtered`
