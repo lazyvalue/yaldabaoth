@@ -116,10 +116,11 @@ The three remaining gaps (what `NEEDS-RUNTIME` actually means now):
    in-process fakes; the missing wire is the GUI's real `SessionServerClient`
    against an in-process fake server+agent, so submit→stream→reduce→render runs
    for real. This retires the largest batch of `NEEDS-RUNTIME` flags.
-3. **Wall-clock perf as a gate.** Render *count* is in CI, but it's a proxy and
-   debug masks wins — real latency is still a human `sample --release`. Close it
-   with a `--release` criterion bench over a realistic transcript as a threshold
-   gate (not small-N).
+3. **Wall-clock perf as a gate.** PARTIALLY CLOSED (2026-06-25). `benches/render_bench.rs`
+   (criterion) measures the lib render + highlight hot paths over a realistic doc,
+   optimized — `cargo bench --bench render_bench`. The measurement + criterion's
+   regression report exist; wiring a CI `--save-baseline`/`--baseline` threshold to
+   fail on regression is the remaining step. See `docs/projects/headless-e2e/`.
 
 Recommended order: (2) in-process loop first (retires the most flags, the seam
 already exists server-side) → (1) element-tree snapshots → (3) perf gate.
