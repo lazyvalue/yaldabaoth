@@ -1150,6 +1150,64 @@ fn chatbox_turn_end_leaves_caret_put() {
     );
 }
 
+/// INV-UX-2 (spec-ux-invariants.md): the compose word-wraps. `wrap_line_cols`
+/// partitions a line into ≤width visual rows, breaking at spaces, hard-breaking
+/// over-long words, covering EVERY char (so the caret is addressable everywhere),
+/// always ≥1 row.
+#[test]
+fn wrap_line_cols_word_wraps_and_covers_every_char() {
+    let w = |s: &str, width: usize| -> Vec<String> {
+        let chars: Vec<char> = s.chars().collect();
+        wrap_line_cols(&chars, width)
+            .into_iter()
+            .map(|(a, b)| chars[a..b].iter().collect())
+            .collect()
+    };
+
+    // Empty line → exactly one (empty) row so the caret has a row to sit on.
+    assert_eq!(w("", 10), vec![""]);
+    // Fits within width → single row.
+    assert_eq!(w("hello", 10), vec!["hello"]);
+    // Breaks at spaces (the trailing space stays on its row).
+    assert_eq!(w("the quick brown", 9), vec!["the ", "quick ", "brown"]);
+    // A word longer than the width is hard-broken at the column limit.
+    assert_eq!(w("abcdefgh", 3), vec!["abc", "def", "gh"]);
+    // width 1 still makes progress (no infinite loop).
+    assert_eq!(w("ab", 1), vec!["a", "b"]);
+
+    // Coverage: every wrapped row is contiguous and the rows tile the line.
+    for (s, width) in [("the quick brown fox jumped", 7), ("loooooong", 3), ("a b c", 1)] {
+        let chars: Vec<char> = s.chars().collect();
+        let rows = wrap_line_cols(&chars, width);
+        assert_eq!(rows.first().unwrap().0, 0, "first row starts at 0");
+        assert_eq!(rows.last().unwrap().1, chars.len(), "last row ends at EOL");
+        for pair in rows.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "rows are contiguous (no dropped char)");
+        }
+        for &(a, b) in &rows {
+            assert!(b > a || chars.is_empty(), "each row makes progress");
+            assert!(b - a <= width.max(1), "no row exceeds the wrap width");
+        }
+    }
+}
+
+/// INV-UX-1 over the wrapped compose: the caret resolves to the single visual row
+/// holding its column; a row-boundary column belongs to the NEXT row; end-of-line
+/// sits on the last row — so the caret is always on a rendered row (never lost).
+#[test]
+fn caret_visual_row_places_caret_on_a_rendered_row() {
+    let chars: Vec<char> = "the quick brown".chars().collect();
+    let rows = wrap_line_cols(&chars, 9); // [(0,4),(4,10),(10,15)]
+    assert_eq!(caret_visual_row(&rows, 0), 0, "col 0 → first row");
+    assert_eq!(caret_visual_row(&rows, 3), 0, "mid first row");
+    assert_eq!(caret_visual_row(&rows, 4), 1, "row-boundary col → next row's start");
+    assert_eq!(caret_visual_row(&rows, 10), 2, "next boundary → third row");
+    assert_eq!(caret_visual_row(&rows, 15), 2, "end-of-line → last row");
+
+    // Empty line: the sole row holds the caret.
+    assert_eq!(caret_visual_row(&wrap_line_cols(&[], 10), 0), 0);
+}
+
 /// THE permanent guard against the 15×-recurring "chatbox caret/text scrolls
 /// off-screen" bug (spec-chatbox-caret-containment.md Constraint 4): drive a real
 /// `Chatbox` editor through every Behavior-7 edit path and, after each, assert

@@ -60,12 +60,11 @@ worksheet caret-below-buffer bug; the streaming caret-drift bug).
   `splice_delete` cursor-shift discipline).
 - A pending-reveal latch re-renders so the reveal is consumed on the next frame.
 
-**Status:** `partial` → `honored` for the vertical axis on all surfaces; the
-compose box additionally satisfies the horizontal axis by **scrolling**
-horizontally. NOTE the tension with INV-UX-2: where INV-UX-2 applies (the agent
-compose), there are no long unwrapped lines to scroll horizontally, so the two
-invariants must be made consistent (wrap ⇒ the horizontal-scroll half of
-caret-containment is moot for that surface).
+**Status:** `honored` — vertical caret containment on all surfaces. The agent
+compose no longer needs the horizontal axis at all: it **word-wraps** (INV-UX-2),
+so the caret is always on a rendered visual row and there are no off-screen-right
+columns. Other monospace surfaces that still scroll horizontally keep the
+`compute_window` horizontal half.
 
 **Enforcement.** Headless: the caret-containment guards
 (`chatbox_caret_cell_stays_in_window_for_every_edit_path`), the worksheet
@@ -85,22 +84,28 @@ to read it; a long line flows onto the next visual row.
 unreadable and you lose sight of what you wrote. Wrapping keeps the whole draft
 visible.
 
-**Status:** `target` — **NOT yet conformant.** The current compose renders via
-`build_chatbox_line` with `left_col`/`visible_cols` **slicing + horizontal
-scroll** (`spec-chatbox-caret-containment.md`, horizontal axis). That design
-satisfies INV-UX-1's horizontal half by scrolling, which this invariant
-supersedes for the compose: the compose should WRAP, not scroll horizontally.
-Reconciling these (wrap the compose; retire its horizontal-scroll window; keep
-the vertical caret-containment) is the open work to close this gap.
+**Status:** `honored` (runtime-unverified for paint, per the GPUI headless gap).
+The compose **word-wraps**: `wrap_line_cols` (agent.rs) partitions each logical
+line into ≤width visual rows at space boundaries (over-long words hard-break),
+covering every char; `build_chatbox_wrapped_line` renders one visual row per
+segment via `build_chatbox_line` (each row sliced to exactly its segment ⇒ no
+clip, no horizontal scroll), with the caret on the row `caret_visual_row` picks.
+The small/virtualized decision keys on TOTAL VISUAL rows so a long wrapped line
+can't overflow the un-scrolled small box. This **retired the compose's
+horizontal-scroll window** (`spec-chatbox-caret-containment.md` horizontal axis);
+the vertical caret-containment is kept.
 
-**Enforcement.** Once implemented: a headless test that a compose line longer than
-the measured width produces >1 visual row (no horizontal clip). Runtime: type a
-long line in both placements and confirm it wraps.
+**Enforcement.** Headless: `wrap_line_cols_word_wraps_and_covers_every_char`
+(wraps, hard-breaks, covers every char, ≥1 row, makes progress) +
+`caret_visual_row_places_caret_on_a_rendered_row` (caret always on a rendered
+row). Runtime (GPUI paint not headless): type a line wider than the box in both
+placements and confirm it wraps with the caret visible.
 
 ## Cross-references
 
-- `spec-chatbox-caret-containment.md` — the compose caret window (and the
-  horizontal-scroll behavior INV-UX-2 supersedes).
+- `spec-chatbox-caret-containment.md` — the compose caret window. Its VERTICAL
+  axis still governs the compose; its HORIZONTAL axis is RETIRED for the compose
+  (superseded by INV-UX-2 word-wrap).
 - `spec-agent-presentation.md` / `spec-agent-render-pipeline.md` — the agent
   render path + `TranscriptSeqs` fingerprint discipline (every render input
   covered, never notify in render) that keeps caret state from going stale.
@@ -111,6 +116,11 @@ long line in both placements and confirm it wraps.
 
 ## Revision history
 
+- 2026-06-25 (2) — INV-UX-2 implemented → `honored`: the compose word-wraps
+  (`wrap_line_cols` / `build_chatbox_wrapped_line`), retiring its horizontal-scroll
+  window; INV-UX-1's compose horizontal half is now moot. Tests
+  `wrap_line_cols_word_wraps_and_covers_every_char` +
+  `caret_visual_row_places_caret_on_a_rendered_row`.
 - 2026-06-25 — Created. INV-UX-1 (cursor always visible + tracks text;
   `partial`/`honored`), INV-UX-2 (agent compose word-wraps; `target` — chatbox
   currently horizontal-scrolls, a known gap).

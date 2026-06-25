@@ -1289,6 +1289,105 @@ pub(crate) fn build_chatbox_line(
     row.into_any_element()
 }
 
+/// Word-wrap a (tab-expanded) monospace line into visual-row char ranges of at
+/// most `width` columns each (INV-UX-2). Breaks at the last space strictly inside
+/// `[start, start+width)`; a word longer than `width` is hard-broken at the limit.
+/// Returns half-open `[start, end)` ranges over the line covering EVERY char
+/// (nothing dropped — the caret must be addressable at every column), always ≥1
+/// row (an empty line → one `(0, 0)` row). `width == 0` is treated as 1.
+///
+/// Computed here (not in GPUI layout) because the compose is monospace and the
+/// box width in columns is known — so the caret's visual row/col stay exactly
+/// known (view-owns-its-coordinates), and INV-UX-1 holds without measuring the
+/// painted text. This supersedes the horizontal-scroll window the compose used
+/// (`spec-chatbox-caret-containment.md`): wrapped text never needs to scroll
+/// sideways.
+pub(crate) fn wrap_line_cols(line: &[char], width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let n = line.len();
+    if n == 0 {
+        return vec![(0, 0)];
+    }
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while start < n {
+        if n - start <= width {
+            rows.push((start, n));
+            break;
+        }
+        let hard = start + width;
+        // Last space strictly inside (start, hard): break AFTER it so the space
+        // trails this row and the next row begins at real content. None ⇒ a word
+        // longer than the row, hard-break at the column limit.
+        let mut end = hard;
+        for j in (start + 1..hard).rev() {
+            if line[j] == ' ' {
+                end = j + 1;
+                break;
+            }
+        }
+        rows.push((start, end));
+        start = end;
+    }
+    rows
+}
+
+/// The index of the visual row (`wrap_line_cols` output) the caret sits on for
+/// `cursor_col`. A column on a row boundary belongs to the NEXT row's start; a
+/// caret at end-of-line sits on the last row.
+pub(crate) fn caret_visual_row(rows: &[(usize, usize)], cursor_col: usize) -> usize {
+    for (i, &(rs, re)) in rows.iter().enumerate() {
+        if cursor_col >= rs && cursor_col < re {
+            return i;
+        }
+    }
+    rows.len().saturating_sub(1)
+}
+
+/// Render one LOGICAL compose line as a column of wrapped visual rows (INV-UX-2).
+/// Each visual row is drawn by [`build_chatbox_line`] over exactly its own char
+/// range, so nothing is clipped and no horizontal scroll is needed; the caret is
+/// placed on the single visual row that holds `cursor_col`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_chatbox_wrapped_line(
+    full_text: &str,
+    is_cursor_line: bool,
+    cursor_col: usize,
+    mode: EditMode,
+    cursor_color: Hsla,
+    sel: Option<((usize, usize), (usize, usize))>,
+    line_idx: usize,
+    code_font: &SharedString,
+    text_color: Hsla,
+    selection_bg: Hsla,
+    wrap_cols: usize,
+) -> AnyElement {
+    let chars: Vec<char> = full_text.chars().collect();
+    let total_chars = chars.len();
+    let rows = wrap_line_cols(&chars, wrap_cols);
+    let caret_row = is_cursor_line.then(|| caret_visual_row(&rows, cursor_col));
+
+    let mut col = div().flex().flex_col().w_full().min_w_0();
+    for (r, &(rs, re)) in rows.iter().enumerate() {
+        col = col.child(build_chatbox_line(
+            full_text,
+            caret_row == Some(r),
+            cursor_col,
+            mode,
+            cursor_color,
+            sel,
+            line_idx,
+            total_chars,
+            code_font,
+            text_color,
+            selection_bg,
+            rs,        // left_col = this visual row's start
+            re - rs,   // visible_cols = this row's exact width (no clip, no scroll)
+        ));
+    }
+    col.into_any_element()
+}
+
 /// Wire a `ListState`'s scroll handler to update the shared `follow_output`
 /// flag. When the user scrolls up (`is_scrolled == true`), follow is disabled.
 /// When they scroll back to the bottom (`is_scrolled == false`), it re-enables.

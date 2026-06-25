@@ -1237,26 +1237,35 @@ impl YaldaGpuiView {
                 4096
             };
             let win = tb.compute_window(COMPOSE_MAX_VISIBLE_LINES, visible_cols);
-            let left_col = win.left_col;
             let compose_bounds_sink = tb.bounds.clone();
 
-            let compose_body: AnyElement = if line_count <= COMPOSE_MAX_VISIBLE_LINES {
-                // ── Small draft: render every line directly. Everything fits
-                //    vertically (line_count ≤ visible_rows ⇒ win.top_line == 0),
-                //    so no vertical scroll; horizontal scroll is per-line. ──
-                let compose_lines: Vec<String> = {
-                    let doc = tb.editor.document();
+            // All logical lines, tab-expanded. INV-UX-2: each WORD-WRAPS to rows
+            // of ≤ `visible_cols` columns (no horizontal scroll). The small vs
+            // virtualized decision is on TOTAL VISUAL rows so one long wrapped
+            // line can't overflow the un-scrolled small box and hide the caret
+            // (INV-UX-1).
+            let compose_lines: std::rc::Rc<Vec<String>> = {
+                let doc = tb.editor.document();
+                std::rc::Rc::new(
                     (0..line_count)
                         .map(|i| {
                             doc.line_text(i).trim_end_matches('\n').replace('\t', "    ")
                         })
-                        .collect()
-                };
+                        .collect(),
+                )
+            };
+            let visual_rows_total: usize = compose_lines
+                .iter()
+                .map(|l| wrap_line_cols(&l.chars().collect::<Vec<_>>(), visible_cols).len())
+                .sum();
+
+            let compose_body: AnyElement = if visual_rows_total <= COMPOSE_MAX_VISIBLE_LINES {
+                // ── Small draft: render every (wrapped) line directly. Total
+                //    visual rows ≤ cap ⇒ fits the box height with no scroll. ──
                 let min_compose_h = line_h + 16.0;
                 let mut inner = div().w_full().min_w_0().flex().flex_col();
                 for (i, line_text) in compose_lines.iter().enumerate() {
-                    let total_chars = line_text.chars().count();
-                    inner = inner.child(build_chatbox_line(
+                    inner = inner.child(build_chatbox_wrapped_line(
                         line_text,
                         i == compose_cursor_line,
                         compose_cursor_col,
@@ -1264,11 +1273,9 @@ impl YaldaGpuiView {
                         compose_cursor_color,
                         compose_sel,
                         i,
-                        total_chars,
                         &compose_code_font,
                         compose_fg,
                         compose_selection_bg,
-                        left_col,
                         visible_cols,
                     ));
                 }
@@ -1303,19 +1310,10 @@ impl YaldaGpuiView {
                     })
                     .into_any_element()
             } else {
-                // ── Long draft: virtualise. Fixed 8-line height; `gpui::list`
-                //    (default, visible-only sizing) builds ONLY the visible
-                //    rows, so per-keystroke cost is O(visible), not O(draft). ──
-                let lines_snap: std::rc::Rc<Vec<String>> = {
-                    let doc = tb.editor.document();
-                    std::rc::Rc::new(
-                        (0..line_count)
-                            .map(|i| {
-                                doc.line_text(i).trim_end_matches('\n').replace('\t', "    ")
-                            })
-                            .collect(),
-                    )
-                };
+                // ── Long draft: virtualise. `gpui::list` builds ONLY the visible
+                //    items (one per LOGICAL line, each a wrapped column of visual
+                //    rows), so per-keystroke cost is O(visible), not O(draft). ──
+                let lines_snap = compose_lines.clone();
                 // Splice the changed range (never `reset()`, which snaps the box
                 // to its top on every newline).
                 let compose_edit_seq = tb.editor.document().edit_seq();
@@ -1340,8 +1338,7 @@ impl YaldaGpuiView {
                         let Some(line_text) = lines_snap.get(idx) else {
                             return div().into_any_element();
                         };
-                        let total_chars = line_text.chars().count();
-                        build_chatbox_line(
+                        build_chatbox_wrapped_line(
                             line_text,
                             idx == compose_cursor_line,
                             compose_cursor_col,
@@ -1349,11 +1346,9 @@ impl YaldaGpuiView {
                             cur_color,
                             compose_sel,
                             idx,
-                            total_chars,
                             &font,
                             fg,
                             sel_bg,
-                            left_col,
                             visible_cols,
                         )
                     };
