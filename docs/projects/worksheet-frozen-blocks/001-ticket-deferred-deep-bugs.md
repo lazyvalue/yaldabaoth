@@ -41,13 +41,13 @@ separately-tested fixes.
   so it survives) instead of resetting — only delete-consumed anchors drop. Test
   `undo_preserves_frozen_line_metadata` (`editor.rs`).
 
-- [ ] **Floor only covers EOF tail.** `agent_tail_floor_char` walks up from EOF
-  and stops at the first frozen/tagged line, so a user draft *between* two frozen
-  blocks is invisible and a streamed chunk can land below/inside it. Fix: protect
-  every editable region the turn's insertion point could fall into (or make the
-  splice anchor-relative to the turn's own frozen lines). **NOT fixed yet —**
-  edge case (mid-document draft + live stream), not in the live report; the fix
-  touches the delicate `append_llm_chunk_floored` path so it needs its own repro.
+- [x] **Floor only covers EOF tail — SUPERSEDED by Model C** (2026-06-24,
+  ADR-0024). The whole class is gone: under Model C the user draft lives in a
+  SEPARATE `Compose` buffer, never in the transcript, so there is no
+  "draft between two frozen blocks" for a stream to land in. `agent_tail_floor_char`
+  now always returns EOF (no untagged user text in the transcript) and streaming
+  appends at the bottom — pinned by `inv_order_*`. No floor fix needed; the
+  fragile `append_llm_chunk_floored` path is inert.
 
 - [x] **`view_model_fingerprint` excludes cursor + `edit_seq` — FIXED**
   (2026-06-22). The memoized flat build's blank-collapse `protect_line` is
