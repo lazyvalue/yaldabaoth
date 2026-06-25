@@ -238,8 +238,6 @@ impl TranscriptView {
         let dim_fg: Hsla = nc(at_snap.dim);
         let frozen_bar: Hsla = nc(at_snap.frozen_bar);
         let user_bar: Hsla = nc(at_snap.user_bar);
-        let claude_turn_bg: Hsla = nc(at_snap.agent_turn_bg);
-        let user_turn_bg: Hsla = nc(at_snap.user_turn_bg);
 
         // Weak handle for the interactive rows' click listeners. Captured here
         // and resolved (with event-time ids) on click — stale-capture-safe.
@@ -524,19 +522,18 @@ impl TranscriptView {
                                 Some(TurnId::System) | None => ("   ".into(), dim_fg),
                             }
                         };
-                        let card_bg: Hsla = match tag {
-                            Some(TurnId::Llm(_)) => claude_turn_bg,
-                            Some(TurnId::User(_)) => user_turn_bg,
-                            Some(TurnId::Tool(_)) | Some(TurnId::System) | None => {
-                                rgba(0x00000000).into()
-                            }
-                        };
+                        // INV-UX-3: agent transcript text sits on the normal
+                        // tile/desktop background — no per-turn card tint. The only
+                        // row background is the transient focus highlight on the
+                        // cursor row, which appears ONLY while the transcript is
+                        // focused for navigation (`cursor_line == usize::MAX`
+                        // otherwise, so no row matches during compose).
                         let row_bg: Hsla = if line_idx == cursor_line {
                             let mut h = nc(at_snap.dim);
                             h.a = 0.2;
                             h
                         } else {
-                            card_bg
+                            rgba(0x00000000).into()
                         };
 
                         div()

@@ -101,6 +101,34 @@ the vertical caret-containment is kept.
 row). Runtime (GPUI paint not headless): type a line wider than the box in both
 placements and confirm it wraps with the caret visible.
 
+### INV-UX-3 — Agent text uses the normal tile/desktop background
+
+**Statement.** Agent transcript text sits on the SAME background as the normal
+yalda desktop / tile — there is no per-turn "card" background tint behind agent
+or user turns. Turns are distinguished by the gutter label, the foreground
+author tint, and the left bar — never by a different background color.
+
+**Applies to.** The agent transcript (`TranscriptView`). The transient
+focused-row highlight (a dim band on the cursor row, shown ONLY while the
+transcript is focused for navigation) is NOT a violation — it's a focus/nav cue,
+not a resting background. Code blocks keep their own background (code styling, not
+a turn card). The compose box keeps its pinned-control affordance.
+
+**Why.** A tinted card per turn makes the transcript read as a separate surface
+floating on the desktop; the agent's text should blend into the tile like every
+other surface, so the workspace looks like one continuous space.
+
+**Status:** `honored` (runtime-unverified for paint). `transcript_view.rs` sets
+`row_bg` to transparent for every committed turn; the per-turn `claude_turn_bg`/
+`user_turn_bg` (theme `agent_turn_bg`/`user_turn_bg`) tints are no longer applied.
+The cursor-row dim highlight remains, gated on transcript focus
+(`cursor_line == usize::MAX` when composing, so no row matches).
+
+**Enforcement.** Runtime (GPUI paint not headless): open an agent tile and
+confirm agent/user turns show no background tint distinct from the tile; the
+focused row highlights only during transcript (`f`) navigation. (A headless guard
+awaits the element-tree-snapshot harness — `docs/projects/headless-e2e/` #3.2.)
+
 ## Cross-references
 
 - `spec-chatbox-caret-containment.md` — the compose caret window. Its VERTICAL
@@ -116,6 +144,9 @@ placements and confirm it wraps with the caret visible.
 
 ## Revision history
 
+- 2026-06-25 (3) — Added INV-UX-3 (agent text uses the tile/desktop background;
+  no per-turn card tint) → `honored`: `transcript_view.rs` `row_bg` transparent
+  for all turns; focus-row highlight retained, gated on transcript focus.
 - 2026-06-25 (2) — INV-UX-2 implemented → `honored`: the compose word-wraps
   (`wrap_line_cols` / `build_chatbox_wrapped_line`), retiring its horizontal-scroll
   window; INV-UX-1's compose horizontal half is now moot. Tests
