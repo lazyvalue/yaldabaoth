@@ -1,11 +1,24 @@
 # Chatbox Caret Containment
 
-**Status:** DRAFT — IMPLEMENTED, runtime-unverified. The design below is built
-(both axes); the headless guards are green. Per the definition of done and the
-15× prior regressions, this is NOT "fixed" until a human runtime check confirms
-it in the live GUI (GPUI paint can't be driven headlessly).
+**Status:** PARTIALLY SUPERSEDED — the **horizontal axis is RETIRED**; the
+**vertical axis remains in force.**
 
-**Last updated:** 2026-06-24
+> **Horizontal axis superseded (2026-06-25).** The compose now **word-wraps**
+> (`spec-ux-invariants.md` INV-UX-2: `wrap_line_cols` /
+> `build_chatbox_wrapped_line`), so there is no off-screen-right text to scroll
+> to and **no horizontal window**. The `left_col` / horizontal `compute_window`
+> half described below is no longer used by the compose render — long lines flow
+> onto the next visual row instead of scrolling sideways. Treat every
+> "horizontal" / `left_col` / `visible_cols`-as-scroll passage below as
+> HISTORICAL. The **vertical** caret-containment (`compute_window`'s `top_line`,
+> the splice-anchored list, no `reset()`) is unchanged and still load-bearing,
+> and `visible_cols` survives only as the **wrap width**.
+>
+> The VERTICAL design below is IMPLEMENTED, runtime-unverified (GPUI paint can't
+> be driven headlessly); per the 15× prior regressions it is not "fixed" until a
+> human runtime check confirms it live.
+
+**Last updated:** 2026-06-25
 
 ## Builds On
 
