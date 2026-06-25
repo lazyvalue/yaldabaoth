@@ -53,6 +53,15 @@ pretty_assertions = "1"
 insta = "1"
 tempfile = "3"
 gpui = { version = "0.2", features = ["test-support"] }
+criterion = "0.5"
+
+# Release-mode perf gate (verification-harness gap #3): markdown render +
+# highlight over a realistic-size document — the lib hot paths the transcript
+# and doc views run. `cargo bench --bench render_bench`. Debug masks wins, so
+# this MUST be measured optimized (criterion builds the bench in release).
+[[bench]]
+name = "render_bench"
+harness = false
 
 [[bin]]
 name = "yalda-channel"
