@@ -3455,6 +3455,14 @@ impl YaldaGpuiView {
             return;
         };
 
+        // Typed `/clear` → yalda's session reset, not a literal prompt to the
+        // agent (which would clear invisibly and let resume read past it). See
+        // the matching note in `submit_chatbox` (spec-session-recall-integrity A2).
+        if prompt_body.trim() == "/clear" {
+            self.clear_agent_session(cx);
+            return;
+        }
+
         // Send FIRST, then freeze the authored lines only on success — mirroring
         // submit_chatbox. The old order computed `last_seen_turns + 1` by hand
         // and froze the lines BEFORE the send check, which (a) bypassed the
@@ -3539,6 +3547,18 @@ impl YaldaGpuiView {
             }
             _ => return,
         };
+
+        // Typed `/clear` is the escape hatch around the `claude-clear` command.
+        // Forwarding the literal text to the agent makes the clear INVISIBLE to
+        // yalda (Claude Code resets its own context with no ACP signal), so on
+        // resume yalda's WAL replays + reloads the pre-`/clear` context. Route a
+        // typed `/clear` to yalda's own session reset instead — it mints a NEW
+        // server session, a durable boundary resume cannot cross
+        // (spec-session-recall-integrity A2).
+        if text.trim() == "/clear" {
+            self.clear_agent_session(cx);
+            return;
+        }
 
         // Send FIRST, then freeze the optimistic echo only on success. Freezing
         // before the send could leave a "phantom" user turn in the transcript
