@@ -7076,6 +7076,10 @@ fn register_keymap(app: &mut GpuiApp) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Reap ACP adapters orphaned by a previously crashed/killed yalda (parent
+    // reparented to PID 1). Graceful exits reap via kill_on_drop; this catches
+    // the crash/SIGKILL path that accumulated ~70 idle adapters over weeks.
+    let _ = yalda::acp_channel::reap_orphaned_adapters();
     // Relocate state written by older builds under <cache_dir>/yalda into the
     // durable `~/.yalda` home (ADR-0018), BEFORE any persisted state (prefs,
     // workspace, client_id, acp_sessions) is read. One-time, idempotent.
