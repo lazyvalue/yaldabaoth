@@ -4411,6 +4411,67 @@ fn leader_intercept_respects_insert_mode(cx: &mut TestAppContext) {
     assert!(normal, "in Normal mode a leader is intercepted as a menu-opener");
 }
 
+/// REGRESSION (live report: in worksheet mode `<space>` opened the WORKSPACE
+/// menu instead of the tile menu). `focused_in_insert_mode` for a bound agent
+/// must reflect the COMPOSE buffer (focus + its mode) in BOTH placements — never
+/// the read-only transcript editor's `mode`, which defaults to Insert and so
+/// wrongly reported "in text entry" in worksheet, suppressing the universal
+/// leaders. With leaders suppressed, a bare `<space>` fell into the compose's
+/// Normal-key dispatch → `NormalOutcome::OpenMenu` → the workspace menu.
+#[gpui::test]
+fn focused_in_insert_mode_tracks_compose_not_transcript(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    // Worksheet placement, focus on the compose, compose in NORMAL — but the
+    // transcript editor's own mode is Insert (its default). The bug read THAT.
+    let in_insert = view.update(vcx, |v, cx| {
+        {
+            let mut c = v.agent_mut(cx).expect("agent");
+            c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
+            c.input_surface.compose_mut().mode = crate::EditMode::Normal;
+            c.focus = crate::AgentFocus::Compose;
+            c.mode = crate::EditMode::Insert; // transcript default — must be ignored
+        }
+        v.focused_in_insert_mode(cx)
+    });
+    assert!(
+        !in_insert,
+        "compose in Normal ⇒ NOT text entry ⇒ leaders fire (space → tile menu)"
+    );
+
+    // Compose in Insert ⇒ text entry ⇒ leaders are left to the tile as text.
+    let in_insert2 = view.update(vcx, |v, cx| {
+        v.agent_mut(cx)
+            .expect("agent")
+            .input_surface
+            .compose_mut()
+            .mode = crate::EditMode::Insert;
+        v.focused_in_insert_mode(cx)
+    });
+    assert!(in_insert2, "compose in Insert ⇒ text entry ⇒ space types a space");
+
+    // Transcript focus is read-only NAVIGATION ⇒ leaders fire even though the
+    // compose is still Insert.
+    let in_insert3 = view.update(vcx, |v, cx| {
+        v.agent_mut(cx).expect("agent").focus = crate::AgentFocus::Transcript;
+        v.focused_in_insert_mode(cx)
+    });
+    assert!(
+        !in_insert3,
+        "transcript focus ⇒ navigation ⇒ leaders fire (space → tile menu)"
+    );
+}
+
 /// The global (Yaldabaoth) menu lists every workspace by number with a
 /// `goto-workspace-N` command, plus name/new entries; dispatching one switches
 /// the active workspace. Covers untitled.md "Global Scope › Commands".

@@ -4186,17 +4186,21 @@ impl YaldaGpuiView {
             Some(App::Agent(tile)) => {
                 if tile.bound.is_none() {
                     false // unbound = session picker = navigation
-                } else if self
-                    .agent_read(cx, |c| c.input_surface.is_chatbox())
-                    .unwrap_or(false)
-                {
+                } else {
+                    // Model C: a bound agent tile is "in text entry" iff focus is
+                    // on the COMPOSE buffer AND it's in Insert — in BOTH placements.
+                    // Transcript focus is read-only navigation, so leaders must
+                    // work there. The transcript editor's own `mode` is irrelevant
+                    // (it's read-only). The old worksheet arm read that transcript
+                    // `mode` — which defaults to Insert — so leaders were wrongly
+                    // suppressed in worksheet and `<space>` fell into the compose's
+                    // normal dispatch, opening the workspace menu instead of the
+                    // tile menu.
                     self.agent_read(cx, |c| {
-                        c.input_surface.compose().mode == EditMode::Insert
+                        c.focus == AgentFocus::Compose
+                            && c.input_surface.compose().mode == EditMode::Insert
                     })
                     .unwrap_or(false)
-                } else {
-                    self.agent_read(cx, |c| c.mode == EditMode::Insert)
-                        .unwrap_or(false)
                 }
             }
             Some(App::Linear(tile)) => {
