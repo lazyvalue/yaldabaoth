@@ -2738,3 +2738,125 @@ fn compose_draft_persist_roundtrip() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ----------------------------------------------------------------------------
+// INV-ORDER (the keystone) — the ordering invariant the old model lacked.
+//
+//   The transcript is append-only/read-only; the draft is a SEPARATE buffer.
+//   The only cross-buffer transfer is text, never a position. ⇒ a turn's
+//   chunks can only extend the transcript at EOF; a draft is never inside
+//   history. Ordering corruption is unrepresentable.
+//
+// These reproduce the reported failure ("a newer agent turn renders above an
+// older exchange; my draft sits in the middle of history") and would FAIL
+// against the old shared-rope model (draft in the transcript ⇒ streaming had to
+// insert ABOVE it via a stale floor/tag, landing mid-document).
+// ----------------------------------------------------------------------------
+
+/// Streaming a NEW agent turn while the user is mid-draft appends at transcript
+/// EOF and leaves the compose untouched. Drives the REAL floor path
+/// (`agent_tail_floor_char` + `append_llm_chunk_floored`) the live pump uses, so
+/// a regression to mid-document insertion is caught. Pins design-c §6 #7.
+#[test]
+fn inv_order_streaming_with_draft_appends_at_eof() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
+
+    // Prior exchange: U1 then its answer, both frozen/tagged in the transcript.
+    st.insert_user_turn(
+        "first question",
+        yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
+        false,
+    );
+    st.editor.append_llm_chunk(TurnId::Llm(1), "first answer\n");
+    let transcript_before = st.editor.document().full_text();
+
+    // The user is composing the NEXT prompt — it lives in the SEPARATE compose
+    // buffer, NOT in the transcript (this is the exact text from the report).
+    for ch in "did we activate /spec".chars() {
+        st.input_surface.compose_mut().editor.insert_char(ch);
+    }
+
+    // A new agent turn streams in. The live pump computes the floor and uses the
+    // floored append; replay that here exactly.
+    let floor = agent_tail_floor_char(&st.editor);
+    assert_eq!(
+        floor,
+        st.editor.document().rope().len_chars(),
+        "no user draft in the transcript ⇒ the floor is EOF (the structural core \
+         of the fix: there is nothing to stream ABOVE)"
+    );
+    st.editor
+        .append_llm_chunk_floored(TurnId::Llm(2), "second answer\n", floor);
+
+    // The new turn appended at the bottom; the prior exchange is untouched and
+    // still ABOVE it; the draft never entered the transcript.
+    assert_eq!(
+        st.editor.document().full_text(),
+        format!("{transcript_before}second answer\n"),
+        "the new agent turn must append at EOF, below the older exchange — not \
+         mid-document, and never fused with the draft"
+    );
+    assert_eq!(
+        st.input_surface.compose().text(),
+        "did we activate /spec",
+        "the draft stays in the compose buffer, out of the transcript (INV-3)"
+    );
+}
+
+/// Several interleaved user/agent turns land in the transcript in the order they
+/// occurred — even with a non-empty draft held throughout. The old model could
+/// place a turn's continuation at its (stale) tag position, rendering a newer
+/// turn above an older one; the append-only transcript makes that impossible.
+#[test]
+fn inv_order_interleaved_turns_stay_chronological() {
+    let mut st = AgentState::new_for_test();
+    st.input_surface = InputSurface::new(InputModeKind::Worksheet);
+
+    // Hold a draft for the whole sequence — it must never perturb ordering.
+    for ch in "scratch draft".chars() {
+        st.input_surface.compose_mut().editor.insert_char(ch);
+    }
+
+    let submit = |st: &mut AgentState, body: &str| {
+        st.insert_user_turn(
+            body,
+            yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
+            false,
+        );
+    };
+    let stream = |st: &mut AgentState, k: usize, body: &str| {
+        let floor = agent_tail_floor_char(&st.editor);
+        st.editor.append_llm_chunk_floored(TurnId::Llm(k), body, floor);
+    };
+
+    submit(&mut st, "q1");
+    stream(&mut st, 1, "a1\n");
+    submit(&mut st, "q2");
+    stream(&mut st, 2, "a2\n");
+    submit(&mut st, "q3");
+    stream(&mut st, 3, "a3\n");
+
+    let text = st.editor.document().full_text();
+    let order: Vec<&str> = ["q1", "a1", "q2", "a2", "q3", "a3"]
+        .into_iter()
+        .filter(|tok| text.contains(tok))
+        .collect();
+    assert_eq!(
+        order,
+        vec!["q1", "a1", "q2", "a2", "q3", "a3"],
+        "transcript content must be in chronological order; got:\n{text}"
+    );
+    // Each marker appears strictly after the previous one (no reordering).
+    let mut last = 0usize;
+    for tok in ["q1", "a1", "q2", "a2", "q3", "a3"] {
+        let at = text.find(tok).unwrap_or_else(|| panic!("missing {tok}"));
+        assert!(at >= last, "out-of-order: {tok} at {at} precedes {last}\n{text}");
+        last = at;
+    }
+    assert_eq!(
+        st.input_surface.compose().text(),
+        "scratch draft",
+        "the draft is untouched by any number of turns (INV-2)"
+    );
+}

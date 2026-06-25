@@ -1392,15 +1392,30 @@ impl YaldaGpuiView {
                 h.a = 0.4;
                 h
             };
-            Some(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .border_t_1()
-                    .border_color(edge_color)
-                    .child(separator)
-                    .child(compose_body),
-            )
+            // Model C "You" boundary: in worksheet (inline) placement the panel
+            // below the read-only transcript is the user's compose area, so label
+            // it `You` in the accent. This is the presence cue the worksheet
+            // promised — under Model C the inline compose is always present in
+            // worksheet mode, so the divider is the boundary of YOUR turn. Chatbox
+            // (pinned) keeps the bare rule (its box is self-evidently the input).
+            let mut panel = div()
+                .w_full()
+                .min_w_0()
+                .border_t_1()
+                .border_color(edge_color);
+            if is_worksheet {
+                panel = panel.child(
+                    div()
+                        .px_4()
+                        .pt_1()
+                        .text_size(px(11.0))
+                        .font_family(compose_code_font.clone())
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(compose_cursor_color)
+                        .child(SharedString::new_static("You")),
+                );
+            }
+            Some(panel.child(separator).child(compose_body))
         };
 
         // ---- Right-side sidebars (Tasklist / Subagents) ----
