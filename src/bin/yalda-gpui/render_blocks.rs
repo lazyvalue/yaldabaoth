@@ -586,6 +586,128 @@ impl Element for CaptureBounds {
     }
 }
 
+// ───────────────────────── Layout probe (headless harness #3.2) ─────────────
+//
+// The verification-harness gap that let the caret-visibility class keep
+// regressing: `run_until_parked` runs a real layout/paint pass, but tests only
+// asserted STATE — never what was painted. This probe records the PAINTED bounds
+// of tagged elements so a `#[gpui::test]` can prove geometry for real (e.g. "the
+// compose cursor row is inside the compose box"). Same paint-time capture idiom
+// as `CaptureBounds`, but keyed by a static label a test reads back — so it can
+// reach a free render fn (the caret lives deep in `build_chatbox_line`) without
+// threading a sink down every call. Inactive (`None`) in production: a branch +
+// early return, no allocation.
+
+thread_local! {
+    static LAYOUT_PROBE: RefCell<Option<HashMap<&'static str, (f32, f32, f32, f32)>>> =
+        const { RefCell::new(None) };
+}
+
+/// Start recording painted bounds for [`probe_bounds`]-tagged elements. Call in a
+/// test before `run_until_parked`. Until called, the probe is a no-op.
+#[cfg(test)]
+pub(crate) fn layout_probe_begin() {
+    LAYOUT_PROBE.with(|p| *p.borrow_mut() = Some(HashMap::new()));
+}
+
+/// The last painted bounds `(x, y, w, h)` of the element tagged `label`, or
+/// `None` if it was never painted this pass — itself a signal (a virtualized row
+/// scrolled BELOW the fold is never painted, so a missing `compose-cursor-row`
+/// means the caret is off-screen).
+#[cfg(test)]
+pub(crate) fn layout_probe_get(label: &str) -> Option<(f32, f32, f32, f32)> {
+    LAYOUT_PROBE.with(|p| p.borrow().as_ref().and_then(|m| m.get(label).copied()))
+}
+
+/// Stop recording and clear (test teardown).
+#[cfg(test)]
+pub(crate) fn layout_probe_end() {
+    LAYOUT_PROBE.with(|p| *p.borrow_mut() = None);
+}
+
+fn layout_probe_record(label: &'static str, b: (f32, f32, f32, f32)) {
+    LAYOUT_PROBE.with(|p| {
+        if let Some(m) = p.borrow_mut().as_mut() {
+            m.insert(label, b);
+        }
+    });
+}
+
+/// Wrap `inner` so its PAINTED bounds are recorded under `label` when the layout
+/// probe is active (no-op otherwise). The headless geometry-assertion primitive.
+pub(crate) fn probe_bounds(label: &'static str, inner: AnyElement) -> AnyElement {
+    ProbeBounds { label, inner }.into_any_element()
+}
+
+struct ProbeBounds {
+    label: &'static str,
+    inner: AnyElement,
+}
+
+impl IntoElement for ProbeBounds {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for ProbeBounds {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) -> (LayoutId, ()) {
+        (self.inner.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) {
+        self.inner.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        _prepaint: &mut (),
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) {
+        layout_probe_record(
+            self.label,
+            (
+                f32::from(bounds.origin.x),
+                f32::from(bounds.origin.y),
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height),
+            ),
+        );
+        self.inner.paint(window, cx);
+    }
+}
+
 pub(crate) struct RegisterOnPaint {
     pub(crate) inner: AnyElement,
     pub(crate) sink: std::rc::Rc<RefCell<HashMap<(usize, usize), TextLayout>>>,

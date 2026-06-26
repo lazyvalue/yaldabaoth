@@ -1286,7 +1286,16 @@ pub(crate) fn build_chatbox_line(
         }
     }
 
-    row.into_any_element()
+    let el = row.into_any_element();
+    // Headless harness (#3.2): tag the caret's visual row so a `#[gpui::test]`
+    // can read its PAINTED bounds and prove it's inside the compose box — the
+    // virtualized list never paints an off-screen row, so a missing probe means
+    // the caret fell below the fold. No-op in production. Pins INV-UX-1 at paint.
+    if is_cursor_line {
+        probe_bounds("compose-cursor-row", el)
+    } else {
+        el
+    }
 }
 
 /// Word-wrap a (tab-expanded) monospace line into visual-row char ranges of at

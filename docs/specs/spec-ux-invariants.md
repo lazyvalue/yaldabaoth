@@ -66,12 +66,19 @@ so the caret is always on a rendered visual row and there are no off-screen-righ
 columns. Other monospace surfaces that still scroll horizontally keep the
 `compute_window` horizontal half.
 
-**Enforcement.** Headless: the caret-containment guards
-(`chatbox_caret_cell_stays_in_window_for_every_edit_path`); the WRAPPED-compose
-vertical-containment guard `compose_wrapped_caret_never_below_the_fold`; the
-worksheet caret-on-tail / streaming-cursor tests. Runtime (GPUI paint not
-headless): type past the bottom/right edge in each surface and confirm the caret
-stays visible.
+**Enforcement.** Headless, two levels:
+- **Model:** the caret-containment guards
+  (`chatbox_caret_cell_stays_in_window_for_every_edit_path`); the WRAPPED-compose
+  vertical-containment guard `compose_wrapped_caret_never_below_the_fold`; the
+  worksheet caret-on-tail / streaming-cursor tests.
+- **Paint (the real proof):** `compose_caret_row_painted_inside_box_when_wrapped`
+  drives a real layout/paint pass (`run_until_parked`) and asserts — via the
+  layout probe (`probe_bounds` / `layout_probe_*` in render_blocks.rs) — that the
+  caret's row is actually PAINTED inside the compose box. The virtualized list
+  never paints an off-screen row, so a caret below the fold fails the test
+  (validated by injecting the regression). This closes what a model test can't
+  (does the list actually scroll + paint there); the probe is the reusable #3.2
+  capability for any painted-geometry assertion.
 
 > **Subtlety (regressed once by INV-UX-2, now pinned):** under word-wrap a logical
 > line spans multiple VISUAL rows, so the compose's vertical window MUST be
