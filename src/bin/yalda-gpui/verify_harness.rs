@@ -4658,3 +4658,86 @@ fn jump_panel_toggle_hides_and_summons(cx: &mut TestAppContext) {
         "summoned panel renders again"
     );
 }
+
+/// VERIFICATION HARNESS (#3.2 — PAINTED-BOUNDS proof of INV-UX-1). The model-level
+/// guard `compose_wrapped_caret_never_below_the_fold` proves the window MATH; this
+/// proves the PAINT: in a compose draft that wraps far past the box, after a real
+/// layout/paint pass (`run_until_parked`) the caret's row must actually be painted
+/// AND its bounds must sit inside the compose box. The virtualized compose list
+/// never paints an off-screen row, so if the caret scrolled below the fold (the
+/// recurring chatbox bug) the `compose-cursor-row` probe is empty and this fails —
+/// the proof a state-level test can't give. This is the harness capability that
+/// closes the caret-visibility regression class.
+#[gpui::test]
+fn compose_caret_row_painted_inside_box_when_wrapped(cx: &mut TestAppContext) {
+    // boot_with_transcript dismisses the startup splash (which otherwise
+    // short-circuits `render` before `render_agent` runs — wall-clock doesn't
+    // advance under run_until_parked, so the splash never expires headlessly).
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+
+    // Seed a draft that wraps WELL beyond the 8-row box, caret left at the end.
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let ed = &mut c.input_surface.compose_mut().editor;
+        for i in 0..40 {
+            for ch in
+                format!("line {i} with plenty of words so it wraps once or twice across the box")
+                    .chars()
+            {
+                ed.insert_char(ch);
+            }
+            ed.insert_char('\n');
+        }
+    });
+
+    // Settle: the virtualized compose list measures item heights lazily, so the
+    // authoritative scroll_to(item) lands only after the visible items are
+    // measured. Drive several frames so measurement + scroll converge before we
+    // probe (mirrors the doc-drag test's settle dance).
+    for _ in 0..4 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    let caret = crate::layout_probe_get("compose-cursor-row");
+    let box_bounds =
+        view.update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().bounds.get()));
+    crate::layout_probe_end();
+
+    let (_, box_y, _, box_h) =
+        box_bounds.expect("compose box bounds were not captured (box did not paint)");
+    // The virtualized compose list never paints an off-screen row, so a missing
+    // probe == the caret scrolled BELOW THE FOLD (the exact reported bug).
+    let (_, caret_y, _, caret_h) = caret.unwrap_or_else(|| {
+        panic!(
+            "compose cursor row was NOT painted — the caret is below the fold \
+             (INV-UX-1 violated). box=[{box_y}, {}] h={box_h}",
+            box_y + box_h
+        )
+    });
+
+    assert!(box_h > 1.0, "compose box has no height ({box_h}) — nothing painted");
+    // The caret row's TOP must be inside the box (caret glyph visible, not below
+    // the fold). A genuine below-fold caret is either unpainted (handled above) or
+    // off by a full row (≥18px); the small bottom tolerance only absorbs the 1px
+    // borders / sub-pixel rounding (the box inner height isn't an exact row
+    // multiple), NOT a real overflow.
+    assert!(
+        caret_y >= box_y - 1.0,
+        "caret row top {caret_y} is above the compose box top {box_y}",
+    );
+    assert!(
+        caret_y < box_y + box_h,
+        "caret row top {caret_y} is at/below the box bottom {} — BELOW THE FOLD",
+        box_y + box_h,
+    );
+    assert!(
+        caret_y + caret_h <= box_y + box_h + 3.0,
+        "caret row bottom {} clipped beyond the box bottom {} by more than border slack",
+        caret_y + caret_h,
+        box_y + box_h,
+    );
+}

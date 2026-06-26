@@ -19,8 +19,17 @@ perf gate first (smallest, self-contained); the big two are below.
 | # | Gap | Status |
 |---|-----|--------|
 | #3.3 | `--release` perf gate | ✅ DONE — `benches/render_bench.rs` (criterion) |
+| #3.2 | painted-bounds / layout snapshots | ✅ DONE (v1) — `probe_bounds`/`layout_probe_*` (render_blocks.rs) + `compose_caret_row_painted_inside_box_when_wrapped`; proves painted geometry headlessly, validated by injecting the regression |
 | #3.1 | full GUI↔server↔agent loop in one process | ticket 001 (scoped) |
-| #3.2 | pixels / element-tree-layout snapshots | ticket 002 (scoped) |
+
+**#3.2 (DONE v1):** the layout probe is a `CaptureBounds`-style element that
+records a tagged element's PAINTED bounds into a thread-local a `#[gpui::test]`
+reads after `run_until_parked`. `compose_caret_row_painted_inside_box_when_wrapped`
+uses it to assert the caret row is painted inside the compose box even when the
+draft wraps far past the box — the real fix for the recurring caret-below-fold
+class (a model test proves the math; this proves the paint). Reusable for any
+"panel didn't collapse / element X is where it should be" assertion. Remaining:
+extend probes to the other surfaces in the coverage matrix (`001-build-plan.md`).
 
 ## #3.3 — perf gate (DONE)
 
