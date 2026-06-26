@@ -811,6 +811,54 @@ fn has_user_header(flat: &[FlatItem]) -> bool {
         .any(|f| matches!(f, FlatItem::TurnHeader { role: TurnRole::User }))
 }
 
+/// REGRESSION (live screenshot: the transcript showed a stack of EMPTY
+/// alternating `You`/`Claude` dividers between real turns). INV-UX-4: a turn
+/// header renders only for a turn with visible content. Build a transcript with
+/// EMPTY turns — blank lines carrying escalating turn numbers, the separator /
+/// resume artifacts behind the bug — interleaved with real turns, and assert no
+/// empty header survives (no header is followed by another header or the end;
+/// header count == content-bearing turn count).
+#[test]
+fn rebuild_drops_empty_turn_headers() {
+    let mut st = AgentState::new_for_test();
+    // Lines: real, blank, blank, real, real (line 5 is the trailing empty line).
+    st.editor
+        .programmatic_insert(0, "first answer\n\n\nreal question\nsecond answer\n");
+    // Tag each content line with a turn; the two blank lines get their OWN
+    // escalating turn numbers → without the fix each mints a phantom header.
+    for (l, turn) in [
+        (0usize, TurnId::Llm(1)),  // real Claude turn
+        (1usize, TurnId::Llm(2)),  // blank → would be an empty "Claude"
+        (2usize, TurnId::User(3)), // blank → would be an empty "You"
+        (3usize, TurnId::User(4)), // real You turn
+        (4usize, TurnId::Llm(5)),  // real Claude turn
+    ] {
+        st.editor.add_frozen_lines(l, l + 1);
+        let a = st.editor.anchor_for_line(l);
+        st.editor.metadata_mut::<TurnId>().insert(a, turn);
+    }
+
+    let flat = flat_of(&mut st);
+
+    // No header is orphaned: every TurnHeader is immediately followed by a
+    // non-header (content) item, and the list never ends on a header.
+    for (i, item) in flat.iter().enumerate() {
+        if matches!(item, FlatItem::TurnHeader { .. }) {
+            let next = flat.get(i + 1);
+            assert!(
+                matches!(next, Some(it) if !matches!(it, FlatItem::TurnHeader { .. })),
+                "empty turn header at index {i}: next item is {next:?}\nflat: {flat:?}"
+            );
+        }
+    }
+    // Exactly the three content-bearing turns (Llm1, User4, Llm5) get a header.
+    let headers = flat
+        .iter()
+        .filter(|it| matches!(it, FlatItem::TurnHeader { .. }))
+        .count();
+    assert_eq!(headers, 3, "expected 3 headers, got {headers}\nflat: {flat:?}");
+}
+
 /// Content-driven half (NORMAL mode): with the caret parked in Normal mode, the
 /// "You" divider tracks content — absent while the editable run is empty,
 /// present once it holds non-whitespace text. (The presence-driven Insert-mode

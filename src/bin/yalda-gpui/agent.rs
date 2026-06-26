@@ -2702,9 +2702,43 @@ pub(crate) fn rebuild_agent_view_model(
         flat_items.push(FlatItem::ThinkingIndicator);
     }
 
+    // INVARIANT — no empty turn header (INV-UX-4): a `You`/`Claude` divider is
+    // rendered only for a turn that actually has visible content (a Line / Block /
+    // ToolGroup / ThinkingIndicator) before the next header. The blank-collapse
+    // pass can strip a turn's only (blank) lines, and a run of content-less turns
+    // (blank-tagged separators between exchanges, or tool-numbered blank lines on
+    // resume) would otherwise render as a stack of empty alternating `You`/
+    // `Claude` dividers — the reported "blank turns" bug. Scan right→left: a
+    // header is dropped unless some non-header item was seen since the previous
+    // kept header. Runs AFTER the thinking indicator so a trailing in-flight
+    // `Claude` header keeps its spinner as content.
+    {
+        let mut keep = vec![true; flat_items.len()];
+        let mut content_since_header = false;
+        for i in (0..flat_items.len()).rev() {
+            if matches!(flat_items[i], FlatItem::TurnHeader { .. }) {
+                if !content_since_header {
+                    keep[i] = false;
+                }
+                content_since_header = false;
+            } else {
+                content_since_header = true;
+            }
+        }
+        let mut j = 0;
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..flat_items.len() {
+            if keep[i] {
+                flat_items.swap(i, j);
+                j += 1;
+            }
+        }
+        flat_items.truncate(j);
+    }
+
     // Derive the cursor-reveal reverse index from the FINAL flat_items (after
-    // blank-collapse, tool-group merge, and the tail indicator) so it matches
-    // the rendered list exactly.
+    // blank-collapse, tool-group merge, empty-header removal, and the tail
+    // indicator) so it matches the rendered list exactly.
     let line_to_item = build_line_to_item(&flat_items, resolved, lines.len());
     let nav_stops = build_nav_stops(&flat_items, lines, frozen_ranges);
 

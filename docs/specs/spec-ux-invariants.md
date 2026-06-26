@@ -145,6 +145,33 @@ confirm agent/user turns show no background tint distinct from the tile; the
 focused row highlights only during transcript (`f`) navigation. (A headless guard
 awaits the element-tree-snapshot harness — `docs/projects/headless-e2e/` #3.2.)
 
+### INV-UX-4 — No empty turn header
+
+**Statement.** A `You` / `Claude` turn divider is rendered ONLY for a turn that
+has visible content — a prose line, a rendered block, a tool group, or the
+in-flight thinking indicator. The transcript never shows a turn header with
+nothing under it, and never a stack of empty alternating `You`/`Claude`
+dividers.
+
+**Applies to.** The agent transcript (`rebuild_agent_view_model` →
+`FlatItem::TurnHeader`).
+
+**Why.** Empty turns are visual noise that make the conversation unreadable and
+imply exchanges that didn't happen (the reported "blank turns" — a screenful of
+empty `You`/`Claude` dividers between the real turns). They arise when a turn's
+only lines are blank (stripped by the blank-collapse pass) or when blank
+separator / resume-artifact lines carry their own escalating turn numbers.
+
+**Status:** `honored`. After the flat-item build (blank-collapse, tool-group
+merge, thinking indicator), `rebuild_agent_view_model` runs a right→left pass
+that drops any `TurnHeader` with no non-header item before the next header.
+
+**Enforcement.** Headless: `rebuild_drops_empty_turn_headers` builds a transcript
+with empty turns (blank lines carrying escalating turn numbers) interleaved with
+real turns and asserts no header is orphaned (every header is followed by content;
+header count == content-bearing-turn count). Validated by disabling the pass →
+the test fails.
+
 ## Cross-references
 
 - `spec-chatbox-caret-containment.md` — the compose caret window. Its VERTICAL
@@ -160,6 +187,9 @@ awaits the element-tree-snapshot harness — `docs/projects/headless-e2e/` #3.2.
 
 ## Revision history
 
+- 2026-06-25 (4) — Added INV-UX-4 (no empty turn header) → `honored`: a right→left
+  pass in `rebuild_agent_view_model` drops `TurnHeader`s with no content before the
+  next header (the "blank turns" bug). Guard `rebuild_drops_empty_turn_headers`.
 - 2026-06-25 (3) — Added INV-UX-3 (agent text uses the tile/desktop background;
   no per-turn card tint) → `honored`: `transcript_view.rs` `row_bg` transparent
   for all turns; focus-row highlight retained, gated on transcript focus.
