@@ -4741,3 +4741,53 @@ fn compose_caret_row_painted_inside_box_when_wrapped(cx: &mut TestAppContext) {
         box_y + box_h,
     );
 }
+
+/// VERIFICATION HARNESS (#3.2 — painted-bounds proof of INV-UX-5 layout): the
+/// subagent panes render BELOW the compose box. Register a Task subagent tool
+/// call so the panes appear, drive a real paint pass, and assert (via the layout
+/// probe) that the `subagent-panes` strip is painted and its top is at/below the
+/// compose box's bottom — i.e. below the chatbox, as specified.
+#[gpui::test]
+fn subagent_panes_paint_below_the_compose(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+
+    // Register a Task subagent (Think + prompt) into the bound session's tool
+    // state so `subagents()` is non-empty and the panes render.
+    view.update(vcx, |v, cx| {
+        use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
+        let mut c = v.agent_mut(cx).expect("agent");
+        let id: ToolCallId = "task-pane".into();
+        let mut tc = ToolCall::new(id.clone(), "Explore repo".to_string());
+        tc.kind = ToolKind::Think;
+        tc.raw_input = Some(serde_json::json!({"prompt": "map the code"}));
+        let anchor = c.editor.anchor_for_line(0);
+        c.tools.register(crate::ToolCallKey::from_id(&id), tc, anchor);
+    });
+
+    // Settle, then probe a clean paint pass.
+    for _ in 0..4 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    let panes = crate::layout_probe_get("subagent-panes");
+    let box_bounds =
+        view.update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().bounds.get()));
+    crate::layout_probe_end();
+
+    let (_, box_y, _, box_h) = box_bounds.expect("compose box did not paint");
+    let (_, panes_y, _, panes_h) =
+        panes.expect("subagent panes did NOT paint — they should appear when a subagent exists");
+
+    assert!(panes_h > 1.0, "subagent panes have no height ({panes_h})");
+    // The panes' top is at/below the compose box's bottom (a little slack for the
+    // 1px border between them) — i.e. they sit below the chatbox.
+    assert!(
+        panes_y + 1.0 >= box_y + box_h,
+        "subagent panes top {panes_y} is NOT below the compose bottom {} — not below the chatbox",
+        box_y + box_h,
+    );
+}
