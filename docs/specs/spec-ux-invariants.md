@@ -188,17 +188,19 @@ doing (status) + its output. The previous detector keyed on `kind == ToolKind::O
 which a real `Task` never has (claude-code-acp maps `Task` → `ToolKind::Think`),
 so subagents were invisible; and they were tucked in a right sidebar.
 
-**Status:** `honored` (detection headless-tested; pane LAYOUT runtime-unverified
-per the GPUI paint gap). `classify_subagent` keys on `Think` + a `prompt`/
-`subagent_type` raw-input (excluding `TodoWrite`'s `todos`), with a name fallback,
-and captures the prompt. `render_agent` renders the panes below the compose (auto
-when subagents exist; `Cmd-2`/`ToggleSubagents` collapses).
+**Status:** `honored` (detection AND pane layout headless-tested). `classify_subagent`
+keys on `Think` + a `prompt`/`subagent_type` raw-input (excluding `TodoWrite`'s
+`todos`), with a name fallback, and captures the prompt. `render_agent` renders the
+panes below the compose (auto when subagents exist; `Cmd-2`/`ToggleSubagents`
+collapses).
 
 **Enforcement.** Headless: `classify_subagent_detects_the_harness_task_shape`
-(Think+prompt detected, prompt captured; TodoWrite/Read excluded; name fallback)
-+ `subagents_surfaces_registered_task_with_prompt` (end-to-end through the real
-`ToolCall`). Runtime (GPUI paint): confirm the panes render below the compose and
-clicking one shows its output.
+(Think+prompt detected, prompt captured; TodoWrite/Read excluded; name fallback) +
+`subagents_surfaces_registered_task_with_prompt` (end-to-end through the real
+`ToolCall`) + **PAINT proof** `subagent_panes_paint_below_the_compose` (the layout
+probe asserts the panes strip is painted with its top at/below the compose box's
+bottom — validated by reordering the layout → the test fails). Runtime: only
+click-to-show-output is left for a human eyeball.
 
 ## Cross-references
 

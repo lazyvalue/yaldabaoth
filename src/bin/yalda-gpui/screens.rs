@@ -1613,7 +1613,9 @@ impl YaldaGpuiView {
                     }
                     strip = strip.child(card);
                 }
-                Some(strip.into_any_element())
+                // Tag the strip so the headless harness can read its PAINTED
+                // bounds and prove the panes sit below the compose (#3.2).
+                Some(probe_bounds("subagent-panes", strip.into_any_element()))
             }
         };
 
