@@ -1893,6 +1893,86 @@ fn tool_calls_register_keeps_maps_in_sync() {
     );
 }
 
+/// Feature #1 — detect subagents the way the HARNESS emits them. claude-code-acp
+/// maps `Task` to `ToolKind::Think` (same kind as `TodoWrite`) carrying the spawn
+/// in `raw_input`; the old `kind == Other` check NEVER matched a real Task, so
+/// subagents were invisible. classify_subagent now keys on the structure (Think +
+/// prompt/subagent_type, TodoWrite excluded by `todos`) + a name fallback, and
+/// captures the prompt for the pane.
+#[test]
+fn classify_subagent_detects_the_harness_task_shape() {
+    use yalda::acp_channel::{ToolCall, ToolCallId, ToolCallStatus, ToolKind};
+    let mk = |title: &str, kind: ToolKind, raw: Option<serde_json::Value>| -> ToolCall {
+        let id: ToolCallId = "t".into();
+        let mut tc = ToolCall::new(id, title.to_string());
+        tc.kind = kind;
+        tc.raw_input = raw;
+        tc.status = ToolCallStatus::InProgress;
+        tc
+    };
+
+    // A real Task subagent: Think + prompt → detected, prompt captured.
+    let sa = classify_subagent(&mk(
+        "Explore the repo",
+        ToolKind::Think,
+        Some(serde_json::json!({"prompt": "map the code", "subagent_type": "Explore"})),
+    ))
+    .expect("Think + prompt is a subagent");
+    assert_eq!(sa.prompt.as_deref(), Some("map the code"));
+
+    // THE regression: a Think subagent with NO subagent-y title — the old
+    // kind==Other + name heuristic missed this entirely.
+    assert!(
+        classify_subagent(&mk(
+            "anonymous",
+            ToolKind::Think,
+            Some(serde_json::json!({"prompt": "go"}))
+        ))
+        .is_some(),
+        "a Think+prompt call is a subagent even without a Task-ish title"
+    );
+
+    // TodoWrite is also Think — excluded by its `todos` input.
+    assert!(
+        classify_subagent(&mk(
+            "TodoWrite",
+            ToolKind::Think,
+            Some(serde_json::json!({"todos": []}))
+        ))
+        .is_none(),
+        "TodoWrite is not a subagent"
+    );
+
+    // Plain tools are not subagents.
+    assert!(classify_subagent(&mk(
+        "Read",
+        ToolKind::Read,
+        Some(serde_json::json!({"path": "x"}))
+    ))
+    .is_none());
+
+    // Name fallback still works for adapters that only title it.
+    assert!(classify_subagent(&mk("Task: foo", ToolKind::Other, None)).is_some());
+}
+
+/// End-to-end: a registered Task tool call surfaces through `subagents()` with its
+/// prompt — the data the bottom panes render.
+#[test]
+fn subagents_surfaces_registered_task_with_prompt() {
+    use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
+    let mut st = AgentState::new_for_test();
+    let id: ToolCallId = "task1".into();
+    let mut tc = ToolCall::new(id.clone(), "Explore repo".to_string());
+    tc.kind = ToolKind::Think;
+    tc.raw_input = Some(serde_json::json!({"prompt": "map the code", "subagent_type": "Explore"}));
+    st.tools
+        .register(ToolCallKey::from_id(&id), tc, st.editor.anchor_for_line(0));
+
+    let subs = st.subagents();
+    assert_eq!(subs.len(), 1, "the Task call is surfaced as a subagent");
+    assert_eq!(subs[0].prompt.as_deref(), Some("map the code"));
+}
+
 #[test]
 fn fingerprint_tracks_resolved_tool_anchor_line() {
     let mut st = AgentState::new_for_test();

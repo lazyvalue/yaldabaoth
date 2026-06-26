@@ -1798,35 +1798,65 @@ pub(crate) struct SubAgent {
     pub(crate) label: String,
     /// Mirrors the underlying tool call's status.
     pub(crate) status: yalda::acp_channel::ToolCallStatus,
+    /// The prompt the subagent was spawned with (the Task tool's `prompt` /
+    /// `description` raw-input), shown in the subagent pane. `None` when the
+    /// adapter didn't carry it.
+    pub(crate) prompt: Option<String>,
 }
 
-/// Heuristic classifier (§25). v1: anything with `kind == ToolKind::Other`
-/// AND a `title` prefix in [`SUBAGENT_TOOL_NAMES`] is treated as a sub-
-/// agent. (The spec calls the matching field "name"; ACP names it
-/// `title` — same meaning, the user-facing label for the tool call.)
-/// Returns the freshly-constructed `SubAgent`, or `None` if the tool call
-/// doesn't match.
+/// Classify a tool call as a sub-agent (Task) spawn, as the HARNESS actually
+/// emits it over ACP — not the old name heuristic.
+///
+/// claude-code-acp maps the `Task` tool to `ToolKind::Think` (the SAME kind as
+/// `TodoWrite`), carrying the spawn in `raw_input` (`prompt` / `subagent_type` /
+/// `description`). The previous classifier keyed on `kind == ToolKind::Other`,
+/// which a real Task NEVER has — so subagents were invisible. This detects the
+/// structured signal the harness sends:
+///   - exclude `TodoWrite` (also `Think`) by its distinctive `todos` input;
+///   - a `Think` call carrying a `prompt`/`subagent_type` IS a subagent;
+///   - plus a name-prefix fallback (`Task`/`Subagent`/`Spawn`) for adapters
+///     that only title it, kept so detection can't regress for them.
+/// The captured `prompt` feeds the subagent pane (the user wants the prompt +
+/// output visible, not just a label).
 pub(crate) fn classify_subagent(tc: &yalda::acp_channel::ToolCall) -> Option<SubAgent> {
     use yalda::acp_channel::ToolKind;
-    if tc.kind != ToolKind::Other {
+    let raw = tc.raw_input.as_ref();
+    // TodoWrite is also `Think`; its body is the running todo list, not a
+    // subagent. Exclude it by the distinctive `todos` array (mirrors
+    // `tool_render_policy`).
+    if raw.and_then(|v| v.get("todos")).is_some() {
         return None;
     }
+    let prompt = raw
+        .and_then(|v| v.get("prompt").or_else(|| v.get("description")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let subagent_type = raw
+        .and_then(|v| v.get("subagent_type"))
+        .and_then(|v| v.as_str());
+    // Structural: a `Think` tool call carrying a Task-shaped input.
+    let structural = tc.kind == ToolKind::Think && (prompt.is_some() || subagent_type.is_some());
+    // Fallback: titled like a subagent spawn (kept narrow so non-subagent
+    // tools don't get swept in).
     let title = tc.title.as_str();
-    if !SUBAGENT_TOOL_NAMES
+    let name_match = SUBAGENT_TOOL_NAMES
         .iter()
-        .any(|prefix| title.starts_with(prefix))
-    {
+        .any(|prefix| title.starts_with(prefix));
+    if !structural && !name_match {
         return None;
     }
-    let label = if title.is_empty() {
-        "subagent".to_string()
-    } else {
+    let label = if !title.is_empty() {
         title.to_string()
+    } else if let Some(t) = subagent_type {
+        format!("subagent: {t}")
+    } else {
+        "subagent".to_string()
     };
     Some(SubAgent {
         tool_call_id: ToolCallKey::from_id(&tc.tool_call_id),
         label,
         status: tc.status,
+        prompt,
     })
 }
 
@@ -3118,7 +3148,9 @@ impl AgentState {
             usage: None,
             focused_subagent: None,
             tasklist_open: false,
-            subagents_open: false,
+            // Subagent panes auto-appear at the tile bottom when subagents exist;
+            // Cmd-2 (ToggleSubagents) collapses them.
+            subagents_open: true,
             server_managed: true,
             reconciler: yalda::agent_transcript::UserTurnReconciler::new(),
             user_turn_ks: std::collections::HashSet::new(),
@@ -3170,7 +3202,9 @@ impl AgentState {
             usage: None,
             focused_subagent: None,
             tasklist_open: false,
-            subagents_open: false,
+            // Subagent panes auto-appear at the tile bottom when subagents exist;
+            // Cmd-2 (ToggleSubagents) collapses them.
+            subagents_open: true,
             server_managed: true,
             reconciler: yalda::agent_transcript::UserTurnReconciler::new(),
             user_turn_ks: std::collections::HashSet::new(),
