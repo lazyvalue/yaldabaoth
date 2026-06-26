@@ -1208,6 +1208,59 @@ fn caret_visual_row_places_caret_on_a_rendered_row() {
     assert_eq!(caret_visual_row(&wrap_line_cols(&[], 10), 0), 0);
 }
 
+/// REGRESSION (live report: "I can move the cursor below the fold in the chatbox
+/// again"): INV-UX-1 under INV-UX-2. Once the compose word-wraps, the vertical
+/// window MUST be computed over VISUAL rows, not logical lines — the wrap change
+/// computed it over logical lines, so the caret's visual row fell below the box.
+/// This drives the real path: `compose_visual_metrics` → `compose_first_visible_line`
+/// (over visual rows) → `compose_item_for_visual_row` (map back to the list's
+/// item/offset). For EVERY caret position in a wrapped draft, the chosen window
+/// must contain the caret's visual row, and the item/offset mapping must round-trip.
+#[test]
+fn compose_wrapped_caret_never_below_the_fold() {
+    let lines: Vec<String> = vec![
+        "short".into(),
+        "this is a fairly long line that definitely wraps several times".into(),
+        "x".into(),
+        "another long wrapping line that also goes well past the width".into(),
+        "end".into(),
+    ];
+    let width = 10; // box width in columns
+    let visible = 8; // COMPOSE_MAX_VISIBLE_LINES (box height in visual rows)
+
+    let (_, total, per_line) = compose_visual_metrics(&lines, 0, 0, width);
+    // The draft must actually exceed the box (so this exercises the scrolling path).
+    assert!(total > visible, "test draft must wrap beyond the visible window");
+
+    let mut prev_top = 0usize;
+    for (li, line) in lines.iter().enumerate() {
+        let len = line.chars().count();
+        for col in 0..=len {
+            let (caret_vrow, total2, per2) = compose_visual_metrics(&lines, li, col, width);
+            assert_eq!(total2, total);
+            assert_eq!(per2, per_line);
+
+            let top = compose_first_visible_line(caret_vrow, prev_top, total2, visible);
+
+            // INV-UX-1: the caret's VISUAL row is inside the visible window.
+            assert!(
+                caret_vrow >= top && caret_vrow < top + visible,
+                "caret visual row {caret_vrow} fell outside window [{top}, {}) \
+                 at line {li} col {col} — BELOW THE FOLD",
+                top + visible
+            );
+
+            // The top visual row maps back to a list (item, offset) that resolves
+            // to exactly that visual row — so the list actually scrolls there.
+            let (item, off) = compose_item_for_visual_row(&per2, top);
+            let mapped: usize = per2.iter().take(item).sum::<usize>() + off;
+            assert_eq!(mapped, top, "item/offset must round-trip to the visual top");
+
+            prev_top = top;
+        }
+    }
+}
+
 /// THE permanent guard against the 15×-recurring "chatbox caret/text scrolls
 /// off-screen" bug (spec-chatbox-caret-containment.md Constraint 4): drive a real
 /// `Chatbox` editor through every Behavior-7 edit path and, after each, assert
