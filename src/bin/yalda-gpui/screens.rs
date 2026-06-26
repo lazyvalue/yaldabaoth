@@ -1499,40 +1499,38 @@ impl YaldaGpuiView {
             None
         };
 
-        let subagents_sidebar = if c.subagents_open {
-            let mut tile = div()
-                .id("subagents-sidebar")
-                .flex()
-                .flex_col()
-                .w(sidebar_width)
-                .min_w(sidebar_width)
-                .flex_none()
-                .bg(sidebar_bg)
-                .border_l_1()
-                .border_color(sidebar_border)
-                .py_1()
-                .text_size(px(12.0))
-                .font_family(self.code_font.clone());
-            tile = tile.child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .text_color(sidebar_header_fg)
-                    .font_weight(FontWeight::BOLD)
-                    .child(SharedString::new_static("Subagents")),
-            );
+        // Subagent panes — a strip of small cards at the BOTTOM of the tile,
+        // below the compose box (replaces the old right-side sidebar). Each card
+        // shows the subagent's status + label + spawn prompt; clicking it focuses
+        // the subagent (swaps the transcript to its output — `focus_subagent`).
+        // Auto-shown when subagents exist; Cmd-2 (ToggleSubagents) collapses them.
+        let subagent_panes: Option<gpui::AnyElement> = {
             let subagents = c.subagents();
-            if subagents.is_empty() {
-                tile = tile.child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .text_color(sidebar_dim_fg)
-                        .child(SharedString::new_static("(no subagents)")),
-                );
+            if !c.subagents_open || subagents.is_empty() {
+                None
             } else {
                 use yalda::acp_channel::ToolCallStatus;
                 let focused_key = c.focused_subagent.clone();
+                let card_bg: Hsla = nc(at.tool_card_bg);
+                let card_border: Hsla = nc(at.tool_card_border);
+                let prompt_fg: Hsla = nc(at.dim);
+                let mut strip = div()
+                    .id("subagent-panes")
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .max_h(px(132.0))
+                    .overflow_y_scroll()
+                    .border_t_1()
+                    .border_color(sidebar_border)
+                    .bg(sidebar_bg)
+                    .text_size(px(11.0))
+                    .font_family(self.code_font.clone());
                 for (i, sa) in subagents.iter().enumerate() {
                     let glyph: &'static str = match sa.status {
                         ToolCallStatus::Completed => "✓",
@@ -1541,50 +1539,82 @@ impl YaldaGpuiView {
                         ToolCallStatus::Pending => "○",
                         _ => "·",
                     };
-                    let trunc_label: String = if sa.label.chars().count() > 20 {
-                        let head: String = sa.label.chars().take(19).collect();
-                        format!("{}…", head)
+                    let glyph_fg: Hsla = match sa.status {
+                        ToolCallStatus::Completed => nc(at.tool_completed),
+                        ToolCallStatus::Failed => nc(at.tool_failed),
+                        ToolCallStatus::InProgress => nc(at.tool_in_progress),
+                        ToolCallStatus::Pending => nc(at.tool_pending),
+                        _ => prompt_fg,
+                    };
+                    let trunc_label: String = if sa.label.chars().count() > 24 {
+                        format!("{}…", sa.label.chars().take(23).collect::<String>())
                     } else {
                         sa.label.clone()
                     };
-                    let row_text = format!("▸ {} {}", glyph, trunc_label);
+                    // Prompt snippet: first non-empty line, truncated — the user
+                    // wants to see WHAT each subagent was asked, not just a label.
+                    let prompt_snip: Option<String> = sa.prompt.as_deref().map(|p| {
+                        let first = p.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                        if first.chars().count() > 80 {
+                            format!("{}…", first.chars().take(79).collect::<String>())
+                        } else {
+                            first.to_string()
+                        }
+                    });
                     let is_focused = focused_key.as_ref() == Some(&sa.tool_call_id);
-                    let row_fg: Hsla = if is_focused {
-                        nc(at.warm_accent)
-                    } else {
-                        self.editor_fg()
-                    };
-                    let row_bg: Hsla = if is_focused {
-                        let mut h = nc(at.dim);
-                        h.a = 0.2;
-                        h
-                    } else {
-                        rgba(0x00000000).into()
-                    };
+                    let mut card = div()
+                        .id(SharedString::from(format!("subagent-pane-{i}")))
+                        .flex()
+                        .flex_col()
+                        .w(px(220.0))
+                        .min_w(px(150.0))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if is_focused { nc(at.warm_accent) } else { card_border })
+                        .bg(card_bg)
+                        .cursor_pointer();
                     let weak = weak_self.clone();
                     let row_key = sa.tool_call_id.clone();
-                    let row = div()
-                        .id(SharedString::from(format!("subagent-row-{}", i)))
-                        .px_2()
-                        .py(px(1.0))
-                        .cursor_pointer()
-                        .text_color(row_fg)
-                        .bg(row_bg)
-                        .on_click(
-                            move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut GpuiApp| {
-                                let key = row_key.clone();
-                                let _ = weak.update(app, |this, cx| {
-                                    this.focus_subagent(key, cx);
-                                });
-                            },
-                        )
-                        .child(SharedString::from(row_text));
-                    tile = tile.child(row);
+                    card = card.on_click(
+                        move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut GpuiApp| {
+                            let key = row_key.clone();
+                            let _ = weak.update(app, |this, cx| {
+                                this.focus_subagent(key, cx);
+                            });
+                        },
+                    );
+                    // Header row: status glyph + label.
+                    card = card.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1()
+                            .child(div().flex_none().text_color(glyph_fg).child(SharedString::new_static(glyph)))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_color(if is_focused { nc(at.warm_accent) } else { self.editor_fg() })
+                                    .child(SharedString::from(trunc_label)),
+                            ),
+                    );
+                    if let Some(snip) = prompt_snip {
+                        if !snip.is_empty() {
+                            card = card.child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .pt(px(1.0))
+                                    .text_color(prompt_fg)
+                                    .child(SharedString::from(snip)),
+                            );
+                        }
+                    }
+                    strip = strip.child(card);
                 }
+                Some(strip.into_any_element())
             }
-            Some(tile)
-        } else {
-            None
         };
 
         let mut transcript_row = div().flex().flex_row().flex_1().min_h_0().child(
@@ -1602,9 +1632,6 @@ impl YaldaGpuiView {
         if let Some(p) = tasklist_sidebar {
             transcript_row = transcript_row.child(p);
         }
-        if let Some(p) = subagents_sidebar {
-            transcript_row = transcript_row.child(p);
-        }
 
         let mut col = div()
             .flex()
@@ -1615,6 +1642,10 @@ impl YaldaGpuiView {
             .child(transcript_row);
         if let Some(panel) = compose_panel {
             col = col.child(panel);
+        }
+        // Subagent panes sit at the very bottom, below the compose (chatbox).
+        if let Some(panes) = subagent_panes {
+            col = col.child(panes);
         }
         let content_area: gpui::AnyElement = col.into_any_element();
 

@@ -172,6 +172,34 @@ real turns and asserts no header is orphaned (every header is followed by conten
 header count == content-bearing-turn count). Validated by disabling the pass →
 the test fails.
 
+### INV-UX-5 — Subagents are detected from the harness, shown as panes below the compose
+
+**Statement.** Sub-agents (the agent's `Task` spawns) are detected from the
+STRUCTURE the harness emits over ACP — not a name heuristic — and surfaced as
+small panes at the BOTTOM of the agent tile, below the compose box. Each pane
+shows the subagent's status, label, and spawn **prompt**; clicking it focuses the
+subagent (the transcript shows its output).
+
+**Applies to.** The agent tile (`classify_subagent` / `AgentState::subagents`;
+the subagent-panes strip in `render_agent`).
+
+**Why.** The user must see what each subagent was asked (prompt) and how it's
+doing (status) + its output. The previous detector keyed on `kind == ToolKind::Other`,
+which a real `Task` never has (claude-code-acp maps `Task` → `ToolKind::Think`),
+so subagents were invisible; and they were tucked in a right sidebar.
+
+**Status:** `honored` (detection headless-tested; pane LAYOUT runtime-unverified
+per the GPUI paint gap). `classify_subagent` keys on `Think` + a `prompt`/
+`subagent_type` raw-input (excluding `TodoWrite`'s `todos`), with a name fallback,
+and captures the prompt. `render_agent` renders the panes below the compose (auto
+when subagents exist; `Cmd-2`/`ToggleSubagents` collapses).
+
+**Enforcement.** Headless: `classify_subagent_detects_the_harness_task_shape`
+(Think+prompt detected, prompt captured; TodoWrite/Read excluded; name fallback)
++ `subagents_surfaces_registered_task_with_prompt` (end-to-end through the real
+`ToolCall`). Runtime (GPUI paint): confirm the panes render below the compose and
+clicking one shows its output.
+
 ## Cross-references
 
 - `spec-chatbox-caret-containment.md` — the compose caret window. Its VERTICAL
@@ -186,6 +214,12 @@ the test fails.
   the surface INV-UX-2 governs.
 
 ## Revision history
+
+- 2026-06-25 (5) — Added INV-UX-5 (subagents detected structurally from the
+  harness + shown as panes below the compose, with the prompt). Fixes the
+  `kind==Other` detector that never matched a real `Task`. Guards
+  `classify_subagent_detects_the_harness_task_shape` +
+  `subagents_surfaces_registered_task_with_prompt`.
 
 - 2026-06-25 (4) — Added INV-UX-4 (no empty turn header) → `honored`: a right→left
   pass in `rebuild_agent_view_model` drops `TurnHeader`s with no content before the
