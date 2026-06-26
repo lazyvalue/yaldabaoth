@@ -1226,7 +1226,6 @@ impl YaldaGpuiView {
                 // we don't scroll horizontally; the next frame self-corrects.
                 4096
             };
-            let win = tb.compute_window(COMPOSE_MAX_VISIBLE_LINES, visible_cols);
             let compose_bounds_sink = tb.bounds.clone();
 
             // All logical lines, tab-expanded. INV-UX-2: each WORD-WRAPS to rows
@@ -1308,16 +1307,36 @@ impl YaldaGpuiView {
                 // to its top on every newline).
                 let compose_edit_seq = tb.editor.document().edit_seq();
                 tb.list.reconcile(&lines_snap, compose_edit_seq);
-                // Anchor the top item to the AUTHORITATIVE `win.top_line` — NOT
-                // read back from the list's own anchor, and NOT GPUI's
-                // measurement-based `scroll_to_reveal_item` (it mis-fires on
-                // freshly-spliced unmeasured rows and strands the caret — the
-                // recurring chatbox-cursor bug). `compose_window` already used
-                // the prior window as `prev`, so the box only moves when the
-                // caret would leave it.
+                // INV-UX-1 under INV-UX-2: once lines wrap, the box scrolls in
+                // VISUAL rows, not logical lines — computing the window over
+                // logical lines stranded the caret below the fold (the recurring
+                // chatbox-cursor bug, reintroduced by word-wrap). So: compute the
+                // vertical window over VISUAL rows, then map the authoritative top
+                // visual row back into the list's (item, offset) space (its items
+                // are logical lines, each a wrapped column of visual rows).
+                // Anchored on the prior window (`tb.window`) so the box only moves
+                // when the caret would leave it; never read back from the list's
+                // own anchor (mis-fires on freshly-spliced unmeasured rows).
+                let (caret_vrow, total_vrows, per_line) = compose_visual_metrics(
+                    &lines_snap,
+                    compose_cursor_line,
+                    compose_cursor_col,
+                    visible_cols,
+                );
+                let visual_top = compose_first_visible_line(
+                    caret_vrow,
+                    tb.window.get().top_line,
+                    total_vrows,
+                    COMPOSE_MAX_VISIBLE_LINES,
+                );
+                tb.window.set(ComposeWindow {
+                    top_line: visual_top,
+                    left_col: 0,
+                });
+                let (item_ix, offset_rows) = compose_item_for_visual_row(&per_line, visual_top);
                 tb.list.state().scroll_to(gpui::ListOffset {
-                    item_ix: win.top_line,
-                    offset_in_item: gpui::px(0.0),
+                    item_ix,
+                    offset_in_item: gpui::px(offset_rows as f32 * line_h),
                 });
                 let font = compose_code_font.clone();
                 let cur_color = compose_cursor_color;

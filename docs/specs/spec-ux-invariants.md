@@ -67,9 +67,18 @@ columns. Other monospace surfaces that still scroll horizontally keep the
 `compute_window` horizontal half.
 
 **Enforcement.** Headless: the caret-containment guards
-(`chatbox_caret_cell_stays_in_window_for_every_edit_path`), the worksheet
-caret-on-tail / streaming-cursor tests. Runtime (GPUI paint not headless): type
-past the bottom/right edge in each surface and confirm the caret stays visible.
+(`chatbox_caret_cell_stays_in_window_for_every_edit_path`); the WRAPPED-compose
+vertical-containment guard `compose_wrapped_caret_never_below_the_fold`; the
+worksheet caret-on-tail / streaming-cursor tests. Runtime (GPUI paint not
+headless): type past the bottom/right edge in each surface and confirm the caret
+stays visible.
+
+> **Subtlety (regressed once by INV-UX-2, now pinned):** under word-wrap a logical
+> line spans multiple VISUAL rows, so the compose's vertical window MUST be
+> computed in visual-row space (`compose_visual_metrics` →
+> `compose_first_visible_line` → `compose_item_for_visual_row`). Computing it over
+> logical lines strands the caret below the fold — the recurring chatbox-cursor
+> bug, reintroduced by the wrap change and re-fixed.
 
 ### INV-UX-2 — The agent compose (chatbox / worksheet) always word-wraps
 

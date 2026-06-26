@@ -1388,6 +1388,56 @@ pub(crate) fn build_chatbox_wrapped_line(
     col.into_any_element()
 }
 
+/// Vertical caret-containment metrics for the WRAPPED compose, in VISUAL-row
+/// space (INV-UX-1 under INV-UX-2). Once lines wrap, the box scrolls in visual
+/// rows — not logical lines — so the vertical window MUST be computed over visual
+/// rows or the caret falls below the fold (the recurring chatbox-cursor bug).
+/// Returns `(caret_visual_row, total_visual_rows, per_line_row_counts)`:
+/// the caret's absolute visual-row index, the total visual-row count, and each
+/// logical line's visual-row count (so the list scroll can map a target visual
+/// row back to a `(list item, offset)` pair via [`compose_item_for_visual_row`]).
+pub(crate) fn compose_visual_metrics(
+    lines: &[String],
+    caret_line: usize,
+    caret_col: usize,
+    wrap_cols: usize,
+) -> (usize, usize, Vec<usize>) {
+    let mut per_line: Vec<usize> = Vec::with_capacity(lines.len().max(1));
+    let mut caret_vrow = 0usize;
+    let mut total = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let rows = wrap_line_cols(&chars, wrap_cols);
+        if i < caret_line {
+            caret_vrow += rows.len();
+        } else if i == caret_line {
+            caret_vrow += caret_visual_row(&rows, caret_col);
+        }
+        per_line.push(rows.len());
+        total += rows.len();
+    }
+    (caret_vrow, total.max(1), per_line)
+}
+
+/// Map an absolute VISUAL-row index to `(logical-line list-item index, visual-row
+/// offset within that item)` for the compose list scroll. The compose list's
+/// items are logical lines (each a wrapped column of visual rows), so the
+/// authoritative visual-row top from the window math must be translated back into
+/// the list's item coordinate space. `per_line` is each line's visual-row count
+/// (from [`compose_visual_metrics`]).
+pub(crate) fn compose_item_for_visual_row(per_line: &[usize], visual_row: usize) -> (usize, usize) {
+    let mut acc = 0usize;
+    for (i, &n) in per_line.iter().enumerate() {
+        if visual_row < acc + n {
+            return (i, visual_row - acc);
+        }
+        acc += n;
+    }
+    let last = per_line.len().saturating_sub(1);
+    let off = per_line.last().copied().unwrap_or(1).saturating_sub(1);
+    (last, off)
+}
+
 /// Wire a `ListState`'s scroll handler to update the shared `follow_output`
 /// flag. When the user scrolls up (`is_scrolled == true`), follow is disabled.
 /// When they scroll back to the bottom (`is_scrolled == false`), it re-enables.
