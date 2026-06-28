@@ -3444,6 +3444,29 @@ impl AgentState {
         true
     }
 
+    /// Place the read-only transcript caret on its LAST navigable stop — the end
+    /// of the conversation — for the worksheet "cursor flows up out of the compose
+    /// into history" gesture (Model C §4.5). Snaps to a real stop so the caret
+    /// never lands on stripped blank padding; falls back to the last line when the
+    /// nav-stop cache is empty (no render yet). Queues a reveal so the viewport
+    /// scrolls the caret into view.
+    pub(crate) fn move_transcript_caret_to_last_stop(&mut self) {
+        let last_line = self.editor.document().line_count().saturating_sub(1);
+        let target = self.view_model.snap_nav_stop(last_line, false).unwrap_or(last_line);
+        self.editor.cursor_mut().line = target;
+        self.editor.cursor_mut().col = 0;
+        self.editor.clear_selection();
+        self.pending_reveal_cursor = true;
+    }
+
+    /// The last navigable transcript stop (end of the conversation). Used by the
+    /// worksheet down-crossing gesture to decide when the caret is "at the end"
+    /// and a further `j`/Down should hand focus back to the compose.
+    pub(crate) fn transcript_last_stop(&self) -> usize {
+        let last_line = self.editor.document().line_count().saturating_sub(1);
+        self.view_model.snap_nav_stop(last_line, false).unwrap_or(last_line)
+    }
+
     /// Drop the worksheet caret to the end of the editable tail (the last line)
     /// and queue a reveal so the viewport scrolls to it. `finalize_agent_turn`
     /// guarantees a trailing newline, so the last line is the empty editable

@@ -1757,6 +1757,211 @@ fn toggle_agent_focus_round_trips(cx: &mut TestAppContext) {
     });
 }
 
+/// Build a bare (no-modifier) key-down event for driving the REAL
+/// `handle_claude_key` dispatch directly. `key` is the gpui key name
+/// (`"up"`/`"down"`/`"k"`/`"j"`); single chars also fill `key_char` so
+/// `keystroke_to_keypress` maps them to `Key::Char`.
+fn bare_key(key: &str) -> gpui::KeyDownEvent {
+    gpui::KeyDownEvent {
+        keystroke: gpui::Keystroke {
+            modifiers: gpui::Modifiers::default(),
+            key: key.to_string(),
+            key_char: (key.chars().count() == 1).then(|| key.to_string()),
+        },
+        is_held: false,
+    }
+}
+
+/// Boot a real view with a bound agent session in **Worksheet** placement and a
+/// short committed transcript (three frozen lines) to navigate. Returns the view
+/// + visual context.
+fn boot_worksheet_with_history(
+    cx: &mut TestAppContext,
+) -> (gpui::Entity<YaldaGpuiView>, &mut gpui::VisualTestContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
+    });
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("line one\n".into())),
+                ev(ReplyEvent::Chunk("line two\n".into())),
+                ev(ReplyEvent::Chunk("line three\n".into())),
+                ev(ReplyEvent::ReplayComplete),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    (view, vcx)
+}
+
+/// INV-UX-9: in worksheet placement, `Up` at the top of the compose hands focus
+/// UP into the read-only transcript (caret on the last navigable stop), `k`/`j`
+/// navigate within it, and `j` at the last stop hands focus back DOWN to the
+/// compose at its first line. The seamless single-cursor traversal that makes the
+/// worksheet a navigable workspace, not a relabeled chatbox.
+#[gpui::test]
+fn worksheet_cursor_crosses_into_transcript_and_back(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_with_history(cx);
+
+    // Precondition: focus is on the compose, caret on its first line.
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(c.focus, crate::AgentFocus::Compose);
+        assert_eq!(c.input_surface.compose().editor.cursor().line, 0);
+    });
+
+    // Up at compose top → enter the transcript at its last navigable stop.
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&bare_key("up"), window, cx));
+    vcx.run_until_parked();
+    let last_stop = view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Transcript,
+            "Up at the compose top enters the transcript"
+        );
+        let ls = c.transcript_last_stop();
+        assert_eq!(
+            c.editor.cursor().line,
+            ls,
+            "caret lands on the last transcript stop"
+        );
+        assert!(
+            c.pending_reveal_cursor,
+            "crossing queues a caret reveal (INV-UX-1)"
+        );
+        ls
+    });
+    assert!(last_stop > 0, "test transcript actually has navigable history");
+
+    // `k` moves the caret up the transcript (still transcript-focused).
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&bare_key("k"), window, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(c.focus, crate::AgentFocus::Transcript);
+        assert!(
+            c.editor.cursor().line < last_stop,
+            "k navigates up within the transcript"
+        );
+    });
+
+    // Back at the last stop, `j` crosses DOWN to the compose first line.
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).expect("agent").editor.cursor_mut().line = last_stop;
+    });
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&bare_key("j"), window, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Compose,
+            "j at the last stop returns to the compose"
+        );
+        assert_eq!(
+            c.input_surface.compose().editor.cursor().line,
+            0,
+            "lands at the compose first line"
+        );
+    });
+}
+
+/// INV-UX-9 / Model C INV-3: a full up-and-back crossing moves only the FOCUS —
+/// the transcript is never edited and the compose draft is preserved byte-for-byte
+/// (no text or buffer position crosses the seam).
+#[gpui::test]
+fn worksheet_crossing_never_mutates_either_buffer(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_with_history(cx);
+
+    // Seed a compose draft so we can prove it survives the round trip untouched.
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.input_surface = crate::InputSurface::with_draft(crate::InputModeKind::Worksheet, "my draft");
+    });
+    let (seq_before, draft_before) = view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        (
+            c.editor.document().edit_seq(),
+            c.input_surface.compose().text(),
+        )
+    });
+
+    // Up into the transcript, navigate, then back down to the compose.
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&bare_key("up"), window, cx));
+    vcx.run_until_parked();
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&bare_key("k"), window, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let last = v.agent_mut(cx).expect("agent").transcript_last_stop();
+        v.agent_mut(cx).expect("agent").editor.cursor_mut().line = last;
+    });
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&bare_key("j"), window, cx));
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(
+            c.editor.document().edit_seq(),
+            seq_before,
+            "the transcript is never edited by a crossing (append-only, INV-1)"
+        );
+        assert_eq!(
+            c.input_surface.compose().text(),
+            draft_before,
+            "the compose draft survives the crossing untouched (INV-3)"
+        );
+        assert_eq!(draft_before, "my draft");
+    });
+}
+
+/// INV-UX-9: the seamless crossing is WORKSHEET-only. In chatbox placement, `Up`
+/// at the compose top does NOT auto-cross into the transcript (the pinned box keeps
+/// focus; transcript nav there is still the explicit space → f toggle).
+#[gpui::test]
+fn chatbox_up_does_not_cross_into_transcript(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_with_history(cx);
+
+    // Flip to chatbox placement (the default, but be explicit).
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.input_surface = crate::InputSurface::new(crate::InputModeKind::Chatbox);
+        assert_eq!(c.focus, crate::AgentFocus::Compose);
+    });
+
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&bare_key("up"), window, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        assert_eq!(
+            v.agent_mut(cx).expect("agent").focus,
+            crate::AgentFocus::Compose,
+            "chatbox Up at the compose top must NOT cross into the transcript"
+        );
+    });
+}
+
 /// Model C INV-1: in worksheet placement, a blank submit is a no-op and the
 /// transcript stays empty — the draft is never written into the transcript
 /// (it lives in the separate compose). Also pins that submit with no channel

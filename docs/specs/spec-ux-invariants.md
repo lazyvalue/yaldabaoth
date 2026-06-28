@@ -280,6 +280,54 @@ accent-bar differences are color-level (harness gap #1, a human eye). INV-UX-1's
 `compose_caret_row_painted_inside_box_when_wrapped` still passes in both
 placements (caret math unchanged).
 
+### INV-UX-9 — The worksheet cursor flows seamlessly between the transcript and the compose
+
+**Statement.** In **Worksheet** placement the caret traverses the read-only
+transcript and the editable compose as **one continuous cursor**, using ordinary
+navigation keys — no menu dance:
+
+- From the compose, pressing **Up** (any mode) or **`k`** (Normal mode) while the
+  caret is on the **first line** of the compose hands keyboard focus **up into the
+  transcript**, placing the navigation caret on the **last navigable stop** (the
+  end of the conversation) and revealing it.
+- From the transcript, pressing **Down** or **`j`** while the caret is on the
+  **last navigable stop** hands focus **back down into the compose**, at its first
+  line.
+- While focus is on the transcript the user navigates (`↑↓`/`jk`/word motions),
+  **selects** (`v` + motion), and **responds** by sending the selection (`S`) — the
+  base "workspace" capability. `Esc` returns to the compose.
+
+**Only the FOCUS crosses the seam — never text or a buffer position** (Model C
+INV-3): the transcript stays read-only and append-only, the compose draft is
+untouched. This is what makes worksheet a navigable workspace ("place the cursor
+anywhere to respond to things") rather than a relabeled chatbox. **Chatbox**
+placement is unaffected — its pinned box does not auto-cross (focus there is still
+reachable via space → f).
+
+**Applies to.** `handle_claude_key` (`agent_ui.rs`): the compose-dispatch
+up-crossing and the transcript-focus down-crossing, both gated on
+`!is_chatbox()`. The status strip (`render_agent`, `screens.rs`) reflects the
+active focus (`TRANSCRIPT NAV …` vs `WORKSHEET …`) so the crossing is legible.
+
+**Why.** Model C deliberately split the single Model-A rope (transcript + draft)
+into two buffers to kill the ordering/anchor bug farm, but v1 only exposed
+transcript navigation through a local-menu toggle (space → f), so worksheet "felt
+functionally identical to the chatbox — can't move the cursor around to respond."
+Crossing focus at the buffer boundary restores the single-cursor *feel* the
+worksheet promised **without** reintroducing a shared mutable rope: positions
+never cross, so the corruption class stays unrepresentable.
+
+**Status:** `honored` — crossing implemented + headless-tested; the on-screen
+feel is the one human-eye item (harness gap #1).
+
+**Enforcement.** Headless in `verify_harness.rs`:
+`worksheet_cursor_crosses_into_transcript_and_back` (drives the real key handler:
+`k`/Up at compose top → `focus == Transcript` with the caret on the last stop;
+`j`/Down at the last stop → `focus == Compose` at line 0) and
+`worksheet_crossing_never_mutates_either_buffer` (transcript `edit_seq` and compose
+text are byte-identical across a full up-and-back crossing — INV-3). Chatbox does
+not cross: `chatbox_up_does_not_cross_into_transcript`.
+
 ## Cross-references
 
 - `spec-turn-steering.md` — the full steering design (queue, delivery modes, the
@@ -297,6 +345,13 @@ placements (caret math unchanged).
 
 ## Revision history
 
+- 2026-06-28 — Added INV-UX-9 (worksheet cursor crosses seamlessly between the
+  read-only transcript and the compose via Up/`k` at the compose top and Down/`j`
+  at the transcript end — focus crosses, never text/position; closes "can't move
+  the cursor around to respond"). Guards
+  `worksheet_cursor_crosses_into_transcript_and_back`,
+  `worksheet_crossing_never_mutates_either_buffer`,
+  `chatbox_up_does_not_cross_into_transcript` in `verify_harness.rs`.
 - 2026-06-28 — Added INV-UX-8 (worksheet renders inline-flush in the transcript
   column; chatbox stays a pinned box — the two placements are now visibly
   distinct, closing the "toggling worksheet does nothing" gap). The deferred
