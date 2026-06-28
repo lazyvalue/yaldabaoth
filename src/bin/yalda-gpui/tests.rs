@@ -483,6 +483,33 @@ fn worksheet_rebuild_reuses_parsed_blocks_by_identity() {
     );
 }
 
+/// INV-UX-9 rule 5: a You-block may be opened only within the latest agent turn
+/// (after one of its newlines) or at the transcript tail; an older frozen turn is
+/// not a legal insertion point. Drives the guard `you_block_anchor_is_legal` over a
+/// two-turn transcript built through the real `append_llm_chunk` tagging path.
+#[test]
+fn you_block_anchor_guard_restricts_to_latest_turn() {
+    let mut st = AgentState::new_for_test();
+    st.editor.append_llm_chunk(TurnId::Llm(1), "old turn line\n");
+    st.editor
+        .append_llm_chunk(TurnId::Llm(2), "new line a\nnew line b\n");
+
+    let (s, _e) = st.latest_agent_turn_range().expect("an agent turn is tagged");
+    assert!(
+        !st.you_block_anchor_is_legal(0),
+        "a line in the OLDER turn is not a legal You-block anchor"
+    );
+    assert!(
+        st.you_block_anchor_is_legal(s),
+        "a line in the LATEST turn is a legal anchor"
+    );
+    let last = st.editor.document().line_count().saturating_sub(1);
+    assert!(
+        st.you_block_anchor_is_legal(last),
+        "the transcript tail is always a legal anchor"
+    );
+}
+
 /// Streaming perf invariant: a chunk that inserts lines ABOVE the blocks
 /// shifts every `(start, end)` range, but parses are keyed by CONTENT —
 /// the revalidation must keep Rc identity for every block whose text is

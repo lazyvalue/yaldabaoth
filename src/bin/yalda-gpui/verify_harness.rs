@@ -4742,75 +4742,73 @@ fn compose_caret_row_painted_inside_box_when_wrapped(cx: &mut TestAppContext) {
     );
 }
 
-/// VERIFICATION HARNESS (INV-UX-8 — painted proof the two compose PLACEMENTS
-/// render differently). Worksheet is inline-flush — no box chrome (no border,
-/// no panel bg, no horizontal margins) — so the draft fills the transcript
-/// column; Chatbox is a pinned box inset by a margin. Boot in chatbox, capture
-/// the compose content bounds (written by the `CaptureBounds` sink during paint),
-/// toggle to worksheet, re-capture, and assert the worksheet content is WIDER and
-/// sits further LEFT — i.e. the box margins/border are gone. Closes the
-/// "toggling worksheet does nothing" gap the user reported.
+/// VERIFICATION HARNESS (INV-UX-9, stage 2 — painted proof the two surfaces render
+/// in DIFFERENT places). The chatbox is a pinned box at the window bottom
+/// (`compose-box`); the worksheet's open You-block renders INLINE in the transcript
+/// (`you-block`), not at the bottom. (Supersedes the INV-UX-8 flush-vs-boxed
+/// geometry test, whose premise — an always-present worksheet compose box — is gone.)
 #[gpui::test]
 fn worksheet_renders_flush_chatbox_renders_boxed(cx: &mut TestAppContext) {
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
 
-    // Capture the compose box's OUTER (post-margin) painted bounds via the
-    // `compose-box` layout probe. The probe records the scroll div's border-box,
-    // so a horizontal margin (chatbox `mx_2`) shows up as a narrower box shifted
-    // right; the flush worksheet has neither.
-    let probe_box = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-        for _ in 0..3 {
-            view.update(vcx, |_, cx| cx.notify());
-            vcx.run_until_parked();
-        }
-        crate::layout_probe_begin();
-        view.update(vcx, |_, cx| cx.notify());
-        vcx.run_until_parked();
-        let b = crate::layout_probe_get("compose-box");
-        crate::layout_probe_end();
-        b.expect("compose box did not paint")
-    };
+    // Chatbox mode (the default): a pinned bottom box paints; no inline block.
+    assert!(
+        view.update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.is_chatbox()))
+            .expect("bound agent session"),
+        "precondition: a fresh session starts in Chatbox"
+    );
+    let (_, chat_y, _, _) = probe_dirty(&view, vcx, "compose-box").expect("chatbox paints a bottom box");
+    assert!(probe_dirty(&view, vcx, "you-block").is_none(), "chatbox has no inline block");
 
-    // Default placement is Chatbox (a boxed, inset panel).
-    let started_chatbox = view
-        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.is_chatbox()))
-        .expect("bound agent session");
-    assert!(started_chatbox, "precondition: a fresh session starts in Chatbox");
-    let (chat_x, _, chat_w, _) = probe_box(&view, vcx);
-    assert!(chat_w > 1.0, "chatbox compose box has no width ({chat_w})");
-
-    // Toggle to Worksheet (inline-flush placement) and re-probe. Under INV-UX-9
-    // the worksheet shows the compose ONLY when a You-block is open, so open one
-    // (the inline-edit reply) before probing — that is the flush surface to compare.
+    // Worksheet with an open You-block: the editable reply paints INLINE in the
+    // transcript, and the bottom box is gone.
     view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    vcx.run_until_parked();
+    let (_, yb_y, _, _) = probe_dirty(&view, vcx, "you-block").expect("worksheet block paints inline");
+    assert!(
+        probe_dirty(&view, vcx, "compose-box").is_none(),
+        "the worksheet block is inline — the bottom box is gone"
+    );
+    // The inline block sits in the scrolling transcript column, ABOVE where the
+    // pinned chatbox sat at the window bottom — a genuinely different placement.
+    assert!(
+        yb_y < chat_y + 1.0,
+        "inline you-block top ({yb_y}) is at/above the pinned chatbox top ({chat_y})"
+    );
+}
+
+/// Probe a painted bounds tag, DIRTYING the cached transcript first so its inner
+/// elements (e.g. the inline `you-block`) actually re-paint this frame — a bare
+/// root notify reuses the cached subtree and never re-runs `probe_bounds` inside
+/// it. `pending_reveal_cursor` is a `TranscriptSeqs` input, so toggling it on the
+/// probe frame busts the cache deterministically. Returns `None` if the tag
+/// didn't paint.
+fn probe_dirty(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    tag: &'static str,
+) -> Option<(f32, f32, f32, f32)> {
+    for _ in 0..2 {
+        view.update(vcx, |v, cx| {
+            if let Some(mut c) = v.agent_mut(cx) {
+                c.pending_reveal_cursor = true;
+            }
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
     view.update(vcx, |v, cx| {
         if let Some(mut c) = v.agent_mut(cx) {
-            c.you_block_open = true;
-            c.focus = crate::AgentFocus::Compose;
+            c.pending_reveal_cursor = true;
         }
+        cx.notify();
     });
-    let in_worksheet = !view
-        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.is_chatbox()))
-        .expect("bound agent session");
-    assert!(in_worksheet, "toggle entered Worksheet placement");
-    let (ws_x, _, ws_w, _) = probe_box(&view, vcx);
-    assert!(ws_w > 1.0, "worksheet compose box has no width ({ws_w})");
-
-    // Worksheet is flush: it drops the chatbox's horizontal margin (mx_2 ≈ 8px
-    // each side) and 1px border, so its content area is WIDER and starts further
-    // LEFT than the boxed chatbox. The delta is small but unambiguous, well
-    // beyond sub-pixel noise — this is the VISIBLE distinction INV-UX-8 requires.
-    // Worksheet is flush: it drops the chatbox's left margin (`mx_2` ≈ 8px), so
-    // its box paints further LEFT than the inset, boxed chatbox. This is the
-    // VISIBLE, geometric distinction INV-UX-8 requires (the border/bg/accent-bar
-    // differences are color-level — harness gap #1, a human eye). The shift is a
-    // full margin (~8px), well beyond sub-pixel noise.
-    let _ = (chat_w, ws_w);
-    assert!(
-        ws_x < chat_x - 4.0,
-        "worksheet box left ({ws_x}) should sit left of the boxed chatbox ({chat_x}) \
-         — the box margin is gone, the worksheet is flush in the column",
-    );
+    vcx.run_until_parked();
+    let b = crate::layout_probe_get(tag);
+    crate::layout_probe_end();
+    b
 }
 
 /// Build a bare (no-modifier) key-down event for driving the REAL
@@ -4922,50 +4920,45 @@ fn worksheet_nonempty_you_block_persists_after_esc(cx: &mut TestAppContext) {
     });
 }
 
-/// INV-UX-9 rules 6/7 (painted): the worksheet compose is HIDDEN when navigating
-/// idle, SHOWN when a You-block is open, and SHOWN mid-turn (the chatbox).
+/// INV-UX-9 rules 2/6/7 (painted, stage 2): navigating idle paints NEITHER the
+/// inline You-block NOR the bottom chatbox; an open You-block paints INLINE (the
+/// `you-block` probe) and NOT the bottom box; mid-turn paints the bottom chatbox
+/// (`compose-box`) and NOT the inline block.
 #[gpui::test]
 fn worksheet_compose_visibility_tracks_block_and_turn(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
 
-    let probe = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
-        for _ in 0..3 {
-            view.update(vcx, |_, cx| cx.notify());
-            vcx.run_until_parked();
-        }
-        crate::layout_probe_begin();
-        view.update(vcx, |_, cx| cx.notify());
-        vcx.run_until_parked();
-        let b = crate::layout_probe_get("compose-box");
-        crate::layout_probe_end();
-        b
-    };
+    // Idle, navigating, no block → no inline block, no bottom box.
+    assert!(probe_dirty(&view, vcx, "you-block").is_none(), "idle nav: no inline block");
+    assert!(probe_dirty(&view, vcx, "compose-box").is_none(), "idle nav: no bottom box");
 
-    // Idle, navigating, no block → no compose chrome.
-    assert!(
-        probe(&view, vcx).is_none(),
-        "idle worksheet navigation shows NO compose (rule 6)"
-    );
-
-    // Open a You-block → compose paints.
+    // Open a You-block → it paints INLINE, not as the bottom box (rules 2/6).
     view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
     vcx.run_until_parked();
     assert!(
-        probe(&view, vcx).is_some(),
-        "an open You-block paints the compose (rule 2)"
+        probe_dirty(&view, vcx, "you-block").is_some(),
+        "an open You-block paints inline in the transcript (rule 2)"
+    );
+    assert!(
+        probe_dirty(&view, vcx, "compose-box").is_none(),
+        "the open block is inline — NOT the bottom box"
     );
 
-    // Discard, then go mid-turn → the chatbox paints even with no block.
+    // Discard, then go mid-turn → the bottom chatbox paints, no inline block.
     view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
     vcx.run_until_parked();
-    assert!(probe(&view, vcx).is_none(), "discarded → hidden again");
+    assert!(probe_dirty(&view, vcx, "you-block").is_none(), "discarded → no inline block");
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).expect("agent");
         c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
     });
     assert!(
-        probe(&view, vcx).is_some(),
-        "mid-turn shows the chatbox even with no You-block (rule 7)"
+        probe_dirty(&view, vcx, "compose-box").is_some(),
+        "mid-turn shows the bottom chatbox (rule 7)"
+    );
+    assert!(
+        probe_dirty(&view, vcx, "you-block").is_none(),
+        "mid-turn suppresses the inline block (no double compose)"
     );
 }
 

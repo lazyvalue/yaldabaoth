@@ -1174,12 +1174,11 @@ impl YaldaGpuiView {
         // inline-flush styling (no box chrome, conversation typography, `›`
         // gutter) + the cached-child promotion are a runtime-tuning follow-up;
         // for now both placements render the same panel so worksheet is usable.
-        // INV-UX-9 visibility: in the WORKSHEET the compose is shown only when a
-        // You-block is open (idle inline editing — rules 2/6) OR the agent is
-        // mid-turn (the chatbox — rule 7). Navigating the buffer idle shows NO
-        // compose chrome. Chatbox mode always shows its pinned box (unchanged).
-        let show_compose =
-            c.input_surface.is_chatbox() || c.you_block_open || c.turn_phase.is_awaiting();
+        // INV-UX-9 visibility (stage 2): the WORKSHEET shows the bottom compose box
+        // ONLY mid-turn (the chatbox — rule 7). An idle You-block renders INLINE in
+        // the transcript at its anchor (FlatItem::YouBlock), not here. Navigating
+        // idle shows NO compose chrome. Chatbox mode always shows its pinned box.
+        let show_compose = c.input_surface.is_chatbox() || c.turn_phase.is_awaiting();
         let compose_panel = if !show_compose {
             None
         } else {

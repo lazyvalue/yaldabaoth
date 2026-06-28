@@ -78,6 +78,17 @@ pub(crate) struct TranscriptSeqs {
     /// cursor-row bar render ONLY when focused; flipping focus must bust the
     /// cache so the caret appears/disappears.
     pub(crate) transcript_focused: bool,
+    /// INV-UX-9 (stage 2): the inline You-block renders the live `Compose` INSIDE
+    /// the transcript, so its draft text + caret + mode are render inputs of this
+    /// cached view. Without them in the fingerprint, typing into the inline block
+    /// would not bust the transcript cache (stale caret/text — the cached-surface
+    /// bug class). `compose_edit_seq` covers the text; caret + mode cover the
+    /// glyph. Inert (constant) when no block is open.
+    pub(crate) you_block_open: bool,
+    pub(crate) you_block_anchor: Option<usize>,
+    pub(crate) compose_edit_seq: u64,
+    pub(crate) compose_cursor: (usize, usize),
+    pub(crate) compose_mode: EditMode,
 }
 
 impl TranscriptSeqs {
@@ -85,6 +96,26 @@ impl TranscriptSeqs {
     /// O(1) (len + last range), the rest are field reads.
     pub(crate) fn of(c: &AgentState) -> Self {
         let cursor = c.editor.cursor();
+        // INV-UX-9 (stage 2): the compose's text/caret/mode are render inputs of
+        // THIS cached view ONLY while the inline You-block is active (worksheet,
+        // idle, block open). When the compose renders in the bottom panel instead
+        // (chatbox mode, or the mid-turn chatbox), its changes must NOT bust the
+        // transcript cache — otherwise chatbox typing re-renders the whole
+        // transcript (the `transcript_021_*` perf regression). So zero the compose
+        // fields off-inline.
+        let inline_block_active =
+            c.you_block_open && !c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();
+        let (compose_edit_seq, compose_cursor, compose_mode) = if inline_block_active {
+            let compose = c.input_surface.compose();
+            let cc = compose.editor.cursor();
+            (
+                compose.editor.document().edit_seq(),
+                (cc.line, cc.col),
+                compose.mode,
+            )
+        } else {
+            (0, (0, 0), EditMode::Normal)
+        };
         Self {
             edit_seq: c.editor.document().edit_seq(),
             frozen_gen: c.frozen_gen(),
@@ -97,6 +128,11 @@ impl TranscriptSeqs {
             pending_reveal: c.pending_reveal_cursor,
             pending_jump: c.pending_jump_ord.is_some(),
             transcript_focused: c.focus == AgentFocus::Transcript,
+            you_block_open: inline_block_active,
+            you_block_anchor: c.you_block_anchor,
+            compose_edit_seq,
+            compose_cursor,
+            compose_mode,
         }
     }
 
@@ -267,6 +303,7 @@ impl TranscriptView {
             block_ranges_active,
             follow_tail,
             pending_reveal_line,
+            you_block_snap,
         } = session.update(cx, |sp, _scx| {
             let c: &mut AgentState = &mut sp.state;
 
@@ -375,6 +412,32 @@ impl TranscriptView {
             let turn_started_snap = c.turn_phase.turn_started();
             let last_event_at_snap = c.turn_phase.last_event_at();
 
+            // INV-UX-9 (stage 2): snapshot the inline You-block draft (the separate
+            // Compose) so the render arm draws it without re-borrowing the session.
+            let you_block_snap = if c.you_block_open {
+                let compose = c.input_surface.compose();
+                let cc = compose.editor.cursor();
+                let n = compose.editor.document().line_count().max(1);
+                Some(YouBlockSnap {
+                    lines: (0..n)
+                        .map(|i| {
+                            compose
+                                .editor
+                                .document()
+                                .line_text(i)
+                                .trim_end_matches('\n')
+                                .replace('\t', "    ")
+                        })
+                        .collect(),
+                    cursor_line: cc.line,
+                    cursor_col: cc.col,
+                    mode: compose.mode,
+                    bounds: compose.bounds.clone(),
+                })
+            } else {
+                None
+            };
+
             TranscriptPrep {
                 flat_items_arc,
                 gutter_tag_snap,
@@ -395,6 +458,7 @@ impl TranscriptView {
                 block_ranges_active,
                 follow_tail,
                 pending_reveal_line,
+                you_block_snap,
             }
         });
 
@@ -419,9 +483,14 @@ impl TranscriptView {
             ranges.iter().any(|&(s, e)| line_idx >= s && line_idx < e)
         };
 
+        // INV-UX-9 (stage 2): the inline You-block snapshot is shared into the
+        // per-item render closure by refcount (it owns Vecs, so not `Copy`).
+        let you_block_snap = std::rc::Rc::new(you_block_snap);
+
         let render_fn = {
             let flat_items = flat_items_arc.clone();
             let weak_self = weak_self.clone();
+            let you_block_snap = you_block_snap.clone();
             let lines_snap = lines_snap.clone();
             let hl_snap = hl_snap.clone();
             let frozen_lines_snap = frozen_lines_snap.clone();
@@ -830,6 +899,69 @@ impl TranscriptView {
                             )
                             .into_any_element()
                     }
+                    FlatItem::YouBlock => {
+                        // INV-UX-9 (stage 2): the inline editable reply, rendered
+                        // INSIDE the transcript at its anchor. The draft lives in
+                        // the separate Compose (Model C — never the transcript); we
+                        // draw the live snapshot here. Word-wrapped at the measured
+                        // column count (INV-UX-2); the caret sits on its visual row
+                        // (INV-UX-1, reuse `build_chatbox_wrapped_line`). A `You`
+                        // accent bar/label marks it as the user's turn-in-progress.
+                        let Some(yb) = you_block_snap.as_ref() else {
+                            return div().into_any_element();
+                        };
+                        let accent = cursor_color;
+                        let fg = self_editor_fg;
+                        let sel_bg = nc(at_snap.selection_bg);
+                        // Measured inner width → wrap columns (first frame: a safe
+                        // narrow default that can't overflow; self-corrects next
+                        // frame from the `CaptureBounds` sink).
+                        let box_w = yb.bounds.get().2;
+                        let wrap_cols = if box_w > 1.0 {
+                            (box_w / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize
+                        } else {
+                            40
+                        };
+                        let mut inner = div().flex().flex_col().w_full().min_w_0();
+                        for (i, line) in yb.lines.iter().enumerate() {
+                            inner = inner.child(crate::build_chatbox_wrapped_line(
+                                line,
+                                i == yb.cursor_line,
+                                yb.cursor_col,
+                                yb.mode,
+                                accent,
+                                None,
+                                i,
+                                &code_font_snap,
+                                fg,
+                                sel_bg,
+                                wrap_cols,
+                            ));
+                        }
+                        let block = div()
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .min_w_0()
+                            .pt_2()
+                            .pb_2()
+                            .pl_2()
+                            .border_l_2()
+                            .border_color(accent)
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(accent)
+                                    .font_family(code_font_snap.clone())
+                                    .child(SharedString::new_static("You")),
+                            )
+                            .child(crate::CaptureBounds {
+                                inner: inner.into_any_element(),
+                                sink: yb.bounds.clone(),
+                            });
+                        crate::probe_bounds("you-block", block.into_any_element())
+                    }
                 }
             }
         };
@@ -900,4 +1032,21 @@ struct TranscriptPrep {
     block_ranges_active: bool,
     follow_tail: bool,
     pending_reveal_line: Option<usize>,
+    /// INV-UX-9 (stage 2): live snapshot of the inline You-block's draft for the
+    /// `FlatItem::YouBlock` render arm — the per-logical-line text, the caret
+    /// position, and the edit mode. `None` when no block is open.
+    you_block_snap: Option<YouBlockSnap>,
+}
+
+/// Per-frame snapshot of the inline You-block draft (the separate `Compose`),
+/// rendered inside the transcript at its anchor (INV-UX-9 rule 5, stage 2).
+struct YouBlockSnap {
+    lines: Vec<String>,
+    cursor_line: usize,
+    cursor_col: usize,
+    mode: EditMode,
+    /// Measured inner width sink (shared with the `Compose`) — written via
+    /// `CaptureBounds` during paint, read next frame to word-wrap at the real
+    /// column count (INV-UX-2), exactly like the bottom-panel chatbox.
+    bounds: std::rc::Rc<std::cell::Cell<(f32, f32, f32, f32)>>,
 }

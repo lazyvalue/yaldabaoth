@@ -167,6 +167,12 @@ pub(crate) enum FlatItem {
     TurnHeader { role: TurnRole },
     /// Pulsing indicator shown at transcript tail while awaiting reply.
     ThinkingIndicator,
+    /// The inline **You-block** (INV-UX-9 rule 5, stage 2): the editable reply
+    /// rendered inside the transcript at the anchor while the agent is idle. Owns
+    /// NO doc line — the draft text lives in the separate `Compose`; the render
+    /// reads it live. Injected at the anchor position during the flat-item build
+    /// when `you_block_open`.
+    YouBlock,
 }
 
 /// Role shown in a `TurnHeader`.
@@ -1511,6 +1517,7 @@ pub(crate) enum FlatKey {
     Block(usize),
     Turn(TurnRole),
     Thinking,
+    YouBlock,
 }
 
 impl FlatKey {
@@ -1521,6 +1528,7 @@ impl FlatKey {
             FlatItem::Block(rc) => FlatKey::Block(std::rc::Rc::as_ptr(rc) as usize),
             FlatItem::TurnHeader { role } => FlatKey::Turn(*role),
             FlatItem::ThinkingIndicator => FlatKey::Thinking,
+            FlatItem::YouBlock => FlatKey::YouBlock,
         }
     }
 }
@@ -2766,6 +2774,26 @@ pub(crate) fn rebuild_agent_view_model(
         flat_items.truncate(j);
     }
 
+    // INV-UX-9 rule 5 (stage 2): inject the inline **You-block** at its anchor —
+    // immediately after the anchored doc line, or at the tail when unanchored. The
+    // draft lives in the separate Compose (never the transcript), so this is purely
+    // a render slot; the per-keystroke content change busts `TranscriptSeqs`, not
+    // this (cached) build. Done AFTER the empty-header pass so the block can't be
+    // mistaken for turn content, and BEFORE `build_line_to_item` so the reverse
+    // index reflects the inserted item's shift.
+    if c.you_block_open && !c.turn_phase.is_awaiting() {
+        let pos = c
+            .you_block_anchor
+            .and_then(|l| {
+                flat_items
+                    .iter()
+                    .position(|it| matches!(it, FlatItem::Line(i) if *i == l))
+                    .map(|p| p + 1)
+            })
+            .unwrap_or(flat_items.len());
+        flat_items.insert(pos, FlatItem::YouBlock);
+    }
+
     // Derive the cursor-reveal reverse index from the FINAL flat_items (after
     // blank-collapse, tool-group merge, empty-header removal, and the tail
     // indicator) so it matches the rendered list exactly.
@@ -2898,6 +2926,14 @@ pub(crate) struct AgentState {
     /// Worksheet mode; the mid-turn chatbox (rule 7) is derived from `turn_phase`,
     /// not from this flag.
     pub(crate) you_block_open: bool,
+    /// Worksheet inline-edit (INV-UX-9 rule 5, stage 2): the doc line the open
+    /// You-block is anchored AFTER — i.e. the block renders inline immediately
+    /// below transcript line `Some(l)`, so a reply lands between two lines of the
+    /// latest agent turn. `None` = tail (render after the last line). Only
+    /// meaningful while `you_block_open`. The draft TEXT still lives in the
+    /// separate `Compose` (Model C: never in the transcript); this is purely a
+    /// render/freeze position, set when Insert opens the block.
+    pub(crate) you_block_anchor: Option<usize>,
     /// Last-seen full snapshot of the agent's plan. Updated on every ACP
     /// `Plan` notification (which carries a complete plan, not a delta —
     /// see spec-agent-window.md §21). Consumed by the Tasklist sidebar.
@@ -3120,6 +3156,13 @@ impl AgentState {
             // name the mode or the divider wouldn't appear/disappear live.
             (self.mode == EditMode::Insert).hash(&mut h);
         }
+        // INV-UX-9 (stage 2): the inline You-block is injected into the flat list
+        // when open, at its anchor — so opening/closing/moving it restructures the
+        // list and must rebuild the memo. The draft CONTENT is not keyed here (the
+        // block is one item regardless of its text); a keystroke busts the render
+        // via `TranscriptSeqs`, not this build.
+        self.you_block_open.hash(&mut h);
+        self.you_block_anchor.hash(&mut h);
         h.finish()
     }
 
@@ -3151,6 +3194,7 @@ impl AgentState {
             input_surface: InputSurface::new(InputModeKind::Chatbox),
             focus: AgentFocus::default(),
             you_block_open: false,
+            you_block_anchor: None,
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -3206,6 +3250,7 @@ impl AgentState {
             input_surface: InputSurface::new(InputModeKind::Chatbox),
             focus: AgentFocus::default(),
             you_block_open: false,
+            you_block_anchor: None,
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -3343,6 +3388,23 @@ impl AgentState {
         }
     }
 
+    /// INV-UX-9 rule 5 (stage 2): like [`insert_user_turn`] but freezes the turn
+    /// INLINE after doc line `after_line` (a between-lines reply) instead of at EOF.
+    /// Shares the same reconciler dedup/numbering chokepoint, so the agent's echo
+    /// of this prompt is still suppressed. A tail anchor degrades to the EOF append.
+    pub(crate) fn insert_user_turn_at(
+        &mut self,
+        after_line: usize,
+        text: &str,
+        origin: yalda::agent_transcript::UserTurnOrigin,
+        advance_boundary: bool,
+    ) {
+        if let Some(k) = self.register_user_turn(text, origin, advance_boundary) {
+            self.editor
+                .freeze_as_user_turn_at(after_line, text, TurnId::User(k));
+        }
+    }
+
     /// Commit a Worksheet-mode submit: derive the canonical turn `k` through the
     /// shared reconciler core ([`register_user_turn`]) — so the server/agent
     /// echo of this prompt is content-matched and **suppressed** instead of
@@ -3453,6 +3515,56 @@ impl AgentState {
             self.move_cursor_to_tail();
         }
         true
+    }
+
+    /// INV-UX-9 rule 5: the `[start, end)` doc-line range of the most-recent agent
+    /// (`TurnId::Llm`) turn, or `None` if no agent turn is tagged yet. Drives the
+    /// legal-insertion-point guard for opening a You-block — a reply may only be
+    /// placed within the latest agent turn (after one of its newlines) or at the
+    /// transcript tail.
+    pub(crate) fn latest_agent_turn_range(&self) -> Option<(usize, usize)> {
+        let meta = self.editor.metadata::<TurnId>();
+        let lc = self.editor.document().line_count();
+        let mut max_n: Option<usize> = None;
+        for l in 0..lc {
+            if let Some(a) = self.editor.anchor_for_line_opt(l)
+                && let Some(TurnId::Llm(n)) = meta.get(a).copied()
+            {
+                max_n = Some(max_n.map_or(n, |m| m.max(n)));
+            }
+        }
+        let target = max_n?;
+        let (mut start, mut end) = (None, 0usize);
+        for l in 0..lc {
+            if let Some(a) = self.editor.anchor_for_line_opt(l)
+                && let Some(TurnId::Llm(n)) = meta.get(a).copied()
+                && n == target
+            {
+                if start.is_none() {
+                    start = Some(l);
+                }
+                end = l + 1;
+            }
+        }
+        start.map(|s| (s, end))
+    }
+
+    /// INV-UX-9 rule 5: may a You-block be opened with the caret on doc line `l`?
+    /// Legal iff `l` is within the latest agent turn (insert after one of its
+    /// newlines) OR at the transcript tail (reply at the end), OR there is no agent
+    /// turn yet (reply to an empty transcript). Frozen content in OLDER turns is
+    /// not a legal insertion point.
+    pub(crate) fn you_block_anchor_is_legal(&self, l: usize) -> bool {
+        let last = self.editor.document().line_count().saturating_sub(1);
+        if l >= last {
+            return true; // tail reply is always legal
+        }
+        match self.latest_agent_turn_range() {
+            // Within the latest turn (its lines, or its trailing boundary).
+            Some((s, e)) => l >= s && l <= e,
+            // No agent turn tagged yet ⇒ nothing older to protect.
+            None => true,
+        }
     }
 
     /// Drop the worksheet caret to the end of the editable tail (the last line)

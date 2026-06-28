@@ -326,24 +326,28 @@ respond." The inline-edit behavior is what the user actually wants and what
 `spec-agent-window.md` §9–§15 originally specified; INV-UX-9 restores it on the
 durable Model C substrate.
 
-**Status:** `partially implemented` — **stage 1** (ticket 001) landed: rules 1–4,
-6, 7 for the **tail** reply (the You-block is the compose, opened on Insert from
-worksheet navigation, discarded on empty Esc, shown only when open or mid-turn).
-**Deferred:** rule 5's between-lines anchoring + the legal-point guard (ticket
-002), and retiring the user-selected Worksheet⇄Chatbox toggle / flipping the
-default to Worksheet (ticket 003). Do NOT mark `honored` until 002/003 land + a
-human runtime check. See `docs/projects/worksheet-inline-edit/`.
+**Status:** `partially implemented` — **stages 1 + 2** (tickets 001/002) landed:
+rules 1–7. The You-block opens at the caret (Insert from worksheet navigation),
+renders INLINE in the transcript at its anchor (`FlatItem::YouBlock`), is discarded
+on empty Esc (transcript byte-identical), persists on non-empty Esc (one block),
+freezes IN PLACE at the anchor on Submit (`freeze_as_user_turn_at`), and is gated to
+the latest agent turn / tail (the legal-point guard). The bottom chatbox shows only
+mid-turn. **Deferred (ticket 003):** retiring the user-selected Worksheet⇄Chatbox
+toggle + defaulting new sessions to Worksheet. Do NOT mark `honored` until 003 +
+a human runtime check (the inline caret/colours are harness gap #1). See
+`docs/projects/worksheet-inline-edit/`.
 
 **Enforcement.** Headless in `verify_harness.rs`:
 `worksheet_insert_opens_and_empty_esc_discards_you_block` (open + byte-identical
 discard, INV-1), `worksheet_nonempty_you_block_persists_after_esc` (rules 4/6),
-`worksheet_compose_visibility_tracks_block_and_turn` (painted: hidden idle, shown
-on open, shown mid-turn — rules 6/7). Planned with ticket 002:
-`worksheet_insert_blocked_outside_latest_turn`,
-`worksheet_insert_only_after_agent_newline`, `worksheet_submit_freezes_you_block_in_place`,
-and extending `agent_tile_statemachine_fuzz_holds_invariants` with You-block ops +
-oracle clauses (one You-block max; no inline edit while mid-turn; transcript
-append-only).
+`worksheet_compose_visibility_tracks_block_and_turn` + `worksheet_renders_flush_chatbox_renders_boxed`
+(painted: inline block vs bottom chatbox vs hidden — rules 2/6/7). In `tests.rs`:
+`you_block_anchor_guard_restricts_to_latest_turn` (rule 5). In `editor.rs`:
+`freeze_as_user_turn_at_inserts_between_agent_lines` +
+`freeze_as_user_turn_at_tail_degrades_to_eof_append` (the in-place freeze + its
+metadata auto-shift). The render-count proxy `transcript_021_*` still passes —
+chatbox typing leaves the transcript flat (the compose fingerprint is live only for
+the inline block).
 
 ## Cross-references
 

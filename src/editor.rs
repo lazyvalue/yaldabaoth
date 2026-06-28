@@ -1644,6 +1644,38 @@ impl Editor {
         }
     }
 
+    /// INV-UX-9 rule 5 (stage 2): freeze `text` as a committed user turn INSERTED
+    /// after doc line `after_line` — an inline reply placed BETWEEN two agent lines,
+    /// rather than appended at EOF. Mirrors [`freeze_as_user_turn`] but at the
+    /// anchor; falls back to the EOF append when the anchor is the last line (the
+    /// tail). Safe mid-document: `programmatic_insert` shifts the existing frozen
+    /// ranges + anchor-keyed metadata for the spliced text, and the insert is
+    /// non-undoable, so the user's undo can't wipe the transcript.
+    pub fn freeze_as_user_turn_at<T>(&mut self, after_line: usize, text: &str, turn_tag: T)
+    where
+        T: Any + Send + Sync + Clone + PartialEq,
+    {
+        let lc = self.core.document().line_count();
+        // Tail (or out-of-range) anchor ⇒ the EOF append handles newline guards.
+        if after_line + 1 >= lc {
+            self.freeze_as_user_turn(text, turn_tag);
+            return;
+        }
+        // Insert at the start of the line after the anchor — always right after a
+        // newline, so the inserted body begins cleanly on its own line(s).
+        let at = self.core.document().rope().line_to_char(after_line + 1);
+        let start_line = after_line + 1;
+        let body = text.strip_suffix('\n').unwrap_or(text);
+        let insert = format!("{body}\n");
+        let n_lines = insert.matches('\n').count();
+        self.splice_insert(at, &insert);
+        self.core.add_frozen_lines(start_line, start_line + n_lines);
+        for l in start_line..start_line + n_lines {
+            let a = self.core.anchor_for_line(l);
+            self.core.metadata_mut::<T>().insert(a, turn_tag.clone());
+        }
+    }
+
     fn find_llm_insertion_point<T: Any + Send + Sync + PartialEq>(&self, turn_tag: &T) -> usize {
         let doc = self.core.document();
         let total_chars = doc.rope().len_chars();
@@ -2603,6 +2635,48 @@ mod tests {
         let u2 = helper.anchor_for_line(lc - 2);
         assert_eq!(helper.metadata::<TurnId>().get(u1), Some(&TurnId::User(2)));
         assert_eq!(helper.metadata::<TurnId>().get(u2), Some(&TurnId::User(2)));
+    }
+
+    #[test]
+    fn freeze_as_user_turn_at_inserts_between_agent_lines() {
+        // INV-UX-9 rule 5 (stage 2): a reply frozen AFTER a middle line of the
+        // agent's turn lands between the right lines, is frozen + tagged, and the
+        // agent lines below it keep their tags (anchor-keyed metadata auto-shifts).
+        let mut ed = new_editor("");
+        ed.append_llm_chunk(TurnId::Llm(1), "para one\npara two\npara three\n");
+        // Lines: 0 "para one", 1 "para two", 2 "para three". Insert after line 1.
+        ed.freeze_as_user_turn_at(1, "my reply", TurnId::User(2));
+        let text = ed.document().full_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            &lines[..4],
+            &["para one", "para two", "my reply", "para three"],
+            "reply lands between para two and para three"
+        );
+        // The reply line is frozen + tagged User(2).
+        assert!(ed.is_frozen_line(2), "reply line frozen");
+        let a = ed.anchor_for_line(2);
+        assert_eq!(ed.metadata::<TurnId>().get(a), Some(&TurnId::User(2)));
+        // The agent line that shifted down keeps its Llm(1) tag.
+        let a3 = ed.anchor_for_line(3);
+        assert_eq!(
+            ed.metadata::<TurnId>().get(a3),
+            Some(&TurnId::Llm(1)),
+            "shifted agent line kept its tag — metadata auto-shift held"
+        );
+    }
+
+    #[test]
+    fn freeze_as_user_turn_at_tail_degrades_to_eof_append() {
+        // An out-of-range / last-line anchor behaves exactly like the EOF append.
+        let mut at = new_editor("");
+        at.append_llm_chunk(TurnId::Llm(1), "agent\n");
+        let mut eof = new_editor("");
+        eof.append_llm_chunk(TurnId::Llm(1), "agent\n");
+        let last = at.document().line_count().saturating_sub(1);
+        at.freeze_as_user_turn_at(last + 5, "reply", TurnId::User(2));
+        eof.freeze_as_user_turn("reply", TurnId::User(2));
+        assert_eq!(snapshot(&mut at), snapshot(&mut eof));
     }
 
     // ---- Finding #9: O(1) llm insertion-point cache -----

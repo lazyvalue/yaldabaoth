@@ -1368,6 +1368,7 @@ impl YaldaGpuiView {
             input_surface: InputSurface::new(InputModeKind::Chatbox),
             focus: AgentFocus::default(),
             you_block_open: false,
+            you_block_anchor: None,
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -3462,7 +3463,19 @@ impl YaldaGpuiView {
         // commits the user turn on a successful write. On send FAILURE we LEAVE
         // the draft in the compose (no clear, no queue) with a status so the user
         // can retry — the message is never moved out of sight or dropped.
-        if self.send_prompt_to_session(id, &text, cx) {
+        // INV-UX-9 rule 5: a worksheet reply freezes IN PLACE at the You-block's
+        // anchor (between the latest turn's lines); chatbox / tail submits append
+        // at EOF (anchor = None). Only meaningful when a block is open + idle.
+        let anchor = self
+            .agent_read(cx, |c| {
+                (!c.input_surface.is_chatbox()
+                    && c.you_block_open
+                    && !c.turn_phase.is_awaiting())
+                .then_some(c.you_block_anchor)
+                .flatten()
+            })
+            .flatten();
+        if self.send_prompt_to_session(id, &text, anchor, cx) {
             self.with_session(id, cx, |claude| {
                 // Reset the compose, PRESERVING placement (Model C §4.1).
                 let mode = claude.input_surface.mode;
@@ -3472,6 +3485,7 @@ impl YaldaGpuiView {
                 // transcript by the reconciler, the editable region is gone.
                 if mode == InputModeKind::Worksheet {
                     claude.you_block_open = false;
+                    claude.you_block_anchor = None;
                     claude.focus = AgentFocus::Transcript;
                 }
             });
@@ -3493,6 +3507,7 @@ impl YaldaGpuiView {
         &mut self,
         id: SessionId,
         text: &str,
+        anchor: Option<usize>,
         cx: &mut Context<Self>,
     ) -> bool {
         let server_sid = self.sessions.sid_of(id).map(|s| s.to_string());
@@ -3517,11 +3532,21 @@ impl YaldaGpuiView {
                 // `LocalSubmit` always inserts + records so the stream echo that
                 // follows (server `UserPrompt` / agent `UserMessage`) is
                 // suppressed. Never advances the replay boundary on a live send.
-                claude.insert_user_turn(
-                    text,
-                    yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
-                    false,
-                );
+                // INV-UX-9 rule 5: a worksheet reply with a between-lines anchor
+                // freezes IN PLACE; otherwise (chatbox / tail) it appends at EOF.
+                match anchor {
+                    Some(after_line) => claude.insert_user_turn_at(
+                        after_line,
+                        text,
+                        yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
+                        false,
+                    ),
+                    None => claude.insert_user_turn(
+                        text,
+                        yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
+                        false,
+                    ),
+                }
                 // Begin a turn unless one is ALREADY CLEANLY awaiting — a mid-turn
                 // steer (promptQueueing) rides the in-flight turn, so we don't
                 // reset its elapsed/quiet clocks. But `StopRequested` (a graceful
@@ -3725,9 +3750,10 @@ impl YaldaGpuiView {
             // editable reply attached to the conversation (rule 2). The draft lives
             // in the separate Compose (Model C: no draft in the transcript), so
             // this only flips focus/mode; nothing is written to the transcript.
-            // (Stage 1: the block is the tail reply. The legal-point guard + the
-            // between-lines anchor are ticket 002.) In a non-worksheet (chatbox)
-            // transcript focus, `Esc` returns to the compose as before.
+            // Stage 2: the block opens AT the caret, anchored to the cursor line,
+            // so a reply lands between the latest turn's lines — gated by the
+            // legal-point guard (rule 5). In a non-worksheet (chatbox) transcript
+            // focus, `Esc` returns to the compose as before.
             let worksheet = self
                 .agent_read(cx, |c| !c.input_surface.is_chatbox())
                 .unwrap_or(false);
@@ -3735,11 +3761,31 @@ impl YaldaGpuiView {
                 && press.modifiers.is_empty()
                 && matches!(press.key, Key::Char('i' | 'a' | 'o' | 'I' | 'A' | 'O'))
             {
-                self.with_session(focused_id, cx, |c| {
-                    c.you_block_open = true;
-                    c.focus = AgentFocus::Compose;
-                    c.input_surface.compose_mut().mode = EditMode::Insert;
-                });
+                // INV-UX-9 rule 5: open only at a legal insertion point (within the
+                // latest agent turn, or the tail). Inserting into an older frozen
+                // turn is refused with a hint; the caret doesn't move.
+                let anchor = self
+                    .agent_read(cx, |c| {
+                        let l = c.editor.cursor().line;
+                        c.you_block_anchor_is_legal(l).then_some(l)
+                    })
+                    .flatten();
+                match anchor {
+                    Some(l) => {
+                        self.with_session(focused_id, cx, |c| {
+                            c.you_block_open = true;
+                            c.you_block_anchor = Some(l);
+                            c.focus = AgentFocus::Compose;
+                            c.input_surface.compose_mut().mode = EditMode::Insert;
+                            c.pending_reveal_cursor = true;
+                        });
+                    }
+                    None => {
+                        if let Some(mut c) = self.agent_mut(cx) {
+                            c.status = Some("can only reply within the latest turn".into());
+                        }
+                    }
+                }
                 cx.notify();
                 return;
             }
@@ -3805,6 +3851,7 @@ impl YaldaGpuiView {
                 if c.input_surface.compose().text().trim().is_empty() {
                     c.input_surface = InputSurface::new(InputModeKind::Worksheet);
                     c.you_block_open = false;
+                    c.you_block_anchor = None;
                 } else {
                     c.input_surface.compose_mut().mode = EditMode::Normal;
                 }
