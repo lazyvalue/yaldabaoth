@@ -3201,6 +3201,9 @@ impl AgentState {
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
+            // The TEST helper keeps the historical Chatbox default so unit tests can
+            // exercise both placements explicitly; PRODUCTION defaults to Worksheet
+            // (the two real constructors — stage 3 / bug-hunt-2 B3).
             input_surface: InputSurface::new(InputModeKind::Chatbox),
             focus: AgentFocus::default(),
             you_block_open: false,
@@ -3257,8 +3260,8 @@ impl AgentState {
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
             highlight_cache: HighlightCache::new(),
-            input_surface: InputSurface::new(InputModeKind::Chatbox),
-            focus: AgentFocus::default(),
+            input_surface: InputSurface::new(InputModeKind::Worksheet),
+            focus: AgentFocus::Transcript,
             you_block_open: false,
             you_block_anchor: None,
             current_plan: None,

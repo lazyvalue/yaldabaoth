@@ -1695,10 +1695,10 @@ fn toggle_preserves_compose_value(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     install_agent_slot(&view, &mut *vcx, Some("S1"));
 
-    // New session starts in Chatbox. Type a draft into the compose.
+    // New sessions default to Worksheet. Type a draft into the compose.
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).unwrap();
-        assert!(c.input_surface.is_chatbox());
+        assert!(!c.input_surface.is_chatbox(), "default is worksheet");
         let cb = c.input_surface.compose_mut();
         for ch in "hello draft".chars() {
             cb.editor.insert_char(ch);
@@ -1706,12 +1706,12 @@ fn toggle_preserves_compose_value(cx: &mut TestAppContext) {
         assert_eq!(c.input_surface.compose().text(), "hello draft");
     });
 
-    // Toggle -> Worksheet: placement flips, the draft is preserved (not moved
-    // into the transcript, not dropped).
+    // Toggle -> Chatbox: placement flips, the draft is preserved (not moved into
+    // the transcript, not dropped).
     view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
     view.update(vcx, |v, cx| {
-        let mut c = v.agent_mut(cx).unwrap();
-        assert!(!c.input_surface.is_chatbox(), "now in worksheet placement");
+        let c = v.agent_mut(cx).unwrap();
+        assert!(c.input_surface.is_chatbox(), "now in chatbox placement");
         assert_eq!(
             c.input_surface.compose().text(),
             "hello draft",
@@ -1719,11 +1719,11 @@ fn toggle_preserves_compose_value(cx: &mut TestAppContext) {
         );
     });
 
-    // Toggle back -> Chatbox: still the same draft.
+    // Toggle back -> Worksheet: still the same draft.
     view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
     view.update(vcx, |v, cx| {
-        let mut c = v.agent_mut(cx).unwrap();
-        assert!(c.input_surface.is_chatbox());
+        let c = v.agent_mut(cx).unwrap();
+        assert!(!c.input_surface.is_chatbox());
         assert_eq!(c.input_surface.compose().text(), "hello draft");
     });
 }
@@ -1744,16 +1744,20 @@ fn toggle_agent_focus_round_trips(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     install_agent_slot(&view, &mut *vcx, Some("S1"));
 
-    view.update(vcx, |v, cx| {
-        assert_eq!(v.agent_mut(cx).unwrap().focus, crate::AgentFocus::Compose);
-    });
-    view.update(vcx, |v, cx| v.toggle_agent_focus(cx));
+    // Worksheet (default) rests in transcript nav. toggle → Compose OPENS a block
+    // (a visible surface); toggle back → Transcript nav.
     view.update(vcx, |v, cx| {
         assert_eq!(v.agent_mut(cx).unwrap().focus, crate::AgentFocus::Transcript);
     });
     view.update(vcx, |v, cx| v.toggle_agent_focus(cx));
     view.update(vcx, |v, cx| {
-        assert_eq!(v.agent_mut(cx).unwrap().focus, crate::AgentFocus::Compose);
+        let c = v.agent_mut(cx).unwrap();
+        assert_eq!(c.focus, crate::AgentFocus::Compose);
+        assert!(c.inline_you_block_active(), "focus→Compose opened a visible block");
+    });
+    view.update(vcx, |v, cx| v.toggle_agent_focus(cx));
+    view.update(vcx, |v, cx| {
+        assert_eq!(v.agent_mut(cx).unwrap().focus, crate::AgentFocus::Transcript);
     });
 }
 
@@ -1775,10 +1779,9 @@ fn worksheet_blank_submit_is_noop(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     install_agent_slot(&view, &mut *vcx, Some("S1"));
 
-    // Switch to worksheet placement; leave the compose blank.
-    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    // Default is worksheet; leave the compose blank.
     view.update(vcx, |v, cx| {
-        let mut c = v.agent_mut(cx).unwrap();
+        let c = v.agent_mut(cx).unwrap();
         assert!(!c.input_surface.is_chatbox());
         assert!(c.input_surface.compose().text().trim().is_empty());
     });
@@ -4674,6 +4677,9 @@ fn compose_caret_row_painted_inside_box_when_wrapped(cx: &mut TestAppContext) {
     // short-circuits `render` before `render_agent` runs — wall-clock doesn't
     // advance under run_until_parked, so the splash never expires headlessly).
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    // The bottom compose BOX is the chatbox surface (default is now worksheet, whose
+    // idle draft renders inline). This test targets the boxed compose's caret math.
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
 
     // Seed a draft that wraps WELL beyond the 8-row box, caret left at the end.
     view.update(vcx, |v, cx| {
@@ -4751,27 +4757,29 @@ fn compose_caret_row_painted_inside_box_when_wrapped(cx: &mut TestAppContext) {
 fn worksheet_renders_flush_chatbox_renders_boxed(cx: &mut TestAppContext) {
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
 
-    // Chatbox mode (the default): a pinned bottom box paints; no inline block.
+    // Worksheet (the default) with an open You-block: the editable reply paints
+    // INLINE in the transcript; there is no pinned bottom box.
     assert!(
-        view.update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.is_chatbox()))
+        !view.update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.is_chatbox()))
             .expect("bound agent session"),
-        "precondition: a fresh session starts in Chatbox"
+        "precondition: a fresh session defaults to Worksheet"
     );
-    let (_, chat_y, _, _) = probe_dirty(&view, vcx, "compose-box").expect("chatbox paints a bottom box");
-    assert!(probe_dirty(&view, vcx, "you-block").is_none(), "chatbox has no inline block");
-
-    // Worksheet with an open You-block: the editable reply paints INLINE in the
-    // transcript, and the bottom box is gone.
-    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
     view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
     vcx.run_until_parked();
     let (_, yb_y, _, _) = probe_dirty(&view, vcx, "you-block").expect("worksheet block paints inline");
     assert!(
         probe_dirty(&view, vcx, "compose-box").is_none(),
-        "the worksheet block is inline — the bottom box is gone"
+        "the worksheet block is inline — no bottom box"
     );
+
+    // Toggle to Chatbox: a pinned bottom box paints; the inline block is gone.
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    vcx.run_until_parked();
+    let (_, chat_y, _, _) = probe_dirty(&view, vcx, "compose-box").expect("chatbox paints a bottom box");
+    assert!(probe_dirty(&view, vcx, "you-block").is_none(), "chatbox has no inline block");
+
     // The inline block sits in the scrolling transcript column, ABOVE where the
-    // pinned chatbox sat at the window bottom — a genuinely different placement.
+    // pinned chatbox sits at the window bottom — a genuinely different placement.
     assert!(
         yb_y < chat_y + 1.0,
         "inline you-block top ({yb_y}) is at/above the pinned chatbox top ({chat_y})"
@@ -4830,10 +4838,11 @@ fn boot_worksheet_nav(
     cx: &mut TestAppContext,
 ) -> (gpui::Entity<YaldaGpuiView>, &mut gpui::VisualTestContext) {
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
-    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    // New sessions now DEFAULT to Worksheet resting in nav (stage 3 / bug-hunt-2 B3) —
+    // no toggle needed. Verify that resting state.
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
-        assert!(!c.input_surface.is_chatbox(), "in worksheet");
+        assert!(!c.input_surface.is_chatbox(), "default is worksheet");
         assert_eq!(c.focus, crate::AgentFocus::Transcript, "worksheet rests in nav");
         assert!(!c.you_block_open, "no You-block until Insert");
     });
@@ -5013,8 +5022,7 @@ fn worksheet_you_block_anchors_at_cursor_not_tail(cx: &mut TestAppContext) {
     use yalda::acp_channel::ReplyEvent;
     use yalda::session_proto::Notification as ServerNotification;
 
-    let (view, vcx, _id, _session) = boot_with_transcript(cx);
-    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx)); // → worksheet nav
+    let (view, vcx, _id, _session) = boot_with_transcript(cx); // defaults to worksheet nav
 
     // A multi-line latest agent turn so there ARE lines after the anchor.
     let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
@@ -5074,8 +5082,7 @@ fn worksheet_reentering_insert_keeps_block_anchor(cx: &mut TestAppContext) {
     use yalda::acp_channel::ReplyEvent;
     use yalda::session_proto::Notification as ServerNotification;
 
-    let (view, vcx, _id, _session) = boot_with_transcript(cx);
-    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx)); // worksheet nav
+    let (view, vcx, _id, _session) = boot_with_transcript(cx); // defaults to worksheet nav
     let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
         session_id: "S1".into(),
         event: e,
@@ -5225,6 +5232,37 @@ fn worksheet_midturn_typing_routes_to_chatbox(cx: &mut TestAppContext) {
     });
 }
 
+/// REGRESSION (bug-hunt-2 B2): a tall inline reply is windowed so the caret's line
+/// is always within the rendered window (≤ YB_WIN lines) — it can't grow past the
+/// viewport and strand the caret below the fold. Drives the real open + typing, then
+/// checks the windowing math the render uses keeps the caret line visible.
+#[gpui::test]
+fn worksheet_tall_inline_block_keeps_caret_in_window(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    vcx.run_until_parked();
+    // Type many lines so the block far exceeds a viewport.
+    for _ in 0..30 {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("x"), w, cx));
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("enter"), w, cx));
+    }
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(c.inline_you_block_active(), "block still open");
+        let cl = c.input_surface.compose().editor.cursor().line;
+        let n = c.input_surface.compose().editor.document().line_count().max(1);
+        assert!(n > 10, "draft is genuinely taller than the window ({n} lines)");
+        // The render windows YB_WIN=10 lines around the caret via the same helper.
+        let win_top = crate::compose_first_visible_line(cl, 0, n, 10);
+        assert!(
+            cl >= win_top && cl < win_top + 10,
+            "the caret line {cl} must lie within the rendered window [{win_top}, {}) (B2)",
+            win_top + 10
+        );
+    });
+}
+
 /// REGRESSION (bug-hunt-2 B1): the `f` focus-toggle (Transcript→Compose) in an idle
 /// worksheet must OPEN a You-block — leaving focus=Compose with no visible surface
 /// would make typing vanish into the void.
@@ -5319,6 +5357,9 @@ fn worksheet_turn_end_carries_over_draft_or_rests_in_nav(cx: &mut TestAppContext
 #[gpui::test]
 fn subagent_panes_paint_above_the_compose(cx: &mut TestAppContext) {
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    // Need the bottom compose box on screen (default is worksheet now); the panes
+    // sit above it. Enter chatbox so the `compose-box` probe has a target.
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
 
     // Register a Task subagent (Think + prompt) into the bound session's tool
     // state so `subagents()` is non-empty and the panes render.

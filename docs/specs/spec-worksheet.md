@@ -103,12 +103,21 @@ only, idle only) so the corruption case stays unrepresentable.
   EOF). See `spec-agent-window.md` §19.
 - **INV-UX-2** holds: the editable region word-wraps.
 
+## Default & the chatbox toggle
+
+New sessions **default to Worksheet** (stage 3). The chatbox is primarily the
+**mid-turn input surface** (rule 7) — it auto-appears while the agent is writing
+and is hidden when idle. It is **also** available as an optional *persistent*
+placement via `Ctrl-Alt-Enter` (a pinned bottom box for users who prefer a plain
+message box); that toggle is not required for normal use and the worksheet is the
+canonical mode.
+
 ## What this supersedes
 
-- `spec-agent-window.md` §4–§7 (two co-equal user-toggled input modes): the
-  chatbox is **no longer a user-selected mode**. It is the **mid-turn-only** input
-  surface. There is no `Ctrl-Alt-Enter` Worksheet⇄Chatbox toggle in the user
-  model; the worksheet is *the* mode and the chatbox auto-appears mid-turn.
+- `spec-agent-window.md` §4–§7 (two **co-equal** input modes, defaulting to
+  Chatbox): the worksheet is now the **default and canonical** mode; the chatbox
+  is the mid-turn surface (auto, idle-hidden) plus an optional persistent
+  placement (above).
 - The Model C *UX* (read-only transcript + always-present separate compose,
   ADR-0024 "Consequences" → UX bullets). The Model C *data architecture* stays.
 

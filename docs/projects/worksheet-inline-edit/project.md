@@ -50,7 +50,8 @@ killed stays unrepresentable.
 |---|---|---|
 | 001 | Worksheet edit-state model + idle/mid-turn routing + You-block lifecycle (tail anchor) | DONE (rules 1–4,6,7 tail; 275+143 tests) |
 | 002 | Between-lines anchoring: open/render/freeze a You-block at an arbitrary legal point in the latest turn (render injection into TranscriptView) | DONE (FlatItem::YouBlock inline render + freeze_as_user_turn_at + legal guard; 276+145 tests) |
-| 003 | Retire the user-selected Worksheet⇄Chatbox toggle; chatbox is purely mid-turn-derived; default new sessions to Worksheet | open |
+| 003 | Default new sessions to Worksheet; chatbox = mid-turn surface + optional persistent toggle (spec reconciled) | DONE |
+| 004 | Two adversarial review rounds (20 bugs found+fixed, each verified) + fuzzer hardening (You-block ops + oracle invariants: block⇒worksheet, focus=Compose⇒visible-surface, effective-anchor legal) | DONE |
 
 ## Links
 

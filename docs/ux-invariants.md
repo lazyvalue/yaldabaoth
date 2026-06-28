@@ -289,8 +289,10 @@ placements (caret math unchanged).
 
 ### INV-UX-9 — The worksheet is an inline-editable conversation buffer (chatbox is mid-turn only)
 
-**Statement.** Worksheet mode behaves as an **editable conversation buffer**, per
-`spec-worksheet.md` (AUTHORITATIVE). Concretely:
+**Statement.** New agent sessions **default to Worksheet** (the canonical mode);
+the chatbox is the mid-turn surface plus an optional persistent placement
+(`Ctrl-Alt-Enter`). Worksheet mode behaves as an **editable conversation buffer**,
+per `spec-worksheet.md` (AUTHORITATIVE). Concretely:
 
 1. **Free navigation.** In Normal mode the caret moves freely over the whole
    transcript (read navigation; nothing editable until Insert).

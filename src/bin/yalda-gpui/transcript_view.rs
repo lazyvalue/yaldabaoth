@@ -941,10 +941,20 @@ impl TranscriptView {
                         } else {
                             40
                         };
+                        // INV-UX-1 (bug-hunt-2 B2): cap the inline reply to a WINDOW
+                        // of logical lines around the caret so a long reply can't grow
+                        // taller than the viewport and scroll the caret below the fold
+                        // (the recurring caret-off-screen class — here bounded by
+                        // construction, the caret's line is always in the window).
+                        const YB_WIN: usize = 10;
+                        let n = yb.lines.len().max(1);
+                        let win_top =
+                            crate::compose_first_visible_line(yb.cursor_line, 0, n, YB_WIN);
+                        let win_end = (win_top + YB_WIN).min(yb.lines.len());
                         let mut inner = div().flex().flex_col().w_full().min_w_0();
-                        for (i, line) in yb.lines.iter().enumerate() {
+                        for i in win_top..win_end {
                             inner = inner.child(crate::build_chatbox_wrapped_line(
-                                line,
+                                &yb.lines[i],
                                 // caret only when the compose is focused (B5: no
                                 // double caret while navigating a persisted block).
                                 yb.focused && i == yb.cursor_line,
