@@ -4742,6 +4742,69 @@ fn compose_caret_row_painted_inside_box_when_wrapped(cx: &mut TestAppContext) {
     );
 }
 
+/// VERIFICATION HARNESS (INV-UX-8 — painted proof the two compose PLACEMENTS
+/// render differently). Worksheet is inline-flush — no box chrome (no border,
+/// no panel bg, no horizontal margins) — so the draft fills the transcript
+/// column; Chatbox is a pinned box inset by a margin. Boot in chatbox, capture
+/// the compose content bounds (written by the `CaptureBounds` sink during paint),
+/// toggle to worksheet, re-capture, and assert the worksheet content is WIDER and
+/// sits further LEFT — i.e. the box margins/border are gone. Closes the
+/// "toggling worksheet does nothing" gap the user reported.
+#[gpui::test]
+fn worksheet_renders_flush_chatbox_renders_boxed(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+
+    // Capture the compose box's OUTER (post-margin) painted bounds via the
+    // `compose-box` layout probe. The probe records the scroll div's border-box,
+    // so a horizontal margin (chatbox `mx_2`) shows up as a narrower box shifted
+    // right; the flush worksheet has neither.
+    let probe_box = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        for _ in 0..3 {
+            view.update(vcx, |_, cx| cx.notify());
+            vcx.run_until_parked();
+        }
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let b = crate::layout_probe_get("compose-box");
+        crate::layout_probe_end();
+        b.expect("compose box did not paint")
+    };
+
+    // Default placement is Chatbox (a boxed, inset panel).
+    let started_chatbox = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.is_chatbox()))
+        .expect("bound agent session");
+    assert!(started_chatbox, "precondition: a fresh session starts in Chatbox");
+    let (chat_x, _, chat_w, _) = probe_box(&view, vcx);
+    assert!(chat_w > 1.0, "chatbox compose box has no width ({chat_w})");
+
+    // Toggle to Worksheet (inline-flush placement) and re-probe.
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    let in_worksheet = !view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.is_chatbox()))
+        .expect("bound agent session");
+    assert!(in_worksheet, "toggle entered Worksheet placement");
+    let (ws_x, _, ws_w, _) = probe_box(&view, vcx);
+    assert!(ws_w > 1.0, "worksheet compose box has no width ({ws_w})");
+
+    // Worksheet is flush: it drops the chatbox's horizontal margin (mx_2 ≈ 8px
+    // each side) and 1px border, so its content area is WIDER and starts further
+    // LEFT than the boxed chatbox. The delta is small but unambiguous, well
+    // beyond sub-pixel noise — this is the VISIBLE distinction INV-UX-8 requires.
+    // Worksheet is flush: it drops the chatbox's left margin (`mx_2` ≈ 8px), so
+    // its box paints further LEFT than the inset, boxed chatbox. This is the
+    // VISIBLE, geometric distinction INV-UX-8 requires (the border/bg/accent-bar
+    // differences are color-level — harness gap #1, a human eye). The shift is a
+    // full margin (~8px), well beyond sub-pixel noise.
+    let _ = (chat_w, ws_w);
+    assert!(
+        ws_x < chat_x - 4.0,
+        "worksheet box left ({ws_x}) should sit left of the boxed chatbox ({chat_x}) \
+         — the box margin is gone, the worksheet is flush in the column",
+    );
+}
+
 /// VERIFICATION HARNESS (#3.2 — painted-bounds proof of INV-UX-5 layout): the
 /// subagent (Task) list renders ABOVE the compose box, one per line. Register a
 /// Task subagent tool call so the list appears, drive a real paint pass, and

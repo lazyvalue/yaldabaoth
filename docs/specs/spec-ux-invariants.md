@@ -244,6 +244,42 @@ worker + REAL `claude-agent-acp` and proves a mid-turn steer is delivered and
 processed; the v2-refused / promptQueueing facts were confirmed by a live probe.
 The only thing left for a human is the subjective visual feel.
 
+### INV-UX-8 — Worksheet renders inline-flush; chatbox renders as a pinned box
+
+**Statement.** The two compose **placements** are visually distinct, not
+cosmetically identical. In **Worksheet** placement the compose renders **inline
+flush in the transcript column** — no box chrome (no panel background, border, or
+horizontal margins), with an accent **left bar** as the `›` draft gutter and the
+**You** label — so the draft reads as a continuation of the conversation. In
+**Chatbox** placement the compose renders as a **pinned, bordered box** inset from
+the column edge by a horizontal margin. Toggling placement (`Ctrl-Alt-Enter` /
+space → w) therefore produces a **visible** change, not a near-no-op.
+
+**Applies to.** The agent tile compose panel (`compose_panel` in `render_agent`,
+`screens.rs`), both the small-draft and virtualized render paths.
+
+**Why.** Model C (ADR-0024) made worksheet and chatbox **one model at two
+placements**, but v1 shipped the placement axis with near-identical rendering
+(both a boxed panel; worksheet differed only by an accent border + label), so
+switching "felt like nothing happened" and worksheet read as broken. The flush
+inline rendering is the deferred §7/v1 styling from `design-c.md` that makes the
+worksheet placement actually distinct and usable. The inner compose body (wrap,
+caret-containment window, virtualization) is **unchanged** — only the outer chrome
+differs — so INV-UX-1/INV-UX-2 are untouched.
+
+**Status:** `honored` — placement chrome implemented; the visible distinction is
+headless-tested via the captured compose bounds. Exact glyphs/colors are the one
+human-eye item (harness gap #1).
+
+**Enforcement.** Headless in `verify_harness.rs`:
+`worksheet_renders_flush_chatbox_renders_boxed` — boots in chatbox, captures the
+compose box's painted bounds via the `compose-box` layout probe, toggles to
+worksheet, re-captures, and asserts the worksheet box paints **~8px further left**
+(the chatbox `mx_2` margin is gone) — i.e. flush in the column. The border/bg/
+accent-bar differences are color-level (harness gap #1, a human eye). INV-UX-1's
+`compose_caret_row_painted_inside_box_when_wrapped` still passes in both
+placements (caret math unchanged).
+
 ## Cross-references
 
 - `spec-turn-steering.md` — the full steering design (queue, delivery modes, the
@@ -261,6 +297,11 @@ The only thing left for a human is the subjective visual feel.
 
 ## Revision history
 
+- 2026-06-28 — Added INV-UX-8 (worksheet renders inline-flush in the transcript
+  column; chatbox stays a pinned box — the two placements are now visibly
+  distinct, closing the "toggling worksheet does nothing" gap). The deferred
+  `design-c.md` §7/v1 inline-flush styling. Guards
+  `worksheet_renders_flush_chatbox_renders_boxed` in `verify_harness.rs`.
 - 2026-06-26 — Added INV-UX-7 (mid-turn submits steer/queue instead of starting a
   competing turn; no optimistic transcript echo; Esc interrupts an in-flight
   turn). See `spec-turn-steering.md`. Guards `steering_*` +

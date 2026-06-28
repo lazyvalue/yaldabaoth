@@ -1268,7 +1268,7 @@ impl YaldaGpuiView {
                         visible_cols,
                     ));
                 }
-                div()
+                let mut scroll = div()
                     .id("compose-scroll")
                     .w_full()
                     .min_w_0()
@@ -1281,15 +1281,25 @@ impl YaldaGpuiView {
                     .overflow_hidden()
                     .px_4()
                     .py(px(8.0))
-                    .bg(compose_panel_bg)
-                    .border_1()
-                    .border_color(dim_fg)
-                    .rounded_md()
-                    .mx_2()
-                    .mb_1()
                     .font_family(compose_code_font.clone())
                     .text_size(px(13.0))
-                    .text_color(compose_fg)
+                    .text_color(compose_fg);
+                // Placement chrome (design-c.md §1): Worksheet renders inline
+                // flush in the transcript column — no box, no margins — with an
+                // accent left bar as the `›` draft gutter, so the draft reads as a
+                // continuation of the conversation. Chatbox keeps the pinned box.
+                if is_worksheet {
+                    scroll = scroll.border_l_2().border_color(compose_cursor_color);
+                } else {
+                    scroll = scroll
+                        .bg(compose_panel_bg)
+                        .border_1()
+                        .border_color(dim_fg)
+                        .rounded_md()
+                        .mx_2()
+                        .mb_1();
+                }
+                scroll
                     // Capture the inner content width (inside px_4) so next
                     // frame's `visible_cols` reflects the real box, not the
                     // whole-window width.
@@ -1361,7 +1371,7 @@ impl YaldaGpuiView {
                             visible_cols,
                         )
                     };
-                div()
+                let mut scroll = div()
                     .id("compose-scroll")
                     .flex()
                     .flex_col()
@@ -1370,15 +1380,23 @@ impl YaldaGpuiView {
                     .h(px(max_visible_h + 16.0))
                     .px_4()
                     .py(px(8.0))
-                    .bg(compose_panel_bg)
-                    .border_1()
-                    .border_color(compose_border)
-                    .rounded_md()
-                    .mx_2()
-                    .mb_1()
                     .font_family(compose_code_font.clone())
                     .text_size(px(13.0))
-                    .text_color(compose_fg)
+                    .text_color(compose_fg);
+                // Same placement chrome as the small-draft path (design-c.md §1):
+                // inline-flush worksheet (accent left bar) vs pinned box.
+                if is_worksheet {
+                    scroll = scroll.border_l_2().border_color(compose_cursor_color);
+                } else {
+                    scroll = scroll
+                        .bg(compose_panel_bg)
+                        .border_1()
+                        .border_color(compose_border)
+                        .rounded_md()
+                        .mx_2()
+                        .mb_1();
+                }
+                scroll
                     .child(CaptureBounds {
                         inner: gpui::list(tb.list.state().clone(), render_fn)
                             .flex_1()
@@ -1419,7 +1437,14 @@ impl YaldaGpuiView {
                         .child(SharedString::new_static("You")),
                 );
             }
-            Some(panel.child(separator).child(compose_body))
+            // Probe the compose box's OUTER (post-margin) bounds so the harness
+            // can prove the placement chrome differs (INV-UX-8): worksheet is
+            // flush (full column width, no margin) vs chatbox's inset box.
+            Some(
+                panel
+                    .child(separator)
+                    .child(probe_bounds("compose-box", compose_body)),
+            )
         };
 
         // ---- Right-side sidebars (Tasklist / Subagents) ----
