@@ -5225,18 +5225,47 @@ fn worksheet_midturn_typing_routes_to_chatbox(cx: &mut TestAppContext) {
     });
 }
 
-/// REGRESSION (round-2, leader-gate): mid-turn the worksheet focuses the COMPOSE
-/// (the chatbox), so `focused_in_insert_mode` is true and the universal leaders
-/// (`space`/`.`/`?`) do NOT fire — a space is typed into the steer, not interpreted
-/// as a menu chord. (A worksheet submit sets focus=Compose for exactly this reason.)
+/// REGRESSION (bug-hunt-2 B1): the `f` focus-toggle (Transcript→Compose) in an idle
+/// worksheet must OPEN a You-block — leaving focus=Compose with no visible surface
+/// would make typing vanish into the void.
+#[gpui::test]
+fn worksheet_focus_toggle_opens_visible_block(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    view.update(vcx, |v, cx| v.toggle_agent_focus(cx));
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(c.focus, crate::AgentFocus::Compose);
+        assert!(
+            c.inline_you_block_active(),
+            "focus→Compose in idle worksheet must open a VISIBLE inline block (B1)"
+        );
+        assert_eq!(c.input_surface.compose().mode, crate::EditMode::Insert);
+    });
+    // And typing now lands in the (visible) block.
+    for k in ["o", "k"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    }
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        assert_eq!(
+            v.agent_mut(cx).expect("agent").input_surface.compose().text().trim(),
+            "ok"
+        );
+    });
+}
+
+/// REGRESSION (round-2, leader-gate): mid-turn in the worksheet, input routes to the
+/// bottom chatbox while focus STAYS on the transcript (focus=Compose would strand on
+/// stop). `focused_in_insert_mode` returns true mid-turn-worksheet so the universal
+/// leaders (`space`/`.`/`?`) do NOT fire — a space is typed into the steer.
 #[gpui::test]
 fn worksheet_midturn_space_types_into_chatbox(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
-    // The post-submit mid-turn state: a turn is awaiting and the compose is focused.
+    // REAL mid-turn state: awaiting, focus stays on the transcript (NOT Compose).
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).expect("agent");
         c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
-        c.focus = crate::AgentFocus::Compose;
+        c.focus = crate::AgentFocus::Transcript;
         c.input_surface.compose_mut().mode = crate::EditMode::Insert;
     });
     for k in ["a", "space", "b"] {
@@ -5576,7 +5605,20 @@ fn assert_agent_invariants(
             let block_mode_ok = !c.you_block_open || !c.input_surface.is_chatbox();
             // The EFFECTIVE anchor (what consumers use) is always legal-or-None.
             let eff_ok = c.effective_you_block_anchor().is_none_or(|a| c.you_block_anchor_is_legal(a));
-            (caret_line_ok, caret_col_ok, frozen, focus_ok, stop_ok && block_mode_ok && eff_ok)
+            // focus==Compose ⇒ there is a VISIBLE editable surface (the bottom box in
+            // chatbox/mid-turn, or the inline block) — never focus-into-the-void
+            // (bug-hunt-2 B1/B4).
+            let visible_surface_ok = c.focus != AgentFocus::Compose
+                || c.input_surface.is_chatbox()
+                || c.turn_phase.is_awaiting()
+                || c.inline_you_block_active();
+            (
+                caret_line_ok,
+                caret_col_ok,
+                frozen,
+                focus_ok,
+                stop_ok && block_mode_ok && eff_ok && visible_surface_ok,
+            )
         })
         .unwrap()
     });

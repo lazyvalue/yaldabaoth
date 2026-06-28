@@ -89,6 +89,7 @@ pub(crate) struct TranscriptSeqs {
     pub(crate) compose_edit_seq: u64,
     pub(crate) compose_cursor: (usize, usize),
     pub(crate) compose_mode: EditMode,
+    pub(crate) compose_selection: Option<((usize, usize), (usize, usize))>,
 }
 
 impl TranscriptSeqs {
@@ -104,17 +105,19 @@ impl TranscriptSeqs {
         // transcript (the `transcript_021_*` perf regression). So zero the compose
         // fields off-inline.
         let inline_block_active = c.inline_you_block_active();
-        let (compose_edit_seq, compose_cursor, compose_mode) = if inline_block_active {
-            let compose = c.input_surface.compose();
-            let cc = compose.editor.cursor();
-            (
-                compose.editor.document().edit_seq(),
-                (cc.line, cc.col),
-                compose.mode,
-            )
-        } else {
-            (0, (0, 0), EditMode::Normal)
-        };
+        let (compose_edit_seq, compose_cursor, compose_mode, compose_selection) =
+            if inline_block_active {
+                let compose = c.input_surface.compose();
+                let cc = compose.editor.cursor();
+                (
+                    compose.editor.document().edit_seq(),
+                    (cc.line, cc.col),
+                    compose.mode,
+                    compose.editor.selection_range(),
+                )
+            } else {
+                (0, (0, 0), EditMode::Normal, None)
+            };
         Self {
             edit_seq: c.editor.document().edit_seq(),
             frozen_gen: c.frozen_gen(),
@@ -132,6 +135,7 @@ impl TranscriptSeqs {
             compose_edit_seq,
             compose_cursor,
             compose_mode,
+            compose_selection,
         }
     }
 
@@ -445,6 +449,8 @@ impl TranscriptView {
                     cursor_line: cc.line,
                     cursor_col: cc.col,
                     mode: compose.mode,
+                    focused: c.focus == AgentFocus::Compose,
+                    selection: compose.editor.selection_range(),
                     bounds: compose.bounds.clone(),
                 })
             } else {
@@ -939,11 +945,13 @@ impl TranscriptView {
                         for (i, line) in yb.lines.iter().enumerate() {
                             inner = inner.child(crate::build_chatbox_wrapped_line(
                                 line,
-                                i == yb.cursor_line,
+                                // caret only when the compose is focused (B5: no
+                                // double caret while navigating a persisted block).
+                                yb.focused && i == yb.cursor_line,
                                 yb.cursor_col,
                                 yb.mode,
                                 accent,
-                                None,
+                                yb.selection, // B6: show the selection highlight
                                 i,
                                 &code_font_snap,
                                 fg,
@@ -1058,6 +1066,13 @@ struct YouBlockSnap {
     cursor_line: usize,
     cursor_col: usize,
     mode: EditMode,
+    /// Whether the compose holds focus. The caret renders ONLY when focused — a
+    /// persisted (non-empty Esc) block shows no caret while the user navigates the
+    /// transcript, so there aren't two carets on screen (bug-hunt-2 B5).
+    focused: bool,
+    /// The compose selection, so a visual selection inside the inline reply is
+    /// actually highlighted (bug-hunt-2 B6).
+    selection: Option<((usize, usize), (usize, usize))>,
     /// Measured inner width sink (shared with the `Compose`) — written via
     /// `CaptureBounds` during paint, read next frame to word-wrap at the real
     /// column count (INV-UX-2), exactly like the bottom-panel chatbox.

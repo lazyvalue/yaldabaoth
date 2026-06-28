@@ -3215,13 +3215,33 @@ impl YaldaGpuiView {
             return;
         };
         self.with_session(id, cx, |claude| {
-            claude.focus = match claude.focus {
+            match claude.focus {
                 AgentFocus::Compose => {
+                    // → Transcript navigation. In the worksheet an EMPTY block is
+                    // discarded (no phantom); a non-empty one persists (rule 4).
                     claude.mode = EditMode::Normal;
-                    AgentFocus::Transcript
+                    if !claude.input_surface.is_chatbox()
+                        && claude.input_surface.compose().text().trim().is_empty()
+                    {
+                        claude.close_you_block();
+                    }
+                    claude.focus = AgentFocus::Transcript;
                 }
-                AgentFocus::Transcript => AgentFocus::Compose,
-            };
+                AgentFocus::Transcript => {
+                    // → Compose. INVARIANT: in the worksheet, focus=Compose only when
+                    // a block is open (else focus-into-the-void — B1). So idle ⇒ open
+                    // a block; mid-turn ⇒ leave focus on the transcript (typing
+                    // already routes to the bottom chatbox, and keeping Transcript
+                    // means the turn can end via stop/finalize without stranding
+                    // focus=Compose over a vanished box — the fuzzer-found edge). Only
+                    // chatbox mode (always-visible box) focuses the compose directly.
+                    if claude.input_surface.is_chatbox() {
+                        claude.focus = AgentFocus::Compose;
+                    } else if !claude.turn_phase.is_awaiting() {
+                        claude.open_you_block_at_cursor();
+                    }
+                }
+            }
         });
         cx.notify();
     }
@@ -3490,15 +3510,16 @@ impl YaldaGpuiView {
                 let mode = claude.input_surface.mode;
                 claude.input_surface = InputSurface::new(mode);
                 // INV-UX-9 (rule 4): a worksheet submit closes the You-block — the
-                // reply was frozen into the transcript by the reconciler. A turn is
-                // now in flight, so focus the COMPOSE: mid-turn that IS the chatbox
-                // (rule 7), and focused-Compose is what makes typing (incl. space /
-                // leader keys) reach the box instead of firing the tile menu. At
-                // turn-end `finalize_agent_turn_idem` returns focus to nav (empty)
-                // or keeps the carried-over tail block (non-empty).
+                // reply was frozen by the reconciler — and rests in transcript NAV
+                // (focus=Transcript). It does NOT switch to focus=Compose: a turn can
+                // end via stop/force-restart (not just finalize), and focus=Compose
+                // would then outlive the vanished mid-turn chatbox → invisible compose
+                // (the fuzzer-found B1 edge). Mid-turn typing still reaches the
+                // chatbox: the transcript is treated unfocused while awaiting, and
+                // `focused_in_insert_mode` suppresses leaders mid-turn.
                 if mode == InputModeKind::Worksheet {
                     claude.close_you_block();
-                    claude.focus = AgentFocus::Compose;
+                    claude.focus = AgentFocus::Transcript;
                 }
             });
         } else if let Some(mut claude) = self.agent_mut(cx) {
@@ -3637,9 +3658,9 @@ impl YaldaGpuiView {
                 // re-materialize as a phantom at a stale anchor when the turn ends
                 // (bug-hunt 4, 10). The compose draft is left intact.
                 claude.close_you_block();
-                // Model C: hand focus back to the compose after sending a
-                // selection, so the user is ready to type the next prompt.
-                claude.focus = AgentFocus::Compose;
+                // Rest in transcript navigation (a turn is now in flight; mid-turn
+                // typing routes to the chatbox without focus=Compose — see submit).
+                claude.focus = AgentFocus::Transcript;
             }
         } else if let Some(mut claude) = self.agent_mut(cx) {
             claude.status = Some("send failed — selection not sent".into());
@@ -3790,50 +3811,34 @@ impl YaldaGpuiView {
                 && press.modifiers.is_empty()
                 && matches!(press.key, Key::Char('i' | 'a' | 'o' | 'I' | 'A' | 'O'))
             {
-                // INV-UX-9 rule 6: one block at a time. If a block is ALREADY open
-                // (e.g. the user pressed Esc to navigate, leaving a non-empty reply
-                // pending), `i` RESUMES it at its existing anchor — it must NOT move
-                // the reply (and its text) to wherever the caret now sits (the
-                // "insertion jumps around" bug). A fresh anchor is computed only when
-                // opening a NEW block, and only at a legal point (rule 5): within the
-                // latest agent turn or the tail; an older frozen turn is refused.
-                let already_open = self.agent_read(cx, |c| c.you_block_open).unwrap_or(false);
-                if already_open {
-                    self.with_session(focused_id, cx, |c| {
-                        c.focus = AgentFocus::Compose;
-                        c.input_surface.compose_mut().mode = EditMode::Insert;
-                        c.pending_reveal_cursor = true;
-                    });
-                    cx.notify();
-                    return;
-                }
-                let anchor = self
+                // INV-UX-9 rule 6: one block at a time. If a block is ALREADY open,
+                // `i` RESUMES it in place (open_you_block_at_cursor is idempotent —
+                // it must NOT move the reply to the caret: the "jumps around" bug). A
+                // NEW block opens only at a legal point (rule 5): within the latest
+                // agent turn or the tail; an older frozen turn is refused with a hint.
+                // The anchor is snapped to a rendered line inside the helper (B7).
+                let open = self
                     .agent_read(cx, |c| {
-                        let l = c.editor.cursor().line;
-                        c.you_block_anchor_is_legal(l).then_some(l)
+                        c.you_block_open || c.you_block_anchor_is_legal(c.editor.cursor().line)
                     })
-                    .flatten();
-                match anchor {
-                    Some(l) => {
-                        self.with_session(focused_id, cx, |c| {
-                            c.you_block_open = true;
-                            c.you_block_anchor = Some(l);
-                            c.focus = AgentFocus::Compose;
-                            c.input_surface.compose_mut().mode = EditMode::Insert;
-                            c.pending_reveal_cursor = true;
-                        });
-                    }
-                    None => {
-                        if let Some(mut c) = self.agent_mut(cx) {
-                            c.status = Some("can only reply within the latest turn".into());
-                        }
-                    }
+                    .unwrap_or(false);
+                if open {
+                    self.with_session(focused_id, cx, |c| c.open_you_block_at_cursor());
+                } else if let Some(mut c) = self.agent_mut(cx) {
+                    c.status = Some("can only reply within the latest turn".into());
                 }
                 cx.notify();
                 return;
             }
             if press.modifiers.is_empty() && press.key == Key::Esc {
-                if let Some(mut c) = self.agent_mut(cx) {
+                // Esc from transcript navigation returns focus to the compose ONLY
+                // where a compose surface is actually visible: the chatbox box, or
+                // the mid-turn box. In an idle WORKSHEET there is no bottom box and
+                // Esc must NOT focus an invisible compose (bug-hunt-2 B1, found by the
+                // fuzzer) — nav is the resting state, so Esc is a no-op there.
+                if let Some(mut c) = self.agent_mut(cx)
+                    && (c.input_surface.is_chatbox() || c.turn_phase.is_awaiting())
+                {
                     c.focus = AgentFocus::Compose;
                 }
                 cx.notify();

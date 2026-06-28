@@ -4233,8 +4233,16 @@ impl YaldaGpuiView {
                     // normal dispatch, opening the workspace menu instead of the
                     // tile menu.
                     self.agent_read(cx, |c| {
-                        c.focus == AgentFocus::Compose
-                            && c.input_surface.compose().mode == EditMode::Insert
+                        // Focused compose in Insert is text entry. ALSO: mid-turn in
+                        // the worksheet, input routes to the bottom chatbox even
+                        // though focus stays on the transcript — so that is text
+                        // entry too, and the leaders (space/./?) must NOT fire (else a
+                        // space mid-turn opens a menu — INV-UX-9 rule 7).
+                        let compose_insert = c.focus == AgentFocus::Compose
+                            && c.input_surface.compose().mode == EditMode::Insert;
+                        let midturn_worksheet =
+                            c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();
+                        compose_insert || midturn_worksheet
                     })
                     .unwrap_or(false)
                 }

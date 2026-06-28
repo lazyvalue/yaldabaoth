@@ -3543,7 +3543,9 @@ impl AgentState {
     /// (`TurnId::Llm`) turn, or `None` if no agent turn is tagged yet. Drives the
     /// legal-insertion-point guard for opening a You-block — a reply may only be
     /// placed within the latest agent turn (after one of its newlines) or at the
-    /// transcript tail.
+    /// transcript tail. Test-only since the legal guard became tag-based (it no
+    /// longer needs a contiguous range); kept as a test helper (bug-hunt-2 E1).
+    #[cfg(test)]
     pub(crate) fn latest_agent_turn_range(&self) -> Option<(usize, usize)> {
         let meta = self.editor.metadata::<TurnId>();
         let lc = self.editor.document().line_count();
@@ -3603,6 +3605,30 @@ impl AgentState {
             .anchor_for_line_opt(l)
             .and_then(|a| meta.get(a).copied())
             == Some(TurnId::Llm(latest))
+    }
+
+    /// Open (or RESUME) the inline You-block for editing: focus the compose in
+    /// Insert and reveal it. A NEW block anchors at the caret — SNAPPED to the
+    /// nearest navigable stop at-or-above it (`snap_nav_stop`) so the freeze
+    /// position matches where the block RENDERS (the injection places it after the
+    /// nearest rendered `FlatItem::Line`; an un-snapped anchor inside a parsed
+    /// table/code block would render above it but freeze after it — bug-hunt-2 B7).
+    /// Illegal/again-resolves to the tail (`None`). Idempotent for an already-open
+    /// block (rule 6: never moves it). Caller ensures worksheet + idle.
+    pub(crate) fn open_you_block_at_cursor(&mut self) {
+        if !self.you_block_open {
+            self.you_block_open = true;
+            let l = self.editor.cursor().line;
+            self.you_block_anchor = if self.you_block_anchor_is_legal(l) {
+                // Snap down to a real rendered line so render == freeze position.
+                Some(self.view_model.snap_nav_stop(l, false).unwrap_or(l))
+            } else {
+                None // tail
+            };
+        }
+        self.input_surface.compose_mut().mode = EditMode::Insert;
+        self.focus = AgentFocus::Compose;
+        self.pending_reveal_cursor = true;
     }
 
     /// Close any open You-block — it is no longer an inline editable region. Does
@@ -3719,6 +3745,12 @@ impl AgentState {
         // re-materialize at a stale line in the rebuilt transcript (bug-hunt 2).
         // The compose draft itself is preserved (InputSurface is untouched).
         self.close_you_block();
+        // ...and the block being closed means the worksheet must rest in NAVIGATION,
+        // not focus=Compose with no rendered surface (invisible-typing — bug-hunt-2
+        // B4). Chatbox keeps its always-visible box, so leave its focus alone.
+        if !self.input_surface.is_chatbox() {
+            self.focus = AgentFocus::Transcript;
+        }
     }
 }
 
