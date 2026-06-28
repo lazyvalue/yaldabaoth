@@ -3479,11 +3479,9 @@ impl YaldaGpuiView {
         // at EOF (anchor = None). Only meaningful when a block is open + idle.
         let anchor = self
             .agent_read(cx, |c| {
-                (!c.input_surface.is_chatbox()
-                    && c.you_block_open
-                    && !c.turn_phase.is_awaiting())
-                .then(|| c.effective_you_block_anchor())
-                .flatten()
+                c.inline_you_block_active()
+                    .then(|| c.effective_you_block_anchor())
+                    .flatten()
             })
             .flatten();
         if self.send_prompt_to_session(id, &text, anchor, cx) {
@@ -3938,11 +3936,7 @@ impl YaldaGpuiView {
         // re-render the whole transcript per chatbox keystroke (the perf
         // regression `transcript_021_*` guards).
         let inline_active = self
-            .agent_read(cx, |c| {
-                !c.input_surface.is_chatbox()
-                    && c.you_block_open
-                    && !c.turn_phase.is_awaiting()
-            })
+            .agent_read(cx, |c| c.inline_you_block_active())
             .unwrap_or(false);
         if inline_active {
             // INV-UX-1: keep the inline block's caret in view as the reply grows.

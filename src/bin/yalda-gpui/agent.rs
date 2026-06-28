@@ -2781,7 +2781,7 @@ pub(crate) fn rebuild_agent_view_model(
     // this (cached) build. Done AFTER the empty-header pass so the block can't be
     // mistaken for turn content, and BEFORE `build_line_to_item` so the reverse
     // index reflects the inserted item's shift.
-    if c.you_block_open && !c.turn_phase.is_awaiting() {
+    if c.inline_you_block_active() {
         // Insert after the rendered line for the anchor. The anchor doc line may
         // not be its OWN `FlatItem::Line` (it can sit inside a parsed Block, a
         // collapsed blank run, or a tool group), so an exact match would silently
@@ -3614,6 +3614,19 @@ impl AgentState {
     pub(crate) fn close_you_block(&mut self) {
         self.you_block_open = false;
         self.you_block_anchor = None;
+    }
+
+    /// INV-UX-9: is the inline You-block currently the live editing surface — i.e.
+    /// rendered inside the transcript at its anchor? True iff a block is open, the
+    /// agent is idle, and we're in the worksheet (mid-turn the draft is the bottom
+    /// chatbox, not an inline block; chatbox mode never has an inline block). This
+    /// is the ONE predicate the render injection (`rebuild_agent_view_model`), the
+    /// transcript fingerprint + snapshot (`TranscriptSeqs`/`YouBlockSnap`), the
+    /// inline-edit session-notify, and the submit-anchor path all share — keeping
+    /// them from drifting out of sync (which would re-introduce the stale/double
+    /// render class).
+    pub(crate) fn inline_you_block_active(&self) -> bool {
+        self.you_block_open && !self.turn_phase.is_awaiting() && !self.input_surface.is_chatbox()
     }
 
     /// The You-block anchor to ACTUALLY use, re-validated against the CURRENT

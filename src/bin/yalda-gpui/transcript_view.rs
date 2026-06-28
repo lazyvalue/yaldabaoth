@@ -103,8 +103,7 @@ impl TranscriptSeqs {
         // transcript cache — otherwise chatbox typing re-renders the whole
         // transcript (the `transcript_021_*` perf regression). So zero the compose
         // fields off-inline.
-        let inline_block_active =
-            c.you_block_open && !c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();
+        let inline_block_active = c.inline_you_block_active();
         let (compose_edit_seq, compose_cursor, compose_mode) = if inline_block_active {
             let compose = c.input_surface.compose();
             let cc = compose.editor.cursor();
@@ -395,9 +394,7 @@ impl TranscriptView {
                 // caret lives in the BLOCK, below its anchor line — so reveal the
                 // YouBlock item itself (it grows as you type), not the anchor line
                 // above it, or a multi-line reply's caret scrolls below the fold.
-                let inline_block =
-                    c.you_block_open && !c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();
-                if inline_block {
+                if c.inline_you_block_active() {
                     flat_items_arc
                         .iter()
                         .position(|it| matches!(it, FlatItem::YouBlock))
@@ -430,10 +427,7 @@ impl TranscriptView {
             // Gate EXACTLY like the injection (agent.rs) — `you_block_open` alone
             // would allocate a snapshot every streaming-frame for a block left open
             // mid-turn that is never injected (bug-hunt 11).
-            let you_block_snap = if c.you_block_open
-                && !c.turn_phase.is_awaiting()
-                && !c.input_surface.is_chatbox()
-            {
+            let you_block_snap = if c.inline_you_block_active() {
                 let compose = c.input_surface.compose();
                 let cc = compose.editor.cursor();
                 let n = compose.editor.document().line_count().max(1);
