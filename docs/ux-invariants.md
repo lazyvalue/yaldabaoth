@@ -280,6 +280,65 @@ accent-bar differences are color-level (harness gap #1, a human eye). INV-UX-1's
 `compose_caret_row_painted_inside_box_when_wrapped` still passes in both
 placements (caret math unchanged).
 
+> **SUPERSEDED by INV-UX-9 (2026-06-28).** INV-UX-8 described the two compose
+> *placements* of the Model C UX (always-present worksheet compose vs pinned
+> chatbox box). INV-UX-9 replaces that UX: the worksheet has **no always-present
+> compose** — you edit **inline in the transcript buffer** (a You-block), and the
+> chatbox is **mid-turn-only**. The flush-vs-boxed distinction is retained only for
+> the mid-turn chatbox. The data substrate (Model C, ADR-0024) is unchanged.
+
+### INV-UX-9 — The worksheet is an inline-editable conversation buffer (chatbox is mid-turn only)
+
+**Statement.** Worksheet mode behaves as an **editable conversation buffer**, per
+`spec-worksheet.md` (AUTHORITATIVE). Concretely:
+
+1. **Free navigation.** In Normal mode the caret moves freely over the whole
+   transcript (read navigation; nothing editable until Insert).
+2. **Insert opens a You-block at the caret** — a `You` delimiter + editable region
+   where typed text lives.
+3. **Empty insert is a no-op** — leaving Insert with only whitespace removes the
+   You-block; the transcript is byte-identical to before (no phantom turn, cf.
+   INV-UX-4).
+4. **Non-empty You-block persists and is sent** — real text stays in place as the
+   pending reply; the next Submit sends it and freezes it as a committed user turn.
+5. **Insert is bounded** — a You-block can be opened **only within the most-recent
+   agent turn, only after an agent newline**; frozen content is not editable.
+6. **One You-block at a time** — the editable set is exactly what you've typed
+   since the last Submit.
+7. **Mid-turn → chatbox.** While the agent is mid-turn the transcript is read-only
+   and a chatbox appears **pinned at the bottom**; input goes there (steers/queues,
+   INV-UX-7). The chatbox is **not visible when the agent is idle**.
+
+**Substrate.** This is layered on Model C (ADR-0024), which stays the durable
+implementation: transcript is the single ordered source of truth, agent content
+appends/streams at a clean EOF, only user *text* enters the buffer. Rules 5–7 make
+that safe — editing happens only while idle, so streaming never lands in a buffer
+being edited (the ordering-corruption class Model C killed stays unrepresentable).
+
+**Applies to.** The agent tile: the worksheet key dispatch (`handle_claude_key`,
+`agent_ui.rs`), the You-block lifecycle (insert-enter opens / empty-exit discards /
+submit freezes), the insertable-point guard (`agent.rs`), and the mid-turn chatbox
+visibility (`screens.rs` `render_agent`).
+
+**Why.** The Model C *UX* (read-only transcript + always-present separate compose)
+made the worksheet "functionally useless — can't place the cursor anywhere to
+respond." The inline-edit behavior is what the user actually wants and what
+`spec-agent-window.md` §9–§15 originally specified; INV-UX-9 restores it on the
+durable Model C substrate.
+
+**Status:** `specified — implementation in progress` (do NOT mark honored until the
+guards below are green + a human runtime check).
+
+**Enforcement.** Headless in `verify_harness.rs` (planned):
+`worksheet_insert_opens_you_block`, `worksheet_empty_insert_discards_you_block`
+(byte-identical transcript), `worksheet_submit_freezes_you_block`,
+`worksheet_insert_blocked_outside_latest_turn`,
+`worksheet_insert_only_after_agent_newline`,
+`worksheet_midturn_input_routes_to_chatbox` +
+`worksheet_chatbox_hidden_when_idle`, and the existing
+`agent_tile_statemachine_fuzz_holds_invariants` extended with You-block ops +
+oracle clauses (one You-block max; no edit while mid-turn; transcript append-only).
+
 ## Cross-references
 
 - `spec-turn-steering.md` — the full steering design (queue, delivery modes, the

@@ -28,7 +28,7 @@
 - **`spec-agent-session-ownership.md`** — strict 1:1 tile↔session; session state
   is owned by the `AgentSession` model. The steering queue is session-owned so it
   survives unbind/rebind and a turn ending in a non-focused session still flushes.
-- **`spec-ux-invariants.md`** — this spec adds **INV-UX-7** (steering-queue
+- **`ux-invariants.md`** — this spec adds **INV-UX-7** (steering-queue
   affordance + delivery semantics + Esc-interrupts-in-flight).
 - **`src/acp_channel.rs`** — the worker driver loop serializes prompts: it fires
   `session/prompt` and awaits the response (turn end) before draining the next.

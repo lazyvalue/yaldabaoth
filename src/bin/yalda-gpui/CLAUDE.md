@@ -1,11 +1,11 @@
 # yalda-gpui — UX architecture (read before adding/altering any view)
 
-> **Behavioral contract: `docs/specs/spec-ux-invariants.md` is authoritative and
+> **Behavioral contract: `docs/ux-invariants.md` is authoritative and
 > mandatory.** Before adding/altering any view, check the change against the UX
 > invariants (cursor always visible + tracks text; agent compose word-wraps; …).
 > A change MUST NOT violate one; if it seems to need to, reconcile the spec first.
 > Designing new UX ⇒ add/extend an `INV-UX-N` there. The rules below are the
-> *performance* contract; spec-ux-invariants is the *behavior* contract.
+> *performance* contract; ux-invariants is the *behavior* contract.
 
 This module is the GPUI surface. GPUI re-renders the **root every frame**
 (`window.rs draw_roots`), and its *only* render-skip lever is

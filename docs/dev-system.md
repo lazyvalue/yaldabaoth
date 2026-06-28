@@ -15,7 +15,12 @@ spec ──▶ decision ──▶ scaffold ──▶ implement ──▶ verify 
 
 - **spec** — `docs/specs/spec-<topic>.md`. The design: what we're building, the
   shared vocabulary, the constraints. Use `/spec` to draft/revise. A spec
-  describes the *target*, not the path taken.
+  describes the *target*, not the path taken. **`docs/ux-invariants.md`** is the
+  cross-cutting, LIVING, AUTHORITATIVE UX behavior contract that sits beside the
+  per-topic specs: every change touching a tile / view / editor / scroll / caret
+  / input surface MUST be checked against it and MUST NOT violate an `INV-UX-N`;
+  new UX adds or extends one (with a headless guard). It is enforced by a
+  PreToolUse hook on UX-bearing files.
 - **decision** — `docs/decisions/NNNN-<slug>.md` (ADR). The *path*: options
   considered, what we chose, why, and what we gave up. Use `/decision`. Specs
   say "what"; ADRs say "we chose Y over X because Z." Without this the *why*
@@ -39,6 +44,7 @@ spec ──▶ decision ──▶ scaffold ──▶ implement ──▶ verify 
 | Artifact | Path | Tense | Written with |
 |---|---|---|---|
 | Specs | `docs/specs/spec-*.md` | future (design) | `/spec` |
+| **UX invariants** | **`docs/ux-invariants.md`** | **living contract** | **`/spec`** |
 | Decisions (ADR) | `docs/decisions/NNNN-*.md` | past (rationale) | `/decision` |
 | Worklog | `docs/worklog/YYYY-MM-DD-*.md` | past (what happened) | `/worklog` |
 | Backlog | `docs/backlog.md` | future (what's open) | `/worklog`, manually |

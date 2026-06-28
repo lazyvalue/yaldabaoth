@@ -1,5 +1,16 @@
 # Agent Window — Worksheet + Chatbox + Sidebars
 
+> **PARTIALLY SUPERSEDED (2026-06-28).** The **worksheet/chatbox behavioral model**
+> here (§4–§20: two co-equal user-toggled input modes) is superseded by
+> **`spec-worksheet.md`** + **`docs/ux-invariants.md` INV-UX-9**: the worksheet is
+> the inline-editable buffer (You-block on Insert), and the chatbox is the
+> **mid-turn-only** input surface — there is no user-selected mode toggle. The
+> §9–§15 *inline-edit mechanics* (turn gutter, frozen-line invariants, submit
+> freezes editable lines, cursor-anchored auto-scroll §19) remain the correct
+> baseline. The data substrate is Model C (ADR-0024). The sidebars (§21–§29),
+> status strip (§30), persistence (§35), and editor extensions (§E1–§E4) are
+> unaffected.
+
 **Status:** ACTIVE — phases 1–4 shipped. Section-level markers below reflect what landed; the rendering polish around sub-agent transcript swap (§27) and a few corner cases still flagged DRAFT.
 
 **Last updated:** 2026-05-23

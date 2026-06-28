@@ -42,7 +42,7 @@ implement → verify → integrate → log lifecycle, the definition of done, pa
 work discipline, and the verification-harness plan. Key artifacts:
 
 - `docs/specs/` — design (what). Skill: `/spec`.
-- **`docs/specs/spec-ux-invariants.md` — the canonical, cross-cutting UX
+- **`docs/ux-invariants.md` — the canonical, cross-cutting UX
   behavior contract (cursor always visible + tracks text, compose word-wrap,
   …).** LIVING and AUTHORITATIVE: **every code change that touches a tile / view
   / editor / scroll / caret / input surface MUST be checked against it and MUST

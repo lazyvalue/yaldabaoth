@@ -8,7 +8,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in */src/bin/yalda-gpui/*|*/src/editor.rs|*/src/document.rs|*/src/render.rs|*/src/blocks.rs) jq -n '{hookSpecificOutput:{hookEventName:\"PreToolUse\",additionalContext:\"UX SURFACE: docs/specs/spec-ux-invariants.md is AUTHORITATIVE + MANDATORY. Your change MUST NOT violate INV-UX-1 (the cursor is always visible; moving it moves the visible text) or INV-UX-2 (the agent compose word-wraps). Any new UX behavior must add/extend an INV-UX-N there with a headless guard test. Re-read that spec before proceeding.\"}}' ;; esac",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in */src/bin/yalda-gpui/*|*/src/editor.rs|*/src/document.rs|*/src/render.rs|*/src/blocks.rs) jq -n '{hookSpecificOutput:{hookEventName:\"PreToolUse\",additionalContext:\"UX SURFACE: docs/ux-invariants.md is AUTHORITATIVE + MANDATORY. Your change MUST NOT violate INV-UX-1 (the cursor is always visible; moving it moves the visible text) or INV-UX-2 (the agent compose word-wraps). Any new UX behavior must add/extend an INV-UX-N there with a headless guard test. Re-read that spec before proceeding.\"}}' ;; esac",
             "timeout": 10,
             "statusMessage": "Checking UX invariants"
           }

@@ -4,7 +4,7 @@
 **vertical axis remains in force.**
 
 > **Horizontal axis superseded (2026-06-25).** The compose now **word-wraps**
-> (`spec-ux-invariants.md` INV-UX-2: `wrap_line_cols` /
+> (`ux-invariants.md` INV-UX-2: `wrap_line_cols` /
 > `build_chatbox_wrapped_line`), so there is no off-screen-right text to scroll
 > to and **no horizontal window**. The `left_col` / horizontal `compute_window`
 > half described below is no longer used by the compose render — long lines flow

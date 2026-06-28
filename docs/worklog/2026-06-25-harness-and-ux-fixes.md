@@ -17,7 +17,7 @@ clearing the open UX work. Everything below is on `main`, builds, tests green.
 - **#3.1 in-process GUI↔server↔agent loop** — still scoped only
   (`docs/projects/headless-e2e/`), the remaining gap.
 - The PreToolUse hook (`.claude/settings.json`) injects the UX-invariants contract
-  on every edit to a UX-bearing file; `spec-ux-invariants.md` is the contract.
+  on every edit to a UX-bearing file; `ux-invariants.md` is the contract.
 
 ## UX regressions fixed (each pinned by a headless guard that fails without the fix)
 

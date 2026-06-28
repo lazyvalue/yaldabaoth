@@ -1198,7 +1198,7 @@ fn chatbox_turn_end_leaves_caret_put() {
     );
 }
 
-/// INV-UX-2 (spec-ux-invariants.md): the compose word-wraps. `wrap_line_cols`
+/// INV-UX-2 (ux-invariants.md): the compose word-wraps. `wrap_line_cols`
 /// partitions a line into ≤width visual rows, breaking at spaces, hard-breaking
 /// over-long words, covering EVERY char (so the caret is addressable everywhere),
 /// always ≥1 row.
