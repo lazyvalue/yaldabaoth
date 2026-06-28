@@ -3489,13 +3489,16 @@ impl YaldaGpuiView {
                 // Reset the compose, PRESERVING placement (Model C §4.1).
                 let mode = claude.input_surface.mode;
                 claude.input_surface = InputSurface::new(mode);
-                // INV-UX-9 (rule 4): a worksheet submit closes the You-block and
-                // returns to transcript navigation — the reply was frozen into the
-                // transcript by the reconciler, the editable region is gone.
+                // INV-UX-9 (rule 4): a worksheet submit closes the You-block — the
+                // reply was frozen into the transcript by the reconciler. A turn is
+                // now in flight, so focus the COMPOSE: mid-turn that IS the chatbox
+                // (rule 7), and focused-Compose is what makes typing (incl. space /
+                // leader keys) reach the box instead of firing the tile menu. At
+                // turn-end `finalize_agent_turn_idem` returns focus to nav (empty)
+                // or keeps the carried-over tail block (non-empty).
                 if mode == InputModeKind::Worksheet {
-                    claude.you_block_open = false;
-                    claude.you_block_anchor = None;
-                    claude.focus = AgentFocus::Transcript;
+                    claude.close_you_block();
+                    claude.focus = AgentFocus::Compose;
                 }
             });
         } else if let Some(mut claude) = self.agent_mut(cx) {

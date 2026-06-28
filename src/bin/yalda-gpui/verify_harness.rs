@@ -5225,6 +5225,33 @@ fn worksheet_midturn_typing_routes_to_chatbox(cx: &mut TestAppContext) {
     });
 }
 
+/// REGRESSION (round-2, leader-gate): mid-turn the worksheet focuses the COMPOSE
+/// (the chatbox), so `focused_in_insert_mode` is true and the universal leaders
+/// (`space`/`.`/`?`) do NOT fire — a space is typed into the steer, not interpreted
+/// as a menu chord. (A worksheet submit sets focus=Compose for exactly this reason.)
+#[gpui::test]
+fn worksheet_midturn_space_types_into_chatbox(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    // The post-submit mid-turn state: a turn is awaiting and the compose is focused.
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
+        c.focus = crate::AgentFocus::Compose;
+        c.input_surface.compose_mut().mode = crate::EditMode::Insert;
+    });
+    for k in ["a", "space", "b"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    }
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        assert_eq!(
+            v.agent_mut(cx).expect("agent").input_surface.compose().text(),
+            "a b",
+            "space must type into the mid-turn chatbox, not fire the leader menu"
+        );
+    });
+}
+
 /// REGRESSION (bug-hunt 6 follow-through): when the turn ends, a non-empty mid-turn
 /// draft is NOT lost — it carries over as a tail You-block; an empty draft returns
 /// to transcript navigation.
