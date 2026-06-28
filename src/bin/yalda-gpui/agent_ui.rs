@@ -3754,8 +3754,14 @@ impl YaldaGpuiView {
             // so a reply lands between the latest turn's lines — gated by the
             // legal-point guard (rule 5). In a non-worksheet (chatbox) transcript
             // focus, `Esc` returns to the compose as before.
+            // Rule 7: a You-block can only be opened while the agent is IDLE
+            // (mid-turn input belongs to the chatbox, never an inline edit) — so
+            // gate the open on `!awaiting`, keeping the transcript append-only
+            // during streaming (the Model C durability property).
             let worksheet = self
-                .agent_read(cx, |c| !c.input_surface.is_chatbox())
+                .agent_read(cx, |c| {
+                    !c.input_surface.is_chatbox() && !c.turn_phase.is_awaiting()
+                })
                 .unwrap_or(false);
             if worksheet
                 && press.modifiers.is_empty()
