@@ -2782,15 +2782,25 @@ pub(crate) fn rebuild_agent_view_model(
     // mistaken for turn content, and BEFORE `build_line_to_item` so the reverse
     // index reflects the inserted item's shift.
     if c.you_block_open && !c.turn_phase.is_awaiting() {
-        let pos = c
-            .you_block_anchor
-            .and_then(|l| {
-                flat_items
-                    .iter()
-                    .position(|it| matches!(it, FlatItem::Line(i) if *i == l))
-                    .map(|p| p + 1)
-            })
-            .unwrap_or(flat_items.len());
+        // Insert after the rendered line for the anchor. The anchor doc line may
+        // not be its OWN `FlatItem::Line` (it can sit inside a parsed Block, a
+        // collapsed blank run, or a tool group), so an exact match would silently
+        // fall to the tail and the block would "jump" away from the caret. Resolve
+        // robustly: the position just after the LAST `FlatItem::Line(i)` with
+        // `i <= anchor` (the nearest rendered line at or above the caret); fall to
+        // the tail only when there's no such line.
+        let pos = match c.you_block_anchor {
+            Some(anchor) => flat_items
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(p, it)| match it {
+                    FlatItem::Line(i) if *i <= anchor => Some(p + 1),
+                    _ => None,
+                })
+                .unwrap_or(flat_items.len()),
+            None => flat_items.len(),
+        };
         flat_items.insert(pos, FlatItem::YouBlock);
     }
 

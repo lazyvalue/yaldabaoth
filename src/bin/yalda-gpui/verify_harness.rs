@@ -4962,6 +4962,109 @@ fn worksheet_compose_visibility_tracks_block_and_turn(cx: &mut TestAppContext) {
     );
 }
 
+/// REGRESSION (user-reported: "typed characters don't show up until later").
+/// The inline You-block renders INSIDE the cached `TranscriptView`, so a keystroke
+/// must notify the SESSION entity to fire its `cx.observe` and bust the transcript
+/// cache. The compose dispatch used `with_session_silent` (no session notify), so
+/// inline typing left the transcript stale until an unrelated event repainted.
+/// Here: typing into an open inline block MUST re-render the transcript, and the
+/// text must land in the compose.
+#[gpui::test]
+fn worksheet_inline_typing_rerenders_transcript(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (view, vcx) = boot_worksheet_nav(cx);
+
+    // Open a You-block, then settle one frame so the baseline excludes the open.
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    // Type into the inline block — each keystroke must bust the transcript cache.
+    for k in ["h", "e", "l", "l", "o"] {
+        view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key(k), window, cx));
+        vcx.run_until_parked();
+    }
+    let after = crate::perf_render_count("transcript");
+    assert!(
+        after > base,
+        "typing into the inline You-block must re-render the cached transcript \
+         (session-notify busts the observe) — base {base}, after {after}; a flat \
+         count is the 'chars appear later' stale-render bug"
+    );
+    view.update(vcx, |v, cx| {
+        assert_eq!(
+            v.agent_mut(cx).expect("agent").input_surface.compose().text().trim(),
+            "hello",
+            "the typed text landed in the compose draft"
+        );
+    });
+}
+
+/// REGRESSION (user-reported: "where I am inserting jumps around"). The inline
+/// You-block must anchor at the caret's line — injected right after that line's
+/// rendered item — NOT silently fall to the transcript tail when the anchor line
+/// isn't its own `FlatItem::Line`. Open a block with the caret on an EARLY line of
+/// the latest turn and assert the `YouBlock` item is not last (it sits inline,
+/// above later content), and that it stays put across keystrokes.
+#[gpui::test]
+fn worksheet_you_block_anchors_at_cursor_not_tail(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx)); // → worksheet nav
+
+    // A multi-line latest agent turn so there ARE lines after the anchor.
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("para one\npara two\npara three\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // Park the transcript caret on the FIRST line of the latest turn (an early,
+    // legal anchor), then open a block there.
+    let (anchor, last_line) = view
+        .update(vcx, |v, cx| {
+            let mut c = v.agent_mut(cx).expect("agent");
+            let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+            c.editor.cursor_mut().line = s;
+            (s, c.editor.document().line_count().saturating_sub(1))
+        });
+    assert!(anchor < last_line, "anchor is genuinely above the tail");
+
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(c.you_block_open, "block opened at the early line");
+        let fi = &c.view_model.flat_items_cache;
+        let yb = fi
+            .iter()
+            .position(|it| matches!(it, crate::FlatItem::YouBlock))
+            .expect("YouBlock injected into the flat list");
+        assert!(
+            yb < fi.len() - 1,
+            "the You-block must sit INLINE above later turn content, not at the \
+             tail (idx {yb} of {}) — falling to the tail is the 'jumps around' bug",
+            fi.len()
+        );
+    });
+}
+
 /// VERIFICATION HARNESS (#3.2 — painted-bounds proof of INV-UX-5 layout): the
 /// subagent (Task) list renders ABOVE the compose box, one per line. Register a
 /// Task subagent tool call so the list appears, drive a real paint pass, and

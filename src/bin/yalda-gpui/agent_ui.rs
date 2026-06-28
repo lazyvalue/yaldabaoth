@@ -3891,6 +3891,26 @@ impl YaldaGpuiView {
         }) else {
             return;
         };
+        // INV-UX-9 bugfix (stale inline typing): when the compose is the INLINE
+        // You-block it renders INSIDE the cached `TranscriptView`, whose
+        // `cx.observe(&session)` fires only on a SESSION notify. `with_session_silent`
+        // above did not notify the session, so a keystroke didn't bust the
+        // transcript cache — chars appeared only "later" when an unrelated event
+        // notified. Notify the session here, but ONLY for the inline block: the
+        // bottom-panel chatbox renders in the root (the root `cx.notify()` below
+        // suffices) and must stay O(changed) — notifying the session there would
+        // re-render the whole transcript per chatbox keystroke (the perf
+        // regression `transcript_021_*` guards).
+        let inline_active = self
+            .agent_read(cx, |c| {
+                !c.input_surface.is_chatbox()
+                    && c.you_block_open
+                    && !c.turn_phase.is_awaiting()
+            })
+            .unwrap_or(false);
+        if inline_active && let Some(ent) = self.session_entity(focused_id) {
+            ent.update(cx, |_, scx| scx.notify());
+        }
         match outcome {
             NormalOutcome::Skipped | NormalOutcome::Handled => cx.notify(),
             NormalOutcome::Yanked => {
