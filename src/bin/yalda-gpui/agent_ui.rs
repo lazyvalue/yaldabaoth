@@ -3767,9 +3767,23 @@ impl YaldaGpuiView {
                 && press.modifiers.is_empty()
                 && matches!(press.key, Key::Char('i' | 'a' | 'o' | 'I' | 'A' | 'O'))
             {
-                // INV-UX-9 rule 5: open only at a legal insertion point (within the
-                // latest agent turn, or the tail). Inserting into an older frozen
-                // turn is refused with a hint; the caret doesn't move.
+                // INV-UX-9 rule 6: one block at a time. If a block is ALREADY open
+                // (e.g. the user pressed Esc to navigate, leaving a non-empty reply
+                // pending), `i` RESUMES it at its existing anchor — it must NOT move
+                // the reply (and its text) to wherever the caret now sits (the
+                // "insertion jumps around" bug). A fresh anchor is computed only when
+                // opening a NEW block, and only at a legal point (rule 5): within the
+                // latest agent turn or the tail; an older frozen turn is refused.
+                let already_open = self.agent_read(cx, |c| c.you_block_open).unwrap_or(false);
+                if already_open {
+                    self.with_session(focused_id, cx, |c| {
+                        c.focus = AgentFocus::Compose;
+                        c.input_surface.compose_mut().mode = EditMode::Insert;
+                        c.pending_reveal_cursor = true;
+                    });
+                    cx.notify();
+                    return;
+                }
                 let anchor = self
                     .agent_read(cx, |c| {
                         let l = c.editor.cursor().line;
