@@ -1717,8 +1717,24 @@ async fn worker_async(
                         }
                     };
                     let supports_load = init_resp.agent_capabilities.load_session;
+                    // Mid-turn steering (spec-turn-steering.md): Claude Code's
+                    // adapter advertises `_meta.claudeCode.promptQueueing`, meaning
+                    // it accepts a `session/prompt` while a turn is in flight and
+                    // queues it (processed the instant the current turn finishes).
+                    // When set, the driver loop below sends prompts CONCURRENTLY
+                    // (it does not wait for the in-flight turn's response before
+                    // forwarding the next) so a steer actually reaches the agent
+                    // mid-turn instead of after the boundary.
+                    let prompt_queueing = init_resp
+                        .agent_capabilities
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.get("claudeCode"))
+                        .and_then(|c| c.get("promptQueueing"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     acp_debug!(
-                        "initialize ok; loadSession capability: {supports_load}, resume id: {:?}",
+                        "initialize ok; loadSession: {supports_load}, promptQueueing: {prompt_queueing}, resume id: {:?}",
                         resume_session_id
                     );
 
@@ -1985,6 +2001,145 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                     // Cap on transient-error retries before giving up on a
                     // turn. Backoff is exponential (0.5s, 1s, 2s, 4s, 8s).
                     const MAX_RETRIES: u32 = 5;
+
+                    // CONCURRENT driver (mid-turn steering, spec-turn-steering.md):
+                    // when the agent advertises promptQueueing, send each prompt
+                    // the moment it arrives — WITHOUT waiting for the in-flight
+                    // turn's response — so a steer reaches the agent mid-turn. The
+                    // agent queues it and processes it after the current turn. Each
+                    // prompt's response settles independently; `turns` bumps per
+                    // settled prompt, preserving the per-turn counter the pump
+                    // reads. Used ONLY for capable agents; everything else falls to
+                    // the proven sequential loop below, untouched.
+                    if prompt_queueing {
+                        use futures::stream::FuturesUnordered;
+                        let mut inflight = FuturesUnordered::new();
+                        let mut intake_open = true;
+                        let mut cancel_open = true;
+                        // Per-prompt cancel flags. A Stop trips EVERY in-flight
+                        // prompt's flag (via these weak handles) AND fires
+                        // `session/cancel`, so a prompt that resolves with an
+                        // *error* during a cancel is not retried (we must never
+                        // resend a cancelled prompt). Per-prompt (not one shared
+                        // flag) so a fresh submit can't clear another in-flight
+                        // prompt's cancel intent. Weak ⇒ entries self-prune as
+                        // their futures complete and drop the owning `Arc`.
+                        let mut live_cancels: Vec<std::sync::Weak<AtomicBool>> = Vec::new();
+                        loop {
+                            tokio::select! {
+                                maybe = async_prompt_rx.recv(), if intake_open => {
+                                    match maybe {
+                                        Some(prompt) => {
+                                            let cf = Arc::new(AtomicBool::new(false));
+                                            live_cancels.push(Arc::downgrade(&cf));
+                                            let connection = connection.clone();
+                                            let session_id = session_id.clone();
+                                            let event_tx = event_tx_for_driver.clone();
+                                            acp_debug!("prompt → agent (queued): {prompt:?}");
+                                            // EAGER wire-send, in submit order: send_request
+                                            // transmits synchronously here (before the next
+                                            // recv), so prompts reach the agent in the order
+                                            // submitted regardless of when the response future
+                                            // is polled. Only the RESPONSE await is deferred.
+                                            let first = agent_client_protocol::schema::PromptRequest::new(
+                                                session_id.clone(),
+                                                vec![ContentBlock::Text(
+                                                    agent_client_protocol::schema::TextContent::new(
+                                                        prompt.clone(),
+                                                    ),
+                                                )],
+                                            );
+                                            let mut resp_fut = connection.send_request(first).block_task();
+                                            inflight.push(async move {
+                                                let mut attempt: u32 = 0;
+                                                loop {
+                                                    match resp_fut.await {
+                                                        Ok(_) => break,
+                                                        Err(e) => {
+                                                            // Cancel usually resolves Ok(Cancelled);
+                                                            // if it instead races into an error, the
+                                                            // per-prompt flag stops a retry/resend.
+                                                            if cf.load(Ordering::SeqCst) {
+                                                                break;
+                                                            }
+                                                            if attempt < MAX_RETRIES && is_retryable_error(&e) {
+                                                                attempt += 1;
+                                                                let backoff_ms = (500u64 << (attempt - 1)).min(8_000);
+                                                                let _ = event_tx.send(WorkerEvent::Reply(
+                                                                    ReplyEvent::Notice(format!(
+                                                                        "API error — retrying {attempt}/{MAX_RETRIES} in {}s ({})",
+                                                                        backoff_ms / 1000,
+                                                                        short_err(&e),
+                                                                    )),
+                                                                ));
+                                                                tokio::time::sleep(
+                                                                    std::time::Duration::from_millis(backoff_ms),
+                                                                ).await;
+                                                                if cf.load(Ordering::SeqCst) {
+                                                                    break; // cancelled during backoff
+                                                                }
+                                                                let req = agent_client_protocol::schema::PromptRequest::new(
+                                                                    session_id.clone(),
+                                                                    vec![ContentBlock::Text(
+                                                                        agent_client_protocol::schema::TextContent::new(
+                                                                            prompt.clone(),
+                                                                        ),
+                                                                    )],
+                                                                );
+                                                                resp_fut = connection.send_request(req).block_task();
+                                                                continue;
+                                                            }
+                                                            let _ = event_tx.send(WorkerEvent::Reply(
+                                                                ReplyEvent::Notice(format!("agent error: {}", short_err(&e))),
+                                                            ));
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        None => { intake_open = false; }
+                                    }
+                                }
+                                Some(()) = inflight.next() => {
+                                    // One queued prompt settled → advance the turn
+                                    // counter (same semantics as the sequential path).
+                                    let count = turns.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if std::env::var("YALDA_EMIT_TURN_ENDED").as_deref() == Ok("1") {
+                                        let _ = event_tx_for_driver
+                                            .send(WorkerEvent::Reply(ReplyEvent::TurnEnded { count }));
+                                    }
+                                }
+                                sig = cancel_rx.next(), if cancel_open => {
+                                    match sig {
+                                        Some(()) => {
+                                            // Trip every in-flight prompt's flag (pruning dead
+                                            // weaks) so none retries after cancel.
+                                            live_cancels.retain(|w| match w.upgrade() {
+                                                Some(c) => { c.store(true, Ordering::SeqCst); true }
+                                                None => false,
+                                            });
+                                            acp_debug!("cancel → session/cancel (queued driver)");
+                                            let _ = connection.send_notification(
+                                                agent_client_protocol::schema::CancelNotification::new(
+                                                    session_id.clone(),
+                                                ),
+                                            );
+                                        }
+                                        // App dropped the cancel sender (teardown):
+                                        // stop selecting on it so we don't spin.
+                                        None => { cancel_open = false; }
+                                    }
+                                }
+                            }
+                            if !intake_open && inflight.is_empty() {
+                                break;
+                            }
+                        }
+                        acp_debug!("queued driver loop exiting");
+                        return Ok::<_, agent_client_protocol::Error>(());
+                    }
+
                     while let Some(prompt) = async_prompt_rx.recv().await {
                         acp_debug!("prompt → agent: {prompt:?}");
                         // Drop any cancel signal that queued while idle so a

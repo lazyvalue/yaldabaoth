@@ -172,13 +172,13 @@ real turns and asserts no header is orphaned (every header is followed by conten
 header count == content-bearing-turn count). Validated by disabling the pass →
 the test fails.
 
-### INV-UX-5 — Subagents are detected from the harness, shown as panes below the compose
+### INV-UX-5 — Subagents are detected from the harness, shown as a one-per-line list above the compose
 
 **Statement.** Sub-agents (the agent's `Task` spawns) are detected from the
-STRUCTURE the harness emits over ACP — not a name heuristic — and surfaced as
-small panes at the BOTTOM of the agent tile, below the compose box. Each pane
-shows the subagent's status, label, and spawn **prompt**; clicking it focuses the
-subagent (the transcript shows its output).
+STRUCTURE the harness emits over ACP — not a name heuristic — and surfaced as a
+compact **one-per-line list ABOVE the compose box** (status glyph + label + spawn
+**prompt** snippet on each line; not cards). Clicking a line focuses the subagent
+(the transcript shows its output).
 
 **Applies to.** The agent tile (`classify_subagent` / `AgentState::subagents`;
 the subagent-panes strip in `render_agent`).
@@ -191,19 +191,63 @@ so subagents were invisible; and they were tucked in a right sidebar.
 **Status:** `honored` (detection AND pane layout headless-tested). `classify_subagent`
 keys on `Think` + a `prompt`/`subagent_type` raw-input (excluding `TodoWrite`'s
 `todos`), with a name fallback, and captures the prompt. `render_agent` renders the
-panes below the compose (auto when subagents exist; `Cmd-2`/`ToggleSubagents`
+list one-per-line above the compose (auto when subagents exist; `Cmd-2`/`ToggleSubagents`
 collapses).
 
 **Enforcement.** Headless: `classify_subagent_detects_the_harness_task_shape`
 (Think+prompt detected, prompt captured; TodoWrite/Read excluded; name fallback) +
 `subagents_surfaces_registered_task_with_prompt` (end-to-end through the real
-`ToolCall`) + **PAINT proof** `subagent_panes_paint_below_the_compose` (the layout
-probe asserts the panes strip is painted with its top at/below the compose box's
-bottom — validated by reordering the layout → the test fails). Runtime: only
-click-to-show-output is left for a human eyeball.
+`ToolCall`) + **PAINT proof** `subagent_panes_paint_above_the_compose` (the layout
+probe asserts the list strip is painted with its bottom at/above the compose box's
+top). Runtime: only click-to-show-output is left for a human eyeball.
+
+### INV-UX-7 — A submit is delivered immediately (even mid-turn); failed sends queue, never drop; Esc interrupts
+
+> **Numbering note:** `INV-UX-6` is reserved for the parallel `toolgroup-expand-key`
+> branch (tool-group collapse). This invariant is `INV-UX-7` to avoid a collision
+> at integrate time.
+
+**Statement.** Submitting a message **sends it to the agent immediately, even
+while a turn is in flight**, and commits it as a user turn — it does **not** start
+a duplicate competing local turn (a mid-turn steer rides the in-flight turn; the
+running clocks are not reset). When the agent advertises the `promptQueueing`
+capability the worker forwards the prompt concurrently, so the agent receives the
+steer mid-turn and processes it the instant the current turn finishes. If the send
+**fails** (offline / reconnecting) the draft is **left in the compose** with a
+status so the user can retry — never silently moved or dropped. In the agent view,
+bare **`Esc` interrupts an in-flight turn** (`session/cancel`); with no turn in
+flight, `Esc` keeps its existing meaning.
+
+**Applies to.** The agent tile: `submit_compose` / `send_prompt_to_session`
+(`agent_ui.rs`) and the worker's concurrent driver (`acp_channel.rs`, gated on
+`promptQueueing`). There is no client-side steering queue — delivery is immediate.
+
+**Why.** Over ACP **v1 a prompt is a turn** and there is no mid-turn input
+message — but the live agent (`claude-agent-acp`) advertises a vendor capability
+`_meta.claudeCode.promptQueueing` and (verified by live probe) **accepts a
+`session/prompt` while a turn is in flight**, queueing it without interrupting.
+yalda's worker previously *serialized* (awaited each turn before sending the next),
+so a steer couldn't reach the agent until the boundary; the concurrent driver
+fixes that. ACP v2 (the `unstable_protocol_v2` draft) is NOT yet honored by the
+agent — it negotiates down to v1 — so promptQueueing is the real mechanism, and
+this design is the v2-ready shape (`spec-turn-steering.md`).
+
+**Status:** `honored` — state, ordering, and transport verified.
+
+**Enforcement.** Headless in `verify_harness.rs`:
+`steering_submit_while_awaiting_sends_immediately` (mid-turn submit sends + commits
++ doesn't reset the turn), `steering_midturn_ordering_and_dedup` (steer lands after
+prior agent content, committed once, agent echo deduped — via the real reducer),
+and `esc_interrupts_in_flight_turn` / `stop_interrupts_only_when_in_flight`.
+Transport (live, not headless): `tests/steering_midturn_live.rs` drives the REAL
+worker + REAL `claude-agent-acp` and proves a mid-turn steer is delivered and
+processed; the v2-refused / promptQueueing facts were confirmed by a live probe.
+The only thing left for a human is the subjective visual feel.
 
 ## Cross-references
 
+- `spec-turn-steering.md` — the full steering design (queue, delivery modes, the
+  ACP v1/v2 constraint) this invariant summarizes.
 - `spec-chatbox-caret-containment.md` — the compose caret window. Its VERTICAL
   axis still governs the compose; its HORIZONTAL axis is RETIRED for the compose
   (superseded by INV-UX-2 word-wrap).
@@ -216,6 +260,12 @@ click-to-show-output is left for a human eyeball.
   the surface INV-UX-2 governs.
 
 ## Revision history
+
+- 2026-06-26 — Added INV-UX-7 (mid-turn submits steer/queue instead of starting a
+  competing turn; no optimistic transcript echo; Esc interrupts an in-flight
+  turn). See `spec-turn-steering.md`. Guards `steering_*` +
+  `esc_interrupts_in_flight_turn` in `verify_harness.rs`. (INV-UX-6 reserved for
+  the parallel tool-group branch.)
 
 - 2026-06-25 (5) — Added INV-UX-5 (subagents detected structurally from the
   harness + shown as panes below the compose, with the prompt). Fixes the

@@ -3434,54 +3434,79 @@ impl YaldaGpuiView {
             return;
         }
 
-        // Send FIRST, then freeze the optimistic echo only on success. Freezing
-        // before the send could leave a "phantom" user turn in the transcript
-        // that was never delivered (the old order did this). The send is to a
-        // local socket/pipe, so doing it first costs nothing perceptible.
+        // STEERING (spec-turn-steering.md, INV-UX-7): a submit is delivered
+        // IMMEDIATELY — even mid-turn. For agents that advertise `promptQueueing`
+        // (claude-agent-acp) the worker forwards the prompt concurrently, so the
+        // agent receives the steer while the current turn is still streaming and
+        // processes it the instant that turn finishes. `send_prompt_to_session`
+        // commits the user turn on a successful write. On send FAILURE we LEAVE
+        // the draft in the compose (no clear, no queue) with a status so the user
+        // can retry — the message is never moved out of sight or dropped.
+        if self.send_prompt_to_session(id, &text, cx) {
+            self.with_session(id, cx, |claude| {
+                // Reset the compose, PRESERVING placement (Model C §4.1).
+                claude.input_surface = InputSurface::new(claude.input_surface.mode);
+            });
+        } else if let Some(mut claude) = self.agent_mut(cx) {
+            // Send failed: leave the draft intact so the user can retry, and
+            // surface it instead of dropping the message into the void.
+            claude.status = Some("send failed — reconnecting; press ⏎ to retry".into());
+        }
+        cx.notify();
+    }
+
+    /// Send `text` to session `id` as an ACP prompt and, on success, commit the
+    /// optimistic user turn + begin the turn (unless one is already cleanly
+    /// awaiting — a mid-turn steer rides it). Returns whether the prompt was
+    /// written (server `prompt` is fire-and-forget — `Ok` means written, not
+    /// accepted). Does NOT touch the compose surface, so it is safe to call for a
+    /// non-focused session. (spec-turn-steering.md)
+    pub(crate) fn send_prompt_to_session(
+        &mut self,
+        id: SessionId,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let server_sid = self.sessions.sid_of(id).map(|s| s.to_string());
         let prompt_body = text.trim_end_matches('\n').to_string();
         let sent = if let Some(sid) = &server_sid {
-            // NB: server `prompt` is fire-and-forget — `Ok` means the request
-            // was written, NOT that the server accepted it (a non-owner
-            // rejection is invisible here). Ownership is instead guaranteed on
-            // resume by the retrying attach in `spawn_attach_sessions`, so by
-            // the time the user can type, this connection owns the session.
             self.session_server
                 .as_ref()
                 .and_then(|s| s.prompt(sid, &prompt_body).ok())
                 .is_some()
-        } else if let Some(mut claude) = self.agent_mut(cx) {
-            if let Some(channel) = claude.channel.as_mut() {
-                channel.send(&prompt_body).is_ok()
-            } else {
-                false
-            }
         } else {
-            false
+            self.with_session_silent(id, cx, |claude| {
+                claude
+                    .channel
+                    .as_mut()
+                    .map(|ch| ch.send(&prompt_body).is_ok())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
         };
-
         if sent {
-            if let Some(mut claude) = self.agent_mut(cx) {
-                // Optimistic echo + begin the turn. `LocalSubmit` always
-                // inserts and records the text so the stream echo that follows
-                // (server `UserPrompt` or agent `UserMessage`, in any order
-                // relative to streamed content) is suppressed. Never advances
-                // the replay boundary on a live submit.
+            self.with_session(id, cx, |claude| {
+                // `LocalSubmit` always inserts + records so the stream echo that
+                // follows (server `UserPrompt` / agent `UserMessage`) is
+                // suppressed. Never advances the replay boundary on a live send.
                 claude.insert_user_turn(
-                    &text,
+                    text,
                     yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
                     false,
                 );
-                claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
-                // Reset the compose to empty, PRESERVING the current placement
-                // (a worksheet submit stays in worksheet — Model C §4.1).
-                claude.input_surface = InputSurface::new(claude.input_surface.mode);
-            }
-        } else if let Some(mut claude) = self.agent_mut(cx) {
-            // Send failed: leave the chatbox text intact so the user can retry,
-            // and surface it instead of dropping the message into the void.
-            claude.status = Some("send failed — reconnecting; press ⏎ to retry".into());
+                // Begin a turn unless one is ALREADY CLEANLY awaiting — a mid-turn
+                // steer (promptQueueing) rides the in-flight turn, so we don't
+                // reset its elapsed/quiet clocks. But `StopRequested` (a graceful
+                // cancel pending) must be superseded: a fresh steer means the user
+                // wants to keep going, so begin() clears the "stopping…" state
+                // (matching main, which always begin()'d). Only the clean
+                // `Awaiting` case is preserved.
+                if !matches!(claude.turn_phase, TurnPhase::Awaiting { .. }) {
+                    claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
+                }
+            });
         }
-        cx.notify();
+        sent
     }
 
     /// Send the transcript editor's current selection as a prompt
@@ -3581,6 +3606,22 @@ impl YaldaGpuiView {
                 .unwrap_or(false)
         {
             self.unfocus_subagent(cx);
+            return;
+        }
+
+        // Esc INTERRUPTS an in-flight turn (spec-turn-steering.md, INV-UX-7) —
+        // the primary, muscle-memory stop, same path as ⌘. (first press =
+        // graceful session/cancel, second = force-restart). Checked after the
+        // subagent-focus return so unfocusing a subagent still wins. When no
+        // turn is in flight, Esc falls through to its existing per-mode meaning
+        // (transcript→compose, toggle Normal, …) — "Esc never quits".
+        if press.key == Key::Esc
+            && press.modifiers.is_empty()
+            && self
+                .agent_read(cx, |c| c.turn_phase.is_awaiting())
+                .unwrap_or(false)
+        {
+            self.stop_agent_inner(cx);
             return;
         }
 

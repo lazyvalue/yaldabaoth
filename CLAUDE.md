@@ -236,6 +236,68 @@ see `docs/projects/gpui-responsiveness/` (`project.md` has the 6 verified GPUI
   state — if you add a new persisted path, give it the same `*_PATH_OVERRIDE`
   seam.
 
+### Verification harness — the testing protocol (DEFAULT to it; do NOT call things "runtime-only")
+
+`verify_harness.rs` (`cargo test --bin yalda-gpui`) drives the **real**
+`YaldaGpuiView` headlessly via `#[gpui::test]` + `TestAppContext`. It is far more
+capable than "state asserts" — **before flagging any GUI behavior as
+human-runtime-only, check it against this list; most things are headless.** Every
+behavior/UX change ships a headless guard here (and an `INV-UX-N` if it's a UX
+invariant). Background + the 3 genuine gaps: `docs/dev-system.md` § Verification harness.
+
+**What the harness CAN verify headlessly — reach for these seams:**
+
+- **Real view + real actions.** `boot_with_transcript` / `install_agent_slot` /
+  `boot_browser` construct the production view with a bound agent session;
+  `run_until_parked()` runs real layout/paint. Read state back via
+  `read_session(id, cx, |c| …)` / `agent_read`; mutate via `with_session`.
+- **Real keystrokes + bindings.** `cx.update(register_keymap)` then
+  `vcx.simulate_keystrokes("escape")` exercises the *actual* keymap + on_key_down
+  dispatch (e.g. `esc_interrupts_in_flight_turn`, `cmd_b_toggles_file_browser_rail`).
+- **Synthetic agent stream through the REAL reducer.** Build
+  `session_proto::Notification::ReplyEvent { session_id, event: ReplyEvent::… }`
+  batches and apply with `v.apply_server_batch(batch, cx)` (or `apply_reply_events`).
+  This covers transcript **ordering, dedup/echo-suppression, turn accounting,
+  tool-call rendering** — NO live agent needed (e.g. `steering_midturn_ordering_and_dedup`).
+- **PAINTED geometry.** Wrap an element in `probe_bounds("tag", el)`, then in a test:
+  `layout_probe_begin()` → force a frame → `layout_probe_get("tag")` returns the
+  painted `(x,y,w,h)` → `layout_probe_end()`. Assert real placement/visibility
+  (e.g. `subagent_panes_paint_above_the_compose`,
+  `compose_caret_row_painted_inside_box_when_wrapped`). Caret-below-fold,
+  panel-collapse, element-order bugs are all catchable here.
+- **Render-count perf proxy.** `perf_reset/perf_render_count` assert O(changed)
+  (typing on surface A leaves cached surface B's render count flat). Every new
+  cached surface ships one (`transcript_021_*`).
+- **State-machine fuzzer + invariant oracle** (property-based; the strongest net
+  for interaction-sequence regressions). `agent_tile_statemachine_fuzz_holds_invariants`
+  drives the real view through deterministic-random op streams (type, toggle
+  worksheet, submit, stream events, stop, spawn subagent, …) and after EVERY op
+  runs `assert_agent_invariants` — one oracle re-checking the whole contract
+  (caret-in-range / INV-UX-1, append-only frozen transcript / INV-ORDER,
+  `stop_requested⇒awaiting`, focus validity, no-panic). A seeded LCG (no
+  wall-clock/RNG) makes any failure reproduce by `seed`/`step`. When you add a
+  new agent-tile operation or invariant, add it to the op list / the oracle —
+  this catches what example tests can't. (Validated with a negative control: a
+  one-line injected caret corruption fires the oracle with the exact seed/step.)
+
+**The 3 genuine gaps (the only legitimate `NEEDS-RUNTIME`):**
+
+1. **Pixels/colors beyond bounds geometry** — the probe gives layout rects, not a
+   rendered bitmap; exact glyphs/theme colors need a human eye.
+2. **The live subprocess worker / full GUI↔server↔agent loop** — `apply_server_batch`
+   feeds the reducer directly because `sent` can't be true with no daemon. To
+   verify the real `AcpChannelClient` worker against the real agent, write an
+   `#[ignore]` integration test in `tests/` (e.g. `tests/steering_midturn_live.rs`,
+   run with `--ignored`) — needs the agent on PATH + auth.
+3. **Wall-clock perf as a gate** — render *count* is a proxy; real timing is a
+   human `sample` under `--release` (debug masks wins). `benches/render_bench.rs` exists.
+
+**Protocol for a GUI change:** pick the seam (reducer for stream behavior, layout
+probe for placement/visibility, `simulate_keystrokes` for bindings, render-count
+for perf), add the guard, and only write "human runtime check" for one of the 3
+gaps above — with which gap, explicitly. Tests must never touch `~/.yalda`
+(`*_PATH_OVERRIDE` / `None` under `cfg(test)`).
+
 ## Naming Conventions
 
 ### Modes

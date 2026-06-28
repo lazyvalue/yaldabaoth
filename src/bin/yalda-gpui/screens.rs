@@ -1499,11 +1499,11 @@ impl YaldaGpuiView {
             None
         };
 
-        // Subagent panes — a strip of small cards at the BOTTOM of the tile,
-        // below the compose box (replaces the old right-side sidebar). Each card
-        // shows the subagent's status + label + spawn prompt; clicking it focuses
-        // the subagent (swaps the transcript to its output — `focus_subagent`).
-        // Auto-shown when subagents exist; Cmd-2 (ToggleSubagents) collapses them.
+        // Subagent (Task) list — one row per subagent, rendered ABOVE the compose
+        // box (status glyph + label + spawn-prompt snippet; not cards). Clicking a
+        // row focuses the subagent (swaps the transcript to its output —
+        // `focus_subagent`). Auto-shown when subagents exist; Cmd-2
+        // (ToggleSubagents) collapses them.
         let subagent_panes: Option<gpui::AnyElement> = {
             let subagents = c.subagents();
             if !c.subagents_open || subagents.is_empty() {
@@ -1511,14 +1511,11 @@ impl YaldaGpuiView {
             } else {
                 use yalda::acp_channel::ToolCallStatus;
                 let focused_key = c.focused_subagent.clone();
-                let card_bg: Hsla = nc(at.tool_card_bg);
-                let card_border: Hsla = nc(at.tool_card_border);
                 let prompt_fg: Hsla = nc(at.dim);
                 let mut strip = div()
                     .id("subagent-panes")
                     .flex()
-                    .flex_row()
-                    .flex_wrap()
+                    .flex_col()
                     .w_full()
                     .min_w_0()
                     .gap_1()
@@ -1562,22 +1559,22 @@ impl YaldaGpuiView {
                         }
                     });
                     let is_focused = focused_key.as_ref() == Some(&sa.tool_call_id);
-                    let mut card = div()
+                    // One subagent per LINE (not a card): status glyph + label,
+                    // then the prompt snippet dimmed and ellipsised to fill the row.
+                    let mut row = div()
                         .id(SharedString::from(format!("subagent-pane-{i}")))
                         .flex()
-                        .flex_col()
-                        .w(px(220.0))
-                        .min_w(px(150.0))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if is_focused { nc(at.warm_accent) } else { card_border })
-                        .bg(card_bg)
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .min_w_0()
+                        .px_1()
+                        .py(px(1.0))
                         .cursor_pointer();
                     let weak = weak_self.clone();
                     let row_key = sa.tool_call_id.clone();
-                    card = card.on_click(
+                    row = row.on_click(
                         move |_ev: &gpui::ClickEvent, _w: &mut Window, app: &mut GpuiApp| {
                             let key = row_key.clone();
                             let _ = weak.update(app, |this, cx| {
@@ -1585,36 +1582,29 @@ impl YaldaGpuiView {
                             });
                         },
                     );
-                    // Header row: status glyph + label.
-                    card = card.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_1()
-                            .child(div().flex_none().text_color(glyph_fg).child(SharedString::new_static(glyph)))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_color(if is_focused { nc(at.warm_accent) } else { self.editor_fg() })
-                                    .child(SharedString::from(trunc_label)),
-                            ),
-                    );
+                    row = row
+                        .child(div().flex_none().text_color(glyph_fg).child(SharedString::new_static(glyph)))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(if is_focused { nc(at.warm_accent) } else { self.editor_fg() })
+                                .child(SharedString::from(trunc_label)),
+                        );
                     if let Some(snip) = prompt_snip {
                         if !snip.is_empty() {
-                            card = card.child(
+                            row = row.child(
                                 div()
-                                    .w_full()
+                                    .flex_1()
                                     .min_w_0()
-                                    .pt(px(1.0))
                                     .text_color(prompt_fg)
                                     .child(SharedString::from(snip)),
                             );
                         }
                     }
-                    strip = strip.child(card);
+                    strip = strip.child(row);
                 }
                 // Tag the strip so the headless harness can read its PAINTED
-                // bounds and prove the panes sit below the compose (#3.2).
+                // bounds and prove the list sits above the compose (#3.2).
                 Some(probe_bounds("subagent-panes", strip.into_any_element()))
             }
         };
@@ -1642,12 +1632,12 @@ impl YaldaGpuiView {
             .min_w_0()
             .min_h_0()
             .child(transcript_row);
-        if let Some(panel) = compose_panel {
-            col = col.child(panel);
-        }
-        // Subagent panes sit at the very bottom, below the compose (chatbox).
+        // Subagent (Task) list sits ABOVE the compose, one per line.
         if let Some(panes) = subagent_panes {
             col = col.child(panes);
+        }
+        if let Some(panel) = compose_panel {
+            col = col.child(panel);
         }
         let content_area: gpui::AnyElement = col.into_any_element();
 

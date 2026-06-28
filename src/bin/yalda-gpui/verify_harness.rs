@@ -4743,12 +4743,12 @@ fn compose_caret_row_painted_inside_box_when_wrapped(cx: &mut TestAppContext) {
 }
 
 /// VERIFICATION HARNESS (#3.2 — painted-bounds proof of INV-UX-5 layout): the
-/// subagent panes render BELOW the compose box. Register a Task subagent tool
-/// call so the panes appear, drive a real paint pass, and assert (via the layout
-/// probe) that the `subagent-panes` strip is painted and its top is at/below the
-/// compose box's bottom — i.e. below the chatbox, as specified.
+/// subagent (Task) list renders ABOVE the compose box, one per line. Register a
+/// Task subagent tool call so the list appears, drive a real paint pass, and
+/// assert (via the layout probe) that the `subagent-panes` strip is painted and
+/// its bottom is at/above the compose box's top — i.e. above the chatbox.
 #[gpui::test]
-fn subagent_panes_paint_below_the_compose(cx: &mut TestAppContext) {
+fn subagent_panes_paint_above_the_compose(cx: &mut TestAppContext) {
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
 
     // Register a Task subagent (Think + prompt) into the bound session's tool
@@ -4783,11 +4783,339 @@ fn subagent_panes_paint_below_the_compose(cx: &mut TestAppContext) {
         panes.expect("subagent panes did NOT paint — they should appear when a subagent exists");
 
     assert!(panes_h > 1.0, "subagent panes have no height ({panes_h})");
-    // The panes' top is at/below the compose box's bottom (a little slack for the
-    // 1px border between them) — i.e. they sit below the chatbox.
+    let _ = box_h;
+    // The list's bottom is at/above the compose box's (inner) top (slack for the
+    // 1px border) — i.e. it sits ABOVE the chatbox.
     assert!(
-        panes_y + 1.0 >= box_y + box_h,
-        "subagent panes top {panes_y} is NOT below the compose bottom {} — not below the chatbox",
-        box_y + box_h,
+        panes_y + panes_h <= box_y + 2.0,
+        "subagent list bottom {} is NOT above the compose top {box_y} — not above the chatbox",
+        panes_y + panes_h,
     );
+}
+
+// === Steering queue (spec-turn-steering.md, INV-UX-7) ===
+
+/// Submitting while a turn is in flight DELIVERS the steer immediately (the
+/// worker forwards it mid-turn for promptQueueing agents) and commits the user
+/// turn — it does NOT start a competing local turn (it rides the in-flight turn;
+/// the running clocks are not reset) and the compose clears.
+#[gpui::test]
+fn steering_submit_while_awaiting_sends_immediately(cx: &mut TestAppContext) {
+    use crate::agent::{InputSurface, TurnPhase};
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.turn_phase = TurnPhase::begin(std::time::Instant::now());
+            let m = c.input_surface.mode;
+            c.input_surface = InputSurface::with_draft(m, "steer me");
+        });
+    });
+    view.update(vcx, |v, cx| v.submit_compose(cx));
+
+    let (awaiting, compose_empty, in_transcript) = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            (
+                c.turn_phase.is_awaiting(),
+                c.input_surface.compose().text().trim().is_empty(),
+                c.editor.document().full_text().contains("steer me"),
+            )
+        })
+        .unwrap()
+    });
+    assert!(awaiting, "the in-flight turn keeps running (steer rides it)");
+    assert!(compose_empty, "compose is cleared after sending");
+    assert!(
+        in_transcript,
+        "the sent steer is committed to the transcript as a user turn"
+    );
+}
+
+/// `stop_agent_inner` (the function Esc and ⌘. both call) interrupts ONLY when a
+/// turn is in flight: Idle stays Idle; Awaiting → StopRequested.
+#[gpui::test]
+fn stop_interrupts_only_when_in_flight(cx: &mut TestAppContext) {
+    use crate::agent::TurnPhase;
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+
+    // No turn in flight ⇒ no-op.
+    view.update(vcx, |v, cx| v.stop_agent_inner(cx));
+    let still_idle = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| matches!(c.turn_phase, TurnPhase::Idle)).unwrap()
+    });
+    assert!(still_idle, "stop with no turn in flight is a no-op");
+
+    // Turn in flight ⇒ a stop is requested.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| c.turn_phase = TurnPhase::begin(std::time::Instant::now()));
+        v.stop_agent_inner(cx);
+    });
+    let requested = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| c.turn_phase.stop_requested()).unwrap()
+    });
+    assert!(requested, "stop while in flight requests an interrupt");
+}
+
+/// REGRESSION (adversarial review): a steer submitted after a graceful Esc-stop
+/// (turn in `StopRequested`) must SUPERSEDE the pending cancel — the send begins
+/// a clean `Awaiting` turn, not leave it stuck in "stopping…" (which would make
+/// the next Esc a hard force-restart). Only a cleanly-`Awaiting` turn is
+/// preserved across a mid-turn steer.
+#[gpui::test]
+fn steering_after_stop_request_supersedes_pending_cancel(cx: &mut TestAppContext) {
+    use crate::agent::{InputSurface, TurnPhase};
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+
+    // Turn in flight, then a graceful Stop → StopRequested.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| c.turn_phase = TurnPhase::begin(std::time::Instant::now()));
+        v.stop_agent_inner(cx);
+    });
+    let pending = view
+        .read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.turn_phase.stop_requested()).unwrap());
+    assert!(pending, "precondition: a graceful stop is pending");
+
+    // Submit a steer — should supersede the pending cancel.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            let m = c.input_surface.mode;
+            c.input_surface = InputSurface::with_draft(m, "keep going");
+        });
+        v.submit_compose(cx);
+    });
+    let (awaiting, still_pending) = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            (
+                matches!(c.turn_phase, TurnPhase::Awaiting { .. }),
+                c.turn_phase.stop_requested(),
+            )
+        })
+        .unwrap()
+    });
+    assert!(awaiting, "a steer after a stop-request begins a clean Awaiting turn");
+    assert!(
+        !still_pending,
+        "the pending cancel is superseded — the next Esc is graceful, not a hard restart"
+    );
+}
+
+/// End-to-end of the Esc binding: with a turn in flight, pressing Esc in the
+/// agent view interrupts it (→ StopRequested). Idle Esc must NOT (it keeps its
+/// per-mode meaning — "Esc never quits").
+#[gpui::test]
+fn esc_interrupts_in_flight_turn(cx: &mut TestAppContext) {
+    use crate::agent::TurnPhase;
+    cx.update(crate::register_keymap);
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+
+    // Put a turn in flight, then press Esc.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| c.turn_phase = TurnPhase::begin(std::time::Instant::now()));
+    });
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    let requested = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| c.turn_phase.stop_requested()).unwrap()
+    });
+    assert!(requested, "Esc while a turn is in flight requests a stop");
+}
+
+/// Mid-turn ordering + echo-dedup (INV-UX-7), through the REAL reducer: a steer
+/// sent while a turn is streaming commits AFTER the agent content that preceded
+/// it, exactly once — the agent's later echo of the same prompt is suppressed
+/// (no phantom / no duplicate).
+#[gpui::test]
+fn steering_midturn_ordering_and_dedup(cx: &mut TestAppContext) {
+    use crate::agent::TurnPhase;
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+
+    // Turn 1 in flight; first agent content arrives.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.turn_phase = TurnPhase::begin(std::time::Instant::now())
+        });
+        v.apply_server_batch(vec![ev(ReplyEvent::Chunk("agent line A\n".into()))], cx);
+    });
+    vcx.run_until_parked();
+
+    // User steers mid-turn (immediate send commits the user turn).
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            let m = c.input_surface.mode;
+            c.input_surface = crate::agent::InputSurface::with_draft(m, "STEER ONE");
+        });
+        v.submit_compose(cx);
+    });
+    vcx.run_until_parked();
+
+    // The agent later echoes the user prompt on the stream — must be deduped.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(vec![ev(ReplyEvent::UserMessage("STEER ONE\n".into()))], cx);
+    });
+    vcx.run_until_parked();
+
+    let text = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| c.editor.document().full_text()).unwrap()
+    });
+    let a = text.find("agent line A").expect("agent content present");
+    let s = text.find("STEER ONE").expect("steer committed to transcript");
+    assert!(
+        a < s,
+        "the mid-turn steer lands AFTER the agent content that preceded it"
+    );
+    assert_eq!(
+        text.matches("STEER ONE").count(),
+        1,
+        "steer committed exactly once — the agent's echo is deduped (no phantom)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NOVEL VERIFICATION METHOD — agent-tile STATE-MACHINE FUZZER + invariant oracle
+// ─────────────────────────────────────────────────────────────────────────────
+// Every other test here is example-based: each pins ONE scripted scenario, so a
+// regression that only surfaces under an unanticipated *sequence* of operations
+// (toggle worksheet → stream a chunk → submit mid-turn → stop → toggle plan → …)
+// slips through. This is the project's first PROPERTY-BASED test: it drives the
+// REAL `YaldaGpuiView` through many deterministic-random operation sequences and,
+// AFTER EVERY operation, runs one cross-cutting ORACLE that re-checks the whole
+// invariant contract at once (`assert_agent_invariants`):
+//   • INV-UX-1 (model): the compose caret is always at a valid position (line in
+//     range, col ≤ that line's length) — it can never point off the buffer.
+//   • INV-ORDER: the frozen transcript is append-only — its frozen-line count
+//     never decreases, so no operation can rewrite or drop committed history.
+//   • turn_phase well-formedness: `stop_requested ⇒ awaiting`.
+//   • focus is always one of {Compose, Transcript}.
+//   • liveness: no operation (or its render via `run_until_parked`) panics.
+// A seeded LCG (no wall-clock, no RNG) chooses the op stream, so any failure
+// reproduces exactly from its `seed`/`step`. This explores the interaction space
+// the example tests cannot — the limit-test the user asked for.
+
+/// The cross-cutting invariant oracle. Reads the live `AgentState` and asserts
+/// the whole contract; `prev_frozen` carries the append-only watermark across
+/// operations so a shrink anywhere in the sequence is caught.
+#[cfg(test)]
+fn assert_agent_invariants(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    id: crate::SessionId,
+    prev_frozen: &mut usize,
+    ctx: &str,
+) {
+    use crate::agent::AgentFocus;
+    let (caret_line_ok, caret_col_ok, frozen, focus_ok, stop_ok) = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            let comp = c.input_surface.compose();
+            let cur = comp.editor.cursor();
+            let lc = comp.editor.document().line_count().max(1);
+            let caret_line_ok = cur.line < lc;
+            let cl = cur.line.min(lc - 1);
+            let line_len = comp
+                .editor
+                .document()
+                .line_text(cl)
+                .trim_end_matches('\n')
+                .chars()
+                .count();
+            let caret_col_ok = cur.col <= line_len;
+            let frozen = (0..c.editor.document().line_count())
+                .filter(|&i| c.editor.is_frozen_line(i))
+                .count();
+            let focus_ok = matches!(c.focus, AgentFocus::Compose | AgentFocus::Transcript);
+            let stop_ok = !c.turn_phase.stop_requested() || c.turn_phase.is_awaiting();
+            (caret_line_ok, caret_col_ok, frozen, focus_ok, stop_ok)
+        })
+        .unwrap()
+    });
+    assert!(caret_line_ok, "INV-UX-1: compose caret line out of range [{ctx}]");
+    assert!(caret_col_ok, "INV-UX-1: compose caret col past end of line [{ctx}]");
+    assert!(focus_ok, "focus is Compose or Transcript [{ctx}]");
+    assert!(stop_ok, "turn_phase: stop_requested implies awaiting [{ctx}]");
+    assert!(
+        frozen >= *prev_frozen,
+        "INV-ORDER: frozen transcript shrank ({} -> {frozen}) — not append-only [{ctx}]",
+        *prev_frozen,
+    );
+    *prev_frozen = frozen;
+}
+
+#[gpui::test]
+fn agent_tile_statemachine_fuzz_holds_invariants(cx: &mut TestAppContext) {
+    use crate::agent::TurnPhase;
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    // Deterministic LCG (no wall-clock / no RNG so failures reproduce by seed).
+    fn next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+
+    for seed in 1u64..=20 {
+        let (view, vcx, id, _session) = boot_with_transcript(cx);
+        let mut st = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        let mut prev_frozen = 0usize;
+        let mut spawn_n = 0u64;
+        assert_agent_invariants(&view, vcx, id, &mut prev_frozen, "init");
+
+        for step in 0..100 {
+            let op = next(&mut st) % 12;
+            match op {
+                0 => view.update(vcx, |v, cx| {
+                    v.with_session(id, cx, |c| c.input_surface.compose_mut().editor.insert_char('x'));
+                }),
+                1 => view.update(vcx, |v, cx| {
+                    v.with_session(id, cx, |c| c.input_surface.compose_mut().editor.insert_char('\n'));
+                }),
+                2 => view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx)),
+                3 => view.update(vcx, |v, cx| v.submit_compose(cx)),
+                4 => view.update(vcx, |v, cx| {
+                    v.apply_server_batch(vec![ev(ReplyEvent::Chunk("agent chunk\n".into()))], cx);
+                }),
+                5 => view.update(vcx, |v, cx| {
+                    v.apply_server_batch(vec![ev(ReplyEvent::UserMessage("echo\n".into()))], cx);
+                }),
+                6 => view.update(vcx, |v, cx| {
+                    v.apply_server_batch(vec![ev(ReplyEvent::ReplayComplete)], cx);
+                }),
+                7 => view.update(vcx, |v, cx| v.toggle_tasklist(cx)),
+                8 => {
+                    spawn_n += 1;
+                    view.update(vcx, |v, cx| {
+                        use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
+                        if let Some(mut c) = v.agent_mut(cx) {
+                            let tcid: ToolCallId = format!("fuzz-task-{spawn_n}").into();
+                            let mut tc = ToolCall::new(tcid.clone(), "Explore".to_string());
+                            tc.kind = ToolKind::Think;
+                            tc.raw_input = Some(serde_json::json!({"prompt": "do x"}));
+                            let anchor = c.editor.anchor_for_line(0);
+                            c.tools.register(crate::ToolCallKey::from_id(&tcid), tc, anchor);
+                        }
+                    });
+                }
+                9 => view.update(vcx, |v, cx| v.toggle_agent_focus(cx)),
+                10 => view.update(vcx, |v, cx| v.stop_agent_inner(cx)),
+                _ => view.update(vcx, |v, cx| {
+                    v.with_session(id, cx, |c| {
+                        c.turn_phase = TurnPhase::begin(std::time::Instant::now())
+                    });
+                }),
+            }
+            vcx.run_until_parked();
+            let label = format!("seed={seed} step={step} op={op}");
+            assert_agent_invariants(&view, vcx, id, &mut prev_frozen, &label);
+        }
+    }
 }
