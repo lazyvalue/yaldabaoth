@@ -869,54 +869,32 @@ impl YaldaGpuiView {
             // WORKSHEET). Mode + cursor read the compose, not the read-only
             // transcript.
             let in_chatbox = c.input_surface.is_chatbox();
-            // INV-UX-9: when focus is on the read-only transcript, the status
-            // readout follows the TRANSCRIPT caret (and says so), not the compose —
-            // otherwise navigating history gives no feedback and worksheet feels
-            // identical to the chatbox. `↓ to compose` hints the way back.
-            let mut status_text = if c.focus == AgentFocus::Transcript {
-                let tc = c.editor.cursor();
-                let extend_mark = if c.editor.extend_mode() { " EXT" } else { "" };
-                format!(
-                    "TRANSCRIPT NAV{} · L{}:C{} · ↑↓/jk move · v select · S send · ↓ to compose",
-                    extend_mark,
-                    tc.line + 1,
-                    tc.col + 1,
-                )
-            } else {
-                let compose = c.input_surface.compose();
-                let mode_label = match (in_chatbox, compose.mode) {
-                    (true, EditMode::Normal) => "CHATBOX",
-                    (true, EditMode::Insert) => "CHATBOX INSERT",
-                    (false, EditMode::Normal) => "WORKSHEET",
-                    (false, EditMode::Insert) => "WORKSHEET INSERT",
-                };
-                let dirty_mark = if compose.editor.document().is_modified() {
-                    "•"
-                } else {
-                    ""
-                };
-                let extend_mark = if compose.editor.extend_mode() {
-                    " EXT"
-                } else {
-                    ""
-                };
-                let compose_cursor = compose.editor.cursor();
-                // In worksheet, hint the up-gesture into history (the feature that
-                // makes worksheet a navigable workspace, not just a box). Up-arrow
-                // crosses from EITHER mode, so the hint shows whenever worksheet is
-                // active (only the caret must be at the compose top to actually
-                // cross — the hint is the affordance, not a live-enabled flag).
-                let nav_hint = if !in_chatbox { " · ↑ to history" } else { "" };
-                format!(
-                    "{}{}{} · L{}:C{}{}",
-                    dirty_mark,
-                    mode_label,
-                    extend_mark,
-                    compose_cursor.line + 1,
-                    compose_cursor.col + 1,
-                    nav_hint,
-                )
+            let compose = c.input_surface.compose();
+            let mode_label = match (in_chatbox, compose.mode) {
+                (true, EditMode::Normal) => "CHATBOX",
+                (true, EditMode::Insert) => "CHATBOX INSERT",
+                (false, EditMode::Normal) => "WORKSHEET",
+                (false, EditMode::Insert) => "WORKSHEET INSERT",
             };
+            let dirty_mark = if compose.editor.document().is_modified() {
+                "•"
+            } else {
+                ""
+            };
+            let extend_mark = if compose.editor.extend_mode() {
+                " EXT"
+            } else {
+                ""
+            };
+            let compose_cursor = compose.editor.cursor();
+            let mut status_text = format!(
+                "{}{}{} · L{}:C{}",
+                dirty_mark,
+                mode_label,
+                extend_mark,
+                compose_cursor.line + 1,
+                compose_cursor.col + 1,
+            );
             if c.turn_phase.is_awaiting() {
                 status_text.push_str(" · …awaiting reply");
             }

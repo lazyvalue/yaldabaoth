@@ -3699,31 +3699,6 @@ impl YaldaGpuiView {
                 cx.notify();
                 return;
             }
-            // Worksheet seamless cursor (INV-UX-9): "down past the end" of the
-            // transcript hands focus back to the compose, so the caret flows out
-            // of history into the editable draft. Only the FOCUS crosses — no text
-            // or position crosses the buffer seam (Model C INV-3). Worksheet only;
-            // chatbox keeps its pinned box. `j` is consumed by user-turn-jump mode
-            // earlier when that's on, so this only fires for plain navigation.
-            let cross_down = self
-                .agent_read(cx, |c| {
-                    !c.input_surface.is_chatbox()
-                        && press.modifiers.is_empty()
-                        && (press.key == Key::Down || press.key == Key::Char('j'))
-                        && c.editor.cursor().line >= c.transcript_last_stop()
-                })
-                .unwrap_or(false);
-            if cross_down {
-                self.with_session(focused_id, cx, |c| {
-                    c.editor.clear_selection();
-                    c.focus = AgentFocus::Compose;
-                    let cb = c.input_surface.compose_mut();
-                    cb.editor.cursor_mut().line = 0;
-                    cb.editor.cursor_mut().col = 0;
-                });
-                cx.notify();
-                return;
-            }
             let Some(outcome) = self.with_session_silent(focused_id, cx, |claude| {
                 claude.status = None;
                 claude.mode = EditMode::Normal;
@@ -3757,36 +3732,6 @@ impl YaldaGpuiView {
                 // No paste into the read-only transcript.
                 NormalOutcome::Paste { .. } => cx.notify(),
             }
-            return;
-        }
-
-        // Worksheet seamless cursor (INV-UX-9): "up past the top" of the compose
-        // hands focus UP into the read-only transcript, so the caret flows out of
-        // the draft into history — the user navigates the conversation and responds
-        // (select + `S`) without the menu dance. Only the FOCUS crosses; no text or
-        // position crosses the buffer seam (Model C INV-3). Worksheet only (chatbox
-        // keeps its pinned box). Up-arrow crosses from either mode; `k` crosses only
-        // in Normal (in Insert it must type a literal `k`).
-        let cross_up = self
-            .agent_read(cx, |c| {
-                if c.input_surface.is_chatbox() {
-                    return false;
-                }
-                let cb = c.input_surface.compose();
-                let at_top = cb.editor.cursor().line == 0;
-                let is_up = press.modifiers.is_empty()
-                    && (press.key == Key::Up
-                        || (press.key == Key::Char('k') && cb.mode == EditMode::Normal));
-                at_top && is_up
-            })
-            .unwrap_or(false);
-        if cross_up {
-            self.with_session(focused_id, cx, |c| {
-                c.mode = EditMode::Normal;
-                c.focus = AgentFocus::Transcript;
-                c.move_transcript_caret_to_last_stop();
-            });
-            cx.notify();
             return;
         }
 
