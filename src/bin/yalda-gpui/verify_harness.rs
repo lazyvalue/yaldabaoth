@@ -5542,14 +5542,24 @@ fn assert_agent_invariants(
                 .count();
             let focus_ok = matches!(c.focus, AgentFocus::Compose | AgentFocus::Transcript);
             let stop_ok = !c.turn_phase.stop_requested() || c.turn_phase.is_awaiting();
-            (caret_line_ok, caret_col_ok, frozen, focus_ok, stop_ok)
+            // INV-UX-9: a You-block exists ONLY in the worksheet (never chatbox
+            // mode). The stored anchor is deliberately NOT asserted legal here — it
+            // may go transiently stale and is re-validated at every consumption site
+            // (effective_you_block_anchor), so a stale stored value is harmless.
+            let block_mode_ok = !c.you_block_open || !c.input_surface.is_chatbox();
+            // The EFFECTIVE anchor (what consumers use) is always legal-or-None.
+            let eff_ok = c.effective_you_block_anchor().is_none_or(|a| c.you_block_anchor_is_legal(a));
+            (caret_line_ok, caret_col_ok, frozen, focus_ok, stop_ok && block_mode_ok && eff_ok)
         })
         .unwrap()
     });
     assert!(caret_line_ok, "INV-UX-1: compose caret line out of range [{ctx}]");
     assert!(caret_col_ok, "INV-UX-1: compose caret col past end of line [{ctx}]");
     assert!(focus_ok, "focus is Compose or Transcript [{ctx}]");
-    assert!(stop_ok, "turn_phase: stop_requested implies awaiting [{ctx}]");
+    assert!(
+        stop_ok,
+        "turn_phase stop⇒awaiting, You-block⇒worksheet, effective-anchor legal [{ctx}]"
+    );
     assert!(
         frozen >= *prev_frozen,
         "INV-ORDER: frozen transcript shrank ({} -> {frozen}) — not append-only [{ctx}]",
@@ -5584,7 +5594,7 @@ fn agent_tile_statemachine_fuzz_holds_invariants(cx: &mut TestAppContext) {
         assert_agent_invariants(&view, vcx, id, &mut prev_frozen, "init");
 
         for step in 0..100 {
-            let op = next(&mut st) % 12;
+            let op = next(&mut st) % 14;
             match op {
                 0 => view.update(vcx, |v, cx| {
                     v.with_session(id, cx, |c| c.input_surface.compose_mut().editor.insert_char('x'));
@@ -5620,6 +5630,12 @@ fn agent_tile_statemachine_fuzz_holds_invariants(cx: &mut TestAppContext) {
                 }
                 9 => view.update(vcx, |v, cx| v.toggle_agent_focus(cx)),
                 10 => view.update(vcx, |v, cx| v.stop_agent_inner(cx)),
+                // INV-UX-9: drive the real You-block open / discard key paths so the
+                // fuzzer exercises the inline-edit lifecycle against the oracle.
+                11 => view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx)),
+                12 => {
+                    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx))
+                }
                 _ => view.update(vcx, |v, cx| {
                     v.with_session(id, cx, |c| {
                         c.turn_phase = TurnPhase::begin(std::time::Instant::now())
