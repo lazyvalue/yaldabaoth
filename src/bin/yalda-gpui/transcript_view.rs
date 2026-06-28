@@ -391,8 +391,21 @@ impl TranscriptView {
                 }
             } else if c.pending_reveal_cursor {
                 c.pending_reveal_cursor = false;
-                let cl = c.editor.cursor().line;
-                Some(c.view_model.item_for_line(cl))
+                // INV-UX-1 (stage 2): while the inline You-block is open the edit
+                // caret lives in the BLOCK, below its anchor line — so reveal the
+                // YouBlock item itself (it grows as you type), not the anchor line
+                // above it, or a multi-line reply's caret scrolls below the fold.
+                let inline_block =
+                    c.you_block_open && !c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();
+                if inline_block {
+                    flat_items_arc
+                        .iter()
+                        .position(|it| matches!(it, FlatItem::YouBlock))
+                        .or_else(|| Some(c.view_model.item_for_line(c.editor.cursor().line)))
+                } else {
+                    let cl = c.editor.cursor().line;
+                    Some(c.view_model.item_for_line(cl))
+                }
             } else {
                 None
             };

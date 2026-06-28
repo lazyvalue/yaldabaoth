@@ -3922,8 +3922,12 @@ impl YaldaGpuiView {
                     && !c.turn_phase.is_awaiting()
             })
             .unwrap_or(false);
-        if inline_active && let Some(ent) = self.session_entity(focused_id) {
-            ent.update(cx, |_, scx| scx.notify());
+        if inline_active {
+            // INV-UX-1: keep the inline block's caret in view as the reply grows.
+            self.with_session_silent(focused_id, cx, |c| c.pending_reveal_cursor = true);
+            if let Some(ent) = self.session_entity(focused_id) {
+                ent.update(cx, |_, scx| scx.notify());
+            }
         }
         match outcome {
             NormalOutcome::Skipped | NormalOutcome::Handled => cx.notify(),
