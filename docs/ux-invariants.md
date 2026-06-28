@@ -326,18 +326,24 @@ respond." The inline-edit behavior is what the user actually wants and what
 `spec-agent-window.md` §9–§15 originally specified; INV-UX-9 restores it on the
 durable Model C substrate.
 
-**Status:** `specified — implementation in progress` (do NOT mark honored until the
-guards below are green + a human runtime check).
+**Status:** `partially implemented` — **stage 1** (ticket 001) landed: rules 1–4,
+6, 7 for the **tail** reply (the You-block is the compose, opened on Insert from
+worksheet navigation, discarded on empty Esc, shown only when open or mid-turn).
+**Deferred:** rule 5's between-lines anchoring + the legal-point guard (ticket
+002), and retiring the user-selected Worksheet⇄Chatbox toggle / flipping the
+default to Worksheet (ticket 003). Do NOT mark `honored` until 002/003 land + a
+human runtime check. See `docs/projects/worksheet-inline-edit/`.
 
-**Enforcement.** Headless in `verify_harness.rs` (planned):
-`worksheet_insert_opens_you_block`, `worksheet_empty_insert_discards_you_block`
-(byte-identical transcript), `worksheet_submit_freezes_you_block`,
+**Enforcement.** Headless in `verify_harness.rs`:
+`worksheet_insert_opens_and_empty_esc_discards_you_block` (open + byte-identical
+discard, INV-1), `worksheet_nonempty_you_block_persists_after_esc` (rules 4/6),
+`worksheet_compose_visibility_tracks_block_and_turn` (painted: hidden idle, shown
+on open, shown mid-turn — rules 6/7). Planned with ticket 002:
 `worksheet_insert_blocked_outside_latest_turn`,
-`worksheet_insert_only_after_agent_newline`,
-`worksheet_midturn_input_routes_to_chatbox` +
-`worksheet_chatbox_hidden_when_idle`, and the existing
-`agent_tile_statemachine_fuzz_holds_invariants` extended with You-block ops +
-oracle clauses (one You-block max; no edit while mid-turn; transcript append-only).
+`worksheet_insert_only_after_agent_newline`, `worksheet_submit_freezes_you_block_in_place`,
+and extending `agent_tile_statemachine_fuzz_holds_invariants` with You-block ops +
+oracle clauses (one You-block max; no inline edit while mid-turn; transcript
+append-only).
 
 ## Cross-references
 

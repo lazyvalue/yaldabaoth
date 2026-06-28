@@ -2889,6 +2889,15 @@ pub(crate) struct AgentState {
     /// Worksheet a *workspace* (select history, `S` = send selection), shared by
     /// both placements. `Esc` from `Transcript` returns to `Compose`.
     pub(crate) focus: AgentFocus,
+    /// Worksheet inline-edit (spec-worksheet.md / INV-UX-9): whether a **You-block**
+    /// is currently open — i.e. the `Compose` is acting as an inline editable reply
+    /// attached to the transcript while the agent is idle. `false` = the worksheet
+    /// is in pure navigation (no compose chrome shown). Entering Insert from
+    /// transcript navigation opens it; leaving Insert with only whitespace discards
+    /// it (rule 3); Submit freezes + clears it (rule 4). Only meaningful in
+    /// Worksheet mode; the mid-turn chatbox (rule 7) is derived from `turn_phase`,
+    /// not from this flag.
+    pub(crate) you_block_open: bool,
     /// Last-seen full snapshot of the agent's plan. Updated on every ACP
     /// `Plan` notification (which carries a complete plan, not a delta —
     /// see spec-agent-window.md §21). Consumed by the Tasklist sidebar.
@@ -3141,6 +3150,7 @@ impl AgentState {
             highlight_cache: HighlightCache::new(),
             input_surface: InputSurface::new(InputModeKind::Chatbox),
             focus: AgentFocus::default(),
+            you_block_open: false,
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -3195,6 +3205,7 @@ impl AgentState {
             highlight_cache: HighlightCache::new(),
             input_surface: InputSurface::new(InputModeKind::Chatbox),
             focus: AgentFocus::default(),
+            you_block_open: false,
             current_plan: None,
             agent_mode: None,
             agent_model: None,

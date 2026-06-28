@@ -1367,6 +1367,7 @@ impl YaldaGpuiView {
             highlight_cache: HighlightCache::new(),
             input_surface: InputSurface::new(InputModeKind::Chatbox),
             focus: AgentFocus::default(),
+            you_block_open: false,
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -3169,6 +3170,25 @@ impl YaldaGpuiView {
                 InputModeKind::Worksheet => InputModeKind::Chatbox,
                 InputModeKind::Chatbox => InputModeKind::Worksheet,
             };
+            // INV-UX-9: the worksheet rests in transcript navigation (free cursor
+            // in the buffer); the chatbox rests in the compose. Entering worksheet
+            // with an existing draft keeps it as an open You-block; otherwise it
+            // starts in pure navigation. Entering chatbox focuses the box.
+            match claude.input_surface.mode {
+                InputModeKind::Worksheet => {
+                    claude.you_block_open =
+                        !claude.input_surface.compose().text().trim().is_empty();
+                    claude.focus = if claude.you_block_open {
+                        AgentFocus::Compose
+                    } else {
+                        AgentFocus::Transcript
+                    };
+                }
+                InputModeKind::Chatbox => {
+                    claude.you_block_open = false;
+                    claude.focus = AgentFocus::Compose;
+                }
+            }
         });
         cx.notify();
     }
@@ -3445,7 +3465,15 @@ impl YaldaGpuiView {
         if self.send_prompt_to_session(id, &text, cx) {
             self.with_session(id, cx, |claude| {
                 // Reset the compose, PRESERVING placement (Model C §4.1).
-                claude.input_surface = InputSurface::new(claude.input_surface.mode);
+                let mode = claude.input_surface.mode;
+                claude.input_surface = InputSurface::new(mode);
+                // INV-UX-9 (rule 4): a worksheet submit closes the You-block and
+                // returns to transcript navigation — the reply was frozen into the
+                // transcript by the reconciler, the editable region is gone.
+                if mode == InputModeKind::Worksheet {
+                    claude.you_block_open = false;
+                    claude.focus = AgentFocus::Transcript;
+                }
             });
         } else if let Some(mut claude) = self.agent_mut(cx) {
             // Send failed: leave the draft intact so the user can retry, and
@@ -3692,6 +3720,29 @@ impl YaldaGpuiView {
             .agent_read(cx, |c| c.focus == AgentFocus::Transcript)
             .unwrap_or(false);
         if transcript_focused {
+            // INV-UX-9: in the WORKSHEET, an Insert-entry key from transcript
+            // navigation opens a **You-block** — the `Compose` becomes an inline
+            // editable reply attached to the conversation (rule 2). The draft lives
+            // in the separate Compose (Model C: no draft in the transcript), so
+            // this only flips focus/mode; nothing is written to the transcript.
+            // (Stage 1: the block is the tail reply. The legal-point guard + the
+            // between-lines anchor are ticket 002.) In a non-worksheet (chatbox)
+            // transcript focus, `Esc` returns to the compose as before.
+            let worksheet = self
+                .agent_read(cx, |c| !c.input_surface.is_chatbox())
+                .unwrap_or(false);
+            if worksheet
+                && press.modifiers.is_empty()
+                && matches!(press.key, Key::Char('i' | 'a' | 'o' | 'I' | 'A' | 'O'))
+            {
+                self.with_session(focused_id, cx, |c| {
+                    c.you_block_open = true;
+                    c.focus = AgentFocus::Compose;
+                    c.input_surface.compose_mut().mode = EditMode::Insert;
+                });
+                cx.notify();
+                return;
+            }
             if press.modifiers.is_empty() && press.key == Key::Esc {
                 if let Some(mut c) = self.agent_mut(cx) {
                     c.focus = AgentFocus::Compose;
@@ -3732,6 +3783,35 @@ impl YaldaGpuiView {
                 // No paste into the read-only transcript.
                 NormalOutcome::Paste { .. } => cx.notify(),
             }
+            return;
+        }
+
+        // INV-UX-9: Esc in a worksheet You-block leaves Insert and returns to
+        // transcript navigation. An EMPTY block (only whitespace typed) is
+        // DISCARDED (rule 3) — the compose clears and no chrome remains, so the
+        // transcript is byte-identical to before Insert. A non-empty block PERSISTS
+        // (rule 4), pending the next Submit. (Chatbox Esc is unchanged: it just
+        // toggles the box to Normal, handled by the dispatch below.)
+        let ws_esc = self
+            .agent_read(cx, |c| {
+                !c.input_surface.is_chatbox()
+                    && c.focus == AgentFocus::Compose
+                    && press.key == Key::Esc
+                    && press.modifiers.is_empty()
+            })
+            .unwrap_or(false);
+        if ws_esc {
+            self.with_session(focused_id, cx, |c| {
+                if c.input_surface.compose().text().trim().is_empty() {
+                    c.input_surface = InputSurface::new(InputModeKind::Worksheet);
+                    c.you_block_open = false;
+                } else {
+                    c.input_surface.compose_mut().mode = EditMode::Normal;
+                }
+                c.focus = AgentFocus::Transcript;
+                c.pending_reveal_cursor = true;
+            });
+            cx.notify();
             return;
         }
 

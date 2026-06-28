@@ -4779,8 +4779,16 @@ fn worksheet_renders_flush_chatbox_renders_boxed(cx: &mut TestAppContext) {
     let (chat_x, _, chat_w, _) = probe_box(&view, vcx);
     assert!(chat_w > 1.0, "chatbox compose box has no width ({chat_w})");
 
-    // Toggle to Worksheet (inline-flush placement) and re-probe.
+    // Toggle to Worksheet (inline-flush placement) and re-probe. Under INV-UX-9
+    // the worksheet shows the compose ONLY when a You-block is open, so open one
+    // (the inline-edit reply) before probing — that is the flush surface to compare.
     view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    view.update(vcx, |v, cx| {
+        if let Some(mut c) = v.agent_mut(cx) {
+            c.you_block_open = true;
+            c.focus = crate::AgentFocus::Compose;
+        }
+    });
     let in_worksheet = !view
         .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.is_chatbox()))
         .expect("bound agent session");
@@ -4802,6 +4810,162 @@ fn worksheet_renders_flush_chatbox_renders_boxed(cx: &mut TestAppContext) {
         ws_x < chat_x - 4.0,
         "worksheet box left ({ws_x}) should sit left of the boxed chatbox ({chat_x}) \
          — the box margin is gone, the worksheet is flush in the column",
+    );
+}
+
+/// Build a bare (no-modifier) key-down event for driving the REAL
+/// `handle_claude_key` dispatch directly (single chars also fill `key_char`).
+fn ws_bare_key(key: &str) -> gpui::KeyDownEvent {
+    gpui::KeyDownEvent {
+        keystroke: gpui::Keystroke {
+            modifiers: gpui::Modifiers::default(),
+            key: key.to_string(),
+            key_char: (key.chars().count() == 1).then(|| key.to_string()),
+        },
+        is_held: false,
+    }
+}
+
+/// Boot a real view with a bound session, switched to **Worksheet** mode resting
+/// in transcript navigation (INV-UX-9 default for the worksheet).
+fn boot_worksheet_nav(
+    cx: &mut TestAppContext,
+) -> (gpui::Entity<YaldaGpuiView>, &mut gpui::VisualTestContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(!c.input_surface.is_chatbox(), "in worksheet");
+        assert_eq!(c.focus, crate::AgentFocus::Transcript, "worksheet rests in nav");
+        assert!(!c.you_block_open, "no You-block until Insert");
+    });
+    (view, vcx)
+}
+
+/// INV-UX-9 rules 1–3: in the worksheet, navigation is free (no compose chrome);
+/// an Insert-entry key (`i`) opens a You-block (compose focus + Insert); leaving
+/// Insert with NO non-whitespace text DISCARDS it — the transcript is
+/// byte-identical to before and no chrome remains.
+#[gpui::test]
+fn worksheet_insert_opens_and_empty_esc_discards_you_block(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+
+    let seq_before = view.update(vcx, |v, cx| {
+        v.agent_mut(cx).expect("agent").editor.document().edit_seq()
+    });
+
+    // `i` opens a You-block.
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(c.you_block_open, "i opens a You-block");
+        assert_eq!(c.focus, crate::AgentFocus::Compose, "focus moves to the block");
+        assert_eq!(
+            c.input_surface.compose().mode,
+            crate::EditMode::Insert,
+            "the block is in Insert"
+        );
+    });
+
+    // Type only whitespace, then Esc → discard.
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("space"), window, cx));
+    vcx.run_until_parked();
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(!c.you_block_open, "empty Esc discards the You-block (rule 3)");
+        assert_eq!(c.focus, crate::AgentFocus::Transcript, "back to navigation");
+        assert!(
+            c.input_surface.compose().text().trim().is_empty(),
+            "draft cleared on discard"
+        );
+        assert_eq!(
+            c.editor.document().edit_seq(),
+            seq_before,
+            "the transcript is byte-identical — no phantom You turn (rule 3 / INV-1)"
+        );
+    });
+}
+
+/// INV-UX-9 rule 4: a You-block with real text PERSISTS after Esc (pending the
+/// next Submit) — focus returns to navigation but the block stays open with its
+/// text. Re-entering Insert reuses the same single block (rule 6).
+#[gpui::test]
+fn worksheet_nonempty_you_block_persists_after_esc(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    vcx.run_until_parked();
+    for k in ["h", "i"] {
+        view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key(k), window, cx));
+    }
+    vcx.run_until_parked();
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(c.you_block_open, "non-empty block persists (rule 4)");
+        assert_eq!(c.focus, crate::AgentFocus::Transcript, "Esc returns to nav");
+        assert_eq!(c.input_surface.compose().text().trim(), "hi", "draft retained");
+    });
+
+    // Re-entering Insert reuses the SAME block (one block at a time, rule 6).
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(c.you_block_open);
+        assert_eq!(c.focus, crate::AgentFocus::Compose);
+        assert_eq!(c.input_surface.compose().text().trim(), "hi", "same block, text kept");
+    });
+}
+
+/// INV-UX-9 rules 6/7 (painted): the worksheet compose is HIDDEN when navigating
+/// idle, SHOWN when a You-block is open, and SHOWN mid-turn (the chatbox).
+#[gpui::test]
+fn worksheet_compose_visibility_tracks_block_and_turn(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+
+    let probe = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        for _ in 0..3 {
+            view.update(vcx, |_, cx| cx.notify());
+            vcx.run_until_parked();
+        }
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let b = crate::layout_probe_get("compose-box");
+        crate::layout_probe_end();
+        b
+    };
+
+    // Idle, navigating, no block → no compose chrome.
+    assert!(
+        probe(&view, vcx).is_none(),
+        "idle worksheet navigation shows NO compose (rule 6)"
+    );
+
+    // Open a You-block → compose paints.
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
+    vcx.run_until_parked();
+    assert!(
+        probe(&view, vcx).is_some(),
+        "an open You-block paints the compose (rule 2)"
+    );
+
+    // Discard, then go mid-turn → the chatbox paints even with no block.
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
+    vcx.run_until_parked();
+    assert!(probe(&view, vcx).is_none(), "discarded → hidden again");
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
+    });
+    assert!(
+        probe(&view, vcx).is_some(),
+        "mid-turn shows the chatbox even with no You-block (rule 7)"
     );
 }
 
