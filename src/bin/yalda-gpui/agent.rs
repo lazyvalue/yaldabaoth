@@ -3496,6 +3496,29 @@ impl AgentState {
         if !self.input_surface.is_chatbox() {
             self.move_cursor_to_tail();
         }
+        // Settle focus/You-block consistency for the restored placement + draft so a
+        // restored chatbox focuses its box, a restored worksheet draft is shown as a
+        // tail block, and an empty worksheet rests in nav (bug-hunt-3 restore edge).
+        self.settle_input_focus();
+    }
+
+    /// Make `focus`/`you_block_open`/`you_block_anchor` consistent with the current
+    /// placement + draft. Used after restore/replay (idle): Chatbox focuses its
+    /// always-visible box; Worksheet with a non-empty draft opens a tail You-block
+    /// (so the draft is visible + editable), an empty Worksheet rests in transcript
+    /// navigation. Upholds the invariant "focus=Compose ⇒ a visible surface".
+    pub(crate) fn settle_input_focus(&mut self) {
+        if self.input_surface.is_chatbox() {
+            self.close_you_block();
+            self.focus = AgentFocus::Compose;
+        } else if !self.input_surface.compose().text().trim().is_empty() {
+            self.you_block_open = true;
+            self.you_block_anchor = None; // tail
+            self.focus = AgentFocus::Compose;
+        } else {
+            self.close_you_block();
+            self.focus = AgentFocus::Transcript;
+        }
     }
 
     /// Idempotent turn finalize keyed on `(generation, turn)` (spec §7/H5).

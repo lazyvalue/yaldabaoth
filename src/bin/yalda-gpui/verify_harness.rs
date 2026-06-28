@@ -5263,6 +5263,49 @@ fn worksheet_tall_inline_block_keeps_caret_in_window(cx: &mut TestAppContext) {
     });
 }
 
+/// REGRESSION (round-3 restore edge): `settle_input_focus` makes focus/You-block
+/// consistent with the restored placement + draft. A restored chatbox focuses its
+/// box; a restored worksheet draft shows as a tail block (not hidden); an empty
+/// worksheet rests in nav. Upholds focus=Compose ⇒ a visible surface.
+#[gpui::test]
+fn worksheet_restore_settles_focus_and_block(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+
+    // Restored worksheet WITH a draft → tail block, focus=Compose, visible.
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.input_surface =
+            crate::InputSurface::with_draft(crate::InputModeKind::Worksheet, "restored draft");
+        c.focus = crate::AgentFocus::Transcript; // as the constructor leaves it
+        c.you_block_open = false;
+        c.settle_input_focus();
+        assert!(c.you_block_open, "restored worksheet draft opens a tail block");
+        assert_eq!(c.you_block_anchor, None, "at the tail");
+        assert_eq!(c.focus, crate::AgentFocus::Compose);
+        assert!(c.inline_you_block_active(), "the draft is visible");
+    });
+
+    // Restored worksheet EMPTY → nav, no block.
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
+        c.settle_input_focus();
+        assert!(!c.you_block_open);
+        assert_eq!(c.focus, crate::AgentFocus::Transcript);
+    });
+
+    // Restored chatbox → focus the box.
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.input_surface =
+            crate::InputSurface::with_draft(crate::InputModeKind::Chatbox, "box draft");
+        c.focus = crate::AgentFocus::Transcript;
+        c.settle_input_focus();
+        assert_eq!(c.focus, crate::AgentFocus::Compose, "chatbox focuses its box");
+        assert!(!c.you_block_open, "chatbox has no inline block");
+    });
+}
+
 /// REGRESSION (bug-hunt-2 B1): the `f` focus-toggle (Transcript→Compose) in an idle
 /// worksheet must OPEN a You-block — leaving focus=Compose with no visible surface
 /// would make typing vanish into the void.

@@ -89,6 +89,11 @@ impl YaldaGpuiView {
                 // Restore placement + seed the persisted compose draft (Model C).
                 state.input_surface =
                     InputSurface::with_draft(slot.mode, slot.compose_draft.as_deref().unwrap_or(""));
+                // Make focus/You-block consistent with the restored placement+draft
+                // (replay's finish_replay re-settles too; this covers a no-history
+                // restore): restored chatbox focuses its box; a restored worksheet
+                // draft shows as a tail block; empty worksheet rests in nav.
+                state.settle_input_focus();
                 state.tasklist_open = slot.tasklist_open;
                 state.subagents_open = slot.subagents_open;
                 self.show_local_session(
