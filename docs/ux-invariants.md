@@ -305,8 +305,10 @@ per `spec-worksheet.md` (AUTHORITATIVE). Concretely:
    pending reply; the next Submit sends it and freezes it as a committed user turn.
 5. **Insert is bounded** — a You-block can be opened **only within the most-recent
    agent turn, only after an agent newline**; frozen content is not editable.
-6. **One You-block at a time** — the editable set is exactly what you've typed
-   since the last Submit.
+6. **Multiple insertion points** — Insert at a new legal point opens another block
+   (the previous parks in place, text kept); one is active, the rest render inline
+   read-only; Submit sends them all combined + freezes each in place. A fresh
+   (empty) session opens one tail block so there's always a visible input.
 7. **Mid-turn → chatbox.** While the agent is mid-turn the transcript is read-only
    and a chatbox appears **pinned at the bottom**; input goes there (steers/queues,
    INV-UX-7). The chatbox is **not visible when the agent is idle**.

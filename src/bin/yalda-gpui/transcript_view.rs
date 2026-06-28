@@ -90,6 +90,10 @@ pub(crate) struct TranscriptSeqs {
     pub(crate) compose_cursor: (usize, usize),
     pub(crate) compose_mode: EditMode,
     pub(crate) compose_selection: Option<((usize, usize), (usize, usize))>,
+    /// Hash of the PARKED You-blocks (rule 6) — their anchors + text. A park/unpark/
+    /// submit changes this so the cached transcript re-renders the inline set. (Copy
+    /// fingerprint, so a hash not the Vec.) 0 when idle-chatbox/none.
+    pub(crate) parked_fp: u64,
 }
 
 impl TranscriptSeqs {
@@ -136,6 +140,12 @@ impl TranscriptSeqs {
             compose_cursor,
             compose_mode,
             compose_selection,
+            parked_fp: {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                c.parked_you_blocks.hash(&mut h);
+                h.finish()
+            },
         }
     }
 
@@ -307,6 +317,7 @@ impl TranscriptView {
             follow_tail,
             pending_reveal_line,
             you_block_snap,
+            you_parked_snap,
         } = session.update(cx, |sp, _scx| {
             let c: &mut AgentState = &mut sp.state;
 
@@ -401,7 +412,7 @@ impl TranscriptView {
                 if c.inline_you_block_active() {
                     flat_items_arc
                         .iter()
-                        .position(|it| matches!(it, FlatItem::YouBlock))
+                        .position(|it| matches!(it, FlatItem::YouBlock { parked: None }))
                         .or_else(|| Some(c.view_model.item_for_line(c.editor.cursor().line)))
                 } else {
                     let cl = c.editor.cursor().line;
@@ -456,6 +467,22 @@ impl TranscriptView {
             } else {
                 None
             };
+            // Parked You-blocks (rule 6): read-only text per additional insertion
+            // point, rendered by the `YouBlock { parked: Some(i) }` arm. Cheap (stored
+            // strings); only when idle worksheet so it can't allocate mid-turn.
+            let you_parked_snap: Vec<Vec<String>> =
+                if !c.input_surface.is_chatbox() && !c.turn_phase.is_awaiting() {
+                    c.parked_you_blocks
+                        .iter()
+                        .map(|(_, text)| {
+                            text.split('\n')
+                                .map(|l| l.replace('\t', "    "))
+                                .collect()
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
 
             TranscriptPrep {
                 flat_items_arc,
@@ -478,6 +505,7 @@ impl TranscriptView {
                 follow_tail,
                 pending_reveal_line,
                 you_block_snap,
+                you_parked_snap,
             }
         });
 
@@ -505,11 +533,13 @@ impl TranscriptView {
         // INV-UX-9 (stage 2): the inline You-block snapshot is shared into the
         // per-item render closure by refcount (it owns Vecs, so not `Copy`).
         let you_block_snap = std::rc::Rc::new(you_block_snap);
+        let you_parked_snap = std::rc::Rc::new(you_parked_snap);
 
         let render_fn = {
             let flat_items = flat_items_arc.clone();
             let weak_self = weak_self.clone();
             let you_block_snap = you_block_snap.clone();
+            let you_parked_snap = you_parked_snap.clone();
             let lines_snap = lines_snap.clone();
             let hl_snap = hl_snap.clone();
             let frozen_lines_snap = frozen_lines_snap.clone();
@@ -918,50 +948,63 @@ impl TranscriptView {
                             )
                             .into_any_element()
                     }
-                    FlatItem::YouBlock => {
-                        // INV-UX-9 (stage 2): the inline editable reply, rendered
-                        // INSIDE the transcript at its anchor. The draft lives in
-                        // the separate Compose (Model C — never the transcript); we
-                        // draw the live snapshot here. Word-wrapped at the measured
-                        // column count (INV-UX-2); the caret sits on its visual row
-                        // (INV-UX-1, reuse `build_chatbox_wrapped_line`). A `You`
-                        // accent bar/label marks it as the user's turn-in-progress.
-                        let Some(yb) = you_block_snap.as_ref() else {
-                            return div().into_any_element();
-                        };
+                    FlatItem::YouBlock { parked } => {
+                        // INV-UX-9 rules 5/6: an inline You-block rendered INSIDE the
+                        // transcript at its anchor. `parked = None` is the ACTIVE block
+                        // (live compose snapshot, caret-bearing, measured width); a
+                        // `parked = Some(i)` is an additional insertion point shown
+                        // read-only from its stored text. Draft text always lives
+                        // OUTSIDE the transcript (Model C). Word-wrapped (INV-UX-2);
+                        // active caret on its visual row, windowed (INV-UX-1).
                         let accent = cursor_color;
                         let fg = self_editor_fg;
                         let sel_bg = nc(at_snap.selection_bg);
-                        // Measured inner width → wrap columns (first frame: a safe
-                        // narrow default that can't overflow; self-corrects next
-                        // frame from the `CaptureBounds` sink).
-                        let box_w = yb.bounds.get().2;
+                        // (lines, caret_line, caret_col, mode, focused, selection, bounds)
+                        let active = parked.is_none();
+                        let bounds = you_block_snap.as_ref().as_ref().map(|yb| yb.bounds.clone());
+                        let empty: Vec<String> = Vec::new();
+                        let (lines, caret_line, caret_col, mode, focused, selection) = match parked {
+                            None => match you_block_snap.as_ref() {
+                                Some(yb) => (
+                                    &yb.lines,
+                                    yb.cursor_line,
+                                    yb.cursor_col,
+                                    yb.mode,
+                                    yb.focused,
+                                    yb.selection,
+                                ),
+                                None => return div().into_any_element(),
+                            },
+                            Some(i) => match you_parked_snap.get(*i) {
+                                // Read-only: no caret (caret_line out of range), no sel.
+                                Some(l) => (l, usize::MAX, 0, EditMode::Normal, false, None),
+                                None => return div().into_any_element(),
+                            },
+                        };
+                        let _ = &empty;
+                        let box_w = bounds.as_ref().map(|b| b.get().2).unwrap_or(0.0);
                         let wrap_cols = if box_w > 1.0 {
                             (box_w / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize
                         } else {
                             40
                         };
-                        // INV-UX-1 (bug-hunt-2 B2): cap the inline reply to a WINDOW
-                        // of logical lines around the caret so a long reply can't grow
-                        // taller than the viewport and scroll the caret below the fold
-                        // (the recurring caret-off-screen class — here bounded by
-                        // construction, the caret's line is always in the window).
+                        // Window logical lines around the caret (active) or the top
+                        // (parked) so a long block can't push the caret below the fold.
                         const YB_WIN: usize = 10;
-                        let n = yb.lines.len().max(1);
+                        let n = lines.len().max(1);
+                        let win_anchor = if caret_line == usize::MAX { 0 } else { caret_line };
                         let win_top =
-                            crate::compose_first_visible_line(yb.cursor_line, 0, n, YB_WIN);
-                        let win_end = (win_top + YB_WIN).min(yb.lines.len());
+                            crate::compose_first_visible_line(win_anchor, 0, n, YB_WIN);
+                        let win_end = (win_top + YB_WIN).min(lines.len());
                         let mut inner = div().flex().flex_col().w_full().min_w_0();
                         for i in win_top..win_end {
                             inner = inner.child(crate::build_chatbox_wrapped_line(
-                                &yb.lines[i],
-                                // caret only when the compose is focused (B5: no
-                                // double caret while navigating a persisted block).
-                                yb.focused && i == yb.cursor_line,
-                                yb.cursor_col,
-                                yb.mode,
+                                &lines[i],
+                                focused && i == caret_line,
+                                caret_col,
+                                mode,
                                 accent,
-                                yb.selection, // B6: show the selection highlight
+                                selection,
                                 i,
                                 &code_font_snap,
                                 fg,
@@ -969,7 +1012,7 @@ impl TranscriptView {
                                 wrap_cols,
                             ));
                         }
-                        let block = div()
+                        let mut block = div()
                             .flex()
                             .flex_col()
                             .w_full()
@@ -986,11 +1029,16 @@ impl TranscriptView {
                                     .text_color(accent)
                                     .font_family(code_font_snap.clone())
                                     .child(SharedString::new_static("You")),
-                            )
-                            .child(crate::CaptureBounds {
+                            );
+                        // Only the ACTIVE block measures its width (it owns the bounds
+                        // Cell that drives wrap_cols); parked blocks render plainly.
+                        block = match (active, bounds) {
+                            (true, Some(sink)) => block.child(crate::CaptureBounds {
                                 inner: inner.into_any_element(),
-                                sink: yb.bounds.clone(),
-                            });
+                                sink,
+                            }),
+                            _ => block.child(inner),
+                        };
                         crate::probe_bounds("you-block", block.into_any_element())
                     }
                 }
@@ -1067,6 +1115,7 @@ struct TranscriptPrep {
     /// `FlatItem::YouBlock` render arm — the per-logical-line text, the caret
     /// position, and the edit mode. `None` when no block is open.
     you_block_snap: Option<YouBlockSnap>,
+    you_parked_snap: Vec<Vec<String>>,
 }
 
 /// Per-frame snapshot of the inline You-block draft (the separate `Compose`),

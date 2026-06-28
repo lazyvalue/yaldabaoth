@@ -1374,6 +1374,7 @@ impl YaldaGpuiView {
             focus: AgentFocus::Transcript,
             you_block_open: false,
             you_block_anchor: None,
+            parked_you_blocks: Vec::new(),
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -3461,6 +3462,21 @@ impl YaldaGpuiView {
             return;
         };
 
+        // INV-UX-9 rules 5/6: an IDLE worksheet submit sends ALL You-blocks (the
+        // active draft + every parked insertion point) as one combined prompt and
+        // freezes each in place. MID-TURN there are no You-blocks (editing is
+        // idle-only) — the compose is the steering chatbox, so fall through to the
+        // single append-at-EOF steer path. The chatbox placement also uses it.
+        let worksheet_idle = self
+            .agent_read(cx, |c| {
+                !c.input_surface.is_chatbox() && !c.turn_phase.is_awaiting()
+            })
+            .unwrap_or(false);
+        if worksheet_idle {
+            self.submit_worksheet_blocks(id, server_sid, cx);
+            return;
+        }
+
         // Read the compose draft + validate sendability inside one session
         // borrow. `Some(None)` ⇒ early-out with a status already set; `None` ⇒
         // no session (no status); `Some(Some(text))` ⇒ proceed.
@@ -3536,6 +3552,88 @@ impl YaldaGpuiView {
             // Send failed: leave the draft intact so the user can retry, and
             // surface it instead of dropping the message into the void.
             claude.status = Some("send failed — reconnecting; press ⏎ to retry".into());
+        }
+        cx.notify();
+    }
+
+    /// Worksheet submit (INV-UX-9 rules 5/6): gather every You-block (the active
+    /// draft + all parked insertion points), send their COMBINED text as one prompt,
+    /// and on success freeze each block IN PLACE under one user turn, then rest in
+    /// nav. On failure the drafts are kept. `/clear` as the sole content still routes
+    /// to the session reset.
+    fn submit_worksheet_blocks(
+        &mut self,
+        id: SessionId,
+        server_sid: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let blocks = self
+            .agent_read(cx, |c| c.collect_you_blocks())
+            .unwrap_or_default();
+        if blocks.is_empty() {
+            if let Some(mut c) = self.agent_mut(cx) {
+                c.status = Some("nothing to send".into());
+            }
+            cx.notify();
+            return;
+        }
+        // `/clear` escape hatch (only when it is the sole content).
+        if blocks.len() == 1 && blocks[0].1.trim() == "/clear" {
+            self.clear_agent_session(cx);
+            return;
+        }
+        let no_channel = self.agent_read(cx, |c| c.channel.is_none()).unwrap_or(true)
+            && server_sid.is_none();
+        if no_channel {
+            if let Some(mut c) = self.agent_mut(cx) {
+                c.status = Some("no channel attached".into());
+            }
+            cx.notify();
+            return;
+        }
+        // Combined prompt in document order, blocks separated by a blank line so the
+        // agent reads each annotation distinctly.
+        let combined = blocks
+            .iter()
+            .map(|(_, t)| t.trim_end_matches('\n').to_string())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let sent = if let Some(sid) = &server_sid {
+            self.session_server
+                .as_ref()
+                .and_then(|s| s.prompt(sid, &combined).ok())
+                .is_some()
+        } else {
+            self.with_session_silent(id, cx, |c| {
+                c.channel
+                    .as_mut()
+                    .map(|ch| ch.send(&combined).is_ok())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+        };
+        if sent {
+            self.with_session(id, cx, |c| {
+                // Mint ONE turn for the whole submit; freeze each block in place
+                // under it (the reconciler suppresses the combined echo).
+                if let Some(k) = c.register_user_turn(
+                    &combined,
+                    yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
+                    false,
+                ) {
+                    c.freeze_you_blocks(&blocks, k);
+                }
+                // Clear every block, rest in nav, follow the reply.
+                c.input_surface = InputSurface::new(InputModeKind::Worksheet);
+                c.close_you_block();
+                c.focus = AgentFocus::Transcript;
+                c.follow_output.set(true);
+                if !matches!(c.turn_phase, TurnPhase::Awaiting { .. }) {
+                    c.turn_phase = TurnPhase::begin(std::time::Instant::now());
+                }
+            });
+        } else if let Some(mut c) = self.agent_mut(cx) {
+            c.status = Some("send failed — reconnecting; press ⏎ to retry".into());
         }
         cx.notify();
     }

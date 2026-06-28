@@ -167,12 +167,12 @@ pub(crate) enum FlatItem {
     TurnHeader { role: TurnRole },
     /// Pulsing indicator shown at transcript tail while awaiting reply.
     ThinkingIndicator,
-    /// The inline **You-block** (INV-UX-9 rule 5, stage 2): the editable reply
-    /// rendered inside the transcript at the anchor while the agent is idle. Owns
-    /// NO doc line — the draft text lives in the separate `Compose`; the render
-    /// reads it live. Injected at the anchor position during the flat-item build
-    /// when `you_block_open`.
-    YouBlock,
+    /// The inline **You-block** (INV-UX-9 rules 5/6): an editable reply rendered
+    /// inside the transcript at its anchor while idle. Owns NO doc line — the draft
+    /// lives outside the transcript (Model C). `parked = None` is the ACTIVE block
+    /// (in `input_surface.compose`, caret-bearing); `parked = Some(i)` is the i-th
+    /// `parked_you_blocks` entry (an additional insertion point, read-only text).
+    YouBlock { parked: Option<usize> },
 }
 
 /// Role shown in a `TurnHeader`.
@@ -1517,7 +1517,7 @@ pub(crate) enum FlatKey {
     Block(usize),
     Turn(TurnRole),
     Thinking,
-    YouBlock,
+    YouBlock(Option<usize>),
 }
 
 impl FlatKey {
@@ -1528,7 +1528,7 @@ impl FlatKey {
             FlatItem::Block(rc) => FlatKey::Block(std::rc::Rc::as_ptr(rc) as usize),
             FlatItem::TurnHeader { role } => FlatKey::Turn(*role),
             FlatItem::ThinkingIndicator => FlatKey::Thinking,
-            FlatItem::YouBlock => FlatKey::YouBlock,
+            FlatItem::YouBlock { parked } => FlatKey::YouBlock(*parked),
         }
     }
 }
@@ -2781,27 +2781,41 @@ pub(crate) fn rebuild_agent_view_model(
     // this (cached) build. Done AFTER the empty-header pass so the block can't be
     // mistaken for turn content, and BEFORE `build_line_to_item` so the reverse
     // index reflects the inserted item's shift.
-    if c.inline_you_block_active() {
-        // Insert after the rendered line for the anchor. The anchor doc line may
-        // not be its OWN `FlatItem::Line` (it can sit inside a parsed Block, a
-        // collapsed blank run, or a tool group), so an exact match would silently
-        // fall to the tail and the block would "jump" away from the caret. Resolve
-        // robustly: the position just after the LAST `FlatItem::Line(i)` with
-        // `i <= anchor` (the nearest rendered line at or above the caret); fall to
-        // the tail only when there's no such line.
-        let pos = match c.effective_you_block_anchor() {
-            Some(anchor) => flat_items
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(p, it)| match it {
-                    FlatItem::Line(i) if *i <= anchor => Some(p + 1),
-                    _ => None,
-                })
-                .unwrap_or(flat_items.len()),
-            None => flat_items.len(),
+    // Inject the inline You-block(s) — the ACTIVE block (if open) plus every PARKED
+    // block (the additional insertion points, rule 6). Each is placed after the
+    // nearest rendered `FlatItem::Line(i)` with `i <= anchor` (the anchor's doc line
+    // may sit inside a parsed Block / collapsed run, so an exact match would jump to
+    // the tail); a `None`/illegal anchor falls to the tail. Only idle worksheet.
+    if !c.input_surface.is_chatbox() && !c.turn_phase.is_awaiting() {
+        let resolve = |anchor: Option<usize>, items: &[FlatItem]| -> usize {
+            match anchor {
+                Some(a) => items
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(p, it)| match it {
+                        FlatItem::Line(i) if *i <= a => Some(p + 1),
+                        _ => None,
+                    })
+                    .unwrap_or(items.len()),
+                None => items.len(),
+            }
         };
-        flat_items.insert(pos, FlatItem::YouBlock);
+        // (insertion position, parked discriminant). Positions are computed against
+        // the SAME pre-insertion list, then applied in DESCENDING order so an insert
+        // never shifts a not-yet-applied (smaller) position.
+        let mut inserts: Vec<(usize, Option<usize>)> = Vec::new();
+        if c.you_block_open {
+            inserts.push((resolve(c.effective_you_block_anchor(), &flat_items), None));
+        }
+        for (i, (anchor, _)) in c.parked_you_blocks.iter().enumerate() {
+            let eff = anchor.filter(|&l| c.you_block_anchor_is_legal(l));
+            inserts.push((resolve(eff, &flat_items), Some(i)));
+        }
+        inserts.sort_by(|a, b| b.0.cmp(&a.0));
+        for (pos, parked) in inserts {
+            flat_items.insert(pos.min(flat_items.len()), FlatItem::YouBlock { parked });
+        }
     }
 
     // Derive the cursor-reveal reverse index from the FINAL flat_items (after
@@ -2944,6 +2958,15 @@ pub(crate) struct AgentState {
     /// separate `Compose` (Model C: never in the transcript); this is purely a
     /// render/freeze position, set when Insert opens the block.
     pub(crate) you_block_anchor: Option<usize>,
+    /// Worksheet inline-edit (INV-UX-9 rule 6, MULTIPLE insertion points): the
+    /// ADDITIONAL You-blocks the user has placed besides the active one. Each is a
+    /// `(anchor, text)` pair — its draft text lives here (outside the transcript,
+    /// Model C), rendered inline read-only; the ACTIVE block being typed stays in
+    /// `input_surface.compose` at `you_block_anchor`. Opening a block at a new
+    /// anchor parks the active one here; Submit freezes every block in place (one
+    /// turn) and sends their combined text; an empty active-block discard leaves
+    /// the parked ones intact.
+    pub(crate) parked_you_blocks: Vec<(Option<usize>, String)>,
     /// Last-seen full snapshot of the agent's plan. Updated on every ACP
     /// `Plan` notification (which carries a complete plan, not a delta —
     /// see spec-agent-window.md §21). Consumed by the Tasklist sidebar.
@@ -3173,6 +3196,13 @@ impl AgentState {
         // via `TranscriptSeqs`, not this build.
         self.you_block_open.hash(&mut h);
         self.you_block_anchor.hash(&mut h);
+        // Parked blocks (rule 6) are injected too — their anchors AND text restructure
+        // the flat list (a park adds an item with that text), so key both.
+        self.parked_you_blocks.len().hash(&mut h);
+        for (anchor, text) in &self.parked_you_blocks {
+            anchor.hash(&mut h);
+            text.hash(&mut h);
+        }
         h.finish()
     }
 
@@ -3208,6 +3238,7 @@ impl AgentState {
             focus: AgentFocus::default(),
             you_block_open: false,
             you_block_anchor: None,
+            parked_you_blocks: Vec::new(),
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -3264,6 +3295,7 @@ impl AgentState {
             focus: AgentFocus::Transcript,
             you_block_open: false,
             you_block_anchor: None,
+            parked_you_blocks: Vec::new(),
             current_plan: None,
             agent_mode: None,
             agent_model: None,
@@ -3637,28 +3669,81 @@ impl AgentState {
             == Some(TurnId::Llm(latest))
     }
 
-    /// Open (or RESUME) the inline You-block for editing: focus the compose in
-    /// Insert and reveal it. A NEW block anchors at the caret — SNAPPED to the
-    /// nearest navigable stop at-or-above it (`snap_nav_stop`) so the freeze
-    /// position matches where the block RENDERS (the injection places it after the
-    /// nearest rendered `FlatItem::Line`; an un-snapped anchor inside a parsed
-    /// table/code block would render above it but freeze after it — bug-hunt-2 B7).
-    /// Illegal/again-resolves to the tail (`None`). Idempotent for an already-open
-    /// block (rule 6: never moves it). Caller ensures worksheet + idle.
+    /// Open / RESUME / ADD an inline You-block for editing at the caret, focus the
+    /// compose in Insert and reveal it. The anchor is SNAPPED to the nearest
+    /// navigable stop at-or-above the caret (`snap_nav_stop`) so the freeze position
+    /// matches where the block RENDERS (an un-snapped anchor inside a parsed block
+    /// would render above it but freeze after it — bug-hunt-2 B7).
+    ///
+    /// MULTIPLE insertion points (rule 6 corrected): if a block is already active
+    /// and the caret is at a DIFFERENT legal anchor, the active block is PARKED (a
+    /// second insertion point) and a fresh one opens at the new anchor. Same anchor
+    /// (or an illegal caret) RESUMES the active block in place — never moving the
+    /// reply (the "jumps around" bug). Caller ensures worksheet + idle.
     pub(crate) fn open_you_block_at_cursor(&mut self) {
+        let l = self.editor.cursor().line;
+        let snapped = if self.you_block_anchor_is_legal(l) {
+            Some(self.view_model.snap_nav_stop(l, false).unwrap_or(l))
+        } else {
+            None
+        };
         if !self.you_block_open {
+            // Fresh first block (the `i`/`f` caller only reaches here when the caret
+            // is legal, so `snapped` is `Some`; `None` would tail-anchor).
             self.you_block_open = true;
-            let l = self.editor.cursor().line;
-            self.you_block_anchor = if self.you_block_anchor_is_legal(l) {
-                // Snap down to a real rendered line so render == freeze position.
-                Some(self.view_model.snap_nav_stop(l, false).unwrap_or(l))
-            } else {
-                None // tail
-            };
+            self.you_block_anchor = snapped;
+        } else if let Some(new_anchor) = snapped {
+            if Some(new_anchor) != self.you_block_anchor {
+                // A NEW insertion point: park the active block (if it has text) and
+                // open a fresh one here.
+                let text = self.input_surface.compose().text();
+                if !text.trim().is_empty() {
+                    self.parked_you_blocks.push((self.you_block_anchor, text));
+                }
+                self.input_surface = InputSurface::new(InputModeKind::Worksheet);
+                self.you_block_anchor = Some(new_anchor);
+            }
+            // else: same anchor → resume in place.
         }
+        // else: illegal caret while a block is open → resume in place.
         self.input_surface.compose_mut().mode = EditMode::Insert;
         self.focus = AgentFocus::Compose;
         self.pending_reveal_cursor = true;
+    }
+
+    /// Gather the worksheet's You-blocks (parked + the active draft) as
+    /// `(effective_anchor, text)`, dropping whitespace-only ones, in DOCUMENT order
+    /// (ascending anchor; `None`/tail last). The submit path sends their combined
+    /// text and freezes each in place.
+    pub(crate) fn collect_you_blocks(&self) -> Vec<(Option<usize>, String)> {
+        let mut v: Vec<(Option<usize>, String)> = self
+            .parked_you_blocks
+            .iter()
+            .filter(|(_, t)| !t.trim().is_empty())
+            .map(|(a, t)| (a.filter(|&l| self.you_block_anchor_is_legal(l)), t.clone()))
+            .collect();
+        if self.you_block_open {
+            let t = self.input_surface.compose().text();
+            if !t.trim().is_empty() {
+                v.push((self.effective_you_block_anchor(), t));
+            }
+        }
+        v.sort_by_key(|(a, _)| a.unwrap_or(usize::MAX));
+        v
+    }
+
+    /// Freeze every collected You-block in place under ONE already-minted user turn
+    /// `k`. Frozen LARGEST-anchor-first (tail `None` first) so each mid-document
+    /// insert can't shift a not-yet-frozen smaller anchor's line index.
+    pub(crate) fn freeze_you_blocks(&mut self, blocks: &[(Option<usize>, String)], k: usize) {
+        let mut ordered: Vec<&(Option<usize>, String)> = blocks.iter().collect();
+        ordered.sort_by_key(|(a, _)| std::cmp::Reverse(a.unwrap_or(usize::MAX)));
+        for (anchor, text) in ordered {
+            match anchor {
+                Some(a) => self.editor.freeze_as_user_turn_at(*a, text, TurnId::User(k)),
+                None => self.editor.freeze_as_user_turn(text, TurnId::User(k)),
+            }
+        }
     }
 
     /// Close any open You-block — it is no longer an inline editable region. Does
@@ -3670,6 +3755,9 @@ impl AgentState {
     pub(crate) fn close_you_block(&mut self) {
         self.you_block_open = false;
         self.you_block_anchor = None;
+        // Parked insertion points (rule 6) are worksheet-only drafts; a turn begin /
+        // replay / leaving the worksheet abandons them too.
+        self.parked_you_blocks.clear();
     }
 
     /// INV-UX-9: is the inline You-block currently the live editing surface — i.e.

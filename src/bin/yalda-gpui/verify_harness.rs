@@ -5062,7 +5062,7 @@ fn worksheet_you_block_anchors_at_cursor_not_tail(cx: &mut TestAppContext) {
         let fi = &c.view_model.flat_items_cache;
         let yb = fi
             .iter()
-            .position(|it| matches!(it, crate::FlatItem::YouBlock))
+            .position(|it| matches!(it, crate::FlatItem::YouBlock { parked: None }))
             .expect("YouBlock injected into the flat list");
         assert!(
             yb < fi.len() - 1,
@@ -5073,10 +5073,81 @@ fn worksheet_you_block_anchors_at_cursor_not_tail(cx: &mut TestAppContext) {
     });
 }
 
-/// REGRESSION (self-found, "insertion jumps around" #2): one block at a time
-/// (rule 6). With a non-empty block open at anchor A, pressing Esc to navigate and
-/// then `i` on a DIFFERENT line must RESUME the block at A — not drag the reply
-/// (and its text) to the new cursor line.
+/// INV-UX-9 rule 6 (MULTIPLE insertion points end-to-end): open two blocks at
+/// different anchors, confirm both render as separate inline `YouBlock`s, and that
+/// gather+freeze commits BOTH in place (each text present in the transcript).
+#[gpui::test]
+fn worksheet_multiple_insertion_points(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("alpha\nbeta\ngamma\ndelta\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // Block 1 at an early line.
+    let s = view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+        s
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    for ch in ["o", "n", "e"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
+    }
+    // Esc back to nav (block 1 persists), navigate down, then `i` for a 2nd point.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).expect("agent").editor.cursor_mut().line = s + 2;
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    for ch in ["t", "w", "o"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
+    }
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        // State: one parked ("one"), one active ("two").
+        assert_eq!(c.parked_you_blocks.len(), 1, "two insertion points (1 parked + active)");
+        assert_eq!(c.parked_you_blocks[0].1.trim(), "one");
+        assert_eq!(c.input_surface.compose().text().trim(), "two");
+        // Render: two inline YouBlocks.
+        let n_blocks = c
+            .view_model
+            .flat_items_cache
+            .iter()
+            .filter(|it| matches!(it, crate::FlatItem::YouBlock { .. }))
+            .count();
+        assert_eq!(n_blocks, 2, "both insertion points render inline");
+        // Gather + freeze both under one turn → both texts land in the transcript.
+        let blocks = c.collect_you_blocks();
+        assert_eq!(blocks.len(), 2, "gather returns both blocks");
+        c.freeze_you_blocks(&blocks, 1);
+        let full = c.editor.document().full_text();
+        assert!(full.contains("one") && full.contains("two"), "both frozen in place");
+    });
+}
+
+/// INV-UX-9 rule 6 (MULTIPLE insertion points): with a non-empty block open at
+/// anchor A, navigating to a DIFFERENT legal line and pressing `i` opens a SECOND
+/// block there — PARKING the first at A (its text kept, never dragged to the new
+/// line). Pressing `i` at the SAME anchor resumes in place.
 #[gpui::test]
 fn worksheet_reentering_insert_keeps_block_anchor(cx: &mut TestAppContext) {
     use yalda::acp_channel::ReplyEvent;
@@ -5117,7 +5188,8 @@ fn worksheet_reentering_insert_keeps_block_anchor(cx: &mut TestAppContext) {
         assert_eq!(c.you_block_anchor, Some(anchor_a));
     });
 
-    // Navigate to a LATER line, press `i` again → must keep anchor A, keep text.
+    // Navigate to a LATER line, press `i` → a SECOND insertion point: the first is
+    // PARKED at anchor A (text kept, NOT dragged), a fresh active opens at the new line.
     view.update(vcx, |v, cx| {
         v.agent_mut(cx).expect("agent").editor.cursor_mut().line = anchor_a + 2;
     });
@@ -5126,12 +5198,30 @@ fn worksheet_reentering_insert_keeps_block_anchor(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         assert_eq!(
+            c.parked_you_blocks.len(),
+            1,
+            "the first block is parked as a second insertion point"
+        );
+        assert_eq!(c.parked_you_blocks[0].0, Some(anchor_a), "parked at its ORIGINAL anchor");
+        assert_eq!(c.parked_you_blocks[0].1.trim(), "hi", "parked text kept, not dragged");
+        assert_ne!(
             c.you_block_anchor,
             Some(anchor_a),
-            "re-entering Insert must NOT move the block to the new cursor line (rule 6)"
+            "the new active block is at the new line, not A"
         );
-        assert_eq!(c.input_surface.compose().text().trim(), "hi", "text preserved");
+        assert!(c.input_surface.compose().text().trim().is_empty(), "fresh active block");
         assert_eq!(c.focus, crate::AgentFocus::Compose);
+    });
+
+    // Pressing `i` again at the SAME (new) anchor resumes in place (no third block).
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        assert_eq!(
+            v.agent_mut(cx).expect("agent").parked_you_blocks.len(),
+            1,
+            "i at the same anchor resumes — no extra parked block"
+        );
     });
 }
 
@@ -5708,7 +5798,9 @@ fn assert_agent_invariants(
             // mode). The stored anchor is deliberately NOT asserted legal here — it
             // may go transiently stale and is re-validated at every consumption site
             // (effective_you_block_anchor), so a stale stored value is harmless.
-            let block_mode_ok = !c.you_block_open || !c.input_surface.is_chatbox();
+            // A block (active OR parked) exists only in the worksheet — never chatbox.
+            let block_mode_ok = (!c.you_block_open && c.parked_you_blocks.is_empty())
+                || !c.input_surface.is_chatbox();
             // The EFFECTIVE anchor (what consumers use) is always legal-or-None.
             let eff_ok = c.effective_you_block_anchor().is_none_or(|a| c.you_block_anchor_is_legal(a));
             // focus==Compose ⇒ there is a VISIBLE editable surface (the bottom box in

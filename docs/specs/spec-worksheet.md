@@ -61,10 +61,18 @@ only, idle only) so the corruption case stays unrepresentable.
    turns, already-committed user turns) is **not** editable; trying to enter Insert
    there does nothing (status hint), it does not open a block.
 
-6. **One You-block at a time.** There is at most one pending You-block — "the
-   editable set is exactly what you've typed since the last Submit." This is the
-   constraint that keeps the worksheet a stateful prompt board, not a chat log with
-   floating annotations (it also bounds the durability surface to a single region).
+6. **Multiple insertion points.** You can place **several** You-blocks at once —
+   navigate (Esc to nav, move the cursor), press Insert at a new legal point, and a
+   *new* block opens there while the previous one is **parked** in place (its text
+   kept, never dragged). One block is *active* (being typed, in the Compose); the
+   rest are parked `(anchor, text)` drafts rendered inline read-only. Re-entering
+   Insert at an existing block's anchor resumes it. **Submit sends them all** as one
+   combined prompt and freezes each in place. (Each draft lives OUTSIDE the
+   transcript until submit — Model C; editing is idle-only, so the durability
+   guarantee holds regardless of how many points are open.)
+
+   A **fresh** session (empty transcript) opens one active block at the tail
+   immediately, so there is always a visible place to type on first open.
 
 ### Chatbox — agent mid-turn
 
