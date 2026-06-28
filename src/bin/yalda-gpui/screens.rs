@@ -1182,11 +1182,11 @@ impl YaldaGpuiView {
         let compose_panel = if !show_compose {
             None
         } else {
-            // Placement-aware accent: Worksheet (inline) tints the compose border
-            // with the cursor/accent color so it reads as the user's inline draft
-            // attached to the conversation; Chatbox keeps the neutral pinned box.
-            // (Fuller inline-flush styling is a runtime-tuning follow-up.)
-            let is_worksheet = !c.input_surface.is_chatbox();
+            // INV-UX-9 rule 7 (bug-hunt 12): the bottom panel is now ALWAYS a pinned
+            // chatbox box — it renders only in chatbox mode or as the mid-turn
+            // steering box (the idle worksheet draft renders INLINE as the YouBlock,
+            // never here). So it never wears the worksheet flush/accent/"You" chrome.
+            let is_worksheet = false;
             let tb = c.input_surface.compose_mut();
             // Logical lines shown before the box caps height + scrolls. At/below
             // this the panel renders every line directly (grows to content,

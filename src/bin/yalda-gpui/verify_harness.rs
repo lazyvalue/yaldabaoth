@@ -5128,6 +5128,133 @@ fn worksheet_reentering_insert_keeps_block_anchor(cx: &mut TestAppContext) {
     });
 }
 
+/// REGRESSION (bug-hunt 1/7): a stale You-block anchor must NEVER place a reply in
+/// old history. After the transcript grows past the anchor's turn,
+/// `effective_you_block_anchor()` returns None (⇒ tail), and an anchor one line PAST
+/// the latest turn is illegal (bug-hunt 13).
+#[gpui::test]
+fn worksheet_stale_anchor_is_rejected(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ev(ReplyEvent::Chunk("aa\nbb\ncc\ndd\n".into()))],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let lc = c.editor.document().line_count();
+        assert!(lc >= 3, "need a few lines to tag");
+        // Deterministically tag: line 0 belongs to an OLD agent turn Llm(1); every
+        // other content line to the LATEST turn Llm(2). (The synthetic stream path
+        // can't be made to advance the turn number, so tag directly — this tests the
+        // guard logic, which is what the real per-turn numbering feeds.)
+        let a0 = c.editor.anchor_for_line(0);
+        c.editor
+            .metadata_mut::<crate::TurnId>()
+            .insert(a0, crate::TurnId::Llm(1));
+        for l in 1..lc {
+            let a = c.editor.anchor_for_line(l);
+            c.editor
+                .metadata_mut::<crate::TurnId>()
+                .insert(a, crate::TurnId::Llm(2));
+        }
+        c.you_block_anchor = Some(0);
+        assert!(
+            !c.you_block_anchor_is_legal(0),
+            "line 0 (Llm 1, OLD turn) is illegal vs the latest Llm 2 (bug-hunt 5/13)"
+        );
+        assert!(
+            c.you_block_anchor_is_legal(1),
+            "a line in the latest agent turn is legal"
+        );
+        assert_eq!(
+            c.effective_you_block_anchor(),
+            None,
+            "a stale anchor resolves to None (⇒ tail append), never mid-history (bug-hunt 1)"
+        );
+    });
+}
+
+/// REGRESSION (bug-hunt 2): a replay/reconnect rebuild closes any open You-block so
+/// a pending reply can't re-materialize at a stale line in the fresh transcript.
+#[gpui::test]
+fn worksheet_replay_closes_you_block(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        assert!(c.you_block_open);
+        c.reset_for_replay();
+        assert!(!c.you_block_open, "replay closes the block (bug-hunt 2)");
+        assert_eq!(c.you_block_anchor, None, "and clears the stale anchor");
+    });
+}
+
+/// REGRESSION (bug-hunt 6): mid-turn in the worksheet, a keystroke edits the bottom
+/// CHATBOX (the steering box), not transcript navigation — even though focus is
+/// nominally on the transcript when the turn began.
+#[gpui::test]
+fn worksheet_midturn_typing_routes_to_chatbox(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    // Begin a turn; worksheet rests in transcript focus.
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
+        assert_eq!(c.focus, crate::AgentFocus::Transcript);
+    });
+    for k in ["h", "i"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
+    }
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(
+            c.input_surface.compose().text().trim(),
+            "hi",
+            "mid-turn worksheet typing must reach the chatbox (rule 7), not nav"
+        );
+    });
+}
+
+/// REGRESSION (bug-hunt 6 follow-through): when the turn ends, a non-empty mid-turn
+/// draft is NOT lost — it carries over as a tail You-block; an empty draft returns
+/// to transcript navigation.
+#[gpui::test]
+fn worksheet_turn_end_carries_over_draft_or_rests_in_nav(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    // Non-empty draft at turn end → tail You-block.
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let cb = c.input_surface.compose_mut();
+        let n = cb.editor.document().rope().len_chars();
+        cb.editor.programmatic_insert(n, "carry");
+        let g = c.generation; c.finalize_agent_turn_idem(g, 1);
+    });
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(c.you_block_open, "non-empty draft carries over as a block");
+        assert_eq!(c.you_block_anchor, None, "carried over at the tail");
+        assert_eq!(c.focus, crate::AgentFocus::Compose);
+    });
+    // Empty draft at turn end → nav.
+    let (view2, vcx2) = boot_worksheet_nav(cx);
+    view2.update(vcx2, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let g = c.generation; c.finalize_agent_turn_idem(g, 1);
+        assert!(!c.you_block_open, "empty draft → no block");
+        assert_eq!(c.focus, crate::AgentFocus::Transcript, "rests in navigation");
+    });
+}
+
 /// VERIFICATION HARNESS (#3.2 — painted-bounds proof of INV-UX-5 layout): the
 /// subagent (Task) list renders ABOVE the compose box, one per line. Register a
 /// Task subagent tool call so the list appears, drive a real paint pass, and

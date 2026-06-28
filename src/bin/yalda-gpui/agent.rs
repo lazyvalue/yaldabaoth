@@ -2789,7 +2789,7 @@ pub(crate) fn rebuild_agent_view_model(
         // robustly: the position just after the LAST `FlatItem::Line(i)` with
         // `i <= anchor` (the nearest rendered line at or above the caret); fall to
         // the tail only when there's no such line.
-        let pos = match c.you_block_anchor {
+        let pos = match c.effective_you_block_anchor() {
             Some(anchor) => flat_items
                 .iter()
                 .enumerate()
@@ -3523,6 +3523,18 @@ impl AgentState {
         // left where it is.
         if !self.input_surface.is_chatbox() {
             self.move_cursor_to_tail();
+            // INV-UX-9 rule 7 turn-end: the mid-turn chatbox is gone now that we're
+            // idle. If the user typed a steer that wasn't sent, DON'T lose it —
+            // carry it over as a tail You-block (so it stays visible + editable);
+            // otherwise rest in transcript navigation. (bug-hunt 6 follow-through.)
+            if self.input_surface.compose().text().trim().is_empty() {
+                self.close_you_block();
+                self.focus = AgentFocus::Transcript;
+            } else {
+                self.you_block_open = true;
+                self.you_block_anchor = None; // tail
+                self.focus = AgentFocus::Compose;
+            }
         }
         true
     }
@@ -3569,12 +3581,49 @@ impl AgentState {
         if l >= last {
             return true; // tail reply is always legal
         }
-        match self.latest_agent_turn_range() {
-            // Within the latest turn (its lines, or its trailing boundary).
-            Some((s, e)) => l >= s && l <= e,
-            // No agent turn tagged yet ⇒ nothing older to protect.
-            None => true,
-        }
+        // TAG-BASED (gap-safe): line `l` is a legal mid-transcript insertion point
+        // iff it is tagged as part of the MOST-RECENT agent turn. A range check
+        // (`l in [first, last] of max-Llm`) spans any gap — a user reply frozen
+        // mid-turn, or a reused turn number — and would wrongly allow anchoring in
+        // older content; checking the line's OWN tag can't (bug-hunt 5/13). No agent
+        // turn tagged yet ⇒ nothing older to protect.
+        let meta = self.editor.metadata::<TurnId>();
+        let max_n = (0..self.editor.document().line_count()).filter_map(|i| {
+            self.editor
+                .anchor_for_line_opt(i)
+                .and_then(|a| match meta.get(a).copied() {
+                    Some(TurnId::Llm(n)) => Some(n),
+                    _ => None,
+                })
+        });
+        let Some(latest) = max_n.max() else {
+            return true; // no agent turn yet
+        };
+        self.editor
+            .anchor_for_line_opt(l)
+            .and_then(|a| meta.get(a).copied())
+            == Some(TurnId::Llm(latest))
+    }
+
+    /// Close any open You-block — it is no longer an inline editable region. Does
+    /// NOT clear the compose draft (owned by `InputSurface`; the caller decides).
+    /// Call whenever a turn begins, on reset/replay, or when leaving the
+    /// idle-worksheet state, so `you_block_open` can never outlive the state it
+    /// means (INV-UX-9: a block exists only while idle in the worksheet). Fixes the
+    /// toggle / replay / selection-send anchor-leak class (bug-hunt 1–4, 10).
+    pub(crate) fn close_you_block(&mut self) {
+        self.you_block_open = false;
+        self.you_block_anchor = None;
+    }
+
+    /// The You-block anchor to ACTUALLY use, re-validated against the CURRENT
+    /// transcript. A stored anchor can go stale (toggle round-trip, streaming,
+    /// replay, finalize moving the cursor) and point into old history; returning
+    /// `None` there makes every consumer fall back to the tail (EOF append /
+    /// tail render) instead of burying the reply mid-history (bug-hunt 1,2,7,8).
+    pub(crate) fn effective_you_block_anchor(&self) -> Option<usize> {
+        self.you_block_anchor
+            .filter(|&l| self.you_block_anchor_is_legal(l))
     }
 
     /// Drop the worksheet caret to the end of the editable tail (the last line)
@@ -3652,6 +3701,11 @@ impl AgentState {
         self.current_plan = None;
         self.focused_subagent = None;
         self.usage = None;
+        // The transcript is being rebuilt from scratch — any open You-block's
+        // anchor points into the OLD line space. Close it so a pending reply can't
+        // re-materialize at a stale line in the rebuilt transcript (bug-hunt 2).
+        // The compose draft itself is preserved (InputSurface is untouched).
+        self.close_you_block();
     }
 }
 

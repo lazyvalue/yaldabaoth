@@ -3177,16 +3177,27 @@ impl YaldaGpuiView {
             // starts in pure navigation. Entering chatbox focuses the box.
             match claude.input_surface.mode {
                 InputModeKind::Worksheet => {
-                    claude.you_block_open =
-                        !claude.input_surface.compose().text().trim().is_empty();
-                    claude.focus = if claude.you_block_open {
-                        AgentFocus::Compose
+                    // A block exists only while IDLE (rule 7); mid-turn the draft is
+                    // the chatbox. Reopen a block (at a fresh legal anchor) only when
+                    // idle with a non-empty draft (bug-hunt 3). Otherwise rest in nav.
+                    let has_draft = !claude.input_surface.compose().text().trim().is_empty();
+                    let idle = !claude.turn_phase.is_awaiting();
+                    if has_draft && idle {
+                        claude.you_block_open = true;
+                        // Fresh anchor at the caret if legal, else the tail (None).
+                        let l = claude.editor.cursor().line;
+                        claude.you_block_anchor =
+                            claude.you_block_anchor_is_legal(l).then_some(l);
+                        claude.focus = AgentFocus::Compose;
                     } else {
-                        AgentFocus::Transcript
-                    };
+                        claude.close_you_block();
+                        claude.focus = AgentFocus::Transcript;
+                    }
                 }
                 InputModeKind::Chatbox => {
-                    claude.you_block_open = false;
+                    // Leaving the worksheet: the block is no longer inline (clears the
+                    // anchor so it can't be reopened stale on return — bug-hunt 1).
+                    claude.close_you_block();
                     claude.focus = AgentFocus::Compose;
                 }
             }
@@ -3471,7 +3482,7 @@ impl YaldaGpuiView {
                 (!c.input_surface.is_chatbox()
                     && c.you_block_open
                     && !c.turn_phase.is_awaiting())
-                .then_some(c.you_block_anchor)
+                .then(|| c.effective_you_block_anchor())
                 .flatten()
             })
             .flatten();
@@ -3621,6 +3632,10 @@ impl YaldaGpuiView {
                 );
                 claude.turn_phase = TurnPhase::begin(std::time::Instant::now());
                 claude.editor.clear_selection();
+                // A turn just began: any open You-block must close so it can't
+                // re-materialize as a phantom at a stale anchor when the turn ends
+                // (bug-hunt 4, 10). The compose draft is left intact.
+                claude.close_you_block();
                 // Model C: hand focus back to the compose after sending a
                 // selection, so the user is ready to type the next prompt.
                 claude.focus = AgentFocus::Compose;
@@ -3741,8 +3756,15 @@ impl YaldaGpuiView {
         // `S` sends the selection. Edits are inert: the transcript is all frozen
         // (guards no-op them) and we pin the editor to Normal so `i`/`a` can't
         // enter Insert.
+        // INV-UX-9 rule 7 (bug-hunt 6): mid-turn in the worksheet, input belongs to
+        // the bottom chatbox — NOT transcript navigation. So treat the transcript as
+        // unfocused while awaiting (keys fall through to the compose dispatch, which
+        // edits the chatbox). Esc-interrupt / Ctrl-Enter-steer are handled earlier.
         let transcript_focused = self
-            .agent_read(cx, |c| c.focus == AgentFocus::Transcript)
+            .agent_read(cx, |c| {
+                c.focus == AgentFocus::Transcript
+                    && !(c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox())
+            })
             .unwrap_or(false);
         if transcript_focused {
             // INV-UX-9: in the WORKSHEET, an Insert-entry key from transcript
