@@ -3508,10 +3508,14 @@ impl AgentState {
     /// (so the draft is visible + editable), an empty Worksheet rests in transcript
     /// navigation. Upholds the invariant "focus=Compose ⇒ a visible surface".
     pub(crate) fn settle_input_focus(&mut self) {
+        // A FRESH worksheet (empty transcript) has nothing to navigate, so it must
+        // show an input immediately — open a tail block (the "I don't see anything
+        // on a new session" bug). Likewise a non-empty restored draft.
+        let fresh = self.editor.document().is_empty();
         if self.input_surface.is_chatbox() {
             self.close_you_block();
             self.focus = AgentFocus::Compose;
-        } else if !self.input_surface.compose().text().trim().is_empty() {
+        } else if fresh || !self.input_surface.compose().text().trim().is_empty() {
             self.you_block_open = true;
             self.you_block_anchor = None; // tail
             self.focus = AgentFocus::Compose;

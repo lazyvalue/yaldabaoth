@@ -5263,6 +5263,26 @@ fn worksheet_tall_inline_block_keeps_caret_in_window(cx: &mut TestAppContext) {
     });
 }
 
+/// REGRESSION (runtime report: "on first open I don't see anything"): a FRESH
+/// worksheet session (empty transcript) must show an input immediately — settle
+/// opens a tail You-block (focus=Compose) so there's a visible place to type.
+#[gpui::test]
+fn fresh_worksheet_session_shows_an_input(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        // Simulate a brand-new session: empty transcript, empty draft, resting nav.
+        c.editor = yalda::editor::Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+        c.close_you_block();
+        c.focus = crate::AgentFocus::Transcript;
+        assert!(c.editor.document().is_empty(), "fresh transcript");
+        c.settle_input_focus();
+        assert!(c.you_block_open, "a fresh session opens a tail input block");
+        assert_eq!(c.focus, crate::AgentFocus::Compose);
+        assert!(c.inline_you_block_active(), "the input is visible");
+    });
+}
+
 /// REGRESSION (round-3 restore edge): `settle_input_focus` makes focus/You-block
 /// consistent with the restored placement + draft. A restored chatbox focuses its
 /// box; a restored worksheet draft shows as a tail block (not hidden); an empty
@@ -5285,12 +5305,14 @@ fn worksheet_restore_settles_focus_and_block(cx: &mut TestAppContext) {
         assert!(c.inline_you_block_active(), "the draft is visible");
     });
 
-    // Restored worksheet EMPTY → nav, no block.
+    // Restored worksheet EMPTY draft but WITH transcript content → nav (there is
+    // history to navigate; a fresh/empty transcript would instead open a tail block).
     view.update(vcx, |v, cx| {
         let mut c = v.agent_mut(cx).expect("agent");
+        c.editor.append_llm_chunk(crate::TurnId::Llm(1), "an agent reply line\n");
         c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
         c.settle_input_focus();
-        assert!(!c.you_block_open);
+        assert!(!c.you_block_open, "with content + empty draft, rest in nav");
         assert_eq!(c.focus, crate::AgentFocus::Transcript);
     });
 

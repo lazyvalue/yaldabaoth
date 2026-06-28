@@ -1395,6 +1395,11 @@ impl YaldaGpuiView {
         // The follow-output scroll handler is wired by the owning
         // `TranscriptView` (ticket 021) — the `ListState` lives in
         // `TranscriptScroll`, not on `AgentState`.
+        let mut state = state;
+        // A FRESH worksheet session has an empty transcript with nothing to
+        // navigate — open a tail You-block so there's a visible input on first
+        // open (bug: "I don't see anything" on a new session). settle handles it.
+        state.settle_input_focus();
         state
     }
 
