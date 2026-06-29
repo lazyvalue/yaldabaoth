@@ -375,6 +375,13 @@ the inline block).
 
 ## Revision history
 
+- 2026-06-29 (2) — Worksheet rests in transcript NAV (not auto-Insert) after fresh
+  open / `/clear` / restore: the input block is VISIBLE but the `space`/`.`/`?`
+  leaders open the tile/app menus (they fire only outside text entry) — fixing "can't
+  use the tile menu when an agent tile is focused"; press `i` to type. Tool-group
+  fold headers clamped to one line (`fold_header_line`) so a multi-line command no
+  longer renders its body in the header ("tool use not folded"). Guards:
+  `fresh_worksheet_space_opens_the_tile_menu`, `fold_header_line_is_single_short_line`.
 - 2026-06-29 — Worksheet runtime fixes: `/clear` settles to a typeable block;
   multiple insertion points editable deterministically (caret on an existing block
   resumes it); you-div scoped-Normal indicator (`You · NORMAL` + accent tint) and

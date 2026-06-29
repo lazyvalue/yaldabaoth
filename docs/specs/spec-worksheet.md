@@ -75,8 +75,12 @@ only, idle only) so the corruption case stays unrepresentable.
    transcript until submit — Model C; editing is idle-only, so the durability
    guarantee holds regardless of how many points are open.)
 
-   A **fresh** session (empty transcript) opens one active block at the tail
-   immediately, so there is always a visible place to type on first open.
+   A **fresh** session (empty transcript), a `/clear`, and a restore all open a
+   **visible** tail block immediately so there is always a place to type — but the
+   worksheet **rests in transcript NAV** (focus on the transcript, not Insert), so a
+   focused tile's `space`/`.`/`?` **leaders open the tile/app menus** (they fire only
+   outside text entry). Press `i` to type into the block. (Auto-focusing Insert here
+   regressed the tile menu under `space`.)
 
 ### Chatbox — agent mid-turn
 

@@ -5524,10 +5524,46 @@ fn fresh_worksheet_session_shows_an_input(cx: &mut TestAppContext) {
         c.focus = crate::AgentFocus::Transcript;
         assert!(c.editor.document().is_empty(), "fresh transcript");
         c.settle_input_focus();
-        assert!(c.you_block_open, "a fresh session opens a tail input block");
-        assert_eq!(c.focus, crate::AgentFocus::Compose);
+        assert!(c.you_block_open, "a fresh session opens a VISIBLE tail input block");
         assert!(c.inline_you_block_active(), "the input is visible");
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Transcript,
+            "rests in nav so the space leader opens the tile menu (press i to type)"
+        );
     });
+}
+
+/// REGRESSION (runtime: "when an agent tile is focused I can't use the tile menu —
+/// Leader: space"): a fresh worksheet rests in nav, so bare `space` opens the tile
+/// menu (it was regressed when the block auto-focused Insert and `space` typed).
+#[gpui::test]
+fn fresh_worksheet_space_opens_the_tile_menu(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_worksheet_nav(cx);
+    // Land in the fresh-session resting state (empty transcript, settled).
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.editor = yalda::editor::Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+        c.close_you_block();
+        c.focus = crate::AgentFocus::Transcript;
+        c.settle_input_focus();
+    });
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(
+        !view.read_with(vcx, |v, _| v.overlay_is_menu()),
+        "no menu before pressing space"
+    );
+    vcx.simulate_keystrokes("space");
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(vcx, |v, _| v.overlay_is_menu()),
+        "bare space on a focused (nav) worksheet opens the tile menu"
+    );
 }
 
 /// REGRESSION (round-3 restore edge): `settle_input_focus` makes focus/You-block
@@ -5548,7 +5584,11 @@ fn worksheet_restore_settles_focus_and_block(cx: &mut TestAppContext) {
         c.settle_input_focus();
         assert!(c.you_block_open, "restored worksheet draft opens a tail block");
         assert_eq!(c.you_block_anchor, None, "at the tail");
-        assert_eq!(c.focus, crate::AgentFocus::Compose);
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Transcript,
+            "rests in nav (space → tile menu); press i to edit the restored draft"
+        );
         assert!(c.inline_you_block_active(), "the draft is visible");
     });
 

@@ -3568,9 +3568,15 @@ impl AgentState {
             self.close_you_block();
             self.focus = AgentFocus::Compose;
         } else if fresh || !self.input_surface.compose().text().trim().is_empty() {
+            // Open a VISIBLE tail block (so a fresh/cleared worksheet shows an input
+            // and a restored draft shows), but REST IN NAV (focus=Transcript), not
+            // Insert: the leaders (`space`/`.`/`?`) must open the tile menu when a
+            // tile is focused, and they only fire outside text entry. The user
+            // presses `i` to type. (Auto-focusing Insert here regressed the tile
+            // menu — runtime report.)
             self.you_block_open = true;
             self.you_block_anchor = None; // tail
-            self.focus = AgentFocus::Compose;
+            self.focus = AgentFocus::Transcript;
         } else {
             self.close_you_block();
             self.focus = AgentFocus::Transcript;
