@@ -442,6 +442,8 @@ impl TranscriptView {
             // Gate EXACTLY like the injection (agent.rs) — `you_block_open` alone
             // would allocate a snapshot every streaming-frame for a block left open
             // mid-turn that is never injected (bug-hunt 11).
+            // Anchor → the doc line the block highlights on in nav (tail = last line).
+            let last_line = c.editor.document().line_count().saturating_sub(1);
             let you_block_snap = if c.inline_you_block_active() {
                 let compose = c.input_surface.compose();
                 let cc = compose.editor.cursor();
@@ -460,6 +462,7 @@ impl TranscriptView {
                     cursor_line: cc.line,
                     cursor_col: cc.col,
                     mode: compose.mode,
+                    anchor_line: c.effective_you_block_anchor().unwrap_or(last_line),
                     focused: c.focus == AgentFocus::Compose,
                     selection: compose.editor.selection_range(),
                     bounds: compose.bounds.clone(),
@@ -467,17 +470,22 @@ impl TranscriptView {
             } else {
                 None
             };
-            // Parked You-blocks (rule 6): read-only text per additional insertion
-            // point, rendered by the `YouBlock { parked: Some(i) }` arm. Cheap (stored
-            // strings); only when idle worksheet so it can't allocate mid-turn.
-            let you_parked_snap: Vec<Vec<String>> =
+            // Parked You-blocks (rule 6): (anchor_line, read-only text lines) per
+            // additional insertion point, rendered by the `YouBlock { parked: Some(i)
+            // }` arm. Cheap; only when idle worksheet so it can't allocate mid-turn.
+            let you_parked_snap: Vec<(usize, Vec<String>)> =
                 if !c.input_surface.is_chatbox() && !c.turn_phase.is_awaiting() {
                     c.parked_you_blocks
                         .iter()
-                        .map(|(_, text)| {
-                            text.split('\n')
+                        .map(|(anchor, text)| {
+                            let al = anchor
+                                .filter(|&l| c.you_block_anchor_is_legal(l))
+                                .unwrap_or(last_line);
+                            let lines = text
+                                .split('\n')
                                 .map(|l| l.replace('\t', "    "))
-                                .collect()
+                                .collect();
+                            (al, lines)
                         })
                         .collect()
                 } else {
@@ -959,29 +967,31 @@ impl TranscriptView {
                         let accent = cursor_color;
                         let fg = self_editor_fg;
                         let sel_bg = nc(at_snap.selection_bg);
-                        // (lines, caret_line, caret_col, mode, focused, selection, bounds)
+                        // (lines, caret_line, caret_col, mode, focused, selection, anchor_line)
                         let active = parked.is_none();
                         let bounds = you_block_snap.as_ref().as_ref().map(|yb| yb.bounds.clone());
-                        let empty: Vec<String> = Vec::new();
-                        let (lines, caret_line, caret_col, mode, focused, selection) = match parked {
-                            None => match you_block_snap.as_ref() {
-                                Some(yb) => (
-                                    &yb.lines,
-                                    yb.cursor_line,
-                                    yb.cursor_col,
-                                    yb.mode,
-                                    yb.focused,
-                                    yb.selection,
-                                ),
-                                None => return div().into_any_element(),
-                            },
-                            Some(i) => match you_parked_snap.get(*i) {
-                                // Read-only: no caret (caret_line out of range), no sel.
-                                Some(l) => (l, usize::MAX, 0, EditMode::Normal, false, None),
-                                None => return div().into_any_element(),
-                            },
-                        };
-                        let _ = &empty;
+                        let (lines, caret_line, caret_col, mode, focused, selection, anchor_line) =
+                            match parked {
+                                None => match you_block_snap.as_ref() {
+                                    Some(yb) => (
+                                        &yb.lines,
+                                        yb.cursor_line,
+                                        yb.cursor_col,
+                                        yb.mode,
+                                        yb.focused,
+                                        yb.selection,
+                                        yb.anchor_line,
+                                    ),
+                                    None => return div().into_any_element(),
+                                },
+                                Some(i) => match you_parked_snap.get(*i) {
+                                    // Read-only: no caret (caret_line out of range), no sel.
+                                    Some((al, l)) => {
+                                        (l, usize::MAX, 0, EditMode::Normal, false, None, *al)
+                                    }
+                                    None => return div().into_any_element(),
+                                },
+                            };
                         let box_w = bounds.as_ref().map(|b| b.get().2).unwrap_or(0.0);
                         let wrap_cols = if box_w > 1.0 {
                             (box_w / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize
@@ -1012,6 +1022,18 @@ impl TranscriptView {
                                 wrap_cols,
                             ));
                         }
+                        // Nav-focus highlight: while navigating the transcript, the
+                        // block the cursor is on tints like an agent row (the cursor
+                        // is "on" a block when it sits on the block's anchor line).
+                        // `cursor_line` is `usize::MAX` off-nav, so this never lights
+                        // up during compose/idle.
+                        let row_bg: Hsla = if cursor_line == anchor_line {
+                            let mut h = nc(at_snap.dim);
+                            h.a = 0.2;
+                            h
+                        } else {
+                            rgba(0x00000000).into()
+                        };
                         let mut block = div()
                             .flex()
                             .flex_col()
@@ -1022,6 +1044,7 @@ impl TranscriptView {
                             .pl_2()
                             .border_l_2()
                             .border_color(accent)
+                            .bg(row_bg)
                             .child(
                                 div()
                                     .text_size(px(11.0))
@@ -1115,7 +1138,7 @@ struct TranscriptPrep {
     /// `FlatItem::YouBlock` render arm — the per-logical-line text, the caret
     /// position, and the edit mode. `None` when no block is open.
     you_block_snap: Option<YouBlockSnap>,
-    you_parked_snap: Vec<Vec<String>>,
+    you_parked_snap: Vec<(usize, Vec<String>)>,
 }
 
 /// Per-frame snapshot of the inline You-block draft (the separate `Compose`),
@@ -1125,6 +1148,10 @@ struct YouBlockSnap {
     cursor_line: usize,
     cursor_col: usize,
     mode: EditMode,
+    /// The doc line the block is anchored at (tail → the last line) — the transcript
+    /// nav cursor "is on" the block when it sits on this line, which drives the
+    /// focus highlight in nav, matching agent rows (INV-UX-9 nav feedback).
+    anchor_line: usize,
     /// Whether the compose holds focus. The caret renders ONLY when focused — a
     /// persisted (non-empty Esc) block shows no caret while the user navigates the
     /// transcript, so there aren't two carets on screen (bug-hunt-2 B5).

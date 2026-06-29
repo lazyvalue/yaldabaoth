@@ -295,7 +295,11 @@ the chatbox is the mid-turn surface plus an optional persistent placement
 per `spec-worksheet.md` (AUTHORITATIVE). Concretely:
 
 1. **Free navigation.** In Normal mode the caret moves freely over the whole
-   transcript (read navigation; nothing editable until Insert).
+   transcript (read navigation; nothing editable until Insert). While navigating,
+   the element under the cursor is focus-highlighted — including **You-blocks** (a
+   block highlights when the cursor is on its anchor line), so your insertion points
+   read like every other transcript element. (The tint color is a paint/human-eye
+   check — harness gap #1.)
 2. **Insert opens a You-block at the caret** — a `You` delimiter + editable region
    where typed text lives.
 3. **Empty insert is a no-op** — leaving Insert with only whitespace removes the
