@@ -318,6 +318,7 @@ impl TranscriptView {
             pending_reveal_line,
             you_block_snap,
             you_parked_snap,
+            you_wrap_cols,
         } = session.update(cx, |sp, _scx| {
             let c: &mut AgentState = &mut sp.state;
 
@@ -491,6 +492,18 @@ impl TranscriptView {
                 } else {
                     Vec::new()
                 };
+            // Measured wrap width (cols) of the compose's box — PARKED blocks render
+            // read-only with no `CaptureBounds` of their own, so they reuse this so
+            // they wrap at the real column width, not a narrow 40-col fallback (the
+            // "strange wordwrap length" once a block parks). 0 = unmeasured.
+            let you_wrap_cols = {
+                let w = c.input_surface.compose().bounds.get().2;
+                if w > 1.0 {
+                    (w / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize
+                } else {
+                    0
+                }
+            };
 
             TranscriptPrep {
                 flat_items_arc,
@@ -514,6 +527,7 @@ impl TranscriptView {
                 pending_reveal_line,
                 you_block_snap,
                 you_parked_snap,
+                you_wrap_cols,
             }
         });
 
@@ -548,6 +562,7 @@ impl TranscriptView {
             let weak_self = weak_self.clone();
             let you_block_snap = you_block_snap.clone();
             let you_parked_snap = you_parked_snap.clone();
+            let you_wrap_cols = you_wrap_cols;
             let lines_snap = lines_snap.clone();
             let hl_snap = hl_snap.clone();
             let frozen_lines_snap = frozen_lines_snap.clone();
@@ -992,9 +1007,14 @@ impl TranscriptView {
                                     None => return div().into_any_element(),
                                 },
                             };
+                        // Active block measures its own box; parked blocks (no bounds)
+                        // reuse the compose's measured column width so they wrap at the
+                        // real width, not a narrow 40-col fallback ("strange wordwrap").
                         let box_w = bounds.as_ref().map(|b| b.get().2).unwrap_or(0.0);
                         let wrap_cols = if box_w > 1.0 {
                             (box_w / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize
+                        } else if you_wrap_cols > 0 {
+                            you_wrap_cols
                         } else {
                             40
                         };
@@ -1154,6 +1174,7 @@ struct TranscriptPrep {
     /// position, and the edit mode. `None` when no block is open.
     you_block_snap: Option<YouBlockSnap>,
     you_parked_snap: Vec<(usize, Vec<String>)>,
+    you_wrap_cols: usize,
 }
 
 /// Per-frame snapshot of the inline You-block draft (the separate `Compose`),
