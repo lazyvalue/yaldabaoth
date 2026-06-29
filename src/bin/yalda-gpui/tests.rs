@@ -105,6 +105,29 @@ fn build_nav_stops_per_frozen_prose_line() {
 }
 
 /// FIX 5 contract: `snap_nav_stop` returns `None` when there is no stop in the
+/// REGRESSION (screenshot: a multi-line Bash command rendered "not folded"): the
+/// tool-group fold header must be ONE short line. A multi-line / very long title is
+/// clamped to its first line (+ ` …`) so the command body never fills the header.
+#[test]
+fn fold_header_line_is_single_short_line() {
+    use crate::fold_header_line;
+    // Single short line: unchanged.
+    assert_eq!(fold_header_line("Read foo.rs"), "Read foo.rs");
+    // Multi-line (heredoc): first line + ellipsis, no newlines.
+    let heredoc = "python3 - <<'PY'\np='x.rs'\ns=open(p).read()\nPY";
+    let h = fold_header_line(heredoc);
+    assert!(!h.contains('\n'), "header has no newlines: {h:?}");
+    assert!(h.starts_with("python3 - <<'PY'"), "keeps the first line: {h:?}");
+    assert!(h.ends_with('…'), "shows a truncation cue: {h:?}");
+    // Very long single line: capped.
+    let long = "git ".to_string() + &"a".repeat(300);
+    let c = fold_header_line(&long);
+    assert!(c.chars().count() <= 124, "capped (~120 + ' …'): {} chars", c.chars().count());
+    assert!(c.ends_with('…'));
+    // Empty title: empty, no panic.
+    assert_eq!(fold_header_line(""), "");
+}
+
 /// REGRESSION ("/clear then can't type in worksheet"): the `/clear` server path
 /// builds a fresh session then `settle_input_focus()`s it. A fresh (empty) worksheet
 /// must open a TYPEABLE tail You-block (open + focus=Compose + Insert) — else the

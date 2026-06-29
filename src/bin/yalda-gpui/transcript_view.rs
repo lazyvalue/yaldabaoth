@@ -759,6 +759,12 @@ impl TranscriptView {
                                 .join(", ")
                         };
 
+                        // A fold header is ONE line. A multi-line title — e.g. a Bash
+                        // heredoc / multi-line command, whose `title` is the whole
+                        // command — would otherwise render its full body in the header
+                        // and read as "tool use not folded" (runtime report).
+                        let header_title = crate::fold_header_line(&header_title);
+
                         let single_policy = if count == 1 {
                             Some(tool_render_policy(calls[0]))
                         } else {

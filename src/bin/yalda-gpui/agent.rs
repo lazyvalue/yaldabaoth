@@ -446,6 +446,26 @@ pub(crate) enum ToolRenderPolicy {
 /// (mapped from claude-code-acp's `tools.js`) plus a couple of
 /// raw_input sniffs for tools the kind alone doesn't disambiguate
 /// (TodoWrite is `Think`, same as Task — but the user wants its body
+/// Clamp a tool-group fold HEADER to a single line: take the first line and cap its
+/// length, appending a ` …` cue when truncated. A tool-call `title` can be the whole
+/// command (a multi-line Bash heredoc, a very long one-liner); rendered verbatim it
+/// fills the "folded" header with the command body and reads as unfolded tool use
+/// (runtime report). The fold header must always be one short line.
+pub(crate) fn fold_header_line(title: &str) -> String {
+    const MAX: usize = 120;
+    let first = title.lines().next().unwrap_or("");
+    let multiline = first.len() < title.len();
+    let (clipped, too_long) = match first.char_indices().nth(MAX) {
+        Some((byte, _)) => (&first[..byte], true),
+        None => (first, false),
+    };
+    if multiline || too_long {
+        format!("{} …", clipped.trim_end())
+    } else {
+        clipped.to_string()
+    }
+}
+
 /// hidden, so we detect it by an `input.todos` field).
 pub(crate) fn tool_render_policy(tc: &yalda::acp_channel::ToolCall) -> ToolRenderPolicy {
     use yalda::acp_channel::ToolKind;
