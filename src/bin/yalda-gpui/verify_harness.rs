@@ -4875,9 +4875,11 @@ fn worksheet_insert_opens_and_empty_esc_discards_you_block(cx: &mut TestAppConte
         );
     });
 
-    // Type only whitespace, then Esc → discard.
+    // Type only whitespace, then Esc Esc → drop to Normal, then leave → discard
+    // (layered Esc: 1st = Normal in the block, 2nd = leave; empty ⇒ discard).
     view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("space"), window, cx));
     vcx.run_until_parked();
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
     view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
@@ -4909,16 +4911,32 @@ fn worksheet_nonempty_you_block_persists_after_esc(cx: &mut TestAppContext) {
         view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key(k), window, cx));
     }
     vcx.run_until_parked();
+    // 1st Esc → Normal IN the block (edit-in-place); focus stays on the compose.
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(c.focus, crate::AgentFocus::Compose, "1st Esc stays in the block");
+        assert_eq!(c.input_surface.compose().mode, crate::EditMode::Normal, "now Normal");
+        assert!(c.you_block_open);
+    });
+    // 2nd Esc → leave to nav; the non-empty block persists (rule 4).
     view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
         let c = v.agent_mut(cx).expect("agent");
         assert!(c.you_block_open, "non-empty block persists (rule 4)");
-        assert_eq!(c.focus, crate::AgentFocus::Transcript, "Esc returns to nav");
+        assert_eq!(c.focus, crate::AgentFocus::Transcript, "2nd Esc returns to nav");
         assert_eq!(c.input_surface.compose().text().trim(), "hi", "draft retained");
     });
 
-    // Re-entering Insert reuses the SAME block (one block at a time, rule 6).
+    // Re-entering Insert at the SAME anchor resumes the block, text kept.
+    view.update(vcx, |v, cx| {
+        let anchor = v.agent_mut(cx).expect("agent").you_block_anchor;
+        if let Some(a) = anchor {
+            v.agent_mut(cx).expect("agent").editor.cursor_mut().line = a;
+        }
+    });
     view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("i"), window, cx));
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {
@@ -4926,6 +4944,42 @@ fn worksheet_nonempty_you_block_persists_after_esc(cx: &mut TestAppContext) {
         assert!(c.you_block_open);
         assert_eq!(c.focus, crate::AgentFocus::Compose);
         assert_eq!(c.input_surface.compose().text().trim(), "hi", "same block, text kept");
+    });
+}
+
+/// REGRESSION (runtime report): you can drop to Normal IN a You-block and re-enter
+/// Insert into the SAME region — use Helix motions to edit, or return to your text
+/// after a second thought. 1st Esc = Normal (stay in block), `i`/motions work, the
+/// block stays the active editable surface (does NOT jump to transcript nav).
+#[gpui::test]
+fn worksheet_block_normal_then_insert_again(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    for ch in ["h", "e", "l", "l", "o"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
+    }
+    vcx.run_until_parked();
+    // 1st Esc → Normal IN the block (still the active surface).
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(c.focus, crate::AgentFocus::Compose, "stay in the block, not nav");
+        assert_eq!(c.input_surface.compose().mode, crate::EditMode::Normal);
+        assert!(c.inline_you_block_active(), "block still the visible active surface");
+    });
+    // A Helix motion edits within the reply (Normal-mode key routes to the compose).
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("b"), w, cx));
+    vcx.run_until_parked();
+    // `i` re-enters Insert into the SAME region (the reported bug: couldn't do this).
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(c.focus, crate::AgentFocus::Compose);
+        assert_eq!(c.input_surface.compose().mode, crate::EditMode::Insert, "back in Insert");
+        assert_eq!(c.input_surface.compose().text().trim(), "hello", "same block, text intact");
+        assert!(c.parked_you_blocks.is_empty(), "no spurious second block");
     });
 }
 
@@ -4953,7 +5007,8 @@ fn worksheet_compose_visibility_tracks_block_and_turn(cx: &mut TestAppContext) {
         "the open block is inline — NOT the bottom box"
     );
 
-    // Discard, then go mid-turn → the bottom chatbox paints, no inline block.
+    // Discard (Esc Esc: Normal then leave; empty ⇒ discard), then go mid-turn.
+    view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
     view.update_in(vcx, |v, window, cx| v.handle_claude_key(&ws_bare_key("escape"), window, cx));
     vcx.run_until_parked();
     assert!(probe_dirty(&view, vcx, "you-block").is_none(), "discarded → no inline block");
@@ -5108,7 +5163,9 @@ fn worksheet_multiple_insertion_points(cx: &mut TestAppContext) {
     for ch in ["o", "n", "e"] {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
     }
-    // Esc back to nav (block 1 persists), navigate down, then `i` for a 2nd point.
+    // Esc Esc back to nav (1st = Normal in block, 2nd = leave; block 1 persists),
+    // navigate down, then `i` for a 2nd insertion point.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
     view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
     view.update(vcx, |v, cx| {
         v.agent_mut(cx).expect("agent").editor.cursor_mut().line = s + 2;
@@ -5180,6 +5237,8 @@ fn worksheet_reentering_insert_keeps_block_anchor(cx: &mut TestAppContext) {
     for k in ["h", "i"] {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(k), w, cx));
     }
+    // Esc Esc → Normal then leave to nav (block persists, non-empty).
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
     view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
     vcx.run_until_parked();
     view.update(vcx, |v, cx| {

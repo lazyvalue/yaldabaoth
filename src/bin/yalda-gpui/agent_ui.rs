@@ -3988,30 +3988,40 @@ impl YaldaGpuiView {
             return;
         }
 
-        // INV-UX-9: Esc in a worksheet You-block leaves Insert and returns to
-        // transcript navigation. An EMPTY block (only whitespace typed) is
-        // DISCARDED (rule 3) — the compose clears and no chrome remains, so the
-        // transcript is byte-identical to before Insert. A non-empty block PERSISTS
-        // (rule 4), pending the next Submit. (Chatbox Esc is unchanged: it just
-        // toggles the box to Normal, handled by the dispatch below.)
-        let ws_esc = self
+        // INV-UX-9: Esc in a worksheet You-block is LAYERED, like a vim/helix editor:
+        //   1st Esc (compose in Insert) → drop to Normal IN the block, keeping focus
+        //      so the user can edit the reply with motions and `i`/`a` back in.
+        //   2nd Esc (compose already Normal) → LEAVE the block to transcript nav. An
+        //      EMPTY block discards (rule 3, byte-identical); a non-empty one persists
+        //      (rule 4), pending Submit. Parked insertion points are untouched.
+        // (Chatbox Esc falls through to the dispatch — it just toggles the box Normal.)
+        let ws_esc_mode = self
             .agent_read(cx, |c| {
-                !c.input_surface.is_chatbox()
+                if !c.input_surface.is_chatbox()
                     && c.focus == AgentFocus::Compose
                     && press.key == Key::Esc
                     && press.modifiers.is_empty()
-            })
-            .unwrap_or(false);
-        if ws_esc {
-            self.with_session(focused_id, cx, |c| {
-                if c.input_surface.compose().text().trim().is_empty() {
-                    c.input_surface = InputSurface::new(InputModeKind::Worksheet);
-                    c.you_block_open = false;
-                    c.you_block_anchor = None;
+                {
+                    Some(c.input_surface.compose().mode)
                 } else {
-                    c.input_surface.compose_mut().mode = EditMode::Normal;
+                    None
                 }
-                c.focus = AgentFocus::Transcript;
+            })
+            .flatten();
+        if let Some(mode) = ws_esc_mode {
+            self.with_session(focused_id, cx, |c| {
+                if mode == EditMode::Insert {
+                    // 1st Esc: edit-in-place (Normal), stay in the block.
+                    c.input_surface.compose_mut().mode = EditMode::Normal;
+                } else {
+                    // 2nd Esc: leave the block to navigation.
+                    if c.input_surface.compose().text().trim().is_empty() {
+                        c.input_surface = InputSurface::new(InputModeKind::Worksheet);
+                        c.you_block_open = false;
+                        c.you_block_anchor = None;
+                    }
+                    c.focus = AgentFocus::Transcript;
+                }
                 c.pending_reveal_cursor = true;
             });
             cx.notify();

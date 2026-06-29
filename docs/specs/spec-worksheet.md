@@ -43,7 +43,11 @@ only, idle only) so the corruption case stays unrepresentable.
 
 2. **Insert opens a You-block at the cursor.** Entering **Insert** mode at an
    insertable point creates a **You-block**: a `You` delimiter at the cursor point
-   with an editable region. Your typed text lives inside that block.
+   with an editable region. Your typed text lives inside that block. **Esc is
+   layered (vim/Helix):** the first Esc drops to **Normal mode *within* the block**
+   (edit your reply with motions, `i`/`a` back into Insert); a second Esc **leaves**
+   the block to transcript navigation. So you can revise a reply or return to it
+   without losing it.
 
 3. **Empty insert is a no-op.** If you leave Insert having typed **no
    non-whitespace text**, the You-block — delimiter and all — **disappears**. The
