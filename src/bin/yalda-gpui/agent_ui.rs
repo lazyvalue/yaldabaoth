@@ -2851,11 +2851,17 @@ impl YaldaGpuiView {
         // snapshotted label + cwd and forcing the preserved permission mode.
         if self.session_server.is_some() {
             let open_token = alloc_open_token();
+            // `/clear` discards the conversation → a FRESH empty worksheet. Settle so
+            // it opens a typeable tail You-block immediately; without this the
+            // worksheet rests in nav and post-clear keystrokes vanish into transcript
+            // navigation (the "/clear then can't type" bug). (The connecting
+            // placeholder has no history, so finish_replay won't re-settle it.)
+            let mut state =
+                AgentState::new_server_managed(Some("connecting to session server…".into()));
+            state.settle_input_focus();
             self.show_local_session(
                 AgentSession {
-                    state: AgentState::new_server_managed(Some(
-                        "connecting to session server…".into(),
-                    )),
+                    state,
                     label: label.clone(),
                     cwd: slot_cwd.clone(),
                     resume_id: None,

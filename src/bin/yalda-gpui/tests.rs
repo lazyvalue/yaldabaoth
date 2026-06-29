@@ -105,6 +105,25 @@ fn build_nav_stops_per_frozen_prose_line() {
 }
 
 /// FIX 5 contract: `snap_nav_stop` returns `None` when there is no stop in the
+/// REGRESSION ("/clear then can't type in worksheet"): the `/clear` server path
+/// builds a fresh session then `settle_input_focus()`s it. A fresh (empty) worksheet
+/// must open a TYPEABLE tail You-block (open + focus=Compose + Insert) — else the
+/// worksheet rests in nav and post-clear keystrokes vanish into transcript nav.
+#[test]
+fn clear_resets_worksheet_to_a_typeable_block() {
+    let mut st = AgentState::new_server_managed(None);
+    assert!(st.editor.document().is_empty(), "fresh transcript after clear");
+    assert!(!st.input_surface.is_chatbox(), "default placement is worksheet");
+    st.settle_input_focus();
+    assert!(st.you_block_open, "clear opens a tail You-block");
+    assert_eq!(st.focus, AgentFocus::Compose, "focused for typing");
+    assert_eq!(
+        st.input_surface.compose().mode,
+        EditMode::Insert,
+        "Insert mode → keystrokes land visibly"
+    );
+}
+
 /// move direction. The worksheet key handler relies on this `None` to fall the
 /// caret back to its pre-motion stop instead of stranding it on an unrenderable
 /// block-interior / blank line (Finding E).
