@@ -3687,25 +3687,59 @@ impl AgentState {
         } else {
             None
         };
-        if !self.you_block_open {
-            // Fresh first block (the `i`/`f` caller only reaches here when the caret
-            // is legal, so `snapped` is `Some`; `None` would tail-anchor).
-            self.you_block_open = true;
-            self.you_block_anchor = snapped;
+        // Deterministic editing (runtime report: "sometimes edits an existing block,
+        // sometimes creates a new one"). Resolve the caret's snapped anchor against
+        // ALL blocks, not just the active one:
+        //   • matches the ACTIVE block's anchor → resume it in place.
+        //   • matches a PARKED block's anchor    → resume THAT block (swap it in).
+        //   • a new legal anchor                 → park the active, open fresh here.
+        //   • illegal caret                      → resume whatever's active.
+        if self.you_block_open && snapped == self.you_block_anchor {
+            // resume active in place (covers the same-anchor and snapped==active cases)
         } else if let Some(new_anchor) = snapped {
-            if Some(new_anchor) != self.you_block_anchor {
-                // A NEW insertion point: park the active block (if it has text) and
-                // open a fresh one here.
-                let text = self.input_surface.compose().text();
-                if !text.trim().is_empty() {
-                    self.parked_you_blocks.push((self.you_block_anchor, text));
+            let parked_idx = self
+                .parked_you_blocks
+                .iter()
+                .position(|(a, _)| *a == Some(new_anchor));
+            if let Some(pi) = parked_idx {
+                // Resume a PARKED block: stash the current active (if any non-empty),
+                // then load the parked one into the active Compose.
+                if self.you_block_open {
+                    let text = self.input_surface.compose().text();
+                    if !text.trim().is_empty() {
+                        self.parked_you_blocks
+                            .push((self.you_block_anchor, text));
+                    }
+                }
+                let (panchor, ptext) = self.parked_you_blocks.remove(pi);
+                self.input_surface = InputSurface::with_draft(InputModeKind::Worksheet, &ptext);
+                self.you_block_open = true;
+                self.you_block_anchor = panchor;
+            } else if !self.you_block_open && self.parked_you_blocks.is_empty() {
+                // First block.
+                self.you_block_open = true;
+                self.you_block_anchor = Some(new_anchor);
+            } else {
+                // A NEW insertion point at a fresh anchor: park the active (if it has
+                // text) and open a fresh block here.
+                if self.you_block_open {
+                    let text = self.input_surface.compose().text();
+                    if !text.trim().is_empty() {
+                        self.parked_you_blocks
+                            .push((self.you_block_anchor, text));
+                    }
                 }
                 self.input_surface = InputSurface::new(InputModeKind::Worksheet);
+                self.you_block_open = true;
                 self.you_block_anchor = Some(new_anchor);
             }
-            // else: same anchor → resume in place.
+        } else if !self.you_block_open {
+            // Illegal caret and nothing active → open a tail block so `i` always
+            // gives a typeable surface.
+            self.you_block_open = true;
+            self.you_block_anchor = None;
         }
-        // else: illegal caret while a block is open → resume in place.
+        // else: illegal caret while a block is open → resume the active block.
         self.input_surface.compose_mut().mode = EditMode::Insert;
         self.focus = AgentFocus::Compose;
         self.pending_reveal_cursor = true;

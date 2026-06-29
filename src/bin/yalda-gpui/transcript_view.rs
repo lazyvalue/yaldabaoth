@@ -1027,12 +1027,27 @@ impl TranscriptView {
                         // is "on" a block when it sits on the block's anchor line).
                         // `cursor_line` is `usize::MAX` off-nav, so this never lights
                         // up during compose/idle.
-                        let row_bg: Hsla = if cursor_line == anchor_line {
+                        // you-div SCOPED-NORMAL indicator: when the block holds focus
+                        // in Normal mode (Esc-once: editing the reply with motions),
+                        // tint it with the accent and badge the label `You · NORMAL`,
+                        // so it's unmistakable you're editing THIS block (vs Insert,
+                        // vs the nav-focus tint). Insert keeps the plain `You`.
+                        let scoped_normal = focused && mode == EditMode::Normal;
+                        let row_bg: Hsla = if scoped_normal {
+                            let mut h = accent;
+                            h.a = 0.12;
+                            h
+                        } else if cursor_line == anchor_line {
                             let mut h = nc(at_snap.dim);
                             h.a = 0.2;
                             h
                         } else {
                             rgba(0x00000000).into()
+                        };
+                        let label = if scoped_normal {
+                            SharedString::from("You · NORMAL")
+                        } else {
+                            SharedString::new_static("You")
                         };
                         let mut block = div()
                             .flex()
@@ -1051,7 +1066,7 @@ impl TranscriptView {
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(accent)
                                     .font_family(code_font_snap.clone())
-                                    .child(SharedString::new_static("You")),
+                                    .child(label),
                             );
                         // Only the ACTIVE block measures its width (it owns the bounds
                         // Cell that drives wrap_cols); parked blocks render plainly.

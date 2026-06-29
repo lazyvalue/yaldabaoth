@@ -201,7 +201,7 @@ collapses).
 probe asserts the list strip is painted with its bottom at/above the compose box's
 top). Runtime: only click-to-show-output is left for a human eyeball.
 
-### INV-UX-7 — A submit is delivered immediately (even mid-turn); failed sends queue, never drop; Esc interrupts
+### INV-UX-7 — A submit is delivered immediately (even mid-turn); failed sends queue, never drop (stop is ⌘., not Esc)
 
 > **Numbering note:** `INV-UX-6` is reserved for the parallel `toolgroup-expand-key`
 > branch (tool-group collapse). This invariant is `INV-UX-7` to avoid a collision
@@ -214,9 +214,10 @@ running clocks are not reset). When the agent advertises the `promptQueueing`
 capability the worker forwards the prompt concurrently, so the agent receives the
 steer mid-turn and processes it the instant the current turn finishes. If the send
 **fails** (offline / reconnecting) the draft is **left in the compose** with a
-status so the user can retry — never silently moved or dropped. In the agent view,
-bare **`Esc` interrupts an in-flight turn** (`session/cancel`); with no turn in
-flight, `Esc` keeps its existing meaning.
+status so the user can retry — never silently moved or dropped. The stop gesture is
+**`⌘.`** (`stop_agent` → `session/cancel`; a second press force-restarts). **`Esc`
+is NOT a stop** — it is the worksheet mode key (Insert→Normal, leave-block), and
+binding it to stop conflicted with mode switching, so it was unbound (2026-06-29).
 
 **Applies to.** The agent tile: `submit_compose` / `send_prompt_to_session`
 (`agent_ui.rs`) and the worker's concurrent driver (`acp_channel.rs`, gated on
@@ -374,6 +375,12 @@ the inline block).
 
 ## Revision history
 
+- 2026-06-29 — Worksheet runtime fixes: `/clear` settles to a typeable block;
+  multiple insertion points editable deterministically (caret on an existing block
+  resumes it); you-div scoped-Normal indicator (`You · NORMAL` + accent tint) and
+  nav-cursor highlight on you-divs; **`Esc` unbound from stopping a turn** (INV-UX-7
+  updated — stop is `⌘.`; Esc is the worksheet mode key); bare-`m`/`'` mark chord
+  gated to transcript-nav only so `m`/`'` stay typeable in the compose.
 - 2026-06-28 — Added INV-UX-8 (worksheet renders inline-flush in the transcript
   column; chatbox stays a pinned box — the two placements are now visibly
   distinct, closing the "toggling worksheet does nothing" gap). The deferred

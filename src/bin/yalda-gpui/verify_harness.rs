@@ -5128,6 +5128,104 @@ fn worksheet_you_block_anchors_at_cursor_not_tail(cx: &mut TestAppContext) {
     });
 }
 
+/// REGRESSION (runtime: "can't type the m character in chatbox mode"): the bare-`m`
+/// mark chord must NOT fire in the editable compose — `m` is typeable in Insert, and
+/// in compose-Normal it routes to the editor (no pending mark chord).
+#[gpui::test]
+fn m_is_typeable_in_compose(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    for ch in ["m", "a", "p"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
+    }
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        assert_eq!(
+            v.agent_mut(cx).expect("agent").input_surface.compose().text().trim(),
+            "map",
+            "m types in the compose (Insert), not eaten by a mark chord"
+        );
+    });
+    // Drop to compose-Normal (1st Esc), press m → still no mark chord started.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("m"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, _cx| {
+        assert!(
+            v.pending_mark_chord.is_none(),
+            "m in compose-Normal must NOT start a mark chord"
+        );
+    });
+}
+
+/// REGRESSION (runtime: "sometimes my cursor edits an existing you-div, sometimes it
+/// creates a new one"): the caret on an EXISTING block's anchor RESUMES that block
+/// (active or parked), deterministically — it does not spawn a duplicate.
+#[gpui::test]
+fn worksheet_cursor_on_existing_block_resumes_it(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("alpha\nbeta\ngamma\ndelta\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let s = view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+        s
+    });
+    // Block 1 "first" at s, Esc Esc to nav.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    for ch in ["f", "i", "r", "s", "t"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
+    }
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    // Block 2 "second" at s+2, Esc Esc to nav (block 1 now parked).
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).expect("agent").editor.cursor_mut().line = s + 2;
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    for ch in ["s", "e", "c"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
+    }
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    vcx.run_until_parked();
+
+    // Navigate BACK to block 1's anchor (s) and press i → RESUMES block 1, not a 3rd.
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).expect("agent").editor.cursor_mut().line = s;
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(
+            c.input_surface.compose().text().trim(),
+            "first",
+            "cursor on block 1's anchor resumes block 1 (edits the existing one)"
+        );
+        assert_eq!(c.you_block_anchor, Some(s));
+        // Exactly two blocks total still (block 2 parked, block 1 active) — no dup.
+        assert_eq!(c.parked_you_blocks.len(), 1, "no duplicate block created");
+        assert_eq!(c.parked_you_blocks[0].1.trim(), "sec");
+    });
+}
+
 /// INV-UX-9 rule 6 (MULTIPLE insertion points end-to-end): open two blocks at
 /// different anchors, confirm both render as separate inline `YouBlock`s, and that
 /// gather+freeze commits BOTH in place (each text present in the transcript).
@@ -5723,25 +5821,37 @@ fn steering_after_stop_request_supersedes_pending_cancel(cx: &mut TestAppContext
     );
 }
 
-/// End-to-end of the Esc binding: with a turn in flight, pressing Esc in the
-/// agent view interrupts it (→ StopRequested). Idle Esc must NOT (it keeps its
-/// per-mode meaning — "Esc never quits").
+/// Esc is UNBOUND from stopping a turn (runtime report: it conflicted with mode
+/// switching — Esc is the Insert→Normal / leave-block key). With a turn in flight,
+/// pressing Esc must NOT request a stop; the turn keeps streaming. (`⌘.` is the
+/// stop, via `stop_agent`.)
 #[gpui::test]
-fn esc_interrupts_in_flight_turn(cx: &mut TestAppContext) {
+fn esc_does_not_stop_in_flight_turn(cx: &mut TestAppContext) {
     use crate::agent::TurnPhase;
     cx.update(crate::register_keymap);
     let (view, vcx, id, _session) = boot_with_transcript(cx);
 
-    // Put a turn in flight, then press Esc.
     view.update(vcx, |v, cx| {
         v.with_session(id, cx, |c| c.turn_phase = TurnPhase::begin(std::time::Instant::now()));
     });
     vcx.simulate_keystrokes("escape");
     vcx.run_until_parked();
-    let requested = view.read_with(vcx, |v, cx| {
+    let (requested, awaiting) = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            (c.turn_phase.stop_requested(), c.turn_phase.is_awaiting())
+        })
+        .unwrap()
+    });
+    assert!(!requested, "Esc must NOT request a stop (unbound)");
+    assert!(awaiting, "the turn keeps streaming after Esc");
+
+    // The explicit stop path still works.
+    view.update(vcx, |v, cx| v.stop_agent_inner(cx));
+    vcx.run_until_parked();
+    let requested2 = view.read_with(vcx, |v, cx| {
         v.read_session(id, cx, |c| c.turn_phase.stop_requested()).unwrap()
     });
-    assert!(requested, "Esc while a turn is in flight requests a stop");
+    assert!(requested2, "explicit stop (⌘.) still requests a cancel");
 }
 
 /// Mid-turn ordering + echo-dedup (INV-UX-7), through the REAL reducer: a steer

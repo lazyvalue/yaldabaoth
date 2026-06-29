@@ -3813,21 +3813,10 @@ impl YaldaGpuiView {
             return;
         }
 
-        // Esc INTERRUPTS an in-flight turn (spec-turn-steering.md, INV-UX-7) —
-        // the primary, muscle-memory stop, same path as ⌘. (first press =
-        // graceful session/cancel, second = force-restart). Checked after the
-        // subagent-focus return so unfocusing a subagent still wins. When no
-        // turn is in flight, Esc falls through to its existing per-mode meaning
-        // (transcript→compose, toggle Normal, …) — "Esc never quits".
-        if press.key == Key::Esc
-            && press.modifiers.is_empty()
-            && self
-                .agent_read(cx, |c| c.turn_phase.is_awaiting())
-                .unwrap_or(false)
-        {
-            self.stop_agent_inner(cx);
-            return;
-        }
+        // Esc does NOT stop an in-flight turn (runtime report: it conflicts too
+        // easily with mode switching — Esc is the Insert→Normal / leave-block key in
+        // the worksheet). Stop is `⌘.` only (`stop_agent`). Esc falls through to its
+        // per-mode meaning (drop to Normal in a You-block, leave to nav, etc.).
 
         // Mode-toggle: Ctrl-Alt-Enter (§5). Checked before Ctrl-Enter so
         // an accidental Alt-press doesn't fire a submit instead.
@@ -3850,19 +3839,22 @@ impl YaldaGpuiView {
         // Model C: input routes to the compose buffer in both placements; the
         // transcript is read-only in both (INV-1).
 
-        // Bare `m`/`'` in NORMAL mode starts a mark chord — agent tiles are
-        // markable/jumpable like any other tile. Insert mode is untouched so
-        // typing `m`/`'` into the compose still works. Model C: the compose's
-        // mode governs normal/insert in BOTH placements.
-        // Normal-like context: the compose is in Normal mode, OR focus is on the
-        // read-only transcript (always navigation, never insert).
+        // Bare `m`/`'` starts a mark chord ONLY in transcript navigation — agent
+        // tiles are markable like any tile, but the chord must NOT fire in the
+        // editable compose, or `m`/`'` become untypeable there (runtime report:
+        // "can't type the m character in chatbox mode" — it fired whenever the
+        // compose was in Normal mode). In the compose, `m`/`'` route to the editor
+        // (typed in Insert; an ordinary motion in Normal).
         let in_normal = self
             .agent_read(cx, |c| {
                 c.focus == AgentFocus::Transcript
                     || c.input_surface.compose().mode == EditMode::Normal
             })
             .unwrap_or(false);
-        if in_normal && self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
+        let transcript_nav = self
+            .agent_read(cx, |c| c.focus == AgentFocus::Transcript)
+            .unwrap_or(false);
+        if transcript_nav && self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
             return;
         }
 
