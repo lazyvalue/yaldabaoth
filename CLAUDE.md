@@ -205,10 +205,14 @@ zoom) are registered with `None` context and **must** have a matching
 is a `text_scale: f32` on `YaldaGpuiView` (clamped `[MIN_TEXT_SCALE, MAX_TEXT_SCALE]`,
 step `TEXT_SCALE_STEP = 1.1`) that multiplies the body `text_size(px(14.0))`
 and every heading size. Threaded into `RenderCtx::text_scale` for block
-rendering. **Chrome stays fixed** — status bars, tab strip, browser rows,
-Claude session blocks all render at their native sizes. To extend the zoom
-to a new surface, multiply that surface's base `text_size` by `self.text_scale`
-and add `on_action(Self::zoom_in/out/reset)` to its root.
+rendering — for the buffer doc/edit views AND the **agent transcript**
+(conversation prose + markdown blocks scale; INV-UX-13). **Chrome stays fixed** —
+status bars, tab strip, browser rows, the agent gutter/labels + bottom panels,
+and the pixel-pinned compose input all render at their native sizes. To extend
+the zoom to a new surface, multiply that surface's base `text_size` by
+`self.text_scale` and add `on_action(Self::zoom_in/out/reset)` to its root; for a
+cached surface (the transcript) read `text_scale` off the root and invalidate via
+`notify_transcript_views`.
 
 ### GUI responsiveness invariants (read before touching agent/transcript UI)
 

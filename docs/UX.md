@@ -196,8 +196,11 @@ at native size — **chrome stays fixed** under document zoom.
 ### Document text zoom (`main.rs`)
 
 `Cmd-=`/`Cmd-+` in, `Cmd--` out, `Cmd-0` reset — a `text_scale` multiplying body
-+ heading sizes in the doc/transcript surfaces. Chrome (status bars, tab strip,
-browser rows, jump panel) stays at native size.
++ heading sizes. It scales the buffer doc + edit views **and the agent transcript**
+(conversation prose + markdown blocks, INV-UX-13). Chrome (status bars, tab strip,
+browser rows, jump panel, agent gutter/labels, bottom panels, and the pixel-pinned
+compose input) stays at native size. `Cmd-0` resets everywhere except agent tiles,
+where it is panel-focus (INV-UX-12).
 
 ---
 

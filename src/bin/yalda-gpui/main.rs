@@ -2775,9 +2775,10 @@ impl YaldaGpuiView {
             self.save_settings();
             // Text-zoom is GLOBAL, not session state (ticket 021): the action
             // handler notifies each live transcript view directly so the cached
-            // subtree re-renders. (The transcript itself renders at fixed size —
-            // zoom is scoped to the doc view — but the notify keeps the contract
-            // uniform with theme and is the audited invalidation path.)
+            // subtree re-renders with the new scale. INV-UX-13: the transcript's
+            // conversation prose + markdown blocks scale by `text_scale` (read
+            // from the root in `RootSnapshot`), like the buffer doc view; this is
+            // the audited invalidation path that makes that re-read take effect.
             self.notify_transcript_views(MissReason::TextStyle, cx);
             self.notify_linear_views(MissReason::TextStyle, cx);
             cx.notify();

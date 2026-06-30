@@ -477,6 +477,38 @@ keymap dispatch proves the AgentView binding shadows zoom-reset),
 `agent_panel_closing_last_panel_exits_focus`, plus the state-machine fuzzer ops +
 oracle (`focus ∈ {Compose,Transcript,Panel}`, panel-focused ⇒ a panel is open).
 
+### INV-UX-13 — Document text zoom scales the agent transcript, like a buffer
+
+**Statement.** `Cmd-=` / `Cmd-+` (in) and `Cmd--` (out) — the document text-zoom
+`text_scale` — scale the **agent transcript** the same way they scale the buffer
+doc view: the conversation **prose** and the transcript's **markdown blocks**
+(headings / code / tables) multiply by `text_scale`. Zoom is GLOBAL (not session
+state): its action handler pushes `notify_transcript_views(TextStyle)` so every live
+`TranscriptView` re-renders and re-reads `text_scale` off the root (via
+`RootSnapshot`) — it is NOT a per-session `TranscriptSeqs` seq. As with buffers,
+**chrome stays at native size**: the turn/tool gutter labels, tool-card status
+glyphs, the bottom panels, the status footer, and the **compose input** (its caret
+and line-box are pixel-pinned for caret-containment — INV-UX-1 — so its font is held
+fixed; scaling it would require scaling the caret + `CHATBOX_CHAR_W` in lockstep, a
+separate change). `Cmd-0` resets zoom everywhere EXCEPT agent tiles, where it is
+panel-focus (INV-UX-12) — zoom-out then back is the reset there.
+
+**Applies to.** `transcript_view.rs`: `RootSnapshot.text_scale` (read from
+`root.text_scale`), the `claude-body` base `text_size(px(13.0 * text_scale))` that
+the `FlatItem::Line` prose rows inherit, and the `FlatItem::Block` `RenderCtx
+{ text_scale }`. `main.rs`: `set_text_scale` → `notify_transcript_views`.
+
+**Why.** Reading the agent conversation at a comfortable size should work exactly
+like reading a document — the transcript is the agent tile's primary reading
+surface.
+
+**Status:** `honored` (the re-render is headless; the exact font px is gap-1 —
+human eye).
+
+**Enforcement.** `verify_harness.rs`: `transcript_021_theme_and_zoom_bust_cache`
+(a zoom-in re-renders the transcript exactly once — the invalidation path that makes
+the new scale take effect). Exact glyph px is the harness's pixel gap (#1).
+
 ## Cross-references
 
 - `spec-turn-steering.md` — the full steering design (queue, delivery modes, the
@@ -494,6 +526,10 @@ oracle (`focus ∈ {Compose,Transcript,Panel}`, panel-focused ⇒ a panel is ope
 
 ## Revision history
 
+- 2026-06-29 (5) — Added INV-UX-13: document text zoom (`Cmd-±`) now scales the
+  agent **transcript** (conversation prose + markdown blocks) by `text_scale`, like
+  the buffer doc view; chrome + the pixel-pinned compose input stay native. Guard:
+  `transcript_021_theme_and_zoom_bust_cache` (exact px is gap-1).
 - 2026-06-29 (4) — Reworked the agent bottom panels into **two side-by-side
   columns** above the compose — Plan/Tasklist (left) + Subagents (right) — and added
   INV-UX-12 (`Cmd-0` focuses + enlarges them; **2-D** vim selection: `h`/`l` switch
