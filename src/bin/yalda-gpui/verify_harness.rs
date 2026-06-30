@@ -4062,6 +4062,74 @@ fn transcript_021_theme_and_zoom_bust_cache(cx: &mut TestAppContext) {
     );
 }
 
+/// INV-UX-13: the transcript's conversation PROSE actually scales with document
+/// zoom — the painted height of a prose line grows when `text_scale` grows. The
+/// layout probe gives real painted bounds, so this is a headless guard for the
+/// font-px effect (not just the cache-bust). Pins the fix for "agent text didn't
+/// resize with Cmd-±" — the size must live on the line's own wrapper, since the
+/// `claude-body` ambient doesn't cross the `gpui::list` item boundary.
+#[gpui::test]
+fn transcript_prose_scales_with_zoom(cx: &mut TestAppContext) {
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+    // Seed a line of prose into the transcript editor so `FlatItem::Line(0)`
+    // renders (the probed row). Mirrors `transcript_021_session_edit_busts_cache`.
+    session.update(vcx, |s, cx| {
+        s.state
+            .editor
+            .programmatic_insert(0, "hello world, a line of agent prose\n");
+        cx.notify();
+    });
+    // Focus the transcript so line 0 carries the cursor — `gpui::list` only
+    // paints VISIBLE items, and `pending_reveal_cursor` (below) scrolls the
+    // cursor row into view so the probe has a painted target.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| c.focus = crate::AgentFocus::Transcript);
+    });
+    view.update(vcx, |v, cx| v.set_text_scale(1.0, cx));
+    for _ in 0..4 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+
+    let probe_h = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| -> f32 {
+        for _ in 0..2 {
+            view.update(vcx, |v, cx| {
+                if let Some(mut c) = v.agent_mut(cx) {
+                    c.pending_reveal_cursor = true;
+                }
+                cx.notify();
+            });
+            vcx.run_until_parked();
+        }
+        crate::layout_probe_begin();
+        view.update(vcx, |v, cx| {
+            if let Some(mut c) = v.agent_mut(cx) {
+                c.pending_reveal_cursor = true;
+            }
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        let b = crate::layout_probe_get("transcript-line0");
+        crate::layout_probe_end();
+        b.expect("transcript line 0 did not paint").3
+    };
+
+    let h1 = probe_h(&view, vcx);
+    assert!(h1 > 1.0, "prose line has no height at scale 1.0 ({h1})");
+
+    // Zoom to 2x; the SAME prose line must paint materially taller.
+    view.update(vcx, |v, cx| v.set_text_scale(2.0, cx));
+    for _ in 0..4 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    let h2 = probe_h(&view, vcx);
+    assert!(
+        h2 > h1 * 1.4,
+        "prose did NOT scale with zoom: line height {h1}px (1x) vs {h2}px (2x)"
+    );
+}
+
 /// Heading-marker toggle is a GLOBAL transcript render input (agent `.` menu →
 /// "toggle heading markers"), pushed via `notify_transcript_views(Refresh)` like
 /// theme/zoom — not a per-session seq. Flipping it must re-render the transcript

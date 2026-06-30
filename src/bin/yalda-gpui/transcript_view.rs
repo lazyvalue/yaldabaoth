@@ -686,6 +686,12 @@ impl TranscriptView {
                             .w_full()
                             .py(px(2.0))
                             .bg(row_bg)
+                            // INV-UX-13: scale the conversation prose on the line's
+                            // own wrapper (the `claude-body` ambient does NOT reach
+                            // across the `gpui::list` item boundary — the working
+                            // doc/WP views set the size on each line wrapper too).
+                            // The fixed-size gutter child below overrides this.
+                            .text_size(px(13.0 * text_scale))
                             .text_color(line_text_color)
                             .child(
                                 div()
@@ -698,7 +704,15 @@ impl TranscriptView {
                                     .child(label_text),
                             )
                             .child(div().w(px(3.0)).flex_none().bg(bar_color).mr_2())
-                            .child(content)
+                            // Probe the FIRST line's painted content so the harness
+                            // can prove the prose height grows with zoom (INV-UX-13)
+                            // — turning the font-px check from a human gap into a
+                            // headless guard (`transcript_prose_scales_with_zoom`).
+                            .child(if line_idx == 0 {
+                                crate::probe_bounds("transcript-line0", content)
+                            } else {
+                                content
+                            })
                             .into_any_element()
                     }
                     FlatItem::ToolGroup { anchor_line, ids } => {

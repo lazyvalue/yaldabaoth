@@ -494,20 +494,23 @@ separate change). `Cmd-0` resets zoom everywhere EXCEPT agent tiles, where it is
 panel-focus (INV-UX-12) — zoom-out then back is the reset there.
 
 **Applies to.** `transcript_view.rs`: `RootSnapshot.text_scale` (read from
-`root.text_scale`), the `claude-body` base `text_size(px(13.0 * text_scale))` that
-the `FlatItem::Line` prose rows inherit, and the `FlatItem::Block` `RenderCtx
-{ text_scale }`. `main.rs`: `set_text_scale` → `notify_transcript_views`.
+`root.text_scale`), the per-line `text_size(px(13.0 * text_scale))` on the
+`FlatItem::Line` **row wrapper** (NOT just `claude-body` — `gpui::list` items do
+not inherit the list's ambient text size, so the size must live on the item, the
+same way the doc/WP views set it on each line wrapper), and the `FlatItem::Block`
+`RenderCtx { text_scale }`. `main.rs`: `set_text_scale` → `notify_transcript_views`.
 
 **Why.** Reading the agent conversation at a comfortable size should work exactly
 like reading a document — the transcript is the agent tile's primary reading
 surface.
 
-**Status:** `honored` (the re-render is headless; the exact font px is gap-1 —
-human eye).
+**Status:** `honored` (headless — the painted line height is probed).
 
-**Enforcement.** `verify_harness.rs`: `transcript_021_theme_and_zoom_bust_cache`
-(a zoom-in re-renders the transcript exactly once — the invalidation path that makes
-the new scale take effect). Exact glyph px is the harness's pixel gap (#1).
+**Enforcement.** `verify_harness.rs`: `transcript_prose_scales_with_zoom` (probes
+a prose line's PAINTED height at 1× vs 2× — it must grow, so the font actually
+scales, not just the cache busting) + `transcript_021_theme_and_zoom_bust_cache`
+(zoom re-renders the transcript once — the invalidation path). Exact glyph shape
+remains the harness's pixel gap (#1), but the size change is now guarded.
 
 ## Cross-references
 
@@ -528,8 +531,11 @@ the new scale take effect). Exact glyph px is the harness's pixel gap (#1).
 
 - 2026-06-29 (5) — Added INV-UX-13: document text zoom (`Cmd-±`) now scales the
   agent **transcript** (conversation prose + markdown blocks) by `text_scale`, like
-  the buffer doc view; chrome + the pixel-pinned compose input stay native. Guard:
-  `transcript_021_theme_and_zoom_bust_cache` (exact px is gap-1).
+  the buffer doc view; chrome + the pixel-pinned compose input stay native. The
+  size must live on each `FlatItem::Line` wrapper — `gpui::list` items don't inherit
+  the list's ambient text size, which is why an initial `claude-body`-only attempt
+  left the prose unscaled. Guard: `transcript_prose_scales_with_zoom` (probes the
+  painted line height grows 1×→2×).
 - 2026-06-29 (4) — Reworked the agent bottom panels into **two side-by-side
   columns** above the compose — Plan/Tasklist (left) + Subagents (right) — and added
   INV-UX-12 (`Cmd-0` focuses + enlarges them; **2-D** vim selection: `h`/`l` switch
