@@ -789,6 +789,142 @@ fn jump_panel_renders_with_sessions(cx: &mut TestAppContext) {
     );
 }
 
+/// INV-UX-11: `ctrl-<n>` jumps straight to the n-th workspace — the digit the
+/// jump panel shows. Exercises the FULL dispatch chain: `register_keymap`
+/// installed `ctrl-3 → GotoWorkspace3`, and the focused screen root wired
+/// `.workspace_nav(cx)` so the action lands on `goto_workspace_number`. A digit
+/// past the last workspace is a no-op (no panic, no spurious switch).
+#[gpui::test]
+fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
+    use crate::workspace::WorkspaceCwd;
+    use crate::{App, BrowserWindow, BufferApp};
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+
+    // Build four real (non-ephemeral) workspaces: the boot tab + three more
+    // INHABITED browser tabs (an empty-layout workspace renders a bare div with
+    // no action handlers, so its root couldn't dispatch the global jump — a
+    // separate edge state; here we want real, switchable workspaces).
+    view.update(vcx, |v, _| {
+        let cwd = PathBuf::from(".");
+        for _ in 0..3 {
+            v.workspace.push_initial_tab(
+                App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
+                WorkspaceCwd::new(cwd.clone()),
+            );
+        }
+        assert_eq!(v.workspace.tabs.len(), 4);
+        v.workspace.set_active_tab(0); // start the keystroke run on workspace 1
+        assert_eq!(v.workspace.active_tab, 0);
+    });
+    vcx.run_until_parked();
+
+    // ctrl-3 → third workspace (index 2).
+    vcx.simulate_keystrokes("ctrl-3");
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert_eq!(v.workspace.active_tab, 2, "ctrl-3 selects the 3rd workspace");
+    });
+
+    // ctrl-1 → back to the first.
+    vcx.simulate_keystrokes("ctrl-1");
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert_eq!(v.workspace.active_tab, 0, "ctrl-1 selects the 1st workspace");
+    });
+
+    // ctrl-9 with only four workspaces is a no-op (stays put).
+    vcx.simulate_keystrokes("ctrl-9");
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.active_tab, 0,
+            "a digit past the last workspace does nothing"
+        );
+    });
+}
+
+/// `goto_workspace_number` numbers NON-ephemeral workspaces 1..N — the same
+/// numbering the jump panel paints (`idx + 1`) and skips ephemeral virtual
+/// workspaces, so the displayed digit and the `ctrl-<n>` target always agree.
+#[gpui::test]
+fn workspace_number_skips_ephemeral(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let sid = add_free_session(&view, vcx, "claude-1");
+    view.update(vcx, |v, _| v.push_empty_workspace()); // workspaces 1 and 2 are real
+    // Open the free session → an ephemeral workspace is appended (sorts last).
+    view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
+    view.update(vcx, |v, _| {
+        assert_eq!(v.workspace.tabs.len(), 3, "two real + one ephemeral");
+        assert!(v.workspace.active_is_ephemeral());
+    });
+    // ctrl-2 must land on the 2nd REAL workspace (index 1), not the ephemeral.
+    view.update(vcx, |v, cx| v.goto_workspace_number(2, cx));
+    view.update(vcx, |v, _| {
+        assert_eq!(v.workspace.active_tab, 1, "number 2 = 2nd non-ephemeral tab");
+        assert!(!v.workspace.active_is_ephemeral());
+    });
+}
+
+/// INV-UX-10: the jump-panel agent status dot reflects the session's turn phase.
+/// `dot_status` is the headless-verifiable mapping (the actual hue is a paint
+/// detail — gap 1). Working while a reply is in flight; waiting-for-you once the
+/// turn finishes; neutral when disconnected.
+#[gpui::test]
+fn agent_status_dot_reflects_turn_phase(cx: &mut TestAppContext) {
+    use crate::AgentDotStatus;
+    let (view, vcx) = boot_browser(cx);
+    let id = add_free_session(&view, vcx, "claude-1");
+
+    let status = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, cx| {
+            let rows = v.jump_panel_agent_rows(cx);
+            assert_eq!(rows.len(), 1, "exactly the one session we added");
+            rows[0].dot_status()
+        })
+    };
+
+    // Idle (fresh session, turn finished) → it's the user's move.
+    assert_eq!(
+        status(&view, vcx),
+        AgentDotStatus::WaitingForYou,
+        "an idle session waits for you"
+    );
+
+    // A reply in flight → working.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now())
+        });
+    });
+    assert_eq!(
+        status(&view, vcx),
+        AgentDotStatus::Working,
+        "a mid-turn session is working"
+    );
+}
+
+/// Unit: the dot-status mapping is total and disconnected wins (a disconnected
+/// agent shows neutral even if it was mid-turn before the drop).
+#[test]
+fn agent_dot_status_mapping() {
+    use crate::{AgentDotStatus, AgentRow, JumpTarget};
+    let row = |connected, awaiting| AgentRow {
+        target: JumpTarget::Roster("s".into()),
+        label: "x".into(),
+        bound: false,
+        connected,
+        awaiting,
+    };
+    assert_eq!(row(true, Some(true)).dot_status(), AgentDotStatus::Working);
+    assert_eq!(
+        row(true, Some(false)).dot_status(),
+        AgentDotStatus::WaitingForYou
+    );
+    assert_eq!(row(true, None).dot_status(), AgentDotStatus::Neutral);
+    assert_eq!(row(false, Some(true)).dot_status(), AgentDotStatus::Neutral);
+}
+
 /// Jump-panel selection of a FREE session opens an ephemeral virtual workspace
 /// (ADR-0021): a new single-tile tab bound to the session, made active. Leaving
 /// it (any workspace switch) tears it down and returns the session to free —
@@ -6186,7 +6322,14 @@ fn assert_agent_invariants(
             let frozen = (0..c.editor.document().line_count())
                 .filter(|&i| c.editor.is_frozen_line(i))
                 .count();
-            let focus_ok = matches!(c.focus, AgentFocus::Compose | AgentFocus::Transcript);
+            // INV-UX-12: panel focus is a legal focus, and you can only hold it
+            // while at least one bottom panel is open (the toggles auto-exit when
+            // the last one closes). The selected row is clamped at render, so the
+            // stored `panel_sel` never indexes a panic.
+            let focus_ok = matches!(
+                c.focus,
+                AgentFocus::Compose | AgentFocus::Transcript | AgentFocus::Panel
+            ) && (c.focus != AgentFocus::Panel || c.tasklist_open || c.subagents_open);
             let stop_ok = !c.turn_phase.stop_requested() || c.turn_phase.is_awaiting();
             // INV-UX-9: a You-block exists ONLY in the worksheet (never chatbox
             // mode). The stored anchor is deliberately NOT asserted legal here — it
@@ -6255,7 +6398,7 @@ fn agent_tile_statemachine_fuzz_holds_invariants(cx: &mut TestAppContext) {
         assert_agent_invariants(&view, vcx, id, &mut prev_frozen, "init");
 
         for step in 0..100 {
-            let op = next(&mut st) % 14;
+            let op = next(&mut st) % 20;
             match op {
                 0 => view.update(vcx, |v, cx| {
                     v.with_session(id, cx, |c| c.input_surface.compose_mut().editor.insert_char('x'));
@@ -6297,6 +6440,14 @@ fn agent_tile_statemachine_fuzz_holds_invariants(cx: &mut TestAppContext) {
                 12 => {
                     view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx))
                 }
+                13 => view.update(vcx, |v, cx| v.toggle_subagents(cx)),
+                // INV-UX-12: enter/leave panel focus and navigate it through the
+                // real Cmd-0 handler + key path, against the oracle.
+                14 => view.update(vcx, |v, cx| v.focus_agent_panel(cx)),
+                15 => view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx)),
+                16 => view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("k"), w, cx)),
+                17 => view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx)),
+                18 => view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx)),
                 _ => view.update(vcx, |v, cx| {
                     v.with_session(id, cx, |c| {
                         c.turn_phase = TurnPhase::begin(std::time::Instant::now())
@@ -6308,4 +6459,197 @@ fn agent_tile_statemachine_fuzz_holds_invariants(cx: &mut TestAppContext) {
             assert_agent_invariants(&view, vcx, id, &mut prev_frozen, &label);
         }
     }
+}
+
+/// Register a `Task` tool-call as a subagent (the structured signal the harness
+/// emits) so the bottom Subagents panel has a selectable row.
+#[cfg(test)]
+fn register_subagent(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, n: u64) {
+    view.update(vcx, |v, cx| {
+        use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
+        if let Some(mut c) = v.agent_mut(cx) {
+            let tcid: ToolCallId = format!("task-{n}").into();
+            let mut tc = ToolCall::new(tcid.clone(), format!("Explore {n}"));
+            tc.kind = ToolKind::Think;
+            tc.raw_input = Some(serde_json::json!({"prompt": "do x"}));
+            let anchor = c.editor.anchor_for_line(0);
+            c.tools.register(crate::ToolCallKey::from_id(&tcid), tc, anchor);
+        }
+        cx.notify();
+    });
+    vcx.run_until_parked();
+}
+
+/// Give the focused session a Plan with `n` entries so the Tasklist column has
+/// selectable rows.
+#[cfg(test)]
+fn set_plan(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, n: usize) {
+    // `Plan` / `PlanEntry` are `#[non_exhaustive]` (no struct literal from here),
+    // so build the plan the way production gets it: deserialize the ACP JSON.
+    use yalda::acp_channel::Plan;
+    let entries: Vec<_> = (0..n)
+        .map(|i| serde_json::json!({"content": format!("step {i}"), "priority": "medium", "status": "pending"}))
+        .collect();
+    let plan: Plan = serde_json::from_value(serde_json::json!({ "entries": entries }))
+        .expect("valid plan json");
+    view.update(vcx, |v, cx| {
+        if let Some(mut c) = v.agent_mut(cx) {
+            c.current_plan = Some(plan);
+        }
+        cx.notify();
+    });
+    vcx.run_until_parked();
+}
+
+/// INV-UX-12: `h`/`l` switch the active column (Plan left / Subagents right) and
+/// `j`/`k` then move within that column; the per-column row index is preserved.
+#[gpui::test]
+fn agent_panel_hl_switches_columns(cx: &mut TestAppContext) {
+    use crate::agent::PanelColumn;
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    set_plan(&view, vcx, 2);
+    register_subagent(&view, vcx, 1);
+    register_subagent(&view, vcx, 2);
+    view.update(vcx, |v, cx| v.toggle_tasklist(cx)); // open the Plan column
+    view.update(vcx, |v, cx| v.focus_agent_panel(cx));
+    // Both columns open → entry lands on the LEFT (Plan).
+    let col = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, cx| {
+            v.read_session(id, cx, |c| (c.panel_col, c.panel_sel)).unwrap()
+        })
+    };
+    assert_eq!(col(&view, vcx), (PanelColumn::Tasklist, 0), "starts in Plan");
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("l"), w, cx));
+    assert_eq!(col(&view, vcx), (PanelColumn::Subagents, 0), "l → Subagents");
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    assert_eq!(col(&view, vcx), (PanelColumn::Subagents, 1), "j moves within Subagents");
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    assert_eq!(
+        col(&view, vcx),
+        (PanelColumn::Tasklist, 1),
+        "h → Plan, row clamped into the column"
+    );
+    // h again is a no-op (already leftmost).
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    assert_eq!(col(&view, vcx).0, PanelColumn::Tasklist, "h at the left edge is a no-op");
+}
+
+/// INV-UX-12: `Cmd-0` (here through `focus_agent_panel`) enters panel focus when
+/// the bottom region has rows, and `Esc` restores the focus captured on entry.
+#[gpui::test]
+fn agent_panel_cmd0_enters_and_esc_restores(cx: &mut TestAppContext) {
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    register_subagent(&view, vcx, 1);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| c.focus = crate::AgentFocus::Compose);
+    });
+    view.update(vcx, |v, cx| v.focus_agent_panel(cx));
+    let focus = view.read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.focus).unwrap());
+    assert_eq!(focus, crate::AgentFocus::Panel, "Cmd-0 enters panel focus");
+
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    let focus = view.read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.focus).unwrap());
+    assert_eq!(
+        focus,
+        crate::AgentFocus::Compose,
+        "Esc returns to the previous focus"
+    );
+}
+
+/// INV-UX-12: vim `j`/`k`/`g`/`G` move the panel selection, clamped to the row
+/// count.
+#[gpui::test]
+fn agent_panel_vim_moves_selection(cx: &mut TestAppContext) {
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    for n in 1..=3 {
+        register_subagent(&view, vcx, n);
+    }
+    view.update(vcx, |v, cx| v.focus_agent_panel(cx));
+    let sel = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.panel_sel).unwrap())
+    };
+    assert_eq!(sel(&view, vcx), 0, "selection starts at the top");
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    assert_eq!(sel(&view, vcx), 2, "j moves down");
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    assert_eq!(sel(&view, vcx), 2, "j clamps at the last row");
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("k"), w, cx));
+    assert_eq!(sel(&view, vcx), 1, "k moves up");
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("g"), w, cx));
+    assert_eq!(sel(&view, vcx), 0, "g jumps to the top");
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("G"), w, cx));
+    assert_eq!(sel(&view, vcx), 2, "G jumps to the bottom");
+}
+
+/// INV-UX-12: `Enter` on a subagent row focuses that subagent's output and
+/// leaves panel focus.
+#[gpui::test]
+fn agent_panel_enter_focuses_subagent(cx: &mut TestAppContext) {
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    register_subagent(&view, vcx, 1);
+    register_subagent(&view, vcx, 2);
+    view.update(vcx, |v, cx| v.focus_agent_panel(cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx));
+    let want = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| {
+            match &c.panel_column_rows(c.panel_col)[c.panel_sel] {
+                crate::agent::PanelItem::Subagent(k) => Some(k.clone()),
+                _ => None,
+            }
+        })
+        .unwrap()
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("enter"), w, cx));
+    let (focused, focus) = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| (c.focused_subagent.clone(), c.focus))
+            .unwrap()
+    });
+    assert_eq!(focused, want, "Enter focuses the selected subagent");
+    assert_ne!(
+        focus,
+        crate::AgentFocus::Panel,
+        "Enter leaves panel focus after activating"
+    );
+}
+
+/// INV-UX-12: the real `cmd-0` keymap binding (AgentView-scoped) reaches the
+/// panel-focus handler — proving it shadows the global zoom-reset in agent tiles.
+#[gpui::test]
+fn agent_panel_cmd0_binding_enters_panel(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    register_subagent(&view, vcx, 1);
+    vcx.simulate_keystrokes("cmd-0");
+    vcx.run_until_parked();
+    let focus = view.read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.focus).unwrap());
+    assert_eq!(
+        focus,
+        crate::AgentFocus::Panel,
+        "cmd-0 in an agent tile enters panel focus via the AgentView binding"
+    );
+}
+
+/// INV-UX-12: closing the last open panel while panel-focused auto-exits (you
+/// can never be panel-focused with no panel open).
+#[gpui::test]
+fn agent_panel_closing_last_panel_exits_focus(cx: &mut TestAppContext) {
+    let (view, vcx, id, _s) = boot_with_transcript(cx);
+    register_subagent(&view, vcx, 1);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| c.focus = crate::AgentFocus::Transcript);
+    });
+    view.update(vcx, |v, cx| v.focus_agent_panel(cx));
+    assert_eq!(
+        view.read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.focus).unwrap()),
+        crate::AgentFocus::Panel
+    );
+    // Subagents is the only open panel; closing it must drop panel focus back to
+    // the captured Transcript focus.
+    view.update(vcx, |v, cx| v.toggle_subagents(cx));
+    assert_eq!(
+        view.read_with(vcx, |v, cx| v.read_session(id, cx, |c| c.focus).unwrap()),
+        crate::AgentFocus::Transcript,
+        "closing the last panel exits panel focus to the captured focus"
+    );
 }

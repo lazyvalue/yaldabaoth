@@ -1740,6 +1740,31 @@ pub(crate) enum AgentFocus {
     #[default]
     Compose,
     Transcript,
+    /// The bottom panel region (Plan + Subagents) holds focus: it is enlarged
+    /// and `panel_sel` selects a row. Entered with `Cmd-0`, navigated with vim
+    /// keys, exited with `Esc` (restoring `panel_return_focus`). The compose and
+    /// transcript are inert while here. See `panel_items` / `focus_agent_panel`.
+    Panel,
+}
+
+/// One selectable row in a focused bottom-panel column. `panel_sel` indexes into
+/// the **active column's** rows ([`AgentState::panel_column_rows`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PanelItem {
+    /// The i-th entry of `current_plan` (no activation target today).
+    Plan(usize),
+    /// A subagent row; activating it focuses that subagent's output.
+    Subagent(ToolCallKey),
+}
+
+/// Which bottom-panel COLUMN holds the selection while `focus == Panel`
+/// (INV-UX-12). The two columns render side by side — Plan on the LEFT,
+/// Subagents on the RIGHT — and `h`/`l` move between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PanelColumn {
+    #[default]
+    Tasklist,
+    Subagents,
 }
 
 /// The live input surface of an agent window (Model C — `design-c.md`). There is
@@ -3028,10 +3053,20 @@ pub(crate) struct AgentState {
     /// transcript, re-enabled when they scroll back to the bottom or send
     /// a new message. Shared with the ListState scroll handler via Rc.
     pub(crate) follow_output: std::rc::Rc<std::cell::Cell<bool>>,
-    /// Whether the Tasklist sidebar is open (§24).
+    /// Whether the Tasklist (Plan) bottom panel is open (§24).
     pub(crate) tasklist_open: bool,
-    /// Whether the Subagents sidebar is open (§28).
+    /// Whether the Subagents bottom panel is open (§28).
     pub(crate) subagents_open: bool,
+    /// Which bottom-panel column holds the selection while `focus == Panel`
+    /// (`h`/`l` switch). Meaningless otherwise.
+    pub(crate) panel_col: PanelColumn,
+    /// Selected row WITHIN the active column (`panel_col`). Only meaningful while
+    /// `focus == AgentFocus::Panel`; clamped to that column's live row count on
+    /// read (content can shrink under it).
+    pub(crate) panel_sel: usize,
+    /// The focus to restore when `Esc` leaves `AgentFocus::Panel`. Captured on
+    /// entry (`focus_agent_panel`); meaningless otherwise.
+    pub(crate) panel_return_focus: AgentFocus,
     /// True when this session is managed by the session server (client/server
     /// mode). False when the GUI owns the ACP subprocess directly (legacy).
     /// Checked by the status strip and anywhere that needs to distinguish
@@ -3133,6 +3168,65 @@ impl AgentState {
             .filter_map(|id| self.tools.calls.get(id))
             .filter_map(classify_subagent)
             .collect()
+    }
+
+    /// The selectable rows of one bottom-panel COLUMN, in render order. A column
+    /// contributes rows only when its panel is open (and, for Subagents, has
+    /// any): Plan entries for `Tasklist`, subagents for `Subagents`. `panel_sel`
+    /// indexes into the active column's list.
+    pub(crate) fn panel_column_rows(&self, col: PanelColumn) -> Vec<PanelItem> {
+        match col {
+            PanelColumn::Tasklist => {
+                if self.tasklist_open {
+                    self.current_plan
+                        .as_ref()
+                        .map(|plan| (0..plan.entries.len()).map(PanelItem::Plan).collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            }
+            PanelColumn::Subagents => {
+                if self.subagents_open {
+                    self.subagents()
+                        .into_iter()
+                        .map(|sa| PanelItem::Subagent(sa.tool_call_id))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    /// The columns that are FOCUSABLE right now — open AND holding ≥1 row — in
+    /// left-to-right order (Tasklist, then Subagents). Empty ⇒ nothing to focus,
+    /// so `focus_agent_panel` is a no-op.
+    pub(crate) fn panel_open_columns(&self) -> Vec<PanelColumn> {
+        [PanelColumn::Tasklist, PanelColumn::Subagents]
+            .into_iter()
+            .filter(|&col| !self.panel_column_rows(col).is_empty())
+            .collect()
+    }
+
+    /// Re-seat panel focus after a panel open/close (INV-UX-12). If the active
+    /// column is no longer focusable, hop to another open column; if none
+    /// remain, leave panel focus (restoring the captured focus). No-op unless
+    /// `focus == Panel`.
+    pub(crate) fn reseat_panel_focus(&mut self) {
+        if self.focus != AgentFocus::Panel {
+            return;
+        }
+        let cols = self.panel_open_columns();
+        if cols.is_empty() {
+            self.focus = self.panel_return_focus;
+        } else if !cols.contains(&self.panel_col) {
+            self.panel_col = cols[0];
+            let n = self.panel_column_rows(self.panel_col).len();
+            if self.panel_sel >= n {
+                self.panel_sel = n.saturating_sub(1);
+            }
+        }
     }
 
     /// Fingerprint of the structural inputs to the `render_agent`
@@ -3269,6 +3363,9 @@ impl AgentState {
             // Subagent panes auto-appear at the tile bottom when subagents exist;
             // Cmd-2 (ToggleSubagents) collapses them.
             subagents_open: true,
+            panel_col: PanelColumn::Tasklist,
+            panel_sel: 0,
+            panel_return_focus: AgentFocus::Compose,
             server_managed: true,
             reconciler: yalda::agent_transcript::UserTurnReconciler::new(),
             user_turn_ks: std::collections::HashSet::new(),
@@ -3326,6 +3423,9 @@ impl AgentState {
             // Subagent panes auto-appear at the tile bottom when subagents exist;
             // Cmd-2 (ToggleSubagents) collapses them.
             subagents_open: true,
+            panel_col: PanelColumn::Tasklist,
+            panel_sel: 0,
+            panel_return_focus: AgentFocus::Compose,
             server_managed: true,
             reconciler: yalda::agent_transcript::UserTurnReconciler::new(),
             user_turn_ks: std::collections::HashSet::new(),

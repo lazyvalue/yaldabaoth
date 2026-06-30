@@ -2,7 +2,7 @@
 
 **Status:** LIVING — authoritative. This is the canonical contract for how UX
 elements behave across the whole app.
-**Last updated:** 2026-06-25
+**Last updated:** 2026-06-29
 
 ## What this is
 
@@ -372,6 +372,111 @@ metadata auto-shift). The render-count proxy `transcript_021_*` still passes —
 chatbox typing leaves the transcript flat (the compose fingerprint is live only for
 the inline block).
 
+### INV-UX-10 — The jump-panel agent dot is a per-session status light
+
+**Statement.** Each agent-session row in the jump panel carries a leading dot
+whose **shape** encodes binding (`●` in-use / `○` free) and whose **color** is a
+status light for the session's turn phase:
+
+- **working** (a reply is in flight) → warm accent (`theme.agent.warm_accent`),
+- **waiting for you** (the turn finished; it's the user's move) → green
+  (`theme.agent.tool_completed`),
+- **neutral** (dim) when the phase is unknown (a roster-only session running on
+  the server but never opened in this GUI, so no local `TurnPhase`) **or** the
+  agent is disconnected (which also dims the whole row).
+
+The mapping is a pure function of `(connected, awaiting)` — `AgentRow::dot_status`
+→ `AgentDotStatus::{Working, WaitingForYou, Neutral}` — so the render just picks
+the hue. Disconnected wins over any prior phase.
+
+**Applies to.** `jump_panel_view.rs`: `jump_panel_agent_rows` (reads each opened
+session's `state.turn_phase.is_awaiting()` into `AgentRow::awaiting`; roster-only
+rows stay `None`) and `render_jump_panel` (shape from `bound`, color from
+`dot_status`).
+
+**Why.** The user wants to glance at the panel and see which agents need them
+versus which are still working — without opening each tile.
+
+**Status:** `partially honored` — the **mapping** is headless-guarded; the actual
+**hue** is a paint/human-eye detail (harness gap #1). Roster-only sessions can't
+show working/waiting until the server reports turn state in `SessionInfo` (today
+`Neutral`).
+
+**Enforcement.** Headless in `verify_harness.rs`:
+`agent_status_dot_reflects_turn_phase` (idle→WaitingForYou, mid-turn→Working
+through the real `jump_panel_agent_rows`) and the pure `agent_dot_status_mapping`
+unit test (totality + disconnected-wins). The hue itself is a runtime check.
+
+### INV-UX-11 — `ctrl-<n>` jumps to the n-th workspace (the number the panel shows)
+
+**Statement.** The jump panel numbers **non-ephemeral** workspaces `1..N` (the
+`idx + 1` badge), and `ctrl-1`…`ctrl-9` / `ctrl-0` (the 10th) jump straight to
+that workspace. The displayed digit and the keystroke target always agree because
+both skip ephemeral virtual workspaces (ADR-0021) — `goto_workspace_number(n)`
+selects the n-th non-ephemeral tab. A digit past the last workspace is a no-op.
+
+**Applies to.** `main.rs`: the `GotoWorkspace1..10` actions + `ctrl-<n>`
+bindings (app-global, `None` context), `goto_workspace_number`, and the
+`WorkspaceNavExt::workspace_nav` helper wired onto every screen root (the action
+needs a handler in the focused element's ancestry — same discipline as
+`toggle_jump_panel`). `jump_panel_view.rs`: the workspace-row number badge.
+
+**Edge.** An **empty-layout** workspace renders a bare div with no action
+handlers (chrome.rs), so global keys (incl. `ctrl-<n>`, `ctrl-tab`, `cmd-t`)
+don't dispatch while sitting on one — a pre-existing, transient edge state, not
+specific to this binding.
+
+**Why.** Direct numeric workspace switching, matching the visible numbering.
+
+**Status:** `honored` (headless).
+
+**Enforcement.** `verify_harness.rs`: `ctrl_digit_switches_workspace` (full
+keymap→action→handler dispatch: `ctrl-3` then `ctrl-1`, plus past-the-end no-op)
+and `workspace_number_skips_ephemeral` (numbering skips the ephemeral tab).
+
+### INV-UX-12 — `Cmd-0` focuses the agent bottom panels; vim selects (2-D), Esc restores
+
+**Statement.** The agent bottom panels render as **two side-by-side columns** above
+the compose — **Plan / Tasklist on the LEFT, Subagents on the RIGHT** (each shown
+only when open; Subagents only when non-empty; one open fills the width). In an
+agent tile `Cmd-0` enters **panel focus**: the region enlarges and one row in one
+column is selected. Selection is **2-D** — `panel_col` (which column) + `panel_sel`
+(the row WITHIN that column). `h`/`←` and `l`/`→` switch the active column to the
+adjacent **open** column (clamping the row into it); `j`/`k`/`↑`/`↓` move the row
+within the active column (clamped); `g`/`G` jump to its ends. `Enter` activates the
+selected row (a Subagent row focuses its output and leaves panel focus; a Plan row
+has no target yet). `Esc` leaves panel focus, **restoring the focus captured on
+entry** (`panel_return_focus`). The mode is **modal** — while focused, other keys
+are inert (no leaders, no compose typing). You can never be panel-focused with no
+focusable column: entering requires a column with ≥1 row (lands on the leftmost
+such), and closing the active column **re-seats** to another open column or exits if
+none remain. In an agent tile `Cmd-0` is panel-focus, **not** zoom-reset (the
+`AgentView`-scoped binding is registered after the global `cmd-0 ZoomReset` so
+GPUI's most-recent-first match prefers it); elsewhere `Cmd-0` still resets zoom.
+
+**Applies to.** `agent.rs`: `AgentFocus::Panel`, `PanelColumn`, `PanelItem`,
+`panel_column_rows` / `panel_open_columns` / `reseat_panel_focus`, the `panel_col` /
+`panel_sel` / `panel_return_focus` state. `agent_ui.rs`: `focus_agent_panel` /
+`exit_agent_panel` / `panel_move_selection` / `panel_switch_column` /
+`panel_select_end` / `panel_activate_selection`, the modal interception at the top
+of `handle_claude_key`, and the re-seat in `toggle_tasklist` / `toggle_subagents`.
+`main.rs`: the `FocusAgentPanel` action + `cmd-0` `AgentView` binding.
+`screens.rs::render_agent`: the two-column layout + enlarge + per-column selection
+highlight + `FocusAgentPanel` `on_action`.
+
+**Why.** Keyboard-drive the bottom panels (jump to a subagent's output) without a
+mouse, with a clear enter/navigate/exit gesture that always returns you where you
+were; the column split keeps Plan and Subagents side by side.
+
+**Status:** `honored` (headless; exact enlarge px / highlight color are gap-1).
+
+**Enforcement.** `verify_harness.rs`: `agent_panel_cmd0_enters_and_esc_restores`,
+`agent_panel_vim_moves_selection`, `agent_panel_hl_switches_columns`,
+`agent_panel_enter_focuses_subagent`, `agent_panel_cmd0_binding_enters_panel` (real
+keymap dispatch proves the AgentView binding shadows zoom-reset),
+`agent_panel_closing_last_panel_exits_focus`, plus the state-machine fuzzer ops +
+oracle (`focus ∈ {Compose,Transcript,Panel}`, panel-focused ⇒ a panel is open).
+
 ## Cross-references
 
 - `spec-turn-steering.md` — the full steering design (queue, delivery modes, the
@@ -389,6 +494,23 @@ the inline block).
 
 ## Revision history
 
+- 2026-06-29 (4) — Reworked the agent bottom panels into **two side-by-side
+  columns** above the compose — Plan/Tasklist (left) + Subagents (right) — and added
+  INV-UX-12 (`Cmd-0` focuses + enlarges them; **2-D** vim selection: `h`/`l` switch
+  column, `j`/`k` move the row within it, `g`/`G` ends; `Enter` activates, `Esc`
+  restores prior focus; modal; re-seats/auto-exits when the active column closes;
+  `Cmd-0` is panel-focus, not zoom-reset, in agent tiles). Guards:
+  `agent_panel_cmd0_enters_and_esc_restores`, `agent_panel_vim_moves_selection`,
+  `agent_panel_hl_switches_columns`, `agent_panel_enter_focuses_subagent`,
+  `agent_panel_cmd0_binding_enters_panel`, `agent_panel_closing_last_panel_exits_focus`,
+  + fuzzer ops/oracle.
+- 2026-06-29 (3) — Added INV-UX-10 (jump-panel agent dot is a per-session status
+  light: working=warm accent, waiting-for-you=green, neutral=dim/disconnected;
+  mapping `AgentRow::dot_status`) and INV-UX-11 (`ctrl-<n>` jumps to the n-th
+  workspace, the number the panel shows; `goto_workspace_number` skips ephemeral
+  workspaces). Guards: `agent_status_dot_reflects_turn_phase`,
+  `agent_dot_status_mapping`, `ctrl_digit_switches_workspace`,
+  `workspace_number_skips_ephemeral`.
 - 2026-06-29 (2) — Worksheet rests in transcript NAV (not auto-Insert) after fresh
   open / `/clear` / restore: the input block is VISIBLE but the `space`/`.`/`?`
   leaders open the tile/app menus (they fire only outside text entry) — fixing "can't

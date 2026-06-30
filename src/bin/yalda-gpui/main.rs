@@ -260,6 +260,10 @@ actions!(
         ToggleTasklist,
         // Agent window: open/close the Subagents sidebar (§32). Cmd-2.
         ToggleSubagents,
+        // Agent window: focus + enlarge the bottom-panel region (Plan +
+        // Subagents) for vim-key selection (INV-UX-12). Cmd-0 in AgentView,
+        // overriding the global zoom-reset there. Esc leaves it.
+        FocusAgentPanel,
         // Agent window: interrupt the in-flight turn (ACP session/cancel).
         // Bound to Cmd-. and surfaced as a Stop button while a reply is
         // pending.
@@ -292,8 +296,48 @@ actions!(
         ClearTagView,
         TagViewChord,
         TagToggleChord,
+        // Workspace number switching (`ctrl-<n>`): jump straight to the Nth
+        // non-ephemeral workspace, the number shown in the jump panel. `0` is
+        // the 10th (mirrors the goto-workspace menu's digit convention).
+        GotoWorkspace1,
+        GotoWorkspace2,
+        GotoWorkspace3,
+        GotoWorkspace4,
+        GotoWorkspace5,
+        GotoWorkspace6,
+        GotoWorkspace7,
+        GotoWorkspace8,
+        GotoWorkspace9,
+        GotoWorkspace10,
     ]
 );
+
+/// Fluent helper to wire the ten `ctrl-<n>` workspace-jump actions onto a
+/// screen root in one call. The bindings are app-global (`None` context), but
+/// the action still needs a handler in the focused element's ancestry — so each
+/// screen root (`YaldaView`, `EditView`, `AgentView`, …) calls `.workspace_nav`
+/// the same way it wires `toggle_jump_panel`. Avoids repeating ten near-
+/// identical `on_action` lines per screen.
+pub(crate) trait WorkspaceNavExt: Sized {
+    fn workspace_nav(self, cx: &mut Context<YaldaGpuiView>) -> Self;
+}
+
+impl<E: InteractiveElement> WorkspaceNavExt for E {
+    fn workspace_nav(self, cx: &mut Context<YaldaGpuiView>) -> Self {
+        self.on_action(cx.listener(|t, _: &GotoWorkspace1, _w, cx| t.goto_workspace_number(1, cx)))
+            .on_action(cx.listener(|t, _: &GotoWorkspace2, _w, cx| t.goto_workspace_number(2, cx)))
+            .on_action(cx.listener(|t, _: &GotoWorkspace3, _w, cx| t.goto_workspace_number(3, cx)))
+            .on_action(cx.listener(|t, _: &GotoWorkspace4, _w, cx| t.goto_workspace_number(4, cx)))
+            .on_action(cx.listener(|t, _: &GotoWorkspace5, _w, cx| t.goto_workspace_number(5, cx)))
+            .on_action(cx.listener(|t, _: &GotoWorkspace6, _w, cx| t.goto_workspace_number(6, cx)))
+            .on_action(cx.listener(|t, _: &GotoWorkspace7, _w, cx| t.goto_workspace_number(7, cx)))
+            .on_action(cx.listener(|t, _: &GotoWorkspace8, _w, cx| t.goto_workspace_number(8, cx)))
+            .on_action(cx.listener(|t, _: &GotoWorkspace9, _w, cx| t.goto_workspace_number(9, cx)))
+            .on_action(
+                cx.listener(|t, _: &GotoWorkspace10, _w, cx| t.goto_workspace_number(10, cx)),
+            )
+    }
+}
 
 // ----------------------------------------------------------------------------
 // gpui::Keystroke → yalda::keys::KeyPress bridge
@@ -3299,6 +3343,27 @@ impl YaldaGpuiView {
         self.workspace.set_active_tab(idx);
         self.save_workspace_state();
         cx.notify();
+    }
+
+    /// Jump to the `n`-th (1-based) workspace as numbered in the jump panel /
+    /// goto-workspace menu — i.e. the `n`-th non-ephemeral tab. `ctrl-<n>`
+    /// entry point. No-ops if there is no such workspace (e.g. `ctrl-7` with
+    /// four tabs). Ephemeral virtual workspaces (ADR-0021) are skipped so the
+    /// numbering matches what the panel shows.
+    fn goto_workspace_number(&mut self, n: usize, cx: &mut Context<Self>) {
+        if n == 0 {
+            return;
+        }
+        if let Some((idx, _)) = self
+            .workspace
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.ephemeral)
+            .nth(n - 1)
+        {
+            self.select_tab(idx, cx);
+        }
     }
 
     fn prev_tab(&mut self, _: &PrevTab, _w: &mut Window, cx: &mut Context<Self>) {
@@ -7011,6 +7076,19 @@ fn register_keymap(app: &mut GpuiApp) {
         // users without Cmd).
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+        // Direct workspace jump by number (the digit shown in the jump panel).
+        // App-global (`None`) like the tab-switching binds above; `ctrl-0` is
+        // the 10th workspace.
+        KeyBinding::new("ctrl-1", GotoWorkspace1, None),
+        KeyBinding::new("ctrl-2", GotoWorkspace2, None),
+        KeyBinding::new("ctrl-3", GotoWorkspace3, None),
+        KeyBinding::new("ctrl-4", GotoWorkspace4, None),
+        KeyBinding::new("ctrl-5", GotoWorkspace5, None),
+        KeyBinding::new("ctrl-6", GotoWorkspace6, None),
+        KeyBinding::new("ctrl-7", GotoWorkspace7, None),
+        KeyBinding::new("ctrl-8", GotoWorkspace8, None),
+        KeyBinding::new("ctrl-9", GotoWorkspace9, None),
+        KeyBinding::new("ctrl-0", GotoWorkspace10, None),
         KeyBinding::new("cmd-t", NewTab, None),
         KeyBinding::new("cmd-shift-w", CloseTab, None),
         KeyBinding::new("cmd-shift-t", ToggleTheme, None),
@@ -7062,6 +7140,12 @@ fn register_keymap(app: &mut GpuiApp) {
         KeyBinding::new("cmd-+", ZoomIn, None),
         KeyBinding::new("cmd--", ZoomOut, None),
         KeyBinding::new("cmd-0", ZoomReset, None),
+        // Cmd-0 in an agent tile focuses+enlarges the bottom panels (INV-UX-12)
+        // instead of resetting zoom. Registered AFTER the global zoom-reset so
+        // GPUI's match (most-recent-first) prefers this `AgentView`-scoped
+        // binding when focused in an agent tile; elsewhere Cmd-0 still resets
+        // document zoom.
+        KeyBinding::new("cmd-0", FocusAgentPanel, Some("AgentView")),
         // Copy the view-mode mouse selection. Scoped to YaldaView so it
         // doesn't shadow edit-mode yank or other surfaces' copy paths.
         KeyBinding::new("cmd-c", CopyDocSelection, Some("YaldaView")),
