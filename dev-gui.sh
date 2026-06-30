@@ -9,8 +9,8 @@
 # owner-reclaim path, so your agents — mid-turn context, transcripts, the lot —
 # survive the bounce. This is the fast loop for GUI-only changes.
 #
-# If you changed the SERVER itself, use ./dev-all.sh instead (it rebuilds and
-# restarts both, dropping live sessions).
+# If you changed the SERVER itself, use ./dev-server.sh instead (it rebuilds and
+# bounces the daemon under this live GUI; run both to refresh everything).
 #
 # PROFILE: RELEASE by default — a debug GPUI build stutters on fast text input.
 # Use `DEBUG=1 ./dev-gui.sh` for the fast-compile loop (expect input lag).

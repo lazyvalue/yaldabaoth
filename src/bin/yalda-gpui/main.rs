@@ -2602,7 +2602,7 @@ impl YaldaGpuiView {
     /// verified only — the actual rebuild/relaunch/re-attach must be checked by
     /// a human.
     /// `dev-restart-gui` — rebuild + relaunch just the GUI, mirroring
-    /// `./dev-gui.sh` (the GUI slice of `./dev-all.sh`): build RELEASE (a debug
+    /// `./dev-gui.sh`: build RELEASE (a debug
     /// GPUI build stutters on text input), leave the running session server
     /// untouched, and relaunch the freshly-built release binary. The new GUI
     /// reconnects to the existing server and re-attaches its sessions, so live
@@ -2612,7 +2612,8 @@ impl YaldaGpuiView {
     }
 
     /// `dev-restart-all` — rebuild + restart BOTH the GUI and the session
-    /// server, mirroring `./dev-all.sh`: build RELEASE for both bins, kill the
+    /// server, mirroring `./dev-server.sh` + `./dev-gui.sh`: build RELEASE for
+    /// both bins, kill the
     /// running server + clear its stale socket/pid so the relaunched GUI spawns
     /// the freshly-built server, then relaunch. Live sessions reconnect from the
     /// WAL on the new server's startup (ADR-0009/-0018); only an in-flight,
@@ -2638,7 +2639,7 @@ impl YaldaGpuiView {
         cx.spawn(async move |this, cx| {
             // Run the (slow, blocking) build on a background thread, then — for
             // the "all" path — tear the old server down so the relaunched GUI
-            // brings up the newly-built one (mirrors `dev-all.sh`).
+            // brings up the newly-built one (mirrors `dev-server.sh`).
             let built = cx
                 .background_executor()
                 .spawn(async move {
