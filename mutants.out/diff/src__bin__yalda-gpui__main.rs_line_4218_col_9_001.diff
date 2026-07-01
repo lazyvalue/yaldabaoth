@@ -1,0 +1,63 @@
+--- src/bin/yalda-gpui/main.rs
++++ replace YaldaGpuiView::focused_in_insert_mode -> bool with false
+@@ -4210,59 +4210,17 @@
+ 
+     /// Does the focused tile currently want raw text input? This is a property
+     /// of the App/tile (untitled.md "tiles flag whether they are in an insert
+     /// mode"): leaders are intercepted as menu-openers ONLY when this is false,
+     /// so a tile in a navigation/selection state always reaches the menus while
+     /// one in text entry keeps those characters. The session / project pickers
+     /// are navigation, never text entry.
+     fn focused_in_insert_mode(&self, cx: &GpuiApp) -> bool {
+-        match self.workspace.focused_content() {
+-            Some(App::Buffer(BufferApp::Editing(e))) => e.mode == EditMode::Insert,
+-            Some(App::Buffer(BufferApp::Picking(b))) => {
+-                b.fb.filter_mode || b.fb.rename.is_some()
+-            }
+-            Some(App::Agent(tile)) => {
+-                if tile.bound.is_none() {
+-                    false // unbound = session picker = navigation
+-                } else {
+-                    // Model C: a bound agent tile is "in text entry" iff focus is
+-                    // on the COMPOSE buffer AND it's in Insert — in BOTH placements.
+-                    // Transcript focus is read-only navigation, so leaders must
+-                    // work there. The transcript editor's own `mode` is irrelevant
+-                    // (it's read-only). The old worksheet arm read that transcript
+-                    // `mode` — which defaults to Insert — so leaders were wrongly
+-                    // suppressed in worksheet and `<space>` fell into the compose's
+-                    // normal dispatch, opening the workspace menu instead of the
+-                    // tile menu.
+-                    self.agent_read(cx, |c| {
+-                        // Focused compose in Insert is text entry. ALSO: mid-turn in
+-                        // the worksheet, input routes to the bottom chatbox even
+-                        // though focus stays on the transcript — so that is text
+-                        // entry too, and the leaders (space/./?) must NOT fire (else a
+-                        // space mid-turn opens a menu — INV-UX-9 rule 7).
+-                        let compose_insert = c.focus == AgentFocus::Compose
+-                            && c.input_surface.compose().mode == EditMode::Insert;
+-                        let midturn_worksheet =
+-                            c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();
+-                        compose_insert || midturn_worksheet
+-                    })
+-                    .unwrap_or(false)
+-                }
+-            }
+-            Some(App::Linear(tile)) => {
+-                let picker = tile
+-                    .view
+-                    .as_ref()
+-                    .map(|v| v.read(cx).is_picker())
+-                    .unwrap_or(false);
+-                !picker && tile.mode == LinearMode::Insert
+-            }
+-            Some(App::Buffer(BufferApp::Viewing(_))) | None => false,
+-        }
++        false /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// Universal leader dispatch: when the focused tile is NOT in text entry, the
+     /// bare leader keys open their menus with TOP priority, before any
+     /// tile-specific key handling. Returns true if it consumed the key (the
+     /// caller then returns early). Every tile's `on_key_down` calls this first,
+     /// so the menus are reachable from any tile that isn't capturing text —
+     /// including the agent session picker and the Linear project picker.

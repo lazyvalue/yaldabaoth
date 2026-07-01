@@ -4235,15 +4235,22 @@ impl YaldaGpuiView {
                     // tile menu.
                     self.agent_read(cx, |c| {
                         // Focused compose in Insert is text entry. ALSO: mid-turn in
-                        // the worksheet, input routes to the bottom chatbox even
-                        // though focus stays on the transcript — so that is text
-                        // entry too, and the leaders (space/./?) must NOT fire (else a
-                        // space mid-turn opens a menu — INV-UX-9 rule 7).
+                        // the worksheet, input routes to the bottom chatbox even though
+                        // focus stays on the transcript — but ONLY once the user has
+                        // started a steer. Rule 7 (revised — runtime report: "the
+                        // <space>/. leader menus don't work mid-turn"): with an EMPTY
+                        // steering draft the worksheet is resting in nav, so the leaders
+                        // MUST fire (open the menu); once the draft is non-empty the
+                        // keystrokes belong to the chatbox so spaces stay spaces and the
+                        // leaders are suppressed. Pinned by
+                        // `real_midturn_worksheet_empty_draft_space_opens_menu` /
+                        // `real_midturn_worksheet_typed_draft_space_is_suppressed`.
                         let compose_insert = c.focus == AgentFocus::Compose
                             && c.input_surface.compose().mode == EditMode::Insert;
-                        let midturn_worksheet =
-                            c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();
-                        compose_insert || midturn_worksheet
+                        let midturn_steer = c.turn_phase.is_awaiting()
+                            && !c.input_surface.is_chatbox()
+                            && !c.input_surface.compose().text().trim().is_empty();
+                        compose_insert || midturn_steer
                     })
                     .unwrap_or(false)
                 }
