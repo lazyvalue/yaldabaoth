@@ -5276,6 +5276,71 @@ fn focused_in_insert_mode_agent_tile_gate(cx: &mut TestAppContext) {
     });
 }
 
+/// `focused_in_insert_mode` for the raw EDIT view (`App::Buffer::Editing`): Insert IS
+/// text entry (leaders suppressed); Normal is navigation (leaders fire). Kills the
+/// `e.mode == Insert` mutant surviving in this arm.
+#[gpui::test]
+fn focused_in_insert_mode_edit_view_arm(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| v.test_open_edit("hello\nworld\n"));
+    let set_mode_read = |view: &gpui::Entity<YaldaGpuiView>,
+                         vcx: &mut gpui::VisualTestContext,
+                         m: crate::EditMode|
+     -> bool {
+        view.update(vcx, |v, cx| {
+            if let Some(crate::App::Buffer(crate::BufferApp::Editing(e))) =
+                v.workspace.focused_content_mut()
+            {
+                e.mode = m;
+            }
+            v.focused_in_insert_mode(cx)
+        })
+    };
+    assert!(
+        !set_mode_read(&view, vcx, crate::EditMode::Normal),
+        "edit view in Normal is navigation (leaders fire)"
+    );
+    assert!(
+        set_mode_read(&view, vcx, crate::EditMode::Insert),
+        "edit view in Insert IS text entry (leaders suppressed)"
+    );
+}
+
+/// `focused_in_insert_mode` for the file BROWSER (`App::Buffer::Picking`): filter mode
+/// IS text entry (leaders suppressed); idle is navigation. Kills the `filter_mode ||
+/// rename.is_some()` mutant surviving in this arm (filter-only ≠ AND of both).
+#[gpui::test]
+fn focused_in_insert_mode_browser_arm(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let set_filter_read =
+        |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, filter: bool| -> bool {
+            view.update(vcx, |v, cx| {
+                if let Some(b) = v.browser_mut() {
+                    b.fb.filter_mode = filter;
+                    b.fb.rename = None;
+                }
+                v.focused_in_insert_mode(cx)
+            })
+        };
+    assert!(
+        !set_filter_read(&view, vcx, false),
+        "idle browser is navigation (leaders fire)"
+    );
+    assert!(
+        set_filter_read(&view, vcx, true),
+        "browser filter mode IS text entry (leaders suppressed) — filter alone, no rename"
+    );
+}
+
 /// INV-UX-9 rules 1–3: in the worksheet, navigation is free (no compose chrome);
 /// an Insert-entry key (`i`) opens a You-block (compose focus + Insert); leaving
 /// Insert with NO non-whitespace text DISCARDS it — the transcript is

@@ -12,4 +12,4 @@
 .superpowers/
 
 # cargo-mutants scratch output
-mutants.out/
+mutants.out*/
