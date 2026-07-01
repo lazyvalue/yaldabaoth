@@ -1,0 +1,21 @@
+--- src/bin/yalda-gpui/main.rs
++++ replace == with != in YaldaGpuiView::focused_in_insert_mode
+@@ -4277,17 +4277,17 @@
+     /// Does the focused tile currently want raw text input? This is a property
+     /// of the App/tile (untitled.md "tiles flag whether they are in an insert
+     /// mode"): leaders are intercepted as menu-openers ONLY when this is false,
+     /// so a tile in a navigation/selection state always reaches the menus while
+     /// one in text entry keeps those characters. The session / project pickers
+     /// are navigation, never text entry.
+     fn focused_in_insert_mode(&self, cx: &GpuiApp) -> bool {
+         match self.workspace.focused_content() {
+-            Some(App::Buffer(BufferApp::Editing(e))) => e.mode == EditMode::Insert,
++            Some(App::Buffer(BufferApp::Editing(e))) => e.mode != /* ~ changed by cargo-mutants ~ */ EditMode::Insert,
+             Some(App::Buffer(BufferApp::Picking(b))) => {
+                 b.fb.filter_mode || b.fb.rename.is_some()
+             }
+             Some(App::Agent(tile)) => {
+                 if tile.bound.is_none() {
+                     false // unbound = session picker = navigation
+                 } else {
+                     // Model C: a bound agent tile is "in text entry" iff focus is

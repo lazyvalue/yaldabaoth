@@ -2986,6 +2986,36 @@ fn clear_then_empty_channel_open_keeps_worksheet_typeable() {
     );
 }
 
+/// EXHAUSTIVE truth table for `inline_you_block_active` — the gate that decides
+/// whether a worksheet keystroke busts the transcript cache (repaints). Mutation
+/// testing found all three of its boolean operands untested (`-> true`, both
+/// `&&`→`||`); this pins each. The predicate is `you_block_open && !awaiting &&
+/// !chatbox` — every clause must be load-bearing.
+#[test]
+fn inline_you_block_active_truth_table() {
+    let base = || {
+        let mut st = AgentState::new_server_managed(None);
+        st.input_surface = InputSurface::new(InputModeKind::Worksheet);
+        st.you_block_open = true;
+        st // open + idle + worksheet
+    };
+    assert!(base().inline_you_block_active(), "open + idle + worksheet ⇒ active");
+
+    // Each clause flipped in isolation must turn it OFF (kills `-> true` and both
+    // `&&`→`||`: with these states an OR would wrongly report active).
+    let mut closed = base();
+    closed.you_block_open = false;
+    assert!(!closed.inline_you_block_active(), "block closed ⇒ inactive");
+
+    let mut awaiting = base();
+    awaiting.turn_phase = TurnPhase::begin(std::time::Instant::now());
+    assert!(!awaiting.inline_you_block_active(), "mid-turn (awaiting) ⇒ inactive");
+
+    let mut chatbox = base();
+    chatbox.input_surface = InputSurface::new(InputModeKind::Chatbox);
+    assert!(!chatbox.inline_you_block_active(), "chatbox placement ⇒ inactive");
+}
+
 /// INV (§4.5): the follow-tail policy is `follow_output` in BOTH placements —
 /// the cursor lives in the compose, never the (read-only) transcript, so the
 /// old `Worksheet => cursor_at_eof` arm is gone.

@@ -1,0 +1,21 @@
+--- src/bin/yalda-gpui/main.rs
++++ delete field window_bounds from struct WindowOptions expression in main
+@@ -7276,17 +7276,17 @@
+             }
+         })
+         .detach();
+ 
+         let bounds = Bounds::new(point(px(120.0), px(80.0)), size(px(900.0), px(700.0)));
+         let window_handle = app
+             .open_window(
+                 WindowOptions {
+-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
++                     /* ~ changed by cargo-mutants ~ */
+                     // Titled window so the standard system title bar (with
+                     // close/minimize/maximize buttons AND the resize affordance
+                     // that comes with it) is rendered. Previously `None` →
+                     // chromeless window that couldn't be resized.
+                     titlebar: Some(TitlebarOptions {
+                         title: Some("Yaldabaoth".into()),
+                         ..Default::default()
+                     }),

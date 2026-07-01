@@ -1,0 +1,25 @@
+--- src/bin/yalda-gpui/main.rs
++++ delete match arm Key::Char('\'') in YaldaGpuiView::try_start_mark_chord
+@@ -3612,21 +3612,17 @@
+             return false;
+         }
+         match key {
+             Key::Char('m') => {
+                 self.pending_mark_chord = Some('m');
+                 cx.notify();
+                 true
+             }
+-            Key::Char('\'') => {
+-                self.pending_mark_chord = Some('\'');
+-                cx.notify();
+-                true
+-            }
++             /* ~ changed by cargo-mutants ~ */
+             _ => false,
+         }
+     }
+ 
+     /// `on_key_down` handler for the Doc view — intercepts bare `m`/`'` to
+     /// start a mark chord.
+     fn handle_doc_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+         let press = keystroke_to_keypress(&ev.keystroke);

@@ -23,3 +23,12 @@ examine_globs = [
     "src/bin/yalda-gpui/agent_ui.rs",
     "src/bin/yalda-gpui/main.rs",
 ]
+
+# `fn main()`'s window-launch cosmetics (window size / titlebar / title fields) are
+# GUI chrome set once at startup — not behavioral logic, and not headlessly testable
+# (verification gap #1, pixels). Excluding them keeps a full run at zero survivors
+# so a real gap stands out; they are NOT input-routing predicates.
+exclude_re = [
+    "delete field .* from struct WindowOptions",
+    "delete field .* from struct TitlebarOptions",
+]

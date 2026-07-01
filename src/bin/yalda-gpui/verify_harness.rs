@@ -5225,6 +5225,57 @@ fn real_midturn_worksheet_typed_draft_space_is_suppressed(cx: &mut TestAppContex
     });
 }
 
+/// The bare mark chord fires for BOTH `m` AND `'` in idle transcript nav. Mutation
+/// testing found the `'` arm of `try_start_mark_chord` untested (only `m` was
+/// covered); this pins it (deleting the arm ⇒ `pending_mark_chord` stays None ⇒
+/// this fails).
+#[gpui::test]
+fn mark_chord_fires_for_m_and_apostrophe_in_idle_nav(cx: &mut TestAppContext) {
+    for (key, expect) in [("m", 'm'), ("'", '\'')] {
+        let (view, vcx) = boot_worksheet_nav(cx);
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(key), w, cx));
+        vcx.run_until_parked();
+        view.update(vcx, |v, _| {
+            assert_eq!(
+                v.pending_mark_chord,
+                Some(expect),
+                "idle transcript nav: bare `{key}` starts a mark chord"
+            );
+        });
+    }
+}
+
+/// `focused_in_insert_mode` truth table for the agent tile — the gate that decides
+/// whether the `<space>`/`.`/`?` leaders fire. Mutation testing found its `==`
+/// (focus is Compose) and `||` (compose-insert OR mid-turn-steer) untested. Pin
+/// both: a focused compose in Insert IS text entry (leaders suppressed) regardless
+/// of turn phase; idle transcript nav is NOT (leaders fire).
+#[gpui::test]
+fn focused_in_insert_mode_agent_tile_gate(cx: &mut TestAppContext) {
+    // Idle transcript nav ⇒ NOT text entry (leaders must fire).
+    let (view, vcx) = boot_worksheet_nav(cx);
+    view.update(vcx, |v, cx| {
+        assert!(
+            !v.focused_in_insert_mode(cx),
+            "idle worksheet nav (focus=Transcript) is navigation, not text entry"
+        );
+    });
+    // Focus the compose in Insert (idle) ⇒ IS text entry (leaders suppressed). This
+    // is the `compose_insert` clause alone — `midturn_steer` is false (idle) — so it
+    // kills both the `==` and the `||` mutants.
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| {
+            c.focus = crate::AgentFocus::Compose;
+            c.input_surface.compose_mut().mode = crate::EditMode::Insert;
+        });
+        assert!(
+            v.focused_in_insert_mode(cx),
+            "focus=Compose + Insert (idle) ⇒ text entry ⇒ leaders suppressed"
+        );
+    });
+}
+
 /// INV-UX-9 rules 1–3: in the worksheet, navigation is free (no compose chrome);
 /// an Insert-entry key (`i`) opens a You-block (compose focus + Insert); leaving
 /// Insert with NO non-whitespace text DISCARDS it — the transcript is
@@ -5868,35 +5919,72 @@ fn worksheet_midturn_typing_routes_to_chatbox(cx: &mut TestAppContext) {
     });
 }
 
-/// REGRESSION (bug-hunt-2 B2): a tall inline reply is windowed so the caret's line
-/// is always within the rendered window (≤ YB_WIN lines) — it can't grow past the
-/// viewport and strand the caret below the fold. Drives the real open + typing, then
-/// checks the windowing math the render uses keeps the caret line visible.
+/// INTENT (co-authoring a document): a tall inline You-block GROWS to render every
+/// line (no internal window/scroll) AND the caret stays painted inside the transcript
+/// viewport — INV-UX-1 upheld by the transcript scroll following the caret, not by
+/// truncating the block. PAINTED proof (layout probe), not window math: type a block
+/// far taller than the viewport, then assert the caret's painted row lies inside the
+/// painted transcript viewport. (Replaces the old test that merely re-checked the
+/// `YB_WIN=10` window it asserted — the "You div scrolls after a while" bug.)
 #[gpui::test]
-fn worksheet_tall_inline_block_keeps_caret_in_window(cx: &mut TestAppContext) {
+fn worksheet_tall_you_block_grows_caret_painted_in_viewport(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
     view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
     vcx.run_until_parked();
-    // Type many lines so the block far exceeds a viewport.
-    for _ in 0..30 {
+    // Co-author a LONG note — enough lines to far exceed any test viewport, so the
+    // reveal is genuinely forced to scroll (a shorter block that just fits would make
+    // the assertion vacuous). Caret ends at the tail.
+    for _ in 0..90 {
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("x"), w, cx));
         view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("enter"), w, cx));
     }
     vcx.run_until_parked();
-    view.update(vcx, |v, cx| {
-        let c = v.agent_mut(cx).expect("agent");
-        assert!(c.inline_you_block_active(), "block still open");
-        let cl = c.input_surface.compose().editor.cursor().line;
-        let n = c.input_surface.compose().editor.document().line_count().max(1);
-        assert!(n > 10, "draft is genuinely taller than the window ({n} lines)");
-        // The render windows YB_WIN=10 lines around the caret via the same helper.
-        let win_top = crate::compose_first_visible_line(cl, 0, n, 10);
-        assert!(
-            cl >= win_top && cl < win_top + 10,
-            "the caret line {cl} must lie within the rendered window [{win_top}, {}) (B2)",
-            win_top + 10
-        );
-    });
+    let n = view
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.input_surface.compose().editor.document().line_count())
+        })
+        .unwrap();
+    assert!(n > 80, "block genuinely long ({n} lines)");
+    // Settle: the You-block lives in the CACHED transcript, so force it to re-render +
+    // re-reveal by mutating the session (agent_mut notifies) and re-latching the caret
+    // reveal — a bare root notify would skip the cached child. Lazy item measurement
+    // means the reveal scroll lands only after several frames.
+    let bust_and_reveal = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            if let Some(mut c) = v.agent_mut(cx) {
+                c.pending_reveal_cursor = true;
+            }
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    };
+    for _ in 0..5 {
+        bust_and_reveal(&view, vcx);
+    }
+    crate::layout_probe_begin();
+    bust_and_reveal(&view, vcx);
+    let caret = crate::layout_probe_get("compose-cursor-row");
+    let viewport = crate::layout_probe_get("transcript-viewport");
+    let block = crate::layout_probe_get("you-block");
+    crate::layout_probe_end();
+
+    let (_, vy, _, vh) = viewport.expect("transcript viewport did not paint");
+    let (_, _, _, bh) = block.expect("you-block did not paint");
+    // NON-VACUOUS: the block must actually be taller than the viewport, else "caret
+    // visible" proves nothing (the block simply fit). This is the growth intent.
+    assert!(
+        bh > vh,
+        "block height {bh} must exceed viewport {vh} (else the test is vacuous)"
+    );
+    let (_, cy, _, ch) =
+        caret.expect("caret row was NOT painted — the caret is below the fold (INV-UX-1)");
+    assert!(
+        cy >= vy - 0.5 && cy + ch <= vy + vh + 0.5,
+        "INV-UX-1: caret row [{cy}, {}] must lie inside the transcript viewport [{vy}, {}] \
+         (block {bh}px tall grew past the {vh}px viewport, yet the caret stays visible)",
+        cy + ch,
+        vy + vh
+    );
 }
 
 /// REGRESSION (runtime report: "on first open I don't see anything"): a FRESH

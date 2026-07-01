@@ -1,0 +1,21 @@
+--- src/bin/yalda-gpui/main.rs
++++ replace || with && in YaldaGpuiView::focused_in_insert_mode
+@@ -4279,17 +4279,17 @@
+     /// mode"): leaders are intercepted as menu-openers ONLY when this is false,
+     /// so a tile in a navigation/selection state always reaches the menus while
+     /// one in text entry keeps those characters. The session / project pickers
+     /// are navigation, never text entry.
+     fn focused_in_insert_mode(&self, cx: &GpuiApp) -> bool {
+         match self.workspace.focused_content() {
+             Some(App::Buffer(BufferApp::Editing(e))) => e.mode == EditMode::Insert,
+             Some(App::Buffer(BufferApp::Picking(b))) => {
+-                b.fb.filter_mode || b.fb.rename.is_some()
++                b.fb.filter_mode && /* ~ changed by cargo-mutants ~ */ b.fb.rename.is_some()
+             }
+             Some(App::Agent(tile)) => {
+                 if tile.bound.is_none() {
+                     false // unbound = session picker = navigation
+                 } else {
+                     // Model C: a bound agent tile is "in text entry" iff focus is
+                     // on the COMPOSE buffer AND it's in Insert — in BOTH placements.
+                     // Transcript focus is read-only navigation, so leaders must

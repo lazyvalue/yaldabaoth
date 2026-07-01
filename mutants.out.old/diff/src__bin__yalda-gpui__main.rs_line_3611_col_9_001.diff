@@ -1,0 +1,36 @@
+--- src/bin/yalda-gpui/main.rs
++++ replace YaldaGpuiView::try_start_mark_chord -> bool with false
+@@ -3603,32 +3603,17 @@
+     /// Check if a bare key press starts a mark chord (`m` or `'`).
+     /// Returns true if the key was consumed.
+     fn try_start_mark_chord(
+         &mut self,
+         key: &Key,
+         modifiers: &KMods,
+         cx: &mut Context<Self>,
+     ) -> bool {
+-        if !modifiers.is_empty() {
+-            return false;
+-        }
+-        match key {
+-            Key::Char('m') => {
+-                self.pending_mark_chord = Some('m');
+-                cx.notify();
+-                true
+-            }
+-            Key::Char('\'') => {
+-                self.pending_mark_chord = Some('\'');
+-                cx.notify();
+-                true
+-            }
+-            _ => false,
+-        }
++        false /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// `on_key_down` handler for the Doc view — intercepts bare `m`/`'` to
+     /// start a mark chord.
+     fn handle_doc_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+         let press = keystroke_to_keypress(&ev.keystroke);
+ 
+         // Universal leaders: the doc view is never text entry, so `<space>`/`.`/

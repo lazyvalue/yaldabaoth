@@ -314,6 +314,17 @@ per `spec-worksheet.md` (AUTHORITATIVE). Concretely:
    (the previous parks in place, text kept); one is active, the rest render inline
    read-only; Submit sends them all combined + freezes each in place. A fresh
    (empty) session opens one tail block so there's always a visible input.
+   - **The You-block is a DOCUMENT, not a text box (intent, 2026-07-01).** It renders
+     EVERY line and GROWS with its content — it must never become a fixed-height
+     region that scrolls its own text out of view (you are co-authoring a doc, not
+     typing in a little box). Keeping the caret visible is the TRANSCRIPT scroll's
+     job: the reveal scrolls to the caret's visual ROW *within* the block (parked ~2
+     rows above the viewport bottom, so earlier lines flow up the page), never by
+     truncating the block. This upholds INV-UX-1 for a block of any height. (Was
+     windowed to 10 logical lines — the "You div scrolls after a while" bug.) Pinned
+     by the PAINTED guard `worksheet_tall_you_block_grows_caret_painted_in_viewport`
+     (a block taller than the viewport, caret proven inside it) in
+     `transcript_view.rs` (render: all lines) + the reveal in `TranscriptView`.
 7. **Mid-turn → chatbox.** While the agent is mid-turn the transcript is read-only
    and a chatbox appears **pinned at the bottom**; input goes there (steers/queues,
    INV-UX-7). The chatbox is **not visible when the agent is idle**.

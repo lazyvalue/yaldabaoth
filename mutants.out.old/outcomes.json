@@ -1,0 +1,2375 @@
+{
+  "outcomes": [
+    {
+      "scenario": "Baseline",
+      "summary": "Success",
+      "log_path": "log/baseline.log",
+      "diff_path": null,
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 127.927543708,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.285772541,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:3611:9: replace YaldaGpuiView::try_start_mark_chord -> bool with true",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::try_start_mark_chord",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 3603,
+                "column": 5
+              },
+              "end": {
+                "line": 3627,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3611,
+              "column": 9
+            },
+            "end": {
+              "line": 3626,
+              "column": 10
+            }
+          },
+          "replacement": "true",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_3611_col_9.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_3611_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.01887975,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.818247542,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:3611:9: replace YaldaGpuiView::try_start_mark_chord -> bool with false",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::try_start_mark_chord",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 3603,
+                "column": 5
+              },
+              "end": {
+                "line": 3627,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3611,
+              "column": 9
+            },
+            "end": {
+              "line": 3626,
+              "column": 10
+            }
+          },
+          "replacement": "false",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_3611_col_9_001.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_3611_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.258316833,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.9198447079999998,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:3611:12: delete ! in YaldaGpuiView::try_start_mark_chord",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::try_start_mark_chord",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 3603,
+                "column": 5
+              },
+              "end": {
+                "line": 3627,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3611,
+              "column": 12
+            },
+            "end": {
+              "line": 3611,
+              "column": 13
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_3611_col_12.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_3611_col_12.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.20607075,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.8301272499999999,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:3615:13: delete match arm Key::Char('m') in YaldaGpuiView::try_start_mark_chord",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::try_start_mark_chord",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 3603,
+                "column": 5
+              },
+              "end": {
+                "line": 3627,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3615,
+              "column": 13
+            },
+            "end": {
+              "line": 3619,
+              "column": 14
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_3615_col_13.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_3615_col_13.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.139736292,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.882139708,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:3620:13: delete match arm Key::Char('\\'') in YaldaGpuiView::try_start_mark_chord",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::try_start_mark_chord",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 3603,
+                "column": 5
+              },
+              "end": {
+                "line": 3627,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3620,
+              "column": 13
+            },
+            "end": {
+              "line": 3624,
+              "column": 14
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_3620_col_13.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_3620_col_13.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.152716042,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.881938625,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4284:9: replace YaldaGpuiView::focused_in_insert_mode -> bool with true",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4284,
+              "column": 9
+            },
+            "end": {
+              "line": 4333,
+              "column": 10
+            }
+          },
+          "replacement": "true",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4284_col_9.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4284_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.328437958,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.8867832500000001,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4284:9: replace YaldaGpuiView::focused_in_insert_mode -> bool with false",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4284,
+              "column": 9
+            },
+            "end": {
+              "line": 4333,
+              "column": 10
+            }
+          },
+          "replacement": "false",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4284_col_9_001.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4284_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.260042792,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.883091292,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4285:64: replace == with != in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4285,
+              "column": 64
+            },
+            "end": {
+              "line": 4285,
+              "column": 66
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4285_col_64.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4285_col_64.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.399711708,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.869883875,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4287:34: replace || with && in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4287,
+              "column": 34
+            },
+            "end": {
+              "line": 4287,
+              "column": 36
+            }
+          },
+          "replacement": "&&",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4287_col_34.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4287_col_34.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.236209375,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.924425042,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4315:29: replace && with || in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4315,
+              "column": 29
+            },
+            "end": {
+              "line": 4315,
+              "column": 31
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4315_col_29.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4315_col_29.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.3667965,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.936679458,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4314:54: replace == with != in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4314,
+              "column": 54
+            },
+            "end": {
+              "line": 4314,
+              "column": 56
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4314_col_54.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4314_col_54.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.2183755,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.973228791,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4315:63: replace == with != in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4315,
+              "column": 63
+            },
+            "end": {
+              "line": 4315,
+              "column": 65
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4315_col_63.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4315_col_63.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.264217375,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.9153284579999998,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4318:29: replace && with || in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4318,
+              "column": 29
+            },
+            "end": {
+              "line": 4318,
+              "column": 31
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4318_col_29.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4318_col_29.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.423900833,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.9220575,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4317:29: replace && with || in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4317,
+              "column": 29
+            },
+            "end": {
+              "line": 4317,
+              "column": 31
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4317_col_29.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4317_col_29.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.355266542,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.980165542,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4317:32: delete ! in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4317,
+              "column": 32
+            },
+            "end": {
+              "line": 4317,
+              "column": 33
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4317_col_32.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4317_col_32.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.629887541,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.920052708,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4318:32: delete ! in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4318,
+              "column": 32
+            },
+            "end": {
+              "line": 4318,
+              "column": 33
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4318_col_32.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4318_col_32.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.281684166,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.930549,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4319:40: replace || with && in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4319,
+              "column": 40
+            },
+            "end": {
+              "line": 4319,
+              "column": 42
+            }
+          },
+          "replacement": "&&",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4319_col_40.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4319_col_40.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.550651667,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.920140167,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4330:25: replace && with || in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4330,
+              "column": 25
+            },
+            "end": {
+              "line": 4330,
+              "column": 27
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4330_col_25.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4330_col_25.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.45917175,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.966402917,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4330:17: delete ! in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4330,
+              "column": 17
+            },
+            "end": {
+              "line": 4330,
+              "column": 18
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4330_col_17.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4330_col_17.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.789962834,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.920760458,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:4330:38: replace == with != in YaldaGpuiView::focused_in_insert_mode",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "YaldaGpuiView::focused_in_insert_mode",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 4277,
+                "column": 5
+              },
+              "end": {
+                "line": 4334,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 4330,
+              "column": 38
+            },
+            "end": {
+              "line": 4330,
+              "column": 40
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_4330_col_38.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_4330_col_38.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.561795209,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.130410541,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:7284:21: delete field window_bounds from struct WindowOptions expression in main",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "main",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 7214,
+                "column": 1
+              },
+              "end": {
+                "line": 7444,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 7284,
+              "column": 21
+            },
+            "end": {
+              "line": 7284,
+              "column": 73
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_7284_col_21.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_7284_col_21.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 6.170437459,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.26779475,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:7289:21: delete field titlebar from struct WindowOptions expression in main",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "main",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 7214,
+                "column": 1
+              },
+              "end": {
+                "line": 7444,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 7289,
+              "column": 21
+            },
+            "end": {
+              "line": 7292,
+              "column": 24
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_7289_col_21.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_7289_col_21.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 6.074963667,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.722100916,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/main.rs:7290:25: delete field title from struct TitlebarOptions expression in main",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/main.rs",
+          "function": {
+            "function_name": "main",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 7214,
+                "column": 1
+              },
+              "end": {
+                "line": 7444,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 7290,
+              "column": 25
+            },
+            "end": {
+              "line": 7290,
+              "column": 58
+            }
+          },
+          "replacement": "",
+          "genre": "StructField"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__bin__yalda-gpui__main.rs_line_7290_col_25.log",
+      "diff_path": "diff/src__bin__yalda-gpui__main.rs_line_7290_col_25.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 8.501532584,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.425046417,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/agent.rs:3666:9: replace AgentState::settle_input_focus with ()",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/agent.rs",
+          "function": {
+            "function_name": "AgentState::settle_input_focus",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 3657,
+                "column": 5
+              },
+              "end": {
+                "line": 3684,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3666,
+              "column": 9
+            },
+            "end": {
+              "line": 3683,
+              "column": 10
+            }
+          },
+          "replacement": "()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__agent.rs_line_3666_col_9.log",
+      "diff_path": "diff/src__bin__yalda-gpui__agent.rs_line_3666_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.636372916,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.347438291,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/agent.rs:3670:25: replace || with && in AgentState::settle_input_focus",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/agent.rs",
+          "function": {
+            "function_name": "AgentState::settle_input_focus",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 3657,
+                "column": 5
+              },
+              "end": {
+                "line": 3684,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3670,
+              "column": 25
+            },
+            "end": {
+              "line": 3670,
+              "column": 27
+            }
+          },
+          "replacement": "&&",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__agent.rs_line_3670_col_25.log",
+      "diff_path": "diff/src__bin__yalda-gpui__agent.rs_line_3670_col_25.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.055712792,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.2918031660000002,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/agent.rs:3670:28: delete ! in AgentState::settle_input_focus",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/agent.rs",
+          "function": {
+            "function_name": "AgentState::settle_input_focus",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 3657,
+                "column": 5
+              },
+              "end": {
+                "line": 3684,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3670,
+              "column": 28
+            },
+            "end": {
+              "line": 3670,
+              "column": 29
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__agent.rs_line_3670_col_28.log",
+      "diff_path": "diff/src__bin__yalda-gpui__agent.rs_line_3670_col_28.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.567498584,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.402185208,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/agent.rs:3933:9: replace AgentState::inline_you_block_active -> bool with true",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/agent.rs",
+          "function": {
+            "function_name": "AgentState::inline_you_block_active",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 3923,
+                "column": 5
+              },
+              "end": {
+                "line": 3934,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3933,
+              "column": 9
+            },
+            "end": {
+              "line": 3933,
+              "column": 98
+            }
+          },
+          "replacement": "true",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__bin__yalda-gpui__agent.rs_line_3933_col_9.log",
+      "diff_path": "diff/src__bin__yalda-gpui__agent.rs_line_3933_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.212855334,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.354487042,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/agent.rs:3933:9: replace AgentState::inline_you_block_active -> bool with false",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/agent.rs",
+          "function": {
+            "function_name": "AgentState::inline_you_block_active",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 3923,
+                "column": 5
+              },
+              "end": {
+                "line": 3934,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3933,
+              "column": 9
+            },
+            "end": {
+              "line": 3933,
+              "column": 98
+            }
+          },
+          "replacement": "false",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__agent.rs_line_3933_col_9_001.log",
+      "diff_path": "diff/src__bin__yalda-gpui__agent.rs_line_3933_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 9.617737584,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.1768375,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/agent.rs:3933:63: replace && with || in AgentState::inline_you_block_active",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/agent.rs",
+          "function": {
+            "function_name": "AgentState::inline_you_block_active",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 3923,
+                "column": 5
+              },
+              "end": {
+                "line": 3934,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3933,
+              "column": 63
+            },
+            "end": {
+              "line": 3933,
+              "column": 65
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__bin__yalda-gpui__agent.rs_line_3933_col_63.log",
+      "diff_path": "diff/src__bin__yalda-gpui__agent.rs_line_3933_col_63.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.111044875,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.179524917,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/agent.rs:3933:29: replace && with || in AgentState::inline_you_block_active",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/agent.rs",
+          "function": {
+            "function_name": "AgentState::inline_you_block_active",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 3923,
+                "column": 5
+              },
+              "end": {
+                "line": 3934,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3933,
+              "column": 29
+            },
+            "end": {
+              "line": 3933,
+              "column": 31
+            }
+          },
+          "replacement": "||",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__bin__yalda-gpui__agent.rs_line_3933_col_29.log",
+      "diff_path": "diff/src__bin__yalda-gpui__agent.rs_line_3933_col_29.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 6.411378583,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 2.120941625,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/agent.rs:3933:32: delete ! in AgentState::inline_you_block_active",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/agent.rs",
+          "function": {
+            "function_name": "AgentState::inline_you_block_active",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 3923,
+                "column": 5
+              },
+              "end": {
+                "line": 3934,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3933,
+              "column": 32
+            },
+            "end": {
+              "line": 3933,
+              "column": 33
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__agent.rs_line_3933_col_32.log",
+      "diff_path": "diff/src__bin__yalda-gpui__agent.rs_line_3933_col_32.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.137842625,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.755026708,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/agent.rs:3933:66: delete ! in AgentState::inline_you_block_active",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/agent.rs",
+          "function": {
+            "function_name": "AgentState::inline_you_block_active",
+            "return_type": "-> bool",
+            "span": {
+              "start": {
+                "line": 3923,
+                "column": 5
+              },
+              "end": {
+                "line": 3934,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3933,
+              "column": 66
+            },
+            "end": {
+              "line": 3933,
+              "column": 67
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__agent.rs_line_3933_col_66.log",
+      "diff_path": "diff/src__bin__yalda-gpui__agent.rs_line_3933_col_66.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.869545583,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.6976125,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/bin/yalda-gpui/agent.rs:3984:9: replace AgentState::reset_for_replay with ()",
+          "package": "yalda",
+          "file": "src/bin/yalda-gpui/agent.rs",
+          "function": {
+            "function_name": "AgentState::reset_for_replay",
+            "return_type": "",
+            "span": {
+              "start": {
+                "line": 3977,
+                "column": 5
+              },
+              "end": {
+                "line": 4036,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 3984,
+              "column": 9
+            },
+            "end": {
+              "line": 4035,
+              "column": 35
+            }
+          },
+          "replacement": "()",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__bin__yalda-gpui__agent.rs_line_3984_col_9.log",
+      "diff_path": "diff/src__bin__yalda-gpui__agent.rs_line_3984_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.606052583,
+          "process_status": "Success",
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 1.9965916670000001,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/Users/scott/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=yalda@0.1.0",
+            "--features=test-support",
+            "--bin",
+            "yalda-gpui",
+            "--features",
+            "test-support"
+          ]
+        }
+      ]
+    }
+  ],
+  "total_mutants": 33,
+  "missed": 9,
+  "caught": 24,
+  "timeout": 0,
+  "unviable": 0,
+  "success": 0,
+  "start_time": "2026-07-01T20:47:12.602565Z",
+  "end_time": "2026-07-01T20:53:43.138607Z",
+  "cargo_mutants_version": "27.1.0"
+}

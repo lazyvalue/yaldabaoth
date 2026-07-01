@@ -1,0 +1,72 @@
+--- src/bin/yalda-gpui/agent.rs
++++ replace AgentState::reset_for_replay with ()
+@@ -3976,68 +3976,17 @@
+ 
+     /// Reset all transcript-derived state to the empty baseline so that a
+     /// server re-attach — which replays the session's full `event_log` — can
+     /// rebuild the transcript from scratch without duplicating what's already
+     /// on screen. Used by the reconnect path. Preserves the live channel /
+     /// attach handle, input mode, follow-output preference, and pump handle;
+     /// only the rendered transcript and its derived caches are cleared.
+     pub(crate) fn reset_for_replay(&mut self) {
+-        self.editor = Editor::new(String::new(), PathBuf::from("*claude*"));
+-        // The list/scroll UI state (`list_state`, counts, watermarks) now lives
+-        // in the owning `TranscriptView`'s `TranscriptScroll` (ticket 021). A
+-        // replay wipes the transcript ⇒ the flat-item count drops, and the
+-        // view's next render reconciles the `ListState` down (a shrink resets
+-        // it) and re-reveals the tail from the fresh `edit_seq` (which restarts
+-        // at 0 on the new editor) — no explicit list reset needed here.
+-        self.turn_phase = TurnPhase::Idle;
+-        self.replay_turns = yalda::acp_channel::ReplayTurns::default();
+-        // The transcript is being rebuilt from the authoritative event_log:
+-        // nothing is "pending local" any more, and this starts a fresh
+-        // tripwire generation (the replay re-numbers `k` from 1). This clear
+-        // MUST happen-before any replayed echo is processed — guaranteed since
+-        // reset runs inside the reconnect update before re-attach.
+-        self.reconciler.reset();
+-        self.user_turn_ks.clear();
+-        // A fresh generation re-numbers turns from 1 and discards the finalize
+-        // ledger (spec §4/§7): a (gen, turn) that finalized in the OLD channel
+-        // must not suppress the SAME (gen, turn) replayed in the new one. The
+-        // `generation` field is NOT reset here — the uniform rebaseline rule
+-        // (`apply_agent_event`) advances it to the bumped value AFTER calling
+-        // this, so zeroing it would make the very event that triggered the
+-        // reset re-trigger it. `agent_stream_authoritative` IS reset: a logless
+-        // reconnect must fall back to inference until the new channel forwards
+-        // its first `TurnEnded`.
+-        self.finalized.clear();
+-        self.replay_prefix_finalized = false;
+-        self.agent_stream_authoritative = false;
+-        self.tools.clear();
+-        self.block_ranges.clear();
+-        self.view_model = AgentViewModel::new();
+-        self.lines_cache = std::rc::Rc::new(Vec::new());
+-        self.lines_cache_seq = u64::MAX;
+-        self.highlight_cache.reset();
+-        self.current_plan = None;
+-        self.focused_subagent = None;
+-        self.usage = None;
+-        // The transcript is being rebuilt from scratch — any open You-block's
+-        // anchor points into the OLD line space, so it must not survive verbatim
+-        // (a pending reply could re-materialize at a stale line — bug-hunt 2).
+-        // `settle_input_focus` re-derives the block from the (now-empty) buffer:
+-        // it reopens a TAIL block (anchor=None, the stale-safe case) so a fresh /
+-        // cleared worksheet stays typeable, and rests a chatbox on its box. This
+-        // is load-bearing for `/clear`: the fresh server session's channel opens
+-        // asynchronously (bumped generation ⇒ this reset) and a historyless
+-        // session sends no `ReplayEnd`, so `finish_replay` never runs to re-settle
+-        // — without settling here the worksheet would rest with a CLOSED block and
+-        // typed chars wouldn't repaint (they gate on `inline_you_block_active`)
+-        // until a chatbox↔worksheet toggle. The compose draft is untouched
+-        // (InputSurface is preserved), and a with-history replay re-settles at its
+-        // `ReplayEnd` anyway. See `clear_then_empty_channel_open_keeps_worksheet_typeable`.
+-        self.settle_input_focus();
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// A re-attachable session resolved by the background half of `open_agent`
+ /// (S4). Carries everything the main thread needs to fill or push a slot —
+ /// the attach round-trip has already been issued off-thread.
+ pub(crate) struct AttachedSlot {
+     pub(crate) label: String,

@@ -546,7 +546,50 @@ impl TranscriptView {
         self.scroll
             .reveal_tail_if_following(follow_tail, edit_seq, new_count);
         if let Some(target) = pending_reveal_line {
-            self.scroll.list_state.scroll_to_reveal_item(target);
+            // The active You-block is ONE (now unwindowed, growing) list item. Item-
+            // granular reveal top-aligns it and strands the caret below the fold on a
+            // tall block. So when the reveal targets the active block, scroll to the
+            // caret's VISUAL ROW within it, parked ~2 rows above the viewport bottom —
+            // the doc-authoring feel (you type at the tail; earlier lines flow up),
+            // and INV-UX-1 holds for any block height. Pinned by
+            // `worksheet_tall_you_block_grows_caret_painted_in_viewport`.
+            let active_yb_item = flat_items_arc
+                .iter()
+                .position(|it| matches!(it, FlatItem::YouBlock { parked: None }));
+            let reveal_caret_row = you_block_snap
+                .as_ref()
+                .filter(|yb| yb.focused && Some(target) == active_yb_item);
+            if let Some(yb) = reveal_caret_row {
+                let wrap_cols = {
+                    let bw = yb.bounds.get().2;
+                    if bw > 1.0 {
+                        (bw / crate::CHATBOX_CHAR_W).floor().max(1.0) as usize
+                    } else if you_wrap_cols > 0 {
+                        you_wrap_cols
+                    } else {
+                        40
+                    }
+                };
+                let (caret_vrow, _, _) = crate::compose_visual_metrics(
+                    &yb.lines,
+                    yb.cursor_line,
+                    yb.cursor_col,
+                    wrap_cols,
+                );
+                // Block chrome above the first content row (pt_2 + the "You" label).
+                const YB_HEADER_PX: f32 = 34.0;
+                const YB_LINE_H: f32 = 18.0;
+                let caret_off = YB_HEADER_PX + caret_vrow as f32 * YB_LINE_H;
+                let vh = f32::from(self.scroll.list_state.viewport_bounds().size.height);
+                let want_from_top = (vh - YB_LINE_H * 2.0).max(0.0);
+                let offset = (caret_off - want_from_top).max(0.0);
+                self.scroll.list_state.scroll_to(gpui::ListOffset {
+                    item_ix: target,
+                    offset_in_item: gpui::px(offset),
+                });
+            } else {
+                self.scroll.list_state.scroll_to_reveal_item(target);
+            }
         }
 
         // Helper: "is this line in a frozen range" — inlined into the closure.
@@ -1042,16 +1085,17 @@ impl TranscriptView {
                         } else {
                             40
                         };
-                        // Window logical lines around the caret (active) or the top
-                        // (parked) so a long block can't push the caret below the fold.
-                        const YB_WIN: usize = 10;
-                        let n = lines.len().max(1);
-                        let win_anchor = if caret_line == usize::MAX { 0 } else { caret_line };
-                        let win_top =
-                            crate::compose_first_visible_line(win_anchor, 0, n, YB_WIN);
-                        let win_end = (win_top + YB_WIN).min(lines.len());
+                        // INTENT — co-authoring a document: the inline You-block renders
+                        // EVERY line and GROWS with its content. It is part of the doc
+                        // flow, never a fixed-height box that scrolls its own text out of
+                        // view. Keeping the caret visible is the TRANSCRIPT scroll's job
+                        // (reveal/follow the caret row below), not an internal window.
+                        // (Was windowed to 10 logical lines around the caret — the "You
+                        // div has limited space and scrolls after a while" bug. INV-UX-1
+                        // is now upheld by revealing the caret's row within the block, not
+                        // by truncating the block.)
                         let mut inner = div().flex().flex_col().w_full().min_w_0();
-                        for i in win_top..win_end {
+                        for i in 0..lines.len() {
                             inner = inner.child(crate::build_chatbox_wrapped_line(
                                 &lines[i],
                                 focused && i == caret_line,
@@ -1132,7 +1176,9 @@ impl TranscriptView {
         // (visible-only) measuring — NOT `Auto` (which measures every item every
         // frame): the body parent is `flex_1().min_h_0()` so the list fills the
         // viewport and scrolls without sizing to content.
-        div()
+        crate::probe_bounds(
+            "transcript-viewport",
+            div()
             .id("claude-body")
             .flex()
             .flex_col()
@@ -1150,7 +1196,8 @@ impl TranscriptView {
                     .flex_1()
                     .w_full(),
             )
-            .into_any_element()
+            .into_any_element(),
+        )
     }
 }
 
