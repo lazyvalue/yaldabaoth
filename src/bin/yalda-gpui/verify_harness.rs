@@ -5437,10 +5437,15 @@ fn worksheet_stale_anchor_is_rejected(cx: &mut TestAppContext) {
     });
 }
 
-/// REGRESSION (bug-hunt 2): a replay/reconnect rebuild closes any open You-block so
-/// a pending reply can't re-materialize at a stale line in the fresh transcript.
+/// REGRESSION (bug-hunt 2 + "/clear can't type"): a replay/reconnect rebuild must
+/// not let a pending reply re-materialize at a STALE line — but it also must not
+/// leave the worksheet un-typeable. `reset_for_replay` re-settles: it clears the
+/// stale anchor and reopens the block at the TAIL (`anchor = None`, the stale-safe
+/// case — `effective_you_block_anchor` folds `None` to a tail append, never
+/// mid-history). The empty rebuilt transcript ⇒ the block stays OPEN so typed
+/// chars repaint (a historyless `/clear` session gets no `ReplayEnd` to re-settle).
 #[gpui::test]
-fn worksheet_replay_closes_you_block(cx: &mut TestAppContext) {
+fn worksheet_replay_reopens_tail_block_stale_safe(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
     view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
     vcx.run_until_parked();
@@ -5448,8 +5453,16 @@ fn worksheet_replay_closes_you_block(cx: &mut TestAppContext) {
         let mut c = v.agent_mut(cx).expect("agent");
         assert!(c.you_block_open);
         c.reset_for_replay();
-        assert!(!c.you_block_open, "replay closes the block (bug-hunt 2)");
-        assert_eq!(c.you_block_anchor, None, "and clears the stale anchor");
+        assert!(
+            c.inline_you_block_active(),
+            "the rebuilt (empty) worksheet stays typeable — else post-/clear typing \
+             doesn't repaint (bug-hunt 2 stayed stale-safe: see the anchor below)"
+        );
+        assert_eq!(
+            c.you_block_anchor, None,
+            "the stale anchor is cleared → the reopened block is at the TAIL, not \
+             a stale mid-history line (bug-hunt 2)"
+        );
     });
 }
 

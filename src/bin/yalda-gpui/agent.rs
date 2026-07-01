@@ -3919,16 +3919,20 @@ impl AgentState {
         self.focused_subagent = None;
         self.usage = None;
         // The transcript is being rebuilt from scratch — any open You-block's
-        // anchor points into the OLD line space. Close it so a pending reply can't
-        // re-materialize at a stale line in the rebuilt transcript (bug-hunt 2).
-        // The compose draft itself is preserved (InputSurface is untouched).
-        self.close_you_block();
-        // ...and the block being closed means the worksheet must rest in NAVIGATION,
-        // not focus=Compose with no rendered surface (invisible-typing — bug-hunt-2
-        // B4). Chatbox keeps its always-visible box, so leave its focus alone.
-        if !self.input_surface.is_chatbox() {
-            self.focus = AgentFocus::Transcript;
-        }
+        // anchor points into the OLD line space, so it must not survive verbatim
+        // (a pending reply could re-materialize at a stale line — bug-hunt 2).
+        // `settle_input_focus` re-derives the block from the (now-empty) buffer:
+        // it reopens a TAIL block (anchor=None, the stale-safe case) so a fresh /
+        // cleared worksheet stays typeable, and rests a chatbox on its box. This
+        // is load-bearing for `/clear`: the fresh server session's channel opens
+        // asynchronously (bumped generation ⇒ this reset) and a historyless
+        // session sends no `ReplayEnd`, so `finish_replay` never runs to re-settle
+        // — without settling here the worksheet would rest with a CLOSED block and
+        // typed chars wouldn't repaint (they gate on `inline_you_block_active`)
+        // until a chatbox↔worksheet toggle. The compose draft is untouched
+        // (InputSurface is preserved), and a with-history replay re-settles at its
+        // `ReplayEnd` anyway. See `clear_then_empty_channel_open_keeps_worksheet_typeable`.
+        self.settle_input_focus();
     }
 }
 

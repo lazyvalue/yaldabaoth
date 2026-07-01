@@ -102,6 +102,36 @@ real reducer, and asserts post-action state through entity handles —
 `run_until_parked` runs a real layout/paint pass. "Drive the view, press keys,
 assert state" is **done**. The scripted-input driver below already exists.
 
+### The guard MUST fail without the fix (negative control) — non-negotiable
+
+A guard test only proves something if it is **observed RED before the fix and
+GREEN after**. A test that passes with *and* without the change guards nothing —
+it manufactures false confidence, which is worse than no test. This is the exact
+mechanism behind repeated "fixed it" claims that didn't fix it: the guard
+asserted a state (`focus == Compose`, `you_block_open == true`) that was already
+true on the passing path, or was reachable by a *different* input (e.g. a later
+`i` keystroke re-opened the block the async replay had closed), so the test went
+green while the reported symptom survived untouched.
+
+Protocol for any bug fix (not just UX):
+1. Write the guard. **Run it against `HEAD` (no fix) and watch it FAIL.** If it
+   passes, the guard doesn't cover the bug — the reproduction is wrong, or a
+   later step in the test masks the defect. Fix the guard until it's red for the
+   *right reason*, then write the code fix.
+2. Reproduce the symptom the user actually reports, on the path they actually
+   drive. "The state predicate is wrong after operation X" is necessary but not
+   sufficient — if the on-screen symptom is "typing doesn't repaint," the guard
+   must exercise typing and assert the repaint (`perf_render_count` bump), not
+   just the predicate. If pressing a key in the test masks the difference,
+   that's a signal the predicate may be *latent* (real but not the cause).
+3. If you cannot make a guard fail without the fix, you have **not localized the
+   bug** — say so explicitly and keep digging or ask for the exact repro. Do NOT
+   ship the change as "the fix." A plausible-looking state correction with a
+   green-both-ways test is precisely the false-fix trap.
+
+Toggling the fix off to confirm the guard flips red costs one `cargo test` run.
+Skipping it has cost multiple false "done" reports. Always pay the one run.
+
 What exists to build on:
 - The headless GPUI harness (`verify_harness.rs`, `cargo test --bin yalda-gpui`).
 - Server-side fakes (`FakeTransport`/`FakeAgentSpawner`, phase 6) +

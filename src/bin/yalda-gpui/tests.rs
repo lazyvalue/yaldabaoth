@@ -2960,6 +2960,32 @@ fn compose_draft_survives_reset_for_replay() {
     );
 }
 
+/// REGRESSION ("/clear then can't type until I toggle chatbox↔worksheet"): the
+/// `/clear` path settles a fresh session into a typeable worksheet block, but the
+/// new server session's channel then OPENS asynchronously (a bumped generation ⇒
+/// `reset_for_replay`). A historyless session has no `ReplayEnd`, so nothing
+/// re-settles — `reset_for_replay` closes the block and leaves it closed. Because
+/// the worksheet keystroke path busts the transcript cache ONLY while
+/// `inline_you_block_active()` (i.e. `you_block_open`), a closed block means typed
+/// chars never repaint. The block must survive an empty-transcript replay.
+#[test]
+fn clear_then_empty_channel_open_keeps_worksheet_typeable() {
+    let mut st = AgentState::new_server_managed(None);
+    st.settle_input_focus();
+    assert!(
+        st.inline_you_block_active(),
+        "clear settles a typeable worksheet block"
+    );
+    // The fresh server session's channel opens (bumped generation ⇒ replay reset).
+    // No history ⇒ no ReplayEnd ⇒ no compensating finish_replay/settle.
+    st.reset_for_replay();
+    assert!(
+        st.inline_you_block_active(),
+        "after clear + channel-open the empty worksheet must STAY typeable \
+         (else typed chars don't repaint until a chatbox↔worksheet toggle)"
+    );
+}
+
 /// INV (§4.5): the follow-tail policy is `follow_output` in BOTH placements —
 /// the cursor lives in the compose, never the (read-only) transcript, so the
 /// old `Worksheet => cursor_at_eof` arm is gone.

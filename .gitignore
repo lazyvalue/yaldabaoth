@@ -10,3 +10,6 @@
 
 # brainstorm scratch (superpowers tool)
 .superpowers/
+
+# cargo-mutants scratch output
+mutants.out/
