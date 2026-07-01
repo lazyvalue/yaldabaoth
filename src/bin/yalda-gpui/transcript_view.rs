@@ -1095,9 +1095,9 @@ impl TranscriptView {
                         // is now upheld by revealing the caret's row within the block, not
                         // by truncating the block.)
                         let mut inner = div().flex().flex_col().w_full().min_w_0();
-                        for i in 0..lines.len() {
+                        for (i, line) in lines.iter().enumerate() {
                             inner = inner.child(crate::build_chatbox_wrapped_line(
-                                &lines[i],
+                                line,
                                 focused && i == caret_line,
                                 caret_col,
                                 mode,
