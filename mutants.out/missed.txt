@@ -1,6 +1,0 @@
-src/bin/yalda-gpui/main.rs:3554:13: delete match arm Key::Char('\'') in YaldaGpuiView::try_start_mark_chord
-src/bin/yalda-gpui/main.rs:4219:64: replace == with != in YaldaGpuiView::focused_in_insert_mode
-src/bin/yalda-gpui/main.rs:4221:34: replace || with && in YaldaGpuiView::focused_in_insert_mode
-src/bin/yalda-gpui/main.rs:7192:21: delete field window_bounds from struct WindowOptions expression in main
-src/bin/yalda-gpui/main.rs:7197:21: delete field titlebar from struct WindowOptions expression in main
-src/bin/yalda-gpui/main.rs:7198:25: delete field title from struct TitlebarOptions expression in main
