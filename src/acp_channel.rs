@@ -1085,6 +1085,63 @@ impl AcpChannelClient {
             generation: 0,
         }
     }
+
+    /// Build an in-process, subprocess-free client for tests. `connected = true`
+    /// and the returned [`TestChannelControls`] RETAINS the `prompt_rx` so
+    /// [`send`](Self::send) succeeds without a worker (a dropped receiver would
+    /// make the sender error and mark the channel disconnected). This is the seam
+    /// that closes verification gap #2 for the GUI half: a real `submit` now takes
+    /// the `channel.send() == Ok` path (`send_prompt_to_session`), so the REAL
+    /// user-turn insert + `turn_phase = begin` transition runs through production
+    /// code — instead of tests hand-setting `turn_phase`. Turn OUTPUT (chunks,
+    /// `TurnEnded`) is still driven through the real reducer via
+    /// `apply_server_batch`, not this channel.
+    #[cfg(feature = "test-support")]
+    pub fn test_connected() -> (Self, TestChannelControls) {
+        let (prompt_tx, prompt_rx) = std_mpsc::channel::<String>();
+        let (reply_tx, reply_rx) = std_mpsc::channel::<ReplyEvent>();
+        let (_wake_tx, wake_rx) = futures::channel::mpsc::unbounded::<()>();
+        let (cancel_tx, cancel_rx) = futures::channel::mpsc::unbounded::<()>();
+        let connected = Arc::new(AtomicBool::new(true));
+        let client = Self {
+            prompt_tx,
+            cancel_tx,
+            reply_rx,
+            connected: Arc::clone(&connected),
+            turns: Arc::new(AtomicUsize::new(0)),
+            session_id: Arc::new(std::sync::Mutex::new(None)),
+            permission_mode: Arc::new(AtomicU8::new(DEFAULT_PERMISSION_MODE as u8)),
+            wake_rx: std::sync::Mutex::new(Some(wake_rx)),
+            worker: None,
+            command: "test-in-process".to_string(),
+            cwd: PathBuf::from("."),
+        };
+        (
+            client,
+            TestChannelControls {
+                prompt_rx,
+                reply_tx,
+                _cancel_rx: cancel_rx,
+                connected,
+            },
+        )
+    }
+}
+
+/// Handles the test must keep alive for a [`AcpChannelClient::test_connected`]
+/// client to keep working, plus levers to simulate transport events.
+#[cfg(feature = "test-support")]
+pub struct TestChannelControls {
+    /// Retained so `send()` succeeds; drain it to assert what was submitted.
+    pub prompt_rx: std_mpsc::Receiver<String>,
+    /// Inject `ReplyEvent`s (chunks / `TurnEnded`) the pump will read via
+    /// `try_recv` — the seam for driving a turn to completion in-process.
+    pub reply_tx: std_mpsc::Sender<ReplyEvent>,
+    /// Kept alive so `cancel()` doesn't error; unused otherwise.
+    _cancel_rx: futures::channel::mpsc::UnboundedReceiver<()>,
+    /// Flip to `false` to simulate the worker dying (EOF) — the next `send()`
+    /// then fails, exercising the "send failed — reconnecting" path.
+    pub connected: Arc<AtomicBool>,
 }
 
 /// The pump-thread-facing surface of an agent connection (Phase 6,

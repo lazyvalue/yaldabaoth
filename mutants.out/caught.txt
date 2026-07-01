@@ -1,0 +1,15 @@
+src/bin/yalda-gpui/main.rs:3545:9: replace YaldaGpuiView::try_start_mark_chord -> bool with true
+src/bin/yalda-gpui/main.rs:3545:9: replace YaldaGpuiView::try_start_mark_chord -> bool with false
+src/bin/yalda-gpui/main.rs:3545:12: delete ! in YaldaGpuiView::try_start_mark_chord
+src/bin/yalda-gpui/main.rs:3549:13: delete match arm Key::Char('m') in YaldaGpuiView::try_start_mark_chord
+src/bin/yalda-gpui/main.rs:4218:9: replace YaldaGpuiView::focused_in_insert_mode -> bool with true
+src/bin/yalda-gpui/main.rs:4218:9: replace YaldaGpuiView::focused_in_insert_mode -> bool with false
+src/bin/yalda-gpui/main.rs:4243:29: replace && with || in YaldaGpuiView::focused_in_insert_mode
+src/bin/yalda-gpui/main.rs:4242:54: replace == with != in YaldaGpuiView::focused_in_insert_mode
+src/bin/yalda-gpui/main.rs:4243:63: replace == with != in YaldaGpuiView::focused_in_insert_mode
+src/bin/yalda-gpui/main.rs:4245:56: replace && with || in YaldaGpuiView::focused_in_insert_mode
+src/bin/yalda-gpui/main.rs:4245:59: delete ! in YaldaGpuiView::focused_in_insert_mode
+src/bin/yalda-gpui/main.rs:4246:40: replace || with && in YaldaGpuiView::focused_in_insert_mode
+src/bin/yalda-gpui/main.rs:4257:25: replace && with || in YaldaGpuiView::focused_in_insert_mode
+src/bin/yalda-gpui/main.rs:4257:17: delete ! in YaldaGpuiView::focused_in_insert_mode
+src/bin/yalda-gpui/main.rs:4257:38: replace == with != in YaldaGpuiView::focused_in_insert_mode

@@ -317,6 +317,20 @@ per `spec-worksheet.md` (AUTHORITATIVE). Concretely:
 7. **Mid-turn → chatbox.** While the agent is mid-turn the transcript is read-only
    and a chatbox appears **pinned at the bottom**; input goes there (steers/queues,
    INV-UX-7). The chatbox is **not visible when the agent is idle**.
+   - **The leaders stay universal mid-turn (revised 2026-07-01).** Suppressing all
+     mid-turn keystrokes into the chatbox also killed the `<space>`/`.`/`?` leader
+     menus — the reported "leaders don't work mid-turn" bug. The rule now keys off
+     the **steering draft**: with an EMPTY draft the worksheet is resting in nav, so
+     the leaders FIRE (open the tile/workspace/global menu); once the draft is
+     non-empty the keystrokes belong to the chatbox (so spaces in a steer stay
+     spaces) and the leaders are suppressed. The bare `m`/`'` **mark chord** never
+     fires mid-turn — `m` always types (it routes to the chatbox), independent of
+     the draft. Governed by `focused_in_insert_mode` (the `midturn_steer` term) and
+     the mark-chord `transcript_nav` guard (`agent_ui.rs`). Pinned real-state (via
+     the in-process channel seam, `AcpChannelClient::test_connected`) by
+     `real_midturn_worksheet_empty_draft_space_opens_menu`,
+     `real_midturn_worksheet_typed_draft_space_is_suppressed`, and
+     `real_midturn_worksheet_m_types_not_marks` (run with `--features test-support`).
 
 **Substrate.** This is layered on Model C (ADR-0024), which stays the durable
 implementation: transcript is the single ordered source of truth, agent content

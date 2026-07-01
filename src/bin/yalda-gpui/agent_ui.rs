@@ -3851,8 +3851,18 @@ impl YaldaGpuiView {
                     || c.input_surface.compose().mode == EditMode::Normal
             })
             .unwrap_or(false);
+        // The bare-`m`/`'` mark chord fires ONLY in genuine transcript navigation.
+        // Mid-turn in the worksheet, `focus` stays on the transcript but input
+        // routes to the bottom chatbox (INV-UX-9 rule 7) — that is text entry, so
+        // `m` must TYPE, not start a chord. Use the SAME exclusion the leaders /
+        // `transcript_focused` use. (Was `focus == Transcript` alone — the "mid-turn
+        // m sets a mark" bug; the real fix lived only on the unmerged `jump-pane-nav`
+        // branch. Pinned real-state by `real_midturn_worksheet_m_types_not_marks`.)
         let transcript_nav = self
-            .agent_read(cx, |c| c.focus == AgentFocus::Transcript)
+            .agent_read(cx, |c| {
+                c.focus == AgentFocus::Transcript
+                    && !(c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox())
+            })
             .unwrap_or(false);
         if transcript_nav && self.try_start_mark_chord(&press.key, &press.modifiers, cx) {
             return;

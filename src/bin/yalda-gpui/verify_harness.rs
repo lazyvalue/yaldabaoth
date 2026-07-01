@@ -4849,6 +4849,178 @@ fn boot_worksheet_nav(
     (view, vcx)
 }
 
+/// Boot a REAL worksheet session backed by an in-process test channel (NO server
+/// sid) so a real `submit` takes the `channel.send()==Ok` path and drives the
+/// production mid-turn transition — the seam that closes verification gap #2 for
+/// the GUI half. Keep the returned controls alive (they retain `prompt_rx`).
+/// Behind `test-support` (the in-process transport feature); run these with
+/// `cargo test --bin yalda-gpui --features test-support`.
+#[cfg(feature = "test-support")]
+fn boot_worksheet_channel(
+    cx: &mut TestAppContext,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &mut gpui::VisualTestContext,
+    crate::SessionId,
+    yalda::acp_channel::TestChannelControls,
+) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, None); // None sid ⇒ channel.send() path
+    let (client, controls) = yalda::acp_channel::AcpChannelClient::test_connected();
+    let id = view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        let id = v.focused_bound_session().expect("bound session");
+        v.with_session(id, cx, |c| c.channel = Some(client));
+        cx.notify();
+        id
+    });
+    (view, vcx, id, controls)
+}
+
+/// Open a tail You-block, type `text`, and submit through the REAL path
+/// (`submit_agent` → `submit_compose` → `submit_worksheet_blocks` →
+/// `channel.send()`), leaving the session in the production post-submit mid-turn
+/// state — NOT a hand-set `turn_phase`.
+#[cfg(feature = "test-support")]
+fn worksheet_real_submit(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    text: &str,
+) {
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| {
+            for ch in text.chars() {
+                c.input_surface.compose_mut().editor.insert_char(ch);
+            }
+        });
+    });
+    view.update(vcx, |v, cx| v.submit_agent(cx));
+    vcx.run_until_parked();
+}
+
+/// ACCEPTANCE (real-state, gap #2 closed): reach mid-turn through the REAL submit
+/// path, then check the REPORTED `m` behavior. On `main` this is EXPECTED TO FAIL
+/// (the mid-turn mark-chord exclusion from `eb6bb4c` is stranded on
+/// `jump-pane-nav`, unmerged) — the failure is the mechanical proof the bug is
+/// live on main. It passes once the guard fix lands on main.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn real_midturn_worksheet_m_types_not_marks(cx: &mut TestAppContext) {
+    let (view, vcx, id, _controls) = boot_worksheet_channel(cx);
+    // CONTROL: genuine (idle) transcript nav — bare `m` DOES start a mark chord.
+    // (This half kills the `try_start_mark_chord` mutants the audit found surviving:
+    // "return false" / "delete the `m` arm" both break this assertion.)
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("m"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert_eq!(
+            v.pending_mark_chord,
+            Some('m'),
+            "idle transcript nav: bare `m` starts a mark chord"
+        );
+        v.pending_mark_chord = None;
+    });
+    worksheet_real_submit(&view, vcx, "do the thing");
+    view.update(vcx, |v, cx| {
+        assert!(
+            v.read_session(id, cx, |c| c.turn_phase.is_awaiting()).unwrap(),
+            "real submit must start a turn (we are genuinely mid-turn)"
+        );
+        v.pending_mark_chord = None;
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("m"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        assert_eq!(
+            v.pending_mark_chord, None,
+            "mid-turn worksheet `m` must NOT start a mark chord (it should type)"
+        );
+        let text = v
+            .read_session(id, cx, |c| c.input_surface.compose().text())
+            .unwrap();
+        assert!(text.contains('m'), "mid-turn `m` types into the chatbox (got {text:?})");
+    });
+}
+
+/// ACCEPTANCE (real-state, rule-7 revised): mid-turn (reached via the REAL submit)
+/// with an EMPTY steering draft, the worksheet rests in nav — so `<space>` OPENS
+/// the tile menu (the reported "leaders don't work mid-turn" bug). Red before the
+/// `focused_in_insert_mode` empty-draft change; green after.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn real_midturn_worksheet_empty_draft_space_opens_menu(cx: &mut TestAppContext) {
+    let (view, vcx, id, _controls) = boot_worksheet_channel(cx);
+    worksheet_real_submit(&view, vcx, "go"); // submit RESETS the compose ⇒ empty draft
+    view.update(vcx, |v, cx| {
+        assert!(v.read_session(id, cx, |c| c.turn_phase.is_awaiting()).unwrap());
+        assert!(
+            v.read_session(id, cx, |c| c.input_surface.compose().text().trim().is_empty())
+                .unwrap(),
+            "post-submit steering draft is empty"
+        );
+        assert!(
+            !v.focused_in_insert_mode(cx),
+            "empty-draft mid-turn worksheet rests in nav ⇒ leaders active"
+        );
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("space"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert!(
+            matches!(v.active_overlay, crate::ActiveOverlay::Menu(_)),
+            "mid-turn <space> with an empty draft OPENS the tile menu (rule 7 revised)"
+        );
+    });
+}
+
+/// ACCEPTANCE (real-state, rule-7 revised): once the user has TYPED a steer
+/// mid-turn (non-empty draft), the keystrokes belong to the chatbox — `<space>`
+/// types a space, it does NOT open a menu (so multi-word steering is unbroken).
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn real_midturn_worksheet_typed_draft_space_is_suppressed(cx: &mut TestAppContext) {
+    let (view, vcx, id, _controls) = boot_worksheet_channel(cx);
+    worksheet_real_submit(&view, vcx, "go");
+    // Type into the mid-turn chatbox so the draft is non-empty.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("f"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        assert!(
+            !v.read_session(id, cx, |c| c.input_surface.compose().text().trim().is_empty())
+                .unwrap(),
+            "typed a char ⇒ draft non-empty"
+        );
+        assert!(
+            v.focused_in_insert_mode(cx),
+            "non-empty steer ⇒ text entry ⇒ leaders suppressed"
+        );
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("space"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        assert!(
+            matches!(v.active_overlay, crate::ActiveOverlay::None),
+            "mid-turn <space> with a draft in progress must NOT open a menu"
+        );
+        let text = v
+            .read_session(id, cx, |c| c.input_surface.compose().text())
+            .unwrap();
+        assert!(text.contains(' '), "the space typed into the steer (got {text:?})");
+    });
+}
+
 /// INV-UX-9 rules 1–3: in the worksheet, navigation is free (no compose chrome);
 /// an Insert-entry key (`i`) opens a You-block (compose focus + Insert); leaving
 /// Insert with NO non-whitespace text DISCARDS it — the transcript is

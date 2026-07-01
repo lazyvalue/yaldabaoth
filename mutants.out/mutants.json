@@ -1,0 +1,674 @@
+[
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace YaldaGpuiView::try_start_mark_chord -> bool with true\n@@ -3537,32 +3537,17 @@\n     /// Check if a bare key press starts a mark chord (`m` or `'`).\n     /// Returns true if the key was consumed.\n     fn try_start_mark_chord(\n         &mut self,\n         key: &Key,\n         modifiers: &KMods,\n         cx: &mut Context<Self>,\n     ) -> bool {\n-        if !modifiers.is_empty() {\n-            return false;\n-        }\n-        match key {\n-            Key::Char('m') => {\n-                self.pending_mark_chord = Some('m');\n-                cx.notify();\n-                true\n-            }\n-            Key::Char('\\'') => {\n-                self.pending_mark_chord = Some('\\'');\n-                cx.notify();\n-                true\n-            }\n-            _ => false,\n-        }\n+        true /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// `on_key_down` handler for the Doc view — intercepts bare `m`/`'` to\n     /// start a mark chord.\n     fn handle_doc_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {\n         let press = keystroke_to_keypress(&ev.keystroke);\n \n         // Universal leaders: the doc view is never text entry, so `<space>`/`.`/\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::try_start_mark_chord",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 3561
+        },
+        "start": {
+          "column": 5,
+          "line": 3537
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/bin/yalda-gpui/main.rs:3545:9: replace YaldaGpuiView::try_start_mark_chord -> bool with true",
+    "package": "yalda",
+    "replacement": "true",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 3560
+      },
+      "start": {
+        "column": 9,
+        "line": 3545
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace YaldaGpuiView::try_start_mark_chord -> bool with false\n@@ -3537,32 +3537,17 @@\n     /// Check if a bare key press starts a mark chord (`m` or `'`).\n     /// Returns true if the key was consumed.\n     fn try_start_mark_chord(\n         &mut self,\n         key: &Key,\n         modifiers: &KMods,\n         cx: &mut Context<Self>,\n     ) -> bool {\n-        if !modifiers.is_empty() {\n-            return false;\n-        }\n-        match key {\n-            Key::Char('m') => {\n-                self.pending_mark_chord = Some('m');\n-                cx.notify();\n-                true\n-            }\n-            Key::Char('\\'') => {\n-                self.pending_mark_chord = Some('\\'');\n-                cx.notify();\n-                true\n-            }\n-            _ => false,\n-        }\n+        false /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// `on_key_down` handler for the Doc view — intercepts bare `m`/`'` to\n     /// start a mark chord.\n     fn handle_doc_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {\n         let press = keystroke_to_keypress(&ev.keystroke);\n \n         // Universal leaders: the doc view is never text entry, so `<space>`/`.`/\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::try_start_mark_chord",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 3561
+        },
+        "start": {
+          "column": 5,
+          "line": 3537
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/bin/yalda-gpui/main.rs:3545:9: replace YaldaGpuiView::try_start_mark_chord -> bool with false",
+    "package": "yalda",
+    "replacement": "false",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 3560
+      },
+      "start": {
+        "column": 9,
+        "line": 3545
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ delete ! in YaldaGpuiView::try_start_mark_chord\n@@ -3537,17 +3537,17 @@\n     /// Check if a bare key press starts a mark chord (`m` or `'`).\n     /// Returns true if the key was consumed.\n     fn try_start_mark_chord(\n         &mut self,\n         key: &Key,\n         modifiers: &KMods,\n         cx: &mut Context<Self>,\n     ) -> bool {\n-        if !modifiers.is_empty() {\n+        if  /* ~ changed by cargo-mutants ~ */modifiers.is_empty() {\n             return false;\n         }\n         match key {\n             Key::Char('m') => {\n                 self.pending_mark_chord = Some('m');\n                 cx.notify();\n                 true\n             }\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::try_start_mark_chord",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 3561
+        },
+        "start": {
+          "column": 5,
+          "line": 3537
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "src/bin/yalda-gpui/main.rs:3545:12: delete ! in YaldaGpuiView::try_start_mark_chord",
+    "package": "yalda",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 13,
+        "line": 3545
+      },
+      "start": {
+        "column": 12,
+        "line": 3545
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ delete match arm Key::Char('m') in YaldaGpuiView::try_start_mark_chord\n@@ -3541,21 +3541,17 @@\n         key: &Key,\n         modifiers: &KMods,\n         cx: &mut Context<Self>,\n     ) -> bool {\n         if !modifiers.is_empty() {\n             return false;\n         }\n         match key {\n-            Key::Char('m') => {\n-                self.pending_mark_chord = Some('m');\n-                cx.notify();\n-                true\n-            }\n+             /* ~ changed by cargo-mutants ~ */\n             Key::Char('\\'') => {\n                 self.pending_mark_chord = Some('\\'');\n                 cx.notify();\n                 true\n             }\n             _ => false,\n         }\n     }\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::try_start_mark_chord",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 3561
+        },
+        "start": {
+          "column": 5,
+          "line": 3537
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/bin/yalda-gpui/main.rs:3549:13: delete match arm Key::Char('m') in YaldaGpuiView::try_start_mark_chord",
+    "package": "yalda",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 3553
+      },
+      "start": {
+        "column": 13,
+        "line": 3549
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ delete match arm Key::Char('\\'') in YaldaGpuiView::try_start_mark_chord\n@@ -3546,21 +3546,17 @@\n             return false;\n         }\n         match key {\n             Key::Char('m') => {\n                 self.pending_mark_chord = Some('m');\n                 cx.notify();\n                 true\n             }\n-            Key::Char('\\'') => {\n-                self.pending_mark_chord = Some('\\'');\n-                cx.notify();\n-                true\n-            }\n+             /* ~ changed by cargo-mutants ~ */\n             _ => false,\n         }\n     }\n \n     /// `on_key_down` handler for the Doc view — intercepts bare `m`/`'` to\n     /// start a mark chord.\n     fn handle_doc_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {\n         let press = keystroke_to_keypress(&ev.keystroke);\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::try_start_mark_chord",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 3561
+        },
+        "start": {
+          "column": 5,
+          "line": 3537
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/bin/yalda-gpui/main.rs:3554:13: delete match arm Key::Char('\\'') in YaldaGpuiView::try_start_mark_chord",
+    "package": "yalda",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 14,
+        "line": 3558
+      },
+      "start": {
+        "column": 13,
+        "line": 3554
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace YaldaGpuiView::focused_in_insert_mode -> bool with true\n@@ -4210,59 +4210,17 @@\n \n     /// Does the focused tile currently want raw text input? This is a property\n     /// of the App/tile (untitled.md \"tiles flag whether they are in an insert\n     /// mode\"): leaders are intercepted as menu-openers ONLY when this is false,\n     /// so a tile in a navigation/selection state always reaches the menus while\n     /// one in text entry keeps those characters. The session / project pickers\n     /// are navigation, never text entry.\n     fn focused_in_insert_mode(&self, cx: &GpuiApp) -> bool {\n-        match self.workspace.focused_content() {\n-            Some(App::Buffer(BufferApp::Editing(e))) => e.mode == EditMode::Insert,\n-            Some(App::Buffer(BufferApp::Picking(b))) => {\n-                b.fb.filter_mode || b.fb.rename.is_some()\n-            }\n-            Some(App::Agent(tile)) => {\n-                if tile.bound.is_none() {\n-                    false // unbound = session picker = navigation\n-                } else {\n-                    // Model C: a bound agent tile is \"in text entry\" iff focus is\n-                    // on the COMPOSE buffer AND it's in Insert — in BOTH placements.\n-                    // Transcript focus is read-only navigation, so leaders must\n-                    // work there. The transcript editor's own `mode` is irrelevant\n-                    // (it's read-only). The old worksheet arm read that transcript\n-                    // `mode` — which defaults to Insert — so leaders were wrongly\n-                    // suppressed in worksheet and `<space>` fell into the compose's\n-                    // normal dispatch, opening the workspace menu instead of the\n-                    // tile menu.\n-                    self.agent_read(cx, |c| {\n-                        // Focused compose in Insert is text entry. ALSO: mid-turn in\n-                        // the worksheet, input routes to the bottom chatbox even\n-                        // though focus stays on the transcript — so that is text\n-                        // entry too, and the leaders (space/./?) must NOT fire (else a\n-                        // space mid-turn opens a menu — INV-UX-9 rule 7).\n-                        let compose_insert = c.focus == AgentFocus::Compose\n-                            && c.input_surface.compose().mode == EditMode::Insert;\n-                        let midturn_worksheet =\n-                            c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();\n-                        compose_insert || midturn_worksheet\n-                    })\n-                    .unwrap_or(false)\n-                }\n-            }\n-            Some(App::Linear(tile)) => {\n-                let picker = tile\n-                    .view\n-                    .as_ref()\n-                    .map(|v| v.read(cx).is_picker())\n-                    .unwrap_or(false);\n-                !picker && tile.mode == LinearMode::Insert\n-            }\n-            Some(App::Buffer(BufferApp::Viewing(_))) | None => false,\n-        }\n+        true /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Universal leader dispatch: when the focused tile is NOT in text entry, the\n     /// bare leader keys open their menus with TOP priority, before any\n     /// tile-specific key handling. Returns true if it consumed the key (the\n     /// caller then returns early). Every tile's `on_key_down` calls this first,\n     /// so the menus are reachable from any tile that isn't capturing text —\n     /// including the agent session picker and the Linear project picker.\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/bin/yalda-gpui/main.rs:4218:9: replace YaldaGpuiView::focused_in_insert_mode -> bool with true",
+    "package": "yalda",
+    "replacement": "true",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 4260
+      },
+      "start": {
+        "column": 9,
+        "line": 4218
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace YaldaGpuiView::focused_in_insert_mode -> bool with false\n@@ -4210,59 +4210,17 @@\n \n     /// Does the focused tile currently want raw text input? This is a property\n     /// of the App/tile (untitled.md \"tiles flag whether they are in an insert\n     /// mode\"): leaders are intercepted as menu-openers ONLY when this is false,\n     /// so a tile in a navigation/selection state always reaches the menus while\n     /// one in text entry keeps those characters. The session / project pickers\n     /// are navigation, never text entry.\n     fn focused_in_insert_mode(&self, cx: &GpuiApp) -> bool {\n-        match self.workspace.focused_content() {\n-            Some(App::Buffer(BufferApp::Editing(e))) => e.mode == EditMode::Insert,\n-            Some(App::Buffer(BufferApp::Picking(b))) => {\n-                b.fb.filter_mode || b.fb.rename.is_some()\n-            }\n-            Some(App::Agent(tile)) => {\n-                if tile.bound.is_none() {\n-                    false // unbound = session picker = navigation\n-                } else {\n-                    // Model C: a bound agent tile is \"in text entry\" iff focus is\n-                    // on the COMPOSE buffer AND it's in Insert — in BOTH placements.\n-                    // Transcript focus is read-only navigation, so leaders must\n-                    // work there. The transcript editor's own `mode` is irrelevant\n-                    // (it's read-only). The old worksheet arm read that transcript\n-                    // `mode` — which defaults to Insert — so leaders were wrongly\n-                    // suppressed in worksheet and `<space>` fell into the compose's\n-                    // normal dispatch, opening the workspace menu instead of the\n-                    // tile menu.\n-                    self.agent_read(cx, |c| {\n-                        // Focused compose in Insert is text entry. ALSO: mid-turn in\n-                        // the worksheet, input routes to the bottom chatbox even\n-                        // though focus stays on the transcript — so that is text\n-                        // entry too, and the leaders (space/./?) must NOT fire (else a\n-                        // space mid-turn opens a menu — INV-UX-9 rule 7).\n-                        let compose_insert = c.focus == AgentFocus::Compose\n-                            && c.input_surface.compose().mode == EditMode::Insert;\n-                        let midturn_worksheet =\n-                            c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();\n-                        compose_insert || midturn_worksheet\n-                    })\n-                    .unwrap_or(false)\n-                }\n-            }\n-            Some(App::Linear(tile)) => {\n-                let picker = tile\n-                    .view\n-                    .as_ref()\n-                    .map(|v| v.read(cx).is_picker())\n-                    .unwrap_or(false);\n-                !picker && tile.mode == LinearMode::Insert\n-            }\n-            Some(App::Buffer(BufferApp::Viewing(_))) | None => false,\n-        }\n+        false /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Universal leader dispatch: when the focused tile is NOT in text entry, the\n     /// bare leader keys open their menus with TOP priority, before any\n     /// tile-specific key handling. Returns true if it consumed the key (the\n     /// caller then returns early). Every tile's `on_key_down` calls this first,\n     /// so the menus are reachable from any tile that isn't capturing text —\n     /// including the agent session picker and the Linear project picker.\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/bin/yalda-gpui/main.rs:4218:9: replace YaldaGpuiView::focused_in_insert_mode -> bool with false",
+    "package": "yalda",
+    "replacement": "false",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 4260
+      },
+      "start": {
+        "column": 9,
+        "line": 4218
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace == with != in YaldaGpuiView::focused_in_insert_mode\n@@ -4211,17 +4211,17 @@\n     /// Does the focused tile currently want raw text input? This is a property\n     /// of the App/tile (untitled.md \"tiles flag whether they are in an insert\n     /// mode\"): leaders are intercepted as menu-openers ONLY when this is false,\n     /// so a tile in a navigation/selection state always reaches the menus while\n     /// one in text entry keeps those characters. The session / project pickers\n     /// are navigation, never text entry.\n     fn focused_in_insert_mode(&self, cx: &GpuiApp) -> bool {\n         match self.workspace.focused_content() {\n-            Some(App::Buffer(BufferApp::Editing(e))) => e.mode == EditMode::Insert,\n+            Some(App::Buffer(BufferApp::Editing(e))) => e.mode != /* ~ changed by cargo-mutants ~ */ EditMode::Insert,\n             Some(App::Buffer(BufferApp::Picking(b))) => {\n                 b.fb.filter_mode || b.fb.rename.is_some()\n             }\n             Some(App::Agent(tile)) => {\n                 if tile.bound.is_none() {\n                     false // unbound = session picker = navigation\n                 } else {\n                     // Model C: a bound agent tile is \"in text entry\" iff focus is\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/bin/yalda-gpui/main.rs:4219:64: replace == with != in YaldaGpuiView::focused_in_insert_mode",
+    "package": "yalda",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 66,
+        "line": 4219
+      },
+      "start": {
+        "column": 64,
+        "line": 4219
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace || with && in YaldaGpuiView::focused_in_insert_mode\n@@ -4213,17 +4213,17 @@\n     /// mode\"): leaders are intercepted as menu-openers ONLY when this is false,\n     /// so a tile in a navigation/selection state always reaches the menus while\n     /// one in text entry keeps those characters. The session / project pickers\n     /// are navigation, never text entry.\n     fn focused_in_insert_mode(&self, cx: &GpuiApp) -> bool {\n         match self.workspace.focused_content() {\n             Some(App::Buffer(BufferApp::Editing(e))) => e.mode == EditMode::Insert,\n             Some(App::Buffer(BufferApp::Picking(b))) => {\n-                b.fb.filter_mode || b.fb.rename.is_some()\n+                b.fb.filter_mode && /* ~ changed by cargo-mutants ~ */ b.fb.rename.is_some()\n             }\n             Some(App::Agent(tile)) => {\n                 if tile.bound.is_none() {\n                     false // unbound = session picker = navigation\n                 } else {\n                     // Model C: a bound agent tile is \"in text entry\" iff focus is\n                     // on the COMPOSE buffer AND it's in Insert — in BOTH placements.\n                     // Transcript focus is read-only navigation, so leaders must\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/bin/yalda-gpui/main.rs:4221:34: replace || with && in YaldaGpuiView::focused_in_insert_mode",
+    "package": "yalda",
+    "replacement": "&&",
+    "span": {
+      "end": {
+        "column": 36,
+        "line": 4221
+      },
+      "start": {
+        "column": 34,
+        "line": 4221
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace && with || in YaldaGpuiView::focused_in_insert_mode\n@@ -4235,17 +4235,17 @@\n                     // tile menu.\n                     self.agent_read(cx, |c| {\n                         // Focused compose in Insert is text entry. ALSO: mid-turn in\n                         // the worksheet, input routes to the bottom chatbox even\n                         // though focus stays on the transcript — so that is text\n                         // entry too, and the leaders (space/./?) must NOT fire (else a\n                         // space mid-turn opens a menu — INV-UX-9 rule 7).\n                         let compose_insert = c.focus == AgentFocus::Compose\n-                            && c.input_surface.compose().mode == EditMode::Insert;\n+                            || /* ~ changed by cargo-mutants ~ */ c.input_surface.compose().mode == EditMode::Insert;\n                         let midturn_worksheet =\n                             c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();\n                         compose_insert || midturn_worksheet\n                     })\n                     .unwrap_or(false)\n                 }\n             }\n             Some(App::Linear(tile)) => {\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/bin/yalda-gpui/main.rs:4243:29: replace && with || in YaldaGpuiView::focused_in_insert_mode",
+    "package": "yalda",
+    "replacement": "||",
+    "span": {
+      "end": {
+        "column": 31,
+        "line": 4243
+      },
+      "start": {
+        "column": 29,
+        "line": 4243
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace == with != in YaldaGpuiView::focused_in_insert_mode\n@@ -4234,17 +4234,17 @@\n                     // normal dispatch, opening the workspace menu instead of the\n                     // tile menu.\n                     self.agent_read(cx, |c| {\n                         // Focused compose in Insert is text entry. ALSO: mid-turn in\n                         // the worksheet, input routes to the bottom chatbox even\n                         // though focus stays on the transcript — so that is text\n                         // entry too, and the leaders (space/./?) must NOT fire (else a\n                         // space mid-turn opens a menu — INV-UX-9 rule 7).\n-                        let compose_insert = c.focus == AgentFocus::Compose\n+                        let compose_insert = c.focus != /* ~ changed by cargo-mutants ~ */ AgentFocus::Compose\n                             && c.input_surface.compose().mode == EditMode::Insert;\n                         let midturn_worksheet =\n                             c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();\n                         compose_insert || midturn_worksheet\n                     })\n                     .unwrap_or(false)\n                 }\n             }\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/bin/yalda-gpui/main.rs:4242:54: replace == with != in YaldaGpuiView::focused_in_insert_mode",
+    "package": "yalda",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 56,
+        "line": 4242
+      },
+      "start": {
+        "column": 54,
+        "line": 4242
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace == with != in YaldaGpuiView::focused_in_insert_mode\n@@ -4235,17 +4235,17 @@\n                     // tile menu.\n                     self.agent_read(cx, |c| {\n                         // Focused compose in Insert is text entry. ALSO: mid-turn in\n                         // the worksheet, input routes to the bottom chatbox even\n                         // though focus stays on the transcript — so that is text\n                         // entry too, and the leaders (space/./?) must NOT fire (else a\n                         // space mid-turn opens a menu — INV-UX-9 rule 7).\n                         let compose_insert = c.focus == AgentFocus::Compose\n-                            && c.input_surface.compose().mode == EditMode::Insert;\n+                            && c.input_surface.compose().mode != /* ~ changed by cargo-mutants ~ */ EditMode::Insert;\n                         let midturn_worksheet =\n                             c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();\n                         compose_insert || midturn_worksheet\n                     })\n                     .unwrap_or(false)\n                 }\n             }\n             Some(App::Linear(tile)) => {\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/bin/yalda-gpui/main.rs:4243:63: replace == with != in YaldaGpuiView::focused_in_insert_mode",
+    "package": "yalda",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 65,
+        "line": 4243
+      },
+      "start": {
+        "column": 63,
+        "line": 4243
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace && with || in YaldaGpuiView::focused_in_insert_mode\n@@ -4237,17 +4237,17 @@\n                         // Focused compose in Insert is text entry. ALSO: mid-turn in\n                         // the worksheet, input routes to the bottom chatbox even\n                         // though focus stays on the transcript — so that is text\n                         // entry too, and the leaders (space/./?) must NOT fire (else a\n                         // space mid-turn opens a menu — INV-UX-9 rule 7).\n                         let compose_insert = c.focus == AgentFocus::Compose\n                             && c.input_surface.compose().mode == EditMode::Insert;\n                         let midturn_worksheet =\n-                            c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();\n+                            c.turn_phase.is_awaiting() || /* ~ changed by cargo-mutants ~ */ !c.input_surface.is_chatbox();\n                         compose_insert || midturn_worksheet\n                     })\n                     .unwrap_or(false)\n                 }\n             }\n             Some(App::Linear(tile)) => {\n                 let picker = tile\n                     .view\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/bin/yalda-gpui/main.rs:4245:56: replace && with || in YaldaGpuiView::focused_in_insert_mode",
+    "package": "yalda",
+    "replacement": "||",
+    "span": {
+      "end": {
+        "column": 58,
+        "line": 4245
+      },
+      "start": {
+        "column": 56,
+        "line": 4245
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ delete ! in YaldaGpuiView::focused_in_insert_mode\n@@ -4237,17 +4237,17 @@\n                         // Focused compose in Insert is text entry. ALSO: mid-turn in\n                         // the worksheet, input routes to the bottom chatbox even\n                         // though focus stays on the transcript — so that is text\n                         // entry too, and the leaders (space/./?) must NOT fire (else a\n                         // space mid-turn opens a menu — INV-UX-9 rule 7).\n                         let compose_insert = c.focus == AgentFocus::Compose\n                             && c.input_surface.compose().mode == EditMode::Insert;\n                         let midturn_worksheet =\n-                            c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();\n+                            c.turn_phase.is_awaiting() &&  /* ~ changed by cargo-mutants ~ */c.input_surface.is_chatbox();\n                         compose_insert || midturn_worksheet\n                     })\n                     .unwrap_or(false)\n                 }\n             }\n             Some(App::Linear(tile)) => {\n                 let picker = tile\n                     .view\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "src/bin/yalda-gpui/main.rs:4245:59: delete ! in YaldaGpuiView::focused_in_insert_mode",
+    "package": "yalda",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 60,
+        "line": 4245
+      },
+      "start": {
+        "column": 59,
+        "line": 4245
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace || with && in YaldaGpuiView::focused_in_insert_mode\n@@ -4238,17 +4238,17 @@\n                         // the worksheet, input routes to the bottom chatbox even\n                         // though focus stays on the transcript — so that is text\n                         // entry too, and the leaders (space/./?) must NOT fire (else a\n                         // space mid-turn opens a menu — INV-UX-9 rule 7).\n                         let compose_insert = c.focus == AgentFocus::Compose\n                             && c.input_surface.compose().mode == EditMode::Insert;\n                         let midturn_worksheet =\n                             c.turn_phase.is_awaiting() && !c.input_surface.is_chatbox();\n-                        compose_insert || midturn_worksheet\n+                        compose_insert && /* ~ changed by cargo-mutants ~ */ midturn_worksheet\n                     })\n                     .unwrap_or(false)\n                 }\n             }\n             Some(App::Linear(tile)) => {\n                 let picker = tile\n                     .view\n                     .as_ref()\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/bin/yalda-gpui/main.rs:4246:40: replace || with && in YaldaGpuiView::focused_in_insert_mode",
+    "package": "yalda",
+    "replacement": "&&",
+    "span": {
+      "end": {
+        "column": 42,
+        "line": 4246
+      },
+      "start": {
+        "column": 40,
+        "line": 4246
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace && with || in YaldaGpuiView::focused_in_insert_mode\n@@ -4249,17 +4249,17 @@\n                 }\n             }\n             Some(App::Linear(tile)) => {\n                 let picker = tile\n                     .view\n                     .as_ref()\n                     .map(|v| v.read(cx).is_picker())\n                     .unwrap_or(false);\n-                !picker && tile.mode == LinearMode::Insert\n+                !picker || /* ~ changed by cargo-mutants ~ */ tile.mode == LinearMode::Insert\n             }\n             Some(App::Buffer(BufferApp::Viewing(_))) | None => false,\n         }\n     }\n \n     /// Universal leader dispatch: when the focused tile is NOT in text entry, the\n     /// bare leader keys open their menus with TOP priority, before any\n     /// tile-specific key handling. Returns true if it consumed the key (the\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/bin/yalda-gpui/main.rs:4257:25: replace && with || in YaldaGpuiView::focused_in_insert_mode",
+    "package": "yalda",
+    "replacement": "||",
+    "span": {
+      "end": {
+        "column": 27,
+        "line": 4257
+      },
+      "start": {
+        "column": 25,
+        "line": 4257
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ delete ! in YaldaGpuiView::focused_in_insert_mode\n@@ -4249,17 +4249,17 @@\n                 }\n             }\n             Some(App::Linear(tile)) => {\n                 let picker = tile\n                     .view\n                     .as_ref()\n                     .map(|v| v.read(cx).is_picker())\n                     .unwrap_or(false);\n-                !picker && tile.mode == LinearMode::Insert\n+                 /* ~ changed by cargo-mutants ~ */picker && tile.mode == LinearMode::Insert\n             }\n             Some(App::Buffer(BufferApp::Viewing(_))) | None => false,\n         }\n     }\n \n     /// Universal leader dispatch: when the focused tile is NOT in text entry, the\n     /// bare leader keys open their menus with TOP priority, before any\n     /// tile-specific key handling. Returns true if it consumed the key (the\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "src/bin/yalda-gpui/main.rs:4257:17: delete ! in YaldaGpuiView::focused_in_insert_mode",
+    "package": "yalda",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 18,
+        "line": 4257
+      },
+      "start": {
+        "column": 17,
+        "line": 4257
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ replace == with != in YaldaGpuiView::focused_in_insert_mode\n@@ -4249,17 +4249,17 @@\n                 }\n             }\n             Some(App::Linear(tile)) => {\n                 let picker = tile\n                     .view\n                     .as_ref()\n                     .map(|v| v.read(cx).is_picker())\n                     .unwrap_or(false);\n-                !picker && tile.mode == LinearMode::Insert\n+                !picker && tile.mode != /* ~ changed by cargo-mutants ~ */ LinearMode::Insert\n             }\n             Some(App::Buffer(BufferApp::Viewing(_))) | None => false,\n         }\n     }\n \n     /// Universal leader dispatch: when the focused tile is NOT in text entry, the\n     /// bare leader keys open their menus with TOP priority, before any\n     /// tile-specific key handling. Returns true if it consumed the key (the\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "YaldaGpuiView::focused_in_insert_mode",
+      "return_type": "-> bool",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 4261
+        },
+        "start": {
+          "column": 5,
+          "line": 4211
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/bin/yalda-gpui/main.rs:4257:38: replace == with != in YaldaGpuiView::focused_in_insert_mode",
+    "package": "yalda",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 40,
+        "line": 4257
+      },
+      "start": {
+        "column": 38,
+        "line": 4257
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ delete field window_bounds from struct WindowOptions expression in main\n@@ -7184,17 +7184,17 @@\n             }\n         })\n         .detach();\n \n         let bounds = Bounds::new(point(px(120.0), px(80.0)), size(px(900.0), px(700.0)));\n         let window_handle = app\n             .open_window(\n                 WindowOptions {\n-                    window_bounds: Some(WindowBounds::Windowed(bounds)),\n+                     /* ~ changed by cargo-mutants ~ */\n                     // Titled window so the standard system title bar (with\n                     // close/minimize/maximize buttons AND the resize affordance\n                     // that comes with it) is rendered. Previously `None` →\n                     // chromeless window that couldn't be resized.\n                     titlebar: Some(TitlebarOptions {\n                         title: Some(\"Yaldabaoth\".into()),\n                         ..Default::default()\n                     }),\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "main",
+      "return_type": "",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 7352
+        },
+        "start": {
+          "column": 1,
+          "line": 7122
+        }
+      }
+    },
+    "genre": "StructField",
+    "name": "src/bin/yalda-gpui/main.rs:7192:21: delete field window_bounds from struct WindowOptions expression in main",
+    "package": "yalda",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 73,
+        "line": 7192
+      },
+      "start": {
+        "column": 21,
+        "line": 7192
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ delete field titlebar from struct WindowOptions expression in main\n@@ -7189,20 +7189,17 @@\n         let window_handle = app\n             .open_window(\n                 WindowOptions {\n                     window_bounds: Some(WindowBounds::Windowed(bounds)),\n                     // Titled window so the standard system title bar (with\n                     // close/minimize/maximize buttons AND the resize affordance\n                     // that comes with it) is rendered. Previously `None` →\n                     // chromeless window that couldn't be resized.\n-                    titlebar: Some(TitlebarOptions {\n-                        title: Some(\"Yaldabaoth\".into()),\n-                        ..Default::default()\n-                    }),\n+                     /* ~ changed by cargo-mutants ~ */\n                     ..Default::default()\n                 },\n                 move |window, app| {\n                     app.new(|cx| {\n                         let focus_handle = cx.focus_handle();\n                         focus_handle.focus(window);\n                         let mut view = match initial_doc.clone() {\n                             Some((blocks, canon, path)) => {\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "main",
+      "return_type": "",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 7352
+        },
+        "start": {
+          "column": 1,
+          "line": 7122
+        }
+      }
+    },
+    "genre": "StructField",
+    "name": "src/bin/yalda-gpui/main.rs:7197:21: delete field titlebar from struct WindowOptions expression in main",
+    "package": "yalda",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 24,
+        "line": 7200
+      },
+      "start": {
+        "column": 21,
+        "line": 7197
+      }
+    }
+  },
+  {
+    "diff": "--- src/bin/yalda-gpui/main.rs\n+++ delete field title from struct TitlebarOptions expression in main\n@@ -7190,17 +7190,17 @@\n             .open_window(\n                 WindowOptions {\n                     window_bounds: Some(WindowBounds::Windowed(bounds)),\n                     // Titled window so the standard system title bar (with\n                     // close/minimize/maximize buttons AND the resize affordance\n                     // that comes with it) is rendered. Previously `None` →\n                     // chromeless window that couldn't be resized.\n                     titlebar: Some(TitlebarOptions {\n-                        title: Some(\"Yaldabaoth\".into()),\n+                         /* ~ changed by cargo-mutants ~ */\n                         ..Default::default()\n                     }),\n                     ..Default::default()\n                 },\n                 move |window, app| {\n                     app.new(|cx| {\n                         let focus_handle = cx.focus_handle();\n                         focus_handle.focus(window);\n",
+    "file": "src/bin/yalda-gpui/main.rs",
+    "function": {
+      "function_name": "main",
+      "return_type": "",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 7352
+        },
+        "start": {
+          "column": 1,
+          "line": 7122
+        }
+      }
+    },
+    "genre": "StructField",
+    "name": "src/bin/yalda-gpui/main.rs:7198:25: delete field title from struct TitlebarOptions expression in main",
+    "package": "yalda",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 58,
+        "line": 7198
+      },
+      "start": {
+        "column": 25,
+        "line": 7198
+      }
+    }
+  }
+]
