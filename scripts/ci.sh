@@ -12,7 +12,11 @@ cd "$(git rev-parse --show-toplevel)"
 echo "==> cargo build --bins"
 cargo build --bins
 
-echo "==> cargo test"
-cargo test
+echo "==> cargo test --features test-support"
+# test-support gates the in-process transport seam (AcpChannelClient::test_connected,
+# FakeTransport) the REAL-loop harness tests use — the mid-turn m/leader and steering
+# guards. Without the feature those #[cfg(feature="test-support")] tests are compiled
+# out and gate NOTHING. This run is a superset of the default `cargo test`.
+cargo test --features test-support
 
 echo "✓ CI gate passed (build + test)"

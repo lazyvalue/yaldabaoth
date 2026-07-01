@@ -1,0 +1,25 @@
+# cargo-mutants config — the MECHANICAL anti-lying gate.
+#
+# Motivation: a guard test that passes whether or not the code is correct guards
+# nothing (the "green-both-ways" class behind repeated false 'fixed' claims).
+# Mutation testing flips/deletes real code and FAILS if the test suite still
+# passes — a surviving mutant IS an untested line. See docs/dev-system.md
+# "The guard MUST fail without the fix (negative control)".
+#
+# Local full run over the input-routing predicates:
+#   cargo mutants --features test-support
+# CI runs `--in-diff` (only changed lines) so it's fast and only gates NEW code.
+
+test_tool = "cargo"
+
+# The harness that reaches real mid-turn state lives behind `test-support`; without
+# it the guards are compiled out and every mutant trivially "survives".
+additional_cargo_test_args = ["--features", "test-support"]
+
+# The predicates whose zero-coverage produced the mark-chord / leader / worksheet
+# bugs. Scoping keeps a full run tractable; `--in-diff` narrows further per-PR.
+examine_globs = [
+    "src/bin/yalda-gpui/agent.rs",
+    "src/bin/yalda-gpui/agent_ui.rs",
+    "src/bin/yalda-gpui/main.rs",
+]

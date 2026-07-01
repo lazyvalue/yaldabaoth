@@ -38,3 +38,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --features test-support -- -D warnings
+
+  # ── Mutation gate (the mechanical anti-lying enforcement) ────────────────────
+  # Mutation-tests ONLY the lines a PR changes in the input-routing predicates
+  # (mutants.toml scopes the files; `--in-diff` scopes to the diff). A surviving
+  # mutant = changed code a test does not actually constrain = the "green-both-ways"
+  # class that let four fixes ship broken. PR-only (needs a base to diff against);
+  # `--in-diff` means it never fails on pre-existing survivors, only on NEW gaps.
+  mutation-gate:
+    if: github.event_name == 'pull_request'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need the base ref to compute the diff
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-mutants --locked
+      - name: Mutation-test the changed lines
+        run: |
+          git diff "origin/${{ github.base_ref }}...HEAD" > /tmp/pr.diff
+          if grep -qE '^\+\+\+ b/src/bin/yalda-gpui/(agent|agent_ui|main)\.rs' /tmp/pr.diff; then
+            cargo mutants --in-diff /tmp/pr.diff --features test-support
+          else
+            echo "No changes to the gated predicates — mutation gate skipped."
+          fi

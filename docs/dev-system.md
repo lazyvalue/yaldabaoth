@@ -132,6 +132,26 @@ Protocol for any bug fix (not just UX):
 Toggling the fix off to confirm the guard flips red costs one `cargo test` run.
 Skipping it has cost multiple false "done" reports. Always pay the one run.
 
+**Mechanically enforced (you can't rely on remembering the above):**
+
+1. **Mutation gate** — `mutants.toml` scopes cargo-mutants to the input-routing
+   predicates (`agent.rs`/`agent_ui.rs`/`main.rs`); the `mutation-gate` CI job runs
+   `cargo mutants --in-diff` on every PR, so any *changed* line those tests don't
+   actually constrain (a surviving mutant) fails the build. Local full run:
+   `cargo mutants --features test-support`. This is the machine version of the
+   negative-control rule — it caught that `try_start_mark_chord` /
+   `focused_in_insert_mode` / `inline_you_block_active` had ~zero real coverage.
+2. **The feature must be ON in CI** — `scripts/ci.sh` runs `cargo test --features
+   test-support`. The real-loop harness (`AcpChannelClient::test_connected`, the
+   seam that reaches genuine mid-turn state) is behind `test-support`; without the
+   flag those guards compile out and gate nothing.
+3. **Fixes live on `main`, not a branch** — the recurring "you said you fixed it"
+   root cause was fixes committed to feature branches (e.g. the mid-turn-`m` fix
+   stranded on `jump-pane-nav`) and never merged; the user runs `main`. A fix isn't
+   done until its guard is green *on main* (CI runs on push to main). Check for
+   stranded work with `git for-each-ref --format='%(refname:short)' refs/heads |
+   while read b; do echo "$b: $(git rev-list --count main..$b)"; done`.
+
 What exists to build on:
 - The headless GPUI harness (`verify_harness.rs`, `cargo test --bin yalda-gpui`).
 - Server-side fakes (`FakeTransport`/`FakeAgentSpawner`, phase 6) +
