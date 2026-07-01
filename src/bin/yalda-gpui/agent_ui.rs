@@ -1383,6 +1383,9 @@ impl YaldaGpuiView {
             focused_subagent: None,
             tasklist_open: false,
             subagents_open: false,
+            panel_col: PanelColumn::Tasklist,
+            panel_sel: 0,
+            panel_return_focus: AgentFocus::Compose,
             server_managed: false,
             reconciler: yalda::agent_transcript::UserTurnReconciler::new(),
             user_turn_ks: std::collections::HashSet::new(),
@@ -3123,18 +3126,23 @@ impl YaldaGpuiView {
     /// only the editable runs between/after frozen Claude turns) as the
     /// next ACP prompt, then lock the turn so that content can't be
     /// retroactively edited.
-    /// Toggle the Tasklist sidebar visibility (§24).
+    /// Toggle the Tasklist (Plan) bottom panel (§24). If this closes the last
+    /// open panel while it holds focus, leave panel focus (INV-UX-12: you can't
+    /// be panel-focused with no panel open).
     pub(crate) fn toggle_tasklist(&mut self, cx: &mut Context<Self>) {
         if let Some(mut c) = self.agent_mut(cx) {
             c.tasklist_open = !c.tasklist_open;
+            c.reseat_panel_focus();
         }
         cx.notify();
     }
 
-    /// Toggle the Subagents sidebar visibility (§28).
+    /// Toggle the Subagents bottom panel (§28). Mirrors `toggle_tasklist`'s
+    /// re-seat of panel focus when the active column closes (INV-UX-12).
     pub(crate) fn toggle_subagents(&mut self, cx: &mut Context<Self>) {
         if let Some(mut c) = self.agent_mut(cx) {
             c.subagents_open = !c.subagents_open;
+            c.reseat_panel_focus();
         }
         cx.notify();
     }
@@ -3159,6 +3167,117 @@ impl YaldaGpuiView {
             c.focused_subagent = None;
         }
         cx.notify();
+    }
+
+    /// Enter or leave the focused bottom-panel region (Cmd-0, INV-UX-12).
+    /// Toggle: already focused → exit (restore prior focus); otherwise focus it
+    /// iff at least one column has a selectable row, landing on the first such
+    /// column (Plan, else Subagents) and remembering the prior focus so `Esc`
+    /// can restore it. No-op (with a hint) when nothing is open to focus.
+    pub(crate) fn focus_agent_panel(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut c) = self.agent_mut(cx) {
+            if c.focus == AgentFocus::Panel {
+                c.focus = c.panel_return_focus;
+            } else {
+                let cols = c.panel_open_columns();
+                if cols.is_empty() {
+                    c.status = Some("no panel to focus — open Plan/Subagents".into());
+                } else {
+                    c.panel_return_focus = c.focus;
+                    c.focus = AgentFocus::Panel;
+                    if !cols.contains(&c.panel_col) {
+                        c.panel_col = cols[0];
+                    }
+                    let n = c.panel_column_rows(c.panel_col).len();
+                    if c.panel_sel >= n {
+                        c.panel_sel = n.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Leave panel focus, restoring the focus captured on entry (Esc). No-op if
+    /// not currently panel-focused.
+    pub(crate) fn exit_agent_panel(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut c) = self.agent_mut(cx)
+            && c.focus == AgentFocus::Panel
+        {
+            c.focus = c.panel_return_focus;
+        }
+        cx.notify();
+    }
+
+    /// Move the selection by `delta` rows WITHIN the active column (vim `j`/`k`,
+    /// arrows), clamped. No-op unless panel-focused with rows present.
+    pub(crate) fn panel_move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(mut c) = self.agent_mut(cx)
+            && c.focus == AgentFocus::Panel
+        {
+            let n = c.panel_column_rows(c.panel_col).len();
+            if n > 0 {
+                let cur = c.panel_sel.min(n - 1) as isize;
+                c.panel_sel = (cur + delta).clamp(0, n as isize - 1) as usize;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Switch the active column (vim `h` = left/Tasklist, `l` = right/Subagents)
+    /// to the adjacent OPEN column in `dir` (-1 left / +1 right), clamping the
+    /// row into the new column. No-op if there is no such column.
+    pub(crate) fn panel_switch_column(&mut self, dir: isize, cx: &mut Context<Self>) {
+        if let Some(mut c) = self.agent_mut(cx)
+            && c.focus == AgentFocus::Panel
+        {
+            let cols = c.panel_open_columns();
+            if let Some(pos) = cols.iter().position(|&col| col == c.panel_col) {
+                let np = pos as isize + dir;
+                if np >= 0 && (np as usize) < cols.len() {
+                    c.panel_col = cols[np as usize];
+                    let n = c.panel_column_rows(c.panel_col).len();
+                    if c.panel_sel >= n {
+                        c.panel_sel = n.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Jump the selection to the first (`g`) or last (`G`) row of the active
+    /// column.
+    pub(crate) fn panel_select_end(&mut self, last: bool, cx: &mut Context<Self>) {
+        if let Some(mut c) = self.agent_mut(cx)
+            && c.focus == AgentFocus::Panel
+        {
+            let n = c.panel_column_rows(c.panel_col).len();
+            if n > 0 {
+                c.panel_sel = if last { n - 1 } else { 0 };
+            }
+        }
+        cx.notify();
+    }
+
+    /// Activate the selected row of the active column (`Enter`). A Subagent row
+    /// focuses that subagent's output and leaves panel focus; a Plan row has no
+    /// jump target today (a no-op, selection stays).
+    pub(crate) fn panel_activate_selection(&mut self, cx: &mut Context<Self>) {
+        let item = self
+            .agent_read(cx, |c| {
+                let rows = c.panel_column_rows(c.panel_col);
+                if rows.is_empty() {
+                    None
+                } else {
+                    rows.get(c.panel_sel.min(rows.len() - 1)).cloned()
+                }
+            })
+            .flatten();
+        if let Some(PanelItem::Subagent(key)) = item {
+            self.focus_subagent(key, cx);
+            self.exit_agent_panel(cx);
+        }
     }
 
     /// Flip the agent window's input mode (§5). Data movement is
@@ -3257,6 +3376,11 @@ impl YaldaGpuiView {
                     } else if !claude.turn_phase.is_awaiting() {
                         claude.open_you_block_at_cursor();
                     }
+                }
+                AgentFocus::Panel => {
+                    // Reachable only if a focus toggle races panel mode; treat it
+                    // as leaving the panel back to the captured focus.
+                    claude.focus = claude.panel_return_focus;
                 }
             }
         });
@@ -3793,6 +3917,32 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
+
+        // Panel focus (Cmd-0, INV-UX-12) is MODAL: while the bottom-panel region
+        // holds focus, vim keys move the selection and everything else is inert
+        // (no leaders, no compose typing) until `Esc` / `Enter` leaves it. Checked
+        // before the leaders so `j`/`k` navigate rows instead of opening menus.
+        if self
+            .agent_read(cx, |c| c.focus == AgentFocus::Panel)
+            .unwrap_or(false)
+        {
+            if press.modifiers.is_empty() {
+                match press.key {
+                    Key::Esc => self.exit_agent_panel(cx),
+                    Key::Enter => self.panel_activate_selection(cx),
+                    Key::Down | Key::Char('j') => self.panel_move_selection(1, cx),
+                    Key::Up | Key::Char('k') => self.panel_move_selection(-1, cx),
+                    Key::Left | Key::Char('h') => self.panel_switch_column(-1, cx),
+                    Key::Right | Key::Char('l') => self.panel_switch_column(1, cx),
+                    Key::Char('g') => self.panel_select_end(false, cx),
+                    Key::Char('G') => self.panel_select_end(true, cx),
+                    _ => {}
+                }
+            }
+            // Modal: consume every key (Cmd-bound actions still dispatch via
+            // `on_action`, which is a separate path from this on_key_down).
+            return;
+        }
 
         // Universal leaders: when NOT in text entry (worksheet/chatbox Normal),
         // `<space>`/`.`/`?` open the menus with top priority.

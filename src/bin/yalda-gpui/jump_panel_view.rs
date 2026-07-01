@@ -46,6 +46,43 @@ pub(crate) struct AgentRow {
     /// The agent subprocess is live (from the roster's `connected`); local-only
     /// pre-attach sessions are treated as connected.
     pub(crate) connected: bool,
+    /// Per-session turn activity, when this GUI has the session open (in
+    /// `self.sessions`): `Some(true)` = a reply is in flight (**working**),
+    /// `Some(false)` = the turn finished and it's the user's move (**waiting for
+    /// you**). `None` = roster-only (running on the server but never opened
+    /// here), so the phase is unknown and the dot stays neutral. Drives the
+    /// status-dot color in `render_jump_panel`.
+    pub(crate) awaiting: Option<bool>,
+}
+
+/// The semantic meaning of an agent row's status dot — the color the dot takes
+/// is a pure function of `(connected, awaiting)`. Split out from the render so
+/// the mapping is unit-testable headlessly (the actual hue is a paint detail).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AgentDotStatus {
+    /// A reply is in flight — the agent is busy. Warm accent.
+    Working,
+    /// The turn finished; it's the user's move. Green.
+    WaitingForYou,
+    /// Phase unknown (roster-only, not open here) or the agent is disconnected.
+    /// Dim chrome color.
+    Neutral,
+}
+
+impl AgentRow {
+    /// Map this row to its status-dot meaning (INV-UX-10). Disconnected wins
+    /// (nothing is happening); otherwise a known phase chooses working vs your-
+    /// turn, and an unknown phase stays neutral.
+    pub(crate) fn dot_status(&self) -> AgentDotStatus {
+        if !self.connected {
+            return AgentDotStatus::Neutral;
+        }
+        match self.awaiting {
+            Some(true) => AgentDotStatus::Working,
+            Some(false) => AgentDotStatus::WaitingForYou,
+            None => AgentDotStatus::Neutral,
+        }
+    }
 }
 
 impl YaldaGpuiView {
@@ -63,17 +100,22 @@ impl YaldaGpuiView {
             let bound = bound_sids.contains(&info.session_id);
             // Prefer the live store label if this session is opened here (kept in
             // sync by SessionRenamed either way, but the entity is authoritative).
-            let label = self
+            // The same lookup tells us the turn phase (working vs your-turn) when
+            // it's open; roster-only sessions have no local phase (`None`).
+            let opened = self
                 .sessions
                 .locate(&info.session_id)
-                .and_then(|id| self.sessions.get(id))
+                .and_then(|id| self.sessions.get(id));
+            let label = opened
                 .map(|e| e.read(cx).label.clone())
                 .unwrap_or_else(|| info.label.clone());
+            let awaiting = opened.map(|e| e.read(cx).state.turn_phase.is_awaiting());
             rows.push(AgentRow {
                 target: JumpTarget::Roster(info.session_id.clone()),
                 label,
                 bound,
                 connected: info.connected,
+                awaiting,
             });
         }
 
@@ -90,6 +132,7 @@ impl YaldaGpuiView {
                 label: ent.read(cx).label.clone(),
                 bound: self.agent_tile_id_bound_to(id).is_some(),
                 connected: true,
+                awaiting: Some(ent.read(cx).state.turn_phase.is_awaiting()),
             });
         }
         rows
@@ -117,6 +160,9 @@ impl YaldaGpuiView {
         sel_bg.a = 0.18;
         let panel_bg = self.editor_bg();
         let border = st.dim;
+        // "Waiting for you" status-dot color (turn finished, your move). The
+        // tool-completed green reads as ready/done across both themes.
+        let ready = nc(self.theme.agent.tool_completed);
 
         // Snapshot the rows up-front (releases the session-entity reads before we
         // wire listeners). Workspaces: non-ephemeral tabs, active marked.
@@ -161,13 +207,19 @@ impl YaldaGpuiView {
         );
 
         // ── Workspaces ───────────────────────────────────────────────────────
+        // The badge shows the 1-based workspace number — the same digit that
+        // `ctrl-<n>` switches to (`goto_workspace_number`). Non-ephemeral tabs
+        // occupy indices `0..N` contiguously (ephemeral virtual workspaces sort
+        // last; see the goto-workspace menu), so `idx + 1` is a stable number.
         col = col.child(section_heading("Workspaces", &st).px_3());
         for (idx, label, active) in workspaces {
             let row_id = SharedString::from(format!("jump-ws-{idx}"));
+            let num = format!("{}", idx + 1);
             col = col.child(
-                jump_nav_row(row_id, &label, active, active, None, &st, sel_bg).on_click(
-                    cx.listener(move |this, _ev, _window, cx| this.select_tab(idx, cx)),
-                ),
+                jump_nav_row(row_id, &label, active, active, Some(&num), None, &st, sel_bg)
+                    .on_click(
+                        cx.listener(move |this, _ev, _window, cx| this.select_tab(idx, cx)),
+                    ),
             );
         }
 
@@ -186,12 +238,32 @@ impl YaldaGpuiView {
         }
         for (i, row) in rows.into_iter().enumerate() {
             // Bound (in-use) sessions jump to their existing tile; free ones
-            // open in an ephemeral virtual workspace. ● = in use, ○ = free; a
-            // disconnected (agent not running) session is dimmed.
+            // open in an ephemeral virtual workspace. ● = in use, ○ = free.
+            //
+            // The dot's COLOR is a per-session status light (universal-agent-list
+            // gives the row; the open session gives the phase):
+            //   • working (a reply is in flight)      → warm accent (`st.accent`)
+            //   • waiting for you (turn finished, idle) → green   (`ready`)
+            //   • unknown phase (roster-only, not open here) or disconnected → dim
+            // A disconnected session is also dimmed wholesale (the label too).
             let badge = if row.bound { "●" } else { "○" };
+            let badge_color = match row.dot_status() {
+                AgentDotStatus::Working => st.accent,
+                AgentDotStatus::WaitingForYou => ready,
+                AgentDotStatus::Neutral => st.dim,
+            };
             let row_id = SharedString::from(format!("jump-sess-{i}"));
             let target = row.target.clone();
-            let mut r = jump_nav_row(row_id, &row.label, false, false, Some(badge), &st, sel_bg);
+            let mut r = jump_nav_row(
+                row_id,
+                &row.label,
+                false,
+                false,
+                Some(badge),
+                Some(badge_color),
+                &st,
+                sel_bg,
+            );
             if !row.connected {
                 r = r.text_color(st.dim);
             }
@@ -208,6 +280,8 @@ impl YaldaGpuiView {
 /// `selected`. Returns a `Stateful<Div>` (has an `id`, so it supports
 /// `hover`/`on_click`); the caller attaches the click listener. `accent_text`
 /// draws the label in the accent color (used to mark the active workspace).
+/// `badge_color` colors the leading badge cell (a status light for agent rows);
+/// `None` falls back to the dim chrome color (workspace numbers).
 #[allow(clippy::too_many_arguments)]
 fn jump_nav_row(
     id: impl Into<ElementId>,
@@ -215,6 +289,7 @@ fn jump_nav_row(
     selected: bool,
     accent_text: bool,
     badge: Option<&str>,
+    badge_color: Option<Hsla>,
     st: &DetailStyle,
     sel_bg: Hsla,
 ) -> gpui::Stateful<gpui::Div> {
@@ -240,9 +315,9 @@ fn jump_nav_row(
         .hover(|s| s.bg(sel_bg))
         .child(
             div()
-                .w(px(12.0))
+                .w(px(16.0))
                 .flex_none()
-                .text_color(st.dim)
+                .text_color(badge_color.unwrap_or(st.dim))
                 .child(SharedString::from(badge.unwrap_or("").to_string())),
         )
         .child(

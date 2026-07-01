@@ -281,6 +281,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_jump_panel))
+            .workspace_nav(cx)
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
             .child(header)
@@ -450,6 +451,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::clear_tag_view))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_jump_panel))
+            .workspace_nav(cx)
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
             .child(header)
@@ -1454,36 +1456,58 @@ impl YaldaGpuiView {
             )
         };
 
-        // ---- Right-side sidebars (Tasklist / Subagents) ----
+        // ---- Bottom panels (Tasklist / Subagents) ----
         //
-        // Stacked horizontally in fixed order (Tasklist innermost, then
-        // Subagents) per spec §2. Each tile is a fixed 28-char column;
-        // the transcript area's flex-1 shrinks to make room. Tiles only
-        // render when their `*_open` flag is true.
-        let sidebar_width = px(28.0 * 7.0); // ~28 monospace cols at 13px = ~196px
+        // Two side-by-side COLUMNS above the compose: **Plan on the LEFT**,
+        // **Subagents on the RIGHT** (INV-UX-12). Each renders only when its
+        // `*_open` flag is true (and Subagents only when non-empty); with one
+        // open it fills the width. Panel focus (Cmd-0) enlarges the region;
+        // `h`/`l` switch the focused column, `j`/`k` move the row within it.
         let sidebar_border: Hsla = nc(at.sidebar_border);
         let sidebar_header_fg: Hsla = nc(at.sidebar_header);
         let sidebar_dim_fg: Hsla = nc(at.dim);
         let sidebar_bg: Hsla = nc(at.sidebar_bg);
 
-        let tasklist_sidebar = if c.tasklist_open {
-            let mut tile = div()
-                .id("tasklist-sidebar")
+        let panel_focused = c.focus == AgentFocus::Panel;
+        let panel_col = c.panel_col;
+        let panel_sel = c.panel_sel;
+        let panel_max_h = if panel_focused { px(360.0) } else { px(132.0) };
+        let focus_border: Hsla = nc(at.warm_accent);
+        let panel_transparent: Hsla = gpui::hsla(0.0, 0.0, 0.0, 0.0);
+        let sel_bg: Hsla = {
+            let mut a = nc(at.warm_accent);
+            a.a = 0.20;
+            a
+        };
+        // A column is "lit" (border-accent + selection-bearing) only while the
+        // whole region holds focus AND it is the active column.
+        let subagents_shown = c.subagents_open && !c.subagents().is_empty();
+        let both_columns = c.tasklist_open && subagents_shown;
+        let tasklist_lit = panel_focused && panel_col == PanelColumn::Tasklist;
+        let subagents_lit = panel_focused && panel_col == PanelColumn::Subagents;
+
+        // Tasklist (Plan) column — LEFT. One row per plan entry: glyph + content.
+        let tasklist_col: Option<gpui::AnyElement> = if c.tasklist_open {
+            let mut panel = div()
+                .id("tasklist-panel")
                 .flex()
                 .flex_col()
-                .w(sidebar_width)
-                .min_w(sidebar_width)
-                .flex_none()
-                .bg(sidebar_bg)
-                .border_l_1()
-                .border_color(sidebar_border)
+                .flex_1()
+                .min_w_0()
+                .gap(px(1.0))
+                .px_2()
                 .py_1()
-                .text_size(px(12.0))
+                .max_h(panel_max_h)
+                .overflow_y_scroll()
+                .border_t_1()
+                .border_color(if tasklist_lit { focus_border } else { sidebar_border })
+                .bg(sidebar_bg)
+                .text_size(px(11.0))
                 .font_family(self.code_font.clone());
-            tile = tile.child(
+            panel = panel.child(
                 div()
-                    .px_2()
-                    .py_1()
+                    .px_1()
+                    .py(px(1.0))
                     .text_color(sidebar_header_fg)
                     .font_weight(FontWeight::BOLD)
                     .child(SharedString::new_static("Plan")),
@@ -1491,54 +1515,66 @@ impl YaldaGpuiView {
             match &c.current_plan {
                 Some(plan) if !plan.entries.is_empty() => {
                     use yalda::acp_channel::PlanEntryStatus;
-                    for entry in &plan.entries {
-                        let glyph: &'static str = match entry.status {
-                            PlanEntryStatus::Completed => "✓",
-                            PlanEntryStatus::InProgress => "●",
-                            PlanEntryStatus::Pending => "○",
-                            // ACP marks the enum #[non_exhaustive]; a
-                            // future "failed" or similar status falls
-                            // back to a clear indicator (§22).
-                            _ => "✗",
+                    for (i, entry) in plan.entries.iter().enumerate() {
+                        let (glyph, glyph_fg): (&'static str, Hsla) = match entry.status {
+                            PlanEntryStatus::Completed => ("✓", nc(at.tool_completed)),
+                            PlanEntryStatus::InProgress => ("●", nc(at.tool_in_progress)),
+                            PlanEntryStatus::Pending => ("○", nc(at.tool_pending)),
+                            // ACP marks the enum #[non_exhaustive]; a future
+                            // "failed" or similar status falls back clearly (§22).
+                            _ => ("✗", nc(at.tool_failed)),
                         };
-                        let line_text = if entry.content.chars().count() > 22 {
-                            let truncated: String = entry.content.chars().take(21).collect();
-                            format!("{}  {}…", glyph, truncated)
-                        } else {
-                            format!("{}  {}", glyph, entry.content)
-                        };
-                        tile = tile.child(
+                        // Each column has its own 0-based row index (`panel_sel`).
+                        let selected = tasklist_lit && panel_sel == i;
+                        panel = panel.child(
                             div()
-                                .px_2()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .w_full()
+                                .min_w_0()
+                                .px_1()
                                 .py(px(1.0))
-                                .text_color(rgb(DEFAULT_FG))
-                                .child(SharedString::from(line_text)),
+                                .bg(if selected { sel_bg } else { panel_transparent })
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(glyph_fg)
+                                        .child(SharedString::new_static(glyph)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_color(rgb(DEFAULT_FG))
+                                        .child(SharedString::from(entry.content.clone())),
+                                ),
                         );
                     }
                 }
                 _ => {
-                    tile = tile.child(
+                    panel = panel.child(
                         div()
-                            .px_2()
+                            .px_1()
                             .py_1()
                             .text_color(sidebar_dim_fg)
                             .child(SharedString::new_static("(no plan)")),
                     );
                 }
             }
-            Some(tile)
+            Some(probe_bounds("tasklist-panel", panel.into_any_element()))
         } else {
             None
         };
 
-        // Subagent (Task) list — one row per subagent, rendered ABOVE the compose
-        // box (status glyph + label + spawn-prompt snippet; not cards). Clicking a
-        // row focuses the subagent (swaps the transcript to its output —
-        // `focus_subagent`). Auto-shown when subagents exist; Cmd-2
-        // (ToggleSubagents) collapses them.
-        let subagent_panes: Option<gpui::AnyElement> = {
+        // Subagents column — RIGHT. One row per subagent (glyph + label + spawn-
+        // prompt snippet; not cards). Clicking a row focuses the subagent (swaps
+        // the transcript to its output — `focus_subagent`). A left border divides
+        // it from the Plan column when both are shown.
+        let subagent_col: Option<gpui::AnyElement> = {
             let subagents = c.subagents();
-            if !c.subagents_open || subagents.is_empty() {
+            if !subagents_shown {
                 None
             } else {
                 use yalda::acp_channel::ToolCallStatus;
@@ -1548,19 +1584,32 @@ impl YaldaGpuiView {
                     .id("subagent-panes")
                     .flex()
                     .flex_col()
-                    .w_full()
+                    .flex_1()
                     .min_w_0()
                     .gap_1()
                     .px_2()
                     .py_1()
-                    .max_h(px(132.0))
+                    .max_h(panel_max_h)
                     .overflow_y_scroll()
                     .border_t_1()
-                    .border_color(sidebar_border)
+                    .border_color(if subagents_lit { focus_border } else { sidebar_border })
                     .bg(sidebar_bg)
                     .text_size(px(11.0))
                     .font_family(self.code_font.clone());
+                if both_columns {
+                    strip = strip.border_l_1();
+                }
+                strip = strip.child(
+                    div()
+                        .px_1()
+                        .py(px(1.0))
+                        .text_color(sidebar_header_fg)
+                        .font_weight(FontWeight::BOLD)
+                        .child(SharedString::new_static("Subagents")),
+                );
                 for (i, sa) in subagents.iter().enumerate() {
+                    // Each column has its own 0-based row index (`panel_sel`).
+                    let selected = subagents_lit && panel_sel == i;
                     let glyph: &'static str = match sa.status {
                         ToolCallStatus::Completed => "✓",
                         ToolCallStatus::Failed => "✗",
@@ -1603,6 +1652,7 @@ impl YaldaGpuiView {
                         .min_w_0()
                         .px_1()
                         .py(px(1.0))
+                        .bg(if selected { sel_bg } else { panel_transparent })
                         .cursor_pointer();
                     let weak = weak_self.clone();
                     let row_key = sa.tool_call_id.clone();
@@ -1641,7 +1691,23 @@ impl YaldaGpuiView {
             }
         };
 
-        let mut transcript_row = div().flex().flex_row().flex_1().min_h_0().child(
+        // Combine the columns into one side-by-side row above the compose.
+        let bottom_panels: Option<gpui::AnyElement> = if tasklist_col.is_some()
+            || subagent_col.is_some()
+        {
+            let mut rowp = div().flex().flex_row().w_full().min_w_0();
+            if let Some(t) = tasklist_col {
+                rowp = rowp.child(t);
+            }
+            if let Some(s) = subagent_col {
+                rowp = rowp.child(s);
+            }
+            Some(rowp.into_any_element())
+        } else {
+            None
+        };
+
+        let transcript_row = div().flex().flex_row().flex_1().min_h_0().child(
             div()
                 .flex()
                 .flex_col()
@@ -1653,9 +1719,6 @@ impl YaldaGpuiView {
                 // gives the cached slot real bounds to fill (size-from-style).
                 .child(transcript_body),
         );
-        if let Some(p) = tasklist_sidebar {
-            transcript_row = transcript_row.child(p);
-        }
 
         let mut col = div()
             .flex()
@@ -1664,9 +1727,10 @@ impl YaldaGpuiView {
             .min_w_0()
             .min_h_0()
             .child(transcript_row);
-        // Subagent (Task) list sits ABOVE the compose, one per line.
-        if let Some(panes) = subagent_panes {
-            col = col.child(panes);
+        // Bottom panels sit above the compose: Plan (left) + Subagents (right)
+        // side by side in one row.
+        if let Some(panels) = bottom_panels {
+            col = col.child(panels);
         }
         if let Some(panel) = compose_panel {
             col = col.child(panel);
@@ -1703,6 +1767,9 @@ impl YaldaGpuiView {
             .on_action(cx.listener(|this, _: &ToggleSubagents, _w, cx| {
                 this.toggle_subagents(cx);
             }))
+            .on_action(cx.listener(|this, _: &FocusAgentPanel, _w, cx| {
+                this.focus_agent_panel(cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleAgentInputMode, _w, cx| {
                 this.toggle_agent_input_mode(cx);
             }))
@@ -1715,6 +1782,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::focus_prev))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_jump_panel))
+            .workspace_nav(cx)
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
             // Layout patterns
@@ -1859,6 +1927,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::focus_prev))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_jump_panel))
+            .workspace_nav(cx)
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
             .on_action(cx.listener(Self::cycle_layout_mode))
@@ -2373,6 +2442,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::focus_prev))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
             .on_action(cx.listener(Self::toggle_jump_panel))
+            .workspace_nav(cx)
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
             // Layout patterns

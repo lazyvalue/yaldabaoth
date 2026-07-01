@@ -265,6 +265,7 @@ impl TranscriptView {
             frozen_fg_u32,
             syntect_hl,
             show_heading_markers,
+            text_scale,
         } = {
             let root = root_ent.read(cx);
             RootSnapshot {
@@ -278,6 +279,7 @@ impl TranscriptView {
                 frozen_fg_u32: ncolor_to_u32(root.theme.agent.frozen_fg, DEFAULT_FG),
                 syntect_hl: root.syntect_hl.clone(),
                 show_heading_markers: root.show_agent_heading_markers,
+                text_scale: root.text_scale,
             }
         };
 
@@ -684,6 +686,12 @@ impl TranscriptView {
                             .w_full()
                             .py(px(2.0))
                             .bg(row_bg)
+                            // INV-UX-13: scale the conversation prose on the line's
+                            // own wrapper (the `claude-body` ambient does NOT reach
+                            // across the `gpui::list` item boundary — the working
+                            // doc/WP views set the size on each line wrapper too).
+                            // The fixed-size gutter child below overrides this.
+                            .text_size(px(13.0 * text_scale))
                             .text_color(line_text_color)
                             .child(
                                 div()
@@ -696,7 +704,15 @@ impl TranscriptView {
                                     .child(label_text),
                             )
                             .child(div().w(px(3.0)).flex_none().bg(bar_color).mr_2())
-                            .child(content)
+                            // Probe the FIRST line's painted content so the harness
+                            // can prove the prose height grows with zoom (INV-UX-13)
+                            // — turning the font-px check from a human gap into a
+                            // headless guard (`transcript_prose_scales_with_zoom`).
+                            .child(if line_idx == 0 {
+                                crate::probe_bounds("transcript-line0", content)
+                            } else {
+                                content
+                            })
                             .into_any_element()
                     }
                     FlatItem::ToolGroup { anchor_line, ids } => {
@@ -863,7 +879,9 @@ impl TranscriptView {
                             theme: &theme_snap,
                             body_font: body_font_snap.clone(),
                             code_font: code_font_snap.clone(),
-                            text_scale: 1.0,
+                            // INV-UX-13: markdown blocks (headings/code/tables) in
+                            // the transcript scale with zoom, like the doc view.
+                            text_scale,
                             cursor_block: None,
                             doc_selection: None,
                             line_layouts: None,
@@ -1122,7 +1140,9 @@ impl TranscriptView {
             .min_h_0()
             .px_6()
             .py_3()
-            .text_size(px(13.0))
+            // INV-UX-13: the conversation prose scales with document zoom (the
+            // FlatItem::Line rows inherit this base size); chrome keeps fixed px.
+            .text_size(px(13.0 * text_scale))
             .font_family(code_font.clone())
             .text_color(editor_fg)
             .child(
@@ -1150,6 +1170,13 @@ struct RootSnapshot {
     /// `notify_transcript_views`, so it busts the cache without a per-session
     /// seq. Threaded into the `FlatItem::Block` `RenderCtx`.
     show_heading_markers: bool,
+    /// Document text-zoom multiplier (INV-UX-13). GLOBAL, not session state;
+    /// pushed via `notify_transcript_views(TextStyle)` on every zoom change, so
+    /// it busts the cache without a per-session seq. Multiplies the transcript's
+    /// conversation prose + markdown-block sizes, the same way the buffer doc
+    /// view scales. Chrome (gutter, tool/turn labels) and the fixed-geometry
+    /// compose input (its own pinned caret/line-box) stay at native size.
+    text_scale: f32,
 }
 
 /// Everything the row-render closure + reconcile/reveal consume, computed inside
