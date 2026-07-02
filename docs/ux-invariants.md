@@ -454,10 +454,15 @@ agent tile `Cmd-0` enters **panel focus**: the region enlarges and one row in on
 column is selected. Selection is **2-D** — `panel_col` (which column) + `panel_sel`
 (the row WITHIN that column). `h`/`←` and `l`/`→` switch the active column to the
 adjacent **open** column (clamping the row into it); `j`/`k`/`↑`/`↓` move the row
-within the active column (clamped); `g`/`G` jump to its ends. `Enter` activates the
-selected row (a Subagent row focuses its output and leaves panel focus; a Plan row
-has no target yet). `Esc` leaves panel focus, **restoring the focus captured on
-entry** (`panel_return_focus`). The mode is **modal** — while focused, other keys
+within the active column (clamped); `g`/`G` jump to its ends. **Highlighting a row
+live-previews it in the transcript**: the transcript scrolls to the row's target
+line and, for a Subagent, its focused-subagent breadcrumb lights (entering the panel
+previews the first row too). A Subagent's target is its tool-call's anchor line
+(precise); a Plan row's target is the plan's **announce anchor** — the transcript
+tail captured when the plan last updated (plan entries carry no per-step position, so
+all plan rows share it). `Enter` **activates** the selected row: it reveals it (jump)
+and then leaves panel focus so the revealed line is readable. `Esc` leaves panel
+focus, **restoring the focus captured on entry** (`panel_return_focus`). The mode is **modal** — while focused, other keys
 are inert (no leaders, no compose typing). You can never be panel-focused with no
 focusable column: entering requires a column with ≥1 row (lands on the leftmost
 such), and closing the active column **re-seats** to another open column or exits if
@@ -466,18 +471,25 @@ none remain. In an agent tile `Cmd-0` is panel-focus, **not** zoom-reset (the
 GPUI's most-recent-first match prefers it); elsewhere `Cmd-0` still resets zoom.
 
 **Applies to.** `agent.rs`: `AgentFocus::Panel`, `PanelColumn`, `PanelItem`,
-`panel_column_rows` / `panel_open_columns` / `reseat_panel_focus`, the `panel_col` /
-`panel_sel` / `panel_return_focus` state. `agent_ui.rs`: `focus_agent_panel` /
+`panel_column_rows` / `panel_open_columns` / `reseat_panel_focus` /
+`panel_item_reveal_line`, the `panel_col` / `panel_sel` / `panel_return_focus` /
+`pending_reveal_line` / `plan_anchor` state. `agent_ui.rs`: `focus_agent_panel` /
 `exit_agent_panel` / `panel_move_selection` / `panel_switch_column` /
-`panel_select_end` / `panel_activate_selection`, the modal interception at the top
-of `handle_claude_key`, and the re-seat in `toggle_tasklist` / `toggle_subagents`.
+`panel_select_end` / `panel_activate_selection` / `reveal_panel_selection`, the
+`plan_anchor` capture at `PlanUpdated`, the modal interception at the top of
+`handle_claude_key`, and the re-seat in `toggle_tasklist` / `toggle_subagents`.
+`transcript_view.rs`: `pending_reveal_line` consumed in `build_body` (→
+`item_for_line` → `scroll_to_reveal_item`), covered by the `pending_panel_reveal`
+seq.
 `main.rs`: the `FocusAgentPanel` action + `cmd-0` `AgentView` binding.
 `screens.rs::render_agent`: the two-column layout + enlarge + per-column selection
 highlight + `FocusAgentPanel` `on_action`.
 
 **Why.** Keyboard-drive the bottom panels (jump to a subagent's output) without a
 mouse, with a clear enter/navigate/exit gesture that always returns you where you
-were; the column split keeps Plan and Subagents side by side.
+were; the column split keeps Plan and Subagents side by side. Live-reveal makes
+highlighting *do* something — you scan the panel and the transcript follows — rather
+than a bare selection with no feedback until Enter.
 
 **Status:** `honored` (headless; exact enlarge px / highlight color are gap-1).
 
@@ -485,8 +497,12 @@ were; the column split keeps Plan and Subagents side by side.
 `agent_panel_vim_moves_selection`, `agent_panel_hl_switches_columns`,
 `agent_panel_enter_focuses_subagent`, `agent_panel_cmd0_binding_enters_panel` (real
 keymap dispatch proves the AgentView binding shadows zoom-reset),
-`agent_panel_closing_last_panel_exits_focus`, plus the state-machine fuzzer ops +
-oracle (`focus ∈ {Compose,Transcript,Panel}`, panel-focused ⇒ a panel is open).
+`agent_panel_closing_last_panel_exits_focus`,
+`panel_highlight_reveals_subagent_in_transcript` (highlight queues a scroll to the
+subagent line + sets the breadcrumb; the transcript build consumes it),
+`panel_enter_reveals_and_exits` (Enter leaves panel focus), plus the state-machine
+fuzzer ops + oracle (`focus ∈ {Compose,Transcript,Panel}`, panel-focused ⇒ a panel
+is open).
 
 ### INV-UX-13 — Document text zoom scales the agent transcript, like a buffer
 

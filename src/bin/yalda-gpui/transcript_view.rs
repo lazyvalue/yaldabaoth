@@ -74,6 +74,10 @@ pub(crate) struct TranscriptSeqs {
     /// the ordinal to a flat-item index and scrolls. `is_some()` ⇒ a jump is
     /// queued.
     pub(crate) pending_jump: bool,
+    /// Panel reveal intent (highlight / Enter on a Subagent or Plan row). Like
+    /// `pending_jump`: a queued reveal must re-render so build_body resolves the
+    /// target line to a flat-item index and scrolls. `is_some()` ⇒ queued.
+    pub(crate) pending_panel_reveal: bool,
     /// Model C §4.5: whether focus is on the transcript. The transcript caret +
     /// cursor-row bar render ONLY when focused; flipping focus must bust the
     /// cache so the caret appears/disappears.
@@ -133,6 +137,7 @@ impl TranscriptSeqs {
             awaiting: c.turn_phase.is_awaiting(),
             pending_reveal: c.pending_reveal_cursor,
             pending_jump: c.pending_jump_ord.is_some(),
+            pending_panel_reveal: c.pending_reveal_line.is_some(),
             transcript_focused: c.focus == AgentFocus::Transcript,
             you_block_open: inline_block_active,
             you_block_anchor: c.you_block_anchor,
@@ -512,7 +517,11 @@ impl TranscriptView {
             // the Nth user `TurnHeader` index in the FRESH flat-item list (tail
             // growth keeps earlier indices stable, but resolving here mirrors
             // `item_for_line`'s render-time discipline).
-            let pending_reveal_line = if let Some(ord) = c.pending_jump_ord.take() {
+            let pending_reveal_line = if let Some(line) = c.pending_reveal_line.take() {
+                // Panel reveal (highlight / Enter on a Subagent or Plan row):
+                // scroll to the target transcript line via its flat-item index.
+                Some(c.view_model.item_for_line(line))
+            } else if let Some(ord) = c.pending_jump_ord.take() {
                 if std::mem::take(&mut c.pending_jump_end) {
                     // `j` past the newest turn → reveal the buffer's page end
                     // (the last flat item: latest output + the editable tail).

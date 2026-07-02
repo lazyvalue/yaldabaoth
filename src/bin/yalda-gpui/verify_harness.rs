@@ -6598,6 +6598,127 @@ fn subagent_panes_paint_above_the_compose(cx: &mut TestAppContext) {
     );
 }
 
+/// Panel reveal-on-highlight: focusing the Subagents panel (and highlighting a
+/// row) queues a transcript scroll to that subagent's tool-call line AND sets
+/// the focused-subagent breadcrumb — driving the REAL `focus_agent_panel` entry
+/// point, then proving the transcript build CONSUMES the reveal.
+///
+/// Negative control: drop the `reveal_panel_selection` call from
+/// `focus_agent_panel` (or the wiring in `panel_move_selection`) and
+/// `pending_reveal_line`/`focused_subagent` stay unset → both asserts fail RED.
+#[gpui::test]
+fn panel_highlight_reveals_subagent_in_transcript(cx: &mut TestAppContext) {
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+
+    // Some transcript content, and a subagent (Task = Think + prompt) anchored
+    // at a known line so the reveal has a precise target.
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, "l0\nl1\nl2\nl3\nl4\nl5\n");
+        cx.notify();
+    });
+    let sub_key = view.update(vcx, |v, cx| {
+        use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
+        let mut c = v.agent_mut(cx).expect("agent");
+        let tid: ToolCallId = "sub-reveal".into();
+        let mut tc = ToolCall::new(tid.clone(), "Explore repo".to_string());
+        tc.kind = ToolKind::Think;
+        tc.raw_input = Some(serde_json::json!({"prompt": "map the code"}));
+        let anchor = c.editor.anchor_for_line(3);
+        let key = crate::ToolCallKey::from_id(&tid);
+        c.tools.register(key.clone(), tc, anchor);
+        // Only the Subagents column open, so focus lands there (not Plan).
+        c.subagents_open = true;
+        c.tasklist_open = false;
+        key
+    });
+    vcx.run_until_parked();
+
+    // REAL entry point: Cmd-0 focuses the bottom panel, which previews the first
+    // highlighted row. Read the queued state INSIDE the same update, before the
+    // effect flush lets the transcript build consume `pending_reveal_line`.
+    let (focused, pending, line3) = view
+        .update(vcx, |v, cx| {
+            v.focus_agent_panel(cx);
+            v.read_session(id, cx, |c| {
+                (
+                    c.focused_subagent.clone(),
+                    c.pending_reveal_line,
+                    c.tools
+                        .anchor
+                        .get(&sub_key)
+                        .and_then(|&a| c.editor.line_for_anchor(a)),
+                )
+            })
+        })
+        .expect("session");
+    assert_eq!(
+        focused,
+        Some(sub_key),
+        "highlighting the subagent must set the focused-subagent breadcrumb"
+    );
+    assert_eq!(
+        pending, line3,
+        "reveal must queue a scroll to the subagent's tool-call line ({line3:?}), got {pending:?}"
+    );
+    assert!(pending.is_some(), "the subagent line must resolve");
+
+    // The transcript build CONSUMES the queued reveal (real scroll path ran).
+    vcx.run_until_parked();
+    let after = view
+        .update(vcx, |v, cx| v.read_session(id, cx, |c| c.pending_reveal_line))
+        .expect("session");
+    assert_eq!(
+        after, None,
+        "the transcript build must consume pending_reveal_line (it drives scroll_to_reveal_item)"
+    );
+}
+
+/// Enter on a panel row activates it: reveals it in the transcript AND leaves
+/// panel focus so the revealed content is readable. Drives the real
+/// `panel_activate_selection`.
+#[gpui::test]
+fn panel_enter_reveals_and_exits(cx: &mut TestAppContext) {
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state.editor.programmatic_insert(0, "l0\nl1\nl2\nl3\n");
+        cx.notify();
+    });
+    view.update(vcx, |v, cx| {
+        use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
+        let mut c = v.agent_mut(cx).expect("agent");
+        let tid: ToolCallId = "sub-enter".into();
+        let mut tc = ToolCall::new(tid.clone(), "Explore repo".to_string());
+        tc.kind = ToolKind::Think;
+        tc.raw_input = Some(serde_json::json!({"prompt": "x"}));
+        let anchor = c.editor.anchor_for_line(2);
+        c.tools
+            .register(crate::ToolCallKey::from_id(&tid), tc, anchor);
+        c.subagents_open = true;
+        c.tasklist_open = false;
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| v.focus_agent_panel(cx));
+    let in_panel = view
+        .update(vcx, |v, cx| {
+            v.read_session(id, cx, |c| c.focus == crate::AgentFocus::Panel)
+        })
+        .expect("session");
+    assert!(in_panel, "Cmd-0 should focus the panel");
+
+    // REAL Enter.
+    view.update(vcx, |v, cx| v.panel_activate_selection(cx));
+    let focus_after = view
+        .update(vcx, |v, cx| v.read_session(id, cx, |c| c.focus))
+        .expect("session");
+    assert_ne!(
+        focus_after,
+        crate::AgentFocus::Panel,
+        "Enter must leave panel focus so the revealed line is readable"
+    );
+}
+
 // === Steering queue (spec-turn-steering.md, INV-UX-7) ===
 
 /// Submitting while a turn is in flight DELIVERS the steer immediately (the
