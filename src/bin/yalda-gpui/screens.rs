@@ -1471,6 +1471,10 @@ impl YaldaGpuiView {
         let sidebar_border: Hsla = nc(at.sidebar_border);
         let sidebar_header_fg: Hsla = nc(at.sidebar_header);
         let sidebar_dim_fg: Hsla = nc(at.dim);
+        // Panel body text uses the theme's editor foreground so it's readable on
+        // the sidebar background across themes (the old hardcoded DEFAULT_FG was a
+        // fixed light gray — invisible on light schemes like folio).
+        let sidebar_fg: Hsla = self.editor_fg();
         let sidebar_bg: Hsla = nc(at.sidebar_bg);
 
         let panel_focused = c.focus == AgentFocus::Panel;
@@ -1535,7 +1539,9 @@ impl YaldaGpuiView {
                             div()
                                 .flex()
                                 .flex_row()
-                                .items_center()
+                                // Top-align so a multi-line (wrapped) entry keeps its
+                                // glyph next to the first line.
+                                .items_start()
                                 .gap_2()
                                 .w_full()
                                 .min_w_0()
@@ -1549,10 +1555,12 @@ impl YaldaGpuiView {
                                         .child(SharedString::new_static(glyph)),
                                 )
                                 .child(
+                                    // Full text, WRAPPED (no truncation) + theme fg so
+                                    // the whole plan step is readable on any scheme.
                                     div()
                                         .flex_1()
                                         .min_w_0()
-                                        .text_color(rgb(DEFAULT_FG))
+                                        .text_color(sidebar_fg)
                                         .child(SharedString::from(entry.content.clone())),
                                 ),
                         );
