@@ -183,6 +183,17 @@ pub(crate) struct TranscriptView {
     /// Stable perf-counter label (per session) so headless render-count
     /// assertions and the `YALDA_PERF` trace can name this transcript.
     pub(crate) perf_label: &'static str,
+    /// Select-to-clipboard hit-test sink: every painted text token pushes its
+    /// window-space bounds + covered `(line, char)` range here at paint time.
+    /// Cleared at the top of `build_body`; refilled at paint. Mouse handlers
+    /// read it (`hit_test_tokens`) to map a click/drag point to a transcript
+    /// position. Shared `Rc` so the render closure and the handlers see the
+    /// same Vec.
+    pub(crate) token_hits: std::rc::Rc<RefCell<Vec<TokenHit>>>,
+    /// Whether a mouse drag-select is in progress (widget UI state). While set,
+    /// the caret is suppressed so EVERY visible line renders via the uniform
+    /// (registerable) non-cursor path and the selection band shows instead.
+    pub(crate) dragging: bool,
 }
 
 impl TranscriptView {
@@ -219,6 +230,8 @@ impl TranscriptView {
             scroll,
             last_rendered: TranscriptSeqs::default(),
             perf_label: "transcript",
+            token_hits: std::rc::Rc::new(RefCell::new(Vec::new())),
+            dragging: false,
         }
     }
 }
@@ -239,6 +252,93 @@ impl Render for TranscriptView {
 }
 
 impl TranscriptView {
+    /// Map a window point to a transcript `(line, char)` via the painted-token
+    /// sink, clamping the column to the line's real length.
+    fn transcript_pos_at(
+        &self,
+        cx: &Context<Self>,
+        pt: gpui::Point<Pixels>,
+    ) -> Option<(usize, usize)> {
+        let (line, col) = hit_test_tokens(pt, &self.token_hits.borrow())?;
+        let line_len = self
+            .session
+            .read(cx)
+            .state
+            .editor
+            .document()
+            .line_len_chars(line);
+        Some((line, col.min(line_len)))
+    }
+
+    /// Begin a mouse drag-select: focus the transcript, place the cursor at the
+    /// hit and drop the selection anchor there. A click on empty space (no token
+    /// hit) clears any existing selection. (INV-UX-14.)
+    fn transcript_mouse_down(&mut self, ev: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
+        let Some((line, col)) = self.transcript_pos_at(cx, ev.position) else {
+            self.session
+                .update(cx, |sp, _| sp.state.editor.clear_selection());
+            self.dragging = false;
+            cx.notify();
+            return;
+        };
+        self.session.update(cx, |sp, _| {
+            let c = &mut sp.state;
+            c.focus = AgentFocus::Transcript;
+            c.editor.cursor_mut().line = line;
+            c.editor.cursor_mut().col = col;
+            c.editor.anchor_at_cursor();
+        });
+        self.dragging = true;
+        cx.notify();
+    }
+
+    /// Extend the drag-select head to the current point (anchor stays put).
+    fn transcript_mouse_move(&mut self, ev: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.dragging {
+            return;
+        }
+        let Some((line, col)) = self.transcript_pos_at(cx, ev.position) else {
+            return;
+        };
+        let moved = self.session.update(cx, |sp, _| {
+            let cur = sp.state.editor.cursor();
+            if cur.line == line && cur.col == col {
+                return false;
+            }
+            sp.state.editor.cursor_mut().line = line;
+            sp.state.editor.cursor_mut().col = col;
+            true
+        });
+        if moved {
+            cx.notify();
+        }
+    }
+
+    /// Finish the drag: X11-style, a non-empty selection auto-copies to the
+    /// system clipboard; an empty one (a bare click) is dropped. (INV-UX-14.)
+    fn transcript_mouse_up(&mut self, _ev: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
+        if !self.dragging {
+            return;
+        }
+        self.dragging = false;
+        let text = self.session.update(cx, |sp, _| {
+            let c = &mut sp.state;
+            match c.editor.selection_range() {
+                Some((a, b)) if a != b => c.editor.selection_text(),
+                _ => {
+                    c.editor.clear_selection();
+                    None
+                }
+            }
+        });
+        if let Some(text) = text
+            && !text.is_empty()
+        {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+        cx.notify();
+    }
+
     /// Build the virtualised transcript list element (the ticket-021 seam: the
     /// row-data build + `render_fn` + `gpui::list` relocated here from
     /// `render_agent`). Reads GLOBAL theme/fonts off the root view; reads + (for
@@ -251,6 +351,14 @@ impl TranscriptView {
         let Some(root_ent) = self.root.upgrade() else {
             return div().size_full().into_any_element();
         };
+
+        // Select-to-clipboard hit-test sink: refilled every paint from the
+        // freshly built rows, so clear the previous frame's tokens before the
+        // list rebuilds. `dragging` suppresses the caret so every visible line
+        // takes the uniform, registerable non-cursor render path.
+        let token_sink = self.token_hits.clone();
+        token_sink.borrow_mut().clear();
+        let dragging = self.dragging;
 
         // Snapshot the root-owned render inputs into OWNED locals, releasing the
         // root read borrow before any `session.update` (which needs `&mut cx`).
@@ -330,12 +438,18 @@ impl TranscriptView {
             // selection band is dropped.
             let transcript_focused = c.focus == AgentFocus::Transcript;
             let cursor = c.editor.cursor();
-            let cursor_line = if transcript_focused {
+            // Suppress the caret mid drag-select (see `dragging`) so every
+            // visible line renders via the registerable non-cursor path.
+            let cursor_line = if transcript_focused && !dragging {
                 cursor.line
             } else {
                 usize::MAX
             };
-            let cursor_col = if transcript_focused { cursor.col } else { 0 };
+            let cursor_col = if transcript_focused && !dragging {
+                cursor.col
+            } else {
+                0
+            };
             let line_count = c.editor.document().line_count();
             let edit_seq = c.editor.document().edit_seq();
 
@@ -619,6 +733,7 @@ impl TranscriptView {
             let theme_snap = theme.clone();
             let at_snap = at_snap.clone();
             let self_editor_fg = editor_fg;
+            let token_sink_snap = token_sink.clone();
             move |idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
                 let item = &flat_items[idx];
                 match item {
@@ -670,6 +785,8 @@ impl TranscriptView {
                             line_base_fg,
                             &code_font_snap,
                             &code_font_snap,
+                            Some(&token_sink_snap),
+                            line_idx,
                         );
 
                         let line_has_content = !line_str.trim().is_empty();
@@ -1186,6 +1303,24 @@ impl TranscriptView {
             .min_h_0()
             .px_6()
             .py_3()
+            // Select-to-clipboard (INV-UX-14): mouse drag over the transcript
+            // selects text and auto-copies on release. Hit-testing maps the
+            // window point to a `(line, char)` via the painted-token sink.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, ev: &gpui::MouseDownEvent, _w, cx| {
+                    this.transcript_mouse_down(ev, cx);
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _w, cx| {
+                this.transcript_mouse_move(ev, cx);
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, ev: &gpui::MouseUpEvent, _w, cx| {
+                    this.transcript_mouse_up(ev, cx);
+                }),
+            )
             // INV-UX-13: the conversation prose scales with document zoom (the
             // FlatItem::Line rows inherit this base size); chrome keeps fixed px.
             .text_size(px(13.0 * text_scale))

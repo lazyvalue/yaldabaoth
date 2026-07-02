@@ -1052,6 +1052,12 @@ pub(crate) fn build_wrapped_line(
     base_fg: u32,
     line_font: &SharedString,
     code_font: &SharedString,
+    // Select-to-clipboard: when present, each painted text token registers its
+    // bounds + covered char range into this sink keyed by `line_idx`, so mouse
+    // hit-testing can map a point to a transcript `(line, char)`. `None` for
+    // surfaces that aren't the selectable transcript (e.g. the inline You-block).
+    token_sink: Option<&std::rc::Rc<RefCell<Vec<TokenHit>>>>,
+    line_idx: usize,
 ) -> AnyElement {
     let mut row = div().flex().flex_row().flex_wrap().flex_1().min_w_0();
 
@@ -1095,11 +1101,19 @@ pub(crate) fn build_wrapped_line(
     }
 
     if !is_cursor_line {
+        let mut char_so_far = 0usize;
         for (text, style) in &tokens {
+            let token_chars = text.chars().count();
             let line = segments_to_styled_line(&[(text.clone(), *style)]);
-            row = row.child(styled_line_element(
-                &line, base_style, base_fg, line_font, code_font,
-            ));
+            let el = styled_line_element(&line, base_style, base_fg, line_font, code_font);
+            let el = match token_sink {
+                Some(sink) => {
+                    register_token_on_paint(el, sink.clone(), line_idx, char_so_far, token_chars)
+                }
+                None => el,
+            };
+            row = row.child(el);
+            char_so_far += token_chars;
         }
         return row.into_any_element();
     }

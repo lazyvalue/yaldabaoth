@@ -535,6 +535,8 @@ impl YaldaGpuiView {
                 DEFAULT_FG,
                 &code_font,
                 &code_font,
+                None,
+                line_idx,
             );
 
             div()
@@ -674,6 +676,8 @@ impl YaldaGpuiView {
                 DEFAULT_FG,
                 line_font,
                 &code_font,
+                None,
+                line_idx,
             );
 
             // Block-level decoration per kind.

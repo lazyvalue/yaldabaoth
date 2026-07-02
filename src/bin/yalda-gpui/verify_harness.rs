@@ -671,6 +671,75 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
     );
 }
 
+/// INV-UX-14 (doc surface): X11-style select-to-clipboard. Finalizing a
+/// non-empty mouse drag over the rendered doc writes the selected text to the
+/// system clipboard automatically — no Cmd-C. Drives the REAL `doc_mouse_*`
+/// handlers, then reads the clipboard back through the test platform.
+///
+/// Negative control: revert the `write_to_clipboard` branch in `doc_mouse_up`
+/// and this asserts the clipboard is stale/empty (fails RED for the right
+/// reason — the copy didn't happen).
+#[gpui::test]
+fn doc_drag_autocopies_selection_to_clipboard(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+    const N: usize = 40;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        let mut v = YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        );
+        let mut md = String::with_capacity(N * 24);
+        for i in 0..N {
+            md.push_str(&format!("Paragraph block number {i}.\n\n"));
+        }
+        v.test_open_doc(&md);
+        v
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    // Seed the clipboard with a sentinel so a "no copy happened" bug is
+    // distinguishable from an empty write.
+    view.update(vcx, |_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("SENTINEL-NOT-COPIED".into()))
+    });
+
+    // Drag across the first painted line (left edge → right edge) so the whole
+    // line's text is selected.
+    let (start, end) = view.update(vcx, |v, cx| {
+        let ll = v.line_layouts.borrow();
+        let mut keys: Vec<(usize, usize)> = ll.keys().copied().collect();
+        keys.sort();
+        let b = ll.get(&keys[0]).unwrap().bounds();
+        (
+            point(b.left() + px(1.0), b.top() + px(2.0)),
+            point(b.right() - px(1.0), b.top() + px(2.0)),
+        )
+    });
+    vcx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    vcx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    vcx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    vcx.run_until_parked();
+
+    let clip = view
+        .update(vcx, |_, cx| cx.read_from_clipboard())
+        .and_then(|it| it.text())
+        .unwrap_or_default();
+    assert_ne!(
+        clip, "SENTINEL-NOT-COPIED",
+        "drag-release did not overwrite the clipboard — auto-copy never fired"
+    );
+    assert!(
+        clip.contains("Paragraph block number 0"),
+        "clipboard {clip:?} does not hold the selected first-line text"
+    );
+}
+
 // ---- M0: agent pump/reconciler SEAM tests --------------------------------
 //
 // The double-render and resume bugs both lived in the seam between the pure
@@ -3995,6 +4064,89 @@ fn boot_with_transcript<'a>(
         (id, ent)
     });
     (view, vcx, id, session)
+}
+
+/// INV-UX-14 (agent surface): X11-style select-to-clipboard over the transcript.
+/// A real mouse drag over the rendered transcript selects text and auto-copies
+/// it to the system clipboard on release. Drives the REAL `simulate_mouse_*`
+/// path (dispatched to `TranscriptView::transcript_mouse_*`), picking drag
+/// endpoints from the PAINTED token-hit sink, then reads the clipboard back.
+///
+/// Negative control: comment out the `write_to_clipboard` in
+/// `transcript_mouse_up` and this asserts the clipboard stays the sentinel
+/// (fails RED — the copy never fired). A second control: revert the
+/// `register_token_on_paint` wiring and the sink is empty ⇒ no endpoints ⇒
+/// the assert on a non-empty sink fails.
+#[gpui::test]
+fn transcript_drag_autocopies_selection_to_clipboard(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+
+    // Put a known line into the transcript editor (the read-only conversation
+    // surface). `programmatic_insert` mirrors a streamed append.
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, "Hello agent world here\nsecond line\n");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    // Settle the one-time jump-panel geometry inset (see the transcript-021
+    // tests) so painted token bounds are final before we sample them.
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    // Seed a sentinel so "no copy happened" ≠ "copied empty".
+    view.update(vcx, |_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("SENTINEL-NOT-COPIED".into()))
+    });
+
+    // Grab the transcript view + its painted token-hit sink.
+    let tv = view
+        .update(vcx, |v, _| v.transcript_views.get(&id).cloned())
+        .expect("transcript view exists");
+    let tokens: Vec<crate::TokenHit> = tv.update(vcx, |t, _| t.token_hits.borrow().clone());
+    assert!(
+        !tokens.is_empty(),
+        "no transcript tokens registered — the paint-time hit-test sink is empty \
+         (register_token_on_paint not wired?)"
+    );
+
+    // Drag across the whole first line (its leftmost token's left edge → its
+    // rightmost token's right edge, at the row's vertical middle).
+    let line0: Vec<&crate::TokenHit> = tokens.iter().filter(|t| t.line_idx == 0).collect();
+    assert!(!line0.is_empty(), "first transcript line painted no tokens");
+    let left = line0
+        .iter()
+        .map(|t| t.bounds.left())
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap();
+    let right = line0
+        .iter()
+        .map(|t| t.bounds.right())
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap();
+    let midy = line0[0].bounds.top() + (line0[0].bounds.bottom() - line0[0].bounds.top()) / 2.0;
+    let start = point(left + px(1.0), midy);
+    let end = point(right - px(1.0), midy);
+
+    vcx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    vcx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    vcx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    vcx.run_until_parked();
+
+    let clip = view
+        .update(vcx, |_, cx| cx.read_from_clipboard())
+        .and_then(|it| it.text())
+        .unwrap_or_default();
+    assert_ne!(
+        clip, "SENTINEL-NOT-COPIED",
+        "transcript drag-release did not overwrite the clipboard — auto-copy never fired"
+    );
+    assert!(
+        clip.contains("Hello agent world"),
+        "clipboard {clip:?} does not hold the dragged first-line text"
+    );
 }
 
 /// (a) A chatbox keystroke re-renders the root chrome + compose, but the

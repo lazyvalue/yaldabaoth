@@ -586,6 +586,164 @@ impl Element for CaptureBounds {
     }
 }
 
+// ─────────────────── Transcript token hit-testing (select-to-clipboard) ──────
+//
+// The agent transcript renders each doc line as a `flex_wrap` row of MANY
+// tokenized `styled_line_element` children (monospace word-wrap), NOT one
+// hittable `StyledText` — so the doc view's per-line `TextLayout` hit-test
+// (`line_layouts` / `doc_pos_at`) doesn't apply. Instead each token registers
+// its PAINTED bounds plus the (doc line, starting char) it covers, and mouse
+// hit-testing maps a window point → token → char via the token's monospace
+// width (`width / char_count`). Registration is at PAINT time (bounds set,
+// virtualized rows never painted are absent) — same idiom as `RegisterOnPaint`.
+
+/// One painted transcript token: the doc line + char range it covers and where
+/// it landed on screen. `bounds` are WINDOW-space (same space mouse events use).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TokenHit {
+    pub(crate) line_idx: usize,
+    pub(crate) start_char: usize,
+    pub(crate) char_count: usize,
+    pub(crate) bounds: Bounds<Pixels>,
+}
+
+/// Map a window point to the nearest painted transcript `(line, char_offset)`.
+/// Picks the token minimizing (vertical distance, horizontal distance) so a
+/// click in a gap / past a line end / above-or-below all content snaps to the
+/// sensible edge; the column within the chosen token is derived from its
+/// monospace width. Returns `None` only when no tokens were painted.
+pub(crate) fn hit_test_tokens(
+    pt: gpui::Point<Pixels>,
+    tokens: &[TokenHit],
+) -> Option<(usize, usize)> {
+    let px_dist = |lo: Pixels, hi: Pixels, v: Pixels| -> f32 {
+        if v < lo {
+            f32::from(lo - v)
+        } else if v > hi {
+            f32::from(v - hi)
+        } else {
+            0.0
+        }
+    };
+    let mut best: Option<(f32, f32, &TokenHit)> = None;
+    for t in tokens {
+        let b = t.bounds;
+        let vd = px_dist(b.top(), b.bottom(), pt.y);
+        let hd = px_dist(b.left(), b.right(), pt.x);
+        let better = match best {
+            None => true,
+            Some((bvd, bhd, _)) => (vd, hd) < (bvd, bhd),
+        };
+        if better {
+            best = Some((vd, hd, t));
+        }
+    }
+    let (_, _, t) = best?;
+    let b = t.bounds;
+    let col = if t.char_count == 0 {
+        t.start_char
+    } else {
+        let w = f32::from(b.size.width);
+        let frac = if w > 0.0 {
+            ((f32::from(pt.x - b.left())) / w * t.char_count as f32).round()
+        } else {
+            0.0
+        };
+        let within = (frac.max(0.0) as usize).min(t.char_count);
+        t.start_char + within
+    };
+    Some((t.line_idx, col))
+}
+
+/// Wrap a transcript token element so its painted bounds + covered char range
+/// register into `sink` at paint time (for `hit_test_tokens`). No-op-ish in
+/// production beyond one push per painted token.
+pub(crate) fn register_token_on_paint(
+    inner: AnyElement,
+    sink: std::rc::Rc<RefCell<Vec<TokenHit>>>,
+    line_idx: usize,
+    start_char: usize,
+    char_count: usize,
+) -> AnyElement {
+    RegisterTokenOnPaint {
+        inner,
+        sink,
+        line_idx,
+        start_char,
+        char_count,
+    }
+    .into_any_element()
+}
+
+struct RegisterTokenOnPaint {
+    inner: AnyElement,
+    sink: std::rc::Rc<RefCell<Vec<TokenHit>>>,
+    line_idx: usize,
+    start_char: usize,
+    char_count: usize,
+}
+
+impl IntoElement for RegisterTokenOnPaint {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for RegisterTokenOnPaint {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) -> (LayoutId, ()) {
+        (self.inner.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) {
+        self.inner.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        _prepaint: &mut (),
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) {
+        self.sink.borrow_mut().push(TokenHit {
+            line_idx: self.line_idx,
+            start_char: self.start_char,
+            char_count: self.char_count,
+            bounds,
+        });
+        self.inner.paint(window, cx);
+    }
+}
+
 // ───────────────────────── Layout probe (headless harness #3.2) ─────────────
 //
 // The verification-harness gap that let the caret-visibility class keep

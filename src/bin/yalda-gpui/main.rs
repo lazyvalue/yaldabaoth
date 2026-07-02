@@ -3119,6 +3119,15 @@ impl YaldaGpuiView {
         sel.dragging = false;
         if sel.is_empty() {
             self.doc_selection = None;
+        } else {
+            // X11-style select-to-clipboard: finalizing a non-empty drag copies
+            // the selection to the system clipboard automatically (no Cmd-C).
+            let sel = *sel;
+            if let Some(text) = self.collect_doc_selection_text(&sel)
+                && !text.is_empty()
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
         }
         cx.notify();
     }
