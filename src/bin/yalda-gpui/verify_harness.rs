@@ -844,6 +844,48 @@ fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
     });
 }
 
+/// REGRESSION ("ctrl-tab does nothing"): tab-cycling (NextTab/PrevTab) was wired ONLY
+/// on the doc screen, so it was DEAD whenever an agent/worksheet tile was focused
+/// (where the user actually was). It's now in `workspace_nav`, wired on every screen.
+/// This drives the AGENT screen (not the browser) and switches with the reliable
+/// `cmd-shift-[`/`]` binding (Ctrl-Tab is OS-mangled on macOS — a 4th genuine gap;
+/// this test is focus-accurate, proving the WIRING, not the OS delivery). RED before
+/// folding next_tab/prev_tab into `workspace_nav`.
+#[gpui::test]
+fn workspace_cycle_works_from_the_agent_screen(cx: &mut TestAppContext) {
+    use crate::workspace::WorkspaceCwd;
+    use crate::{App, BrowserWindow, BufferApp};
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_worksheet_nav(cx); // FOCUSED on an agent/worksheet tile
+    view.update(vcx, |v, _| {
+        let cwd = PathBuf::from(".");
+        for _ in 0..2 {
+            v.workspace.push_initial_tab(
+                App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
+                WorkspaceCwd::new(cwd.clone()),
+            );
+        }
+        assert_eq!(v.workspace.tabs.len(), 3, "agent workspace + 2 more");
+        v.workspace.set_active_tab(0); // start on the agent workspace
+    });
+    vcx.run_until_parked();
+
+    vcx.simulate_keystrokes("cmd-shift-]");
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.active_tab, 1,
+            "cmd-shift-] advances the workspace FROM THE AGENT SCREEN (the dead-wiring bug)"
+        );
+    });
+
+    vcx.simulate_keystrokes("cmd-shift-[");
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert_eq!(v.workspace.active_tab, 0, "cmd-shift-[ goes back");
+    });
+}
+
 /// `goto_workspace_number` numbers NON-ephemeral workspaces 1..N — the same
 /// numbering the jump panel paints (`idx + 1`) and skips ephemeral virtual
 /// workspaces, so the displayed digit and the `ctrl-<n>` target always agree.

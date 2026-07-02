@@ -324,7 +324,15 @@ pub(crate) trait WorkspaceNavExt: Sized {
 
 impl<E: InteractiveElement> WorkspaceNavExt for E {
     fn workspace_nav(self, cx: &mut Context<YaldaGpuiView>) -> Self {
-        self.on_action(cx.listener(|t, _: &GotoWorkspace1, _w, cx| t.goto_workspace_number(1, cx)))
+        self
+            // Tab CYCLING must be wired on EVERY screen root (it was only on the doc
+            // view — so Ctrl-Tab was dead whenever an agent/edit/browser tile was
+            // focused, the reported "ctrl-tab does nothing" bug). Folded into
+            // `workspace_nav` so it can never again be present on some screens and not
+            // others. (Bindings: reliable `cmd-shift-[`/`]` + legacy ctrl-tab.)
+            .on_action(cx.listener(YaldaGpuiView::next_tab))
+            .on_action(cx.listener(YaldaGpuiView::prev_tab))
+            .on_action(cx.listener(|t, _: &GotoWorkspace1, _w, cx| t.goto_workspace_number(1, cx)))
             .on_action(cx.listener(|t, _: &GotoWorkspace2, _w, cx| t.goto_workspace_number(2, cx)))
             .on_action(cx.listener(|t, _: &GotoWorkspace3, _w, cx| t.goto_workspace_number(3, cx)))
             .on_action(cx.listener(|t, _: &GotoWorkspace4, _w, cx| t.goto_workspace_number(4, cx)))
@@ -7089,6 +7097,15 @@ fn register_keymap(app: &mut GpuiApp) {
         // users without Cmd).
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+        // RELIABLE workspace cycling on macOS: Ctrl-Tab / Ctrl+digit are frequently
+        // intercepted or mangled by the OS before they reach the app, so they can't be
+        // depended on. The Cmd family IS delivered cleanly (cmd-t/cmd-b/cmd-l/cmd-shift-w
+        // all work), so bind the standard editor/browser tab-cycle chords here — this is
+        // the workspace-switch that actually works. `]`=next, `[`=prev.
+        KeyBinding::new("cmd-shift-]", NextTab, None),
+        KeyBinding::new("cmd-shift-[", PrevTab, None),
+        KeyBinding::new("cmd-shift-right", NextTab, None),
+        KeyBinding::new("cmd-shift-left", PrevTab, None),
         // Direct workspace jump by number (the digit shown in the jump panel).
         // App-global (`None`) like the tab-switching binds above; `ctrl-0` is
         // the 10th workspace.

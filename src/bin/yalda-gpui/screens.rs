@@ -243,8 +243,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::next_buffer))
             .on_action(cx.listener(Self::prev_buffer))
-            .on_action(cx.listener(Self::next_tab))
-            .on_action(cx.listener(Self::prev_tab))
+            // next_tab/prev_tab now come from `.workspace_nav(cx)` (every screen).
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::split_h))
