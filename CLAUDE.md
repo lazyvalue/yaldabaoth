@@ -78,9 +78,12 @@ land and keep the session task list in sync; new threads get a new ticket
 `docs/projects/agent-model-refactor/`.
 
 **Definition of done:** builds + tests + pasted evidence + runtime-checked-or-
-flagged + artifacts updated. "Compiles" is not done. The GPUI app can't be
-driven headlessly yet, so most UX/perf changes need a human runtime check — say
-so explicitly (building the verification harness is the top backlog item).
+flagged + artifacts updated. "Compiles" is not done, and neither is "a green test"
+— the test must exercise the REAL path the user's action runs and be observed RED
+without the fix (see **"The anti-circling rules"** under Verification harness below;
+they are mandatory for every bugfix). Most GUI behavior IS headlessly testable via
+`verify_harness.rs` — flag `NEEDS-RUNTIME` only for one of the documented genuine
+gaps, naming which.
 
 ## Worktree workflow (default)
 
@@ -301,6 +304,47 @@ probe for placement/visibility, `simulate_keystrokes` for bindings, render-count
 for perf), add the guard, and only write "human runtime check" for one of the 3
 gaps above — with which gap, explicitly. Tests must never touch `~/.yalda`
 (`*_PATH_OVERRIDE` / `None` under `cfg(test)`).
+
+### The anti-circling rules — READ BEFORE calling ANY bugfix "done"
+
+Each of these cost a multi-round, user-enraging failure where green tests coexisted
+with a broken app. A test that doesn't exercise the code the user's action actually
+runs is WORSE than no test — it manufactures false confidence and sends us in circles.
+
+1. **Drive the REAL entry point, not a hand-built proxy state.** If the bug is "after
+   `/clear` I can't type," the test must call the method the user's action invokes
+   (`clear_agent_session` / `apply_open_agent_resolution`) — NOT hand-call
+   `settle_input_focus` and assert the state "looks right." FIVE "/clear typeable"
+   fixes passed because each asserted a *simulated* post-clear state; the real async
+   bind path was never run, so the real state (resting in nav) was never seen. Find
+   the method the click/keystroke actually calls, and call THAT.
+2. **Negative control is mandatory — observe the guard RED with the fix reverted.**
+   Toggle the fix off, run the test, watch it fail *for the right reason*, restore. A
+   test that passes both ways guards nothing. One `cargo test` run; skipping it has
+   cost days. (Do it inline: comment out the fix line, `cargo test <name>`, restore.)
+3. **Assert on PAINT/behavior, not just state.** "the char is in the compose buffer"
+   ≠ "the user sees it." For visibility/render bugs use the layout probe
+   (`probe_bounds` / `layout_probe_*`) and assert the caret/text painted INSIDE the
+   viewport (and make it NON-vacuous: assert the content is bigger than the viewport
+   so a fit isn't a false pass). A state assert cannot catch a repaint miss.
+4. **Keystrokes: `simulate_keystrokes` is focus-accurate but NOT OS-accurate.** It
+   fabricates the ideal `Keystroke`, so it CANNOT catch OS-mangled chords. macOS eats
+   `Ctrl`+digit and `Ctrl-Tab` — a passing `simulate_keystrokes("ctrl-3")` proves
+   nothing about the real key. This is a 4th genuine gap. Prefer `Cmd`-based bindings
+   (the app's `cmd-*` are delivered reliably); treat `Ctrl`+digit / `Ctrl-Tab` as
+   unreliable on macOS. Boot the screen the user is actually on (agent, not browser).
+5. **The fix must be on `main` AND in the running binary.** Fixes stranded on feature
+   branches (the mid-turn-`m` fix sat unmerged on `jump-pane-nav`) never reach the
+   user, who runs `main` via `./dev-gui.sh` (release). "Tests pass on the branch" is
+   not shipped. Not done until green ON `main` + the binary rebuilt + the user
+   restarted. Check for stranded work before assuming a fix landed.
+6. **Mutation-test the changed predicate** (`cargo mutants`, config `mutants.toml`;
+   CI `mutation-gate` runs `--in-diff`). A surviving mutant = the test doesn't
+   constrain the code.
+
+If you cannot make a test fail without the fix ON THE REAL PATH, you have NOT
+localized the bug. Say so; do NOT ship the guess. (Full post-mortem of the saga that
+produced these rules: `docs/dev-system.md` § negative-control + the anti-circling set.)
 
 ## Naming Conventions
 
