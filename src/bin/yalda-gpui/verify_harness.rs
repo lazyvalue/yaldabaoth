@@ -4656,16 +4656,17 @@ fn focused_in_insert_mode_tracks_compose_not_transcript(cx: &mut TestAppContext)
         "compose in Normal ⇒ NOT text entry ⇒ leaders fire (space → tile menu)"
     );
 
-    // Compose in Insert ⇒ text entry ⇒ leaders are left to the tile as text.
+    // Compose in Insert with a NON-EMPTY draft ⇒ text entry ⇒ leaders are left to the
+    // tile as text. (An empty worksheet block keeps the leaders live — the empty-draft
+    // heuristic — so seed a char to exercise the genuine text-entry case.)
     let in_insert2 = view.update(vcx, |v, cx| {
-        v.agent_mut(cx)
-            .expect("agent")
-            .input_surface
-            .compose_mut()
-            .mode = crate::EditMode::Insert;
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.input_surface.compose_mut().mode = crate::EditMode::Insert;
+        c.input_surface.compose_mut().editor.insert_char('x');
+        drop(c);
         v.focused_in_insert_mode(cx)
     });
-    assert!(in_insert2, "compose in Insert ⇒ text entry ⇒ space types a space");
+    assert!(in_insert2, "compose in Insert + non-empty draft ⇒ text entry ⇒ space types");
 
     // Transcript focus is read-only NAVIGATION ⇒ leaders fire even though the
     // compose is still Insert.
@@ -5260,9 +5261,8 @@ fn focused_in_insert_mode_agent_tile_gate(cx: &mut TestAppContext) {
             "idle worksheet nav (focus=Transcript) is navigation, not text entry"
         );
     });
-    // Focus the compose in Insert (idle) ⇒ IS text entry (leaders suppressed). This
-    // is the `compose_insert` clause alone — `midturn_steer` is false (idle) — so it
-    // kills both the `==` and the `||` mutants.
+    // An EMPTY worksheet block focused in Insert is NOT text entry — the leaders must
+    // still open the menu (empty-draft heuristic), even though you can type into it.
     view.update(vcx, |v, cx| {
         let id = v.focused_bound_session().expect("bound");
         v.with_session(id, cx, |c| {
@@ -5270,10 +5270,58 @@ fn focused_in_insert_mode_agent_tile_gate(cx: &mut TestAppContext) {
             c.input_surface.compose_mut().mode = crate::EditMode::Insert;
         });
         assert!(
-            v.focused_in_insert_mode(cx),
-            "focus=Compose + Insert (idle) ⇒ text entry ⇒ leaders suppressed"
+            !v.focused_in_insert_mode(cx),
+            "empty worksheet block (focus=Compose, Insert) ⇒ leaders still fire"
         );
     });
+    // Once the draft is NON-empty ⇒ IS text entry (leaders suppressed). Non-empty +
+    // Insert exercises the `compose_insert` clause, killing the `==` and `||` mutants.
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| {
+            c.input_surface.compose_mut().editor.insert_char('x');
+        });
+        assert!(
+            v.focused_in_insert_mode(cx),
+            "focus=Compose + Insert + non-empty draft ⇒ text entry ⇒ leaders suppressed"
+        );
+    });
+}
+
+/// THE REPORTED BUG, end-to-end: after `/clear` the worksheet must be immediately
+/// TYPEABLE — the user just cleared to write, and types WITHOUT pressing `i`; the
+/// text must land in the compose and be visible. (Prior "fixes" kept the block open
+/// but rested it in NAV, so the keystrokes were eaten as navigation and nothing
+/// appeared — the "can't see anything I'm typing after clear" bug. This test drives
+/// the real key handler with NO `i`.)
+#[gpui::test]
+fn worksheet_typing_after_clear_is_visible_without_pressing_i(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    // Land in the post-/clear resting state: a settled fresh (empty) worksheet.
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| {
+            c.editor =
+                yalda::editor::Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+            c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
+            c.close_you_block();
+            c.focus = crate::AgentFocus::Transcript;
+            c.settle_input_focus();
+        });
+    });
+    // The user types immediately — NO `i` — because they just cleared to write.
+    for ch in ["h", "e", "l", "l", "o"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
+    }
+    vcx.run_until_parked();
+    let text = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text()))
+        .unwrap();
+    assert_eq!(
+        text.trim(),
+        "hello",
+        "after /clear, typing (no `i`) must land in the compose + be visible (got {text:?})"
+    );
 }
 
 /// `focused_in_insert_mode` for the raw EDIT view (`App::Buffer::Editing`): Insert IS
@@ -6070,8 +6118,14 @@ fn fresh_worksheet_session_shows_an_input(cx: &mut TestAppContext) {
         assert!(c.inline_you_block_active(), "the input is visible");
         assert_eq!(
             c.focus,
-            crate::AgentFocus::Transcript,
-            "rests in nav so the space leader opens the tile menu (press i to type)"
+            crate::AgentFocus::Compose,
+            "rests focused+Insert so typing lands immediately (no `i`); the space leader \
+             still opens the tile menu on the empty block via the empty-draft heuristic"
+        );
+        assert_eq!(
+            c.input_surface.compose().mode,
+            crate::EditMode::Insert,
+            "the fresh block is in Insert — type and see it"
         );
     });
 }
@@ -6128,8 +6182,8 @@ fn worksheet_restore_settles_focus_and_block(cx: &mut TestAppContext) {
         assert_eq!(c.you_block_anchor, None, "at the tail");
         assert_eq!(
             c.focus,
-            crate::AgentFocus::Transcript,
-            "rests in nav (space → tile menu); press i to edit the restored draft"
+            crate::AgentFocus::Compose,
+            "a restored draft rests focused+Insert so you continue writing immediately"
         );
         assert!(c.inline_you_block_active(), "the draft is visible");
     });

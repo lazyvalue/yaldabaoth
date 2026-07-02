@@ -564,6 +564,17 @@ remains the harness's pixel gap (#1), but the size change is now guarded.
   workspaces). Guards: `agent_status_dot_reflects_turn_phase`,
   `agent_dot_status_mapping`, `ctrl_digit_switches_workspace`,
   `workspace_number_skips_ephemeral`.
+- 2026-07-01 — **Worksheet rests TYPEABLE, not in nav (supersedes 2026-06-29 (2)).**
+  Resting in nav made `/clear` (and fresh open) require pressing `i` before anything
+  you typed appeared — the "can't see anything I'm typing after clear" bug. A fresh /
+  cleared / restored worksheet now rests focused + Insert (`settle_input_focus` →
+  focus=Compose), so typing lands and is visible immediately. The tile-menu leaders
+  are NOT lost: the `<space>`/`.`/`?` still fire on an EMPTY block via the empty-draft
+  heuristic in `focused_in_insert_mode` (bare space on a blank block opens the menu;
+  once you've typed, space types — the same rule as mid-turn steer). Both prior
+  complaints now hold. Guards: `worksheet_typing_after_clear_is_visible_without_pressing_i`,
+  `clear_resets_worksheet_to_a_typeable_block`, `fresh_worksheet_space_opens_the_tile_menu`,
+  `focused_in_insert_mode_agent_tile_gate`.
 - 2026-06-29 (2) — Worksheet rests in transcript NAV (not auto-Insert) after fresh
   open / `/clear` / restore: the input block is VISIBLE but the `space`/`.`/`?`
   leaders open the tile/app menus (they fire only outside text entry) — fixing "can't

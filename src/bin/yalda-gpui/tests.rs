@@ -128,22 +128,24 @@ fn fold_header_line_is_single_short_line() {
     assert_eq!(fold_header_line(""), "");
 }
 
-/// REGRESSION ("/clear then can't type" + "space doesn't open the tile menu"): the
-/// `/clear` server path builds a fresh session then `settle_input_focus()`s it. A
-/// fresh (empty) worksheet opens a VISIBLE tail You-block but RESTS IN NAV
-/// (focus=Transcript) — so the input is shown AND the `space` leader opens the tile
-/// menu; the user presses `i` to type.
+/// REGRESSION ("/clear then can't type"): the `/clear` server path builds a fresh
+/// session then `settle_input_focus()`s it. A fresh (empty) worksheet opens a VISIBLE
+/// tail You-block that is immediately TYPEABLE (focus=Compose, Insert) — you just
+/// cleared to write, so typing lands + is visible with NO `i`. The `space` tile-menu
+/// leader still works on the empty block via the empty-draft heuristic
+/// (`focused_in_insert_mode`), so this does not re-regress the tile menu.
 #[test]
-fn clear_resets_worksheet_to_a_visible_nav_block() {
+fn clear_resets_worksheet_to_a_typeable_block() {
     let mut st = AgentState::new_server_managed(None);
     assert!(st.editor.document().is_empty(), "fresh transcript after clear");
     assert!(!st.input_surface.is_chatbox(), "default placement is worksheet");
     st.settle_input_focus();
     assert!(st.you_block_open, "clear opens a VISIBLE tail You-block");
+    assert_eq!(st.focus, AgentFocus::Compose, "focused so typing lands immediately");
     assert_eq!(
-        st.focus,
-        AgentFocus::Transcript,
-        "rests in nav so the space leader opens the tile menu"
+        st.input_surface.compose().mode,
+        EditMode::Insert,
+        "in Insert — type and see it, no `i`"
     );
 }
 

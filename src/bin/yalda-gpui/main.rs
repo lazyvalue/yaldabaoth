@@ -4311,11 +4311,23 @@ impl YaldaGpuiView {
                         // leaders are suppressed. Pinned by
                         // `real_midturn_worksheet_empty_draft_space_opens_menu` /
                         // `real_midturn_worksheet_typed_draft_space_is_suppressed`.
+                        let draft_empty =
+                            c.input_surface.compose().text().trim().is_empty();
+                        // Focused compose in Insert is text entry — EXCEPT an empty
+                        // WORKSHEET block: a fresh/cleared worksheet rests focused +
+                        // Insert (so typing lands immediately, no `i`), but while its
+                        // draft is still empty the `<space>`/`.`/`?` leaders must open
+                        // the tile menu (typing a letter lands in the compose; a bare
+                        // space on the blank block opens the menu). The chatbox is a
+                        // real box: empty or not, it's text entry. Once the worksheet
+                        // draft is non-empty, space types (multi-word). Same empty-draft
+                        // rule as the mid-turn steer below (INV-UX-9 rule 7).
                         let compose_insert = c.focus == AgentFocus::Compose
-                            && c.input_surface.compose().mode == EditMode::Insert;
+                            && c.input_surface.compose().mode == EditMode::Insert
+                            && (c.input_surface.is_chatbox() || !draft_empty);
                         let midturn_steer = c.turn_phase.is_awaiting()
                             && !c.input_surface.is_chatbox()
-                            && !c.input_surface.compose().text().trim().is_empty();
+                            && !draft_empty;
                         compose_insert || midturn_steer
                     })
                     .unwrap_or(false)

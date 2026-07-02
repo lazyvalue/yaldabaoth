@@ -3668,15 +3668,21 @@ impl AgentState {
             self.close_you_block();
             self.focus = AgentFocus::Compose;
         } else if fresh || !self.input_surface.compose().text().trim().is_empty() {
-            // Open a VISIBLE tail block (so a fresh/cleared worksheet shows an input
-            // and a restored draft shows), but REST IN NAV (focus=Transcript), not
-            // Insert: the leaders (`space`/`.`/`?`) must open the tile menu when a
-            // tile is focused, and they only fire outside text entry. The user
-            // presses `i` to type. (Auto-focusing Insert here regressed the tile
-            // menu — runtime report.)
+            // Open a VISIBLE tail block AND make it immediately TYPEABLE (focus=Compose,
+            // Insert): a fresh/cleared worksheet is a blank doc you write in, so typing
+            // must land + be visible with NO `i` (the "can't see anything I type after
+            // /clear" bug). Earlier this rested in NAV (focus=Transcript) to keep the
+            // `<space>` tile-menu leader — but that broke typing-after-clear. Both now
+            // hold: the leaders still fire on an EMPTY block via the empty-draft
+            // heuristic in `focused_in_insert_mode` (bare space on a blank block opens
+            // the menu; once you've typed, space types), so this does NOT re-regress
+            // the tile menu. Pinned by
+            // `worksheet_typing_after_clear_is_visible_without_pressing_i` +
+            // `fresh_worksheet_space_opens_the_tile_menu`.
             self.you_block_open = true;
             self.you_block_anchor = None; // tail
-            self.focus = AgentFocus::Transcript;
+            self.focus = AgentFocus::Compose;
+            self.input_surface.compose_mut().mode = EditMode::Insert;
         } else {
             self.close_you_block();
             self.focus = AgentFocus::Transcript;
