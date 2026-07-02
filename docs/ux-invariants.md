@@ -454,15 +454,13 @@ agent tile `Cmd-0` enters **panel focus**: the region enlarges and one row in on
 column is selected. Selection is **2-D** — `panel_col` (which column) + `panel_sel`
 (the row WITHIN that column). `h`/`←` and `l`/`→` switch the active column to the
 adjacent **open** column (clamping the row into it); `j`/`k`/`↑`/`↓` move the row
-within the active column (clamped); `g`/`G` jump to its ends. **Highlighting a row
-live-previews it in the transcript**: the transcript scrolls to the row's target
-line and, for a Subagent, its focused-subagent breadcrumb lights (entering the panel
-previews the first row too). A Subagent's target is its tool-call's anchor line
-(precise); a Plan row's target is the plan's **announce anchor** — the transcript
-tail captured when the plan last updated (plan entries carry no per-step position, so
-all plan rows share it). `Enter` **activates** the selected row: it reveals it (jump)
-and then leaves panel focus so the revealed line is readable. `Esc` leaves panel
-focus, **restoring the focus captured on entry** (`panel_return_focus`). The mode is **modal** — while focused, other keys
+within the active column (clamped); `g`/`G` jump to its ends. **Highlighting a
+Subagent SWAPS the main view to its context** (see INV-UX-15) — entering the panel
+previews the first row too; highlighting a Plan row clears the swap so the main
+transcript returns (the plan is read in the panel itself). `Enter` **activates** the
+selected row: it commits the preview (a Subagent stays swapped in) and leaves panel
+focus so it's readable. `Esc` leaves panel focus, **restoring the focus captured on
+entry** (`panel_return_focus`). The mode is **modal** — while focused, other keys
 are inert (no leaders, no compose typing). You can never be panel-focused with no
 focusable column: entering requires a column with ≥1 row (lands on the leftmost
 such), and closing the active column **re-seats** to another open column or exits if
@@ -471,25 +469,22 @@ none remain. In an agent tile `Cmd-0` is panel-focus, **not** zoom-reset (the
 GPUI's most-recent-first match prefers it); elsewhere `Cmd-0` still resets zoom.
 
 **Applies to.** `agent.rs`: `AgentFocus::Panel`, `PanelColumn`, `PanelItem`,
-`panel_column_rows` / `panel_open_columns` / `reseat_panel_focus` /
-`panel_item_reveal_line`, the `panel_col` / `panel_sel` / `panel_return_focus` /
-`pending_reveal_line` / `plan_anchor` state. `agent_ui.rs`: `focus_agent_panel` /
+`panel_column_rows` / `panel_open_columns` / `reseat_panel_focus`, the `panel_col` /
+`panel_sel` / `panel_return_focus` state. `agent_ui.rs`: `focus_agent_panel` /
 `exit_agent_panel` / `panel_move_selection` / `panel_switch_column` /
-`panel_select_end` / `panel_activate_selection` / `reveal_panel_selection`, the
-`plan_anchor` capture at `PlanUpdated`, the modal interception at the top of
-`handle_claude_key`, and the re-seat in `toggle_tasklist` / `toggle_subagents`.
-`transcript_view.rs`: `pending_reveal_line` consumed in `build_body` (→
-`item_for_line` → `scroll_to_reveal_item`), covered by the `pending_panel_reveal`
-seq.
+`panel_select_end` / `panel_activate_selection` / `reveal_panel_selection` (sets/
+clears `focused_subagent`), the modal interception at the top of `handle_claude_key`,
+and the re-seat in `toggle_tasklist` / `toggle_subagents`.
 `main.rs`: the `FocusAgentPanel` action + `cmd-0` `AgentView` binding.
 `screens.rs::render_agent`: the two-column layout + enlarge + per-column selection
-highlight + `FocusAgentPanel` `on_action`.
+highlight (Plan entries theme-colored + wrapped for full text) + `FocusAgentPanel`
+`on_action`.
 
-**Why.** Keyboard-drive the bottom panels (jump to a subagent's output) without a
+**Why.** Keyboard-drive the bottom panels (view a subagent's context) without a
 mouse, with a clear enter/navigate/exit gesture that always returns you where you
-were; the column split keeps Plan and Subagents side by side. Live-reveal makes
-highlighting *do* something — you scan the panel and the transcript follows — rather
-than a bare selection with no feedback until Enter.
+were; the column split keeps Plan and Subagents side by side. Highlight-to-swap makes
+selection *do* something visible — you scan the panel and the main view follows —
+rather than a bare selection with no feedback.
 
 **Status:** `honored` (headless; exact enlarge px / highlight color are gap-1).
 
@@ -498,11 +493,10 @@ than a bare selection with no feedback until Enter.
 `agent_panel_enter_focuses_subagent`, `agent_panel_cmd0_binding_enters_panel` (real
 keymap dispatch proves the AgentView binding shadows zoom-reset),
 `agent_panel_closing_last_panel_exits_focus`,
-`panel_highlight_reveals_subagent_in_transcript` (highlight queues a scroll to the
-subagent line + sets the breadcrumb; the transcript build consumes it),
-`panel_enter_reveals_and_exits` (Enter leaves panel focus), plus the state-machine
-fuzzer ops + oracle (`focus ∈ {Compose,Transcript,Panel}`, panel-focused ⇒ a panel
-is open).
+`panel_highlight_swaps_to_subagent` (highlight sets `focused_subagent`; unfocus
+clears it), `panel_enter_reveals_and_exits` (Enter leaves panel focus), plus the
+state-machine fuzzer ops + oracle (`focus ∈ {Compose,Transcript,Panel}`,
+panel-focused ⇒ a panel is open). The swap render itself: see INV-UX-15.
 
 ### INV-UX-13 — Document text zoom scales the agent transcript, like a buffer
 
@@ -587,6 +581,43 @@ seeds a sentinel clipboard value, drags across a known line via real mouse
 events, and asserts the clipboard now holds the dragged text (negative control:
 disabling the `write_to_clipboard` leaves the sentinel ⇒ RED).
 
+### INV-UX-15 — Focusing a subagent swaps the main agent view to its context
+
+**Statement.** When a subagent is **focused** (`focused_subagent = Some(key)` — set
+by clicking its row, or highlighting it in the Subagents panel per INV-UX-12), the
+agent tile's **main area is replaced** by that subagent's **context**: a `← Back`
+header (label of the subagent) over a scrollable view of its prompt + content +
+output (`append_tool_body`, the same body the expanded tool card shows). The cached
+main `TranscriptView` is **not rendered** while swapped. Returning to the main agent
+is easy and always available: click **`← Back`**, or press **`Esc`** (`Esc` with a
+focused subagent calls `unfocus_subagent`, ahead of its per-mode meaning). Switching
+the panel highlight to a Plan row, or any `focused_subagent = None`, restores the
+main transcript. The swap is a pure render-time branch on `focused_subagent`; no
+transcript state is touched, so Back is lossless.
+
+**Applies to.** `screens.rs::render_agent`: the `focused_subagent` match that builds
+the `subagent-view` (Back header + `append_tool_body`) OR the transcript body.
+`agent_ui.rs`: `focus_subagent` / `unfocus_subagent` (set/clear), the `Esc`-returns
+branch in `handle_claude_key`, and `reveal_panel_selection` (panel highlight → swap).
+`agent.rs`: `focused_subagent: Option<ToolCallKey>`, `classify_subagent` (label).
+
+**Why.** A subagent's work is a self-contained sub-conversation; reading it should
+feel like *entering* it — a full view you can scroll — not squinting at an inline
+expanded card. A single obvious Back (button + `Esc`) keeps it non-trapping.
+
+**Bounds.** A subagent's "context" is whatever the Task tool call carries (prompt +
+accumulated content/output blocks), not a separate live nested transcript with its
+own tool cards — that's all the agent surfaces over ACP today.
+
+**Status:** `honored` (headless — the swap is proven by the layout probe; exact
+pixels/colors are gap-1).
+
+**Enforcement.** `verify_harness.rs`: `subagent_focus_swaps_the_painted_view` — with
+a subagent focused, the `subagent-view` PAINTS and `transcript-viewport` does NOT;
+after Back the `subagent-view` is gone (negative control: render the transcript
+unconditionally ⇒ `subagent-view` never paints ⇒ RED). Plus
+`panel_highlight_swaps_to_subagent` for the panel-driven entry.
+
 ## Cross-references
 
 - `spec-turn-steering.md` — the full steering design (queue, delivery modes, the
@@ -604,6 +635,11 @@ disabling the `write_to_clipboard` leaves the sentinel ⇒ RED).
 
 ## Revision history
 
+- 2026-07-02 (7) — Added INV-UX-15: focusing a subagent swaps the main agent view
+  to its context (Back header + prompt/content/output), Back/Esc returns. Reworked
+  INV-UX-12's highlight behavior from a transcript-scroll into this swap (the
+  scroll machinery — `pending_reveal_line` / `plan_anchor` — was removed). Plan
+  panel entries are now theme-colored + wrapped (readable full text on any scheme).
 - 2026-07-02 (6) — Added INV-UX-14: X11-style select-to-clipboard. A finalized
   mouse drag-selection auto-copies to the system clipboard on both the buffer doc
   view (`doc_mouse_up`) and the agent transcript (new `TranscriptView`

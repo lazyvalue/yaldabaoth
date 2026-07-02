@@ -1727,10 +1727,89 @@ impl YaldaGpuiView {
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
-                // The transcript body is the cached `TranscriptView` (ticket
-                // 021), built before this update and moved in here. `flex_1`
-                // gives the cached slot real bounds to fill (size-from-style).
-                .child(transcript_body),
+                // Subagent context swap (INV-UX-15): while a subagent is focused
+                // (`focused_subagent`, set by clicking / highlighting it in the
+                // panel), the main area shows THAT subagent's context — a Back
+                // header + its prompt/content/output — in place of the cached
+                // transcript. `focused_subagent == None` (the common case) renders
+                // the normal transcript body built before this update.
+                .child(
+                    match c
+                        .focused_subagent
+                        .clone()
+                        .filter(|k| c.tools.calls.contains_key(k))
+                    {
+                        Some(key) => {
+                            let tc = c.tools.calls.get(&key).expect("checked");
+                            let label = classify_subagent(tc)
+                                .map(|s| s.label)
+                                .unwrap_or_else(|| "subagent".to_string());
+                            let weak = weak_self.clone();
+                            let back = div()
+                                .id("subagent-back")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .w_full()
+                                .px_4()
+                                .py_1()
+                                .h(px(28.0))
+                                .bg(bg_or(top, STATUS_BG))
+                                .text_color(strip_fg)
+                                .font_weight(FontWeight::BOLD)
+                                .text_size(px(12.0))
+                                .cursor_pointer()
+                                .on_click(move |_ev: &gpui::ClickEvent, _w, app| {
+                                    let _ = weak.update(app, |this, cx| this.unfocus_subagent(cx));
+                                })
+                                .child(SharedString::new_static("← Back"))
+                                .child(
+                                    div()
+                                        .text_color(strip_dim)
+                                        .font_weight(FontWeight::NORMAL)
+                                        .child(SharedString::from(format!("· {label}"))),
+                                );
+                            let mut content = div()
+                                .flex()
+                                .flex_col()
+                                .text_size(px(13.0))
+                                .text_color(compose_fg)
+                                .font_family(self.code_font.clone());
+                            content = append_tool_body(
+                                content,
+                                tc,
+                                ToolRenderPolicy::Full,
+                                &self.code_font,
+                                at,
+                            );
+                            let body = div()
+                                .id("subagent-body")
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .px_4()
+                                .py_2()
+                                .child(content);
+                            probe_bounds(
+                                "subagent-view",
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .min_h_0()
+                                    .child(back)
+                                    .child(body)
+                                    .into_any_element(),
+                            )
+                        }
+                        None => transcript_body,
+                    },
+                ),
         );
 
         let mut col = div()

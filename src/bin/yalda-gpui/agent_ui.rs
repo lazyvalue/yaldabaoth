@@ -1387,8 +1387,6 @@ impl YaldaGpuiView {
             you_block_anchor: None,
             parked_you_blocks: Vec::new(),
             current_plan: None,
-            plan_anchor: None,
-            pending_reveal_line: None,
             agent_mode: None,
             agent_model: None,
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
@@ -2438,12 +2436,7 @@ impl YaldaGpuiView {
                     }
                 }
                 ReplyEvent::PlanUpdated(plan) => {
-                    // Full snapshot replaces the previous plan (§21). Anchor it to
-                    // the current transcript tail so a panel reveal on any plan row
-                    // scrolls back to roughly where the plan appeared (plan entries
-                    // carry no per-step transcript position).
-                    let tail = claude.editor.document().line_count().saturating_sub(1);
-                    claude.plan_anchor = Some(claude.editor.anchor_for_line(tail));
+                    // Full snapshot replaces the previous plan (§21).
                     claude.current_plan = Some(plan);
                 }
                 ReplyEvent::ModeChanged(mode_id) => {
@@ -2648,10 +2641,6 @@ impl YaldaGpuiView {
                 AgentEventEffect::None
             }
             AgentEventKind::PlanUpdated(plan) => {
-                // Anchor the plan to the transcript tail for panel reveal (see the
-                // ReplyEvent::PlanUpdated path).
-                let tail = claude.editor.document().line_count().saturating_sub(1);
-                claude.plan_anchor = Some(claude.editor.anchor_for_line(tail));
                 claude.current_plan = Some(plan.clone());
                 AgentEventEffect::None
             }
@@ -3218,8 +3207,9 @@ impl YaldaGpuiView {
             }
         }
         cx.notify();
-        // Entering the panel previews the first highlighted row in the transcript
-        // (no-op when this call TOGGLED the panel off — reveal requires focus).
+        // Entering the panel previews the first highlighted row — a Subagent
+        // swaps into the main view (no-op when this call TOGGLED the panel off —
+        // reveal requires focus).
         self.reveal_panel_selection(cx);
     }
 
@@ -3246,7 +3236,7 @@ impl YaldaGpuiView {
                 c.panel_sel = (cur + delta).clamp(0, n as isize - 1) as usize;
             }
         }
-        // Live-preview: scroll the transcript to the newly highlighted row.
+        // Live-preview: highlighting a Subagent swaps the main view to it.
         self.reveal_panel_selection(cx);
     }
 
@@ -3269,7 +3259,7 @@ impl YaldaGpuiView {
                 }
             }
         }
-        // Live-preview: scroll the transcript to the newly highlighted row.
+        // Live-preview: highlighting a Subagent swaps the main view to it.
         self.reveal_panel_selection(cx);
     }
 
@@ -3284,15 +3274,15 @@ impl YaldaGpuiView {
                 c.panel_sel = if last { n - 1 } else { 0 };
             }
         }
-        // Live-preview: scroll the transcript to the newly highlighted row.
+        // Live-preview: highlighting a Subagent swaps the main view to it.
         self.reveal_panel_selection(cx);
     }
 
-    /// Reveal the currently HIGHLIGHTED panel row in the transcript — the
-    /// live-preview half of panel navigation. Queues a scroll to the row's
-    /// target line (`pending_reveal_line`, consumed by the transcript build) and,
-    /// for a Subagent, sets the focused-subagent breadcrumb. No-op unless
-    /// panel-focused with a resolvable target. Called after every highlight move.
+    /// Live-preview the currently HIGHLIGHTED panel row. Highlighting a Subagent
+    /// SWAPS the main view to that subagent's context (`focused_subagent`);
+    /// highlighting a Plan row clears the swap so the main transcript returns
+    /// (the plan is read in the panel itself). No-op unless panel-focused with a
+    /// row. Called after every highlight move.
     pub(crate) fn reveal_panel_selection(&mut self, cx: &mut Context<Self>) {
         if let Some(mut c) = self.agent_mut(cx) {
             if c.focus != AgentFocus::Panel {
@@ -3305,26 +3295,24 @@ impl YaldaGpuiView {
             let Some(item) = rows.get(c.panel_sel.min(rows.len() - 1)).cloned() else {
                 return;
             };
-            if let PanelItem::Subagent(key) = &item
-                && c.tools.calls.contains_key(key)
-            {
-                c.focused_subagent = Some(key.clone());
-            }
-            if let Some(line) = c.panel_item_reveal_line(&item) {
-                c.pending_reveal_line = Some(line);
+            match &item {
+                PanelItem::Subagent(key) if c.tools.calls.contains_key(key) => {
+                    c.focused_subagent = Some(key.clone());
+                }
+                _ => c.focused_subagent = None,
             }
         }
         cx.notify();
     }
 
-    /// Activate the selected row of the active column (`Enter`): reveal it in the
-    /// transcript (jump), then leave panel focus so the revealed content is
-    /// readable. A Subagent additionally becomes the focused sub-agent
-    /// (breadcrumb); a Plan row scrolls to where the plan was announced.
+    /// Activate the selected row of the active column (`Enter`): commit the
+    /// live-preview (a Subagent stays swapped into the main view), then leave
+    /// panel focus so it's readable. A Plan row leaves the main transcript in
+    /// place (the plan is read in the panel). Back / `Esc` returns to the main
+    /// view (`focused_subagent = None`).
     pub(crate) fn panel_activate_selection(&mut self, cx: &mut Context<Self>) {
-        // Reveal while STILL panel-focused (reveal_panel_selection requires it),
-        // then exit — the queued `pending_reveal_line` still fires on the next
-        // transcript build.
+        // Preview while STILL panel-focused (reveal_panel_selection requires it),
+        // then exit — the swap (`focused_subagent`) persists past the exit.
         self.reveal_panel_selection(cx);
         self.exit_agent_panel(cx);
     }

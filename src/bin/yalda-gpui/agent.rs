@@ -2997,17 +2997,6 @@ pub(crate) struct AgentState {
     /// than on a user-turn header. The render path reveals the LAST flat item
     /// instead of resolving the ordinal. Consumed (`take`) with the ordinal.
     pub(crate) pending_jump_end: bool,
-    /// Set by a panel reveal (highlight/Enter on a Subagent or Plan row) to
-    /// request "scroll the transcript to this line on the next render". Consumed
-    /// (`take`) in the transcript build via `item_for_line` → `scroll_to_reveal_
-    /// item`, same INV-RV discipline as `pending_reveal_cursor`. `None` = none.
-    pub(crate) pending_reveal_line: Option<usize>,
-    /// The transcript line the current plan was announced at (captured at
-    /// `PlanUpdated` as the tail, tracked through edits by a `LineAnchor`). Plan
-    /// entries have no per-step transcript position — the whole plan is a side
-    /// snapshot — so a panel reveal on any plan row scrolls back to roughly where
-    /// the plan appeared in the conversation. `None` until the first plan.
-    pub(crate) plan_anchor: Option<LineAnchor>,
     /// The memoized `render_agent` view-model caches (block cache, flat-items,
     /// gutter tags, fingerprint, seq) — one owner instead of six sibling
     /// fields (A.7). See [`AgentViewModel`].
@@ -3249,22 +3238,6 @@ impl AgentState {
         }
     }
 
-    /// The transcript line a panel row points at, for reveal-on-highlight /
-    /// Enter-jump. A Subagent resolves to its tool-call's anchor line (precise);
-    /// a Plan row resolves to the plan-level announce anchor (all steps share it
-    /// — plan entries carry no per-step transcript position). `None` when the
-    /// anchor can't currently be resolved (tool not live / no plan seen yet).
-    pub(crate) fn panel_item_reveal_line(&self, item: &PanelItem) -> Option<usize> {
-        match item {
-            PanelItem::Subagent(key) => self
-                .tools
-                .anchor
-                .get(key)
-                .and_then(|&a| self.editor.line_for_anchor(a)),
-            PanelItem::Plan(_) => self.plan_anchor.and_then(|a| self.editor.line_for_anchor(a)),
-        }
-    }
-
     /// The columns that are FOCUSABLE right now — open AND holding ≥1 row — in
     /// left-to-right order (Tasklist, then Subagents). Empty ⇒ nothing to focus,
     /// so `focus_agent_panel` is a no-op.
@@ -3407,8 +3380,6 @@ impl AgentState {
             user_turn_jump_ord: 0,
             pending_jump_ord: None,
             pending_jump_end: false,
-            pending_reveal_line: None,
-            plan_anchor: None,
             view_model: AgentViewModel::new(),
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
@@ -3472,8 +3443,6 @@ impl AgentState {
             user_turn_jump_ord: 0,
             pending_jump_ord: None,
             pending_jump_end: false,
-            pending_reveal_line: None,
-            plan_anchor: None,
             view_model: AgentViewModel::new(),
             lines_cache: std::rc::Rc::new(Vec::new()),
             lines_cache_seq: u64::MAX,
@@ -4092,8 +4061,6 @@ impl AgentState {
         self.lines_cache_seq = u64::MAX;
         self.highlight_cache.reset();
         self.current_plan = None;
-        self.plan_anchor = None;
-        self.pending_reveal_line = None;
         self.focused_subagent = None;
         self.usage = None;
         // The transcript is being rebuilt from scratch — any open You-block's

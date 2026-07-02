@@ -6598,80 +6598,110 @@ fn subagent_panes_paint_above_the_compose(cx: &mut TestAppContext) {
     );
 }
 
-/// Panel reveal-on-highlight: focusing the Subagents panel (and highlighting a
-/// row) queues a transcript scroll to that subagent's tool-call line AND sets
-/// the focused-subagent breadcrumb — driving the REAL `focus_agent_panel` entry
-/// point, then proving the transcript build CONSUMES the reveal.
+/// Panel highlight SWAPS the main view to the subagent's context: focusing the
+/// Subagents panel (Cmd-0, which previews the first row) sets `focused_subagent`
+/// to that subagent — the render swap trigger. Drives the REAL `focus_agent_panel`
+/// entry point.
 ///
-/// Negative control: drop the `reveal_panel_selection` call from
-/// `focus_agent_panel` (or the wiring in `panel_move_selection`) and
-/// `pending_reveal_line`/`focused_subagent` stay unset → both asserts fail RED.
+/// Negative control: drop `reveal_panel_selection` from `focus_agent_panel` and
+/// `focused_subagent` stays `None` → the assert fails RED.
 #[gpui::test]
-fn panel_highlight_reveals_subagent_in_transcript(cx: &mut TestAppContext) {
-    let (view, vcx, id, session) = boot_with_transcript(cx);
+fn panel_highlight_swaps_to_subagent(cx: &mut TestAppContext) {
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
 
-    // Some transcript content, and a subagent (Task = Think + prompt) anchored
-    // at a known line so the reveal has a precise target.
-    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
-        s.state
-            .editor
-            .programmatic_insert(0, "l0\nl1\nl2\nl3\nl4\nl5\n");
-        cx.notify();
-    });
     let sub_key = view.update(vcx, |v, cx| {
         use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
         let mut c = v.agent_mut(cx).expect("agent");
-        let tid: ToolCallId = "sub-reveal".into();
+        let tid: ToolCallId = "sub-swap".into();
         let mut tc = ToolCall::new(tid.clone(), "Explore repo".to_string());
         tc.kind = ToolKind::Think;
         tc.raw_input = Some(serde_json::json!({"prompt": "map the code"}));
-        let anchor = c.editor.anchor_for_line(3);
+        let anchor = c.editor.anchor_for_line(0);
         let key = crate::ToolCallKey::from_id(&tid);
         c.tools.register(key.clone(), tc, anchor);
-        // Only the Subagents column open, so focus lands there (not Plan).
         c.subagents_open = true;
         c.tasklist_open = false;
         key
     });
     vcx.run_until_parked();
 
-    // REAL entry point: Cmd-0 focuses the bottom panel, which previews the first
-    // highlighted row. Read the queued state INSIDE the same update, before the
-    // effect flush lets the transcript build consume `pending_reveal_line`.
-    let (focused, pending, line3) = view
+    // Cmd-0 focuses the panel; the first Subagents row previews → swap set.
+    let focused = view
         .update(vcx, |v, cx| {
             v.focus_agent_panel(cx);
-            v.read_session(id, cx, |c| {
-                (
-                    c.focused_subagent.clone(),
-                    c.pending_reveal_line,
-                    c.tools
-                        .anchor
-                        .get(&sub_key)
-                        .and_then(|&a| c.editor.line_for_anchor(a)),
-                )
-            })
+            v.read_session(id, cx, |c| c.focused_subagent.clone())
         })
         .expect("session");
     assert_eq!(
         focused,
         Some(sub_key),
-        "highlighting the subagent must set the focused-subagent breadcrumb"
+        "highlighting the subagent must set focused_subagent (the view-swap trigger)"
     );
-    assert_eq!(
-        pending, line3,
-        "reveal must queue a scroll to the subagent's tool-call line ({line3:?}), got {pending:?}"
-    );
-    assert!(pending.is_some(), "the subagent line must resolve");
 
-    // The transcript build CONSUMES the queued reveal (real scroll path ran).
-    vcx.run_until_parked();
-    let after = view
-        .update(vcx, |v, cx| v.read_session(id, cx, |c| c.pending_reveal_line))
+    // Leaving the subagent view (unfocus) returns to the main transcript.
+    let after_back = view
+        .update(vcx, |v, cx| {
+            v.unfocus_subagent(cx);
+            v.read_session(id, cx, |c| c.focused_subagent.clone())
+        })
         .expect("session");
-    assert_eq!(
-        after, None,
-        "the transcript build must consume pending_reveal_line (it drives scroll_to_reveal_item)"
+    assert_eq!(after_back, None, "back must clear the subagent swap");
+}
+
+/// The subagent swap actually PAINTS (INV-UX-15): with a subagent focused, the
+/// main area renders the `subagent-view` (Back header + its context) and the
+/// cached `transcript-viewport` is NOT painted — proving the view was replaced,
+/// not just a state flag flipped. Clearing focus (Back / Esc) restores it.
+///
+/// Negative control: render the transcript unconditionally (drop the
+/// `focused_subagent` match arm) and `subagent-view` never paints → RED.
+#[gpui::test]
+fn subagent_focus_swaps_the_painted_view(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let key = view.update(vcx, |v, cx| {
+        use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
+        let mut c = v.agent_mut(cx).expect("agent");
+        let tid: ToolCallId = "sub-paint".into();
+        let mut tc = ToolCall::new(tid.clone(), "Explore repo".to_string());
+        tc.kind = ToolKind::Think;
+        tc.raw_input = Some(serde_json::json!({"prompt": "map the code"}));
+        let anchor = c.editor.anchor_for_line(0);
+        let k = crate::ToolCallKey::from_id(&tid);
+        c.tools.register(k.clone(), tc, anchor);
+        k
+    });
+    vcx.run_until_parked();
+
+    // Focus the subagent → swap. Probe a clean paint pass.
+    view.update(vcx, |v, cx| v.focus_subagent(key, cx));
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let swapped = crate::layout_probe_get("subagent-view");
+    let transcript_while_swapped = crate::layout_probe_get("transcript-viewport");
+    crate::layout_probe_end();
+    assert!(
+        swapped.is_some(),
+        "the subagent context view must paint when a subagent is focused"
+    );
+    assert!(
+        transcript_while_swapped.is_none(),
+        "the transcript must NOT paint while swapped to the subagent view"
+    );
+
+    // Back (unfocus) → the subagent view is gone (the transcript, a cached view,
+    // repaints via cached-scene replay, so its own paint-time probe need not
+    // re-fire; the swap's disappearance is the reliable signal that the main
+    // view returned).
+    view.update(vcx, |v, cx| v.unfocus_subagent(cx));
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let subagent_after_back = crate::layout_probe_get("subagent-view");
+    crate::layout_probe_end();
+    assert!(
+        subagent_after_back.is_none(),
+        "the subagent view must be gone after Back — the main view returned"
     );
 }
 
