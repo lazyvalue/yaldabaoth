@@ -463,6 +463,17 @@ impl YaldaGpuiView {
                             session.state.permission_mode = permission_mode;
                             session.state.status =
                                 Some("attaching to ACP agent via session server…".into());
+                            // The synchronous `/clear` (or open) settled the local
+                            // PLACEHOLDER, but this async server round-trip is where the
+                            // session is finally bound — and the reported "can't see
+                            // what I type after /clear" bug is that the worksheet ends
+                            // here NOT typeable. Re-settle at the bind so the fresh
+                            // worksheet rests focused+Insert (typeable + inline-active ⇒
+                            // keystrokes route to the compose AND repaint the block); a
+                            // restored draft/history session settles to its own correct
+                            // state (settle is idempotent + stale-safe). `scx.notify()`
+                            // repaints the (possibly freshly-created) TranscriptView.
+                            session.state.settle_input_focus();
                             scx.notify();
                         });
                     }

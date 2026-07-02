@@ -3543,6 +3543,59 @@ fn duplicate_resolution_closes_orphan_and_focuses_owner(cx: &mut TestAppContext)
     });
 }
 
+/// THE `/clear` async completion, real view method: after the server round-trip
+/// binds the new session (`apply_open_agent_resolution` → `Created` → `Bound`), the
+/// worksheet must end TYPEABLE (inline You-block active, focus=Compose) — this is the
+/// path the pure /clear can't reach in the harness (gap #2), and where the "can't see
+/// what I type after clear" bug lived: the async bind left the session resting in NAV.
+/// Drives the REAL method with a synthetic `Created`; RED without the settle at the
+/// bind, GREEN with it.
+#[gpui::test]
+fn clear_async_bind_leaves_worksheet_typeable(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    // Post-/clear placeholder as the async path could leave it: fresh worksheet, NOT
+    // typeable (resting nav, block closed), a pending open token, no sid yet.
+    let token = view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| {
+            c.editor =
+                yalda::editor::Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+            c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
+            c.close_you_block();
+            c.focus = crate::AgentFocus::Transcript;
+        });
+        let token = crate::alloc_open_token();
+        if let Some(tile) = v.agent_tile_mut() {
+            tile.pending_open_token = Some(token);
+        }
+        token
+    });
+    // The REAL server-resolution handler binds the new sid.
+    view.update(vcx, |v, cx| {
+        v.apply_open_agent_resolution(
+            token,
+            crate::OpenResolution::Created {
+                sid: "S-cleared".into(),
+                acp_id: None,
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            },
+            cx,
+        );
+    });
+    view.read_with(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("still bound after resolution");
+        let (active, focus) = v
+            .read_session(id, cx, |c| (c.inline_you_block_active(), c.focus))
+            .unwrap();
+        assert!(
+            active,
+            "after the async /clear bind the worksheet must be typeable (inline block active) \
+             — else keystrokes fall into nav and nothing repaints"
+        );
+        assert_eq!(focus, crate::AgentFocus::Compose, "focused so typing lands + repaints");
+    });
+}
+
 /// Multi-session save→restore: persisting N bound sessions and loading them back
 /// yields N slots, each carrying its OWN sid/label — the mapping
 /// `restore_agent_leaves` zips one slot per leaf. Hermetic: the persistence file
