@@ -536,6 +536,7 @@ impl YaldaGpuiView {
                 &code_font,
                 &code_font,
                 None,
+                None,
                 line_idx,
             );
 
@@ -676,6 +677,7 @@ impl YaldaGpuiView {
                 DEFAULT_FG,
                 line_font,
                 &code_font,
+                None,
                 None,
                 line_idx,
             );

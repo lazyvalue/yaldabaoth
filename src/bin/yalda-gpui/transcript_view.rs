@@ -783,8 +783,16 @@ impl TranscriptView {
                             cursor_color,
                             base_style,
                             line_base_fg,
+                            // Transcript prose renders in the PROPORTIONAL body
+                            // font (`styled_line_element` keeps inline-code spans
+                            // on `code_font`). The compose box stays monospace —
+                            // its caret containment (INV-UX-1) depends on a fixed
+                            // char width.
+                            &body_font_snap,
                             &code_font_snap,
-                            &code_font_snap,
+                            // Exclude the selection bg from the code-font proxy so
+                            // highlighting prose doesn't turn it monospace.
+                            Some(at_snap.selection_bg),
                             Some(&token_sink_snap),
                             line_idx,
                         );

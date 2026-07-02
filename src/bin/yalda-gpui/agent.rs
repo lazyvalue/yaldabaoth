@@ -1052,6 +1052,10 @@ pub(crate) fn build_wrapped_line(
     base_fg: u32,
     line_font: &SharedString,
     code_font: &SharedString,
+    // The selection-highlight bg (if a selection is painted onto these segs), so
+    // `styled_line_element` doesn't mistake it for the inline-code bg and flip
+    // selected prose to monospace. `None` when nothing is selected.
+    selection_bg: Option<NColor>,
     // Select-to-clipboard: when present, each painted text token registers its
     // bounds + covered char range into this sink keyed by `line_idx`, so mouse
     // hit-testing can map a point to a transcript `(line, char)`. `None` for
@@ -1092,7 +1096,12 @@ pub(crate) fn build_wrapped_line(
     if tokens.is_empty() {
         let line = segments_to_styled_line(&[(" ".to_string(), base_style)]);
         row = row.child(styled_line_element(
-            &line, base_style, base_fg, line_font, code_font,
+            &line,
+            base_style,
+            base_fg,
+            line_font,
+            code_font,
+            selection_bg,
         ));
         if is_cursor_line {
             row = row.child(make_caret(mode, ' ', cursor_color));
@@ -1105,7 +1114,8 @@ pub(crate) fn build_wrapped_line(
         for (text, style) in &tokens {
             let token_chars = text.chars().count();
             let line = segments_to_styled_line(&[(text.clone(), *style)]);
-            let el = styled_line_element(&line, base_style, base_fg, line_font, code_font);
+            let el =
+                styled_line_element(&line, base_style, base_fg, line_font, code_font, selection_bg);
             let el = match token_sink {
                 Some(sink) => {
                     register_token_on_paint(el, sink.clone(), line_idx, char_so_far, token_chars)
@@ -1138,7 +1148,12 @@ pub(crate) fn build_wrapped_line(
             if !before.is_empty() {
                 let line = segments_to_styled_line(&[(before, *style)]);
                 row = row.child(styled_line_element(
-                    &line, base_style, base_fg, line_font, code_font,
+                    &line,
+                    base_style,
+                    base_fg,
+                    line_font,
+                    code_font,
+                    selection_bg,
                 ));
             }
             let cursor_char = chars.get(split_point).copied().unwrap_or(' ');
@@ -1155,13 +1170,23 @@ pub(crate) fn build_wrapped_line(
                 let after: String = chars[after_start..].iter().collect();
                 let line = segments_to_styled_line(&[(after, *style)]);
                 row = row.child(styled_line_element(
-                    &line, base_style, base_fg, line_font, code_font,
+                    &line,
+                    base_style,
+                    base_fg,
+                    line_font,
+                    code_font,
+                    selection_bg,
                 ));
             }
         } else {
             let line = segments_to_styled_line(&[(text.clone(), *style)]);
             row = row.child(styled_line_element(
-                &line, base_style, base_fg, line_font, code_font,
+                &line,
+                base_style,
+                base_fg,
+                line_font,
+                code_font,
+                selection_bg,
             ));
         }
         col_so_far = token_end_col;

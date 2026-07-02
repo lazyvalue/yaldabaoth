@@ -2252,6 +2252,38 @@ fn apply_selection_bg_no_overlap_preserves_segments() {
 }
 
 #[test]
+fn selection_bg_does_not_flip_prose_to_code_font() {
+    use crate::span_uses_code_font;
+    let code_yellow = NColor::Rgb(241, 250, 140);
+    let sel = NColor::Rgb(68, 71, 90); // a selection-highlight color
+    let code_bg = NColor::Rgb(40, 42, 54); // inline-code / code-block bg
+
+    // Plain prose, no selection → body font.
+    assert!(!span_uses_code_font(None, None, None));
+    // Inline code detected by its distinctive bg → code font.
+    assert!(span_uses_code_font(Some(code_bg), None, None));
+    // Inline code detected by the Dracula code fg → code font.
+    assert!(span_uses_code_font(None, Some(code_yellow), None));
+
+    // THE FIX: selected prose carries the selection bg, but that must NOT be
+    // read as code (else highlighting flips proportional text to monospace).
+    assert!(
+        !span_uses_code_font(Some(sel), None, Some(sel)),
+        "selected prose must stay in the body font"
+    );
+    // NEGATIVE CONTROL: without the selection-bg exclusion (pretend selection_bg
+    // is unknown/None), the same span WOULD be misclassified as code — proving
+    // the exclusion is load-bearing.
+    assert!(
+        span_uses_code_font(Some(sel), None, None),
+        "control: any bg without the exclusion looks like code"
+    );
+    // Selected INLINE CODE keeps the code font via its fg even though its bg is
+    // now the selection color.
+    assert!(span_uses_code_font(Some(sel), Some(code_yellow), Some(sel)));
+}
+
+#[test]
 fn apply_selection_bg_full_segment_gets_bg() {
     let segs = vec![s("abc")];
     let out = apply_selection_bg(&segs, 0, 3, NColor::Red);

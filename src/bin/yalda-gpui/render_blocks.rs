@@ -136,12 +136,31 @@ pub(crate) fn font_for(s: NStyle, family: &SharedString) -> Font {
 // Convert a StyledLine to a GPUI StyledText with TextRuns
 // ----------------------------------------------------------------------------
 
+/// Decide whether a span renders in the monospace CODE font. Inline code is
+/// detected by its distinctive bg (the `code_inline` proxy) or the Dracula code
+/// fg. The **selection-highlight bg is explicitly excluded** — any span can
+/// carry it, and treating it as code would flip selected proportional prose to
+/// monospace (the "highlight becomes monospaced" bug).
+pub(crate) fn span_uses_code_font(
+    bg: Option<NColor>,
+    fg: Option<NColor>,
+    selection_bg: Option<NColor>,
+) -> bool {
+    let is_code_bg = bg.is_some() && bg != selection_bg;
+    is_code_bg || fg == Some(NColor::Rgb(241, 250, 140))
+}
+
 pub(crate) fn styled_line_element(
     line: &StyledLine,
     base_style: NStyle,
     base_fg: u32,
     body_font: &SharedString,
     code_font: &SharedString,
+    // The active selection-highlight background, if any. A selected span carries
+    // this as its `bg`, which must NOT be mistaken for the inline-code bg proxy
+    // below (else selecting proportional prose flips it to monospace). `None`
+    // for callers that never paint a selection into the span style.
+    selection_bg: Option<NColor>,
 ) -> AnyElement {
     // Build the concatenated text and a parallel run list.
     let mut text = String::new();
@@ -168,9 +187,7 @@ pub(crate) fn styled_line_element(
             let len = span.text.len();
             text.push_str(&span.text);
 
-            // Pick code font for spans whose bg matches code_inline (yellow on dark);
-            // simpler proxy: any span with explicit bg uses code font.
-            let font = if combined.bg.is_some() || combined.fg == Some(NColor::Rgb(241, 250, 140)) {
+            let font = if span_uses_code_font(combined.bg, combined.fg, selection_bg) {
                 font_for(combined, code_font)
             } else {
                 font_for(combined, body_font)
@@ -243,7 +260,7 @@ pub(crate) fn doc_styled_line_element(
     // Reuse the plain element when this ctx isn't set up for doc-view selection.
     let (block_idx, sink) = match (ctx.current_block, ctx.line_layouts.as_ref()) {
         (Some(b), Some(s)) => (b, s.clone()),
-        _ => return styled_line_element(line, base_style, base_fg, body_font, code_font),
+        _ => return styled_line_element(line, base_style, base_fg, body_font, code_font, None),
     };
 
     // Build text + runs, identical to `styled_line_element`. We need the
@@ -1332,6 +1349,7 @@ pub(crate) fn table_element(
             DEFAULT_FG,
             &ctx.body_font,
             &ctx.code_font,
+            None,
         )));
     }
     table = table.child(header_row);
@@ -1360,6 +1378,7 @@ pub(crate) fn table_element(
                 DEFAULT_FG,
                 &ctx.body_font,
                 &ctx.code_font,
+                None,
             )));
         }
         table = table.child(row_div);
