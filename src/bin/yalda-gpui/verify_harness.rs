@@ -5571,6 +5571,292 @@ fn worksheet_typing_after_clear_is_visible_without_pressing_i(cx: &mut TestAppCo
     );
 }
 
+// ============================================================================
+// /clear worksheet-invisible reproduction (docs/projects/clear-worksheet-invisible)
+//
+// The recurring bug: after `/clear` in worksheet mode, typed text is INVISIBLE
+// until a chatbox toggle. The text IS in the buffer — it just doesn't REPAINT.
+// Prior tests asserted the BUFFER (`compose().text() == "hello"`) or a hand-built
+// GATE state (`inline_you_block_active()`), never that a keystroke actually
+// RE-RENDERS the cached transcript. This measures the real mechanism: typing must
+// bust the cached transcript (render count advances). Flat count = invisible = bug.
+// ============================================================================
+
+/// REPRO A — the SIMULATED post-clear resting state (same setup as the legacy
+/// `worksheet_typing_after_clear_is_visible_without_pressing_i`, which asserted
+/// the buffer). Here we assert the real invalidation: a keystroke after `/clear`
+/// must RE-RENDER the cached transcript (so the You-block repaints with the text).
+#[gpui::test]
+fn repro_clear_worksheet_typed_text_repaints_simulated(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    // Land in the settled post-/clear resting state.
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| {
+            c.editor =
+                yalda::editor::Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+            c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
+            c.close_you_block();
+            c.focus = crate::AgentFocus::Transcript;
+            c.settle_input_focus();
+        });
+    });
+    vcx.run_until_parked();
+    crate::perf_reset("transcript");
+    // Force a clean baseline render, then measure the delta the keystroke causes.
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    // The user types — NO `i`, NO mode toggle — via the REAL key handler.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("transcript");
+
+    let (active, text) = view
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| {
+                (c.inline_you_block_active(), c.input_surface.compose().text())
+            })
+        })
+        .expect("session");
+    assert_eq!(text.trim(), "h", "sanity: the char landed in the compose buffer");
+    assert!(
+        active,
+        "inline You-block must be active after /clear so the keystroke renders"
+    );
+    assert!(
+        after > base,
+        "a keystroke after /clear MUST re-render the cached transcript so the typed \
+         text repaints (render count {base} -> {after}); flat == the invisible-text bug"
+    );
+}
+
+/// REPRO B — THE REAL REDUCER PATH. After `/clear` the fresh server session's
+/// channel opens, which the reducer sees as a `ChannelOpened` that rebaselines
+/// the generation → `reset_for_replay` → `settle`. That is the exact step no
+/// prior `/clear` test ran BEFORE the user types. We feed it to the ALREADY-bound
+/// session (the bind/attach dance can't run headlessly without a server — the
+/// deferred `spawn_attach_sessions` unbinds with no server; that's gap #2, not the
+/// bug), then a REAL keystroke, and assert the cached transcript RE-RENDERS.
+#[gpui::test]
+fn repro_clear_worksheet_typed_text_repaints_real_path(cx: &mut TestAppContext) {
+    use yalda::agent_event::AgentEventKind as K;
+
+    let (view, vcx) = boot_worksheet_nav(cx); // bound sid "S1", splash dismissed
+    // Post-/clear resting worksheet, exactly as `settle_input_focus` leaves it.
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| {
+            c.editor =
+                yalda::editor::Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+            c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
+            c.close_you_block();
+            c.focus = crate::AgentFocus::Transcript;
+            c.settle_input_focus();
+        });
+    });
+    vcx.run_until_parked();
+
+    // The fresh channel opens: ChannelOpened rebaselines gen → reset_for_replay →
+    // settle. THE UNTESTED TAIL — driven through the REAL reducer.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false })],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    crate::perf_reset("transcript");
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    // The user types — NO `i`, NO mode toggle — through the REAL key handler.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("transcript");
+
+    let (active, text, awaiting, open, chatbox) = view
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| {
+                (
+                    c.inline_you_block_active(),
+                    c.input_surface.compose().text(),
+                    c.turn_phase.is_awaiting(),
+                    c.you_block_open,
+                    c.input_surface.is_chatbox(),
+                )
+            })
+        })
+        .expect("session still bound");
+    assert_eq!(text.trim(), "h", "sanity: the char landed in the compose buffer");
+    assert!(
+        active,
+        "REAL PATH: inline You-block inactive after /clear + ChannelOpened replay \
+         (you_block_open={open}, awaiting={awaiting}, chatbox={chatbox}) — \
+         keystrokes won't render",
+    );
+    assert!(
+        after > base,
+        "REAL PATH: a keystroke after /clear MUST re-render the cached transcript so \
+         the typed text repaints (render count {base} -> {after}); flat == the \
+         invisible-text bug the user reports",
+    );
+}
+
+/// THE BUG, on the real render path (the one that matters). "The hole" is the
+/// state the `/clear` symptom reduces to (Fable's analysis, spec.md §1):
+/// `focus=Compose ∧ you_block_open=false ∧ idle ∧ worksheet` — keystrokes route
+/// to the compose (routing keys on `focus`, agent_ui.rs:4231) but nothing paints
+/// it (painting keys on `you_block_open` via `inline_you_block_active`, and the
+/// bottom box only shows when chatbox/awaiting — screens.rs:1188). This drives
+/// the REAL key handler + REAL render and asserts the typed char both busts the
+/// cached transcript (render count) AND paints an inline You-block. The hole
+/// precondition is set directly because it is an invariant VIOLATION with no
+/// single named producer — the FIX (deriving the gate from `focus`) heals it
+/// regardless of producer.
+///
+/// NEGATIVE CONTROL (mandatory): revert `inline_you_block_active` to
+/// `you_block_open && ...` and this fails RED — flat render count AND no
+/// `you-block` paint — the exact user symptom.
+#[gpui::test]
+fn clear_worksheet_hole_types_and_paints(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    // Enter the hole: focus=Compose, block CLOSED, idle, worksheet, Insert.
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| {
+            c.editor =
+                yalda::editor::Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+            c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
+            c.close_you_block(); // you_block_open = false
+            c.focus = crate::AgentFocus::Compose; // routed-to but (pre-fix) un-painted
+            c.input_surface.compose_mut().mode = crate::EditMode::Insert;
+            c.turn_phase = crate::TurnPhase::Idle;
+        });
+    });
+    vcx.run_until_parked();
+
+    // Pre-assert the FULL four-part hole so a future refactor can't make this test
+    // vacuous (critique axis 5.1).
+    let (focus_compose, open, awaiting, chatbox) = view
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| {
+                (
+                    c.focus == crate::AgentFocus::Compose,
+                    c.you_block_open,
+                    c.turn_phase.is_awaiting(),
+                    c.input_surface.is_chatbox(),
+                )
+            })
+        })
+        .expect("session");
+    assert!(
+        focus_compose && !open && !awaiting && !chatbox,
+        "precondition: must be in the hole (focus=Compose, block closed, idle, worksheet) \
+         got (focus_compose,open,awaiting,chatbox)=({focus_compose},{open},{awaiting},{chatbox})"
+    );
+
+    crate::perf_reset("transcript");
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    // REAL typing + REAL render, with the paint probe active so the keystroke's
+    // re-render (if any) is captured.
+    crate::layout_probe_begin();
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("transcript");
+    let you_block = crate::layout_probe_get("you-block");
+    let viewport = crate::layout_probe_get("transcript-viewport");
+    crate::layout_probe_end();
+
+    let text = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text()))
+        .expect("session");
+    assert_eq!(text.trim(), "h", "sanity: the char landed in the compose buffer");
+    // The assertions the six prior fixes never made — RENDER + PAINT, not buffer:
+    assert!(
+        after > base,
+        "typing in the hole MUST bust the cached transcript (render count {base} -> {after}); \
+         flat == the invisible-text bug",
+    );
+    let (_, by, _, bh) = you_block
+        .expect("typing in the hole MUST paint an inline You-block (invisible-text bug)");
+    let (_, vy, _, vh) = viewport.expect("transcript viewport did not paint");
+    // The block must paint INSIDE the visible viewport — a block painted off-screen
+    // would be just as invisible (non-vacuous paint, critique axis 5.2).
+    assert!(
+        by >= vy - 0.5 && by + bh <= vy + vh + 0.5,
+        "the You-block [{by}, {}] must lie inside the transcript viewport [{vy}, {}]",
+        by + bh,
+        vy + vh,
+    );
+}
+
+/// REPRO C — the FRESH TranscriptView lifecycle. `clear_agent_session` does
+/// `self.transcript_views.remove(&id)` and rebinds to a new session, so a BRAND
+/// NEW `TranscriptView` (with `last_rendered = default`) is created and must
+/// repaint on the first keystroke. Reproduce that: settle, ChannelOpened, then
+/// DROP the transcript view (as clear does), let it re-create on a render, then
+/// type — and assert the fresh view re-renders.
+#[gpui::test]
+fn repro_clear_worksheet_typed_text_repaints_fresh_transcript_view(cx: &mut TestAppContext) {
+    use yalda::agent_event::AgentEventKind as K;
+    let (view, vcx) = boot_worksheet_nav(cx);
+    let id = view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| {
+            c.editor =
+                yalda::editor::Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+            c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
+            c.close_you_block();
+            c.focus = crate::AgentFocus::Transcript;
+            c.settle_input_focus();
+        });
+        id
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note("S1", 1, 1, 0, K::ChannelOpened { resumed: false })],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // Drop the TranscriptView (what clear_agent_session does via transcript_views.
+    // remove) so the next render builds a FRESH one with a default watermark.
+    view.update(vcx, |v, _| {
+        v.transcript_views.remove(&id);
+    });
+    crate::perf_reset("transcript");
+    // One render re-creates + first-renders the fresh view (stamps last_rendered).
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    vcx.run_until_parked();
+    let after = crate::perf_render_count("transcript");
+
+    let (active, text) = view
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| (c.inline_you_block_active(), c.input_surface.compose().text()))
+        })
+        .expect("session");
+    assert_eq!(text.trim(), "h", "sanity: the char landed in the compose buffer");
+    assert!(active, "inline You-block active");
+    assert!(
+        after > base,
+        "FRESH VIEW: a keystroke must re-render the newly-created transcript view \
+         (render count {base} -> {after}); flat == invisible-text bug",
+    );
+}
+
 /// `focused_in_insert_mode` for the raw EDIT view (`App::Buffer::Editing`): Insert IS
 /// text entry (leaders suppressed); Normal is navigation (leaders fire). Kills the
 /// `e.mode == Insert` mutant surviving in this arm.

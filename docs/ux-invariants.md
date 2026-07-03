@@ -618,6 +618,60 @@ after Back the `subagent-view` is gone (negative control: render the transcript
 unconditionally ⇒ `subagent-view` never paints ⇒ RED). Plus
 `panel_highlight_swaps_to_subagent` for the panel-driven entry.
 
+### INV-UX-16 — Keystrokes that route to the compose are ALWAYS painted (routing ⇒ painting)
+
+**Statement.** In an agent worksheet, a keystroke ROUTES to the compose buffer
+whenever `focus == AgentFocus::Compose` (agent_ui.rs:4231; the transcript-nav
+branch is taken only when focus is on the transcript). Therefore, whenever focus
+is on the compose in an idle worksheet, the compose **must be painted** and its
+edits must **bust the cached transcript** — otherwise the user types into a
+surface that renders nowhere (the "invisible text" class). This is guaranteed
+structurally by deriving the render/notify gate from the SAME fact the router
+uses:
+
+```
+inline_you_block_active() =
+    (you_block_open || focus == AgentFocus::Compose) && !awaiting && !chatbox
+```
+
+The `|| focus == Compose` clause is load-bearing: it closes the recurring
+"`/clear` worksheet-invisible" bug ("the hole" =
+`focus==Compose ∧ you_block_open==false ∧ idle ∧ worksheet`, where routing sent
+keys to a compose that painted nowhere — the bottom box only shows chatbox /
+mid-turn, screens.rs:1188). Mid-turn (`awaiting`) and chatbox stay excluded —
+their draft is the bottom box, which IS painted there.
+
+**Applies to.** `agent.rs`: `inline_you_block_active()` (:3977, the ONE shared
+gate), the flat-list injection (`rebuild_agent_view_model` :2892, on the derived
+gate), and the view-model memo key (`view_model_fingerprint` :3350, hashes the
+DERIVED gate so a focus-only flip busts the flat-list memo — else a stale list
+without the YouBlock row is reused). Everything else
+(`TranscriptSeqs::of`/`YouBlockSnap`, the keystroke session-notify
+agent_ui.rs:4260, reveal, submit anchor) already routes through the predicate and
+self-aligns.
+
+**Why.** Six prior "fixes" added another `settle_input_focus()` at another guessed
+producer of the hole; the hole has many producers (e.g. `force_restart_agent`
+Idles without settle, agent_ui.rs:3602) and was never made unrepresentable.
+Deriving painting from routing makes the disagreement set empty for EVERY
+producer — no writer can strand focus on an unpainted compose without visibly
+breaking routing. See `docs/projects/clear-worksheet-invisible/` (spec + critique
++ failure-log).
+
+**Status:** `honored` (headless — the real key handler + real render, with the
+paint probe; the live `/clear` producer is confirmed via `YALDA_CLEAR_DEBUG`).
+
+**Enforcement.** `verify_harness.rs::clear_worksheet_hole_types_and_paints` —
+enter the hole (pre-asserted 4-part state), type via the REAL `handle_claude_key`,
+assert the cached transcript re-renders (render count advances) AND an inline
+You-block PAINTS inside the transcript viewport. **Negative control: each of the
+three edits (predicate :3977, injection :2892, memo :3350) reverted independently
+produces RED for its OWN reason** (flat count / no paint / stale-list no paint) —
+verified. Plus `tests.rs::inline_you_block_active_truth_table` (the
+`focus==Compose` rows). The buffer-only assertion of the six prior fixes
+(`compose().text()=="hello"`) is explicitly NOT the guard — it is green while the
+screen is blank.
+
 ## Cross-references
 
 - `spec-turn-steering.md` — the full steering design (queue, delivery modes, the
@@ -635,6 +689,14 @@ unconditionally ⇒ `subagent-view` never paints ⇒ RED). Plus
 
 ## Revision history
 
+- 2026-07-02 (8) — Added INV-UX-16: keystrokes that route to the compose are always
+  painted. `inline_you_block_active()` now derives from `focus==Compose` (not just
+  `you_block_open`), closing the recurring "`/clear` worksheet-invisible" bug
+  (routing keyed on `focus`, painting keyed on `you_block_open` — the disagreement
+  set was "the hole"). Aligned the flat-list injection + view-model memo key onto
+  the shared gate. Guarded by `clear_worksheet_hole_types_and_paints` (3 edits
+  independently negative-controlled). Root cause + fix + adversarial critique:
+  `docs/projects/clear-worksheet-invisible/`.
 - 2026-07-02 (7) — Added INV-UX-15: focusing a subagent swaps the main agent view
   to its context (Back header + prompt/content/output), Back/Esc returns. Reworked
   INV-UX-12's highlight behavior from a transcript-scroll into this swap (the

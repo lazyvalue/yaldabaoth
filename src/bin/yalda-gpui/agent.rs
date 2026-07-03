@@ -2889,7 +2889,12 @@ pub(crate) fn rebuild_agent_view_model(
         // the SAME pre-insertion list, then applied in DESCENDING order so an insert
         // never shifts a not-yet-applied (smaller) position.
         let mut inserts: Vec<(usize, Option<usize>)> = Vec::new();
-        if c.you_block_open {
+        // INV-UX-16: inject the inline You-block on the SAME gate the render/notify
+        // paths use (`inline_you_block_active` — here it reduces to `you_block_open
+        // || focus==Compose`, since the enclosing guard already ensures idle +
+        // worksheet). Using the shared predicate keeps injection ⇔ paint ⇔ notify
+        // aligned, so a `focus==Compose` hole always gets a rendered block.
+        if c.inline_you_block_active() {
             inserts.push((resolve(c.effective_you_block_anchor(), &flat_items), None));
         }
         for (i, (anchor, _)) in c.parked_you_blocks.iter().enumerate() {
@@ -3342,12 +3347,16 @@ impl AgentState {
             // name the mode or the divider wouldn't appear/disappear live.
             (self.mode == EditMode::Insert).hash(&mut h);
         }
-        // INV-UX-9 (stage 2): the inline You-block is injected into the flat list
-        // when open, at its anchor — so opening/closing/moving it restructures the
-        // list and must rebuild the memo. The draft CONTENT is not keyed here (the
-        // block is one item regardless of its text); a keystroke busts the render
-        // via `TranscriptSeqs`, not this build.
-        self.you_block_open.hash(&mut h);
+        // INV-UX-9 (stage 2) / INV-UX-16: the inline You-block is injected into the
+        // flat list on the `inline_you_block_active()` gate, at its anchor — so a
+        // change in that gate (open/close, OR a `focus==Compose` flip per INV-UX-16)
+        // restructures the list and must rebuild the memo. Keying the DERIVED gate
+        // (not the raw `you_block_open`) is load-bearing: a Transcript→Compose focus
+        // flip with a closed block now injects the block, so the memo MUST see it or
+        // a stale flat list (no YouBlock row) is reused — the hole would persist even
+        // with the predicate fixed. The draft CONTENT is not keyed (one item
+        // regardless of text; a keystroke busts the render via `TranscriptSeqs`).
+        self.inline_you_block_active().hash(&mut h);
         self.you_block_anchor.hash(&mut h);
         // Parked blocks (rule 6) are injected too — their anchors AND text restructure
         // the flat list (a park adds an item with that text), so key both.
@@ -3965,17 +3974,29 @@ impl AgentState {
         self.parked_you_blocks.clear();
     }
 
-    /// INV-UX-9: is the inline You-block currently the live editing surface — i.e.
-    /// rendered inside the transcript at its anchor? True iff a block is open, the
-    /// agent is idle, and we're in the worksheet (mid-turn the draft is the bottom
-    /// chatbox, not an inline block; chatbox mode never has an inline block). This
-    /// is the ONE predicate the render injection (`rebuild_agent_view_model`), the
-    /// transcript fingerprint + snapshot (`TranscriptSeqs`/`YouBlockSnap`), the
-    /// inline-edit session-notify, and the submit-anchor path all share — keeping
-    /// them from drifting out of sync (which would re-introduce the stale/double
-    /// render class).
+    /// INV-UX-9 / INV-UX-16: is the inline You-block currently the live editing
+    /// surface — i.e. rendered inside the transcript at its anchor? True iff (a
+    /// block is open OR **focus is on the compose**), the agent is idle, and we're
+    /// in the worksheet.
+    ///
+    /// The `|| focus == Compose` clause is LOAD-BEARING and closes the recurring
+    /// "`/clear` worksheet-invisible" bug (docs/projects/clear-worksheet-invisible).
+    /// Keystroke ROUTING keys on `focus` (a worksheet key routes to the compose
+    /// whenever `focus == Compose`, agent_ui.rs:4231); if PAINTING keyed only on
+    /// `you_block_open`, any state with `focus == Compose` but a closed block —
+    /// "the hole" — would route keystrokes to a compose that renders NOWHERE (the
+    /// bottom box only shows chatbox/mid-turn, screens.rs:1188) and never busts the
+    /// cached transcript. Deriving the gate from the SAME routing fact makes
+    /// routing⇒painting STRUCTURAL: no writer can strand focus on an unpainted
+    /// compose. Mid-turn (awaiting) and chatbox are still excluded (their draft is
+    /// the bottom box). This is the ONE predicate the render injection
+    /// (`rebuild_agent_view_model`), the transcript fingerprint + snapshot
+    /// (`TranscriptSeqs`/`YouBlockSnap`), the inline-edit session-notify, and the
+    /// submit-anchor path all share — keeping them from drifting out of sync.
     pub(crate) fn inline_you_block_active(&self) -> bool {
-        self.you_block_open && !self.turn_phase.is_awaiting() && !self.input_surface.is_chatbox()
+        (self.you_block_open || self.focus == AgentFocus::Compose)
+            && !self.turn_phase.is_awaiting()
+            && !self.input_surface.is_chatbox()
     }
 
     /// The You-block anchor to ACTUALLY use, re-validated against the CURRENT

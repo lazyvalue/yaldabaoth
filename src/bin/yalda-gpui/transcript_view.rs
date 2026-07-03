@@ -218,7 +218,28 @@ impl TranscriptView {
         // when a slice moved — logging the reason for the notify counter.
         cx.observe(&session, |this: &mut TranscriptView, session, cx| {
             let now = TranscriptSeqs::of(&session.read(cx).state);
-            if let Some(reason) = this.last_rendered.diff_reason(&now) {
+            let diff = this.last_rendered.diff_reason(&now);
+            // Diagnostic for the recurring "/clear worksheet invisible" bug: with
+            // YALDA_CLEAR_DEBUG=1, log EVERY observe fire, whether or not a slice
+            // moved. If the user types after /clear and this prints "moved=NONE"
+            // (no re-render) while inline-active flips, the keystroke isn't busting
+            // the cache — the invisible-text bug, caught on the REAL path.
+            if std::env::var_os("YALDA_CLEAR_DEBUG").is_some() {
+                let c = &session.read(cx).state;
+                eprintln!(
+                    "[clear-debug] transcript observe: moved={:?} inline_active={} \
+                     you_block_open={} awaiting={} chatbox={} compose_edit_seq={} \
+                     last_compose_edit_seq={}",
+                    diff,
+                    c.inline_you_block_active(),
+                    c.you_block_open,
+                    c.turn_phase.is_awaiting(),
+                    c.input_surface.is_chatbox(),
+                    now.compose_edit_seq,
+                    this.last_rendered.compose_edit_seq,
+                );
+            }
+            if let Some(reason) = diff {
                 record_notify(this.perf_label, reason);
                 cx.notify();
             }

@@ -4259,6 +4259,24 @@ impl YaldaGpuiView {
         let inline_active = self
             .agent_read(cx, |c| c.inline_you_block_active())
             .unwrap_or(false);
+        // Diagnostic for the recurring "/clear worksheet invisible" bug. With
+        // YALDA_CLEAR_DEBUG=1, every worksheet keystroke logs the exact gate that
+        // decides whether it repaints. If after /clear this prints
+        // inline_active=false, the false clause (open/awaiting/chatbox) IS the bug.
+        if std::env::var_os("YALDA_CLEAR_DEBUG").is_some() {
+            let g = self.agent_read(cx, |c| {
+                (
+                    c.you_block_open,
+                    c.turn_phase.is_awaiting(),
+                    c.input_surface.is_chatbox(),
+                    c.focus == AgentFocus::Compose,
+                    c.input_surface.compose().text().chars().count(),
+                )
+            });
+            eprintln!(
+                "[clear-debug] worksheet keystroke: inline_active={inline_active} gate(open,awaiting,chatbox,focus_compose,compose_len)={g:?}"
+            );
+        }
         if inline_active {
             // INV-UX-1: keep the inline block's caret in view as the reply grows.
             self.with_session_silent(focused_id, cx, |c| c.pending_reveal_cursor = true);

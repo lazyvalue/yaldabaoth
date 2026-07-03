@@ -3021,25 +3021,30 @@ fn clear_then_empty_channel_open_keeps_worksheet_typeable() {
 }
 
 /// EXHAUSTIVE truth table for `inline_you_block_active` — the gate that decides
-/// whether a worksheet keystroke busts the transcript cache (repaints). Mutation
-/// testing found all three of its boolean operands untested (`-> true`, both
-/// `&&`→`||`); this pins each. The predicate is `you_block_open && !awaiting &&
-/// !chatbox` — every clause must be load-bearing.
+/// whether the inline You-block renders AND a worksheet keystroke busts the
+/// transcript cache (repaints). The predicate (INV-UX-16) is
+/// `(you_block_open || focus==Compose) && !awaiting && !chatbox`. Every clause
+/// must be load-bearing (mutation testing found the original three operands
+/// untested); the `|| focus==Compose` clause closes the recurring
+/// "/clear worksheet-invisible" bug — see docs/projects/clear-worksheet-invisible.
 #[test]
 fn inline_you_block_active_truth_table() {
     let base = || {
         let mut st = AgentState::new_server_managed(None);
         st.input_surface = InputSurface::new(InputModeKind::Worksheet);
         st.you_block_open = true;
-        st // open + idle + worksheet
+        st // open + idle + worksheet (focus defaults to Transcript)
     };
     assert!(base().inline_you_block_active(), "open + idle + worksheet ⇒ active");
 
-    // Each clause flipped in isolation must turn it OFF (kills `-> true` and both
-    // `&&`→`||`: with these states an OR would wrongly report active).
+    // Each conjunct flipped in isolation must turn it OFF.
     let mut closed = base();
     closed.you_block_open = false;
-    assert!(!closed.inline_you_block_active(), "block closed ⇒ inactive");
+    closed.focus = AgentFocus::Transcript; // explicit: NOT the compose either
+    assert!(
+        !closed.inline_you_block_active(),
+        "block closed + focus on transcript (nav) ⇒ inactive"
+    );
 
     let mut awaiting = base();
     awaiting.turn_phase = TurnPhase::begin(std::time::Instant::now());
@@ -3048,6 +3053,34 @@ fn inline_you_block_active_truth_table() {
     let mut chatbox = base();
     chatbox.input_surface = InputSurface::new(InputModeKind::Chatbox);
     assert!(!chatbox.inline_you_block_active(), "chatbox placement ⇒ inactive");
+
+    // INV-UX-16: the `|| focus==Compose` clause. "The hole" — focus on the compose
+    // in an idle worksheet with the block CLOSED — must be ACTIVE (else keystrokes
+    // route to a compose that paints nowhere: the invisible-text bug).
+    let hole = || {
+        let mut st = base();
+        st.you_block_open = false;
+        st.focus = AgentFocus::Compose;
+        st
+    };
+    assert!(
+        hole().inline_you_block_active(),
+        "INV-UX-16: focus=Compose + closed block + idle worksheet ⇒ ACTIVE (routing⇒painting)"
+    );
+    // But the compose-focus clause is still gated by !awaiting and !chatbox — a
+    // focus=Compose that is mid-turn or chatbox has its draft in the bottom box.
+    let mut hole_awaiting = hole();
+    hole_awaiting.turn_phase = TurnPhase::begin(std::time::Instant::now());
+    assert!(
+        !hole_awaiting.inline_you_block_active(),
+        "focus=Compose but AWAITING ⇒ inactive (draft is the mid-turn bottom box)"
+    );
+    let mut hole_chatbox = hole();
+    hole_chatbox.input_surface = InputSurface::new(InputModeKind::Chatbox);
+    assert!(
+        !hole_chatbox.inline_you_block_active(),
+        "focus=Compose but CHATBOX ⇒ inactive (draft is the pinned box)"
+    );
 }
 
 /// INV (§4.5): the follow-tail policy is `follow_output` in BOTH placements —

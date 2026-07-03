@@ -102,6 +102,13 @@ pub(crate) fn with_no_session_server<R>(f: impl FnOnce() -> R) -> R {
 }
 
 pub(crate) fn connect_session_server() -> Option<SessionServerClient> {
+    // NOTE (clear-worksheet-invisible critique R4): under `cfg(test)` this still
+    // falls through to a LIVE `SessionServerClient::connect()` unless a test wraps
+    // itself in `with_no_session_server`. That is a real hygiene gap — a synthetic
+    // sid can issue a real `attach` and get unbound — but forcing None under test
+    // breaks steering tests that (fragilely) rely on the live connection. The
+    // proper fix is a `test-support` in-process session-server seam; tracked as a
+    // follow-up, NOT bundled with the `/clear` fix.
     #[cfg(test)]
     if FORCE_NO_SESSION_SERVER.with(|c| c.get()) {
         return None;
