@@ -7472,12 +7472,106 @@ fn main() {
             },
         ]);
 
+        // TEMP autonomous reproduction harness for the recurring "/clear
+        // worksheet-invisible" bug. `YALDA_SCENARIO=clear-worksheet` drives the
+        // REAL production methods programmatically (no keystroke injection, no GUI
+        // navigation) against an ISOLATED server (launch with YALDA_SESSION_SOCKET
+        // + YALDA_ACP_AGENT=yalda-acp-stub + a temp HOME): create a fresh worksheet
+        // agent, type "/clear" + submit (→ real clear_agent_session), wait for the
+        // async re-create/rebind, then type "hello" through the REAL key handler.
+        // The `clear_log` instrumentation captures the full causal chain to
+        // /tmp/yalda-clear-debug.log, then the app quits. Removed once root-caused.
+        let scenario = std::env::var("YALDA_SCENARIO").ok();
+        if scenario.as_deref() == Some("clear-worksheet") {
+            let wh = window_handle;
+            app.spawn(async move |cx| {
+                let mk = |k: &str| gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke {
+                        modifiers: gpui::Modifiers::default(),
+                        key: k.to_string(),
+                        key_char: (k.chars().count() == 1).then(|| k.to_string()),
+                    },
+                    is_held: false,
+                };
+                let bg = cx.background_executor().clone();
+                macro_rules! sleep {
+                    ($ms:expr) => {
+                        bg.timer(Duration::from_millis($ms)).await
+                    };
+                }
+                clear_log("scenario: start; waiting for boot + server connect");
+                sleep!(2500);
+                let _ = wh.update(cx, |v, _w, cx| {
+                    v.splash_until = None;
+                    v.new_agent_session(None, cx);
+                });
+                clear_log("scenario: new_agent_session called");
+                // Wait for the fresh session to bind a server sid.
+                for i in 0..200u32 {
+                    sleep!(100);
+                    let bound = wh
+                        .update(cx, |v, _w, _cx| {
+                            v.focused_bound_session()
+                                .map(|id| v.sessions.sid_of(id).is_some())
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if bound {
+                        clear_log(&format!("scenario: session bound after {}00ms", i));
+                        break;
+                    }
+                }
+                sleep!(800);
+                // FIRST have a real CONVERSATION so the session has HISTORY — the
+                // user /clears a session with content, which takes a different
+                // resume/replay path than a fresh one (a fresh /clear was verified
+                // to work). Send a short prompt and let the agent reply.
+                let _ = wh.update(cx, |v, w, cx| {
+                    for ch in "hi".chars() {
+                        v.handle_claude_key(&mk(&ch.to_string()), w, cx);
+                    }
+                });
+                sleep!(200);
+                let _ = wh.update(cx, |v, _w, cx| v.submit_agent(cx));
+                clear_log("scenario: sent 'hi' prompt; waiting for agent reply");
+                sleep!(12000); // let the real agent stream a reply + settle to Idle
+                clear_log("scenario: reply window elapsed; post-turn state ↑ (nav?). Pressing i then /clear");
+                // Post-turn the worksheet rests in NAV, so press `i` to open a
+                // typeable block (as the user does), THEN type "/clear" as text.
+                let _ = wh.update(cx, |v, w, cx| {
+                    v.handle_claude_key(&mk("i"), w, cx);
+                    for ch in "/clear".chars() {
+                        v.handle_claude_key(&mk(&ch.to_string()), w, cx);
+                    }
+                });
+                sleep!(200);
+                let _ = wh.update(cx, |v, _w, cx| v.submit_agent(cx));
+                clear_log("scenario: submitted /clear (session had history); waiting for rebind");
+                sleep!(6000);
+                clear_log("scenario: post-/clear state ↑; now typing 'hello' WITHOUT pressing i (as the user does)");
+                // Type "hello" — the keystroke whose visibility is the bug. Do NOT
+                // press i first: the user expects a cleared worksheet to be typeable.
+                let _ = wh.update(cx, |v, w, cx| {
+                    for ch in "hello".chars() {
+                        v.handle_claude_key(&mk(&ch.to_string()), w, cx);
+                    }
+                });
+                clear_log("scenario: typed hello");
+                sleep!(2500);
+                clear_log("scenario: done, quitting");
+                let _ = cx.update(|cx| cx.quit());
+            })
+            .detach();
+        }
+
         // Bring yalda to the foreground on launch. Without this the
         // process opens a window but stays behind whatever app the user
         // had focused (terminal, editor, etc.) — particularly noticeable
         // on a `cargo run` or a `reboot_into_claude` re-launch. `true`
         // = ignore other apps' "don't yield focus" hints, which is the
-        // right behaviour for a user-initiated launch.
+        // right behaviour for a user-initiated launch. (Scenario mode also
+        // activates — an occluded window doesn't paint, and the scenario needs the
+        // real render pass; it self-quits in ~14s.)
         app.activate(true);
     });
 }

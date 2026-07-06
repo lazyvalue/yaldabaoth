@@ -224,20 +224,22 @@ impl TranscriptView {
             // moved. If the user types after /clear and this prints "moved=NONE"
             // (no re-render) while inline-active flips, the keystroke isn't busting
             // the cache — the invisible-text bug, caught on the REAL path.
-            if std::env::var_os("YALDA_CLEAR_DEBUG").is_some() {
+            {
                 let c = &session.read(cx).state;
-                eprintln!(
-                    "[clear-debug] transcript observe: moved={:?} inline_active={} \
-                     you_block_open={} awaiting={} chatbox={} compose_edit_seq={} \
-                     last_compose_edit_seq={}",
+                crate::clear_log(&format!(
+                    "transcript OBSERVE: moved={:?} inline_active={} focus_compose={} \
+                     you_block_open={} awaiting={} chatbox={} compose_edit_seq={}->{} \
+                     transcript_focused_seq={}",
                     diff,
                     c.inline_you_block_active(),
+                    c.focus == AgentFocus::Compose,
                     c.you_block_open,
                     c.turn_phase.is_awaiting(),
                     c.input_surface.is_chatbox(),
-                    now.compose_edit_seq,
                     this.last_rendered.compose_edit_seq,
-                );
+                    now.compose_edit_seq,
+                    now.transcript_focused,
+                ));
             }
             if let Some(reason) = diff {
                 record_notify(this.perf_label, reason);
