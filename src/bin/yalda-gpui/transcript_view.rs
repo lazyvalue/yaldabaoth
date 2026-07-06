@@ -517,10 +517,27 @@ impl TranscriptView {
 
             // ── View-model memoization (S1) ──
             let view_model_fp: u64 = c.view_model_fingerprint(line_count, frozen_line_count);
+            let memo_hit = c.view_model.cached(view_model_fp).is_some();
             let (flat_items_arc, gutter_tag_snap) = match c.view_model.cached(view_model_fp) {
                 Some(hit) => hit,
                 None => rebuild_agent_view_model(c, lines, &frozen_ranges, &theme, view_model_fp),
             };
+
+            // TEMP diagnostic (/tmp/yalda-clear-debug.log): what the transcript
+            // ACTUALLY builds — whether a live inline YouBlock row is present, the
+            // memo hit/miss, and the gate. If a keystroke leaves `has_you_block=false`
+            // while inline-active, the render (not the gate) is the break.
+            let has_you_block = flat_items_arc
+                .iter()
+                .any(|it| matches!(it, FlatItem::YouBlock { parked: None }));
+            crate::clear_log(&format!(
+                "build_body: inline_active={} focus_compose={} you_block_open={} \
+                 has_YouBlock_row={has_you_block} flat_items={} memo_hit={memo_hit} fp={view_model_fp}",
+                c.inline_you_block_active(),
+                c.focus == AgentFocus::Compose,
+                c.you_block_open,
+                flat_items_arc.len(),
+            ));
 
             let new_count = flat_items_arc.len();
             let block_ranges_active = !c.block_ranges.is_empty();

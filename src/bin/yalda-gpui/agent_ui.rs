@@ -474,6 +474,13 @@ impl YaldaGpuiView {
                             // state (settle is idempotent + stale-safe). `scx.notify()`
                             // repaints the (possibly freshly-created) TranscriptView.
                             session.state.settle_input_focus();
+                            crate::clear_log(&format!(
+                                "apply_open_agent_resolution Created: settled id={id:?} \
+                                 focus_compose={} you_block_open={} awaiting={}",
+                                session.state.focus == AgentFocus::Compose,
+                                session.state.you_block_open,
+                                session.state.turn_phase.is_awaiting(),
+                            ));
                             scx.notify();
                         });
                     }
@@ -2860,6 +2867,10 @@ impl YaldaGpuiView {
             tile.bound = None;
             tile.picker = None;
         }
+        crate::clear_log(&format!(
+            "clear_agent_session: closed old_id={id:?} server_is_some={}",
+            self.session_server.is_some()
+        ));
 
         // Re-create in place on the now-unbound focused tile, reusing the
         // snapshotted label + cwd and forcing the preserved permission mode.
@@ -4259,23 +4270,29 @@ impl YaldaGpuiView {
         let inline_active = self
             .agent_read(cx, |c| c.inline_you_block_active())
             .unwrap_or(false);
-        // Diagnostic for the recurring "/clear worksheet invisible" bug. With
-        // YALDA_CLEAR_DEBUG=1, every worksheet keystroke logs the exact gate that
-        // decides whether it repaints. If after /clear this prints
-        // inline_active=false, the false clause (open/awaiting/chatbox) IS the bug.
-        if std::env::var_os("YALDA_CLEAR_DEBUG").is_some() {
+        // TEMP unconditional diagnostic for the recurring "/clear worksheet
+        // invisible" bug (→ /tmp/yalda-clear-debug.log). Captures the FULL state at
+        // the keystroke so ONE real reproduction is unambiguous: the exact gate, the
+        // focused session id being EDITED, whether a TranscriptView is observing
+        // THAT id (a mismatch ⇒ keystroke edits one session, the displayed
+        // transcript observes another), and the compose length.
+        {
             let g = self.agent_read(cx, |c| {
                 (
                     c.you_block_open,
                     c.turn_phase.is_awaiting(),
                     c.input_surface.is_chatbox(),
-                    c.focus == AgentFocus::Compose,
+                    c.focus,
                     c.input_surface.compose().text().chars().count(),
                 )
             });
-            eprintln!(
-                "[clear-debug] worksheet keystroke: inline_active={inline_active} gate(open,awaiting,chatbox,focus_compose,compose_len)={g:?}"
-            );
+            let tv_exists = self.transcript_views.contains_key(&focused_id);
+            let tv_ids: Vec<_> = self.transcript_views.keys().copied().collect();
+            crate::clear_log(&format!(
+                "keystroke: focused_id={focused_id:?} inline_active={inline_active} \
+                 gate(open,awaiting,chatbox,focus,compose_len)={g:?} \
+                 transcript_view_exists_for_focused={tv_exists} all_tv_ids={tv_ids:?}"
+            ));
         }
         if inline_active {
             // INV-UX-1: keep the inline block's caret in view as the reply grows.

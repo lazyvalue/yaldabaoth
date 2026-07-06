@@ -2309,6 +2309,7 @@ impl YaldaGpuiView {
             tile.bound = Some(id);
             tile.picker = None;
         }
+        crate::clear_log(&format!("show_local_session: new_id={id:?} bound to tile"));
         id
     }
 

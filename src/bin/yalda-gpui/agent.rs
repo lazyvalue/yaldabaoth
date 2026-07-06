@@ -6,6 +6,25 @@
 
 use super::*;
 
+/// TEMP diagnostic for the recurring "/clear worksheet-invisible" bug. Appends a
+/// timestamped line to `/tmp/yalda-clear-debug.log` UNCONDITIONALLY (no env var,
+/// so a single real reproduction captures the full causal chain without the user
+/// having to remember a flag). Removed once the bug is root-caused from real data.
+pub(crate) fn clear_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/yalda-clear-debug.log")
+    {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{t} {msg}");
+    }
+}
+
 /// Domain newtype for a tool-call identity (Finding 7, parse-don't-validate).
 /// The protocol hands us a typed [`ToolCallId`](yalda::acp_channel::ToolCallId)
 /// (`Arc<str>` under the hood); we parse it into this key ONCE at the boundary
