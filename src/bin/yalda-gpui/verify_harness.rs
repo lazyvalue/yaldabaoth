@@ -7612,3 +7612,200 @@ fn agent_panel_closing_last_panel_exits_focus(cx: &mut TestAppContext) {
         "closing the last panel exits panel focus to the captured focus"
     );
 }
+
+// ── Keybindings reference + rebind tile (App::Keymap) ──────────────────────────
+
+/// The `DEFAULT_BINDINGS` table is internally consistent: every action name
+/// resolves via `build_action`, every context predicate parses, and every
+/// keystroke string parses. This is what makes `register_keymap` = the table
+/// truthful — a typo'd action (e.g. `OpenKeymap` never added to `actions!`)
+/// would be silently skipped by `apply` and this guard catches it.
+#[gpui::test]
+fn keymap_registry_table_is_valid(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    cx.update(|app| {
+        let reg = crate::KeymapRegistry::defaults();
+        let bad = reg.validate(app);
+        assert!(bad.is_empty(), "invalid keymap table entries: {bad:?}");
+        assert!(
+            reg.entries.len() > 100,
+            "the ported table should hold the full keymap, got {}",
+            reg.entries.len()
+        );
+    });
+}
+
+/// A rebind persists and reloads: mutate an entry, `persist`, then `load` a
+/// fresh registry and see the override survive — while an unrelated entry stays
+/// at its default. Also the negative half: an empty/garbage keystroke is
+/// rejected (`rebind` returns false, entry unchanged).
+#[gpui::test]
+fn keymap_rebind_persists_and_reloads(_cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("keymap-overrides.json");
+    crate::persist::with_keymap_overrides_path(path, || {
+        let mut reg = crate::KeymapRegistry::defaults();
+        let idx = reg
+            .entries
+            .iter()
+            .find(|e| e.action == "ScrollDown" && e.default_keystrokes == "j")
+            .expect("ScrollDown/j must exist")
+            .idx;
+
+        // Negative: garbage / empty keys are refused, entry stays default.
+        assert!(!reg.rebind(idx, ""), "empty keys must be rejected");
+        assert_eq!(reg.entry(idx).unwrap().keystrokes, "j");
+
+        // Positive: a valid rebind takes, persists, and reloads.
+        assert!(reg.rebind(idx, "y"), "valid keys must be accepted");
+        assert!(reg.entry(idx).unwrap().is_changed());
+        reg.persist();
+
+        let reloaded = crate::KeymapRegistry::load();
+        assert_eq!(
+            reloaded.entry(idx).unwrap().keystrokes,
+            "y",
+            "the override must survive a reload"
+        );
+        // An untouched entry is still its default after reload.
+        let quit = reloaded
+            .entries
+            .iter()
+            .find(|e| e.action == "Quit")
+            .unwrap();
+        assert_eq!(quit.keystrokes, "cmd-q");
+        assert!(!quit.is_changed());
+    });
+}
+
+/// Conflict detection: two entries with the SAME keystrokes in overlapping
+/// contexts are reported; the same keystrokes in disjoint contexts are not.
+#[gpui::test]
+fn keymap_conflict_detection(_cx: &mut TestAppContext) {
+    let mut reg = crate::KeymapRegistry::defaults();
+    // Pick a global entry and rebind it to collide with another global one.
+    let zoom_in = reg
+        .entries
+        .iter()
+        .find(|e| e.action == "ZoomIn" && e.default_keystrokes == "cmd-=")
+        .unwrap()
+        .idx;
+    // `cmd-q` (Quit, global) already exists — colliding onto it must be flagged.
+    assert!(reg.rebind(zoom_in, "cmd-q"));
+    let conflicts = reg.conflicts(zoom_in);
+    assert!(
+        !conflicts.is_empty(),
+        "cmd-q collision in the global context must be reported"
+    );
+
+    // A disjoint-context reuse is NOT a conflict: `j` exists in YaldaView,
+    // BrowserView, and RailView independently — none should conflict with each
+    // other (they can never both be active).
+    let yalda_j = reg
+        .entries
+        .iter()
+        .find(|e| e.action == "ScrollDown" && e.context == Some("YaldaView"))
+        .unwrap()
+        .idx;
+    let browser_conflicts: Vec<usize> = reg
+        .conflicts(yalda_j)
+        .into_iter()
+        .filter(|&i| reg.entry(i).map(|e| e.context) == Some(Some("BrowserView")))
+        .collect();
+    assert!(
+        browser_conflicts.is_empty(),
+        "j in YaldaView must not conflict with j in BrowserView"
+    );
+}
+
+/// REAL PATH: open a Keymap tile, drive the actual key handler (filter → return
+/// to browse → begin rebind → capture a chord → commit) via `simulate_keystrokes`,
+/// and assert the live registry entry changed. Exercises `handle_keymap_key`,
+/// the capture keyboard-grab, and the commit path the user's keystrokes run.
+#[gpui::test]
+fn keymap_rebind_via_real_keystrokes(cx: &mut TestAppContext) {
+    use crate::App;
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+
+    // Swap the focused tile to the keybindings sheet.
+    view.update(vcx, |v, cx| v.open_keymap_inner(cx));
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(vcx, |v, _| v.workspace.focused_content().is_some()),
+        "a focused tile must exist"
+    );
+
+    // Precondition: the outline-rail toggle is at its default.
+    let keys_of = |view: &gpui::Entity<YaldaGpuiView>,
+                   vcx: &mut gpui::VisualTestContext,
+                   action: &str| {
+        view.read_with(vcx, |v, _| {
+            v.keymap_registry
+                .entries
+                .iter()
+                .find(|e| e.action == action)
+                .map(|e| e.keystrokes.clone())
+                .unwrap()
+        })
+    };
+    assert_eq!(keys_of(&view, vcx, "ToggleOutlineRail"), "cmd-shift-o");
+
+    // Filter down to the unique "outline" row (cursor lands on it), return to
+    // browse, begin a rebind, capture `y`, and commit.
+    vcx.simulate_keystrokes("/ o u t l i n e enter r y enter");
+    vcx.run_until_parked();
+
+    assert_eq!(
+        keys_of(&view, vcx, "ToggleOutlineRail"),
+        "y",
+        "rebinding through the real key handler must update the live registry"
+    );
+    // The tile must remain an App::Keymap (never silently become a buffer).
+    assert!(matches!(
+        view.read_with(vcx, |v, _| matches!(
+            v.workspace.focused_content(),
+            Some(App::Keymap(_))
+        )),
+        true
+    ));
+}
+
+/// The Keymap body is a cached child: an unrelated root notify leaves its render
+/// count flat, while moving its own browse cursor busts it. Mirrors the
+/// `linear_*_is_render_flat` / `transcript_021_*` perf guards.
+#[gpui::test]
+fn keymap_body_is_cached_and_self_invalidates(cx: &mut TestAppContext) {
+    crate::perf_reset("keymap");
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, cx| v.open_keymap_inner(cx));
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("keymap");
+    assert!(base >= 1, "the keymap body must paint once after the tile opens");
+
+    // Moving the browse cursor (a body-owned mutation) busts the cached body —
+    // the mutation-site notify is the only thing that re-renders it.
+    let vw = view
+        .read_with(vcx, |v, _| v.keymap_focused_view())
+        .expect("keymap body must exist");
+    vw.update(vcx, |kv, c| {
+        kv.move_cursor(1, 50);
+        c.notify();
+    });
+    vcx.run_until_parked();
+    let after_move = crate::perf_render_count("keymap");
+    assert!(
+        after_move > base,
+        "moving the cursor must re-render the keymap body (base {base}, got {after_move})"
+    );
+
+    // An unrelated root repaint must NOT re-render the cached body.
+    view.update(vcx, |_v, cx| cx.notify());
+    vcx.run_until_parked();
+    assert_eq!(
+        crate::perf_render_count("keymap"),
+        after_move,
+        "a root-only notify must not re-render the cached keymap body"
+    );
+}

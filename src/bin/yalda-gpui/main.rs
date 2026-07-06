@@ -76,6 +76,10 @@ mod chrome;
 mod edit_ui;
 mod highlight_cache;
 mod jump_panel_view;
+mod keymap_registry;
+mod keymap_tile;
+mod keymap_ui;
+mod keymap_view;
 mod linear;
 mod linear_ui;
 mod linear_view;
@@ -92,6 +96,9 @@ pub(crate) use agent::*;
 pub(crate) use agent_roster::*;
 pub(crate) use agent_sessions::*;
 pub(crate) use jump_panel_view::*;
+pub(crate) use keymap_registry::*;
+pub(crate) use keymap_tile::*;
+pub(crate) use keymap_view::*;
 pub(crate) use linear::*;
 pub(crate) use linear_view::*;
 pub(crate) use persist::*;
@@ -112,7 +119,7 @@ pub(crate) use gpui::{
     AnyElement, App as GpuiApp, AppContext, Application, Bounds, ClipboardItem, Context, Element,
     ElementId, Entity, FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight,
     GlobalElementId, Hsla,
-    InspectorElementId, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Keystroke,
+    InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, Keystroke,
     LayoutId, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
     StrikethroughStyle, Styled, StyledText, Task, TextLayout, TextRun, TitlebarOptions,
@@ -187,6 +194,7 @@ actions!(
         EnterWp,
         OpenAgent,
         OpenLinear,
+        OpenKeymap,
         OpenMenu,
         OpenLocalMenu,
         OpenGlobalMenu,
@@ -1294,6 +1302,8 @@ enum App {
     Buffer(BufferApp),
     Agent(AgentTile),
     Linear(LinearTile),
+    /// The keybindings reference + rebind sheet (`keymap_tile.rs`).
+    Keymap(KeymapTile),
 }
 
 impl App {
@@ -1307,6 +1317,7 @@ impl App {
             // Agent/Linear and Buffer are orthogonal — they stash no buffer.
             App::Agent(_) => None,
             App::Linear(_) => None,
+            App::Keymap(_) => None,
         }
     }
 }
@@ -1473,6 +1484,7 @@ fn gpui_menu() -> Vec<MenuNode> {
                 MenuNode::entry("a", "agent", "new-agent-tile"),
                 MenuNode::entry("b", "buffer", "new-buffer-tile"),
                 MenuNode::entry("l", "linear", "new-linear-tile"),
+                MenuNode::entry("k", "keybindings", "new-keymap-tile"),
             ],
         ),
         MenuNode::submenu(
@@ -1590,6 +1602,15 @@ fn linear_local_menu() -> Vec<MenuNode> {
     ]
 }
 
+fn keymap_local_menu() -> Vec<MenuNode> {
+    vec![
+        MenuNode::entry("i", "filter", "keymap-filter"),
+        MenuNode::entry("r", "rebind selected", "keymap-rebind"),
+        MenuNode::entry("x", "reset selected", "keymap-reset"),
+        MenuNode::entry("R", "reset all to defaults", "keymap-reset-all"),
+    ]
+}
+
 fn browser_local_menu() -> Vec<MenuNode> {
     vec![
         MenuNode::entry("s", "cycle sort", "browser-sort"),
@@ -1616,6 +1637,12 @@ struct YaldaGpuiView {
     /// (all transcripts), pushed to `TranscriptView`s via `notify_transcript_
     /// views` (not a seq). The doc/edit views never show markers.
     show_agent_heading_markers: bool,
+    /// The live keybinding registry — the single source of truth for every GPUI
+    /// binding (`keymap_registry.rs`). Built from the default table + persisted
+    /// user overrides at boot; the `App::Keymap` reference tile reads it to
+    /// display bindings and mutates it (then re-applies to the app + persists)
+    /// when the user rebinds a key.
+    keymap_registry: KeymapRegistry,
     /// Desktop-mode tile size in mono cells (spec-desktop-mode.md
     /// Behavior 6) — one global setting for all tiles in all tabs,
     /// persisted in `Preferences`, clamped to [20, 400] × [5, 200].
@@ -1741,6 +1768,7 @@ impl YaldaGpuiView {
             code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
             show_agent_heading_markers: true,
+            keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: 2,
             desktop_grid_rows: 2,
             browser_sort: HashMap::new(),
@@ -1781,6 +1809,7 @@ impl YaldaGpuiView {
             code_font: SharedString::new_static("SF Mono"),
             text_scale: 1.0,
             show_agent_heading_markers: true,
+            keymap_registry: KeymapRegistry::load(),
             desktop_grid_cols: 2,
             desktop_grid_rows: 2,
             browser_sort: HashMap::new(),
@@ -2561,8 +2590,8 @@ impl YaldaGpuiView {
         match self.workspace.focused_content().expect("no focused window") {
             // Already picking — nothing to do.
             App::Buffer(BufferApp::Picking(_)) => return,
-            // Agent/Linear tile: out of scope. No buffer here to pick into.
-            App::Agent(_) | App::Linear(_) => {
+            // Agent/Linear/Keymap tile: out of scope. No buffer here to pick into.
+            App::Agent(_) | App::Linear(_) | App::Keymap(_) => {
                 self.transient_status = Some("no buffer here".into());
                 cx.notify();
                 return;
@@ -2790,6 +2819,7 @@ impl YaldaGpuiView {
             // the audited invalidation path that makes that re-read take effect.
             self.notify_transcript_views(MissReason::TextStyle, cx);
             self.notify_linear_views(MissReason::TextStyle, cx);
+            self.notify_keymap_views(MissReason::TextStyle, cx);
             cx.notify();
         }
     }
@@ -2919,6 +2949,26 @@ impl YaldaGpuiView {
         }
     }
 
+    /// Notify every live [`KeymapView`] cached body — same global-invalidation
+    /// contract as [`notify_linear_views`] (the keymap body reads theme + zoom
+    /// off the root, so a theme/zoom change must bust it directly).
+    fn notify_keymap_views(&mut self, reason: MissReason, cx: &mut Context<Self>) {
+        let mut views: Vec<Entity<KeymapView>> = Vec::new();
+        for tab in self.workspace.tabs.iter() {
+            tab.layout.for_each_leaf(&mut |w| {
+                if let App::Keymap(tile) = &w.content
+                    && let Some(v) = &tile.view
+                {
+                    views.push(v.clone());
+                }
+            });
+        }
+        for v in views {
+            record_notify("keymap", reason);
+            v.update(cx, |_kv, vcx| vcx.notify());
+        }
+    }
+
     /// Tick the thinking-indicator clock (ticket 021). The `Thinking… mm:ss`
     /// label + 30s stall warning live INSIDE the cached `TranscriptView`, so the
     /// ~1Hz anim tick must bust each *awaiting* session's cached transcript
@@ -3037,6 +3087,7 @@ impl YaldaGpuiView {
         // busts each live transcript view directly (event context, fact 4).
         self.notify_transcript_views(MissReason::Refresh, cx);
         self.notify_linear_views(MissReason::Refresh, cx);
+        self.notify_keymap_views(MissReason::Refresh, cx);
         self.save_settings();
         cx.notify();
     }
@@ -4206,6 +4257,7 @@ impl YaldaGpuiView {
             Some(App::Agent(_)) => (agent_local_menu(), "AGENT"),
             Some(App::Buffer(BufferApp::Picking(_))) => (browser_local_menu(), "BROWSE"),
             Some(App::Linear(_)) => (linear_local_menu(), "LINEAR"),
+            Some(App::Keymap(_)) => (keymap_local_menu(), "KEYBINDINGS"),
             None => return,
         };
         self.transient_status = None;
@@ -4359,6 +4411,9 @@ impl YaldaGpuiView {
                     .unwrap_or(false);
                 !picker && tile.mode == LinearMode::Insert
             }
+            // The keymap tile captures text while filtering or rebinding — the
+            // leaders must be suppressed then so keys reach the box.
+            Some(App::Keymap(_)) => self.keymap_captures_text(cx),
             Some(App::Buffer(BufferApp::Viewing(_))) | None => false,
         }
     }
@@ -4493,6 +4548,10 @@ impl YaldaGpuiView {
             "linear-edit" => self.linear_set_mode(LinearMode::Insert, cx),
             "linear-open-url" => self.linear_open_url(cx),
             "linear-copy-url" => self.linear_copy_url(cx),
+            "keymap-filter" => self.keymap_menu_filter(cx),
+            "keymap-rebind" => self.keymap_menu_rebind(cx),
+            "keymap-reset" => self.keymap_menu_reset(cx),
+            "keymap-reset-all" => self.keymap_menu_reset_all(cx),
             "back-to-doc" => self.back_to_doc(cx),
             "reload-file" => self.reload_focused_from_disk(cx),
             "rename-tab" => self.open_rename_active_tab_overlay(cx),
@@ -4773,6 +4832,24 @@ impl YaldaGpuiView {
                 {
                     self.workspace.retile_active();
                     self.open_linear_inner(cx);
+                    self.save_workspace_state();
+                    cx.notify();
+                }
+            }
+            "new-keymap-tile" => {
+                // Split a new tile, then swap it for the keybindings sheet —
+                // mirrors new-linear-tile.
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                if self
+                    .workspace
+                    .split_focused(
+                        workspace::SplitDir::V,
+                        App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
+                    )
+                    .is_some()
+                {
+                    self.workspace.retile_active();
+                    self.open_keymap_inner(cx);
                     self.save_workspace_state();
                     cx.notify();
                 }
@@ -6963,6 +7040,7 @@ fn tab_strip_label(tab: &workspace::Tab<App>) -> String {
             App::Buffer(BufferApp::Picking(_)) => format!("Browser ({})", tab.display_label()),
             App::Agent(_) => format!("Claude ({})", tab.display_label()),
             App::Linear(tile) => tile.title(),
+            App::Keymap(_) => "Keybindings".to_string(),
         }
     } else {
         tab.display_label().to_string()
@@ -7045,209 +7123,13 @@ fn fuzzy_match_gpui(text: &str, query: &str) -> bool {
 /// production path calls this once from the run-closure; tests call it via
 /// `cx.update(|cx| register_keymap(cx))`.
 fn register_keymap(app: &mut GpuiApp) {
-    // Document-view bindings.
-    app.bind_keys([
-        KeyBinding::new("j", ScrollDown, Some("YaldaView")),
-        KeyBinding::new("down", ScrollDown, Some("YaldaView")),
-        KeyBinding::new("ctrl-n", ScrollDown, Some("YaldaView")),
-        KeyBinding::new("k", ScrollUp, Some("YaldaView")),
-        KeyBinding::new("up", ScrollUp, Some("YaldaView")),
-        KeyBinding::new("ctrl-p", ScrollUp, Some("YaldaView")),
-        KeyBinding::new("ctrl-d", ScrollPageDown, Some("YaldaView")),
-        KeyBinding::new("pagedown", ScrollPageDown, Some("YaldaView")),
-        KeyBinding::new("ctrl-u", ScrollPageUp, Some("YaldaView")),
-        KeyBinding::new("pageup", ScrollPageUp, Some("YaldaView")),
-        KeyBinding::new("l", CursorNextBlock, Some("YaldaView")),
-        KeyBinding::new("right", CursorNextBlock, Some("YaldaView")),
-        KeyBinding::new("h", CursorPrevBlock, Some("YaldaView")),
-        KeyBinding::new("left", CursorPrevBlock, Some("YaldaView")),
-        KeyBinding::new("g", CursorTop, Some("YaldaView")),
-        KeyBinding::new("shift-g", CursorBottom, Some("YaldaView")),
-        KeyBinding::new("ctrl-o", OpenBrowser, Some("YaldaView")),
-        KeyBinding::new("ctrl-e", EnterEdit, Some("YaldaView")),
-        // Ctrl-W is the split chord prefix (see global bindings below).
-        // Word-processor entry rebinds to Ctrl-Shift-E.
-        KeyBinding::new("ctrl-shift-e", EnterWp, Some("YaldaView")),
-        KeyBinding::new("ctrl-k", OpenAgent, Some("YaldaView")),
-        KeyBinding::new("ctrl-l", OpenLinear, Some("YaldaView")),
-        // Leaders (`<space>` / `.` / `?`) are handled UNIVERSALLY in every
-        // tile's `on_key_down` via `leader_intercept` — gated on the tile's
-        // insert-mode flag — not by per-context keybindings, so they reach the
-        // menus from any tile that isn't capturing text (incl. the pickers).
-        // Doc-view Esc and bare `q` used to dispatch `Quit` — that
-        // made it too easy to lose the app by mashing keys. Quit now
-        // lives only on Cmd-Q (the macOS-standard chord). Esc in the
-        // doc view is a no-op so users in normal-mode just stay where
-        // they are; the menu still dismisses on Esc via its own
-        // capture-phase handler.
-        KeyBinding::new("tab", NextBuffer, Some("YaldaView")),
-        KeyBinding::new("shift-tab", PrevBuffer, Some("YaldaView")),
-    ]);
-
-    // Global Cmd-shortcut bindings — work in every key context, so the
-    // macOS menu-bar items (and the user's muscle memory) reach the
-    // right action regardless of which screen is focused. `None`
-    // context = matches anywhere, identical to how Zed wires its
-    // application-wide commands.
-    app.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-shift-ctrl-r", Restart, None),
-        KeyBinding::new("cmd-o", OpenBrowser, None),
-        KeyBinding::new("cmd-k", OpenAgent, None),
-        KeyBinding::new("cmd-l", OpenLinear, None),
-        // Agent-window sidebar toggles (§32). Scoped to AgentView
-        // so Cmd-1/Cmd-2 don't shadow anything in other screens.
-        KeyBinding::new("cmd-1", ToggleTasklist, Some("AgentView")),
-        KeyBinding::new("cmd-2", ToggleSubagents, Some("AgentView")),
-        KeyBinding::new("ctrl-alt-enter", ToggleAgentInputMode, Some("AgentView")),
-        KeyBinding::new("cmd-.", StopAgent, Some("AgentView")),
-        // Workspace-level tab switching — app-global so the strip is
-        // reachable from every screen and overlay (per spec Interfaces
-        // table; bind also `Ctrl-Tab`/`Ctrl-Shift-Tab` for keyboard-only
-        // users without Cmd).
-        KeyBinding::new("ctrl-tab", NextTab, None),
-        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
-        // RELIABLE workspace cycling on macOS: Ctrl-Tab / Ctrl+digit are frequently
-        // intercepted or mangled by the OS before they reach the app, so they can't be
-        // depended on. The Cmd family IS delivered cleanly (cmd-t/cmd-b/cmd-l/cmd-shift-w
-        // all work), so bind the standard editor/browser tab-cycle chords here — this is
-        // the workspace-switch that actually works. `]`=next, `[`=prev.
-        KeyBinding::new("cmd-shift-]", NextTab, None),
-        KeyBinding::new("cmd-shift-[", PrevTab, None),
-        KeyBinding::new("cmd-shift-right", NextTab, None),
-        KeyBinding::new("cmd-shift-left", PrevTab, None),
-        // Direct workspace jump by number (the digit shown in the jump panel).
-        // App-global (`None`) like the tab-switching binds above; `ctrl-0` is
-        // the 10th workspace.
-        KeyBinding::new("ctrl-1", GotoWorkspace1, None),
-        KeyBinding::new("ctrl-2", GotoWorkspace2, None),
-        KeyBinding::new("ctrl-3", GotoWorkspace3, None),
-        KeyBinding::new("ctrl-4", GotoWorkspace4, None),
-        KeyBinding::new("ctrl-5", GotoWorkspace5, None),
-        KeyBinding::new("ctrl-6", GotoWorkspace6, None),
-        KeyBinding::new("ctrl-7", GotoWorkspace7, None),
-        KeyBinding::new("ctrl-8", GotoWorkspace8, None),
-        KeyBinding::new("ctrl-9", GotoWorkspace9, None),
-        KeyBinding::new("ctrl-0", GotoWorkspace10, None),
-        KeyBinding::new("cmd-t", NewTab, None),
-        KeyBinding::new("cmd-shift-w", CloseTab, None),
-        KeyBinding::new("cmd-shift-t", ToggleTheme, None),
-        // Vim-style split chord prefix (spec-tabs-and-splits.md §12–§14).
-        // GPUI parses "ctrl-w s" as a two-keystroke chord; pressing
-        // Ctrl-W alone never resolves (it's a pure prefix here).
-        KeyBinding::new("ctrl-w s", SplitH, None),
-        KeyBinding::new("ctrl-w v", SplitV, None),
-        KeyBinding::new("ctrl-w c", CloseWindow, None),
-        // Mac-standard close shortcut. Closes the focused tile; falls
-        // through to closing the tab if the tile was the only one in
-        // its tab (unless it's also the only tab — then no-op rather
-        // than quit, per the "no surprise quits" rule).
-        KeyBinding::new("cmd-w", CloseWindow, None),
-        KeyBinding::new("ctrl-w o", OnlyWindow, None),
-        // Move / also-show the focused tile in another workspace
-        // (spec-workspaces-tagging.md Phase 1). `m` moves (tile leaves
-        // here), `M` (shift) also-shows a second view of a file tile.
-        KeyBinding::new("ctrl-w m", MoveTile, None),
-        KeyBinding::new("ctrl-w shift-m", AlsoShowTile, None),
-        // Vim-style focus motion across split tiles.
-        KeyBinding::new("ctrl-w h", FocusLeft, None),
-        KeyBinding::new("ctrl-w l", FocusRight, None),
-        KeyBinding::new("ctrl-w k", FocusUp, None),
-        KeyBinding::new("ctrl-w j", FocusDown, None),
-        KeyBinding::new("ctrl-w w", FocusNext, None),
-        KeyBinding::new("ctrl-w shift-w", FocusPrev, None),
-        // Resize the focused tile vs. its next sibling.
-        KeyBinding::new("ctrl-w <", ResizeShrink, None),
-        KeyBinding::new("ctrl-w -", ResizeShrink, None),
-        KeyBinding::new("ctrl-w >", ResizeGrow, None),
-        KeyBinding::new("ctrl-w +", ResizeGrow, None),
-        KeyBinding::new("ctrl-w =", Equalize, None),
-        // Layout patterns (spec-layout-patterns.md)
-        // Phase 2: automatic layouts
-        KeyBinding::new("ctrl-w space", CycleLayoutMode, None),
-        KeyBinding::new("ctrl-w p", DesktopTileSize, None),
-        KeyBinding::new("ctrl-w enter", PromoteToMaster, None),
-        KeyBinding::new("ctrl-w i", IncreaseMasterCount, None),
-        KeyBinding::new("ctrl-w d", DecreaseMasterCount, None),
-        // Phase 3: tags
-        KeyBinding::new("ctrl-w t", TagViewChord, None),
-        KeyBinding::new("ctrl-w ctrl-t", TagToggleChord, None),
-        KeyBinding::new("ctrl-w shift-t", ClearTagView, None),
-        // Document text zoom — same chord set every Mac app uses for
-        // browser/editor zoom (Cmd-=, Cmd-+, Cmd--, Cmd-0). Scales the
-        // doc/edit body + heading sizes; chrome stays fixed.
-        KeyBinding::new("cmd-=", ZoomIn, None),
-        KeyBinding::new("cmd-+", ZoomIn, None),
-        KeyBinding::new("cmd--", ZoomOut, None),
-        KeyBinding::new("cmd-0", ZoomReset, None),
-        // Cmd-0 in an agent tile focuses+enlarges the bottom panels (INV-UX-12)
-        // instead of resetting zoom. Registered AFTER the global zoom-reset so
-        // GPUI's match (most-recent-first) prefers this `AgentView`-scoped
-        // binding when focused in an agent tile; elsewhere Cmd-0 still resets
-        // document zoom.
-        KeyBinding::new("cmd-0", FocusAgentPanel, Some("AgentView")),
-        // Copy the view-mode mouse selection. Scoped to YaldaView so it
-        // doesn't shadow edit-mode yank or other surfaces' copy paths.
-        KeyBinding::new("cmd-c", CopyDocSelection, Some("YaldaView")),
-        // Copy active selection to system clipboard (all screens).
-        KeyBinding::new("cmd-c", CopySelection, None),
-        // Paste from system clipboard into active editor.
-        KeyBinding::new("cmd-v", PasteFromClipboard, None),
-        // Rename the active tab. Global so it works from any screen
-        // (and the menu's "rename tab" entry uses the same path).
-        KeyBinding::new("cmd-shift-r", RenameTab, None),
-        // Rail toggles (spec-rail.md §1, §10). Global so they work from
-        // any screen and from inside the rail itself.
-        KeyBinding::new("cmd-b", ToggleFileBrowserRail, None),
-        KeyBinding::new("cmd-shift-o", ToggleOutlineRail, None),
-        KeyBinding::new("cmd-shift-b", FlipRailSide, None),
-        // Jump panel (jump-panel; spec-jump-panel.md). Global.
-        KeyBinding::new("cmd-j", ToggleJumpPanel, None),
-    ]);
-
-    // Browser-view bindings.
-    app.bind_keys([
-        KeyBinding::new("j", BrowserDown, Some("BrowserView")),
-        KeyBinding::new("down", BrowserDown, Some("BrowserView")),
-        KeyBinding::new("ctrl-n", BrowserDown, Some("BrowserView")),
-        KeyBinding::new("k", BrowserUp, Some("BrowserView")),
-        KeyBinding::new("up", BrowserUp, Some("BrowserView")),
-        KeyBinding::new("ctrl-p", BrowserUp, Some("BrowserView")),
-        KeyBinding::new("enter", BrowserEnter, Some("BrowserView")),
-        KeyBinding::new("l", BrowserEnter, Some("BrowserView")),
-        KeyBinding::new("right", BrowserEnter, Some("BrowserView")),
-        KeyBinding::new("h", BrowserParent, Some("BrowserView")),
-        KeyBinding::new("left", BrowserParent, Some("BrowserView")),
-        KeyBinding::new("-", BrowserParent, Some("BrowserView")),
-        // `.`/`<space>`/`?` are leaders — handled universally in
-        // `handle_browser_filter_key` via `leader_intercept` (suppressed while
-        // filtering/renaming), so they're not keybindings here. (`.` was
-        // BrowserToggleHidden; toggle-hidden now lives in the local menu `. .`.)
-        KeyBinding::new("s", BrowserCycleSort, Some("BrowserView")),
-        KeyBinding::new("q", BrowserClose, Some("BrowserView")),
-        KeyBinding::new("escape", BrowserClose, Some("BrowserView")),
-        KeyBinding::new("w", BrowserWorktrees, Some("BrowserView")),
-        KeyBinding::new("/", BrowserFilter, Some("BrowserView")),
-        KeyBinding::new("r", BrowserRename, Some("BrowserView")),
-    ]);
-
-    // Rail-view bindings (spec-rail.md §6). Active only while the rail
-    // holds focus (its root attaches `track_focus` inside this context).
-    app.bind_keys([
-        KeyBinding::new("j", RailDown, Some("RailView")),
-        KeyBinding::new("down", RailDown, Some("RailView")),
-        KeyBinding::new("ctrl-n", RailDown, Some("RailView")),
-        KeyBinding::new("k", RailUp, Some("RailView")),
-        KeyBinding::new("up", RailUp, Some("RailView")),
-        KeyBinding::new("ctrl-p", RailUp, Some("RailView")),
-        KeyBinding::new("enter", RailSelect, Some("RailView")),
-        KeyBinding::new("escape", RailClose, Some("RailView")),
-        KeyBinding::new("-", RailParent, Some("RailView")),
-        KeyBinding::new(".", RailToggleHidden, Some("RailView")),
-        KeyBinding::new("s", RailCycleSort, Some("RailView")),
-        KeyBinding::new("w", RailWorktrees, Some("RailView")),
-        KeyBinding::new("/", RailFilter, Some("RailView")),
-    ]);
+    // The keymap is now data-driven: every binding lives in the declarative
+    // `DEFAULT_BINDINGS` table (`keymap_registry.rs`), and `apply` clears +
+    // rebinds the whole set via `build_action` + `KeyBinding::load`. This is
+    // the single source of truth the `App::Keymap` reference tile reads and
+    // rebinds, so the displayed keys are always the live ones. User overrides
+    // (from that tile) are folded in by `KeymapRegistry::load`.
+    KeymapRegistry::load().apply(app);
 }
 
 fn main() {
@@ -7468,6 +7350,7 @@ fn main() {
                     MenuItem::action("Open File Browser", OpenBrowser),
                     MenuItem::action("Open Claude Session", OpenAgent),
                     MenuItem::action("Open Linear", OpenLinear),
+                    MenuItem::action("Keyboard Shortcuts", OpenKeymap),
                 ],
             },
         ]);

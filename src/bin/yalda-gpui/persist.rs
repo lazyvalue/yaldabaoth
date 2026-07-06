@@ -296,6 +296,38 @@ pub(crate) fn preferences_path() -> Option<PathBuf> {
     }
 }
 
+/// Where user keybinding overrides are stored (the rebindable-keymap tile,
+/// `keymap_registry.rs`). Only the diffs from the default table are written.
+/// Same fail-safe seam as [`preferences_path`]: under `cfg(test)` this returns
+/// `None` unless a test opts in via [`with_keymap_overrides_path`], so a rebind
+/// exercised in a headless test never clobbers the user's real overrides.
+pub(crate) fn keymap_overrides_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        return KEYMAP_OVERRIDES_PATH_OVERRIDE.with(|c| c.borrow().clone());
+    }
+    #[cfg(not(test))]
+    {
+        yalda::paths::yalda_home().map(|d| d.join("keymap-overrides.json"))
+    }
+}
+
+/// Test-only seam mirroring [`PREFS_PATH_OVERRIDE`] for keymap overrides.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static KEYMAP_OVERRIDES_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn with_keymap_overrides_path<R>(path: PathBuf, f: impl FnOnce() -> R) -> R {
+    KEYMAP_OVERRIDES_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+    let r = f();
+    KEYMAP_OVERRIDES_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    r
+}
+
 /// Test-only seam: redirect the preferences file to a tempdir so a save→load
 /// round-trip test never touches the user's real `~/.yalda/preferences.json`.
 /// When unset (the default in any test), `preferences_path()` returns `None`
@@ -390,6 +422,10 @@ pub(crate) enum PersistedKind {
     /// remote and cheap to re-fetch).
     #[serde(rename = "linear")]
     Linear {},
+    /// The keybindings reference tile — stateless (it reads the live registry),
+    /// so restore just opens a fresh one.
+    #[serde(rename = "keymap")]
+    Keymap {},
 }
 
 /// Persisted shadow of `BufferApp`'s mode (B1). `viewing`/`editing` carry the
@@ -547,6 +583,7 @@ pub(crate) fn snapshot_content(content: &App) -> PersistedKind {
             PersistedKind::Agent { session_id: None }
         }
         App::Linear(_tile) => PersistedKind::Linear {},
+        App::Keymap(_tile) => PersistedKind::Keymap {},
     }
 }
 
@@ -745,6 +782,7 @@ pub(crate) fn restore_content(
             )))
         }
         PersistedKind::Linear {} => App::Linear(LinearTile::new()),
+        PersistedKind::Keymap {} => App::Keymap(KeymapTile::new()),
     }
 }
 

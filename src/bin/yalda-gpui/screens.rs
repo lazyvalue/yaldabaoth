@@ -236,6 +236,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::enter_wp))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::open_menu))
             .on_action(cx.listener(Self::open_local_menu))
             .on_action(cx.listener(Self::open_global_menu))
@@ -423,6 +424,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
@@ -1843,6 +1845,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
@@ -2001,6 +2004,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
@@ -2035,6 +2039,74 @@ impl YaldaGpuiView {
             .size_full()
             .bg(bg)
             .child(input_row)
+            .child(body_area)
+    }
+
+    /// Render the keybindings reference tile (`App::Keymap`). The whole surface
+    /// (header + filter line + grouped list) lives in the cached `KeymapView`
+    /// body, so this just lazily creates + embeds it and wires the key handler +
+    /// workspace actions — mirroring `render_linear`. All keys route through
+    /// `handle_keymap_key` (there is no `KeymapView`-scoped keymap; navigation
+    /// and rebind are handled in `on_key_down`).
+    pub(crate) fn render_keymap(
+        &mut self,
+        root: gpui::Div,
+        tile: &mut KeymapTile,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let weak = cx.entity().downgrade();
+        let view = tile
+            .view
+            .get_or_insert_with(|| cx.new(|_| KeymapView::new(weak)))
+            .clone();
+        let bg = self.editor_bg();
+        let body_area = div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(cached_child(view));
+
+        root.key_context("KeymapView")
+            .on_key_down(cx.listener(Self::handle_keymap_key))
+            .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::restart))
+            .on_action(cx.listener(Self::open_browser))
+            .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_keymap))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::toggle_theme))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::paste_from_clipboard))
+            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::move_tile))
+            .on_action(cx.listener(Self::also_show_tile))
+            .on_action(cx.listener(Self::close_window))
+            .on_action(cx.listener(Self::focus_left))
+            .on_action(cx.listener(Self::focus_right))
+            .on_action(cx.listener(Self::focus_up))
+            .on_action(cx.listener(Self::focus_down))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::toggle_file_browser_rail))
+            .on_action(cx.listener(Self::toggle_jump_panel))
+            .workspace_nav(cx)
+            .on_action(cx.listener(Self::toggle_outline_rail))
+            .on_action(cx.listener(Self::flip_rail_side))
+            .on_action(cx.listener(Self::cycle_layout_mode))
+            .on_action(cx.listener(Self::desktop_tile_size_overlay))
+            .on_action(cx.listener(Self::promote_to_master))
+            .on_action(cx.listener(Self::increase_master_count))
+            .on_action(cx.listener(Self::decrease_master_count))
+            .on_action(cx.listener(Self::tag_view_chord))
+            .on_action(cx.listener(Self::tag_toggle_chord))
+            .on_action(cx.listener(Self::clear_tag_view))
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(bg)
             .child(body_area)
     }
 
@@ -2202,6 +2274,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
@@ -2516,6 +2589,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
