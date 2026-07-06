@@ -7365,7 +7365,13 @@ fn main() {
         // The `clear_log` instrumentation captures the full causal chain to
         // /tmp/yalda-clear-debug.log, then the app quits. Removed once root-caused.
         let scenario = std::env::var("YALDA_SCENARIO").ok();
-        if scenario.as_deref() == Some("clear-worksheet") {
+        // Two-phase autonomous reproduction of the RESTORED-session /clear bug
+        // (the confirmed precondition). Run BOTH with the same HOME + the same
+        // (kept-alive) isolated server:
+        //   clear-setup    → create agent, converse (persist), quit.
+        //   clear-restored → boot RESTORES that session from disk; then /clear + type.
+        if matches!(scenario.as_deref(), Some("clear-setup") | Some("clear-restored")) {
+            let phase = scenario.clone().unwrap();
             let wh = window_handle;
             app.spawn(async move |cx| {
                 let mk = |k: &str| gpui::KeyDownEvent {
@@ -7382,45 +7388,104 @@ fn main() {
                         bg.timer(Duration::from_millis($ms)).await
                     };
                 }
-                clear_log("scenario: start; waiting for boot + server connect");
+                let bound_with_sid = |wh: &gpui::WindowHandle<YaldaGpuiView>,
+                                      cx: &mut gpui::AsyncApp| {
+                    wh.update(cx, |v, _w, _cx| {
+                        v.focused_bound_session()
+                            .map(|id| v.sessions.sid_of(id).is_some())
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+                };
+                clear_log(&format!("scenario[{phase}]: start"));
                 sleep!(2500);
-                let _ = wh.update(cx, |v, _w, cx| {
-                    v.splash_until = None;
-                    v.new_agent_session(None, cx);
-                });
-                clear_log("scenario: new_agent_session called");
-                // Wait for the fresh session to bind a server sid.
-                for i in 0..200u32 {
+                let _ = wh.update(cx, |v, _w, _cx| v.splash_until = None);
+
+                if phase == "clear-setup" {
+                    // PHASE A: create a session, converse, persist, quit.
+                    let _ = wh.update(cx, |v, _w, cx| v.new_agent_session(None, cx));
+                    for _ in 0..200u32 {
+                        sleep!(100);
+                        if bound_with_sid(&wh, cx) {
+                            break;
+                        }
+                    }
+                    clear_log("scenario[setup]: session bound; sending 'hi'");
+                    let _ = wh.update(cx, |v, w, cx| {
+                        for ch in "hi".chars() {
+                            v.handle_claude_key(&mk(&ch.to_string()), w, cx);
+                        }
+                    });
+                    sleep!(200);
+                    let _ = wh.update(cx, |v, _w, cx| v.submit_agent(cx));
+                    sleep!(12000); // let the agent reply + settle
+                    // Log what save_agent_ring will see (it only persists a session
+                    // that has a resume_id or a channel sid).
+                    let _ = wh.update(cx, |v, _w, cx| {
+                        if let Some(id) = v.focused_bound_session() {
+                            let _ = v.read_session(id, cx, |c| {
+                                clear_log(&format!(
+                                    "scenario[setup]: pre-save resume_id_present={} channel_present={} sid_of={:?}",
+                                    // resume_id lives on the AgentSession, not state — read via entity below
+                                    "?", c.channel.is_some(), "?"
+                                ));
+                            });
+                            if let Some(ent) = v.session_entity(id) {
+                                let s = ent.read(cx);
+                                clear_log(&format!(
+                                    "scenario[setup]: resume_id={:?} channel_sid={:?} store_sid={:?}",
+                                    s.resume_id,
+                                    s.state.channel.as_ref().and_then(|c| c.session_id()),
+                                    v.sessions.sid_of(id).map(|x| x.to_string()),
+                                ));
+                            }
+                        }
+                    });
+                    // PERSIST the session + workspace so the next launch RESTORES it.
+                    let _ = wh.update(cx, |v, _w, cx| {
+                        v.save_agent_ring(cx);
+                        v.save_workspace_state();
+                    });
+                    clear_log("scenario[setup]: persisted; quitting");
+                    sleep!(500);
+                    let _ = cx.update(|cx| cx.quit());
+                    return;
+                }
+
+                // PHASE B: the boot already ran restore_workspace_from_disk. Wait for
+                // the RESTORED session to rebind + resume.
+                clear_log("scenario[restored]: waiting for restore/resume of the session");
+                let mut restored = false;
+                for i in 0..250u32 {
                     sleep!(100);
-                    let bound = wh
-                        .update(cx, |v, _w, _cx| {
-                            v.focused_bound_session()
-                                .map(|id| v.sessions.sid_of(id).is_some())
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    if bound {
-                        clear_log(&format!("scenario: session bound after {}00ms", i));
+                    if bound_with_sid(&wh, cx) {
+                        clear_log(&format!("scenario[restored]: restored+bound after {}00ms", i));
+                        restored = true;
                         break;
                     }
                 }
-                sleep!(800);
-                // FIRST have a real CONVERSATION so the session has HISTORY — the
-                // user /clears a session with content, which takes a different
-                // resume/replay path than a fresh one (a fresh /clear was verified
-                // to work). Send a short prompt and let the agent reply.
-                let _ = wh.update(cx, |v, w, cx| {
-                    for ch in "hi".chars() {
-                        v.handle_claude_key(&mk(&ch.to_string()), w, cx);
+                if !restored {
+                    clear_log("scenario[restored]: NO restored session bound — check persistence");
+                }
+                sleep!(1500);
+                // Log the RESTORED session's pre-/clear state.
+                let _ = wh.update(cx, |v, _w, cx| {
+                    if let Some(id) = v.focused_bound_session() {
+                        let _ = v.read_session(id, cx, |c| {
+                            clear_log(&format!(
+                                "scenario[restored]: pre-/clear focus_compose={} you_block_open={} \
+                                 awaiting={} chatbox={} inline_active={} lines={}",
+                                c.focus == AgentFocus::Compose,
+                                c.you_block_open,
+                                c.turn_phase.is_awaiting(),
+                                c.input_surface.is_chatbox(),
+                                c.inline_you_block_active(),
+                                c.editor.document().line_count(),
+                            ));
+                        });
                     }
                 });
-                sleep!(200);
-                let _ = wh.update(cx, |v, _w, cx| v.submit_agent(cx));
-                clear_log("scenario: sent 'hi' prompt; waiting for agent reply");
-                sleep!(12000); // let the real agent stream a reply + settle to Idle
-                clear_log("scenario: reply window elapsed; post-turn state ↑ (nav?). Pressing i then /clear");
-                // Post-turn the worksheet rests in NAV, so press `i` to open a
-                // typeable block (as the user does), THEN type "/clear" as text.
+                // /clear the RESTORED session: press i (nav→typeable), type /clear, submit.
                 let _ = wh.update(cx, |v, w, cx| {
                     v.handle_claude_key(&mk("i"), w, cx);
                     for ch in "/clear".chars() {
@@ -7429,19 +7494,27 @@ fn main() {
                 });
                 sleep!(200);
                 let _ = wh.update(cx, |v, _w, cx| v.submit_agent(cx));
-                clear_log("scenario: submitted /clear (session had history); waiting for rebind");
+                clear_log("scenario[restored]: submitted /clear on RESTORED session; waiting for rebind");
                 sleep!(6000);
-                clear_log("scenario: post-/clear state ↑; now typing 'hello' WITHOUT pressing i (as the user does)");
-                // Type "hello" — the keystroke whose visibility is the bug. Do NOT
-                // press i first: the user expects a cleared worksheet to be typeable.
+                // Ensure the window is FRONTMOST so a missing repaint below is a
+                // real repaint-not-firing bug, NOT an occluded-window artifact.
+                let _ = cx.update(|cx| cx.activate(true));
+                sleep!(600);
+                clear_log("scenario[restored]: window activated; typing 'hello' — a build_body SHOULD follow");
                 let _ = wh.update(cx, |v, w, cx| {
                     for ch in "hello".chars() {
                         v.handle_claude_key(&mk(&ch.to_string()), w, cx);
                     }
                 });
-                clear_log("scenario: typed hello");
+                clear_log("scenario[restored]: typed hello");
                 sleep!(2500);
-                clear_log("scenario: done, quitting");
+                // Simulate the JUMP BAR click: an UNRELATED full re-render. The user
+                // reports THIS reveals the stale edits. If typing above produced no
+                // build_body but this does, that IS the repaint-not-firing bug.
+                clear_log("scenario[restored]: >>> jump-bar sim (root cx.notify → schedules a frame) — does THIS paint the edits?");
+                let _ = wh.update(cx, |_v, _w, cx| cx.notify());
+                sleep!(1500);
+                clear_log("scenario[restored]: done, quitting");
                 let _ = cx.update(|cx| cx.quit());
             })
             .detach();
