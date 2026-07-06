@@ -325,6 +325,7 @@ impl YaldaGpuiView {
                 }
                 App::Agent(tile) => self.render_agent(leaf_root, tile, cx).into_any_element(),
                 App::Linear(tile) => self.render_linear(leaf_root, tile, cx).into_any_element(),
+                App::Keymap(tile) => self.render_keymap(leaf_root, tile, cx).into_any_element(),
             };
 
             let mut title_bar = div()
@@ -520,6 +521,7 @@ impl YaldaGpuiView {
                 .map(|s| s.read(cx).label.clone())
                 .unwrap_or_else(|| "claude".to_string()),
             App::Linear(tile) => tile.title(),
+            App::Keymap(tile) => tile.title(),
         }
     }
 
@@ -795,6 +797,9 @@ impl YaldaGpuiView {
                     App::Agent(tile) => self.render_agent(leaf_root, tile, cx).into_any_element(),
                     App::Linear(tile) => {
                         self.render_linear(leaf_root, tile, cx).into_any_element()
+                    }
+                    App::Keymap(tile) => {
+                        self.render_keymap(leaf_root, tile, cx).into_any_element()
                     }
                 };
                 // Pin the rail to the leaf it was opened from, not whichever
@@ -1259,6 +1264,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::open_browser))
             .on_action(cx.listener(Self::open_agent))
             .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
