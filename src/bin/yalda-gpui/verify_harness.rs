@@ -1023,6 +1023,7 @@ fn agent_dot_status_mapping() {
     let row = |connected, awaiting| AgentRow {
         target: JumpTarget::Roster("s".into()),
         label: "x".into(),
+        cwd: std::path::PathBuf::from("/"),
         bound: false,
         connected,
         awaiting,
@@ -5054,6 +5055,164 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
     });
     let rows = view.update(vcx, |v, cx| v.jump_panel_agent_rows(cx));
     assert!(rows.is_empty(), "closed session is gone from the roster");
+}
+
+/// Unit (jump-reorder, INV-UX-18): `order_grouped_rows` applies the user's
+/// drag-reordered order on top of the cwd grouping, and is a total no-op when
+/// both order lists are empty (the default — alphabetical groups, by-label
+/// sessions). Doubles as the negative control: the empty-order assertion holds
+/// only because the sort ranks unlisted items last (stable), and the non-empty
+/// assertions hold only because the order lists actually drive the sort — revert
+/// either sort in `order_grouped_rows` and one of these fails.
+#[test]
+fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
+    use crate::{group_agent_rows_by_cwd, order_grouped_rows, AgentRow, JumpTarget};
+    let row = |sid: &str, label: &str, cwd: &str| AgentRow {
+        target: JumpTarget::Roster(sid.into()),
+        label: label.into(),
+        cwd: std::path::PathBuf::from(cwd),
+        bound: false,
+        connected: true,
+        awaiting: None,
+    };
+    // Two projects; alpha has two sessions (incoming by-label a,b), beta one.
+    let mk = || {
+        vec![
+            row("s-a", "a", "/work/alpha"),
+            row("s-b", "b", "/work/alpha"),
+            row("s-z", "z", "/work/beta"),
+        ]
+    };
+    let keys = |g: &Vec<(String, Vec<(usize, AgentRow)>)>| {
+        g.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()
+    };
+    let sess = |g: &Vec<(String, Vec<(usize, AgentRow)>)>, idx: usize| {
+        g[idx].1.iter().map(|(_, r)| r.label.clone()).collect::<Vec<_>>()
+    };
+
+    // Empty orders → default: groups alphabetical (alpha, beta); alpha's
+    // sessions in by-label order (a, b). (Negative control for "no drag".)
+    let g = order_grouped_rows(group_agent_rows_by_cwd(mk()), &[], &[]);
+    assert_eq!(keys(&g), vec!["/work/alpha", "/work/beta"], "default: alpha before beta");
+    assert_eq!(sess(&g, 0), vec!["a", "b"], "default: sessions by label");
+
+    // A cwd order flips the groups (beta before alpha).
+    let cwd_order = vec!["/work/beta".to_string(), "/work/alpha".to_string()];
+    let g = order_grouped_rows(group_agent_rows_by_cwd(mk()), &cwd_order, &[]);
+    assert_eq!(keys(&g), vec!["/work/beta", "/work/alpha"], "cwd order reorders headers");
+
+    // A session order flips alpha's sessions (b before a); groups still alpha.
+    let sess_order = vec!["s-b".to_string(), "s-a".to_string()];
+    let g = order_grouped_rows(group_agent_rows_by_cwd(mk()), &[], &sess_order);
+    let alpha_idx = keys(&g).iter().position(|k| k == "/work/alpha").unwrap();
+    assert_eq!(sess(&g, alpha_idx), vec!["b", "a"], "session order reorders within group");
+}
+
+/// Unit (jump-reorder): `reorder_move` drops the dragged item into the target's
+/// slot (target shifts down); a no-op when dragged == target or absent.
+#[test]
+fn jump_reorder_move_semantics() {
+    use crate::reorder_move;
+    let mut v = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    // Drag c onto a → c takes a's slot.
+    reorder_move(&mut v, "c", "a");
+    assert_eq!(v, vec!["c", "a", "b"]);
+    // Drag c onto b → c between a and b's new positions (b's slot).
+    reorder_move(&mut v, "c", "b");
+    assert_eq!(v, vec!["a", "c", "b"], "dragged item lands in target's slot");
+    // Same item is a no-op.
+    let before = v.clone();
+    reorder_move(&mut v, "a", "a");
+    assert_eq!(v, before, "self-drop is a no-op");
+    // Missing dragged is a no-op.
+    reorder_move(&mut v, "zzz", "a");
+    assert_eq!(v, before, "absent dragged is a no-op");
+}
+
+/// jump-reorder (INV-UX-18), REAL path: seed two cwd groups on the roster, then
+/// call the exact methods the drop handlers invoke. `reorder_cwd_group` reorders
+/// the headers (and persists the order); `reorder_session` reorders sessions
+/// WITHIN a group; and a cross-cwd `reorder_session` is REFUSED — a session can
+/// never be dragged into a cwd it doesn't belong in. Drives the production view
+/// (the GPUI mouse-drag GESTURE that dispatches these is the runtime gap — gap
+/// #2, no headless drag-dispatch seam — but the state change these methods make
+/// is the real code the drop runs).
+#[gpui::test]
+fn jump_reorder_methods_reorder_and_gate_by_cwd(cx: &mut TestAppContext) {
+    use yalda::session_proto::SessionInfo;
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+
+    let info = |sid: &str, label: &str, cwd: &str| SessionInfo {
+        session_id: sid.into(),
+        acp_session_id: None,
+        label: label.into(),
+        cwd: std::path::PathBuf::from(cwd),
+        turns: 0,
+        connected: true,
+        permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
+    };
+    // alpha: {a1, a2}; beta: {b1}.
+    view.update(vcx, |v, _| {
+        v.agent_roster.upsert(info("a1", "a-one", "/proj/alpha"));
+        v.agent_roster.upsert(info("a2", "a-two", "/proj/alpha"));
+        v.agent_roster.upsert(info("b1", "b-one", "/proj/beta"));
+    });
+
+    // Snapshot the ordered, grouped view the way render does.
+    let snapshot = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            let g = crate::order_grouped_rows(
+                crate::group_agent_rows_by_cwd(v.jump_panel_agent_rows(cx)),
+                &v.jump_cwd_order,
+                &v.jump_session_order,
+            );
+            g.into_iter()
+                .map(|(k, rows)| {
+                    (k, rows.into_iter().map(|(_, r)| r.label).collect::<Vec<_>>())
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+
+    // Default: alpha before beta; alpha sessions by label (a-one, a-two).
+    let g = snapshot(&view, vcx);
+    assert_eq!(g[0].0, "/proj/alpha");
+    assert_eq!(g[1].0, "/proj/beta");
+    assert_eq!(g[0].1, vec!["a-one", "a-two"]);
+
+    // Reorder the HEADERS: drop beta onto alpha → beta first. Persisted.
+    view.update(vcx, |v, cx| v.reorder_cwd_group("/proj/beta", "/proj/alpha", cx));
+    let g = snapshot(&view, vcx);
+    assert_eq!(g[0].0, "/proj/beta", "cwd drag reordered the group headers");
+    assert!(
+        view.update(vcx, |v, _| v.jump_cwd_order.first().map(|s| s == "/proj/beta").unwrap_or(false)),
+        "cwd order persisted on the view"
+    );
+
+    // Reorder WITHIN alpha: drop a2 onto a1 → a-two before a-one.
+    view.update(vcx, |v, cx| v.reorder_session("a2", "a1", cx));
+    let g = snapshot(&view, vcx);
+    let alpha = g.iter().find(|(k, _)| k == "/proj/alpha").unwrap();
+    assert_eq!(alpha.1, vec!["a-two", "a-one"], "session drag reordered within the group");
+
+    // CROSS-CWD is refused: dragging b1 (beta) onto a1 (alpha) does nothing.
+    let before = view.update(vcx, |v, _| v.jump_session_order.clone());
+    view.update(vcx, |v, cx| v.reorder_session("b1", "a1", cx));
+    let after = view.update(vcx, |v, _| v.jump_session_order.clone());
+    assert_eq!(before, after, "a session cannot be reordered into another cwd group");
+    // And b1 is still under beta, not alpha.
+    let g = snapshot(&view, vcx);
+    assert!(g.iter().any(|(k, rows)| k == "/proj/beta" && rows.contains(&"b-one".to_string())));
+    assert!(g.iter().all(|(k, rows)| k != "/proj/alpha" || !rows.contains(&"b-one".to_string())));
 }
 
 /// The jump panel can be hidden/summoned via `cmd-j` / the `?` menu

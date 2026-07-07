@@ -370,6 +370,20 @@ pub(crate) struct Preferences {
     /// "no saved preference; show it" (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) jump_panel_visible: Option<bool>,
+    /// User's drag-reordered order of jump-panel cwd group headers
+    /// (jump-reorder). Ordered list of cwd display keys
+    /// (`shorten_cwd_for_display`); groups render in this order, any group not
+    /// listed sorts after them alphabetically. `None`/absent = alphabetical
+    /// (the default). Rewritten wholesale on a cwd-header drop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) jump_cwd_order: Option<Vec<String>>,
+    /// User's drag-reordered order of jump-panel sessions WITHIN their cwd group
+    /// (jump-reorder). Ordered list of server sids; within a cwd group sessions
+    /// sort by their index here (unlisted sids sort after, keeping label order).
+    /// A session never crosses cwd groups (the drop is cwd-gated), so one global
+    /// list suffices. `None`/absent = by-label (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) jump_session_order: Option<Vec<String>>,
 }
 
 pub(crate) fn load_preferences() -> Preferences {

@@ -1748,6 +1748,14 @@ struct YaldaGpuiView {
     /// Whether the jump panel is shown. Toggled by `cmd-j` / the `?` menu and
     /// persisted (`Preferences::jump_panel_visible`). Defaults to `true`.
     jump_panel_visible: bool,
+    /// User's drag-reordered order of jump-panel cwd group headers
+    /// (jump-reorder; `Preferences::jump_cwd_order`). Empty = alphabetical.
+    /// Rewritten on a cwd-header drop; groups not listed sort after, alpha.
+    jump_cwd_order: Vec<String>,
+    /// User's drag-reordered order of jump-panel sessions within their cwd group
+    /// (jump-reorder; `Preferences::jump_session_order`). Ordered server sids;
+    /// empty = by-label. A session never crosses cwd groups (drop is cwd-gated).
+    jump_session_order: Vec<String>,
 }
 
 impl YaldaGpuiView {
@@ -1795,6 +1803,8 @@ impl YaldaGpuiView {
             transcript_views: HashMap::new(),
             jump_panel_scroll: ScrollHandle::new(),
             jump_panel_visible: true,
+            jump_cwd_order: Vec::new(),
+            jump_session_order: Vec::new(),
         }
     }
 
@@ -1833,6 +1843,8 @@ impl YaldaGpuiView {
             transcript_views: HashMap::new(),
             jump_panel_scroll: ScrollHandle::new(),
             jump_panel_visible: true,
+            jump_cwd_order: Vec::new(),
+            jump_session_order: Vec::new(),
         }
     }
 
@@ -3008,6 +3020,9 @@ impl YaldaGpuiView {
             desktop_grid_cols: Some(self.desktop_grid_cols),
             desktop_grid_rows: Some(self.desktop_grid_rows),
             jump_panel_visible: Some(self.jump_panel_visible),
+            jump_cwd_order: (!self.jump_cwd_order.is_empty()).then(|| self.jump_cwd_order.clone()),
+            jump_session_order: (!self.jump_session_order.is_empty())
+                .then(|| self.jump_session_order.clone()),
         });
     }
 
@@ -7270,6 +7285,13 @@ fn main() {
                         }
                         if let Some(v) = prefs.jump_panel_visible {
                             view.jump_panel_visible = v;
+                        }
+                        // User's drag-reordered jump-panel order (jump-reorder).
+                        if let Some(o) = prefs.jump_cwd_order {
+                            view.jump_cwd_order = o;
+                        }
+                        if let Some(o) = prefs.jump_session_order {
+                            view.jump_session_order = o;
                         }
                         // Universal agent roster (universal-agent-list): start
                         // the server pump + seed the roster at boot (not only
