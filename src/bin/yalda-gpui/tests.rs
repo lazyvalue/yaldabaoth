@@ -291,12 +291,16 @@ fn preferences_round_trip_with_text_scale() {
         desktop_grid_cols: Some(100),
         desktop_grid_rows: Some(30),
         jump_panel_visible: Some(false),
+        jump_cwd_order: Some(vec!["/work/beta".into(), "/work/alpha".into()]),
+        jump_session_order: Some(vec!["sid-2".into(), "sid-1".into()]),
     };
     let json = serde_json::to_string(&prefs).unwrap();
     let back: Preferences = serde_json::from_str(&json).unwrap();
     assert_eq!(back.theme.as_deref(), Some("dracula"));
     assert_eq!(back.text_scale, Some(1.21));
     assert_eq!(back.jump_panel_visible, Some(false));
+    assert_eq!(back.jump_cwd_order.as_deref(), Some(&["/work/beta".into(), "/work/alpha".into()][..]));
+    assert_eq!(back.jump_session_order.as_deref(), Some(&["sid-2".into(), "sid-1".into()][..]));
     assert_eq!(back.desktop_grid_cols, Some(100));
     assert_eq!(back.desktop_grid_rows, Some(30));
 

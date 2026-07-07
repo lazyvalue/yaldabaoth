@@ -716,6 +716,55 @@ rejected), `keymap_conflict_detection`, and
 `keymap_body_is_cached_and_self_invalidates` (the render-count perf guard for the
 new cached surface).
 
+### INV-UX-18 — Jump-panel items reorder by drag, at two levels, cwd-bounded
+
+**Statement.** The jump panel's "Agent sessions" section is user-reorderable by
+drag-and-drop at two levels, and the ordering survives restart:
+
+1. **cwd groups reorder.** Dragging a cwd subheader onto another moves that whole
+   group; the header order is the user's, persisted in
+   `Preferences::jump_cwd_order` (a list of cwd display keys).
+2. **sessions reorder within their group.** Dragging a session row onto another
+   in the SAME group reorders it there, persisted in
+   `Preferences::jump_session_order` (a list of server sids).
+3. **A session never crosses cwd groups.** A session drag is accepted only by a
+   drop target in its own cwd group (`can_drop` gates on the drag payload's
+   `cwd_key`), and `reorder_session` defensively re-checks and refuses a
+   cross-cwd move. So a session can never be dragged into a cwd it doesn't belong
+   in — it is a hard gate at the gesture AND a guard in the state change.
+
+Both orders are applied as a **stable** sort by "rank in the order list" over the
+cwd-grouped rows (`order_grouped_rows`), so an empty/absent order list is a total
+no-op: the panel stays alphabetical (groups) / by-label (sessions) until the user
+drags. Items not yet in an order list sort after the listed ones, keeping their
+default position. Only roster-backed sessions (stable sid) drag; local mid-create
+placeholders don't.
+
+**Applies to.** `jump_panel_view.rs` (`SessionDrag`/`CwdDrag` payloads,
+`JumpDragPreview`, `group_agent_rows_by_cwd` + `order_grouped_rows` +
+`reorder_move`, `reorder_cwd_group`/`reorder_session`, and the `on_drag` /
+`drag_over` / `can_drop` / `on_drop` wiring in `render_jump_panel`), and the
+`Preferences::{jump_cwd_order, jump_session_order}` persistence (`persist.rs`,
+loaded/saved in `main.rs`).
+
+**Why.** Alphabetical-by-label is not how a user thinks about their projects and
+agents; manual curation (drag the active project to the top, order its agents by
+task) is. Grouping stays cwd-anchored because the cwd is the project axis — so a
+session moving to a foreign project's group would be a lie about where it runs,
+hence the hard cwd gate.
+
+**Status:** `honored` (headless for the ordering + reorder state change; the GPUI
+mouse-drag GESTURE that dispatches the drop is `NEEDS-RUNTIME` — gap #2, there is
+no headless drag-dispatch seam, so the on_drag/on_drop wiring itself is
+human-verified).
+
+**Enforcement.** `verify_harness.rs`:
+`jump_reorder_ordering_applies_and_defaults_to_alpha` (the pure order +
+negative-control default), `jump_reorder_move_semantics` (list surgery), and
+`jump_reorder_methods_reorder_and_gate_by_cwd` (drives the REAL
+`reorder_cwd_group` / `reorder_session` the drop handlers call: headers reorder,
+sessions reorder within group, cross-cwd refused).
+
 ## Cross-references
 
 - `spec-turn-steering.md` — the full steering design (queue, delivery modes, the
