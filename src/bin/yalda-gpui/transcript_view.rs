@@ -35,6 +35,12 @@
 
 use super::*;
 
+/// Perf/test label for the dedicated active-You-block item splice (the
+/// "/clear worksheet invisible" fix). Advances once per `build_body` that
+/// invalidates the You-block list item because its compose-driven content
+/// moved — the invalidation GPUI needs to repaint the just-typed text.
+pub(crate) const YOU_BLOCK_SPLICE_LABEL: &str = "you_block_splice";
+
 /// The slice-version watermark the observe filter compares across renders. Each
 /// field is a monotonic (or monotonic-equivalent) counter for one input the
 /// transcript `render()` reads; the observe callback recomputes the live values
@@ -452,6 +458,7 @@ impl TranscriptView {
             you_block_snap,
             you_parked_snap,
             you_wrap_cols,
+            you_block_seq,
         } = session.update(cx, |sp, _scx| {
             let c: &mut AgentState = &mut sp.state;
 
@@ -627,6 +634,27 @@ impl TranscriptView {
             } else {
                 None
             };
+            // Render-input hash of the ACTIVE You-block, driving the dedicated
+            // list-item splice below. Folds EXACTLY the fields the `YouBlock`
+            // render arm reads (text via `edit_seq`, caret, mode, selection) — a
+            // move in any of them changes the drawn element, but none bump the
+            // transcript `edit_seq` that `reconcile_list` keys on. 0 when no block
+            // is active (the item isn't present, so no splice is owed).
+            let you_block_seq = if let Some(snap) = &you_block_snap {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                c.input_surface.compose().editor.document().edit_seq().hash(&mut h);
+                snap.cursor_line.hash(&mut h);
+                snap.cursor_col.hash(&mut h);
+                (snap.mode == EditMode::Insert).hash(&mut h);
+                snap.selection.hash(&mut h);
+                // Non-zero even for an empty just-opened block so the FIRST
+                // keystroke (edit_seq 0→1) is a genuine move off `u64::MAX`.
+                let v = h.finish();
+                if v == 0 { 1 } else { v }
+            } else {
+                0
+            };
             // Parked You-blocks (rule 6): (anchor_line, read-only text lines) per
             // additional insertion point, rendered by the `YouBlock { parked: Some(i)
             // }` arm. Cheap; only when idle worksheet so it can't allocate mid-turn.
@@ -684,6 +712,7 @@ impl TranscriptView {
                 you_block_snap,
                 you_parked_snap,
                 you_wrap_cols,
+                you_block_seq,
             }
         });
 
@@ -691,6 +720,33 @@ impl TranscriptView {
         // view-owned `TranscriptScroll`. The session borrow is dropped. ──
         self.scroll
             .reconcile_list(block_ranges_active, &flat_items_arc, edit_seq);
+        // The ACTIVE inline You-block is ONE list item whose content is driven by
+        // the COMPOSE buffer, not the transcript `edit_seq` — so `reconcile_list`
+        // (which keys the tail re-measure on `edit_seq`, and `FlatKey::YouBlock` on
+        // `parked` only) never marks it dirty when you type into it. GPUI caches
+        // rendered list items, so without an explicit splice it repaints the block
+        // at its STALE text: the recurring "/clear worksheet invisible" bug — the
+        // observe fires and `build_body` runs, but the typed char never appears
+        // until an unrelated event (jump bar, chatbox toggle) forces a splice. When
+        // the block's render-input hash moves, splice exactly its item so GPUI
+        // re-measures it. Targets `YouBlock { parked: None }` (the active block; a
+        // parked block's text is frozen). Serves INV-UX-1 — the caret + its text
+        // stay visible as you type. Pinned by
+        // `clear_worksheet_you_block_keystroke_splices_item`.
+        if you_block_seq != self.scroll.last_you_block_seq {
+            if let Some(yb_idx) = flat_items_arc
+                .iter()
+                .position(|it| matches!(it, FlatItem::YouBlock { parked: None }))
+            {
+                self.scroll.list_state.splice(yb_idx..yb_idx + 1, 1);
+                // Test/perf seam: a splice here IS the fix — it's the invalidation
+                // GPUI needs to repaint the You-block with the just-typed text.
+                // `clear_worksheet_you_block_keystroke_splices_item` asserts this
+                // count advances on the real keystroke path (RED when reverted).
+                record_render(YOU_BLOCK_SPLICE_LABEL);
+            }
+            self.scroll.last_you_block_seq = you_block_seq;
+        }
         debug_assert!(
             self.scroll.list_item_count == flat_items_arc.len(),
             "list_item_count ({}) out of sync with flat_items ({})",
@@ -1438,6 +1494,14 @@ struct TranscriptPrep {
     you_block_snap: Option<YouBlockSnap>,
     you_parked_snap: Vec<(usize, Vec<String>)>,
     you_wrap_cols: usize,
+    /// Render-input hash of the ACTIVE You-block (compose text + caret + mode +
+    /// selection), or 0 when no block is active. The You-block is one list item
+    /// driven by the COMPOSE buffer, not the transcript `edit_seq`, so
+    /// `reconcile_list` can't see its content move. When this differs from
+    /// `TranscriptScroll::last_you_block_seq`, `build_body` splices that one item
+    /// so GPUI re-measures it instead of repainting the stale cached element (the
+    /// "/clear worksheet invisible" bug). See [`TranscriptScroll::last_you_block_seq`].
+    you_block_seq: u64,
 }
 
 /// Per-frame snapshot of the inline You-block draft (the separate `Compose`),

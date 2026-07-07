@@ -650,6 +650,26 @@ without the YouBlock row is reused). Everything else
 agent_ui.rs:4260, reveal, submit anchor) already routes through the predicate and
 self-aligns.
 
+**Second mechanism — the You-block LIST ITEM must be invalidated on every compose
+edit (added 2026-07-06).** The gate being correct is necessary but NOT sufficient.
+The active You-block is ONE `FlatItem::YouBlock` list item, and GPUI's `ListState`
+**caches rendered items** — an item is only re-measured/repainted when it is
+`splice`d. `reconcile_list` (agent.rs:1638) splices the tail on a *transcript*
+`edit_seq` move and diffs `FlatKey::YouBlock` on `parked` only. But the You-block's
+content is driven by the **compose** buffer, whose `compose_edit_seq` bumps
+neither the transcript's `edit_seq` NOR the key — so a keystroke left the item
+un-spliced and GPUI repainted its STALE cached element. The observe fired,
+`build_body` ran, the caret/gate were all correct, and the char was STILL invisible
+until an unrelated event (jump bar, chatbox toggle, a transcript change) forced a
+splice. This was the true, seven-times-recurring root cause the six gate/fingerprint
+fixes never touched (found by autonomous runtime repro, `YALDA_CLEAR_DEBUG`: the
+observe logged `compose_edit_seq` advancing while `build_body` reported
+`memo_hit=true` with no repaint). Fix: `build_body` (transcript_view.rs) hashes the
+active block's render inputs into `you_block_seq` and splices exactly that item when
+it moves (vs `TranscriptScroll::last_you_block_seq`). Invariant: **any change to the
+active You-block's compose text / caret / mode / selection MUST splice its list item
+the same frame.**
+
 **Why.** Six prior "fixes" added another `settle_input_focus()` at another guessed
 producer of the hole; the hole has many producers (e.g. `force_restart_agent`
 Idles without settle, agent_ui.rs:3602) and was never made unrepresentable.
@@ -671,6 +691,18 @@ verified. Plus `tests.rs::inline_you_block_active_truth_table` (the
 `focus==Compose` rows). The buffer-only assertion of the six prior fixes
 (`compose().text()=="hello"`) is explicitly NOT the guard — it is green while the
 screen is blank.
+
+**Enforcement (second mechanism).**
+`verify_harness.rs::clear_worksheet_you_block_keystroke_splices_item` — rest in the
+post-`/clear` typeable worksheet (inline block active, pre-asserted), settle so
+`last_you_block_seq` catches up, then type via the REAL `handle_claude_key` and
+assert the `YOU_BLOCK_SPLICE_LABEL` perf counter advances (the You-block item was
+invalidated). **Negative control (observed): delete the `you_block_seq != …` splice
+block in `build_body` → RED, splice count `0 -> 0`** — the item is never
+invalidated, the exact cached-item staleness the user reports. Paint is NOT the
+guard here: the headless harness re-renders every list item each frame, masking the
+`ListState` item cache — which is precisely why the paint-based repros were falsely
+green through six rounds.
 
 ### INV-UX-17 — The keybindings tile shows the LIVE keymap and rebinds it in place
 

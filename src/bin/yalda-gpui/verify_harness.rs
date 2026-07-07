@@ -5215,6 +5215,120 @@ fn jump_reorder_methods_reorder_and_gate_by_cwd(cx: &mut TestAppContext) {
     assert!(g.iter().all(|(k, rows)| k != "/proj/alpha" || !rows.contains(&"b-one".to_string())));
 }
 
+/// Unit: the jump panel groups agent-session rows under per-cwd subheaders
+/// (agent-sessions-by-cwd). Sessions sharing a cwd land in one group; groups are
+/// ordered by their display path (stable, alphabetized headers); and every row
+/// keeps its original flat index (so its id / click listener stay stable
+/// regardless of grouping).
+#[test]
+fn jump_panel_groups_agent_rows_by_cwd() {
+    use crate::{group_agent_rows_by_cwd, AgentRow, JumpTarget};
+    let row = |label: &str, cwd: &str| AgentRow {
+        target: JumpTarget::Roster(label.into()),
+        label: label.into(),
+        cwd: std::path::PathBuf::from(cwd),
+        bound: false,
+        connected: true,
+        awaiting: None,
+    };
+    // Two projects, one with two sessions; input order is by-label (a,b,c).
+    let rows = vec![
+        row("a", "/work/beta"),
+        row("b", "/work/alpha"),
+        row("c", "/work/alpha"),
+    ];
+    let groups = group_agent_rows_by_cwd(rows);
+    assert_eq!(groups.len(), 2, "one group per distinct cwd");
+    // Headers alphabetized by display path: alpha before beta.
+    assert_eq!(groups[0].0, "/work/alpha");
+    assert_eq!(groups[1].0, "/work/beta");
+    // alpha holds b (idx 1) and c (idx 2), in incoming order, original indices kept.
+    let alpha: Vec<(usize, &str)> =
+        groups[0].1.iter().map(|(i, r)| (*i, r.label.as_str())).collect();
+    assert_eq!(alpha, vec![(1, "b"), (2, "c")]);
+    // beta holds a (idx 0).
+    let beta: Vec<(usize, &str)> =
+        groups[1].1.iter().map(|(i, r)| (*i, r.label.as_str())).collect();
+    assert_eq!(beta, vec![(0, "a")]);
+}
+
+/// THE ACTUAL ROOT CAUSE of "/clear worksheet invisible", caught on the real
+/// path — the mechanism the six paint/render-count fixes all MISSED.
+///
+/// The inline You-block is ONE `FlatItem::YouBlock` list item whose content is
+/// driven by the COMPOSE buffer, not the transcript `edit_seq`. GPUI's
+/// `ListState` caches rendered items and only re-measures one when it's spliced.
+/// `reconcile_list` splices the tail on a transcript `edit_seq` move and diffs
+/// `FlatKey::YouBlock` on `parked` only — so a keystroke into the You-block (which
+/// bumps the *compose* seq, not the transcript seq, and doesn't change the key)
+/// left the item un-spliced. GPUI repainted its stale cached element → the typed
+/// char was invisible until an unrelated event (jump bar, chatbox toggle) forced a
+/// splice. The fix: `build_body` hashes the active You-block's render inputs
+/// (`you_block_seq`) and splices exactly that item when the hash moves.
+///
+/// This asserts on the SPLICE (`YOU_BLOCK_SPLICE_LABEL`), not on paint: the
+/// headless harness re-renders every list item each frame, which MASKS the
+/// `ListState` item-cache staleness — that mask is precisely why the prior
+/// paint-based repros were falsely GREEN. The splice count is the one observable
+/// that reflects the real GPUI invalidation.
+///
+/// NEGATIVE CONTROL (mandatory, observed): delete the `you_block_seq != …` splice
+/// block in `build_body` (transcript_view.rs) and this fails RED — the count stays
+/// flat at 0, i.e. the You-block item is never invalidated ⇒ the user's invisible
+/// text. Restore it and it passes. Verified by commenting the block out.
+#[gpui::test]
+fn clear_worksheet_you_block_keystroke_splices_item(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    // Rest in the exact post-/clear typeable worksheet: fresh transcript, focus on
+    // the Compose (INV-UX-16 gate → inline You-block active), idle, Insert.
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| {
+            c.editor =
+                yalda::editor::Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+            c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
+            c.close_you_block();
+            c.focus = crate::AgentFocus::Compose;
+            c.input_surface.compose_mut().mode = crate::EditMode::Insert;
+            c.turn_phase = crate::TurnPhase::Idle;
+        });
+    });
+    vcx.run_until_parked();
+
+    // Sanity: we ARE in the state where a You-block item is present + active, so a
+    // keystroke's staleness would actually be user-visible (non-vacuous).
+    let active = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.inline_you_block_active()))
+        .unwrap_or(false);
+    assert!(active, "precondition: inline You-block must be active (else nothing to keep fresh)");
+
+    // Let the initial render settle so `last_you_block_seq` has caught up to the
+    // empty block, THEN start the measurement window — so the count we read is
+    // attributable to the KEYSTROKE, not the first paint.
+    vcx.run_until_parked();
+    crate::perf_reset(crate::YOU_BLOCK_SPLICE_LABEL);
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let base = crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL);
+    assert_eq!(base, 0, "a plain notify (no compose change) must NOT splice the You-block item");
+
+    // The user types — through the REAL key handler, no `i`, no toggle.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    vcx.run_until_parked();
+    let after = crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL);
+
+    let text = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text()))
+        .expect("session");
+    assert_eq!(text.trim(), "h", "sanity: the char landed in the compose buffer");
+    assert!(
+        after > base,
+        "ROOT CAUSE: typing into the active You-block MUST splice its list item so GPUI \
+         re-measures + repaints the new text (splice count {base} -> {after}); flat == the \
+         cached-item staleness the user sees as invisible text",
+    );
+}
+
 /// The jump panel can be hidden/summoned via `cmd-j` / the `?` menu
 /// (jump-panel; spec-jump-panel.md). It defaults visible and renders; toggling
 /// it off stops it rendering (and flips the menu label); toggling on brings it

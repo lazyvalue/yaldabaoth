@@ -6,12 +6,17 @@
 
 use super::*;
 
-/// TEMP diagnostic for the recurring "/clear worksheet-invisible" bug. Appends a
-/// timestamped line to `/tmp/yalda-clear-debug.log` UNCONDITIONALLY (no env var,
-/// so a single real reproduction captures the full causal chain without the user
-/// having to remember a flag). Removed once the bug is root-caused from real data.
+/// Diagnostic for the "/clear worksheet-invisible" bug class. Appends a
+/// timestamped line to `/tmp/yalda-clear-debug.log`. Gated on `YALDA_CLEAR_DEBUG`
+/// so it's a zero-cost no-op in the shipped binary (the root cause — a missing
+/// You-block list-item splice — is fixed; kept for cheap re-instrumentation should
+/// any repaint-staleness regress). The call sites double as an executable map of
+/// the /clear causal chain (keystroke → observe → build_body → splice).
 pub(crate) fn clear_log(msg: &str) {
     use std::io::Write;
+    if std::env::var_os("YALDA_CLEAR_DEBUG").is_none() {
+        return;
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1582,6 +1587,18 @@ pub(crate) struct TranscriptScroll {
     /// of `reset()`-ing the whole list (which nulled the scroll → the worksheet
     /// "newline jumps to the top of the viewport" bug).
     pub(crate) last_keys: Vec<FlatKey>,
+    /// Render-input hash of the ACTIVE inline You-block (compose text + caret +
+    /// mode + selection) at the last reconcile. The You-block is ONE list item
+    /// whose *content* is driven by the COMPOSE buffer, NOT the transcript
+    /// `edit_seq` — so a keystroke in it never bumps `last_reconciled_edit_seq`
+    /// and `FlatKey::YouBlock` (keys on `parked` only) stays identical. Without
+    /// a dedicated seq the item is never spliced, so GPUI repaints its CACHED
+    /// element at the old text — the recurring "/clear worksheet invisible"
+    /// bug: you type, the observe fires, `build_body` runs, but the You-block
+    /// row shows nothing until an unrelated event forces a splice/reset. When
+    /// this hash moves, `build_body` splices the You-block item to re-measure
+    /// it. `u64::MAX` = never rendered a block.
+    pub(crate) last_you_block_seq: u64,
 }
 
 /// A cheap, `Copy` identity for a [`FlatItem`] — enough to diff two item lists
@@ -1619,6 +1636,7 @@ impl TranscriptScroll {
             last_reconciled_edit_seq: 0,
             last_scrolled_edit_seq: u64::MAX,
             last_keys: Vec::new(),
+            last_you_block_seq: u64::MAX,
         }
     }
 
