@@ -797,6 +797,48 @@ negative-control default), `jump_reorder_move_semantics` (list surgery), and
 `reorder_cwd_group` / `reorder_session` the drop handlers call: headers reorder,
 sessions reorder within group, cross-cwd refused).
 
+### INV-UX-19 — A tool call never splits an agent text token
+
+**Statement.** A tool-call row interleaved into an agent turn's streamed prose
+must break the prose only at a **word / sentence boundary**, never inside a word.
+Concretely: when a tool call arrives while the turn's tail line is still OPEN (the
+last streamed chunk did not end the run) and the interruption falls mid-word — the
+open line's last content char AND the next chunk's first char are both
+**alphanumeric** — the continuation **rejoins** the open run's end-of-content, and
+the tool group renders AFTER the completed text. Any other boundary (whitespace,
+or sentence/word-terminating punctuation like the '.' ending "here.") is a
+legitimate `text → tool → text` interleave and is left in place (tool between the
+two statements). This makes the reconstructed transcript read as the model wrote
+it: `` `mode=max` `` is never rendered as `` `m `` | ToolSearch | `ode=max`. The
+alphanumeric-only rule is conservative on purpose — it fixes the word-cut-in-half
+case (what reads worst) without guessing at ambiguous punctuation splits.
+
+**Applies to.** `editor.rs` — `Editor::append_llm_chunk_floored` +
+`midtoken_rejoin_point` (the mid-token detector) vs `find_llm_insertion_point`
+(the whitespace-boundary interleave, whose `ends_with('\n')` → different-turn →
+EOF branch is the splitter this guards). Driven from the agent reducer
+(`agent_ui.rs` `apply_reply_events`, the `Chunk` / `ToolCallStarted` arms).
+
+**Why.** Streamed `ReplyEvent`s can deliver a tool-call notification between two
+text deltas of one content block. Anchoring the tool on its own line then forcing
+the continuation below it (INV-ORDER keeps the transcript append-only) bisected
+whatever token straddled the delta boundary — the reported "interleaved toolcalls
+with agent text" screenshot, where a code span was cut in half. The token-straddle
+test distinguishes that artifact from a genuine `text → tool → text` agent-loop
+interleave (which breaks at a sentence boundary and must be preserved).
+
+**Status:** `honored` (headless — the split is a buffer-content property the
+reducer produces, fully observable without paint).
+
+**Enforcement.** `verify_harness.rs`:
+`tool_call_midtoken_does_not_split_agent_text_run` (drives the REAL
+`apply_server_batch` → `append_llm_chunk_floored` with a `Chunk` / `ToolCallStarted`
+/ `Chunk` mid-token stream; asserts the token stays whole AND the tool group
+renders after the reassembled line; negative control: the buffer becomes
+`` `m\n\node=max ``). `tests.rs`:
+`floored_tools_and_text_stay_in_order_above_draft` pins the complementary
+whitespace-boundary case (chunks ending `". "` stay interleaved with their tools).
+
 ## Cross-references
 
 - `spec-turn-steering.md` — the full steering design (queue, delivery modes, the
