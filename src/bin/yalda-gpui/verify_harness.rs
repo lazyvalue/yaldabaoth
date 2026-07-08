@@ -1324,6 +1324,70 @@ fn worksheet_already_active_during_replay_lands_caret_on_tail(cx: &mut TestAppCo
     });
 }
 
+/// REGRESSION (live screenshot "interleaved toolcalls with agent text"): a
+/// single agent text run streamed as two deltas with a tool call landing
+/// BETWEEN them, while the run is still OPEN (first delta ends mid-token, no
+/// trailing '\n'), must NOT be split around the tool. The reducer used to force
+/// the continuation to EOF below the tool anchor (`find_llm_insertion_point`'s
+/// `ends_with('\n')` → different-turn → EOF branch), bisecting the token —
+/// e.g. the code span `mode=max` rendered as "`m" | ToolSearch | "ode=max".
+/// Fix: an open run rejoins at end-of-content so the token stays whole and the
+/// tool group renders AFTER the completed text. Drives the REAL reducer path
+/// (`apply_server_batch` → `apply_reply_events` → `append_llm_chunk_floored`).
+#[gpui::test]
+fn tool_call_midtoken_does_not_split_agent_text_run(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{ReplyEvent, ToolCall};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        let tc = ToolCall::new("tool-1", "ToolSearch");
+        let batch = vec![
+            // First delta ends mid-token (no trailing '\n') — the run is OPEN.
+            ev(ReplyEvent::Chunk("only re-push the 8 GB `m".into())),
+            ev(ReplyEvent::ToolCallStarted(tc)),
+            // Continuation completes the `mode=max` token.
+            ev(ReplyEvent::Chunk("ode=max cache when inputs changed.\n".into())),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+    vcx.run_until_parked();
+    // Force a view-model rebuild so flat items reflect the current buffer.
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        let text = c.editor.document().full_text();
+        // The token is WHOLE — no tool/blank line spliced through `mode=max`.
+        assert!(
+            text.contains("8 GB `mode=max cache"),
+            "agent text run stays contiguous across the interrupting tool call; got:\n{text:?}"
+        );
+        // Order preserved: the tool group still renders, AFTER the reassembled
+        // text line (never before it, never inside it).
+        let items = &c.view_model.flat_items_cache;
+        let text_idx = items.iter().position(|it| {
+            matches!(it, crate::FlatItem::Line(l)
+                if c.editor.document().line_text(*l).contains("mode=max"))
+        });
+        let tool_idx = items
+            .iter()
+            .position(|it| matches!(it, crate::FlatItem::ToolGroup { .. }));
+        let text_idx = text_idx.expect("the reassembled agent line is rendered");
+        let tool_idx = tool_idx.expect("the tool group is rendered");
+        assert!(
+            tool_idx > text_idx,
+            "tool group renders AFTER the completed text run (text@{text_idx}, tool@{tool_idx})"
+        );
+    });
+}
+
 /// REGRESSION (live report "undo erased the buffer"): agent content that
 /// streams while the user is mid-insert in Worksheet mode must NOT become
 /// user-undoable. The bug: `begin_insert` opens ONE undo group for the whole

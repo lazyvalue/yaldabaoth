@@ -1541,7 +1541,19 @@ impl Editor {
             return;
         }
         let eof = self.core.document().rope().len_chars();
-        let natural = self.find_llm_insertion_point::<T>(&turn_tag);
+        // Mid-token tool interruption (interspersed-tool-group bug for AGENT
+        // text): if this turn's tail line is still OPEN and a tool call spliced
+        // itself INSIDE a token — the open line's last content char and this
+        // chunk's first char are both non-whitespace — the continuation must
+        // rejoin the open run's end-of-content rather than land on a fresh line
+        // below the tool (where `find_llm_insertion_point` sends it once the
+        // tool closed the line with a '\n'). Otherwise the token is cut in half,
+        // e.g. `mode=max` rendering as "`m" | ToolSearch | "ode=max". A break at
+        // a whitespace/sentence boundary is a LEGITIMATE interleave and is left
+        // alone. Overrides `natural` only in the straddled-token case.
+        let natural = self
+            .midtoken_rejoin_point::<T>(&turn_tag, chunk)
+            .unwrap_or_else(|| self.find_llm_insertion_point::<T>(&turn_tag));
         let insertion_char = if floor_char >= eof || natural < floor_char {
             // No draft below the insertion point, or `natural` already lands in
             // the agent region ABOVE the user's draft (a mid-line streaming
@@ -1674,6 +1686,52 @@ impl Editor {
             let a = self.core.anchor_for_line(l);
             self.core.metadata_mut::<T>().insert(a, turn_tag.clone());
         }
+    }
+
+    /// End-of-content char of this turn's OPEN tail line when an incoming
+    /// `chunk` would fuse a WORD across a tool interruption — otherwise `None`.
+    ///
+    /// The guard is deliberately narrow: the tail must come from the LIVE cache
+    /// and still be OPEN (`cached_llm_open` — the model has not ended the run),
+    /// AND the join must be mid-word: the open line's last content char and the
+    /// chunk's first char are both **alphanumeric**. That is exactly the streamed
+    /// artifact where a tool call landed between two halves of one word
+    /// (`mode=max` → "`m" | tool | "ode=max"). Any other boundary — whitespace,
+    /// or sentence/word-terminating punctuation like the '.' ending "here." — is
+    /// a legitimate `text → tool → text` interleave and returns `None`, so the
+    /// tool stays between the two statements (INV-UX-19). Alphanumeric-only is
+    /// conservative on purpose: it fixes the word-cut-in-half case (what reads
+    /// worst) without guessing at ambiguous punctuation splits (a filename like
+    /// "gate.sh" broken on '.' is left to interleave rather than mis-fused).
+    /// `line_len_chars` already excludes the trailing '\n', so this is the
+    /// content end whether or not the tool closed the line with a synthetic
+    /// newline.
+    fn midtoken_rejoin_point<T: Any + Send + Sync + PartialEq>(
+        &self,
+        turn_tag: &T,
+        chunk: &str,
+    ) -> Option<usize> {
+        if !self.core.cached_llm_open() {
+            return None;
+        }
+        let doc = self.core.document();
+        let line = self
+            .core
+            .cached_llm_line()
+            .filter(|&l| l < doc.line_count() && self.line_tagged_this_turn::<T>(l, turn_tag))?;
+        let chunk_head = chunk.chars().next()?;
+        if !chunk_head.is_alphanumeric() {
+            return None;
+        }
+        let content_len = doc.line_len_chars(line);
+        if content_len == 0 {
+            return None;
+        }
+        let last_char = doc.line_text(line).chars().nth(content_len - 1)?;
+        if !last_char.is_alphanumeric() {
+            return None;
+        }
+        Some(doc.line_col_to_char(line, content_len))
     }
 
     fn find_llm_insertion_point<T: Any + Send + Sync + PartialEq>(&self, turn_tag: &T) -> usize {
@@ -2093,6 +2151,43 @@ mod tests {
             tags[pre],
             Some(TurnId::Llm(1)),
             "pre-tool line keeps Llm(1): {text:?}"
+        );
+    }
+
+    /// INV-UX-19 (complement of `post_tool_chunk_does_not_clobber_pre_tool_line`):
+    /// when a tool interrupts an OPEN run MID-WORD — the pre-tool chunk ends on an
+    /// alphanumeric and the post-tool chunk starts on one — the halves REJOIN onto
+    /// one line (word kept whole) and the tool renders after, instead of splitting
+    /// the word around the tool. This is the screenshot bug: `` `mode=max` `` cut
+    /// as "`m" | tool | "ode=max". Negative control: force `midtoken_rejoin_point`
+    /// to `None` (or flip either boundary to punctuation) and the word splits.
+    #[test]
+    fn post_tool_chunk_rejoins_a_word_split_mid_token() {
+        let mut ed = new_editor("");
+        // Pre-tool chunk ends mid-word (alphanumeric 'm', no trailing '\n').
+        ed.append_llm_chunk(TurnId::Llm(1), "only re-push the 8 GB `m");
+        simulate_tool_call(&mut ed, 1);
+        // Continuation starts on an alphanumeric ('o') — the other half of the word.
+        ed.append_llm_chunk(TurnId::Llm(1), "ode=max cache.");
+
+        let text = ed.document().full_text();
+        assert!(
+            text.contains("8 GB `mode=max cache."),
+            "the word `mode=max` is rejoined whole, not split by the tool: {text:?}"
+        );
+        // The reassembled prose and the tool line stay in order: prose line first,
+        // tool line strictly after it (never inside the word).
+        let prose = text.lines().position(|l| l.contains("mode=max")).unwrap();
+        let tool_line = (0..ed.document().line_count())
+            .position(|l| {
+                ed.anchor_for_line_opt(l)
+                    .and_then(|a| ed.metadata::<TurnId>().get(a).copied())
+                    == Some(TurnId::Tool(1))
+            })
+            .expect("tool line tagged Tool(1)");
+        assert!(
+            tool_line > prose,
+            "tool renders after the completed word (prose@{prose}, tool@{tool_line}): {text:?}"
         );
     }
 
