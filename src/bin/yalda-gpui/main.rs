@@ -1457,6 +1457,7 @@ fn agent_local_menu() -> Vec<MenuNode> {
         MenuNode::entry("m", "cycle permission mode", "claude-mode-cycle"),
         MenuNode::entry("h", "toggle heading markers", "agent-toggle-heading-markers"),
         MenuNode::entry("j", "jump between user turns (j/k)", "agent-toggle-jump-mode"),
+        MenuNode::entry("R", "recap this session", "recap-session"),
     ]
 }
 
@@ -1622,6 +1623,11 @@ struct YaldaGpuiView {
     /// (jump-reorder; `Preferences::jump_session_order`). Ordered server sids;
     /// empty = by-label. A session never crosses cwd groups (drop is cwd-gated).
     jump_session_order: Vec<String>,
+    /// The single pinned session recap (recap-panel), or `None` when dismissed /
+    /// never summoned. Shown at the top of the jump panel; summoned via the menu
+    /// (`recap-session`), re-runnable, dismissed with `recap-dismiss`. Owns the
+    /// throwaway recap worker + pump for the life of a generation.
+    recap: Option<RecapState>,
 }
 
 impl YaldaGpuiView {
@@ -1671,6 +1677,7 @@ impl YaldaGpuiView {
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
+            recap: None,
         }
     }
 
@@ -1711,6 +1718,7 @@ impl YaldaGpuiView {
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
+            recap: None,
         }
     }
 
@@ -4433,6 +4441,8 @@ impl YaldaGpuiView {
             "rail-flip" => self.flip_rail_side_impl(cx),
             "agent-toggle-heading-markers" => self.toggle_agent_heading_markers(cx),
             "agent-toggle-jump-mode" => self.toggle_agent_jump_mode(cx),
+            "recap-session" => self.summon_recap(cx),
+            "recap-dismiss" => self.dismiss_recap(cx),
             "compose-toggle" | "agent-input-toggle" => {
                 if matches!(
                     self.workspace.focused_content().expect("no focused window"),

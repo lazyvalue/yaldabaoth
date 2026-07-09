@@ -3881,6 +3881,316 @@ impl YaldaGpuiView {
         sent
     }
 
+    // ── Session recap (recap-panel) ─────────────────────────────────────────
+    //
+    // A recap is a one-off, LLM-generated prose summary of the focused session's
+    // conversation, requested manually and pinned at the top of the jump panel
+    // until dismissed (INV-UX-20). Generation runs on a THROWAWAY
+    // `AcpChannelClient` — a private side-channel worker fed the transcript text
+    // inline — so its reply stream never routes through the visible transcript
+    // reducer (`apply_reply_events`). The reply-application logic
+    // (`apply_recap_event` / `finalize_recap`) is factored out of the pump so it
+    // is headlessly testable with synthetic `ReplyEvent`s (the live subprocess is
+    // the sole genuine gap, per dev-system § Verification harness gap 2).
+
+    /// Cap on how much transcript we stuff into the recap prompt. A recap only
+    /// needs the shape of the conversation; the tail carries the current state,
+    /// so we keep the last N chars rather than blowing the context on a huge
+    /// history. Trimmed at a line boundary in `build_recap_prompt`.
+    const RECAP_TRANSCRIPT_BUDGET: usize = 24_000;
+
+    /// Summon (or re-run) a recap of the focused agent session (menu
+    /// `recap-session`). Snapshots the session's transcript, flips the panel to
+    /// `Generating`, and kicks off the throwaway worker. Re-running while one is
+    /// live bumps the run token so the prior worker's late updates are ignored
+    /// and its subprocess is torn down. No-op with a clear status when there's no
+    /// focused session or nothing to summarize.
+    pub(crate) fn summon_recap(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.focused_bound_session() else {
+            self.transient_status = Some("no agent session focused to recap".into());
+            cx.notify();
+            return;
+        };
+        self.start_recap_for(id, cx);
+    }
+
+    /// Re-run the pinned recap against the session it already targets (the panel
+    /// `⟳` button), independent of which tile currently has focus.
+    pub(crate) fn rerun_recap(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.recap.as_ref().map(|r| r.session_id) {
+            self.start_recap_for(id, cx);
+        }
+    }
+
+    /// Shared core of summon / re-run: snapshot `id`'s transcript, flip the panel
+    /// to `Generating`, and kick off the throwaway worker.
+    fn start_recap_for(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let Some(ent) = self.sessions.get(id).cloned() else {
+            return;
+        };
+        let (label, cwd, transcript) = {
+            let s = ent.read(cx);
+            (
+                s.label.clone(),
+                s.cwd.clone(),
+                s.state.editor.document().full_text(),
+            )
+        };
+        if transcript.trim().is_empty() {
+            self.transient_status = Some("nothing to recap yet".into());
+            cx.notify();
+            return;
+        }
+
+        // Bump the run token; assigning a fresh `RecapState` drops any prior one,
+        // whose Drop tears down its worker + pump (superseding an in-flight run).
+        let token = self.recap.as_ref().map(|r| r.token.wrapping_add(1)).unwrap_or(1);
+        self.recap = Some(RecapState {
+            session_label: label,
+            session_id: id,
+            status: RecapStatus::Generating,
+            text: String::new(),
+            token,
+            channel: None,
+            _pump: None,
+        });
+        // The recap lives in the jump panel — make sure it's visible so the user
+        // sees the result of the command they just invoked.
+        if !self.jump_panel_visible {
+            self.jump_panel_visible = true;
+        }
+        cx.notify();
+        self.spawn_recap_worker(token, cwd, transcript, cx);
+    }
+
+    /// Dismiss the pinned recap (menu `recap-dismiss`). Clears the panel and, via
+    /// `RecapState`'s Drop, tears down any live worker + pump.
+    pub(crate) fn dismiss_recap(&mut self, cx: &mut Context<Self>) {
+        if self.recap.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Build the recap prompt: a tail-trimmed transcript wrapped with a terse
+    /// instruction. Kept pure so the trimming/budget is unit-testable.
+    fn build_recap_prompt(transcript: &str) -> String {
+        let trimmed = if transcript.len() > Self::RECAP_TRANSCRIPT_BUDGET {
+            let start = transcript.len() - Self::RECAP_TRANSCRIPT_BUDGET;
+            // Advance to the next line boundary so we don't slice mid-line.
+            let start = transcript[start..]
+                .find('\n')
+                .map(|off| start + off + 1)
+                .unwrap_or(start);
+            format!("…(earlier conversation elided)…\n{}", &transcript[start..])
+        } else {
+            transcript.to_string()
+        };
+        format!(
+            "Write a brief recap of the coding-assistant conversation below, so the \
+             user can re-orient at a glance. Use 3–6 short bullet points covering: \
+             what the user is working on, the key decisions and actions taken, and \
+             the current state / next step. Output ONLY the recap — no preamble, no \
+             restating this instruction.\n\n<conversation>\n{trimmed}\n</conversation>"
+        )
+    }
+
+    /// Spawn the throwaway recap worker in the background (blocking handshake +
+    /// first prompt), then hand the live channel back to the view to start
+    /// pumping. On any spawn/send error the recap flips to `Failed`.
+    fn spawn_recap_worker(
+        &self,
+        token: u64,
+        cwd: PathBuf,
+        transcript: String,
+        cx: &mut Context<Self>,
+    ) {
+        // The throwaway worker is a REAL subprocess (dev-system § Verification
+        // harness gap 2). Headless tests drive the reducer (`apply_recap_event` /
+        // `finalize_recap`) directly and must never fork an agent — so summon
+        // leaves the panel `Generating` with no channel and the test feeds
+        // synthetic `ReplyEvent`s. The live spawn→pump wiring is exercised at
+        // runtime only.
+        if cfg!(test) {
+            return;
+        }
+        let prompt = Self::build_recap_prompt(&transcript);
+        let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
+        cx.spawn(async move |this, cx| {
+            let spawned: Result<AcpChannelClient, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    match AcpChannelClient::spawn(&cmd, Some(cwd)) {
+                        Ok(mut ch) => match ch.send(&prompt) {
+                            Ok(()) => Ok(ch),
+                            Err(e) => Err(format!("recap send failed: {e}")),
+                        },
+                        Err(e) => Err(format!("recap agent unavailable: {e}")),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| match spawned {
+                Ok(ch) => this.install_recap_channel(token, ch, cx),
+                Err(e) => this.fail_recap(token, e, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Adopt the freshly-spawned recap worker and start its pump — unless the run
+    /// was superseded/dismissed while we were spawning (token mismatch), in which
+    /// case `ch` is dropped here (killing the now-orphan subprocess).
+    fn install_recap_channel(
+        &mut self,
+        token: u64,
+        ch: AcpChannelClient,
+        cx: &mut Context<Self>,
+    ) {
+        match self.recap.as_mut() {
+            Some(r) if r.token == token => r.channel = Some(ch),
+            _ => return, // superseded — drop ch
+        }
+        self.start_recap_pump(token, cx);
+    }
+
+    /// Drive the recap worker's reply stream. Event-driven via the channel's wake
+    /// receiver (falling back to a short poll), draining into `apply_recap_event`
+    /// and finalizing when the turn resolves or the worker dies.
+    fn start_recap_pump(&mut self, token: u64, cx: &mut Context<Self>) {
+        let wake = self
+            .recap
+            .as_ref()
+            .and_then(|r| r.channel.as_ref())
+            .and_then(|ch| ch.take_wake_receiver());
+        let pump = cx.spawn(async move |this, cx| {
+            use futures::FutureExt;
+            use futures::stream::StreamExt;
+            let mut wake = wake;
+            loop {
+                if let Some(rx) = wake.as_mut() {
+                    let timer = cx.background_executor().timer(Duration::from_millis(50));
+                    futures::select_biased! {
+                        _ = rx.next().fuse() => {}
+                        _ = timer.fuse() => {}
+                    }
+                    while rx.next().now_or_never().flatten().is_some() {}
+                } else {
+                    cx.background_executor().timer(Duration::from_millis(50)).await;
+                }
+                let keep_going = this.update(cx, |this, cx| this.drain_recap(token, cx));
+                match keep_going {
+                    Ok(true) => {}
+                    _ => return, // done, superseded, or view gone
+                }
+            }
+        });
+        if let Some(r) = self.recap.as_mut() {
+            r._pump = Some(pump);
+        }
+    }
+
+    /// Drain any queued reply events into the recap, then decide whether the run
+    /// is complete. Returns `true` to keep pumping, `false` when finished or
+    /// superseded. Draining BEFORE reading `turn_count` guarantees every chunk
+    /// enqueued before the turn boundary is applied before we finalize.
+    fn drain_recap(&mut self, token: u64, cx: &mut Context<Self>) -> bool {
+        // Bail if this run is no longer the current one (dismissed / re-run).
+        let current = matches!(
+            self.recap.as_ref(),
+            Some(r) if r.token == token && r.status == RecapStatus::Generating
+        );
+        if !current {
+            return false;
+        }
+        let mut events: Vec<yalda::acp_channel::ReplyEvent> = Vec::new();
+        let (connected, turns) = match self.recap.as_ref().and_then(|r| r.channel.as_ref()) {
+            Some(ch) => {
+                while let Some(ev) = ch.try_recv() {
+                    events.push(ev);
+                }
+                (ch.is_connected(), ch.turn_count())
+            }
+            None => (false, 0),
+        };
+        for ev in events {
+            self.apply_recap_event(token, ev, cx);
+        }
+        // The worker increments `turn_count` only after the `session/prompt` RPC
+        // resolves — i.e. after every chunk has been enqueued. So a climbed
+        // counter is the authoritative "reply is complete" signal.
+        if turns >= 1 {
+            self.finalize_recap(token, cx);
+            return false;
+        }
+        // Worker died before resolving a turn — finalize with whatever we have
+        // (Ready if some text streamed, else Failed).
+        if !connected {
+            self.finalize_recap(token, cx);
+            return false;
+        }
+        true
+    }
+
+    /// Apply one recap reply event. Text chunks accumulate into the panel;
+    /// everything else (tool calls, plans, mode/model/usage) is irrelevant to a
+    /// summary and ignored. Token-guarded so a stale pump can't scribble on a
+    /// newer run.
+    pub(crate) fn apply_recap_event(
+        &mut self,
+        token: u64,
+        ev: yalda::acp_channel::ReplyEvent,
+        cx: &mut Context<Self>,
+    ) {
+        use yalda::acp_channel::ReplyEvent;
+        let Some(r) = self.recap.as_mut() else {
+            return;
+        };
+        if r.token != token || r.status != RecapStatus::Generating {
+            return;
+        }
+        if let ReplyEvent::Chunk(text) = ev {
+            r.text.push_str(&text);
+            cx.notify();
+        }
+    }
+
+    /// Settle a recap run: `Ready` when text streamed, else `Failed`. Detaches
+    /// the worker (a background drop so the join can't stall the foreground) but
+    /// leaves the pump task to unwind on its own (`drain_recap` returns false).
+    /// Token-guarded.
+    pub(crate) fn finalize_recap(&mut self, token: u64, cx: &mut Context<Self>) {
+        let Some(r) = self.recap.as_mut() else {
+            return;
+        };
+        if r.token != token || r.status != RecapStatus::Generating {
+            return;
+        }
+        r.status = if r.text.trim().is_empty() {
+            RecapStatus::Failed("agent returned no summary".into())
+        } else {
+            RecapStatus::Ready
+        };
+        // Tear down the subprocess off-thread (Drop joins the worker).
+        if let Some(ch) = r.channel.take() {
+            cx.background_executor()
+                .spawn(async move { drop(ch) })
+                .detach();
+        }
+        cx.notify();
+    }
+
+    /// Flip the recap to `Failed` (spawn/send error). Token-guarded so a stale
+    /// spawn can't fail a newer run.
+    fn fail_recap(&mut self, token: u64, reason: String, cx: &mut Context<Self>) {
+        if let Some(r) = self.recap.as_mut()
+            && r.token == token
+            && r.status == RecapStatus::Generating
+        {
+            r.status = RecapStatus::Failed(reason);
+            r.channel = None;
+            cx.notify();
+        }
+    }
+
     /// Send the transcript editor's current selection as a prompt
     /// (Agent local menu `S`, spec-menu-scopes.md). Mirrors `submit_chatbox`'s
     /// send-first-then-echo order, but takes the text from the worksheet

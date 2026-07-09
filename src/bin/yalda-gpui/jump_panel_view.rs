@@ -383,6 +383,12 @@ impl YaldaGpuiView {
             .border_color(border)
             .py_2();
 
+        // ── Recap (recap-panel; pinned until dismissed, INV-UX-20) ───────────
+        // Sits at the very top, above the session list, per the manual-recap UX.
+        if let Some(recap_el) = self.render_recap_panel(&st, sel_bg, cx) {
+            col = col.child(recap_el);
+        }
+
         // ── Pinned (placeholder; pinning mechanics land later) ───────────────
         col = col.child(section_heading("Pinned", &st).px_3());
         col = col.child(
@@ -553,6 +559,130 @@ impl YaldaGpuiView {
 
         col.into_any_element()
     }
+
+    /// Render the pinned session recap (recap-panel), or `None` when no recap is
+    /// summoned. A bordered box at the top of the jump panel: a header (title +
+    /// session label + re-run/dismiss buttons) over a status-dependent body —
+    /// "Summarizing…" (plus any streamed-so-far text) while `Generating`, the
+    /// finished prose when `Ready`, a reason when `Failed`. Rendered INLINE like
+    /// the rest of the panel (cheap, short text; see the module note); the pump's
+    /// `apply_recap_event` notifies the root to repaint as chunks land.
+    /// Chrome-class: native size, unaffected by document zoom.
+    pub(crate) fn render_recap_panel(
+        &self,
+        st: &DetailStyle,
+        sel_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let recap = self.recap.as_ref()?;
+        let mut box_bg = st.accent;
+        box_bg.a = 0.10;
+
+        // Header: "Recap" + the session label, then the re-run / dismiss buttons.
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap_1()
+            .w_full()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_color(st.accent)
+                            .font_family(st.mono.clone())
+                            .text_size(px(st.pt * 0.95))
+                            .child(SharedString::from("Recap")),
+                    )
+                    .child(
+                        div()
+                            .text_color(st.dim)
+                            .font_family(st.mono.clone())
+                            .text_size(px(st.pt * 0.8))
+                            .child(SharedString::from(recap.session_label.clone())),
+                    ),
+            )
+            .child(
+                recap_icon_button("recap-rerun", "⟳", st, sel_bg)
+                    .on_click(cx.listener(|this, _ev, _window, cx| this.rerun_recap(cx))),
+            )
+            .child(
+                recap_icon_button("recap-dismiss", "✕", st, sel_bg)
+                    .on_click(cx.listener(|this, _ev, _window, cx| this.dismiss_recap(cx))),
+            );
+
+        let body: AnyElement = match &recap.status {
+            RecapStatus::Generating => {
+                let mut col = div().flex().flex_col().gap_1().w_full().child(
+                    div()
+                        .text_color(st.dim)
+                        .font_family(st.mono.clone())
+                        .text_size(px(st.pt * 0.85))
+                        .child(SharedString::from("Summarizing…")),
+                );
+                if !recap.text.trim().is_empty() {
+                    col = col.child(multiline_text(&recap.text, st.fg, &st.prose, st.base));
+                }
+                col.into_any_element()
+            }
+            RecapStatus::Ready => {
+                multiline_text(&recap.text, st.fg, &st.prose, st.base).into_any_element()
+            }
+            RecapStatus::Failed(reason) => div()
+                .w_full()
+                .text_color(st.err)
+                .font_family(st.mono.clone())
+                .text_size(px(st.pt * 0.85))
+                .child(SharedString::from(format!("Recap failed: {reason}")))
+                .into_any_element(),
+        };
+
+        let panel = div().px_3().pb_2().child(
+            div()
+                .id("recap-panel")
+                .flex()
+                .flex_col()
+                .gap_2()
+                .w_full()
+                .p_2()
+                .rounded_md()
+                .bg(box_bg)
+                .border_1()
+                .border_color(st.dim)
+                .child(header)
+                .child(body),
+        );
+        Some(probe_bounds("recap-panel", panel.into_any_element()))
+    }
+}
+
+/// A small square icon button for the recap panel header (re-run / dismiss).
+/// Stateful (has an id) so it takes a hover highlight + the caller's click.
+fn recap_icon_button(
+    id: impl Into<ElementId>,
+    glyph: &str,
+    st: &DetailStyle,
+    sel_bg: Hsla,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(18.0))
+        .h(px(18.0))
+        .rounded_sm()
+        .cursor_pointer()
+        .text_color(st.dim)
+        .font_family(st.mono.clone())
+        .text_size(px(st.pt * 0.9))
+        .hover(|s| s.bg(sel_bg).text_color(st.fg))
+        .child(SharedString::from(glyph.to_string()))
 }
 
 /// One selectable row: optional leading badge glyph + label, tinted when

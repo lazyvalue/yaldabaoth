@@ -873,6 +873,46 @@ renders after the reassembled line; negative control: the buffer becomes
 `floored_tools_and_text_stay_in_order_above_draft` pins the complementary
 whitespace-boundary case (chunks ending `". "` stay interleaved with their tools).
 
+### INV-UX-20 — A summoned session recap is pinned and isolated
+
+**Statement.** Invoking "recap this session" (agent menu `R` → `recap-session`)
+generates an LLM prose summary of the focused session and pins it at the **top of
+the jump panel**, above the session list, until the user dismisses it (`✕` /
+`recap-dismiss`). It is **re-runnable** at any time (`⟳` / `recap-session`), which
+supersedes the prior run. Two hard properties:
+
+1. **Isolation.** Recap generation runs on a THROWAWAY `AcpChannelClient`
+   side-channel fed the transcript text inline. Its reply stream NEVER routes
+   through the visible transcript reducer (`apply_reply_events`) — summoning a
+   recap adds nothing to any session's transcript and cannot reorder it.
+2. **Visible progress, last-writer-wins.** While `Generating` the panel shows
+   "Summarizing…" and streams chunks in as they arrive; on turn resolution it
+   flips to the finished prose (`Ready`), or a reason (`Failed`) on spawn/send
+   error or an empty reply. A run token guards every state transition, so a
+   superseded (re-run / dismissed) run can never scribble on the current one.
+
+**Applies to.** `agent_ui.rs` — `summon_recap` / `rerun_recap` / `start_recap_for`
+/ `spawn_recap_worker` / `drain_recap` / `apply_recap_event` / `finalize_recap` /
+`fail_recap`; the `RecapState` / `RecapStatus` model (`agent.rs`); the inline
+`render_recap_panel` (`jump_panel_view.rs`). Chrome-class: native size, unaffected
+by document zoom.
+
+**Why.** A recap is a manual, re-orienting glance — it must be summonable without
+mutating the conversation it summarizes (property 1 is exactly the transcript-
+ordering-corruption class this codebase has fought repeatedly), and it must show
+its work and never leak a stale worker's output onto a newer request (property 2).
+
+**Status:** `honored` (headless for the reducer + panel; the live throwaway
+subprocess is the sole `NEEDS-RUNTIME` gap — dev-system § Verification harness
+gap 2).
+
+**Enforcement.** `verify_harness.rs`: `recap_summon_sets_generating`,
+`recap_chunks_accumulate_and_finalize_ready`, `recap_empty_reply_fails`,
+`recap_dismiss_clears`, `recap_rerun_supersedes_stale_run`, and
+`recap_panel_paints_at_top_of_jump_panel` (layout probe). Each drives the REAL
+menu-dispatched entry point / reducer methods; negative controls documented at the
+tests.
+
 ## Cross-references
 
 - `spec-turn-steering.md` — the full steering design (queue, delivery modes, the
@@ -890,6 +930,10 @@ whitespace-boundary case (chunks ending `". "` stay interleaved with their tools
 
 ## Revision history
 
+- 2026-07-09 — Added INV-UX-20: a summoned session recap (agent menu `R`) is an
+  LLM prose summary pinned at the top of the jump panel until dismissed,
+  re-runnable, generated on a throwaway side-channel so it never touches the
+  visible transcript. Guards `recap_*` in `verify_harness.rs`.
 - 2026-07-06 — Added INV-UX-17: the `App::Keymap` reference tile shows the LIVE
   keymap (one `KeymapRegistry` drives both `register_keymap` and the tile) and
   rebinds it in place (apply + persist; capture grabs the keyboard). New feature:

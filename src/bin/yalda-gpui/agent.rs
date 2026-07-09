@@ -4317,3 +4317,43 @@ impl AgentTile {
         }
     }
 }
+
+/// Lifecycle of a recap generation (recap-panel). A recap is a one-off,
+/// LLM-generated prose summary of the focused session's conversation, requested
+/// manually and shown pinned at the top of the jump panel until dismissed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RecapStatus {
+    /// The throwaway agent worker is spawning / streaming its answer. `text`
+    /// holds whatever has arrived so far.
+    Generating,
+    /// The turn resolved; `text` is the finished recap.
+    Ready,
+    /// Generation failed before any usable text (spawn/send error, or the
+    /// worker died mid-turn with an empty buffer). Carries a short reason.
+    Failed(String),
+}
+
+/// A pinned session recap (recap-panel). Owns the throwaway `AcpChannelClient`
+/// worker and its pump task for the duration of generation so both are torn
+/// down when the recap is replaced or dismissed. Deliberately isolated from the
+/// `AgentSessions` store and the transcript reducer: the recap worker is a
+/// private side-channel keyed to nothing, so its stream never touches any
+/// visible transcript.
+pub(crate) struct RecapState {
+    /// Label of the session this recap summarizes (shown in the panel header).
+    pub(crate) session_label: String,
+    /// The session this recap was requested for. Re-run targets the same one.
+    pub(crate) session_id: SessionId,
+    pub(crate) status: RecapStatus,
+    /// Accumulated summary text, streamed in as `Chunk` events arrive.
+    pub(crate) text: String,
+    /// Monotonic run token. A re-run bumps it; stale async pump updates that
+    /// don't match the current token are dropped (last-writer-wins).
+    pub(crate) token: u64,
+    /// The throwaway worker, kept alive while `Generating`. Dropped (killing the
+    /// subprocess) on completion, failure, dismiss, or re-run.
+    pub(crate) channel: Option<AcpChannelClient>,
+    /// The pump task draining `channel`'s replies into `text`. Dropped with the
+    /// recap so a superseded run stops updating.
+    pub(crate) _pump: Option<Task<()>>,
+}
