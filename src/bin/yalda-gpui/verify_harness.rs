@@ -8528,13 +8528,14 @@ fn keymap_body_is_cached_and_self_invalidates(cx: &mut TestAppContext) {
 
 // ── Session recap (recap-panel, INV-UX-20) ──────────────────────────────────
 //
-// A recap is an LLM prose summary of the focused session, pinned at the top of
-// the jump panel until dismissed and re-runnable. The live generation runs on a
-// throwaway subprocess (dev-system § Verification harness gap 2) which
-// `spawn_recap_worker` skips under `cfg(test)`; these tests drive the REAL
-// entry points — the menu dispatch (`recap-session` / `recap-dismiss`) and the
-// reducer methods the pump calls (`apply_recap_event` / `finalize_recap`) — so
-// the panel state machine (INV-UX-20 property 2) is fully covered headlessly.
+// A recap is an LLM prose summary of ONE agent session, keyed by `SessionId`
+// (`self.recaps`) and rendered INSIDE that session's agent tile above the
+// subagents/tasks panels — re-runnable and dismissed. The live generation runs
+// on a throwaway subprocess (dev-system § Verification harness gap 2) which
+// `spawn_recap_worker` skips under `cfg(test)`; these tests drive the REAL entry
+// points — the menu dispatch (`recap-session` / `recap-dismiss`) and the reducer
+// methods the pump calls (`apply_recap_event` / `finalize_recap`) — so the panel
+// state machine (INV-UX-20 property 2) is fully covered headlessly.
 
 /// Seed the focused session's transcript so a recap has something to summarize.
 fn seed_recap_transcript(
@@ -8550,26 +8551,23 @@ fn seed_recap_transcript(
     vcx.run_until_parked();
 }
 
-/// Summoning a recap (REAL menu entry `recap-session`) pins the panel in
-/// `Generating` for the focused session and forces the jump panel visible.
+/// Summoning a recap (REAL menu entry `recap-session`) pins a `Generating` recap
+/// keyed to the FOCUSED session.
 ///
-/// Negative control: revert the `RecapStatus::Generating` assignment in
-/// `start_recap_for` (e.g. leave `recap = None`) and `.expect("recap present")`
-/// fails RED — no panel was pinned.
+/// Negative control: revert the `RecapStatus::Generating` insert in
+/// `start_recap_for` (e.g. skip the `self.recaps.insert`) and `.expect("recap
+/// present")` fails RED — no panel was pinned.
 #[gpui::test]
 fn recap_summon_sets_generating(cx: &mut TestAppContext) {
-    let (view, vcx, _id, session) = boot_with_transcript(cx);
+    let (view, vcx, id, session) = boot_with_transcript(cx);
     seed_recap_transcript(&session, vcx);
     let sess_label = session.update(vcx, |s, _| s.label.clone());
 
-    view.update(vcx, |v, cx| {
-        v.jump_panel_visible = false; // prove summon re-reveals it
-        v.dispatch_menu_command("recap-session", cx);
-    });
+    view.update(vcx, |v, cx| v.dispatch_menu_command("recap-session", cx));
 
-    let (status, label, visible) = view.update(vcx, |v, _| {
-        let r = v.recap.as_ref().expect("recap present after summon");
-        (r.status.clone(), r.session_label.clone(), v.jump_panel_visible)
+    let (status, label) = view.update(vcx, |v, _| {
+        let r = v.recaps.get(&id).expect("recap present after summon");
+        (r.status.clone(), r.session_label.clone())
     });
     assert_eq!(
         status,
@@ -8577,17 +8575,16 @@ fn recap_summon_sets_generating(cx: &mut TestAppContext) {
         "summon must flip the panel to Generating"
     );
     assert_eq!(label, sess_label, "recap targets the focused session's label");
-    assert!(visible, "summon must make the jump panel visible");
 }
 
 /// Summoning with an EMPTY transcript is a no-op with a status note — nothing to
 /// recap, no panel pinned.
 #[gpui::test]
 fn recap_summon_empty_transcript_is_noop(cx: &mut TestAppContext) {
-    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
     // No seed → transcript empty.
     view.update(vcx, |v, cx| v.dispatch_menu_command("recap-session", cx));
-    let present = view.update(vcx, |v, _| v.recap.is_some());
+    let present = view.update(vcx, |v, _| v.recaps.contains_key(&id));
     assert!(!present, "empty transcript must not pin a recap");
 }
 
@@ -8602,18 +8599,18 @@ fn recap_summon_empty_transcript_is_noop(cx: &mut TestAppContext) {
 #[gpui::test]
 fn recap_chunks_accumulate_and_finalize_ready(cx: &mut TestAppContext) {
     use yalda::acp_channel::ReplyEvent;
-    let (view, vcx, _id, session) = boot_with_transcript(cx);
+    let (view, vcx, id, session) = boot_with_transcript(cx);
     seed_recap_transcript(&session, vcx);
     view.update(vcx, |v, cx| v.dispatch_menu_command("recap-session", cx));
-    let token = view.update(vcx, |v, _| v.recap.as_ref().unwrap().token);
+    let token = view.update(vcx, |v, _| v.recaps.get(&id).unwrap().token);
 
     view.update(vcx, |v, cx| {
-        v.apply_recap_event(token, ReplyEvent::Chunk("- Working on the recap\n".into()), cx);
-        v.apply_recap_event(token, ReplyEvent::Chunk("- Panel added\n".into()), cx);
+        v.apply_recap_event(id, token, ReplyEvent::Chunk("- Working on the recap\n".into()), cx);
+        v.apply_recap_event(id, token, ReplyEvent::Chunk("- Panel added\n".into()), cx);
     });
 
     let (text, status) = view.update(vcx, |v, _| {
-        let r = v.recap.as_ref().unwrap();
+        let r = v.recaps.get(&id).unwrap();
         (r.text.clone(), r.status.clone())
     });
     assert!(
@@ -8626,9 +8623,9 @@ fn recap_chunks_accumulate_and_finalize_ready(cx: &mut TestAppContext) {
         "recap stays Generating until finalize"
     );
 
-    view.update(vcx, |v, cx| v.finalize_recap(token, cx));
+    view.update(vcx, |v, cx| v.finalize_recap(id, token, cx));
     let (text2, status2) = view.update(vcx, |v, _| {
-        let r = v.recap.as_ref().unwrap();
+        let r = v.recaps.get(&id).unwrap();
         (r.text.clone(), r.status.clone())
     });
     assert_eq!(status2, crate::RecapStatus::Ready, "non-empty run finalizes Ready");
@@ -8641,30 +8638,31 @@ fn recap_chunks_accumulate_and_finalize_ready(cx: &mut TestAppContext) {
 /// `Ready` and this asserts the wrong status (fails RED).
 #[gpui::test]
 fn recap_empty_reply_fails(cx: &mut TestAppContext) {
-    let (view, vcx, _id, session) = boot_with_transcript(cx);
+    let (view, vcx, id, session) = boot_with_transcript(cx);
     seed_recap_transcript(&session, vcx);
     view.update(vcx, |v, cx| v.dispatch_menu_command("recap-session", cx));
-    let token = view.update(vcx, |v, _| v.recap.as_ref().unwrap().token);
+    let token = view.update(vcx, |v, _| v.recaps.get(&id).unwrap().token);
 
-    view.update(vcx, |v, cx| v.finalize_recap(token, cx));
-    let status = view.update(vcx, |v, _| v.recap.as_ref().unwrap().status.clone());
+    view.update(vcx, |v, cx| v.finalize_recap(id, token, cx));
+    let status = view.update(vcx, |v, _| v.recaps.get(&id).unwrap().status.clone());
     assert!(
         matches!(status, crate::RecapStatus::Failed(_)),
         "an empty reply must finalize Failed, got {status:?}"
     );
 }
 
-/// Dismissing the recap (REAL menu entry `recap-dismiss`) clears the panel.
+/// Dismissing the recap (REAL menu entry `recap-dismiss`) clears the focused
+/// session's panel.
 #[gpui::test]
 fn recap_dismiss_clears(cx: &mut TestAppContext) {
-    let (view, vcx, _id, session) = boot_with_transcript(cx);
+    let (view, vcx, id, session) = boot_with_transcript(cx);
     seed_recap_transcript(&session, vcx);
     view.update(vcx, |v, cx| v.dispatch_menu_command("recap-session", cx));
-    assert!(view.update(vcx, |v, _| v.recap.is_some()), "recap pinned");
+    assert!(view.update(vcx, |v, _| v.recaps.contains_key(&id)), "recap pinned");
 
     view.update(vcx, |v, cx| v.dispatch_menu_command("recap-dismiss", cx));
     assert!(
-        view.update(vcx, |v, _| v.recap.is_none()),
+        view.update(vcx, |v, _| !v.recaps.contains_key(&id)),
         "dismiss must clear the recap panel"
     );
 }
@@ -8677,27 +8675,27 @@ fn recap_dismiss_clears(cx: &mut TestAppContext) {
 #[gpui::test]
 fn recap_rerun_supersedes_stale_run(cx: &mut TestAppContext) {
     use yalda::acp_channel::ReplyEvent;
-    let (view, vcx, _id, session) = boot_with_transcript(cx);
+    let (view, vcx, id, session) = boot_with_transcript(cx);
     seed_recap_transcript(&session, vcx);
 
     view.update(vcx, |v, cx| v.dispatch_menu_command("recap-session", cx));
-    let t1 = view.update(vcx, |v, _| v.recap.as_ref().unwrap().token);
+    let t1 = view.update(vcx, |v, _| v.recaps.get(&id).unwrap().token);
     view.update(vcx, |v, cx| {
-        v.apply_recap_event(t1, ReplyEvent::Chunk("first run text\n".into()), cx);
+        v.apply_recap_event(id, t1, ReplyEvent::Chunk("first run text\n".into()), cx);
     });
 
     // Re-run (the panel ⟳ path) supersedes.
-    view.update(vcx, |v, cx| v.rerun_recap(cx));
-    let t2 = view.update(vcx, |v, _| v.recap.as_ref().unwrap().token);
+    view.update(vcx, |v, cx| v.rerun_recap(id, cx));
+    let t2 = view.update(vcx, |v, _| v.recaps.get(&id).unwrap().token);
     assert_ne!(t1, t2, "re-run must bump the run token");
-    let fresh = view.update(vcx, |v, _| v.recap.as_ref().unwrap().text.clone());
+    let fresh = view.update(vcx, |v, _| v.recaps.get(&id).unwrap().text.clone());
     assert!(fresh.is_empty(), "re-run resets the accumulated text");
 
     // A late event tagged with the OLD token must be dropped.
     view.update(vcx, |v, cx| {
-        v.apply_recap_event(t1, ReplyEvent::Chunk("STALE from run 1\n".into()), cx);
+        v.apply_recap_event(id, t1, ReplyEvent::Chunk("STALE from run 1\n".into()), cx);
     });
-    let after_stale = view.update(vcx, |v, _| v.recap.as_ref().unwrap().text.clone());
+    let after_stale = view.update(vcx, |v, _| v.recaps.get(&id).unwrap().text.clone());
     assert!(
         !after_stale.contains("STALE"),
         "a stale run's chunk must be ignored (got {after_stale:?})"
@@ -8705,38 +8703,41 @@ fn recap_rerun_supersedes_stale_run(cx: &mut TestAppContext) {
 
     // The current run still accepts its own events.
     view.update(vcx, |v, cx| {
-        v.apply_recap_event(t2, ReplyEvent::Chunk("second run text\n".into()), cx);
+        v.apply_recap_event(id, t2, ReplyEvent::Chunk("second run text\n".into()), cx);
     });
-    let live = view.update(vcx, |v, _| v.recap.as_ref().unwrap().text.clone());
+    let live = view.update(vcx, |v, _| v.recaps.get(&id).unwrap().text.clone());
     assert!(live.contains("second run text"), "current run accepts its events");
 }
 
-/// The recap panel PAINTS at the top of the jump panel when pinned (INV-UX-20).
-/// Asserts real painted geometry via the layout probe — non-vacuous (height >
-/// one line) and near the top of the panel.
+/// The recap panel PAINTS inside the agent tile, ABOVE the compose box, when
+/// pinned (INV-UX-20). Asserts real painted geometry via the layout probe:
+/// non-vacuous area, and positioned above the compose (its natural slot above
+/// the subagents/tasks panels).
 ///
-/// Negative control: remove the `render_recap_panel` call in `render_jump_panel`
-/// and `layout_probe_get("recap-panel")` returns `None` (fails RED — nothing
+/// Negative control: remove the `render_agent_recap` call in `render_agent` and
+/// `layout_probe_get("recap-panel")` returns `None` (fails RED — nothing
 /// painted).
 #[gpui::test]
-fn recap_panel_paints_at_top_of_jump_panel(cx: &mut TestAppContext) {
+fn recap_panel_paints_in_agent_tile(cx: &mut TestAppContext) {
     use yalda::acp_channel::ReplyEvent;
-    let (view, vcx, _id, session) = boot_with_transcript(cx);
+    let (view, vcx, id, session) = boot_with_transcript(cx);
     seed_recap_transcript(&session, vcx);
-    view.update(vcx, |v, cx| {
-        v.jump_panel_visible = true;
-        v.dispatch_menu_command("recap-session", cx);
-    });
-    let token = view.update(vcx, |v, _| v.recap.as_ref().unwrap().token);
+    view.update(vcx, |v, cx| v.dispatch_menu_command("recap-session", cx));
+    let token = view.update(vcx, |v, _| v.recaps.get(&id).unwrap().token);
     // Give the panel multi-line visible content so a paint is non-vacuous.
     view.update(vcx, |v, cx| {
         v.apply_recap_event(
+            id,
             token,
             ReplyEvent::Chunk("- point one\n- point two\n- point three\n".into()),
             cx,
         );
-        v.finalize_recap(token, cx);
+        v.finalize_recap(id, token, cx);
     });
+    // Switch to the chatbox so the compose renders as a pinned box (in the
+    // default worksheet state the compose is inline and paints no "compose-box"),
+    // giving a stable anchor to prove the recap sits ABOVE it.
+    view.update(vcx, |v, cx| v.dispatch_menu_command("agent-input-toggle", cx));
     // Settle geometry.
     for _ in 0..3 {
         view.update(vcx, |_, cx| cx.notify());
@@ -8746,13 +8747,20 @@ fn recap_panel_paints_at_top_of_jump_panel(cx: &mut TestAppContext) {
     crate::layout_probe_begin();
     view.update(vcx, |_, cx| cx.notify());
     vcx.run_until_parked();
-    let bounds = crate::layout_probe_get("recap-panel");
+    let recap = crate::layout_probe_get("recap-panel");
+    let compose = crate::layout_probe_get("compose-box");
     crate::layout_probe_end();
 
-    let (_x, y, w, h) = bounds.expect(
+    let (_rx, ry, rw, rh) = recap.expect(
         "recap-panel did not paint — the pinned recap is invisible (INV-UX-20 violated)",
     );
-    assert!(w > 1.0 && h > 1.0, "recap panel painted with no area (w={w}, h={h})");
-    // It sits at the top of the panel (above the session list): a small y offset.
-    assert!(y < 200.0, "recap panel should paint near the top of the jump panel (y={y})");
+    assert!(rw > 1.0 && rh > 1.0, "recap panel painted with no area (w={rw}, h={rh})");
+    // It renders inside the tile, above the compose (its slot above the
+    // subagents/tasks panels). The compose box always paints, so this is a real
+    // placement check, not a vacuous one.
+    let (_cx2, cy, _cw, _ch) = compose.expect("compose box did not paint");
+    assert!(
+        ry < cy,
+        "recap panel must paint ABOVE the compose (recap y={ry}, compose y={cy})"
+    );
 }

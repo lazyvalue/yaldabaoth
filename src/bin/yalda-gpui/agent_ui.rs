@@ -3883,9 +3883,11 @@ impl YaldaGpuiView {
 
     // ── Session recap (recap-panel) ─────────────────────────────────────────
     //
-    // A recap is a one-off, LLM-generated prose summary of the focused session's
-    // conversation, requested manually and pinned at the top of the jump panel
-    // until dismissed (INV-UX-20). Generation runs on a THROWAWAY
+    // A recap is a one-off, LLM-generated prose summary of one agent session's
+    // conversation, requested manually and pinned INSIDE that session's agent
+    // tile — above the subagents/tasks panels — until dismissed (INV-UX-20).
+    // Recaps are keyed by `SessionId` (`self.recaps`), so each is SPECIFIC to its
+    // tile; two tiles can each hold their own. Generation runs on a THROWAWAY
     // `AcpChannelClient` — a private side-channel worker fed the transcript text
     // inline — so its reply stream never routes through the visible transcript
     // reducer (`apply_reply_events`). The reply-application logic
@@ -3899,12 +3901,12 @@ impl YaldaGpuiView {
     /// history. Trimmed at a line boundary in `build_recap_prompt`.
     const RECAP_TRANSCRIPT_BUDGET: usize = 24_000;
 
-    /// Summon (or re-run) a recap of the focused agent session (menu
-    /// `recap-session`). Snapshots the session's transcript, flips the panel to
+    /// Summon (or re-run) a recap of the FOCUSED agent session (menu
+    /// `recap-session`). Snapshots the session's transcript, flips its panel to
     /// `Generating`, and kicks off the throwaway worker. Re-running while one is
-    /// live bumps the run token so the prior worker's late updates are ignored
-    /// and its subprocess is torn down. No-op with a clear status when there's no
-    /// focused session or nothing to summarize.
+    /// live bumps that session's run token so the prior worker's late updates are
+    /// ignored and its subprocess is torn down. No-op with a clear status when
+    /// there's no focused session or nothing to summarize.
     pub(crate) fn summon_recap(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.focused_bound_session() else {
             self.transient_status = Some("no agent session focused to recap".into());
@@ -3914,15 +3916,13 @@ impl YaldaGpuiView {
         self.start_recap_for(id, cx);
     }
 
-    /// Re-run the pinned recap against the session it already targets (the panel
-    /// `⟳` button), independent of which tile currently has focus.
-    pub(crate) fn rerun_recap(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.recap.as_ref().map(|r| r.session_id) {
-            self.start_recap_for(id, cx);
-        }
+    /// Re-run the recap for a specific session (the panel `⟳` button), regardless
+    /// of which tile currently has focus.
+    pub(crate) fn rerun_recap(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.start_recap_for(id, cx);
     }
 
-    /// Shared core of summon / re-run: snapshot `id`'s transcript, flip the panel
+    /// Shared core of summon / re-run: snapshot `id`'s transcript, flip its panel
     /// to `Generating`, and kick off the throwaway worker.
     fn start_recap_for(&mut self, id: SessionId, cx: &mut Context<Self>) {
         let Some(ent) = self.sessions.get(id).cloned() else {
@@ -3942,31 +3942,42 @@ impl YaldaGpuiView {
             return;
         }
 
-        // Bump the run token; assigning a fresh `RecapState` drops any prior one,
-        // whose Drop tears down its worker + pump (superseding an in-flight run).
-        let token = self.recap.as_ref().map(|r| r.token.wrapping_add(1)).unwrap_or(1);
-        self.recap = Some(RecapState {
-            session_label: label,
-            session_id: id,
-            status: RecapStatus::Generating,
-            text: String::new(),
-            token,
-            channel: None,
-            _pump: None,
-        });
-        // The recap lives in the jump panel — make sure it's visible so the user
-        // sees the result of the command they just invoked.
-        if !self.jump_panel_visible {
-            self.jump_panel_visible = true;
-        }
+        // Bump this session's run token; inserting a fresh `RecapState` drops any
+        // prior one for the same session, whose Drop tears down its worker + pump
+        // (superseding an in-flight run).
+        let token = self
+            .recaps
+            .get(&id)
+            .map(|r| r.token.wrapping_add(1))
+            .unwrap_or(1);
+        self.recaps.insert(
+            id,
+            RecapState {
+                session_label: label,
+                session_id: id,
+                status: RecapStatus::Generating,
+                text: String::new(),
+                token,
+                channel: None,
+                _pump: None,
+            },
+        );
         cx.notify();
-        self.spawn_recap_worker(token, cwd, transcript, cx);
+        self.spawn_recap_worker(id, token, cwd, transcript, cx);
     }
 
-    /// Dismiss the pinned recap (menu `recap-dismiss`). Clears the panel and, via
-    /// `RecapState`'s Drop, tears down any live worker + pump.
+    /// Dismiss the FOCUSED session's recap (menu `recap-dismiss`) — or, from the
+    /// panel `✕`, a specific session. Clears the panel and, via `RecapState`'s
+    /// Drop, tears down any live worker + pump.
     pub(crate) fn dismiss_recap(&mut self, cx: &mut Context<Self>) {
-        if self.recap.take().is_some() {
+        if let Some(id) = self.focused_bound_session() {
+            self.dismiss_recap_for(id, cx);
+        }
+    }
+
+    /// Dismiss a specific session's recap (the panel `✕` button).
+    pub(crate) fn dismiss_recap_for(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if self.recaps.remove(&id).is_some() {
             cx.notify();
         }
     }
@@ -3999,6 +4010,7 @@ impl YaldaGpuiView {
     /// pumping. On any spawn/send error the recap flips to `Failed`.
     fn spawn_recap_worker(
         &self,
+        id: SessionId,
         token: u64,
         cwd: PathBuf,
         transcript: String,
@@ -4029,8 +4041,8 @@ impl YaldaGpuiView {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| match spawned {
-                Ok(ch) => this.install_recap_channel(token, ch, cx),
-                Err(e) => this.fail_recap(token, e, cx),
+                Ok(ch) => this.install_recap_channel(id, token, ch, cx),
+                Err(e) => this.fail_recap(id, token, e, cx),
             });
         })
         .detach();
@@ -4041,24 +4053,25 @@ impl YaldaGpuiView {
     /// case `ch` is dropped here (killing the now-orphan subprocess).
     fn install_recap_channel(
         &mut self,
+        id: SessionId,
         token: u64,
         ch: AcpChannelClient,
         cx: &mut Context<Self>,
     ) {
-        match self.recap.as_mut() {
+        match self.recaps.get_mut(&id) {
             Some(r) if r.token == token => r.channel = Some(ch),
             _ => return, // superseded — drop ch
         }
-        self.start_recap_pump(token, cx);
+        self.start_recap_pump(id, token, cx);
     }
 
     /// Drive the recap worker's reply stream. Event-driven via the channel's wake
     /// receiver (falling back to a short poll), draining into `apply_recap_event`
     /// and finalizing when the turn resolves or the worker dies.
-    fn start_recap_pump(&mut self, token: u64, cx: &mut Context<Self>) {
+    fn start_recap_pump(&mut self, id: SessionId, token: u64, cx: &mut Context<Self>) {
         let wake = self
-            .recap
-            .as_ref()
+            .recaps
+            .get(&id)
             .and_then(|r| r.channel.as_ref())
             .and_then(|ch| ch.take_wake_receiver());
         let pump = cx.spawn(async move |this, cx| {
@@ -4076,14 +4089,14 @@ impl YaldaGpuiView {
                 } else {
                     cx.background_executor().timer(Duration::from_millis(50)).await;
                 }
-                let keep_going = this.update(cx, |this, cx| this.drain_recap(token, cx));
+                let keep_going = this.update(cx, |this, cx| this.drain_recap(id, token, cx));
                 match keep_going {
                     Ok(true) => {}
                     _ => return, // done, superseded, or view gone
                 }
             }
         });
-        if let Some(r) = self.recap.as_mut() {
+        if let Some(r) = self.recaps.get_mut(&id) {
             r._pump = Some(pump);
         }
     }
@@ -4092,17 +4105,17 @@ impl YaldaGpuiView {
     /// is complete. Returns `true` to keep pumping, `false` when finished or
     /// superseded. Draining BEFORE reading `turn_count` guarantees every chunk
     /// enqueued before the turn boundary is applied before we finalize.
-    fn drain_recap(&mut self, token: u64, cx: &mut Context<Self>) -> bool {
+    fn drain_recap(&mut self, id: SessionId, token: u64, cx: &mut Context<Self>) -> bool {
         // Bail if this run is no longer the current one (dismissed / re-run).
         let current = matches!(
-            self.recap.as_ref(),
+            self.recaps.get(&id),
             Some(r) if r.token == token && r.status == RecapStatus::Generating
         );
         if !current {
             return false;
         }
         let mut events: Vec<yalda::acp_channel::ReplyEvent> = Vec::new();
-        let (connected, turns) = match self.recap.as_ref().and_then(|r| r.channel.as_ref()) {
+        let (connected, turns) = match self.recaps.get(&id).and_then(|r| r.channel.as_ref()) {
             Some(ch) => {
                 while let Some(ev) = ch.try_recv() {
                     events.push(ev);
@@ -4112,36 +4125,37 @@ impl YaldaGpuiView {
             None => (false, 0),
         };
         for ev in events {
-            self.apply_recap_event(token, ev, cx);
+            self.apply_recap_event(id, token, ev, cx);
         }
         // The worker increments `turn_count` only after the `session/prompt` RPC
         // resolves — i.e. after every chunk has been enqueued. So a climbed
         // counter is the authoritative "reply is complete" signal.
         if turns >= 1 {
-            self.finalize_recap(token, cx);
+            self.finalize_recap(id, token, cx);
             return false;
         }
         // Worker died before resolving a turn — finalize with whatever we have
         // (Ready if some text streamed, else Failed).
         if !connected {
-            self.finalize_recap(token, cx);
+            self.finalize_recap(id, token, cx);
             return false;
         }
         true
     }
 
-    /// Apply one recap reply event. Text chunks accumulate into the panel;
-    /// everything else (tool calls, plans, mode/model/usage) is irrelevant to a
-    /// summary and ignored. Token-guarded so a stale pump can't scribble on a
-    /// newer run.
+    /// Apply one recap reply event to session `id`'s recap. Text chunks
+    /// accumulate into the panel; everything else (tool calls, plans,
+    /// mode/model/usage) is irrelevant to a summary and ignored. Token-guarded so
+    /// a stale pump can't scribble on a newer run.
     pub(crate) fn apply_recap_event(
         &mut self,
+        id: SessionId,
         token: u64,
         ev: yalda::acp_channel::ReplyEvent,
         cx: &mut Context<Self>,
     ) {
         use yalda::acp_channel::ReplyEvent;
-        let Some(r) = self.recap.as_mut() else {
+        let Some(r) = self.recaps.get_mut(&id) else {
             return;
         };
         if r.token != token || r.status != RecapStatus::Generating {
@@ -4153,12 +4167,12 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Settle a recap run: `Ready` when text streamed, else `Failed`. Detaches
-    /// the worker (a background drop so the join can't stall the foreground) but
-    /// leaves the pump task to unwind on its own (`drain_recap` returns false).
-    /// Token-guarded.
-    pub(crate) fn finalize_recap(&mut self, token: u64, cx: &mut Context<Self>) {
-        let Some(r) = self.recap.as_mut() else {
+    /// Settle session `id`'s recap run: `Ready` when text streamed, else
+    /// `Failed`. Detaches the worker (a background drop so the join can't stall
+    /// the foreground) but leaves the pump task to unwind on its own
+    /// (`drain_recap` returns false). Token-guarded.
+    pub(crate) fn finalize_recap(&mut self, id: SessionId, token: u64, cx: &mut Context<Self>) {
+        let Some(r) = self.recaps.get_mut(&id) else {
             return;
         };
         if r.token != token || r.status != RecapStatus::Generating {
@@ -4178,10 +4192,10 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Flip the recap to `Failed` (spawn/send error). Token-guarded so a stale
-    /// spawn can't fail a newer run.
-    fn fail_recap(&mut self, token: u64, reason: String, cx: &mut Context<Self>) {
-        if let Some(r) = self.recap.as_mut()
+    /// Flip session `id`'s recap to `Failed` (spawn/send error). Token-guarded so
+    /// a stale spawn can't fail a newer run.
+    fn fail_recap(&mut self, id: SessionId, token: u64, reason: String, cx: &mut Context<Self>) {
+        if let Some(r) = self.recaps.get_mut(&id)
             && r.token == token
             && r.status == RecapStatus::Generating
         {

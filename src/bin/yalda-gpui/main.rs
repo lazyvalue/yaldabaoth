@@ -1623,11 +1623,13 @@ struct YaldaGpuiView {
     /// (jump-reorder; `Preferences::jump_session_order`). Ordered server sids;
     /// empty = by-label. A session never crosses cwd groups (drop is cwd-gated).
     jump_session_order: Vec<String>,
-    /// The single pinned session recap (recap-panel), or `None` when dismissed /
-    /// never summoned. Shown at the top of the jump panel; summoned via the menu
-    /// (`recap-session`), re-runnable, dismissed with `recap-dismiss`. Owns the
-    /// throwaway recap worker + pump for the life of a generation.
-    recap: Option<RecapState>,
+    /// Pinned session recaps (recap-panel), keyed by the session they summarize —
+    /// one per session, so a recap is SPECIFIC to its agent tile (INV-UX-20). An
+    /// entry appears when summoned (`recap-session`), is re-runnable and dismissed
+    /// (`recap-dismiss`), and owns the throwaway recap worker + pump for the life
+    /// of a generation. Rendered inside the agent tile, above the subagents/tasks
+    /// panels (`render_agent`), NOT in the global jump panel.
+    recaps: HashMap<SessionId, RecapState>,
 }
 
 impl YaldaGpuiView {
@@ -1677,7 +1679,7 @@ impl YaldaGpuiView {
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
-            recap: None,
+            recaps: HashMap::new(),
         }
     }
 
@@ -1718,7 +1720,7 @@ impl YaldaGpuiView {
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
-            recap: None,
+            recaps: HashMap::new(),
         }
     }
 

@@ -747,6 +747,147 @@ impl YaldaGpuiView {
     // `gpui::list` can construct tool blocks without holding a borrow
     // of `self`.
 
+    /// Render the pinned session recap (recap-panel, INV-UX-20) for tile session
+    /// `id`, or `None` when this session has no recap. A full-width bordered box
+    /// that sits ABOVE the subagents/tasks panels inside the agent tile: a header
+    /// ("Recap" + session label + re-run/dismiss buttons) over a status-dependent
+    /// body — "Summarizing…" (plus any streamed-so-far text) while `Generating`,
+    /// the finished prose when `Ready`, a reason when `Failed`. Long summaries
+    /// scroll within a capped height so the recap never crowds out the transcript.
+    ///
+    /// Built with `&self` + `weak_self` (NOT `Context<Self>`) because it renders
+    /// inside the session entity's `update`; buttons re-enter via `weak.update` at
+    /// click time. Chrome-class: native size, unaffected by document zoom.
+    /// `render_agent` notifies the root as chunks land (`apply_recap_event`) to
+    /// repaint this inline element.
+    pub(crate) fn render_agent_recap(
+        &self,
+        id: SessionId,
+        weak_self: gpui::WeakEntity<Self>,
+    ) -> Option<AnyElement> {
+        let recap = self.recaps.get(&id)?;
+        let at = &self.theme.agent;
+        let accent: Hsla = nc(at.warm_accent);
+        let dim: Hsla = nc(at.dim);
+        let err: Hsla = rgb(0xff6b6b).into();
+        let fg: Hsla = self.editor_fg();
+        let mono = self.code_font.clone();
+        let prose = self.body_font.clone();
+        let base = px(13.0);
+        let pt = 13.0f32;
+        let mut box_bg = accent;
+        box_bg.a = 0.08;
+        let mut hover_bg = accent;
+        hover_bg.a = 0.18;
+
+        // A small icon button (re-run / dismiss). Each re-enters the root via the
+        // weak handle at click time (state resolved in the handler, INV rule 4).
+        let mk_btn = |btn_id: &'static str, glyph: &'static str| {
+            div()
+                .id(btn_id)
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(18.0))
+                .h(px(18.0))
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(dim)
+                .font_family(mono.clone())
+                .text_size(px(pt * 0.9))
+                .hover(move |s| s.bg(hover_bg).text_color(fg))
+                .child(SharedString::from(glyph))
+        };
+        let rerun = mk_btn("agent-recap-rerun", "⟳").on_click({
+            let weak = weak_self.clone();
+            move |_ev: &gpui::ClickEvent, _w, app| {
+                let _ = weak.update(app, |this, cx| this.rerun_recap(id, cx));
+            }
+        });
+        let dismiss = mk_btn("agent-recap-dismiss", "✕").on_click({
+            let weak = weak_self.clone();
+            move |_ev: &gpui::ClickEvent, _w, app| {
+                let _ = weak.update(app, |this, cx| this.dismiss_recap_for(id, cx));
+            }
+        });
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_color(accent)
+                            .font_family(mono.clone())
+                            .text_size(px(pt * 0.95))
+                            .child(SharedString::from("Recap")),
+                    )
+                    .child(
+                        div()
+                            .text_color(dim)
+                            .font_family(mono.clone())
+                            .text_size(px(pt * 0.8))
+                            .child(SharedString::from(recap.session_label.clone())),
+                    ),
+            )
+            .child(rerun)
+            .child(dismiss);
+
+        let body: AnyElement = match &recap.status {
+            RecapStatus::Generating => {
+                let mut colb = div().flex().flex_col().gap_1().w_full().child(
+                    div()
+                        .text_color(dim)
+                        .font_family(mono.clone())
+                        .text_size(px(pt * 0.85))
+                        .child(SharedString::from("Summarizing…")),
+                );
+                if !recap.text.trim().is_empty() {
+                    colb = colb.child(multiline_text(&recap.text, fg, &prose, base));
+                }
+                colb.into_any_element()
+            }
+            RecapStatus::Ready => multiline_text(&recap.text, fg, &prose, base).into_any_element(),
+            RecapStatus::Failed(reason) => div()
+                .w_full()
+                .text_color(err)
+                .font_family(mono.clone())
+                .text_size(px(pt * 0.85))
+                .child(SharedString::from(format!("Recap failed: {reason}")))
+                .into_any_element(),
+        };
+
+        let panel = div().px_4().pb_2().child(
+            div()
+                .id("agent-recap-panel")
+                .flex()
+                .flex_col()
+                .gap_2()
+                .w_full()
+                .p_2()
+                .max_h(px(180.0))
+                .overflow_y_scroll()
+                .rounded_md()
+                .bg(box_bg)
+                .border_1()
+                .border_color(dim)
+                .child(header)
+                .child(body),
+        );
+        Some(probe_bounds("recap-panel", panel.into_any_element()))
+    }
+
     /// Render the Claude (ACP) screen. Frozen lines (Claude's prior turns)
     /// get a left bar + dim color; the editable region (the user's pending
     /// draft and any inline replies) renders normally with cursor splice.
@@ -1801,6 +1942,13 @@ impl YaldaGpuiView {
             .min_w_0()
             .min_h_0()
             .child(transcript_row);
+        // Recap (recap-panel, INV-UX-20): the pinned session summary sits ABOVE
+        // the subagents/tasks panels, specific to THIS tile's session
+        // (`self.recaps[id]`). Built with `weak_self` click handlers since we're
+        // inside the entity `update` (no `Context<Self>` here).
+        if let Some(recap_el) = self.render_agent_recap(id, weak_self.clone()) {
+            col = col.child(recap_el);
+        }
         // Bottom panels sit above the compose: Plan (left) + Subagents (right)
         // side by side in one row.
         if let Some(panels) = bottom_panels {
