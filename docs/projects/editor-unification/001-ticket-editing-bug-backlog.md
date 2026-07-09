@@ -19,13 +19,13 @@ File:line references are from the 2026-07-08 tree — reconfirm before fixing.
       `screens.rs`) but cursor/selection columns stay raw char columns, so the
       painted caret sits left of where edits land. Map doc col → display col
       before handing `cursor_col`/selection to the render helpers. Cross-surface.
-- [ ] **Count prefixes eaten** (`edit_ui.rs:617`): `10j` moves one line. Loop the
-      motion arms `count.unwrap_or(1)` times. (Shared dispatch → both surfaces.)
+- [x] **Count prefixes eaten** (`10j` moved one line) — FIXED `8a8f964`: motion
+      arms now repeat `count` times (capped 100k). Shared dispatch → both surfaces.
 - [ ] **`e` (word-end) strands on the newline; `x`/`d` there joins lines**
       (`cursor.rs:177` move_word_end includes trailing `\n`).
-- [ ] **Undo/redo + `cursor_set` restore a stale `desired_col`** (`editor.rs:1246`,
-      `cursor.rs:60`) — caret lands at the old sticky column. Clear `desired_col`
-      on direct cursor placement.
+- [x] **Undo/redo + `cursor_set` restore a stale `desired_col`** — FIXED `539b81c`:
+      added `CursorPos::set_col`/`set_pos` (absolute placement clears the sticky
+      column) used by undo/redo/cursor_set.
 - [ ] **Cmd-V pastes only in Insert; Normal-mode Cmd-V is a silent no-op**
       (`main.rs:3329`). Route Normal-mode Cmd-V through the `p` path.
 - [ ] **Wide glyphs (emoji/CJK) break the 8px-per-char compose wrap grid** — text
