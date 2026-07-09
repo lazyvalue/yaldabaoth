@@ -261,6 +261,37 @@ pub struct Editor {
     view: EditorView,
 }
 
+/// Uniform access to the `(EditorView, EditorCore)` pair behind either an owned
+/// [`Editor`] or a pool-backed handle whose core lives in an `Rc<RefCell<…>>`.
+/// This is the ONE thing the two storage shapes differ on; everything else (the
+/// ~40 cursor/motion/edit operations) is written once as default methods on the
+/// `EditOps` trait in the GPUI binary, over this accessor. Replaces the two
+/// hand-written, must-stay-in-lockstep delegation impls.
+pub trait EditAccess {
+    fn view(&self) -> &EditorView;
+    fn view_mut(&mut self) -> &mut EditorView;
+    /// Run `f` with a shared borrow of the core.
+    fn read_core<R>(&self, f: impl FnOnce(&EditorCore) -> R) -> R;
+    /// Run `f` with mutable borrows of BOTH the view and the core (a split
+    /// borrow for the owned case, `borrow_mut()` for the pooled case).
+    fn edit<R>(&mut self, f: impl FnOnce(&mut EditorView, &mut EditorCore) -> R) -> R;
+}
+
+impl EditAccess for Editor {
+    fn view(&self) -> &EditorView {
+        &self.view
+    }
+    fn view_mut(&mut self) -> &mut EditorView {
+        &mut self.view
+    }
+    fn read_core<R>(&self, f: impl FnOnce(&EditorCore) -> R) -> R {
+        f(&self.core)
+    }
+    fn edit<R>(&mut self, f: impl FnOnce(&mut EditorView, &mut EditorCore) -> R) -> R {
+        f(&mut self.view, &mut self.core)
+    }
+}
+
 // =============================================================================
 // EditorCore
 // =============================================================================

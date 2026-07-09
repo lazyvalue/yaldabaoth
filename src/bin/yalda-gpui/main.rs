@@ -131,7 +131,7 @@ pub(crate) use yalda::acp_channel::AcpChannelClient;
 pub(crate) use yalda::blocks::{ColumnAlignment, ListItem, RenderedBlock, StyledLine, StyledSpan};
 pub(crate) use yalda::cursor::CursorPos;
 pub(crate) use yalda::document::Document;
-pub(crate) use yalda::editor::{Editor, EditorCore, EditorView, LineAnchor};
+pub(crate) use yalda::editor::{EditAccess, Editor, EditorCore, EditorView, LineAnchor};
 pub(crate) use yalda::file_browser::{BrowserEntry, FileBrowser, SortOrder};
 pub(crate) use yalda::keybind::KeybindManager;
 pub(crate) use yalda::keys::{Key, KeyPress, Modifiers as KMods};
@@ -821,331 +821,167 @@ impl SharedEditor {
     }
 }
 
-/// The dispatch core (`dispatch_normal_core` / `dispatch_insert_core`) is
-/// shared by every text surface — the pooled Edit tile plus the (non-pooled)
-/// Chatbox and Agent transcript. This trait lets the dispatch stay one body
-/// while operating over either an owned [`Editor`] or a pool-backed
-/// [`SharedEditor`]. Every method mirrors the matching `Editor` method; the
-/// `SharedEditor` impl simply borrows its `Rc<RefCell<EditorCore>>` first.
-trait EditOps {
-    fn cursor(&self) -> CursorPos;
-    fn cursor_set(&mut self, line: usize, col: usize);
-    fn cursor_move_left(&mut self);
-    fn cursor_move_up(&mut self);
-    fn cursor_move_line_start(&mut self);
-    fn cursor_jump_top(&mut self);
-    fn line_len_chars(&self, line: usize) -> usize;
-    fn line_text_at_cursor(&self) -> String;
-
-    fn extend_mode(&self) -> bool;
-    fn set_extend_mode(&mut self, on: bool);
-    fn toggle_extend_mode(&mut self);
-    fn selection_range(&self) -> Option<((usize, usize), (usize, usize))>;
-    fn selection_anchor(&self) -> Option<CursorPos>;
-    fn anchor_at_cursor(&mut self);
-    fn clear_selection(&mut self);
-    fn collapse_selection(&mut self);
-    fn flip_selection(&mut self);
-    fn select_all(&mut self);
-    fn extend_by_line(&mut self);
-    fn yank_selection(&self) -> Option<String>;
-
-    fn pre_move(&mut self, creates_selection: bool);
-    fn move_down(&mut self, insert_mode: bool);
-    fn move_right_clamped(&mut self, insert_mode: bool);
-    fn clamp_cursor_col(&mut self, insert_mode: bool);
-    fn move_cursor_line_end(&mut self, insert_mode: bool);
-    fn move_cursor_first_non_blank(&mut self);
-    fn move_cursor_word_forward(&mut self);
-    fn move_cursor_word_backward(&mut self);
-    fn move_cursor_word_end(&mut self);
-    fn jump_cursor_bottom(&mut self);
-    fn jump_to_line(&mut self, line: usize);
-    fn line_count(&self) -> usize;
-
-    fn begin_insert(&mut self);
-    fn end_insert(&mut self);
-    fn insert_char(&mut self, ch: char);
-    fn backspace(&mut self);
-    fn delete_char_at_cursor(&mut self);
-    fn delete_current_line(&mut self);
-    fn delete_selection(&mut self) -> bool;
-    fn open_line_below(&mut self);
-    fn open_line_above(&mut self);
-    fn undo(&mut self);
-    fn redo(&mut self);
+impl EditAccess for SharedEditor {
+    fn view(&self) -> &EditorView {
+        &self.view
+    }
+    fn view_mut(&mut self) -> &mut EditorView {
+        &mut self.view
+    }
+    fn read_core<R>(&self, f: impl FnOnce(&EditorCore) -> R) -> R {
+        f(&self.core.borrow())
+    }
+    fn edit<R>(&mut self, f: impl FnOnce(&mut EditorView, &mut EditorCore) -> R) -> R {
+        f(&mut self.view, &mut self.core.borrow_mut())
+    }
 }
 
-impl EditOps for Editor {
+/// The vim-ish editing vocabulary the dispatch core (`dispatch_normal_core` /
+/// `dispatch_insert_core`) drives. Every method is a default implemented ONCE
+/// over [`EditAccess`], so an owned [`Editor`] and a pool-backed [`SharedEditor`]
+/// share the exact same bodies — no more two hand-written delegation impls kept
+/// in lockstep. `EditorView` motions take `&EditorCore`; `edit()` hands them a
+/// `&mut EditorCore` that reborrows down.
+trait EditOps: EditAccess {
     fn cursor(&self) -> CursorPos {
-        *Editor::cursor(self)
+        *self.view().cursor()
     }
     fn cursor_set(&mut self, line: usize, col: usize) {
-        let c = self.cursor_mut();
+        let c = self.view_mut().cursor_mut();
         c.line = line;
         c.col = col;
     }
     fn cursor_move_left(&mut self) {
-        self.cursor_mut().move_left();
+        self.view_mut().cursor_mut().move_left();
     }
     fn cursor_move_up(&mut self) {
-        self.cursor_mut().move_up();
+        self.view_mut().cursor_mut().move_up();
     }
     fn cursor_move_line_start(&mut self) {
-        self.cursor_mut().move_line_start();
+        self.view_mut().cursor_mut().move_line_start();
     }
     fn cursor_jump_top(&mut self) {
-        self.cursor_mut().jump_top();
+        self.view_mut().cursor_mut().jump_top();
     }
     fn line_len_chars(&self, line: usize) -> usize {
-        self.document().line_len_chars(line)
+        self.read_core(|c| c.document().line_len_chars(line))
     }
     fn line_text_at_cursor(&self) -> String {
-        self.document().line_text(Editor::cursor(self).line)
+        let line = self.view().cursor().line;
+        self.read_core(|c| c.document().line_text(line))
     }
+
     fn extend_mode(&self) -> bool {
-        Editor::extend_mode(self)
+        self.view().extend_mode()
     }
     fn set_extend_mode(&mut self, on: bool) {
-        Editor::set_extend_mode(self, on);
+        self.view_mut().set_extend_mode(on);
     }
     fn toggle_extend_mode(&mut self) {
-        Editor::toggle_extend_mode(self);
+        self.view_mut().toggle_extend_mode();
     }
     fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
-        Editor::selection_range(self)
+        self.view().selection_range()
     }
     fn selection_anchor(&self) -> Option<CursorPos> {
-        Editor::selection_anchor(self)
+        self.view().selection_anchor()
     }
     fn anchor_at_cursor(&mut self) {
-        Editor::anchor_at_cursor(self);
+        self.view_mut().anchor_at_cursor();
     }
     fn clear_selection(&mut self) {
-        Editor::clear_selection(self);
+        self.view_mut().clear_selection();
     }
     fn collapse_selection(&mut self) {
-        Editor::collapse_selection(self);
+        self.view_mut().collapse_selection();
     }
     fn flip_selection(&mut self) {
-        Editor::flip_selection(self);
+        self.view_mut().flip_selection();
     }
     fn select_all(&mut self) {
-        Editor::select_all(self);
+        self.edit(|v, c| v.select_all(c));
     }
     fn extend_by_line(&mut self) {
-        Editor::extend_by_line(self);
+        self.edit(|v, c| v.extend_by_line(c));
     }
     fn yank_selection(&self) -> Option<String> {
-        Editor::yank_selection(self)
+        self.read_core(|c| self.view().yank_selection(c))
     }
+
     fn pre_move(&mut self, creates_selection: bool) {
-        Editor::pre_move(self, creates_selection);
+        self.view_mut().pre_move(creates_selection);
     }
     fn move_down(&mut self, insert_mode: bool) {
-        Editor::move_down(self, insert_mode);
+        self.edit(|v, c| v.move_down(c, insert_mode));
     }
     fn move_right_clamped(&mut self, insert_mode: bool) {
-        Editor::move_right_clamped(self, insert_mode);
+        self.edit(|v, c| v.move_right_clamped(c, insert_mode));
     }
     fn clamp_cursor_col(&mut self, insert_mode: bool) {
-        Editor::clamp_cursor_col(self, insert_mode);
+        self.edit(|v, c| v.clamp_cursor_col(c, insert_mode));
     }
     fn move_cursor_line_end(&mut self, insert_mode: bool) {
-        Editor::move_cursor_line_end(self, insert_mode);
+        self.edit(|v, c| v.move_cursor_line_end(c, insert_mode));
     }
     fn move_cursor_first_non_blank(&mut self) {
-        Editor::move_cursor_first_non_blank(self);
+        self.edit(|v, c| v.move_cursor_first_non_blank(c));
     }
     fn move_cursor_word_forward(&mut self) {
-        Editor::move_cursor_word_forward(self);
+        self.edit(|v, c| v.move_cursor_word_forward(c));
     }
     fn move_cursor_word_backward(&mut self) {
-        Editor::move_cursor_word_backward(self);
+        self.edit(|v, c| v.move_cursor_word_backward(c));
     }
     fn move_cursor_word_end(&mut self) {
-        Editor::move_cursor_word_end(self);
+        self.edit(|v, c| v.move_cursor_word_end(c));
     }
     fn jump_cursor_bottom(&mut self) {
-        Editor::jump_cursor_bottom(self);
+        self.edit(|v, c| v.jump_cursor_bottom(c));
     }
     fn jump_to_line(&mut self, line: usize) {
-        Editor::jump_to_line(self, line);
+        self.edit(|v, c| v.jump_to_line(c, line));
     }
     fn line_count(&self) -> usize {
-        self.document().line_count()
+        self.read_core(|c| c.document().line_count())
     }
+
     fn begin_insert(&mut self) {
-        Editor::begin_insert(self);
+        self.edit(|v, c| v.begin_insert(c));
     }
     fn end_insert(&mut self) {
-        Editor::end_insert(self);
+        self.edit(|v, c| v.end_insert(c));
     }
     fn insert_char(&mut self, ch: char) {
-        Editor::insert_char(self, ch);
+        self.edit(|v, c| v.insert_char(c, ch));
     }
     fn backspace(&mut self) {
-        Editor::backspace(self);
+        self.edit(|v, c| v.backspace(c));
     }
     fn delete_char_at_cursor(&mut self) {
-        Editor::delete_char_at_cursor(self);
+        self.edit(|v, c| v.delete_char_at_cursor(c));
     }
     fn delete_current_line(&mut self) {
-        Editor::delete_current_line(self);
+        self.edit(|v, c| v.delete_current_line(c));
     }
     fn delete_selection(&mut self) -> bool {
-        Editor::delete_selection(self)
+        self.edit(|v, c| v.delete_selection(c))
     }
     fn open_line_below(&mut self) {
-        Editor::open_line_below(self);
+        self.edit(|v, c| v.open_line_below(c));
     }
     fn open_line_above(&mut self) {
-        Editor::open_line_above(self);
+        self.edit(|v, c| v.open_line_above(c));
     }
     fn undo(&mut self) {
-        Editor::undo(self);
+        self.edit(|v, c| v.undo(c));
     }
     fn redo(&mut self) {
-        Editor::redo(self);
+        self.edit(|v, c| v.redo(c));
     }
 }
 
-impl EditOps for SharedEditor {
-    fn cursor(&self) -> CursorPos {
-        *self.view.cursor()
-    }
-    fn cursor_set(&mut self, line: usize, col: usize) {
-        let c = self.view.cursor_mut();
-        c.line = line;
-        c.col = col;
-    }
-    fn cursor_move_left(&mut self) {
-        self.view.cursor_mut().move_left();
-    }
-    fn cursor_move_up(&mut self) {
-        self.view.cursor_mut().move_up();
-    }
-    fn cursor_move_line_start(&mut self) {
-        self.view.cursor_mut().move_line_start();
-    }
-    fn cursor_jump_top(&mut self) {
-        self.view.cursor_mut().jump_top();
-    }
-    fn line_len_chars(&self, line: usize) -> usize {
-        self.core.borrow().document().line_len_chars(line)
-    }
-    fn line_text_at_cursor(&self) -> String {
-        let line = self.view.cursor().line;
-        self.core.borrow().document().line_text(line)
-    }
-    fn extend_mode(&self) -> bool {
-        self.view.extend_mode()
-    }
-    fn set_extend_mode(&mut self, on: bool) {
-        self.view.set_extend_mode(on);
-    }
-    fn toggle_extend_mode(&mut self) {
-        self.view.toggle_extend_mode();
-    }
-    fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
-        self.view.selection_range()
-    }
-    fn selection_anchor(&self) -> Option<CursorPos> {
-        self.view.selection_anchor()
-    }
-    fn anchor_at_cursor(&mut self) {
-        self.view.anchor_at_cursor();
-    }
-    fn clear_selection(&mut self) {
-        self.view.clear_selection();
-    }
-    fn collapse_selection(&mut self) {
-        self.view.collapse_selection();
-    }
-    fn flip_selection(&mut self) {
-        self.view.flip_selection();
-    }
-    fn select_all(&mut self) {
-        self.view.select_all(&self.core.borrow());
-    }
-    fn extend_by_line(&mut self) {
-        self.view.extend_by_line(&self.core.borrow());
-    }
-    fn yank_selection(&self) -> Option<String> {
-        self.view.yank_selection(&self.core.borrow())
-    }
-    fn pre_move(&mut self, creates_selection: bool) {
-        self.view.pre_move(creates_selection);
-    }
-    fn move_down(&mut self, insert_mode: bool) {
-        self.view.move_down(&self.core.borrow(), insert_mode);
-    }
-    fn move_right_clamped(&mut self, insert_mode: bool) {
-        self.view
-            .move_right_clamped(&self.core.borrow(), insert_mode);
-    }
-    fn clamp_cursor_col(&mut self, insert_mode: bool) {
-        self.view.clamp_cursor_col(&self.core.borrow(), insert_mode);
-    }
-    fn move_cursor_line_end(&mut self, insert_mode: bool) {
-        self.view
-            .move_cursor_line_end(&self.core.borrow(), insert_mode);
-    }
-    fn move_cursor_first_non_blank(&mut self) {
-        self.view.move_cursor_first_non_blank(&self.core.borrow());
-    }
-    fn move_cursor_word_forward(&mut self) {
-        self.view.move_cursor_word_forward(&self.core.borrow());
-    }
-    fn move_cursor_word_backward(&mut self) {
-        self.view.move_cursor_word_backward(&self.core.borrow());
-    }
-    fn move_cursor_word_end(&mut self) {
-        self.view.move_cursor_word_end(&self.core.borrow());
-    }
-    fn jump_cursor_bottom(&mut self) {
-        self.view.jump_cursor_bottom(&self.core.borrow());
-    }
-    fn jump_to_line(&mut self, line: usize) {
-        self.view.jump_to_line(&self.core.borrow(), line);
-    }
-    fn line_count(&self) -> usize {
-        self.core.borrow().document().line_count()
-    }
-    fn begin_insert(&mut self) {
-        self.view.begin_insert(&mut self.core.borrow_mut());
-    }
-    fn end_insert(&mut self) {
-        self.view.end_insert(&mut self.core.borrow_mut());
-    }
-    fn insert_char(&mut self, ch: char) {
-        self.view.insert_char(&mut self.core.borrow_mut(), ch);
-    }
-    fn backspace(&mut self) {
-        self.view.backspace(&mut self.core.borrow_mut());
-    }
-    fn delete_char_at_cursor(&mut self) {
-        self.view.delete_char_at_cursor(&mut self.core.borrow_mut());
-    }
-    fn delete_current_line(&mut self) {
-        self.view.delete_current_line(&mut self.core.borrow_mut());
-    }
-    fn delete_selection(&mut self) -> bool {
-        self.view.delete_selection(&mut self.core.borrow_mut())
-    }
-    fn open_line_below(&mut self) {
-        self.view.open_line_below(&mut self.core.borrow_mut());
-    }
-    fn open_line_above(&mut self) {
-        self.view.open_line_above(&mut self.core.borrow_mut());
-    }
-    fn undo(&mut self) {
-        self.view.undo(&mut self.core.borrow_mut());
-    }
-    fn redo(&mut self) {
-        self.view.redo(&mut self.core.borrow_mut());
-    }
-}
+impl EditOps for Editor {}
+impl EditOps for SharedEditor {}
 
 // Build the trimmed, tab-expanded per-line text for an Edit tile's body,
 // reading the pooled core's rope once. Mirrors the prior per-line
