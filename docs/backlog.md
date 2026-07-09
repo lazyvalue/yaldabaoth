@@ -15,6 +15,17 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ## Features
 
+- **Agent model switcher (per session, live)** — `NEEDS-RUNTIME` (built
+  2026-07-09, `agent-model-switch` worktree; INV-UX-21,
+  `docs/projects/agent-model-switch/`). Switch a tile's model (Opus / Fable /
+  Sonnet / …) live from the agent's advertised picklist via ACP
+  `session/set_config_option` — `space M` submenu or the clickable `model ▾`
+  status-strip badge. Full suite green + 3 new headless tests (each
+  negative-controlled) + `#[ignore]` live round-trip. **Not yet on `main`** —
+  needs merge + rebuild + restart. Follow-up: the `effort` option (low..max)
+  could get the same treatment. Human check: the badge shows `▾` + opens the
+  menu, picking a model flips the badge live and the next turn uses it.
+
 - **Jump panel (root-level navigator)** — `NEEDS-RUNTIME` (built 2026-06-22,
   merged `e3fa254`/`720b7a0`; spec `spec-jump-panel.md`, ADR-0021). Always-visible
   left sidebar (Pinned placeholder · Workspaces · Agent sessions), `cmd-j`/`?`

@@ -547,6 +547,19 @@ impl SessionServerClient {
         }
     }
 
+    /// Switch a session's model. The server forwards to the session's channel
+    /// (ACP `session/set_config_option`); the refreshed selector returns on the
+    /// reply stream.
+    pub fn set_model(&self, session_id: &str, model_id: &str) -> io::Result<()> {
+        match self.request(Request::SetModel {
+            session_id: session_id.to_string(),
+            model_id: model_id.to_string(),
+        })? {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message } => Err(io::Error::other(message)),
+        }
+    }
+
     pub fn rename_session(&self, session_id: &str, label: &str) -> io::Result<()> {
         self.request_fire(Request::RenameSession {
             session_id: session_id.to_string(),
@@ -720,6 +733,18 @@ impl SessionServerHandle {
         match self.request(Request::SetPermissionMode {
             session_id: session_id.to_string(),
             mode,
+        })? {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message } => Err(io::Error::other(message)),
+        }
+    }
+
+    /// Switch a session's model off-thread. Mirrors
+    /// [`SessionServerClient::set_model`].
+    pub fn set_model(&self, session_id: &str, model_id: &str) -> io::Result<()> {
+        match self.request(Request::SetModel {
+            session_id: session_id.to_string(),
+            model_id: model_id.to_string(),
         })? {
             Response::Ok { .. } => Ok(()),
             Response::Error { message } => Err(io::Error::other(message)),

@@ -5810,6 +5810,157 @@ fn real_midturn_worksheet_typed_draft_space_is_suppressed(cx: &mut TestAppContex
     });
 }
 
+/// A `ModelsAvailable` reply through the REAL reducer captures the advertised
+/// picklist into `available_models` and syncs `agent_model` to the current
+/// selection (INV-UX-21). Negative control: the list is empty before the reply.
+#[gpui::test]
+fn agent_reply_models_available_captures_picklist(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{ModelOption, ReplyEvent};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    // Negative control: no models advertised yet.
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        assert!(
+            v.read_session(id, cx, |c| c.available_models.is_empty())
+                .unwrap(),
+            "picklist is empty before any ModelsAvailable reply"
+        );
+    });
+
+    let opts = vec![
+        ModelOption { id: "default".into(), label: "Default".into() },
+        ModelOption { id: "claude-fable-5[1m]".into(), label: "Fable".into() },
+        ModelOption { id: "sonnet".into(), label: "Sonnet".into() },
+    ];
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::ReplyEvent {
+                session_id: "S1".into(),
+                event: ReplyEvent::ModelsAvailable {
+                    current: "sonnet".into(),
+                    options: opts.clone(),
+                },
+            }],
+            cx,
+        );
+        let id = v.focused_bound_session().expect("bound");
+        assert_eq!(
+            v.read_session(id, cx, |c| c.available_models.clone()).unwrap(),
+            opts,
+            "advertised picklist captured verbatim + in order"
+        );
+        assert_eq!(
+            v.read_session(id, cx, |c| c.agent_model.clone()).unwrap(),
+            Some("sonnet".to_string()),
+            "current selection synced to agent_model"
+        );
+    });
+}
+
+/// The agent tile menu grows a "switch model" submenu whose children are the
+/// advertised models — the current one marked ✓, each dispatching
+/// `set-model:<id>` (INV-UX-21). Negative control: no submenu before any model
+/// is advertised.
+#[gpui::test]
+fn agent_menu_lists_advertised_models_and_marks_current(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{ModelOption, ReplyEvent};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    // Negative control: no "switch model" entry until models are known.
+    view.update(vcx, |v, cx| {
+        let menu = v.agent_local_menu_dynamic(cx);
+        assert!(
+            !menu.iter().any(|n| n.label == "switch model"),
+            "no model submenu before the agent advertises a picklist"
+        );
+    });
+
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::ReplyEvent {
+                session_id: "S1".into(),
+                event: ReplyEvent::ModelsAvailable {
+                    current: "sonnet".into(),
+                    options: vec![
+                        ModelOption { id: "default".into(), label: "Default".into() },
+                        ModelOption { id: "sonnet".into(), label: "Sonnet".into() },
+                    ],
+                },
+            }],
+            cx,
+        );
+        let menu = v.agent_local_menu_dynamic(cx);
+        let sub = menu
+            .iter()
+            .find(|n| n.label == "switch model")
+            .expect("switch-model submenu present once models are advertised");
+        let crate::MenuAction::Submenu(children) = &sub.action else {
+            panic!("switch model is a submenu");
+        };
+        let labels: Vec<&str> = children.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"Sonnet ✓"), "current model marked: {labels:?}");
+        assert!(labels.contains(&"Default"), "other model unmarked: {labels:?}");
+        let cmds: Vec<&str> = children
+            .iter()
+            .filter_map(|c| match &c.action {
+                crate::MenuAction::Command(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            cmds.contains(&"set-model:sonnet") && cmds.contains(&"set-model:default"),
+            "each child dispatches set-model:<id>: {cmds:?}"
+        );
+    });
+}
+
+/// The REAL switch path: `set_agent_model` (what the `set-model:<id>` menu
+/// command invokes) drives the session's channel with a `session/set_config_option`
+/// carrying the chosen model id. Direct-spawn channel (no server sid) so the
+/// request is observable on `TestChannelControls`. Negative control: nothing is
+/// enqueued until `set_agent_model` runs.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn set_agent_model_issues_set_config_on_channel(cx: &mut TestAppContext) {
+    let (view, vcx, _id, controls) = boot_worksheet_channel(cx);
+    assert!(
+        controls.try_recv_set_model().is_none(),
+        "no model switch enqueued before set_agent_model"
+    );
+    view.update(vcx, |v, cx| v.set_agent_model("sonnet".to_string(), cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        controls.try_recv_set_model(),
+        Some("sonnet".to_string()),
+        "set_agent_model forwards the model id to the channel's set_model"
+    );
+}
+
 /// The bare mark chord fires for BOTH `m` AND `'` in idle transcript nav. Mutation
 /// testing found the `'` arm of `try_start_mark_chord` untested (only `m` was
 /// covered); this pins it (deleting the arm ⇒ `pending_mark_chord` stays None ⇒

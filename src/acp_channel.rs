@@ -127,6 +127,18 @@ pub struct UsageSnapshot {
     pub cost_usd: Option<f64>,
 }
 
+/// One selectable model advertised by the agent's `model` config-option
+/// `Select`. `id` is the wire value passed back to `session/set_config_option`
+/// (e.g. `"default"`, `"sonnet"`, `"claude-fable-5[1m]"`); `label` is the
+/// human name (e.g. `"Default (recommended)"`, `"Sonnet"`, `"Fable"`).
+/// Serializable because it rides `ReplyEvent::ModelsAvailable` across the
+/// session-server boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelOption {
+    pub id: String,
+    pub label: String,
+}
+
 /// Events drained by the App from the ACP worker. Replaces the previous
 /// "stream of text chunks" channel so we can also report tool-call
 /// activity (announcements + status/output updates) in chronological
@@ -159,6 +171,19 @@ pub enum ReplyEvent {
     /// label. Carries the current model id only; the available-models list
     /// (for an in-app switcher) is a follow-up.
     ModelChanged(String),
+    /// The full model picklist advertised by the `model` config-option
+    /// `Select`: the current selection plus every selectable model. Sourced
+    /// from the same `session/new` / `session/load` / `session/set_config_option`
+    /// responses (and `ConfigOptionUpdate` notifications) that drive
+    /// `ModelChanged`, but carries the whole option list so the App can render
+    /// an in-app model switcher. `current` duplicates the `ModelChanged`
+    /// payload emitted alongside it (kept separate so the status-strip label
+    /// path is unchanged). Recorded as a plain reply event (no AgentEvent
+    /// mapping) so it replays on reconnect without entering the transcript.
+    ModelsAvailable {
+        current: String,
+        options: Vec<ModelOption>,
+    },
     /// Updated context-window utilization and cost. Variant is unconditional;
     /// the *emitter* in the notification handler is gated on the upstream
     /// `unstable_session_usage` feature (spec-agent-window.md §31).
@@ -348,20 +373,63 @@ impl PermissionMode {
 /// hard-coded fallback everywhere; the config node is the user-facing knob.
 pub const DEFAULT_PERMISSION_MODE: PermissionMode = PermissionMode::Yolo;
 
-/// Pull the current model id out of a `session/new` (or `session/load`)
-/// response's `config_options`. The modern adapter advertises the model as a
-/// `Select` option categorised `Model` (id `"model"`), whose `current_value`
-/// is the active model id. Returns `None` if no such option is present (older
-/// adapters, or an adapter that doesn't surface model selection).
-fn model_from_config_options(opts: &[SessionConfigOption]) -> Option<String> {
+/// Pull the current model id AND the full advertised model picklist out of a
+/// `session/new` / `session/load` / `session/set_config_option` response's
+/// `config_options` (or a `ConfigOptionUpdate` notification). The model is a
+/// `Select` categorised `Model` (id `"model"`); its `.options` enumerate every
+/// selectable model, flattened across any groups. Returns `(current_id,
+/// options)` or `None` if no model selector is present.
+fn model_state_from_config_options(
+    opts: &[SessionConfigOption],
+) -> Option<(String, Vec<ModelOption>)> {
     opts.iter().find_map(|o| {
         let is_model = matches!(o.category, Some(SessionConfigOptionCategory::Model))
             || o.id.0.as_ref() == "model";
         match (is_model, &o.kind) {
-            (true, SessionConfigKind::Select(sel)) => Some(sel.current_value.0.to_string()),
+            (true, SessionConfigKind::Select(sel)) => {
+                let current = sel.current_value.0.to_string();
+                let options = flatten_select_options(&sel.options);
+                Some((current, options))
+            }
             _ => None,
         }
     })
+}
+
+/// Flatten a `Select`'s options (grouped or ungrouped) into a flat
+/// `[ModelOption]`, preserving advertised order.
+fn flatten_select_options(
+    options: &agent_client_protocol::schema::SessionConfigSelectOptions,
+) -> Vec<ModelOption> {
+    use agent_client_protocol::schema::SessionConfigSelectOptions as O;
+    let to_opt = |opt: &agent_client_protocol::schema::SessionConfigSelectOption| ModelOption {
+        id: opt.value.0.to_string(),
+        label: opt.name.clone(),
+    };
+    match options {
+        O::Ungrouped(list) => list.iter().map(to_opt).collect(),
+        O::Grouped(groups) => groups
+            .iter()
+            .flat_map(|g| g.options.iter().map(to_opt))
+            .collect(),
+        // `SessionConfigSelectOptions` is `#[non_exhaustive]`; an unknown
+        // future shape yields no models rather than failing to compile.
+        _ => Vec::new(),
+    }
+}
+
+/// Build the `(ModelChanged, ModelsAvailable)` reply-event pair from a set of
+/// config options, if a model selector is present. Emitting BOTH keeps the
+/// existing status-strip `ModelChanged` path untouched while adding the
+/// picklist. Returns an empty vec when there is no model selector.
+fn model_reply_events(opts: &[SessionConfigOption]) -> Vec<ReplyEvent> {
+    match model_state_from_config_options(opts) {
+        Some((current, options)) => vec![
+            ReplyEvent::ModelChanged(current.clone()),
+            ReplyEvent::ModelsAvailable { current, options },
+        ],
+        None => Vec::new(),
+    }
 }
 
 /// Decide whether `kind` is allowed under `mode`. Centralised so both
@@ -531,6 +599,7 @@ mod fake {
         permission_mode: Arc<AtomicU8>,
         session_id: Arc<std::sync::Mutex<Option<String>>>,
         prompt_tx: std_mpsc::Sender<String>,
+        set_model_tx: std_mpsc::Sender<String>,
         cancel_tx: f_mpsc::UnboundedSender<()>,
     }
 
@@ -547,6 +616,9 @@ mod fake {
         /// Receiver for prompts the transport side enqueues — lets a scenario
         /// assert a prompt arrived (e.g. admin_prompt) before auto-emitting a turn.
         pub prompt_rx: std_mpsc::Receiver<String>,
+        /// Receiver for model-switch requests the transport side enqueues — lets
+        /// a scenario assert `set_model` reached the transport.
+        pub set_model_rx: std_mpsc::Receiver<String>,
         /// Receiver for cancel signals.
         pub cancel_rx: f_mpsc::UnboundedReceiver<()>,
     }
@@ -564,6 +636,7 @@ mod fake {
         pub fn with_session_id(sid: &str) -> (FakeTransport, FakeAgentControls) {
             let (reply_tx, reply_rx) = std_mpsc::channel::<ReplyEvent>();
             let (prompt_tx, prompt_rx) = std_mpsc::channel::<String>();
+            let (set_model_tx, set_model_rx) = std_mpsc::channel::<String>();
             let (cancel_tx, cancel_rx) = f_mpsc::unbounded::<()>();
             let connected = Arc::new(AtomicBool::new(true));
             let turns = Arc::new(AtomicUsize::new(0));
@@ -577,6 +650,7 @@ mod fake {
                 permission_mode: Arc::clone(&permission_mode),
                 session_id: Arc::clone(&session_id),
                 prompt_tx,
+                set_model_tx,
                 cancel_tx,
             };
             let controls = FakeAgentControls {
@@ -586,6 +660,7 @@ mod fake {
                 permission_mode,
                 session_id,
                 prompt_rx,
+                set_model_rx,
                 cancel_rx,
             };
             (transport, controls)
@@ -605,6 +680,7 @@ mod fake {
         fn handle(&self) -> TransportHandle {
             TransportHandle {
                 prompt_tx: self.prompt_tx.clone(),
+                set_model_tx: self.set_model_tx.clone(),
                 cancel_tx: self.cancel_tx.clone(),
                 connected: Arc::clone(&self.connected),
                 turns: Arc::clone(&self.turns),
@@ -739,6 +815,11 @@ pub use fake::{FakeAgentControls, FakeAgentSpawner, FakeTransport};
 pub struct AcpChannelClient {
     /// Outbound prompts: `App::claude_acp_send_text` → worker.
     prompt_tx: std_mpsc::Sender<String>,
+    /// Outbound model switches: each model id pushed here makes the worker
+    /// driver issue an ACP `session/set_config_option` for the `model`
+    /// option. Separate from `prompt_tx` so a switch never rides the prompt
+    /// queue (it applies out-of-band, mid-turn if needed).
+    set_model_tx: std_mpsc::Sender<String>,
     /// Cancel signal: `App::stop_agent` → worker driver loop. Each `()`
     /// pushed here makes the driver send an ACP `session/cancel` for the
     /// in-flight turn. `unbounded_send` is callable from the sync App side
@@ -910,6 +991,7 @@ impl AcpChannelClient {
         }
 
         let (prompt_tx, prompt_rx) = std_mpsc::channel::<String>();
+        let (set_model_tx, set_model_rx) = std_mpsc::channel::<String>();
         let (reply_tx, reply_rx) = std_mpsc::channel::<ReplyEvent>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<io::Result<()>>();
         let connected = Arc::new(AtomicBool::new(true));
@@ -950,6 +1032,7 @@ impl AcpChannelClient {
                     parts,
                     worker_cwd,
                     prompt_rx,
+                    set_model_rx,
                     reply_tx,
                     ready_tx,
                     connected_for_worker,
@@ -977,6 +1060,7 @@ impl AcpChannelClient {
 
         Ok(Self {
             prompt_tx,
+            set_model_tx,
             cancel_tx,
             reply_rx,
             connected,
@@ -1060,6 +1144,15 @@ impl AcpChannelClient {
         let _ = self.cancel_tx.unbounded_send(());
     }
 
+    /// Switch the session's model. Enqueues `model_id` for the worker driver,
+    /// which issues a `session/set_config_option` for the `model` option. The
+    /// agent applies it live (subsequent turns use the new model) and echoes
+    /// the updated selector back as `ModelChanged` + `ModelsAvailable` reply
+    /// events. Best-effort: a no-op if the worker channel has closed.
+    pub fn set_model(&self, model_id: &str) {
+        let _ = self.set_model_tx.send(model_id.to_string());
+    }
+
     /// Pull one queued reply event (text chunk or tool-call activity) if
     /// any are pending. Non-blocking — safe to call every tick.
     pub fn try_recv(&self) -> Option<ReplyEvent> {
@@ -1077,6 +1170,7 @@ impl AcpChannelClient {
     pub fn handle(&self) -> TransportHandle {
         TransportHandle {
             prompt_tx: self.prompt_tx.clone(),
+            set_model_tx: self.set_model_tx.clone(),
             cancel_tx: self.cancel_tx.clone(),
             connected: Arc::clone(&self.connected),
             turns: Arc::clone(&self.turns),
@@ -1099,12 +1193,14 @@ impl AcpChannelClient {
     #[cfg(feature = "test-support")]
     pub fn test_connected() -> (Self, TestChannelControls) {
         let (prompt_tx, prompt_rx) = std_mpsc::channel::<String>();
+        let (set_model_tx, set_model_rx) = std_mpsc::channel::<String>();
         let (reply_tx, reply_rx) = std_mpsc::channel::<ReplyEvent>();
         let (_wake_tx, wake_rx) = futures::channel::mpsc::unbounded::<()>();
         let (cancel_tx, cancel_rx) = futures::channel::mpsc::unbounded::<()>();
         let connected = Arc::new(AtomicBool::new(true));
         let client = Self {
             prompt_tx,
+            set_model_tx,
             cancel_tx,
             reply_rx,
             connected: Arc::clone(&connected),
@@ -1120,6 +1216,7 @@ impl AcpChannelClient {
             client,
             TestChannelControls {
                 prompt_rx,
+                set_model_rx,
                 reply_tx,
                 _cancel_rx: cancel_rx,
                 connected,
@@ -1134,6 +1231,10 @@ impl AcpChannelClient {
 pub struct TestChannelControls {
     /// Retained so `send()` succeeds; drain it to assert what was submitted.
     pub prompt_rx: std_mpsc::Receiver<String>,
+    /// Retained so `set_model()` succeeds without a worker; drain it (via
+    /// [`try_recv_set_model`](Self::try_recv_set_model)) to assert a model
+    /// switch reached the channel.
+    set_model_rx: std_mpsc::Receiver<String>,
     /// Inject `ReplyEvent`s (chunks / `TurnEnded`) the pump will read via
     /// `try_recv` — the seam for driving a turn to completion in-process.
     pub reply_tx: std_mpsc::Sender<ReplyEvent>,
@@ -1142,6 +1243,14 @@ pub struct TestChannelControls {
     /// Flip to `false` to simulate the worker dying (EOF) — the next `send()`
     /// then fails, exercising the "send failed — reconnecting" path.
     pub connected: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "test-support")]
+impl TestChannelControls {
+    /// Non-blocking pull of the next model id a `set_model()` enqueued, if any.
+    pub fn try_recv_set_model(&self) -> Option<String> {
+        self.set_model_rx.try_recv().ok()
+    }
 }
 
 /// The pump-thread-facing surface of an agent connection (Phase 6,
@@ -1212,6 +1321,8 @@ impl AgentTransport for AcpChannelClient {
 pub struct TransportHandle {
     /// Outbound prompts (Clone+Send). `send`-equivalent of `AcpChannelClient`.
     pub prompt_tx: std_mpsc::Sender<String>,
+    /// Outbound model switches (Clone+Send). `set_model`-equivalent.
+    pub set_model_tx: std_mpsc::Sender<String>,
     /// Cancel signal (Clone+Send).
     pub cancel_tx: futures::channel::mpsc::UnboundedSender<()>,
     /// Liveness flag, shared with the worker.
@@ -1252,6 +1363,13 @@ impl TransportHandle {
     /// Set the live permission policy (read by the worker on gated tool calls).
     pub fn set_permission_mode(&self, mode: PermissionMode) {
         self.permission_mode.store(mode as u8, Ordering::SeqCst);
+    }
+
+    /// Switch the session's model. Mirrors [`AcpChannelClient::set_model`]:
+    /// enqueues `model_id` for the worker driver to issue as a
+    /// `session/set_config_option`. Best-effort.
+    pub fn set_model(&self, model_id: &str) {
+        let _ = self.set_model_tx.send(model_id.to_string());
     }
 
     /// Worker liveness flag.
@@ -1419,6 +1537,7 @@ fn run_worker(
     parts: Vec<String>,
     cwd: PathBuf,
     prompt_rx: std_mpsc::Receiver<String>,
+    set_model_rx: std_mpsc::Receiver<String>,
     reply_tx: std_mpsc::Sender<ReplyEvent>,
     ready_tx: std_mpsc::Sender<io::Result<()>>,
     connected: Arc<AtomicBool>,
@@ -1453,6 +1572,7 @@ fn run_worker(
             parts,
             cwd,
             prompt_rx,
+            set_model_rx,
             reply_tx,
             ready_tx,
             connected_for_async,
@@ -1483,6 +1603,7 @@ async fn worker_async(
     parts: Vec<String>,
     cwd: PathBuf,
     prompt_rx: std_mpsc::Receiver<String>,
+    set_model_rx: std_mpsc::Receiver<String>,
     reply_tx: std_mpsc::Sender<ReplyEvent>,
     ready_tx: std_mpsc::Sender<io::Result<()>>,
     connected: Arc<AtomicBool>,
@@ -1610,12 +1731,28 @@ async fn worker_async(
         // signals the driver loop to exit cleanly.
     });
 
+    // Same std→async bridge for out-of-band model switches. A model id pushed
+    // via `set_model` reaches the driver loop, which issues a
+    // `session/set_config_option`. Kept on its own channel so it never queues
+    // behind prompts (a switch applies immediately, mid-turn if needed).
+    let (async_set_model_tx, async_set_model_rx) =
+        tokio::sync::mpsc::unbounded_channel::<String>();
+    let set_model_bridge_task = tokio::task::spawn_blocking(move || {
+        while let Ok(model_id) = set_model_rx.recv() {
+            if async_set_model_tx.send(model_id).is_err() {
+                break;
+            }
+        }
+    });
+
     // 4) Run the ACP client. The closure passed to connect_with stays alive
     //    until we explicitly return — that's our "session lifetime".
     let event_tx_for_handlers = event_tx.clone();
     // Separate clone for the driver loop so it can emit transient Notice
     // events (retry/failed status) alongside the handler's stream events.
     let event_tx_for_driver = event_tx.clone();
+    // Clone for the model-switch task so it can emit the refreshed selector.
+    let event_tx_for_setmodel = event_tx.clone();
     let connect_result = Client
         .builder()
         .name("yalda")
@@ -1681,6 +1818,15 @@ async fn worker_async(
                         let _ = event_tx_for_handlers
                             .send(WorkerEvent::Reply(ReplyEvent::UsageUpdated(snap)));
                     }
+                    // The agent re-advertises its config options (e.g. after a
+                    // model or mode change made outside our own request path).
+                    // Re-emit the model selector so the switcher label + list
+                    // stay live regardless of what triggered the change.
+                    SessionUpdate::ConfigOptionUpdate(upd) => {
+                        for ev in model_reply_events(&upd.config_options) {
+                            let _ = event_tx_for_handlers.send(WorkerEvent::Reply(ev));
+                        }
+                    }
                     // Parked: explicit no-op arms — promotion is a one-arm
                     // change. AgentMessageChunk's and UserMessageChunk's
                     // non-text content variants (images, etc.) fall through to
@@ -1688,8 +1834,7 @@ async fn worker_async(
                     SessionUpdate::AgentMessageChunk(_)
                     | SessionUpdate::AgentThoughtChunk(_)
                     | SessionUpdate::AvailableCommandsUpdate(_)
-                    | SessionUpdate::SessionInfoUpdate(_)
-                    | SessionUpdate::ConfigOptionUpdate(_) => {}
+                    | SessionUpdate::SessionInfoUpdate(_) => {}
                     // Future variants added by upstream — drop them rather
                     // than failing to compile, since the enum is
                     // `#[non_exhaustive]`.
@@ -1944,8 +2089,18 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         )
                         .await
                         {
-                            Ok(Ok(_resp)) => {
+                            Ok(Ok(resp)) => {
                                 acp_debug!("session/load ok: {id}");
+                                // A resumed session re-advertises its model
+                                // selector in the load response; surface it so
+                                // the switcher populates without waiting for a
+                                // config update.
+                                if let Some(opts) = &resp.config_options {
+                                    for ev in model_reply_events(opts) {
+                                        let _ =
+                                            event_tx_for_driver.send(WorkerEvent::Reply(ev));
+                                    }
+                                }
                                 true
                             }
                             Ok(Err(e)) => {
@@ -1973,10 +2128,9 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             {
                                 Ok(r) => {
                                     if let Some(opts) = &r.config_options {
-                                        if let Some(model) = model_from_config_options(opts) {
-                                            let _ = event_tx_for_driver.send(WorkerEvent::Reply(
-                                                ReplyEvent::ModelChanged(model),
-                                            ));
+                                        for ev in model_reply_events(opts) {
+                                            let _ = event_tx_for_driver
+                                                .send(WorkerEvent::Reply(ev));
                                         }
                                     }
                                     r.session_id
@@ -1999,10 +2153,9 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         {
                             Ok(r) => {
                                 if let Some(opts) = &r.config_options {
-                                    if let Some(model) = model_from_config_options(opts) {
-                                        let _ = event_tx_for_driver.send(WorkerEvent::Reply(
-                                            ReplyEvent::ModelChanged(model),
-                                        ));
+                                    for ev in model_reply_events(opts) {
+                                        let _ =
+                                            event_tx_for_driver.send(WorkerEvent::Reply(ev));
                                     }
                                 }
                                 r.session_id
@@ -2051,6 +2204,46 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
 
                     // Handshake done — App can start sending.
                     let _ = ready_tx.send(Ok(()));
+
+                    // === Model-switch task: independent of the prompt driver ===
+                    // Drains `set_model` requests and issues each as a
+                    // `session/set_config_option` for the `model` option. Runs
+                    // as its own task so a switch applies out-of-band (even
+                    // mid-turn) regardless of which prompt-driver variant is
+                    // active. The response echoes the refreshed selector, which
+                    // we forward as `ModelChanged` + `ModelsAvailable`.
+                    let set_model_task = {
+                        let connection = connection.clone();
+                        let session_id = session_id.clone();
+                        let event_tx = event_tx_for_setmodel;
+                        let mut rx = async_set_model_rx;
+                        tokio::spawn(async move {
+                            while let Some(model_id) = rx.recv().await {
+                                acp_debug!("set_model → agent: {model_id:?}");
+                                let req =
+                                    agent_client_protocol::schema::SetSessionConfigOptionRequest::new(
+                                        session_id.clone(),
+                                        "model",
+                                        model_id.clone(),
+                                    );
+                                match connection.send_request(req).block_task().await {
+                                    Ok(resp) => {
+                                        for ev in model_reply_events(&resp.config_options) {
+                                            let _ = event_tx.send(WorkerEvent::Reply(ev));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(WorkerEvent::Reply(
+                                            ReplyEvent::Notice(format!(
+                                                "model switch failed: {}",
+                                                short_err(&e)
+                                            )),
+                                        ));
+                                    }
+                                }
+                            }
+                        })
+                    };
 
                     // === Driver loop: forward prompts as session/prompt
                     //     requests until the App side closes the channel.  ===
@@ -2194,6 +2387,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             }
                         }
                         acp_debug!("queued driver loop exiting");
+                        set_model_task.abort();
                         return Ok::<_, agent_client_protocol::Error>(());
                     }
 
@@ -2305,6 +2499,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         }
                     }
                     acp_debug!("driver loop exiting");
+                    set_model_task.abort();
                     Ok::<_, agent_client_protocol::Error>(())
                 }
             },
@@ -2320,6 +2515,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
     drop(event_tx);
     pump_task.abort();
     bridge_task.abort();
+    set_model_bridge_task.abort();
     let _ = pump_task.await;
     // bridge_task is spawn_blocking; abort signals its JoinHandle but the
     // OS thread inside isn't actually killable. Hence we don't await it
@@ -2339,6 +2535,61 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::process::Stdio;
+
+    /// The model `Select` (id `"model"`, category `Model`) is parsed into
+    /// `(current, [ModelOption])` preserving advertised order + labels; a
+    /// non-model option alongside it is ignored. Mirrors the real
+    /// `claude-agent-acp` `session/new` payload observed in the wild.
+    #[test]
+    fn model_state_parses_select_current_and_options() {
+        use agent_client_protocol::schema::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        };
+        // A non-model select that must be skipped.
+        let mode_opt = SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "default",
+            vec![SessionConfigSelectOption::new("default", "Default")],
+        );
+        let mut model_opt = SessionConfigOption::select(
+            "model",
+            "Model",
+            "sonnet",
+            vec![
+                SessionConfigSelectOption::new("default", "Default (recommended)"),
+                SessionConfigSelectOption::new("claude-fable-5[1m]", "Fable"),
+                SessionConfigSelectOption::new("sonnet", "Sonnet"),
+            ],
+        );
+        model_opt.category = Some(SessionConfigOptionCategory::Model);
+
+        let (current, options) =
+            model_state_from_config_options(&[mode_opt, model_opt]).expect("model selector parsed");
+        assert_eq!(current, "sonnet");
+        assert_eq!(
+            options,
+            vec![
+                ModelOption { id: "default".into(), label: "Default (recommended)".into() },
+                ModelOption { id: "claude-fable-5[1m]".into(), label: "Fable".into() },
+                ModelOption { id: "sonnet".into(), label: "Sonnet".into() },
+            ]
+        );
+
+        // model_reply_events emits BOTH a ModelChanged(current) and a
+        // ModelsAvailable{current, options} so the status strip + switcher stay
+        // in sync from one config payload.
+        let mode_only = SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "default",
+            vec![SessionConfigSelectOption::new("default", "Default")],
+        );
+        assert!(
+            model_reply_events(&[mode_only]).is_empty(),
+            "no model selector ⇒ no model events"
+        );
+    }
 
     /// The orphan reaper only targets adapters whose parent is PID 1 (the spawner
     /// died) AND whose command matches an adapter needle — so it can never kill a
