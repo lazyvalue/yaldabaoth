@@ -6390,6 +6390,37 @@ fn focused_in_insert_mode_edit_view_arm(cx: &mut TestAppContext) {
     );
 }
 
+/// A numeric count prefix repeats a Normal-mode motion: `10j` moves ten lines,
+/// not one. The count used to be taken-and-discarded for every motion except
+/// gg/G. Drives the REAL `handle_edit_key` path (digits accumulate in the
+/// KeybindManager, then `j` fires). NEGATIVE CONTROL: revert the `for _ in 0..n`
+/// loop in the `move-down` arm → the caret lands on line 1, not line 10.
+#[gpui::test]
+fn count_prefix_repeats_normal_motion(cx: &mut TestAppContext) {
+    use crate::EditOps;
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    let text = (0..20).map(|i| format!("line {i}\n")).collect::<String>();
+    view.update(vcx, |v, _| v.test_open_edit(&text));
+    // Drop to Normal (test_open_edit rests in Insert).
+    view.update(vcx, |v, _| {
+        v.edit_mut().unwrap().mode = crate::EditMode::Normal;
+    });
+    for k in ["1", "0", "j"] {
+        view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_bare_key(k), w, cx));
+    }
+    let line = view.update(vcx, |v, _| v.edit_mut().unwrap().editor.cursor().line);
+    assert_eq!(line, 10, "`10j` moves the caret ten lines down");
+}
+
 /// The Normal-mode block caret lands ON the char under the cursor, even when the
 /// cursor sits exactly on a word start (a token boundary — where `w`/`b` land).
 /// The old `<=` predicate handed the boundary to the PRECEDING token, drawing a

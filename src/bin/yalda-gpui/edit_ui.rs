@@ -641,25 +641,37 @@ impl YaldaGpuiView {
         // Numeric count prefix typed ahead of this action (e.g. `42` in
         // `42G`). Taken-and-cleared here; arms that don't use it ignore it.
         let count = keybinds.take_count();
+        // Repeat count for motions: `10j` moves ten lines, `3w` three words.
+        // Capped so a pathological `999999999j` can't spin. pre_move runs once
+        // (it collapses/extends the selection); only the inner step repeats.
+        let n = count.unwrap_or(1).min(100_000);
 
         match action_name.as_str() {
             // ---- Pure motions: collapse selection (or extend in extend mode) ----
             "move-down" => {
                 editor.pre_move(false);
-                editor.move_down(false);
+                for _ in 0..n {
+                    editor.move_down(false);
+                }
             }
             "move-up" => {
                 editor.pre_move(false);
-                editor.cursor_move_up();
+                for _ in 0..n {
+                    editor.cursor_move_up();
+                }
                 editor.clamp_cursor_col(false);
             }
             "move-left" => {
                 editor.pre_move(false);
-                editor.cursor_move_left();
+                for _ in 0..n {
+                    editor.cursor_move_left();
+                }
             }
             "move-right" => {
                 editor.pre_move(false);
-                editor.move_right_clamped(false);
+                for _ in 0..n {
+                    editor.move_right_clamped(false);
+                }
             }
             "move-line-start" => {
                 editor.pre_move(false);
@@ -676,15 +688,21 @@ impl YaldaGpuiView {
             // ---- Word motions: create a fresh selection from cursor → motion target ----
             "move-word-forward" => {
                 editor.pre_move(true);
-                editor.move_cursor_word_forward();
+                for _ in 0..n {
+                    editor.move_cursor_word_forward();
+                }
             }
             "move-word-backward" => {
                 editor.pre_move(true);
-                editor.move_cursor_word_backward();
+                for _ in 0..n {
+                    editor.move_cursor_word_backward();
+                }
             }
             "move-word-end" => {
                 editor.pre_move(true);
-                editor.move_cursor_word_end();
+                for _ in 0..n {
+                    editor.move_cursor_word_end();
+                }
             }
             // ---- Doc-level jumps ----
             "goto-top" => {
@@ -789,10 +807,12 @@ impl YaldaGpuiView {
             }
             // ---- Direct-edit actions (still callable via custom config) ----
             "delete-char" => {
-                if let Some(t) = char_under_cursor(editor) {
-                    Self::yank_to_clipboard(&t);
+                for _ in 0..n {
+                    if let Some(t) = char_under_cursor(editor) {
+                        Self::yank_to_clipboard(&t);
+                    }
+                    editor.delete_char_at_cursor();
                 }
-                editor.delete_char_at_cursor();
             }
             "delete-line" => {
                 let line = editor.line_text_at_cursor();

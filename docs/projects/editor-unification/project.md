@@ -52,8 +52,8 @@ which the compose *is* a small buffer (the user's stated end-state).
 |---|--------|--------|
 | — | Batch 1: shared-dispatch bug fixes (arrows/Home/End/Delete, Cmd chords, block-caret off-by-one) | ✅ landed `main` (9d3ca50, 6f83f43) |
 | — | reconcile_and_reveal dedup (scroll target 3, buffer half) | ✅ landed `main` (4f7663a) |
-| 001 | Remaining editing bug backlog (undo lifecycle, tab caret-align, count prefixes, `e`/`x` at EOL, stale desired_col) | open |
-| 002 | Unification target 2 — fold `EditOps`/`SharedEditor` into one `Editor` over a shared core | open |
+| 001 | Remaining editing bug backlog (undo lifecycle, tab caret-align, count prefixes, `e`/`x` at EOL, stale desired_col) | in progress |
+| 002 | Unification target 2 — `EditOps` as default methods over one `EditAccess` accessor (was: fold into one Editor) | ✅ landed `main` (1c917dc), −133 LOC |
 | 003 | Unification target 1 — one wrapped-line renderer; delete `build_chatbox_*` + compose grid-window | open |
 
 ## Links
