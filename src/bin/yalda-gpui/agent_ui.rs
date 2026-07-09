@@ -2874,7 +2874,7 @@ impl YaldaGpuiView {
 
         // Re-create in place on the now-unbound focused tile, reusing the
         // snapshotted label + cwd and forcing the preserved permission mode.
-        if self.session_server.is_some() {
+        if self.session_server.is_some() || crate::force_server_clear_branch() {
             let open_token = alloc_open_token();
             // `/clear` discards the conversation → a FRESH empty worksheet. Settle so
             // it opens a typeable tail You-block immediately; without this the

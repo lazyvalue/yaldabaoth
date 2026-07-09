@@ -6194,6 +6194,163 @@ fn repro_clear_worksheet_typed_text_repaints_fresh_transcript_view(cx: &mut Test
     );
 }
 
+/// THE full real `/clear` sequence, SERVER branch, end-to-end — the seam no prior
+/// test composed. Each earlier clear test covered ONE hop (hand-built "the hole",
+/// or dropped/re-created the TV for the SAME id, or drove `apply_open_agent_resolution`
+/// but asserted state only, or spliced over a hand-built state) — none drove
+/// `clear_agent_session` (server branch) → async `Created` bind → keystroke → PAINT.
+/// That gap is exactly where the 7×-recurring "worksheet invisible until I click"
+/// bug hid: green tests, broken app. This forces the real client/server `/clear`
+/// branch via the `FORCE_SERVER_CLEAR_BRANCH` seam (no live server needed —
+/// `spawn_create_agent_session` bails, leaving the placeholder mid-open), drives the
+/// REAL async completion, then a REAL keystroke, and asserts the typed char PAINTS an
+/// inline You-block inside the transcript viewport (INV-UX-16, cached-view-swap arm).
+///
+/// ROOT CAUSE this pins: `/clear` drops the old session's `TranscriptView` and the
+/// rebind creates a new one that GPUI hands the SAME entity slot; embedded at the same
+/// tree position it inherits the dropped view's stale cached prepaint AND — never
+/// painted into the committed dispatch tree — its self-notifies are dropped by
+/// `mark_view_dirty` (empty `view_path`). It FREEZES: typed text never repaints until a
+/// click forces a refresh. Fix: `transcript_view_for` defers a full window refresh when
+/// it CREATES a view, painting it fresh into the dispatch tree.
+///
+/// Negative control (mandatory, observed RED): comment out the
+/// `cx.defer(|app| app.refresh_windows())` in `transcript_view_for` → after_r/after_s
+/// stay 0 and `you-block` never paints — the exact "invisible until I click" symptom,
+/// caught on the FULL real path for the first time. (A prior control also holds: revert
+/// the You-block splice in `transcript_view.rs` → the splice counter stays flat.)
+#[gpui::test]
+fn real_clear_server_branch_then_type_paints(cx: &mut TestAppContext) {
+    // HERMETIC construction (session_server = None) so the forced server branch's
+    // `spawn_create_agent_session` bails and leaves the placeholder mid-open — a
+    // live dev-box server would otherwise complete the round-trip and consume the
+    // token before we can drive the resolution ourselves.
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+    let old_session = view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        let id = v.focused_bound_session().expect("bound session");
+        let ent = v.session_entity(id).expect("session entity");
+        cx.notify();
+        ent
+    });
+    vcx.run_until_parked();
+    // Give the OLD session real history so the clear is a genuine reset (non-vacuous).
+    old_session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, "old turn one\nold turn two\n");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    // CONTROL (non-vacuous guard): typing into the BOOT session BEFORE any clear
+    // paints the you-block — proving this hermetic harness renders the transcript at
+    // all, so the post-clear flatness below is the BUG, not a dead window.
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().unwrap();
+        v.with_session(id, cx, |c| {
+            c.editor =
+                yalda::editor::Editor::new(String::new(), std::path::PathBuf::from("*claude*"));
+            c.input_surface = crate::InputSurface::new(crate::InputModeKind::Worksheet);
+            c.settle_input_focus();
+        });
+    });
+    vcx.run_until_parked();
+    crate::perf_reset("transcript");
+    crate::layout_probe_begin();
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("x"), w, cx));
+    vcx.run_until_parked();
+    let ctrl_r = crate::perf_render_count("transcript");
+    let ctrl_yb = crate::layout_probe_get("you-block");
+    crate::layout_probe_end();
+    assert!(
+        ctrl_r > 0 && ctrl_yb.is_some(),
+        "control: the pre-clear boot transcript must render + paint (else the test is vacuous)"
+    );
+
+    // REAL `/clear`, forced down the SERVER branch. `spawn_create_agent_session`
+    // bails (no live server) but leaves the placeholder bound with a
+    // `pending_open_token` — exactly the real mid-open state.
+    view.update(vcx, |v, cx| {
+        crate::with_server_clear_branch(|| v.clear_agent_session(cx));
+    });
+    vcx.run_until_parked();
+
+    // The placeholder tile carries the token `/clear` minted for the async round-trip.
+    let token = view
+        .update(vcx, |v, _| v.agent_tile().and_then(|t| t.pending_open_token))
+        .expect("clear left a pending open token on the placeholder tile");
+
+    // REAL async completion: the server round-trip binds the fresh sid + re-settles.
+    view.update(vcx, |v, cx| {
+        v.apply_open_agent_resolution(
+            token,
+            crate::OpenResolution::Created {
+                sid: "S-fresh".into(),
+                acp_id: None,
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            },
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // Precondition: the typeable idle worksheet the user faces post-clear (non-vacuous).
+    let (active, focus) = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| (c.inline_you_block_active(), c.focus)))
+        .expect("bound after resolution");
+    assert!(
+        active && focus == crate::AgentFocus::Compose,
+        "post-clear worksheet must be typeable inline (active={active}, focus={focus:?})"
+    );
+
+    crate::perf_reset("transcript");
+    crate::perf_reset(crate::YOU_BLOCK_SPLICE_LABEL);
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let base_r = crate::perf_render_count("transcript");
+    let base_s = crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL);
+
+    // REAL keystroke, through the REAL key handler, paint probe active.
+    crate::layout_probe_begin();
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("h"), w, cx));
+    vcx.run_until_parked();
+    let after_r = crate::perf_render_count("transcript");
+    let after_s = crate::perf_render_count(crate::YOU_BLOCK_SPLICE_LABEL);
+    let you_block = crate::layout_probe_get("you-block");
+    let viewport = crate::layout_probe_get("transcript-viewport");
+    crate::layout_probe_end();
+
+    let text = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text()))
+        .expect("session");
+    assert_eq!(text.trim(), "h", "sanity: the char landed in the compose buffer");
+    assert!(
+        after_r > base_r,
+        "REAL PATH: typing after /clear MUST bust the cached transcript ({base_r} -> {after_r}); \
+         flat == the invisible-text bug",
+    );
+    assert!(
+        after_s > base_s,
+        "REAL PATH: typing after /clear MUST splice the You-block item ({base_s} -> {after_s}); \
+         flat == the ListState cached-item staleness the user sees as invisible text",
+    );
+    let (_, by, _, bh) = you_block.expect("typed char MUST paint an inline You-block");
+    let (_, vy, _, vh) = viewport.expect("transcript viewport did not paint");
+    assert!(
+        by >= vy - 0.5 && by + bh <= vy + vh + 0.5,
+        "the You-block [{by}, {}] must lie inside the transcript viewport [{vy}, {}]",
+        by + bh,
+        vy + vh,
+    );
+}
+
 /// `focused_in_insert_mode` for the raw EDIT view (`App::Buffer::Editing`): Insert IS
 /// text entry (leaders suppressed); Normal is navigation (leaders fire). Kills the
 /// `e.mode == Insert` mutant surviving in this arm.

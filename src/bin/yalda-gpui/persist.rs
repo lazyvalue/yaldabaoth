@@ -101,6 +101,40 @@ pub(crate) fn with_no_session_server<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Test seam: force `clear_agent_session` down the SERVER branch (the real
+/// client/server `/clear` path — placeholder + async `apply_open_agent_resolution`
+/// bind) even though no live server is present under `cfg(test)`. Without this the
+/// harness only ever exercises the legacy direct-spawn else-branch, so the real
+/// user path (which the 7×-recurring "/clear worksheet invisible" bug lives on)
+/// was never headlessly reproduced. `spawn_create_agent_session` bails gracefully
+/// when `session_server` is `None`, leaving the placeholder bound with its
+/// `pending_open_token` — exactly the real mid-open state the test then resolves.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_SERVER_CLEAR_BRANCH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether `clear_agent_session` should take the server branch on this thread.
+/// Always `false` outside tests.
+pub(crate) fn force_server_clear_branch() -> bool {
+    #[cfg(test)]
+    {
+        return FORCE_SERVER_CLEAR_BRANCH.with(|c| c.get());
+    }
+    #[cfg(not(test))]
+    false
+}
+
+/// Run `f` with the server `/clear` branch forced ON this thread (test-only).
+#[cfg(test)]
+pub(crate) fn with_server_clear_branch<R>(f: impl FnOnce() -> R) -> R {
+    FORCE_SERVER_CLEAR_BRANCH.with(|c| c.set(true));
+    let r = f();
+    FORCE_SERVER_CLEAR_BRANCH.with(|c| c.set(false));
+    r
+}
+
 pub(crate) fn connect_session_server() -> Option<SessionServerClient> {
     // NOTE (clear-worksheet-invisible critique R4): under `cfg(test)` this still
     // falls through to a LIVE `SessionServerClient::connect()` unless a test wraps

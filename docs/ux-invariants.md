@@ -704,6 +704,40 @@ guard here: the headless harness re-renders every list item each frame, masking 
 `ListState` item cache — which is precisely why the paint-based repros were falsely
 green through six rounds.
 
+**Third mechanism — a session-SWAP must re-seat the cached transcript view in the
+committed frame (added 2026-07-08).** Even with the gate and the item-splice both
+correct, the FULL real `/clear` path stayed broken: `clear_agent_session` drops the
+old session's `TranscriptView` (`transcript_views.remove`) and the async rebind
+(`apply_open_agent_resolution`) creates a NEW one — which GPUI routinely hands the
+**same entity slot** the dropped view just freed (observed: boot `EntityId(3v1)` →
+post-clear `EntityId(3v3)`). Embedded via `cached_child` at the SAME tree position,
+the fresh view (a) inherits the dropped view's stale cached prepaint (gpui keys
+`AnyViewState` by `GlobalElementId` = tree position, `view.rs:208-214`), and worse
+(b) having never been painted into the COMMITTED `rendered_frame.dispatch_tree`, its
+self-notifies are silently dropped by `mark_view_dirty` (`window.rs` — empty
+`view_path` ⇒ nothing enters `dirty_views`). The transcript FREEZES: the observe
+fires and even a DIRECT `cx.notify()` on the view does nothing; typed text never
+repaints until an unrelated event (a mouse click) forces a full refresh. This was
+the residual "invisible until I click" the gate + splice fixes never reached — it is
+NOT a routing/gate fault at all but a cached-view lifecycle fault. Fix:
+`transcript_view_for` (main.rs), on CREATING a new view, `cx.defer`s a full
+`app.refresh_windows()` — one forced (`refreshing`-bypassing) paint that seats the
+new view in the dispatch tree, after which its observe-notifies land normally.
+Invariant: **creating a `TranscriptView` (any session open / `/clear` / rebind /
+restore) MUST force one full window refresh so the new cached view is re-seated in
+the committed frame — a bare notify cannot dirty a view GPUI has never painted.**
+
+**Enforcement (third mechanism).**
+`verify_harness.rs::real_clear_server_branch_then_type_paints` — drives the ENTIRE
+real path no prior test composed: REAL `clear_agent_session` down the client/server
+branch (via the `FORCE_SERVER_CLEAR_BRANCH` seam) → REAL async
+`apply_open_agent_resolution(Created)` bind → REAL `handle_claude_key` → assert the
+transcript re-renders AND the You-block PAINTS inside the viewport. A pre-clear
+CONTROL (boot session types + paints) makes it non-vacuous. **Negative control
+(observed): comment out the `cx.defer(|app| app.refresh_windows())` in
+`transcript_view_for` → RED, `after_r/after_s == 0` and `you-block` never paints —
+the exact user symptom.**
+
 ### INV-UX-17 — The keybindings tile shows the LIVE keymap and rebinds it in place
 
 **Statement.** The `App::Keymap` reference tile is not a static cheat-sheet: it

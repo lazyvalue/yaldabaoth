@@ -2226,6 +2226,21 @@ impl YaldaGpuiView {
         let weak = cx.entity().downgrade();
         let view = cx.new(|vcx| TranscriptView::new(session_ent, weak, vcx));
         self.transcript_views.insert(id, view.clone());
+        // A brand-new TranscriptView often REUSES the GPUI entity slot a just-dropped
+        // one freed (e.g. `/clear` removes the old session's view, then the rebind
+        // creates this one). GPUI keys a cached `AnyView`'s prepaint by tree POSITION
+        // and dirties it only via `mark_view_dirty`, which walks the COMMITTED frame's
+        // dispatch tree (`window.rs`). Embedded at the same position, the fresh view
+        // inherits the dropped one's stale prepaint AND — never having been painted
+        // into the committed dispatch tree — its self-notifies are dropped by
+        // `mark_view_dirty` (no `view_path`), so it FREEZES: typed text never repaints
+        // until an unrelated event forces a full refresh (a mouse click). This is the
+        // 7×-recurring "/clear worksheet invisible until I click" bug. Force ONE full
+        // window refresh (deferred, outside this render pass) so the new view is
+        // painted fresh into the dispatch tree — after which its observe-notifies land.
+        // Binds are rare, so the refresh cost is irrelevant. Pinned by
+        // `real_clear_server_branch_then_type_paints`.
+        cx.defer(|app| app.refresh_windows());
         view
     }
 
