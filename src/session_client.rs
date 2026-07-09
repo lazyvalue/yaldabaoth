@@ -493,6 +493,16 @@ impl SessionServerClient {
     }
 
     pub fn prompt(&self, session_id: &str, text: &str) -> io::Result<()> {
+        self.prompt_with_images(session_id, text, Vec::new())
+    }
+
+    /// Send a prompt with pasted image attachments alongside the text.
+    pub fn prompt_with_images(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: Vec<crate::acp_channel::ImageAttachment>,
+    ) -> io::Result<()> {
         // Fire-and-forget: the server only returns an Ack and we don't
         // need it. Blocking here stalls the GPUI main thread and
         // prevents the server pump from draining reply notifications,
@@ -500,6 +510,7 @@ impl SessionServerClient {
         self.request_fire(Request::Prompt {
             session_id: session_id.to_string(),
             text: text.to_string(),
+            images,
         })
     }
 

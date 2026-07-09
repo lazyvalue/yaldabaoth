@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::acp_channel::{PermissionMode, ReplyEvent};
+use crate::acp_channel::{ImageAttachment, PermissionMode, ReplyEvent};
 use crate::agent_event::AgentEvent;
 
 /// Server-assigned stable session handle (UUID string).
@@ -84,6 +84,11 @@ pub enum Request {
     Prompt {
         session_id: ServerSessionId,
         text: String,
+        /// Pasted image attachments to send alongside the text as ACP
+        /// `ContentBlock::Image`s. `#[serde(default)]` keeps it additive — a
+        /// pre-image peer omits it and it deserializes as empty (text-only).
+        #[serde(default)]
+        images: Vec<ImageAttachment>,
     },
 
     /// Interrupt the in-flight turn (ACP `session/cancel`). The session stays
@@ -362,6 +367,52 @@ pub fn session_wal_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Back-compat: a `prompt` request written before image attachments existed
+    /// has no `images` key. `#[serde(default)]` MUST let it deserialize (to an
+    /// empty vec) so a pre-image peer's prompt still works (text-only).
+    #[test]
+    fn prompt_deserializes_without_images() {
+        let old = r#"{"method":"prompt","session_id":"s1","text":"hi"}"#;
+        let req: Request = serde_json::from_str(old).expect("old prompt must deserialize");
+        match req {
+            Request::Prompt {
+                session_id,
+                text,
+                images,
+            } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(text, "hi");
+                assert!(images.is_empty(), "missing images defaults to empty");
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    /// A prompt carrying image attachments round-trips over the wire — the
+    /// base64 data + mime type survive serialize → deserialize.
+    #[test]
+    fn prompt_round_trips_images() {
+        let req = Request::Prompt {
+            session_id: "s1".to_string(),
+            text: "see attached".to_string(),
+            images: vec![ImageAttachment {
+                data: "QUJD".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back {
+            Request::Prompt { text, images, .. } => {
+                assert_eq!(text, "see attached");
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].data, "QUJD");
+                assert_eq!(images[0].mime_type, "image/png");
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
 
     /// A.8a back-compat: an `event_log` written before `generation` existed
     /// has no `generation` key. `#[serde(default)]` MUST let it deserialize

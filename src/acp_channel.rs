@@ -59,10 +59,11 @@ use std::sync::mpsc as std_mpsc;
 use std::thread::{self, JoinHandle};
 
 use agent_client_protocol::schema::{
-    ContentBlock, ContentChunk, InitializeRequest, LoadSessionRequest, NewSessionRequest,
-    PermissionOptionKind, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionId, SessionNotification, SessionUpdate,
+    ContentBlock, ContentChunk, ImageContent, InitializeRequest, LoadSessionRequest,
+    NewSessionRequest, PermissionOptionKind, ProtocolVersion, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionId,
+    SessionNotification, SessionUpdate, TextContent,
 };
 // Re-exported via this module so consumers (App / GPUI) don't need a
 // direct dependency on the agent-client-protocol schema crate just to
@@ -125,6 +126,59 @@ pub struct UsageSnapshot {
     pub tokens_total: u64,
     /// Cumulative session cost in USD, if the upstream provided one.
     pub cost_usd: Option<f64>,
+}
+
+/// A single image attachment on a user prompt (e.g. pasted from the
+/// clipboard). Crosses the GUI↔session-server wire (`session_proto`) and is
+/// turned into an ACP `ContentBlock::Image` in the worker driver. `data` is
+/// standard base64 of the raw image bytes (NO `data:` URI prefix); `mime_type`
+/// is e.g. `"image/png"`. Ephemeral for now — not persisted in the WAL, so a
+/// resumed/replayed transcript shows the prompt text but not the image.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ImageAttachment {
+    pub data: String,
+    pub mime_type: String,
+}
+
+/// A user prompt as it travels through the ACP channel worker: prompt text
+/// plus any image attachments. Bundled here (rather than the bare `String` the
+/// channel used to carry) so the driver can build a mixed
+/// `[Text, Image, …]` content-block vector for `session/prompt`.
+#[derive(Debug, Clone, Default)]
+pub struct PromptPayload {
+    pub text: String,
+    pub images: Vec<ImageAttachment>,
+}
+
+impl PromptPayload {
+    /// Convenience for the common text-only path.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// Build the ACP content-block vector for `session/prompt`: the text block
+    /// (when non-empty) followed by one `Image` block per attachment. ACP
+    /// requires at least one block, so an all-empty payload still yields a
+    /// single empty text block.
+    fn content_blocks(&self) -> Vec<ContentBlock> {
+        let mut blocks = Vec::new();
+        if !self.text.is_empty() {
+            blocks.push(ContentBlock::Text(TextContent::new(self.text.clone())));
+        }
+        for img in &self.images {
+            blocks.push(ContentBlock::Image(ImageContent::new(
+                img.data.clone(),
+                img.mime_type.clone(),
+            )));
+        }
+        if blocks.is_empty() {
+            blocks.push(ContentBlock::Text(TextContent::new(String::new())));
+        }
+        blocks
+    }
 }
 
 /// Events drained by the App from the ACP worker. Replaces the previous
@@ -530,7 +584,7 @@ mod fake {
         turns: Arc<AtomicUsize>,
         permission_mode: Arc<AtomicU8>,
         session_id: Arc<std::sync::Mutex<Option<String>>>,
-        prompt_tx: std_mpsc::Sender<String>,
+        prompt_tx: std_mpsc::Sender<PromptPayload>,
         cancel_tx: f_mpsc::UnboundedSender<()>,
     }
 
@@ -546,7 +600,7 @@ mod fake {
         session_id: Arc<std::sync::Mutex<Option<String>>>,
         /// Receiver for prompts the transport side enqueues — lets a scenario
         /// assert a prompt arrived (e.g. admin_prompt) before auto-emitting a turn.
-        pub prompt_rx: std_mpsc::Receiver<String>,
+        pub prompt_rx: std_mpsc::Receiver<PromptPayload>,
         /// Receiver for cancel signals.
         pub cancel_rx: f_mpsc::UnboundedReceiver<()>,
     }
@@ -563,7 +617,7 @@ mod fake {
         /// Like [`new`] but with a caller-chosen synthetic session id.
         pub fn with_session_id(sid: &str) -> (FakeTransport, FakeAgentControls) {
             let (reply_tx, reply_rx) = std_mpsc::channel::<ReplyEvent>();
-            let (prompt_tx, prompt_rx) = std_mpsc::channel::<String>();
+            let (prompt_tx, prompt_rx) = std_mpsc::channel::<PromptPayload>();
             let (cancel_tx, cancel_rx) = f_mpsc::unbounded::<()>();
             let connected = Arc::new(AtomicBool::new(true));
             let turns = Arc::new(AtomicUsize::new(0));
@@ -672,7 +726,7 @@ mod fake {
         }
 
         /// Non-blocking pull of the next prompt the transport enqueued, if any.
-        pub fn try_recv_prompt(&self) -> Option<String> {
+        pub fn try_recv_prompt(&self) -> Option<PromptPayload> {
             self.prompt_rx.try_recv().ok()
         }
     }
@@ -738,7 +792,7 @@ pub use fake::{FakeAgentControls, FakeAgentSpawner, FakeTransport};
 /// details.
 pub struct AcpChannelClient {
     /// Outbound prompts: `App::claude_acp_send_text` → worker.
-    prompt_tx: std_mpsc::Sender<String>,
+    prompt_tx: std_mpsc::Sender<PromptPayload>,
     /// Cancel signal: `App::stop_agent` → worker driver loop. Each `()`
     /// pushed here makes the driver send an ACP `session/cancel` for the
     /// in-flight turn. `unbounded_send` is callable from the sync App side
@@ -909,7 +963,7 @@ impl AcpChannelClient {
             ));
         }
 
-        let (prompt_tx, prompt_rx) = std_mpsc::channel::<String>();
+        let (prompt_tx, prompt_rx) = std_mpsc::channel::<PromptPayload>();
         let (reply_tx, reply_rx) = std_mpsc::channel::<ReplyEvent>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<io::Result<()>>();
         let connected = Arc::new(AtomicBool::new(true));
@@ -1036,16 +1090,22 @@ impl AcpChannelClient {
         &self.command
     }
 
-    /// Send a prompt to the agent. Returns Err if the worker has died (e.g.
-    /// the child crashed) so the caller can drop the connection.
+    /// Send a text prompt to the agent. Returns Err if the worker has died
+    /// (e.g. the child crashed) so the caller can drop the connection.
     pub fn send(&mut self, prompt: &str) -> io::Result<()> {
+        self.send_payload(PromptPayload::text(prompt))
+    }
+
+    /// Send a prompt carrying image attachments (pasted images) alongside the
+    /// text. The worker builds a mixed `[Text, Image, …]` content-block vector.
+    pub fn send_payload(&mut self, payload: PromptPayload) -> io::Result<()> {
         if !self.is_connected() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "ACP agent gone (worker exited) — re-attach to recover",
             ));
         }
-        self.prompt_tx.send(prompt.to_string()).map_err(|_| {
+        self.prompt_tx.send(payload).map_err(|_| {
             self.connected.store(false, Ordering::SeqCst);
             io::Error::new(io::ErrorKind::BrokenPipe, "ACP worker channel closed")
         })
@@ -1098,7 +1158,7 @@ impl AcpChannelClient {
     /// `apply_server_batch`, not this channel.
     #[cfg(feature = "test-support")]
     pub fn test_connected() -> (Self, TestChannelControls) {
-        let (prompt_tx, prompt_rx) = std_mpsc::channel::<String>();
+        let (prompt_tx, prompt_rx) = std_mpsc::channel::<PromptPayload>();
         let (reply_tx, reply_rx) = std_mpsc::channel::<ReplyEvent>();
         let (_wake_tx, wake_rx) = futures::channel::mpsc::unbounded::<()>();
         let (cancel_tx, cancel_rx) = futures::channel::mpsc::unbounded::<()>();
@@ -1133,7 +1193,7 @@ impl AcpChannelClient {
 #[cfg(feature = "test-support")]
 pub struct TestChannelControls {
     /// Retained so `send()` succeeds; drain it to assert what was submitted.
-    pub prompt_rx: std_mpsc::Receiver<String>,
+    pub prompt_rx: std_mpsc::Receiver<PromptPayload>,
     /// Inject `ReplyEvent`s (chunks / `TurnEnded`) the pump will read via
     /// `try_recv` — the seam for driving a turn to completion in-process.
     pub reply_tx: std_mpsc::Sender<ReplyEvent>,
@@ -1211,7 +1271,7 @@ impl AgentTransport for AcpChannelClient {
 /// `AcpChannelClient` (whose `Drop` joins an OS thread).
 pub struct TransportHandle {
     /// Outbound prompts (Clone+Send). `send`-equivalent of `AcpChannelClient`.
-    pub prompt_tx: std_mpsc::Sender<String>,
+    pub prompt_tx: std_mpsc::Sender<PromptPayload>,
     /// Cancel signal (Clone+Send).
     pub cancel_tx: futures::channel::mpsc::UnboundedSender<()>,
     /// Liveness flag, shared with the worker.
@@ -1232,13 +1292,18 @@ impl TransportHandle {
     /// [`AcpChannelClient::send`]: fails (and marks disconnected) if the worker
     /// channel is closed.
     pub fn send(&self, prompt: &str) -> io::Result<()> {
+        self.send_payload(PromptPayload::text(prompt))
+    }
+
+    /// Send a prompt carrying image attachments alongside the text.
+    pub fn send_payload(&self, payload: PromptPayload) -> io::Result<()> {
         if !self.is_connected() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "ACP agent gone (worker exited) — re-attach to recover",
             ));
         }
-        self.prompt_tx.send(prompt.to_string()).map_err(|_| {
+        self.prompt_tx.send(payload).map_err(|_| {
             self.connected.store(false, Ordering::SeqCst);
             io::Error::new(io::ErrorKind::BrokenPipe, "ACP worker channel closed")
         })
@@ -1282,7 +1347,7 @@ impl Drop for AcpChannelClient {
         // Dropping prompt_tx by replacing it: we can't move out of `&mut self`
         // for a `Sender<String>`, but we *can* swap it with a fresh disposable
         // pair whose receiver we throw away — that releases the original tx.
-        let (dummy_tx, _dummy_rx) = std_mpsc::channel::<String>();
+        let (dummy_tx, _dummy_rx) = std_mpsc::channel::<PromptPayload>();
         // Note: replaces only `prompt_tx` (still String). `reply_rx` lives
         // on the App side and gets dropped naturally when AcpChannelClient is
         // dropped — no manual swap needed.
@@ -1418,7 +1483,7 @@ fn short_err(e: &agent_client_protocol::Error) -> String {
 fn run_worker(
     parts: Vec<String>,
     cwd: PathBuf,
-    prompt_rx: std_mpsc::Receiver<String>,
+    prompt_rx: std_mpsc::Receiver<PromptPayload>,
     reply_tx: std_mpsc::Sender<ReplyEvent>,
     ready_tx: std_mpsc::Sender<io::Result<()>>,
     connected: Arc<AtomicBool>,
@@ -1482,7 +1547,7 @@ fn run_worker(
 async fn worker_async(
     parts: Vec<String>,
     cwd: PathBuf,
-    prompt_rx: std_mpsc::Receiver<String>,
+    prompt_rx: std_mpsc::Receiver<PromptPayload>,
     reply_tx: std_mpsc::Sender<ReplyEvent>,
     ready_tx: std_mpsc::Sender<io::Result<()>>,
     connected: Arc<AtomicBool>,
@@ -1599,7 +1664,7 @@ async fn worker_async(
 
     // 3) Bridge the std mpsc prompt channel into a tokio mpsc the async
     //    driver loop can await on. spawn_blocking holds the std recv() call.
-    let (async_prompt_tx, mut async_prompt_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (async_prompt_tx, mut async_prompt_rx) = tokio::sync::mpsc::unbounded_channel::<PromptPayload>();
     let bridge_task = tokio::task::spawn_blocking(move || {
         while let Ok(prompt) = prompt_rx.recv() {
             if async_prompt_tx.send(prompt).is_err() {
@@ -2100,11 +2165,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                             // is polled. Only the RESPONSE await is deferred.
                                             let first = agent_client_protocol::schema::PromptRequest::new(
                                                 session_id.clone(),
-                                                vec![ContentBlock::Text(
-                                                    agent_client_protocol::schema::TextContent::new(
-                                                        prompt.clone(),
-                                                    ),
-                                                )],
+                                                prompt.content_blocks(),
                                             );
                                             let mut resp_fut = connection.send_request(first).block_task();
                                             inflight.push(async move {
@@ -2137,11 +2198,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                                                                 }
                                                                 let req = agent_client_protocol::schema::PromptRequest::new(
                                                                     session_id.clone(),
-                                                                    vec![ContentBlock::Text(
-                                                                        agent_client_protocol::schema::TextContent::new(
-                                                                            prompt.clone(),
-                                                                        ),
-                                                                    )],
+                                                                    prompt.content_blocks(),
                                                                 );
                                                                 resp_fut = connection.send_request(req).block_task();
                                                                 continue;
@@ -2208,11 +2265,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         loop {
                             let req = agent_client_protocol::schema::PromptRequest::new(
                                 session_id.clone(),
-                                vec![ContentBlock::Text(
-                                    agent_client_protocol::schema::TextContent::new(
-                                        prompt.clone(),
-                                    ),
-                                )],
+                                prompt.content_blocks(),
                             );
                             // Await the prompt response (turn end), but stay
                             // responsive to a cancel request: on the first
@@ -2339,6 +2392,74 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::process::Stdio;
+
+    /// A prompt carrying image attachments is turned into a mixed content-block
+    /// vector: the text block first, then one `ContentBlock::Image` per
+    /// attachment carrying the base64 data + mime type the agent reads. This is
+    /// the exact payload `session/prompt` sends. Negative control: drop the
+    /// `for img in …` push in `content_blocks` and the image assertions fail
+    /// (only the text block survives).
+    #[test]
+    fn prompt_payload_builds_text_then_image_blocks() {
+        let payload = PromptPayload {
+            text: "look at this".into(),
+            images: vec![
+                ImageAttachment {
+                    data: "AAAA".into(),
+                    mime_type: "image/png".into(),
+                },
+                ImageAttachment {
+                    data: "BBBB".into(),
+                    mime_type: "image/jpeg".into(),
+                },
+            ],
+        };
+        let blocks = payload.content_blocks();
+        assert_eq!(blocks.len(), 3, "text + 2 images");
+        match &blocks[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "look at this"),
+            other => panic!("expected text block first, got {other:?}"),
+        }
+        match &blocks[1] {
+            ContentBlock::Image(img) => {
+                assert_eq!(img.data, "AAAA");
+                assert_eq!(img.mime_type, "image/png");
+            }
+            other => panic!("expected image block, got {other:?}"),
+        }
+        match &blocks[2] {
+            ContentBlock::Image(img) => {
+                assert_eq!(img.data, "BBBB");
+                assert_eq!(img.mime_type, "image/jpeg");
+            }
+            other => panic!("expected image block, got {other:?}"),
+        }
+    }
+
+    /// An image-only prompt (no typed text) still yields exactly the image
+    /// block(s) — no stray empty text block padding the request.
+    #[test]
+    fn prompt_payload_image_only_omits_empty_text_block() {
+        let payload = PromptPayload {
+            text: String::new(),
+            images: vec![ImageAttachment {
+                data: "ZZ".into(),
+                mime_type: "image/png".into(),
+            }],
+        };
+        let blocks = payload.content_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Image(_)));
+    }
+
+    /// A fully empty payload still produces the single empty text block ACP
+    /// requires (at least one block per `session/prompt`).
+    #[test]
+    fn prompt_payload_empty_yields_one_text_block() {
+        let blocks = PromptPayload::default().content_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Text(_)));
+    }
 
     /// The orphan reaper only targets adapters whose parent is PID 1 (the spawner
     /// died) AND whose command matches an adapter needle — so it can never kill a

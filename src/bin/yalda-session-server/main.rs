@@ -21,7 +21,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use yalda::acp_channel::{
-    AgentSpawner, AgentTransport, PermissionMode, RealAgentSpawner, TransportHandle, YaldaFrontend,
+    AgentSpawner, AgentTransport, ImageAttachment, PermissionMode, PromptPayload, RealAgentSpawner,
+    TransportHandle, YaldaFrontend,
 };
 use yalda::session_proto::*;
 
@@ -142,6 +143,7 @@ enum Command {
     Prompt {
         sid: ServerSessionId,
         text: String,
+        images: Vec<ImageAttachment>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     /// Headless "start-work" enqueue (ADR-0015): same as `Prompt` but with NO
@@ -307,7 +309,7 @@ struct ManagedSession {
     forwarder: Option<ForwarderProgress>,
     /// Prompts that arrived before the ACP subprocess finished spawning.
     /// Drained in submission order once `channel` becomes `Some`.
-    pending_prompts: Vec<String>,
+    pending_prompts: Vec<PromptPayload>,
     /// Every notification ever broadcast for this session, so a
     /// re-attaching GUI can replay the full transcript.
     ///
@@ -634,8 +636,9 @@ impl ManagedSession {
     ) -> Vec<(String, String)> {
         handle.set_permission_mode(self.permission_mode);
         let mut undelivered: Vec<(String, String)> = Vec::new();
-        for text in std::mem::take(&mut self.pending_prompts) {
-            if let Err(e) = handle.send(&text) {
+        for payload in std::mem::take(&mut self.pending_prompts) {
+            let text = payload.text.clone();
+            if let Err(e) = handle.send_payload(payload) {
                 tracing::error!(error = %e, "queued prompt failed to flush — notifying submitter");
                 undelivered.push((
                     text,
@@ -856,11 +859,17 @@ impl SessionManager {
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
-    async fn send_prompt(&self, sid: &str, text: &str) -> Result<(), String> {
+    async fn send_prompt(
+        &self,
+        sid: &str,
+        text: &str,
+        images: Vec<ImageAttachment>,
+    ) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::Prompt {
             sid: sid.to_string(),
             text: text.to_string(),
+            images,
             reply,
         });
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
@@ -1143,8 +1152,13 @@ impl Manager {
             Command::Detach { sid, reply } => {
                 let _ = reply.send(self.do_detach(&sid));
             }
-            Command::Prompt { sid, text, reply } => {
-                let _ = reply.send(self.do_prompt(&sid, &text));
+            Command::Prompt {
+                sid,
+                text,
+                images,
+                reply,
+            } => {
+                let _ = reply.send(self.do_prompt(&sid, &text, images));
             }
             Command::AdminPrompt {
                 session_id,
@@ -1152,7 +1166,7 @@ impl Manager {
                 reply,
             } => {
                 // Ungated: enqueue directly, no owner check (ADR-0015).
-                let _ = reply.send(self.enqueue_prompt(&session_id, &text));
+                let _ = reply.send(self.enqueue_prompt(&session_id, &text, Vec::new()));
             }
             Command::Cancel { sid, reply } => {
                 let _ = reply.send(self.do_cancel(&sid));
@@ -1475,15 +1489,25 @@ impl Manager {
         Ok(())
     }
 
-    fn do_prompt(&mut self, session_id: &str, text: &str) -> Result<(), String> {
-        self.enqueue_prompt(session_id, text)
+    fn do_prompt(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        images: Vec<ImageAttachment>,
+    ) -> Result<(), String> {
+        self.enqueue_prompt(session_id, text, images)
     }
 
     /// Log the user's prompt durably, then hand it to the live channel (or queue
     /// it if the agent is still spawning). Shared by the GUI [`do_prompt`] path
     /// and the headless [`Command::AdminPrompt`] path (ADR-0015) — under strict
     /// 1:1 there is no owner gate, so the two are identical.
-    fn enqueue_prompt(&mut self, session_id: &str, text: &str) -> Result<(), String> {
+    fn enqueue_prompt(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        images: Vec<ImageAttachment>,
+    ) -> Result<(), String> {
         let session = self
             .sessions
             .get_mut(session_id)
@@ -1503,10 +1527,16 @@ impl Manager {
         session.record_agent(yalda::agent_event::AgentEventKind::UserMessage {
             text: text.to_string(),
         });
+        let payload = PromptPayload {
+            text: text.to_string(),
+            images,
+        };
         match session.channel.as_ref() {
-            Some(channel) => channel.send(text).map_err(|e| format!("send failed: {e}")),
+            Some(channel) => channel
+                .send_payload(payload)
+                .map_err(|e| format!("send failed: {e}")),
             None => {
-                session.pending_prompts.push(text.to_string());
+                session.pending_prompts.push(payload);
                 Ok(())
             }
         }
@@ -2047,8 +2077,12 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                 }
             }
 
-            Request::Prompt { session_id, text } => {
-                match manager.send_prompt(&session_id, &text).await {
+            Request::Prompt {
+                session_id,
+                text,
+                images,
+            } => {
+                match manager.send_prompt(&session_id, &text, images).await {
                     Ok(()) => Response::Ok {
                         data: ResponseData::Ack,
                     },

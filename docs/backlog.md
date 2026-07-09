@@ -15,6 +15,28 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ## Features
 
+- **Image paste into a session** — `NEEDS-RUNTIME` (built 2026-07-09, branch
+  `image-paste`, NOT yet merged; INV-UX-21). Cmd+V of a clipboard image stages it
+  as a pending attachment (chip above the compose), sent on submit as an ACP
+  `ContentBlock::Image` (both submit paths) with a `🖼 image N (EXT)` transcript
+  marker; attachments clear after send and are ephemeral (not persisted). Wire
+  carries `Request::Prompt.images` additively. Headless-tested end-to-end (paste
+  staging, mixed content-block build, wire round-trip, real worksheet submit; 2
+  negative controls RED). Human check (harness gap 2, live loop): the
+  `claude-agent-acp` adapter actually advertises the `image` prompt capability +
+  reads the pasted image — NOT gated on the capability yet, so verify it doesn't
+  error; gap 1 for the chip glyphs. See `docs/worklog/2026-07-09-image-paste.md`.
+- **Session recap panel** — `NEEDS-RUNTIME` (built 2026-07-09, on `main`
+  `36bdc8a`; INV-UX-20). Agent space-menu `R` ("recap this session") generates an
+  LLM prose summary of the focused session on a THROWAWAY isolated
+  `AcpChannelClient` subprocess and pins it at the top of the jump panel, above
+  the session list; re-runnable (`⟳`), dismissed (`✕`), pinned until dismissed.
+  Reducer + panel + token-guard supersession are headless-tested (7 `recap_*`, 2
+  negative controls RED). Human check (harness gap 2, live subprocess): with the
+  agent on PATH, `R` streams a summary in, `⟳` re-runs, `✕` dismisses, and the
+  throwaway worker EXITS (no lingering `claude-agent-acp`); gap 1 for the panel's
+  exact look. The `spawn_recap_worker`→pump wiring is the only untested seam
+  (`cfg(test)`-skipped).
 - **Jump panel (root-level navigator)** — `NEEDS-RUNTIME` (built 2026-06-22,
   merged `e3fa254`/`720b7a0`; spec `spec-jump-panel.md`, ADR-0021). Always-visible
   left sidebar (Pinned placeholder · Workspaces · Agent sessions), `cmd-j`/`?`

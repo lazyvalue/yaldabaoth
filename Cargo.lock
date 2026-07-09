@@ -7920,6 +7920,7 @@ name = "yalda"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
+ "base64",
  "clap",
  "criterion",
  "dirs 6.0.0",

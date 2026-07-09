@@ -143,7 +143,10 @@ fn fake_handle_shares_state_with_controls() {
     // the prompt_tx/prompt_rx pair is wired (needed to assert admin_prompt
     // actually reached the agent).
     handle.send("drive a turn").expect("send on live handle");
-    assert_eq!(controls.try_recv_prompt().as_deref(), Some("drive a turn"));
+    assert_eq!(
+        controls.try_recv_prompt().map(|p| p.text).as_deref(),
+        Some("drive a turn")
+    );
 
     // permission_mode is a shared atomic: actor writes via handle, agent reads.
     assert_eq!(controls.permission_mode(), DEFAULT_PERMISSION_MODE);

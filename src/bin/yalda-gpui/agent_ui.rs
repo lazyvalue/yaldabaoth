@@ -3655,12 +3655,20 @@ impl YaldaGpuiView {
             return;
         }
 
-        // Read the compose draft + validate sendability inside one session
-        // borrow. `Some(None)` ⇒ early-out with a status already set; `None` ⇒
-        // no session (no status); `Some(Some(text))` ⇒ proceed.
-        let text = match self.with_session(id, cx, |claude| {
+        // Read the compose draft (+ any staged image attachments) and validate
+        // sendability inside one session borrow. `Some(None)` ⇒ early-out with a
+        // status already set; `None` ⇒ no session (no status); `Some(Some(..))`
+        // ⇒ proceed. An image-only prompt (no text) IS sendable.
+        let (text, images) = match self.with_session(id, cx, |claude| {
             let text = claude.input_surface.compose().text();
-            if text.trim().is_empty() {
+            let images: Vec<yalda::acp_channel::ImageAttachment> = claude
+                .input_surface
+                .compose()
+                .pending_images
+                .iter()
+                .map(|p| p.to_attachment())
+                .collect();
+            if text.trim().is_empty() && images.is_empty() {
                 claude.status = Some("nothing to send".into());
                 return Some(None);
             }
@@ -3668,9 +3676,9 @@ impl YaldaGpuiView {
                 claude.status = Some("no channel attached".into());
                 return Some(None);
             }
-            Some(Some(text))
+            Some(Some((text, images)))
         }) {
-            Some(Some(Some(text))) => text,
+            Some(Some(Some(pair))) => pair,
             Some(Some(None)) => {
                 cx.notify();
                 return;
@@ -3708,7 +3716,7 @@ impl YaldaGpuiView {
                     .flatten()
             })
             .flatten();
-        if self.send_prompt_to_session(id, &text, anchor, cx) {
+        if self.send_prompt_to_session(id, &text, &images, anchor, cx) {
             self.with_session(id, cx, |claude| {
                 // Reset the compose, PRESERVING placement (Model C §4.1).
                 let mode = claude.input_surface.mode;
@@ -3745,10 +3753,22 @@ impl YaldaGpuiView {
         server_sid: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let blocks = self
+        let mut blocks = self
             .agent_read(cx, |c| c.collect_you_blocks())
             .unwrap_or_default();
-        if blocks.is_empty() {
+        // Staged image attachments ride the worksheet submit too (they live on
+        // the same compose the You-blocks are collected from).
+        let images: Vec<yalda::acp_channel::ImageAttachment> = self
+            .agent_read(cx, |c| {
+                c.input_surface
+                    .compose()
+                    .pending_images
+                    .iter()
+                    .map(|p| p.to_attachment())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if blocks.is_empty() && images.is_empty() {
             if let Some(mut c) = self.agent_mut(cx) {
                 c.status = Some("nothing to send".into());
             }
@@ -3756,7 +3776,7 @@ impl YaldaGpuiView {
             return;
         }
         // `/clear` escape hatch (only when it is the sole content).
-        if blocks.len() == 1 && blocks[0].1.trim() == "/clear" {
+        if blocks.len() == 1 && images.is_empty() && blocks[0].1.trim() == "/clear" {
             self.clear_agent_session(cx);
             return;
         }
@@ -3779,17 +3799,27 @@ impl YaldaGpuiView {
         let sent = if let Some(sid) = &server_sid {
             self.session_server
                 .as_ref()
-                .and_then(|s| s.prompt(sid, &combined).ok())
+                .and_then(|s| s.prompt_with_images(sid, &combined, images.clone()).ok())
                 .is_some()
         } else {
+            let payload = yalda::acp_channel::PromptPayload {
+                text: combined.clone(),
+                images: images.clone(),
+            };
             self.with_session_silent(id, cx, |c| {
                 c.channel
                     .as_mut()
-                    .map(|ch| ch.send(&combined).is_ok())
+                    .map(|ch| ch.send_payload(payload).is_ok())
                     .unwrap_or(false)
             })
             .unwrap_or(false)
         };
+        // A marker block (one 🖼 line per attachment) is frozen alongside the
+        // typed blocks so the sent images show in the transcript. The image bytes
+        // went to the agent as content blocks, not as this text.
+        if !images.is_empty() {
+            blocks.push((None, image_turn_marker("", &images)));
+        }
         if sent {
             self.with_session(id, cx, |c| {
                 // Mint ONE turn for the whole submit; freeze each block in place
@@ -3826,6 +3856,7 @@ impl YaldaGpuiView {
         &mut self,
         id: SessionId,
         text: &str,
+        images: &[yalda::acp_channel::ImageAttachment],
         anchor: Option<usize>,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -3834,18 +3865,27 @@ impl YaldaGpuiView {
         let sent = if let Some(sid) = &server_sid {
             self.session_server
                 .as_ref()
-                .and_then(|s| s.prompt(sid, &prompt_body).ok())
+                .and_then(|s| s.prompt_with_images(sid, &prompt_body, images.to_vec()).ok())
                 .is_some()
         } else {
+            let payload = yalda::acp_channel::PromptPayload {
+                text: prompt_body.clone(),
+                images: images.to_vec(),
+            };
             self.with_session_silent(id, cx, |claude| {
                 claude
                     .channel
                     .as_mut()
-                    .map(|ch| ch.send(&prompt_body).is_ok())
+                    .map(|ch| ch.send_payload(payload).is_ok())
                     .unwrap_or(false)
             })
             .unwrap_or(false)
         };
+        // The transcript shows the text the user typed plus a marker line per
+        // pasted image (the image bytes aren't in the transcript — they went to
+        // the agent as content blocks). Image-only prompts still show a marker so
+        // the sent turn is visible.
+        let display_text = image_turn_marker(text, images);
         if sent {
             self.with_session(id, cx, |claude| {
                 // `LocalSubmit` always inserts + records so the stream echo that
@@ -3856,12 +3896,12 @@ impl YaldaGpuiView {
                 match anchor {
                     Some(after_line) => claude.insert_user_turn_at(
                         after_line,
-                        text,
+                        &display_text,
                         yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
                         false,
                     ),
                     None => claude.insert_user_turn(
-                        text,
+                        &display_text,
                         yalda::agent_transcript::UserTurnOrigin::LocalSubmit,
                         false,
                     ),
@@ -4358,6 +4398,20 @@ impl YaldaGpuiView {
             return;
         }
 
+        // Cmd+V into the compose. If the clipboard holds an image, stage it as a
+        // pending attachment (sent as an ACP `ContentBlock::Image` on submit)
+        // instead of typing garbage; otherwise fall back to a text paste. Routed
+        // to the compose in both placements (input always targets the compose,
+        // INV-1). Cmd chords are otherwise swallowed by `dispatch_insert_core`,
+        // so this is the only place Cmd+V reaches the compose.
+        if press.key == Key::Char('v')
+            && press.modifiers.contains(KMods::PLATFORM)
+            && !press.modifiers.contains(KMods::CONTROL)
+        {
+            self.paste_into_compose(cx);
+            return;
+        }
+
         // Model C: input routes to the compose buffer in both placements; the
         // transcript is read-only in both (INV-1).
 
@@ -4644,4 +4698,98 @@ impl YaldaGpuiView {
             }
         }
     }
+
+    /// Cmd+V into the compose. Reads GPUI's clipboard (which carries images, not
+    /// just text — unlike the `pbpaste` text path). An image entry is staged as
+    /// a `PendingImage` attachment (rendered as a chip, sent as an ACP
+    /// `ContentBlock::Image` on submit); otherwise the clipboard text is pasted
+    /// into the compose editor. Multiple image entries stage multiple chips.
+    pub(crate) fn paste_into_compose(&mut self, cx: &mut Context<Self>) {
+        let item = cx.read_from_clipboard();
+        let mut staged = 0usize;
+        if let Some(item) = &item {
+            for entry in item.entries() {
+                if let gpui::ClipboardEntry::Image(img) = entry
+                    && let Some(mut pending) = pending_image_from_clipboard(img)
+                    && let Some(mut c) = self.agent_mut(cx)
+                {
+                    let cb = c.input_surface.compose_mut();
+                    let n = cb.pending_images.len() + 1;
+                    pending.label = format!("image {n} ({})", image_ext(&pending.mime_type));
+                    cb.pending_images.push(pending);
+                    staged += 1;
+                }
+            }
+        }
+        if staged == 0 {
+            // No image on the clipboard — ordinary text paste into the compose.
+            if let Some(text) = item.as_ref().and_then(|i| i.text())
+                && let Some(mut c) = self.agent_mut(cx)
+            {
+                let cb = c.input_surface.compose_mut();
+                Self::put_text(&mut cb.editor, &text, false);
+            }
+        } else if let Some(mut c) = self.agent_mut(cx) {
+            c.status = Some(
+                format!(
+                    "{staged} image{} attached",
+                    if staged == 1 { "" } else { "s" }
+                )
+                .into(),
+            );
+        }
+        cx.notify();
+    }
+}
+
+/// Encode a clipboard image into a [`PendingImage`]: standard-base64 of the raw
+/// encoded bytes (already PNG/JPEG/etc. — GPUI hands over the file bytes, not a
+/// decoded bitmap) plus its mime type. `None` for an empty payload.
+pub(crate) fn pending_image_from_clipboard(img: &gpui::Image) -> Option<PendingImage> {
+    use base64::Engine;
+    let bytes = img.bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(PendingImage {
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        mime_type: img.format().mime_type().to_string(),
+        label: String::new(),
+    })
+}
+
+/// The transcript display text for a submitted turn that carried pasted images:
+/// the typed text (if any) followed by one `🖼 image N (EXT)` marker line per
+/// attachment. With no images this is just `text`. The image bytes never enter
+/// the transcript — they go to the agent as content blocks — so the marker is
+/// the sole record that the turn included images.
+pub(crate) fn image_turn_marker(
+    text: &str,
+    images: &[yalda::acp_channel::ImageAttachment],
+) -> String {
+    if images.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    if !text.is_empty() {
+        out.push_str(text);
+        out.push('\n');
+    }
+    for (i, img) in images.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("🖼 image {} ({})", i + 1, image_ext(&img.mime_type)));
+    }
+    out
+}
+
+/// Short uppercase tag for a chip label, e.g. `"image/png" → "PNG"`.
+pub(crate) fn image_ext(mime_type: &str) -> String {
+    mime_type
+        .rsplit('/')
+        .next()
+        .unwrap_or("img")
+        .trim_start_matches("x-")
+        .to_ascii_uppercase()
 }

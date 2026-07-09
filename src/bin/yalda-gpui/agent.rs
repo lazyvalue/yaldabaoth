@@ -2093,6 +2093,31 @@ pub(crate) struct Compose {
     /// the whole-window `viewport_width_px`, which over-counts by the split tree
     /// + sidebars + padding and would itself strand the caret (review B1).
     pub(crate) bounds: std::rc::Rc<std::cell::Cell<(f32, f32, f32, f32)>>,
+    /// Pasted image attachments staged for the next submit (spec: image paste).
+    /// Filled by the Cmd+V handler when the clipboard holds an image; rendered
+    /// as chips above the compose box; drained into the outgoing prompt on
+    /// submit and cleared. Ephemeral — never persisted with the draft.
+    pub(crate) pending_images: Vec<PendingImage>,
+}
+
+/// One clipboard-pasted image staged on the compose box. `data` is standard
+/// base64 of the encoded bytes (PNG), `mime_type` e.g. `"image/png"`; `label`
+/// is a short human tag shown on the chip (e.g. `"image 1 (PNG)"`).
+#[derive(Clone, Debug)]
+pub(crate) struct PendingImage {
+    pub(crate) data: String,
+    pub(crate) mime_type: String,
+    pub(crate) label: String,
+}
+
+impl PendingImage {
+    /// Convert to the wire/channel attachment type.
+    pub(crate) fn to_attachment(&self) -> yalda::acp_channel::ImageAttachment {
+        yalda::acp_channel::ImageAttachment {
+            data: self.data.clone(),
+            mime_type: self.mime_type.clone(),
+        }
+    }
 }
 
 /// Conservative monospace column advance for the compose grid, in px. Set equal
@@ -2118,6 +2143,7 @@ impl Compose {
             list: ScrollAnchoredList::new(gpui::ListAlignment::Top, gpui::px(18.0)),
             window: std::cell::Cell::new(ComposeWindow::default()),
             bounds: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0, 0.0, 0.0))),
+            pending_images: Vec::new(),
         }
     }
 

@@ -5638,6 +5638,62 @@ fn boot_worksheet_nav(
     (view, vcx)
 }
 
+/// INV-UX-21: Cmd+V with an image on the clipboard stages it as a pending
+/// attachment on the compose (rather than typing garbage), base64-encoded with
+/// its mime type — the payload that becomes an ACP `ContentBlock::Image`. Drives
+/// the REAL key handler (`handle_claude_key` → `paste_into_compose`) against the
+/// REAL test-platform clipboard.
+///
+/// Negative control: delete the `cb.pending_images.push(pending)` in
+/// `paste_into_compose` and the staged-count assert fails RED (nothing staged).
+#[gpui::test]
+fn image_paste_stages_pending_attachment(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    // A distinctive fake PNG byte payload on the clipboard.
+    let png: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
+    {
+        let png = png.clone();
+        view.update(vcx, |_, cx| {
+            let img = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
+            cx.write_to_clipboard(gpui::ClipboardItem::new_image(&img));
+        });
+    }
+    // Cmd+V through the real key path.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_cmd_key("v"), w, cx));
+    vcx.run_until_parked();
+
+    let staged = view
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| {
+                c.input_surface
+                    .compose()
+                    .pending_images
+                    .iter()
+                    .map(|p| (p.mime_type.clone(), p.data.clone(), p.label.clone()))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .expect("session");
+    assert_eq!(staged.len(), 1, "Cmd+V with a clipboard image stages one attachment");
+    assert_eq!(staged[0].0, "image/png", "mime type carried from the clipboard format");
+    assert!(staged[0].2.contains("PNG"), "chip label names the format: {}", staged[0].2);
+    // The base64 payload decodes back to the exact bytes the agent will read.
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&staged[0].1)
+        .expect("valid base64");
+    assert_eq!(decoded, png, "the staged data round-trips to the original image bytes");
+
+    // The compose editor stayed empty — Cmd+V did NOT type the 'v' or paste junk.
+    let compose_text = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().text()))
+        .expect("session");
+    assert!(
+        compose_text.trim().is_empty(),
+        "an image paste must not put text in the compose; got {compose_text:?}"
+    );
+}
+
 /// Boot a REAL worksheet session backed by an in-process test channel (NO server
 /// sid) so a real `submit` takes the `channel.send()==Ok` path and drives the
 /// production mid-turn transition — the seam that closes verification gap #2 for
@@ -5697,6 +5753,88 @@ fn worksheet_real_submit(
     });
     view.update(vcx, |v, cx| v.submit_agent(cx));
     vcx.run_until_parked();
+}
+
+/// INV-UX-21 (end-to-end, real submit path): a pasted image staged on the
+/// compose rides a REAL worksheet submit — it reaches the channel as a
+/// `PromptPayload` carrying the image attachment, the transcript records a
+/// `🖼 image N (EXT)` marker for it, and the staged attachment clears after send.
+/// Drives `handle_claude_key` (Cmd+V) → `submit_agent` → `submit_worksheet_blocks`
+/// → `channel.send_payload` against the in-process test channel, then reads the
+/// payload back off `TestChannelControls::try_recv_prompt`.
+///
+/// Negative controls: (a) drop `images` from the worksheet `PromptPayload` and
+/// the `payload.images` assert fails; (b) remove the marker-block push and the
+/// transcript-contains assert fails; (c) the `pending_images` clear rides
+/// `InputSurface::new` on the reset — leave a stale vec and the cleared assert
+/// fails.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn image_submit_sends_block_marks_transcript_and_clears(cx: &mut TestAppContext) {
+    let (view, vcx, _id, controls) = boot_worksheet_channel(cx);
+
+    // Stage a pasted PNG via the real Cmd+V path (in worksheet nav).
+    let png: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 7, 7, 7, 7];
+    {
+        let png = png.clone();
+        view.update(vcx, |_, cx| {
+            let img = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
+            cx.write_to_clipboard(gpui::ClipboardItem::new_image(&img));
+        });
+    }
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_cmd_key("v"), w, cx));
+    vcx.run_until_parked();
+
+    // Open a You-block, type text, submit through the REAL path.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| {
+            for ch in "hey".chars() {
+                c.input_surface.compose_mut().editor.insert_char(ch);
+            }
+        });
+    });
+    view.update(vcx, |v, cx| v.submit_agent(cx));
+    vcx.run_until_parked();
+
+    // 1. The channel received the image as a real attachment on the prompt.
+    let payload = controls
+        .prompt_rx
+        .try_recv()
+        .expect("a prompt reached the channel");
+    assert_eq!(payload.text, "hey", "the typed text was sent");
+    assert_eq!(
+        payload.images.len(),
+        1,
+        "the pasted image rode the submit as an attachment"
+    );
+    assert_eq!(payload.images[0].mime_type, "image/png");
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&payload.images[0].data)
+        .expect("valid base64");
+    assert_eq!(decoded, png, "the agent receives the exact image bytes");
+
+    // 2. The transcript records a marker for the sent image.
+    let transcript = view
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.editor.document().full_text())
+        })
+        .expect("session");
+    assert!(
+        transcript.contains("🖼 image 1 (PNG)"),
+        "transcript must mark the sent image; got:\n{transcript}"
+    );
+
+    // 3. The staged attachment cleared after a successful submit.
+    let remaining = view
+        .update(vcx, |v, cx| {
+            v.agent_read(cx, |c| c.input_surface.compose().pending_images.len())
+        })
+        .expect("session");
+    assert_eq!(remaining, 0, "attachments clear after a successful submit");
 }
 
 /// ACCEPTANCE (real-state, gap #2 closed): reach mid-turn through the REAL submit

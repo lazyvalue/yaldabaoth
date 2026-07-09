@@ -867,7 +867,7 @@ impl YaldaGpuiView {
     /// text in the system clipboard with no linewise-vs-charwise register
     /// metadata. Leaves the cursor on the last inserted character (vim
     /// convention). Returns false if there was nothing to insert.
-    fn put_text<E: EditOps>(editor: &mut E, text: &str, before: bool) -> bool {
+    pub(crate) fn put_text<E: EditOps>(editor: &mut E, text: &str, before: bool) -> bool {
         if text.is_empty() {
             return false;
         }

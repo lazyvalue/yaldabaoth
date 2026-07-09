@@ -920,6 +920,56 @@ gap 2).
 drives the REAL menu-dispatched entry point / reducer methods; negative controls
 documented at the tests.
 
+### INV-UX-21 — A pasted image is staged, shown, and sent as a content block
+
+**Statement.** Cmd+V into an agent tile whose clipboard holds an image stages
+that image as a **pending attachment** on the compose rather than typing text.
+Three hard properties:
+
+1. **Stage, don't type.** The image is base64-encoded (with its mime type, taken
+   from GPUI's clipboard `ImageFormat`) and pushed to `Compose::pending_images`;
+   the compose editor text is untouched. A clipboard with no image falls back to
+   an ordinary text paste. Image bytes never enter the compose/transcript text.
+2. **Visible before send.** Each staged image renders as a `🖼 <label>` chip
+   above the compose box so the user sees what will go with the next submit.
+3. **Sent as a content block; cleared after.** On submit (both the chatbox/tail
+   path `send_prompt_to_session` and the worksheet path `submit_worksheet_blocks`)
+   the attachments become ACP `ContentBlock::Image`s appended after the text block
+   in the `session/prompt` request — travelling the GUI→session-server wire as
+   `Request::Prompt.images` (additive, `#[serde(default)]`). The transcript
+   records a `🖼 image N (EXT)` marker line for the sent images, and
+   `pending_images` clears on the post-submit compose reset. An image-only prompt
+   (no typed text) is sendable. Attachments are **ephemeral** — not persisted in
+   the WAL, so a resumed transcript shows the marker's text but not the image.
+
+**Applies to.** `agent_ui.rs` — `paste_into_compose` / `pending_image_from_clipboard`
+/ `image_ext` / `image_turn_marker`, `send_prompt_to_session`,
+`submit_worksheet_blocks`; the `PendingImage` model + `Compose::pending_images`
+(`agent.rs`); the chip row in `render_agent` (`screens.rs`); `ImageAttachment` /
+`PromptPayload` + `content_blocks()` (`acp_channel.rs`); `Request::Prompt.images`
+(`session_proto.rs`) threaded through `session_client::prompt_with_images` and the
+session-server prompt path. Chrome-class: the chips render at native size.
+
+**Why.** Pasting a screenshot is the natural way to show the agent something; the
+old paste path was text-only (`pbpaste`), so Cmd+V of an image did nothing useful.
+Staging + a visible chip + an explicit content block keeps the image out of the
+conversation text (which the transcript-ordering invariants protect) while still
+reaching the model.
+
+**Status:** `honored` (headless for the paste-staging, the mixed content-block
+build, the wire round-trip, and the end-to-end worksheet submit; the live
+subprocess loop is the `NEEDS-RUNTIME` gap — dev-system § Verification harness
+gap 2 — and exact chip glyphs/colors are gap 1).
+
+**Enforcement.** `verify_harness.rs`: `image_paste_stages_pending_attachment`
+(real Cmd+V → real test-platform clipboard → staged base64 round-trips; compose
+text stays empty) and `image_submit_sends_block_marks_transcript_and_clears`
+(real submit → `PromptPayload.images` on the channel + transcript marker +
+cleared). `acp_channel.rs`: `prompt_payload_builds_text_then_image_blocks` /
+`_image_only_omits_empty_text_block` / `_empty_yields_one_text_block`.
+`session_proto.rs`: `prompt_deserializes_without_images` / `prompt_round_trips_images`.
+Negative controls documented at each test.
+
 ## Cross-references
 
 - `spec-turn-steering.md` — the full steering design (queue, delivery modes, the
@@ -937,6 +987,13 @@ documented at the tests.
 
 ## Revision history
 
+- 2026-07-09 (2) — Added INV-UX-21: Cmd+V of a clipboard image stages it as a
+  pending attachment (chip above the compose), sent on submit as an ACP
+  `ContentBlock::Image` (both submit paths) with a `🖼` transcript marker;
+  attachments clear after send and are ephemeral (not persisted). Wire carries
+  `Request::Prompt.images` additively. Guards `image_paste_stages_pending_attachment`
+  + `image_submit_sends_block_marks_transcript_and_clears` (verify_harness),
+  `prompt_payload_*` (acp_channel), `prompt_*_images` (session_proto).
 - 2026-07-09 — Added INV-UX-20: a summoned session recap (agent menu `R`) is an
   LLM prose summary pinned INSIDE its agent tile, above the subagents/tasks
   panels, keyed per-session (`recaps: HashMap<SessionId, RecapState>`) so it's

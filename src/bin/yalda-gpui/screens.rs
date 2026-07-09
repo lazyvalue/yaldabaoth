@@ -1317,6 +1317,16 @@ impl YaldaGpuiView {
             // steering box (the idle worksheet draft renders INLINE as the YouBlock,
             // never here). So it never wears the worksheet flush/accent/"You" chrome.
             let is_worksheet = false;
+            // Staged image attachments (pasted via Cmd+V) → chip labels, captured
+            // before the mutable compose borrow below. Rendered as chips above the
+            // box so the user sees what will be sent (INV-UX-21).
+            let pending_image_labels: Vec<SharedString> = c
+                .input_surface
+                .compose()
+                .pending_images
+                .iter()
+                .map(|p| SharedString::from(format!("🖼 {}", p.label)))
+                .collect();
             let tb = c.input_surface.compose_mut();
             // Logical lines shown before the box caps height + scrolls. At/below
             // this the panel renders every line directly (grows to content,
@@ -1577,6 +1587,32 @@ impl YaldaGpuiView {
             // Probe the compose box's OUTER (post-margin) bounds so the harness
             // can prove the placement chrome differs (INV-UX-8): worksheet is
             // flush (full column width, no margin) vs chatbox's inset box.
+            // Image-attachment chips, above the box: one per staged paste, tinted
+            // with the accent so they read as pending payload (INV-UX-21).
+            if !pending_image_labels.is_empty() {
+                let mut chips = div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_1()
+                    .px_4()
+                    .pt_1();
+                for label in pending_image_labels {
+                    chips = chips.child(
+                        div()
+                            .px_2()
+                            .rounded_md()
+                            .bg(compose_panel_bg)
+                            .border_1()
+                            .border_color(compose_cursor_color)
+                            .text_size(px(11.0))
+                            .font_family(compose_code_font.clone())
+                            .text_color(compose_fg)
+                            .child(label),
+                    );
+                }
+                panel = panel.child(probe_bounds("compose-image-chips", chips.into_any_element()));
+            }
             Some(
                 panel
                     .child(separator)
