@@ -1275,7 +1275,9 @@ impl EditorView {
             // TurnId/tool metadata) instead of resetting them.
             core.apply_anchor_shifts(&shifts);
             self.cursor.line = line.min(core.document.line_count().saturating_sub(1));
-            self.cursor.col = col;
+            // `set_col` clears the sticky `desired_col` so the following clamp
+            // restores THIS column, not a stale one from an earlier j/k run.
+            self.cursor.set_col(col);
             self.clamp_cursor_col(core, false);
             core.reparse();
         }
@@ -1291,7 +1293,9 @@ impl EditorView {
             core.lockable_through_line = lockable;
             core.apply_anchor_shifts(&shifts);
             self.cursor.line = line.min(core.document.line_count().saturating_sub(1));
-            self.cursor.col = col;
+            // `set_col` clears the sticky `desired_col` so the following clamp
+            // restores THIS column, not a stale one from an earlier j/k run.
+            self.cursor.set_col(col);
             self.clamp_cursor_col(core, false);
             core.reparse();
         }

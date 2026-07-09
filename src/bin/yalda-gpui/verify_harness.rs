@@ -6390,6 +6390,52 @@ fn focused_in_insert_mode_edit_view_arm(cx: &mut TestAppContext) {
     );
 }
 
+/// Undo restores the caret to the edit's recorded column, NOT a stale sticky
+/// column left over from an earlier j/k run. `undo`/`redo` wrote `cursor.col`
+/// directly, so `clamp_cursor_col`'s `desired_col.unwrap_or` then overrode it.
+/// Drives the REAL `handle_edit_key` path. NEGATIVE CONTROL: change `set_col`
+/// back to a bare `self.cursor.col = col` in `EditorView::undo` → caret lands at
+/// col 6, not col 0.
+#[gpui::test]
+fn undo_restores_recorded_column_not_sticky(cx: &mut TestAppContext) {
+    use crate::EditOps;
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| v.test_open_edit("abcdefghij\nkl\n"));
+    view.update(vcx, |v, _| {
+        v.edit_mut().unwrap().mode = crate::EditMode::Normal;
+        v.edit_mut().unwrap().editor.cursor_set(0, 0);
+    });
+    let key = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, k: &str| {
+        view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_bare_key(k), w, cx));
+    };
+    // Real insert edit at col 0 (undo group recorded there), then build a HIGH
+    // sticky column via a horizontal run + a vertical down/up, then undo.
+    key(&view, vcx, "i"); // insert mode, begin_insert at (0,0)
+    key(&view, vcx, "Z"); // type 'Z' → "Zabcdefghij", caret (0,1)
+    key(&view, vcx, "escape"); // end_insert; caret steps back to (0,0)
+    for _ in 0..6 {
+        key(&view, vcx, "l"); // → col 6 (clears desired_col each step)
+    }
+    key(&view, vcx, "j"); // down to short line → desired_col becomes 6
+    key(&view, vcx, "k"); // back up → caret at (0,6), desired_col still 6
+    key(&view, vcx, "u"); // undo the insert (recorded at col 0)
+    let cur = view.update(vcx, |v, _| v.edit_mut().unwrap().editor.cursor());
+    assert_eq!(
+        (cur.line, cur.col),
+        (0, 0),
+        "undo restores the edit's column (0), not the stale sticky column (6)"
+    );
+}
+
 /// A numeric count prefix repeats a Normal-mode motion: `10j` moves ten lines,
 /// not one. The count used to be taken-and-discarded for every motion except
 /// gg/G. Drives the REAL `handle_edit_key` path (digits accumulate in the

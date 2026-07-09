@@ -17,6 +17,24 @@ impl CursorPos {
         }
     }
 
+    /// Absolute column placement (undo/redo restore, selection anchor, click):
+    /// sets the column and CLEARS the sticky vertical column, so a following
+    /// clamp / j / k uses THIS column rather than a stale `desired_col` left over
+    /// from an earlier vertical run. Writing `cursor.col` directly skips this and
+    /// lets the old sticky column win — the undo-lands-at-the-wrong-column bug.
+    pub fn set_col(&mut self, col: usize) {
+        self.col = col;
+        self.desired_col = None;
+    }
+
+    /// Absolute `(line, col)` placement, clearing the sticky column. See
+    /// [`set_col`](Self::set_col).
+    pub fn set_pos(&mut self, line: usize, col: usize) {
+        self.line = line;
+        self.col = col;
+        self.desired_col = None;
+    }
+
     pub fn move_left(&mut self) {
         if self.col > 0 {
             self.col -= 1;

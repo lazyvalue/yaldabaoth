@@ -847,9 +847,9 @@ trait EditOps: EditAccess {
         *self.view().cursor()
     }
     fn cursor_set(&mut self, line: usize, col: usize) {
-        let c = self.view_mut().cursor_mut();
-        c.line = line;
-        c.col = col;
+        // Absolute placement (selection anchor → insert): clear the sticky
+        // vertical column so a later clamp/j/k doesn't snap to a stale one.
+        self.view_mut().cursor_mut().set_pos(line, col);
     }
     fn cursor_move_left(&mut self) {
         self.view_mut().cursor_mut().move_left();
