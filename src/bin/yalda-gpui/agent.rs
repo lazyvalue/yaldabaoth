@@ -1065,6 +1065,30 @@ pub(crate) fn cap_string_chars(s: &str, max_chars: usize) -> String {
 /// Code/worksheet views, proportional in the WP view); `code_font` is the
 /// fallback `styled_line_element` uses for spans carrying a code background.
 #[allow(clippy::too_many_arguments)]
+/// Which token owns the block caret on a cursor line, and where inside it the
+/// caret splits. Tokens are whitespace-delimited runs; `token_lens` are their
+/// char counts in order. Returns `(token_index, split_point)` — the caret is
+/// drawn before `token[token_index]`'s char at `split_point` — or `None` when
+/// the caret sits past the last char (a trailing EOL beam).
+///
+/// The boundary is `[col_so_far, end)` (half-open, `<` not `<=`): a `cursor_col`
+/// that lands exactly on a token boundary belongs to the FOLLOWING token, so the
+/// caret is drawn ON the first char of the next word — not as a blank box after
+/// the previous one. That off-by-one (`<=`) put a ghost caret before every word
+/// the cursor landed on via `w`/`b` in Normal mode. Pinned by
+/// `caret_token_split_lands_on_word_start`.
+pub(crate) fn caret_token_split(token_lens: &[usize], cursor_col: usize) -> Option<(usize, usize)> {
+    let mut col_so_far = 0usize;
+    for (i, &len) in token_lens.iter().enumerate() {
+        let end = col_so_far + len;
+        if cursor_col >= col_so_far && cursor_col < end {
+            return Some((i, cursor_col - col_so_far));
+        }
+        col_so_far = end;
+    }
+    None
+}
+
 pub(crate) fn build_wrapped_line(
     segs: &[Segment],
     line_str: &str,
@@ -1156,17 +1180,15 @@ pub(crate) fn build_wrapped_line(
     // cursor's column boundary, splitting the containing token if needed.
     let line_chars = line_str.chars().count();
     let cursor_col = cursor_col.min(line_chars);
-    let mut col_so_far = 0usize;
-    let mut caret_emitted = false;
+    let token_lens: Vec<usize> = tokens.iter().map(|(t, _)| t.chars().count()).collect();
+    // Which token owns the caret, and where it splits. `None` ⇒ the caret sits
+    // past the last char (EOL beam / trailing block).
+    let caret_owner = caret_token_split(&token_lens, cursor_col);
 
-    for (text, style) in &tokens {
-        let token_chars = text.chars().count();
-        let token_end_col = col_so_far + token_chars;
-        let caret_in_token =
-            !caret_emitted && cursor_col >= col_so_far && cursor_col <= token_end_col;
+    for (i, (text, style)) in tokens.iter().enumerate() {
+        let owner_split = caret_owner.and_then(|(oi, sp)| (oi == i).then_some(sp));
 
-        if caret_in_token {
-            let split_point = cursor_col - col_so_far;
+        if let Some(split_point) = owner_split {
             let chars: Vec<char> = text.chars().collect();
             let before: String = chars[..split_point].iter().collect();
             if !before.is_empty() {
@@ -1182,7 +1204,6 @@ pub(crate) fn build_wrapped_line(
             }
             let cursor_char = chars.get(split_point).copied().unwrap_or(' ');
             row = row.child(make_caret(mode, cursor_char, cursor_color));
-            caret_emitted = true;
             // After-the-caret: in Normal mode the cursor cell consumed the
             // char at split_point; in Insert mode it's a zero-width beam so
             // the char at split_point still belongs to the after-stream.
@@ -1213,11 +1234,10 @@ pub(crate) fn build_wrapped_line(
                 selection_bg,
             ));
         }
-        col_so_far = token_end_col;
     }
 
     // Cursor sits past the last char (e.g., end-of-line in Insert mode).
-    if !caret_emitted {
+    if caret_owner.is_none() {
         row = row.child(make_caret(mode, ' ', cursor_color));
     }
 

@@ -6390,6 +6390,33 @@ fn focused_in_insert_mode_edit_view_arm(cx: &mut TestAppContext) {
     );
 }
 
+/// The Normal-mode block caret lands ON the char under the cursor, even when the
+/// cursor sits exactly on a word start (a token boundary — where `w`/`b` land).
+/// The old `<=` predicate handed the boundary to the PRECEDING token, drawing a
+/// blank caret box before the word instead of highlighting its first char.
+/// This is the decision function `build_wrapped_line` runs for every cursor row.
+/// NEGATIVE CONTROL: change `<` back to `<=` in `caret_token_split` → the
+/// boundary assertion below flips from token 2 to token 1.
+#[gpui::test]
+fn caret_token_split_lands_on_word_start(_cx: &mut TestAppContext) {
+    // "foo bar" → tokens ["foo"(3), " "(1), "bar"(3)]. Cursor col 4 = the 'b'.
+    let lens = [3usize, 1, 3];
+    assert_eq!(
+        crate::caret_token_split(&lens, 4),
+        Some((2, 0)),
+        "caret on a word start is owned by that word's token at split 0 (the 'b'), \
+         not a blank box after the space"
+    );
+    // Mid-token still resolves inside the token.
+    assert_eq!(crate::caret_token_split(&lens, 1), Some((0, 1)), "col 1 = 2nd char of 'foo'");
+    // On the last char (Normal max) → owned by the last token.
+    assert_eq!(crate::caret_token_split(&lens, 6), Some((2, 2)), "col 6 = 'r' of 'bar'");
+    // Past the last char (EOL beam) → no owner, caller draws a trailing caret.
+    assert_eq!(crate::caret_token_split(&lens, 7), None, "col 7 = EOL, trailing caret");
+    // The space between words is owned by the space token, not the word after.
+    assert_eq!(crate::caret_token_split(&lens, 3), Some((1, 0)), "col 3 = the space itself");
+}
+
 /// Build a Cmd-modified (platform) key-down event — for verifying that unbound
 /// Cmd chords do NOT reach the text buffer.
 fn ws_cmd_key(key: &str) -> gpui::KeyDownEvent {
