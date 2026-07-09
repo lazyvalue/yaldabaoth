@@ -528,10 +528,28 @@ impl YaldaGpuiView {
                 editor.insert_char(' ');
                 editor.insert_char(' ');
             }
+            // Caret motion in insert mode. `insert_mode=true` lets the caret
+            // rest one past EOL (unlike Normal). Shared by the buffer EditView
+            // and the agent compose, so both get identical arrow/Home/End/Delete
+            // behaviour — the "arrows are dead in the message box" bug.
+            Key::Left => editor.cursor_move_left(),
+            Key::Right => editor.move_right_clamped(true),
+            Key::Up => {
+                editor.cursor_move_up();
+                editor.clamp_cursor_col(true);
+            }
+            Key::Down => editor.move_down(true),
+            Key::Home => editor.cursor_move_line_start(),
+            Key::End => editor.move_cursor_line_end(true),
+            Key::Delete => editor.delete_char_at_cursor(),
             Key::Char(c) => {
-                if press.modifiers.contains(KMods::CONTROL) {
-                    // Ignore ctrl-chords in insert mode for the MVP; only
-                    // bare typed chars produce text.
+                if press.modifiers.contains(KMods::CONTROL)
+                    || press.modifiers.contains(KMods::PLATFORM)
+                {
+                    // Ignore ctrl-/cmd-chords in insert mode; only bare typed
+                    // chars produce text. Without the PLATFORM guard an unbound
+                    // Cmd chord (cmd-s, cmd-z) arrives as a bare Char and gets
+                    // typed into the buffer.
                     return;
                 }
                 editor.insert_char(c);
@@ -606,6 +624,14 @@ impl YaldaGpuiView {
             editor.set_extend_mode(false);
             editor.clear_selection();
             return NormalOutcome::Handled;
+        }
+
+        // Unbound Cmd chords (e.g. cmd-a, cmd-d) fall through to here as a bare
+        // Char; without this they'd fire the letter's vim action (cmd-a →
+        // insert-after, cmd-d → delete). Global Cmd bindings are consumed by the
+        // GPUI keymap before on_key_down, so nothing legitimate reaches here.
+        if press.modifiers.contains(KMods::PLATFORM) {
+            return NormalOutcome::Skipped;
         }
 
         let action_name = match keybinds.process_key(press) {

@@ -371,6 +371,11 @@ fn keystroke_to_keypress(ks: &Keystroke) -> KeyPress {
     if ks.modifiers.alt {
         mods |= KMods::ALT;
     }
+    if ks.modifiers.platform {
+        // Cmd on macOS. Preserved so the edit/compose dispatch can reject
+        // unbound Cmd chords instead of typing/executing their bare letter.
+        mods |= KMods::PLATFORM;
+    }
     let key = match ks.key.as_str() {
         "enter" => Key::Enter,
         "tab" if ks.modifiers.shift => Key::BackTab,

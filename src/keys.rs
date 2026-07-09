@@ -38,9 +38,11 @@ pub struct Modifiers(u8);
 
 impl Modifiers {
     pub const NONE: Modifiers = Modifiers(0);
-    pub const CONTROL: Modifiers = Modifiers(0b001);
-    pub const ALT: Modifiers = Modifiers(0b010);
-    pub const SHIFT: Modifiers = Modifiers(0b100);
+    pub const CONTROL: Modifiers = Modifiers(0b0001);
+    pub const ALT: Modifiers = Modifiers(0b0010);
+    pub const SHIFT: Modifiers = Modifiers(0b0100);
+    /// The platform / "super" key — Cmd on macOS, Win/Super elsewhere.
+    pub const PLATFORM: Modifiers = Modifiers(0b1000);
 
     pub fn contains(self, other: Modifiers) -> bool {
         (self.0 & other.0) == other.0
@@ -74,7 +76,7 @@ impl std::ops::BitAnd for Modifiers {
 impl std::ops::Not for Modifiers {
     type Output = Modifiers;
     fn not(self) -> Modifiers {
-        Modifiers((!self.0) & 0b111)
+        Modifiers((!self.0) & 0b1111)
     }
 }
 

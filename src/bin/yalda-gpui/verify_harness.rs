@@ -6390,6 +6390,124 @@ fn focused_in_insert_mode_edit_view_arm(cx: &mut TestAppContext) {
     );
 }
 
+/// Build a Cmd-modified (platform) key-down event — for verifying that unbound
+/// Cmd chords do NOT reach the text buffer.
+fn ws_cmd_key(key: &str) -> gpui::KeyDownEvent {
+    gpui::KeyDownEvent {
+        keystroke: gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            key: key.to_string(),
+            key_char: (key.chars().count() == 1).then(|| key.to_string()),
+        },
+        is_held: false,
+    }
+}
+
+/// Arrow keys / Home / End / forward-Delete move the caret in Insert mode on the
+/// BUFFER edit view. These used to fall through `dispatch_insert_core`'s `_ => {}`
+/// arm and silently no-op — the "arrows are dead in the editor" bug. Drives the
+/// REAL `handle_edit_key` dispatch. NEGATIVE CONTROL: delete the `Key::Left/Right/
+/// Home/End/Delete` arms and every assertion below the first fails.
+#[gpui::test]
+fn edit_view_insert_arrows_move_caret_and_delete(cx: &mut TestAppContext) {
+    use crate::EditOps;
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| v.test_open_edit("hello world\n"));
+    let key = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext, k: &str| {
+        view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_bare_key(k), w, cx));
+    };
+    let col = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| -> usize {
+        view.update(vcx, |v, _| v.edit_mut().unwrap().editor.cursor().col)
+    };
+    key(&view, vcx, "right");
+    key(&view, vcx, "right");
+    key(&view, vcx, "right");
+    assert_eq!(col(&view, vcx), 3, "three Right presses move the caret to col 3");
+    key(&view, vcx, "end");
+    assert_eq!(col(&view, vcx), 11, "End moves to the line end");
+    key(&view, vcx, "home");
+    assert_eq!(col(&view, vcx), 0, "Home moves to col 0");
+    key(&view, vcx, "delete");
+    let text = view.update(vcx, |v, _| v.edit_mut().unwrap().editor.line_text_at_cursor());
+    assert_eq!(
+        text.trim_end(),
+        "ello world",
+        "forward-Delete at col 0 removes the char under the caret"
+    );
+}
+
+/// The SAME `dispatch_insert_core` arrow arms make caret motion work in the AGENT
+/// compose (the message box). Drives the REAL `handle_claude_key` path so the
+/// unification is verified on both surfaces. NEGATIVE CONTROL: without the
+/// `Key::Left` arm the caret stays at col 5.
+#[gpui::test]
+fn compose_insert_arrows_move_caret(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_worksheet_nav(cx);
+    // `i` opens the tail You-block in Insert; then type "hello" through the real
+    // dispatch so the caret advances char-by-char.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    vcx.run_until_parked();
+    for ch in ["h", "e", "l", "l", "o"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
+    }
+    let col = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| -> usize {
+        view.update(vcx, |v, cx| {
+            let id = v.focused_bound_session().expect("bound");
+            v.read_session(id, cx, |c| c.input_surface.compose().editor.cursor().col)
+                .expect("session")
+        })
+    };
+    assert_eq!(col(&view, vcx), 5, "typing 'hello' leaves the caret at col 5");
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("left"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("left"), w, cx));
+    assert_eq!(col(&view, vcx), 3, "two Left presses move the compose caret to col 3");
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("home"), w, cx));
+    assert_eq!(col(&view, vcx), 0, "Home moves the compose caret to col 0");
+}
+
+/// An unbound Cmd chord must NOT type its bare letter into the buffer (cmd-s /
+/// cmd-z reflexes) nor fire the letter's vim action. Drives the REAL
+/// `handle_edit_key`. NEGATIVE CONTROL: drop the `platform` mapping in
+/// `keystroke_to_keypress` (or the PLATFORM guards) → the buffer gains a 'g'.
+#[gpui::test]
+fn cmd_chord_does_not_type_into_edit_buffer(cx: &mut TestAppContext) {
+    use crate::EditOps;
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let fh = cx.focus_handle();
+        fh.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            fh,
+        )
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| v.test_open_edit("hi\n"));
+    // Insert mode: cmd-g must not insert a 'g'.
+    view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_cmd_key("g"), w, cx));
+    let text = view.update(vcx, |v, _| v.edit_mut().unwrap().editor.line_text_at_cursor());
+    assert_eq!(text.trim_end(), "hi", "cmd-g inserts nothing in Insert mode");
+    // Normal mode: cmd-a must not run `insert-after` (which would flip to Insert).
+    view.update(vcx, |v, _| {
+        v.edit_mut().unwrap().mode = crate::EditMode::Normal;
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_edit_key(&ws_cmd_key("a"), w, cx));
+    let mode = view.update(vcx, |v, _| v.edit_mut().unwrap().mode);
+    assert_eq!(mode, crate::EditMode::Normal, "cmd-a does not fire insert-after");
+}
+
 /// `focused_in_insert_mode` for the file BROWSER (`App::Buffer::Picking`): filter mode
 /// IS text entry (leaders suppressed); idle is navigation. Kills the `filter_mode ||
 /// rename.is_some()` mutant surviving in this arm (filter-only ≠ AND of both).
