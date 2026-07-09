@@ -1231,6 +1231,31 @@ impl EditState {
         }
     }
 
+    /// Reconcile the row list to `lines` by splicing ONLY the changed range —
+    /// never `reset()` (that drops scroll + measurements and snaps the viewport
+    /// to the top on every newline edit) — then reveal the caret's line so it
+    /// stays on-screen (INV-UX-1). Shared by the Code and WordProcessor bodies so
+    /// caret-follows-scroll lives in exactly one place, not two verbatim copies.
+    /// Returns the reconciled row count.
+    fn reconcile_and_reveal(
+        &mut self,
+        lines: &std::rc::Rc<Vec<String>>,
+        edit_seq: u64,
+        cursor_line: usize,
+        cursor_col: usize,
+    ) -> usize {
+        self.list.reconcile(lines, edit_seq);
+        let new_count = self.list.len();
+        let anchor = (edit_seq, cursor_line, cursor_col);
+        if self.last_cursor_anchor != Some(anchor) {
+            self.last_cursor_anchor = Some(anchor);
+            if cursor_line < new_count {
+                self.list.state().scroll_to_reveal_item(cursor_line);
+            }
+        }
+        new_count
+    }
+
     /// Per-line WordProcessor typographic kinds, cached on `edit_seq` (mirrors
     /// `highlight_snapshot`/`lines_cache`). `classify_wp_line` carries fence
     /// state so it must be folded in order over the whole buffer; this makes that

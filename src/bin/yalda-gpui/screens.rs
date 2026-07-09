@@ -482,19 +482,8 @@ impl YaldaGpuiView {
         // frames recompute zero. `lines_rc`/`hl_snap` are cheap Rc clones.
         let (lines_rc, hl_snap) = e.highlight_snapshot(&self.theme, &self.syntect_hl);
 
-        // Reconcile the list to the current lines by splicing ONLY the changed
-        // range — never `reset()` (that drops scroll + measurements and snaps
-        // the viewport to the top on every newline edit). Scroll stays anchored;
-        // the reveal below keeps the caret on-screen.
-        e.list.reconcile(&lines_rc, edit_seq);
-        let new_count = e.list.len();
-        let anchor = (edit_seq, cursor_line, cursor_col);
-        if e.last_cursor_anchor != Some(anchor) {
-            e.last_cursor_anchor = Some(anchor);
-            if cursor_line < new_count {
-                e.list.state().scroll_to_reveal_item(cursor_line);
-            }
-        }
+        // Splice the changed range + keep the caret revealed (shared with WP).
+        e.reconcile_and_reveal(&lines_rc, edit_seq, cursor_line, cursor_col);
 
         // Owned snapshots for the `'static` per-row render closure — all cheap
         // (Rc pointer clones / Copy / SharedString refcount bumps).
@@ -603,17 +592,8 @@ impl YaldaGpuiView {
         // virtualized render closure indexes any visible line off the `Rc`.
         let kinds = e.wp_kinds_snapshot(&lines_rc, edit_seq);
 
-        // Reconcile by splicing the changed range (mirrors the Code view); never
-        // `reset()`, which would snap the viewport to the top on newline edits.
-        e.list.reconcile(&lines_rc, edit_seq);
-        let new_count = e.list.len();
-        let anchor = (edit_seq, cursor_line, cursor_col);
-        if e.last_cursor_anchor != Some(anchor) {
-            e.last_cursor_anchor = Some(anchor);
-            if cursor_line < new_count {
-                e.list.state().scroll_to_reveal_item(cursor_line);
-            }
-        }
+        // Splice the changed range + keep the caret revealed (shared with Code).
+        e.reconcile_and_reveal(&lines_rc, edit_seq, cursor_line, cursor_col);
 
         // Owned snapshots for the `'static` per-row closure.
         let base_style = self.theme.paragraph;
