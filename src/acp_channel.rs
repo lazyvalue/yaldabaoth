@@ -2141,6 +2141,14 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                     //     fall through to a fresh session/new. We auto-fall
                     //     back on load failure so a stale or GC'd id never
                     //     leaves the user without an attached agent.
+                    // The model selector (ModelChanged + ModelsAvailable) is
+                    // CAPTURED here, not emitted — on a resume it would land in
+                    // the session/load replay burst and be eaten by the server's
+                    // replay fence (which discards everything before the
+                    // ReplayComplete marker → "models not available yet" on
+                    // resumed sessions). We emit it AFTER the marker below so it
+                    // is always a live, post-fence event.
+                    let mut model_events: Vec<ReplyEvent> = Vec::new();
                     let session_id: SessionId = if let (true, Some(id)) =
                         (supports_load, resume_session_id.as_ref())
                     {
@@ -2170,14 +2178,10 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             Ok(Ok(resp)) => {
                                 acp_debug!("session/load ok: {id}");
                                 // A resumed session re-advertises its model
-                                // selector in the load response; surface it so
-                                // the switcher populates without waiting for a
-                                // config update.
+                                // selector in the load response; capture it for
+                                // post-fence emission (see the note above).
                                 if let Some(opts) = &resp.config_options {
-                                    for ev in model_reply_events(opts) {
-                                        let _ =
-                                            event_tx_for_driver.send(WorkerEvent::Reply(ev));
-                                    }
+                                    model_events = model_reply_events(opts);
                                 }
                                 true
                             }
@@ -2206,10 +2210,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                             {
                                 Ok(r) => {
                                     if let Some(opts) = &r.config_options {
-                                        for ev in model_reply_events(opts) {
-                                            let _ = event_tx_for_driver
-                                                .send(WorkerEvent::Reply(ev));
-                                        }
+                                        model_events = model_reply_events(opts);
                                     }
                                     r.session_id
                                 }
@@ -2231,10 +2232,7 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                         {
                             Ok(r) => {
                                 if let Some(opts) = &r.config_options {
-                                    for ev in model_reply_events(opts) {
-                                        let _ =
-                                            event_tx_for_driver.send(WorkerEvent::Reply(ev));
-                                    }
+                                    model_events = model_reply_events(opts);
                                 }
                                 r.session_id
                             }
@@ -2274,6 +2272,12 @@ IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the 
                     if resume_session_id.is_some() {
                         let _ = event_tx_for_driver
                             .send(WorkerEvent::Reply(ReplyEvent::ReplayComplete));
+                    }
+                    // Emit the model selector AFTER the replay marker so it is a
+                    // live, post-fence event on both fresh and resumed sessions
+                    // (a resume's fence discards everything before the marker).
+                    for ev in model_events {
+                        let _ = event_tx_for_driver.send(WorkerEvent::Reply(ev));
                     }
                     acp_debug!("session ready: {session_id:?}");
                     if let Ok(mut slot) = session_id_slot.lock() {
