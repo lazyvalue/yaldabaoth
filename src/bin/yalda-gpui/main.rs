@@ -4150,6 +4150,46 @@ impl YaldaGpuiView {
     /// <space> — open the content-kind-specific local menu (spec-menu-scopes.md
     /// Behavior 2). Same overlay machinery as the global menu; only the tree
     /// and header differ.
+    /// The agent tile's local menu with a live "switch model" submenu grafted
+    /// on. The base entries are static (`agent_local_menu`); the submenu's
+    /// children are built from the focused session's advertised model list so
+    /// the picker reflects exactly what the agent offers (INV-UX-22). Each
+    /// child dispatches `set-model:<id>`; the active model is marked. Omitted
+    /// entirely when no models are advertised yet (older adapter / pre-attach).
+    fn agent_local_menu_dynamic(&self, cx: &mut Context<Self>) -> Vec<MenuNode> {
+        let mut menu = agent_local_menu();
+        let (models, current) = self
+            .focused_bound_session()
+            .and_then(|id| {
+                self.read_session(id, cx, |s| {
+                    (s.available_models.clone(), s.agent_model.clone())
+                })
+            })
+            .unwrap_or((Vec::new(), None));
+        if models.is_empty() {
+            return menu;
+        }
+        // Keys 1..=9 then 0 for a tenth — same digit convention as the global
+        // workspace menu. More than ten models is not a real case.
+        let keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
+        let children: Vec<MenuNode> = models
+            .iter()
+            .take(keys.len())
+            .enumerate()
+            .map(|(i, m)| {
+                let is_current = current.as_deref() == Some(m.id.as_str());
+                let label = if is_current {
+                    format!("{} ✓", m.label)
+                } else {
+                    m.label.clone()
+                };
+                MenuNode::entry(keys[i], &label, &format!("set-model:{}", m.id))
+            })
+            .collect();
+        menu.push(MenuNode::submenu("M", "switch model", children));
+        menu
+    }
+
     fn open_local_menu_inner(&mut self, cx: &mut Context<Self>) {
         if self.overlay_is_menu() {
             return;
@@ -4160,7 +4200,7 @@ impl YaldaGpuiView {
         let (menu, header) = match self.workspace.focused_content() {
             Some(App::Buffer(BufferApp::Viewing(_))) => (doc_local_menu(), "DOC"),
             Some(App::Buffer(BufferApp::Editing(_))) => (edit_local_menu(), "EDIT"),
-            Some(App::Agent(_)) => (agent_local_menu(), "AGENT"),
+            Some(App::Agent(_)) => (self.agent_local_menu_dynamic(cx), "AGENT"),
             Some(App::Buffer(BufferApp::Picking(_))) => (browser_local_menu(), "BROWSE"),
             Some(App::Linear(_)) => (linear_local_menu(), "LINEAR"),
             Some(App::Keymap(_)) => (keymap_local_menu(), "KEYBINDINGS"),
@@ -4400,6 +4440,17 @@ impl YaldaGpuiView {
     /// require both a `MenuNode::entry` line in `gpui_menu()` and a
     /// match arm here).
     fn dispatch_menu_command(&mut self, name: &str, cx: &mut Context<Self>) {
+        // Dynamic model-switch entries carry the target model id in the command
+        // name (`set-model:<id>`); route them before the static match.
+        if let Some(model_id) = name.strip_prefix("set-model:") {
+            if matches!(
+                self.workspace.focused_content().expect("no focused window"),
+                App::Agent(_)
+            ) {
+                self.set_agent_model(model_id.to_string(), cx);
+            }
+            return;
+        }
         match name {
             "open-browser" => self.open_browser_inner(cx),
             "buffer-list" => self.open_buffer_switcher(cx),

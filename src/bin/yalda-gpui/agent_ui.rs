@@ -1396,6 +1396,7 @@ impl YaldaGpuiView {
             current_plan: None,
             agent_mode: None,
             agent_model: None,
+            available_models: Vec::new(),
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
@@ -2452,6 +2453,13 @@ impl YaldaGpuiView {
                 ReplyEvent::ModelChanged(model_id) => {
                     claude.agent_model = Some(model_id);
                 }
+                ReplyEvent::ModelsAvailable { current, options } => {
+                    // Capture the advertised picklist for the switcher; keep
+                    // `agent_model` in sync (a `ModelChanged` rides alongside,
+                    // but set it here too so the pair is self-consistent).
+                    claude.agent_model = Some(current);
+                    claude.available_models = options;
+                }
                 ReplyEvent::UsageUpdated(snap) => {
                     claude.usage = Some(snap);
                 }
@@ -2992,6 +3000,75 @@ impl YaldaGpuiView {
             if let Some(mut claude) = self.agent_mut(cx) {
                 claude.status = Some("permission mode: no session".into());
             }
+        }
+        cx.notify();
+    }
+
+    /// Switch the focused session's model to `model_id`. Mirrors
+    /// [`cycle_claude_permission_mode`]'s dual path: a server-backed session
+    /// routes through `session_server.set_model` (authority lives in the
+    /// server), a legacy direct-spawn session flips its local channel. The
+    /// agent echoes the refreshed selector back on the reply stream
+    /// (`ModelChanged` + `ModelsAvailable`), which updates the badge; we set an
+    /// optimistic status line here. No-op with a friendly notice if there is no
+    /// live agent to drive.
+    pub(crate) fn set_agent_model(&mut self, model_id: String, cx: &mut Context<Self>) {
+        let snapshot = self
+            .focused_bound_session()
+            .and_then(|id| self.read_session(id, cx, |s| s.channel.is_some()));
+        let has_channel = match snapshot {
+            Some(v) => v,
+            None => {
+                if let Some(mut c) = self.agent_mut(cx) {
+                    c.status = Some("model: no session".into());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        // Human label for the status line, if we know it.
+        let label = self
+            .focused_bound_session()
+            .and_then(|id| {
+                self.read_session(id, cx, |s| {
+                    s.available_models
+                        .iter()
+                        .find(|m| m.id == model_id)
+                        .map(|m| m.label.clone())
+                })
+            })
+            .flatten()
+            .unwrap_or_else(|| model_id.clone());
+
+        let sid = self.active_server_session_id();
+        let server_result: Option<std::io::Result<()>> =
+            match (&sid, self.session_server.as_ref()) {
+                (Some(sid), Some(server)) => Some(server.set_model(sid, &model_id)),
+                _ => None,
+            };
+
+        if let Some(result) = server_result {
+            match result {
+                Ok(()) => {
+                    if let Some(mut claude) = self.agent_mut(cx) {
+                        claude.status = Some(format!("model → {label}").into());
+                    }
+                }
+                Err(e) => {
+                    if let Some(mut claude) = self.agent_mut(cx) {
+                        claude.status = Some(format!("model change failed: {e}").into());
+                    }
+                }
+            }
+        } else if has_channel {
+            if let Some(mut claude) = self.agent_mut(cx) {
+                if let Some(ch) = &claude.channel {
+                    ch.set_model(&model_id);
+                }
+                claude.status = Some(format!("model → {label}").into());
+            }
+        } else if let Some(mut claude) = self.agent_mut(cx) {
+            claude.status = Some("model: no session".into());
         }
         cx.notify();
     }

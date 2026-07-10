@@ -1092,12 +1092,37 @@ impl YaldaGpuiView {
             .or_else(|| c.agent_mode.as_ref().map(|m| m.0.to_string()))
             .or_else(|| c.channel.as_ref().map(|ch| ch.command().to_string()));
         if let Some(m) = model_label {
-            strip = strip.child(
-                div()
-                    .pr_2()
-                    .text_color(strip_dim)
-                    .child(SharedString::from(m)),
-            );
+            // Clickable when the agent advertised a model picklist: a click
+            // opens the local (space) menu where the "switch model" submenu
+            // lives — a mouse affordance for the keyboard `space M` path
+            // (INV-UX-22). Falls back to a plain label otherwise.
+            let has_models = !c.available_models.is_empty();
+            if has_models {
+                strip = strip.child(
+                    div()
+                        .id("agent-model-badge")
+                        .pr_2()
+                        .text_color(strip_dim)
+                        .hover(|s| s.text_color(strip_warm))
+                        .cursor_pointer()
+                        .child(SharedString::from(format!("{m} ▾")))
+                        // Dispatch the OpenLocalMenu action (not `cx.listener` —
+                        // the strip is assembled inside a `session_ent.update`
+                        // closure that already holds `cx`). The agent tile is
+                        // focused (we clicked its badge), so the menu opens on
+                        // the AGENT scope where "switch model" lives.
+                        .on_click(|_ev, window, cx| {
+                            window.dispatch_action(Box::new(crate::OpenLocalMenu), cx);
+                        }),
+                );
+            } else {
+                strip = strip.child(
+                    div()
+                        .pr_2()
+                        .text_color(strip_dim)
+                        .child(SharedString::from(m)),
+                );
+            }
         }
 
         // Permission mode — made prominent so the danger level of the

@@ -511,6 +511,10 @@ pub fn agent_kind_from_reply(reply: &ReplyEvent) -> Option<AgentEventKind> {
         ReplyEvent::PlanUpdated(p) => AgentEventKind::PlanUpdated(p.clone()),
         ReplyEvent::ModeChanged(m) => AgentEventKind::ModeChanged(m.clone()),
         ReplyEvent::ModelChanged(m) => AgentEventKind::ModelChanged(m.clone()),
+        // The available-models picklist is not a transcript fact — it rides the
+        // plain `ReplyEvent` record so the GUI updates its switcher without a
+        // synthetic `AgentEvent`. Return None so the server records it verbatim.
+        ReplyEvent::ModelsAvailable { .. } => return None,
         ReplyEvent::UsageUpdated(s) => AgentEventKind::UsageUpdated(s.clone()),
         ReplyEvent::Notice(msg) => AgentEventKind::Notice {
             // Legacy Notice conflates retry-status with terminal failure; during

@@ -37,6 +37,16 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   throwaway worker EXITS (no lingering `claude-agent-acp`); gap 1 for the panel's
   exact look. The `spawn_recap_worker`→pump wiring is the only untested seam
   (`cfg(test)`-skipped).
+- **Agent model switcher (per session, live)** — `NEEDS-RUNTIME` (built
+  2026-07-09, merged to `main`; INV-UX-22, `docs/projects/agent-model-switch/`).
+  Switch a tile's model (Opus / Fable / Sonnet / …) live from the agent's
+  advertised picklist via ACP `session/set_config_option` — `space M` submenu or
+  the clickable `model ▾` status-strip badge. Full suite green + 3 new headless
+  tests (each negative-controlled) + `#[ignore]` live round-trip. Rebuild +
+  restart to pick it up in the running binary. Follow-up: the `effort` option
+  (low..max) could get the same treatment. Human check: the badge shows `▾` +
+  opens the menu, picking a model flips the badge live and the next turn uses it.
+
 - **Jump panel (root-level navigator)** — `NEEDS-RUNTIME` (built 2026-06-22,
   merged `e3fa254`/`720b7a0`; spec `spec-jump-panel.md`, ADR-0021). Always-visible
   left sidebar (Pinned placeholder · Workspaces · Agent sessions), `cmd-j`/`?`

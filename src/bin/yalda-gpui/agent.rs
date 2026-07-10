@@ -3151,6 +3151,11 @@ pub(crate) struct AgentState {
     /// sourced from the `session/new` response's `config_options`. Surfaced
     /// by the Status Strip in place of the old best-effort model label.
     pub(crate) agent_model: Option<String>,
+    /// The full model picklist the agent advertises (id + human label), from
+    /// the same `config_options` model `Select` that yields `agent_model`.
+    /// Empty until the first `ModelsAvailable` reply lands. Drives the model
+    /// switcher; the current selection is `agent_model`.
+    pub(crate) available_models: Vec<yalda::acp_channel::ModelOption>,
     /// The session's permission mode, as session state sourced from the
     /// server. In session-server mode the agent/channel live in the server
     /// (not the GUI), so `channel` is `None` and the live `AcpChannelClient`
@@ -3487,6 +3492,7 @@ impl AgentState {
             current_plan: None,
             agent_mode: None,
             agent_model: None,
+            available_models: Vec::new(),
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,
@@ -3547,6 +3553,7 @@ impl AgentState {
             current_plan: None,
             agent_mode: None,
             agent_model: None,
+            available_models: Vec::new(),
             permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
             usage: None,
             focused_subagent: None,

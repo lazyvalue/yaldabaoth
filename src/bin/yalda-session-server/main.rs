@@ -176,6 +176,11 @@ enum Command {
         mode: PermissionMode,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    SetModel {
+        sid: ServerSessionId,
+        model_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     ListSessions {
         reply: tokio::sync::oneshot::Sender<Vec<SessionInfo>>,
     },
@@ -937,6 +942,16 @@ impl SessionManager {
         rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
     }
 
+    async fn send_set_model(&self, sid: &str, model_id: String) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(Command::SetModel {
+            sid: sid.to_string(),
+            model_id,
+            reply,
+        });
+        rx.await.unwrap_or_else(|_| Err("actor unavailable".into()))
+    }
+
     async fn send_list_sessions(&self) -> Vec<SessionInfo> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         let _ = self.cmd_tx.send(Command::ListSessions { reply });
@@ -1182,6 +1197,13 @@ impl Manager {
             }
             Command::SetPermissionMode { sid, mode, reply } => {
                 let _ = reply.send(self.do_set_permission_mode(&sid, mode));
+            }
+            Command::SetModel {
+                sid,
+                model_id,
+                reply,
+            } => {
+                let _ = reply.send(self.do_set_model(&sid, &model_id));
             }
             Command::ListSessions { reply } => {
                 let _ = reply.send(self.sessions.values().map(|s| s.info()).collect());
@@ -1639,6 +1661,23 @@ impl Manager {
             channel.set_permission_mode(mode);
         }
         Ok(())
+    }
+
+    fn do_set_model(&mut self, session_id: &str, model_id: &str) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("no such session: {session_id}"))?;
+        // No live channel ⇒ the agent isn't spawned yet; the switch can't be
+        // delivered (unlike permission mode, there's no persisted field to
+        // re-apply on spawn). Surface it rather than silently dropping.
+        match &session.channel {
+            Some(channel) => {
+                channel.set_model(model_id);
+                Ok(())
+            }
+            None => Err(format!("session {session_id} has no live agent to switch")),
+        }
     }
 
     fn do_admin_status(&self) -> AdminSnapshot {
@@ -2150,6 +2189,16 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>, con
                     Err(e) => Response::Error { message: e },
                 }
             }
+
+            Request::SetModel {
+                session_id,
+                model_id,
+            } => match manager.send_set_model(&session_id, model_id).await {
+                Ok(()) => Response::Ok {
+                    data: ResponseData::Ack,
+                },
+                Err(e) => Response::Error { message: e },
+            },
 
             Request::CloseSession { session_id } => {
                 if let Some(handle) = subscribed.remove(&session_id) {

@@ -108,6 +108,16 @@ pub enum Request {
         mode: PermissionMode,
     },
 
+    /// Switch the session's model. The server forwards `model_id` to the
+    /// session's channel, which issues an ACP `session/set_config_option` for
+    /// the `model` option. The updated selector comes back on the reply stream
+    /// as `ReplyEvent::ModelChanged` + `ModelsAvailable`.
+    #[serde(rename = "set_model")]
+    SetModel {
+        session_id: ServerSessionId,
+        model_id: String,
+    },
+
     #[serde(rename = "close_session")]
     CloseSession { session_id: ServerSessionId },
 
