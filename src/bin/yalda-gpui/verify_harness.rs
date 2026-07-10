@@ -6029,12 +6029,20 @@ fn agent_menu_lists_advertised_models_and_marks_current(cx: &mut TestAppContext)
     vcx.run_until_parked();
     install_agent_slot(&view, &mut *vcx, Some("S1"));
 
-    // Negative control: no "switch model" entry until models are known.
+    // Before models are advertised the "switch model" entry is still present
+    // (discoverability) but drills into a disabled placeholder, not a picklist.
     view.update(vcx, |v, cx| {
         let menu = v.agent_local_menu_dynamic(cx);
+        let sub = menu
+            .iter()
+            .find(|n| n.label == "switch model")
+            .expect("switch-model entry always present for discoverability");
+        let crate::MenuAction::Submenu(children) = &sub.action else {
+            panic!("switch model is a submenu");
+        };
         assert!(
-            !menu.iter().any(|n| n.label == "switch model"),
-            "no model submenu before the agent advertises a picklist"
+            children.iter().all(|c| matches!(c.action, crate::MenuAction::Label(_))),
+            "pre-advertise: only a placeholder label, no set-model commands"
         );
     });
 

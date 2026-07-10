@@ -4154,8 +4154,10 @@ impl YaldaGpuiView {
     /// on. The base entries are static (`agent_local_menu`); the submenu's
     /// children are built from the focused session's advertised model list so
     /// the picker reflects exactly what the agent offers (INV-UX-22). Each
-    /// child dispatches `set-model:<id>`; the active model is marked. Omitted
-    /// entirely when no models are advertised yet (older adapter / pre-attach).
+    /// child dispatches `set-model:<id>`; the active model is marked `✓`. The
+    /// "switch model" entry is ALWAYS present for discoverability — when the
+    /// agent hasn't advertised a picklist yet it drills into a single disabled
+    /// "(models not available yet)" label rather than vanishing.
     fn agent_local_menu_dynamic(&self, cx: &mut Context<Self>) -> Vec<MenuNode> {
         let mut menu = agent_local_menu();
         let (models, current) = self
@@ -4166,26 +4168,27 @@ impl YaldaGpuiView {
                 })
             })
             .unwrap_or((Vec::new(), None));
-        if models.is_empty() {
-            return menu;
-        }
         // Keys 1..=9 then 0 for a tenth — same digit convention as the global
         // workspace menu. More than ten models is not a real case.
         let keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
-        let children: Vec<MenuNode> = models
-            .iter()
-            .take(keys.len())
-            .enumerate()
-            .map(|(i, m)| {
-                let is_current = current.as_deref() == Some(m.id.as_str());
-                let label = if is_current {
-                    format!("{} ✓", m.label)
-                } else {
-                    m.label.clone()
-                };
-                MenuNode::entry(keys[i], &label, &format!("set-model:{}", m.id))
-            })
-            .collect();
+        let children: Vec<MenuNode> = if models.is_empty() {
+            vec![MenuNode::label("(models not available yet)")]
+        } else {
+            models
+                .iter()
+                .take(keys.len())
+                .enumerate()
+                .map(|(i, m)| {
+                    let is_current = current.as_deref() == Some(m.id.as_str());
+                    let label = if is_current {
+                        format!("{} ✓", m.label)
+                    } else {
+                        m.label.clone()
+                    };
+                    MenuNode::entry(keys[i], &label, &format!("set-model:{}", m.id))
+                })
+                .collect()
+        };
         menu.push(MenuNode::submenu("M", "switch model", children));
         menu
     }
