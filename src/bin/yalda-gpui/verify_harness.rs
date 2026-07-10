@@ -6008,6 +6008,69 @@ fn agent_reply_models_available_captures_picklist(cx: &mut TestAppContext) {
     });
 }
 
+/// Regression (the "still no models" bug): once a session is
+/// `agent_stream_authoritative` (it has completed a turn), the legacy
+/// `ReplyEvent` arm goes inert — so the picklist must ride the canonical
+/// `Agent` stream to survive. Feed `ModelsAvailable` as an `Agent` notification
+/// on an authoritative session and assert the switcher list populates.
+#[gpui::test]
+fn agent_authoritative_models_available_via_agent_stream(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ModelOption;
+    use yalda::agent_event::AgentEventKind;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        )
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+
+    // Make the session authoritative — this is what makes the legacy ReplyEvent
+    // arm inert, the exact condition that dropped the picklist in the field.
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("bound");
+        v.with_session(id, cx, |c| c.agent_stream_authoritative = true);
+    });
+
+    let opts = vec![
+        ModelOption { id: "default".into(), label: "Default".into() },
+        ModelOption { id: "claude-fable-5[1m]".into(), label: "Fable".into() },
+        ModelOption { id: "sonnet".into(), label: "Sonnet".into() },
+    ];
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![agent_note(
+                "S1",
+                1,
+                1,
+                1,
+                AgentEventKind::ModelsAvailable {
+                    current: "default".into(),
+                    options: opts.clone(),
+                },
+            )],
+            cx,
+        );
+        let id = v.focused_bound_session().expect("bound");
+        assert_eq!(
+            v.read_session(id, cx, |c| c.available_models.clone()).unwrap(),
+            opts,
+            "authoritative session captures the picklist via the Agent stream"
+        );
+        assert_eq!(
+            v.read_session(id, cx, |c| c.agent_model.clone()).unwrap(),
+            Some("default".to_string()),
+            "current selection synced via the Agent stream"
+        );
+    });
+}
+
 /// The agent tile menu grows a "switch model" submenu whose children are the
 /// advertised models — the current one marked ✓, each dispatching
 /// `set-model:<id>` (INV-UX-22). Negative control: no submenu before any model

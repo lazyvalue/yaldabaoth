@@ -57,7 +57,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::acp_channel::{
-    Plan, ReplyEvent, SessionModeId, ToolCall, ToolCallUpdate, UsageSnapshot,
+    ModelOption, Plan, ReplyEvent, SessionModeId, ToolCall, ToolCallUpdate, UsageSnapshot,
 };
 use crate::session_proto::ServerSessionId;
 
@@ -176,6 +176,15 @@ pub enum AgentEventKind {
     /// [`ReplyEvent::ModelChanged`]. Sourced from `session/new`'s
     /// `config_options`.
     ModelChanged(String),
+    /// The full advertised model picklist + current selection, mirrored from
+    /// [`ReplyEvent::ModelsAvailable`]. Rides the canonical AgentEvent stream
+    /// (not just the legacy ReplyEvent) so it still reaches the GUI after the
+    /// session becomes `agent_stream_authoritative` — otherwise the switcher
+    /// list is dropped on any session that has completed a turn.
+    ModelsAvailable {
+        current: String,
+        options: Vec<ModelOption>,
+    },
     UsageUpdated(UsageSnapshot),
     /// Transient status ONLY (spec §1) — terminal failure is `TurnEnded`.
     Notice {
@@ -256,6 +265,10 @@ enum KnownKind {
     ModelChanged {
         model: String,
     },
+    ModelsAvailable {
+        current: String,
+        options: Vec<ModelOption>,
+    },
     UsageUpdated(UsageSnapshot),
     // `kind` is the internal enum tag, so the Notice severity rides the wire as
     // `level` to avoid colliding with it.
@@ -296,6 +309,10 @@ impl AgentEventKind {
             AgentEventKind::PlanUpdated(p) => KnownKind::PlanUpdated(p.clone()),
             AgentEventKind::ModeChanged(m) => KnownKind::ModeChanged { mode: m.clone() },
             AgentEventKind::ModelChanged(m) => KnownKind::ModelChanged { model: m.clone() },
+            AgentEventKind::ModelsAvailable { current, options } => KnownKind::ModelsAvailable {
+                current: current.clone(),
+                options: options.clone(),
+            },
             AgentEventKind::UsageUpdated(s) => KnownKind::UsageUpdated(s.clone()),
             AgentEventKind::Notice { kind, msg } => KnownKind::Notice {
                 kind: *kind,
@@ -327,6 +344,9 @@ impl AgentEventKind {
             KnownKind::PlanUpdated(p) => AgentEventKind::PlanUpdated(p),
             KnownKind::ModeChanged { mode } => AgentEventKind::ModeChanged(mode),
             KnownKind::ModelChanged { model } => AgentEventKind::ModelChanged(model),
+            KnownKind::ModelsAvailable { current, options } => {
+                AgentEventKind::ModelsAvailable { current, options }
+            }
             KnownKind::UsageUpdated(s) => AgentEventKind::UsageUpdated(s),
             KnownKind::Notice { kind, msg } => AgentEventKind::Notice { kind, msg },
             KnownKind::UserMessage { text } => AgentEventKind::UserMessage { text },
@@ -511,10 +531,14 @@ pub fn agent_kind_from_reply(reply: &ReplyEvent) -> Option<AgentEventKind> {
         ReplyEvent::PlanUpdated(p) => AgentEventKind::PlanUpdated(p.clone()),
         ReplyEvent::ModeChanged(m) => AgentEventKind::ModeChanged(m.clone()),
         ReplyEvent::ModelChanged(m) => AgentEventKind::ModelChanged(m.clone()),
-        // The available-models picklist is not a transcript fact — it rides the
-        // plain `ReplyEvent` record so the GUI updates its switcher without a
-        // synthetic `AgentEvent`. Return None so the server records it verbatim.
-        ReplyEvent::ModelsAvailable { .. } => return None,
+        // Ride the canonical AgentEvent stream (NOT just the legacy ReplyEvent):
+        // the GUI's ReplyEvent arm goes inert once a session is
+        // `agent_stream_authoritative` (post first turn), so a picklist sent only
+        // as a ReplyEvent is dropped on any session that has completed a turn.
+        ReplyEvent::ModelsAvailable { current, options } => AgentEventKind::ModelsAvailable {
+            current: current.clone(),
+            options: options.clone(),
+        },
         ReplyEvent::UsageUpdated(s) => AgentEventKind::UsageUpdated(s.clone()),
         ReplyEvent::Notice(msg) => AgentEventKind::Notice {
             // Legacy Notice conflates retry-status with terminal failure; during

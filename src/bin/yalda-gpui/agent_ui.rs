@@ -2667,6 +2667,11 @@ impl YaldaGpuiView {
                 claude.agent_model = Some(model_id.clone());
                 AgentEventEffect::None
             }
+            AgentEventKind::ModelsAvailable { current, options } => {
+                claude.agent_model = Some(current.clone());
+                claude.available_models = options.clone();
+                AgentEventEffect::None
+            }
             AgentEventKind::UsageUpdated(snap) => {
                 claude.usage = Some(snap.clone());
                 AgentEventEffect::None
