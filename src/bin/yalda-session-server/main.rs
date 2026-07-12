@@ -2328,9 +2328,9 @@ async fn forward_notifications(
             yalda::event_log::CursorResolution::FromBase => 0,
             yalda::event_log::CursorResolution::Tail { vec_index } => vec_index,
         };
-        let entries = snap.log.entries();
-        if entries.len() > offset {
-            if !flush_tail(writer, session_id, &entries[offset..]).await {
+        let tail = snap.log.tail_from(offset);
+        if !tail.is_empty() {
+            if !flush_tail(writer, session_id, &tail).await {
                 return false;
             }
             // Advance to the tip seq: everything resident is now sent.

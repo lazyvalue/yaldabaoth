@@ -27,7 +27,6 @@
 //! `seq`. A client that fell off the trimmed tail (`acked_seq < log_base`) gets
 //! a clean from-base rebuild instead of a silent gap.
 
-use std::sync::Arc;
 
 use crate::session_proto::Notification;
 
@@ -130,13 +129,21 @@ pub struct TrimResult {
 
 /// Append-only, ringbuffer-bounded in-memory event log with a logical seq space.
 ///
-/// Wraps the `Arc<Vec<Notification>>` the server already shares with the
-/// forwarder watch (so `attach` clones a pointer, not the Vec) and adds the
-/// `log_base` logical offset. Pushes go through `Arc::make_mut` (cheap in-place
-/// mutation in the common single-reference case).
+/// Backed by an `imbl::Vector` (a persistent, structurally-shared RRB tree): the
+/// server publishes a `clone()` of the whole log on the forwarder watch every
+/// append, and with a persistent vector both that clone AND the append are
+/// cheap (O(1) clone, O(log n) push) — the shared snapshot and the live log
+/// share structure instead of forcing a copy.
+///
+/// This replaced an `Arc<Vec<Notification>>` whose `Arc::make_mut` copy-on-write
+/// deep-cloned the ENTIRE log on every append while a snapshot was outstanding
+/// in the watch (always, by design): O(n) per push → O(n²) over a session. On a
+/// long, tool-heavy session (28k events) that stalled the single-writer actor
+/// for seconds per turn, starving every session's forwarder — the observed
+/// "messages spool and release in bursts" bug.
 #[derive(Debug, Clone)]
 pub struct EventLog {
-    entries: Arc<Vec<Notification>>,
+    entries: imbl::Vector<Notification>,
     /// Lowest `seq` still resident in `entries`. `entries[i].seq == log_base + i`
     /// for an `AgentEvent`-carrying entry. Advances by `dropped` on every trim.
     log_base: u64,
@@ -152,7 +159,7 @@ impl EventLog {
     /// A fresh, empty log with `log_base == 0`.
     pub fn new() -> Self {
         Self {
-            entries: Arc::new(Vec::new()),
+            entries: imbl::Vector::new(),
             log_base: 0,
         }
     }
@@ -164,20 +171,18 @@ impl EventLog {
     /// from the true base.)
     pub fn from_recovered(entries: Vec<Notification>, log_base: u64) -> Self {
         Self {
-            entries: Arc::new(entries),
+            entries: entries.into_iter().collect(),
             log_base,
         }
     }
 
-    /// The shared snapshot pointer to publish on the forwarder watch.
-    pub fn snapshot(&self) -> Arc<Vec<Notification>> {
-        Arc::clone(&self.entries)
-    }
-
-    /// The resident entries (read-only). The forwarder slices `[vec_index..]`
-    /// off this after resolving its logical cursor via [`resolve_cursor`].
-    pub fn entries(&self) -> &[Notification] {
-        &self.entries
+    /// Clone the tail `[vec_index..]` for the forwarder to flush. `imbl::Vector`
+    /// has no contiguous slice, so this materialises the tail into a `Vec` — but
+    /// the tail is only the NEW events since the forwarder last caught up (the
+    /// forwarder serializes+clones each anyway), so this is O(tail), not O(log).
+    /// An out-of-range `vec_index` (caught up) yields an empty `Vec`.
+    pub fn tail_from(&self, vec_index: usize) -> Vec<Notification> {
+        self.entries.iter().skip(vec_index).cloned().collect()
     }
 
     /// Resolve a live forwarder's logical `sent_seq` into the `Vec` offset to
@@ -234,7 +239,9 @@ impl EventLog {
     /// between the push and the broadcast.
     pub fn push(&mut self, note: Notification) -> u64 {
         let seq = self.tip_seq();
-        Arc::make_mut(&mut self.entries).push(note);
+        // O(log n) even when a snapshot is shared on the watch — the persistent
+        // vector shares structure with the outstanding clone instead of copying.
+        self.entries.push_back(note);
         seq
     }
 
@@ -262,7 +269,7 @@ impl EventLog {
             self.log_base >= 1,
             "prepend reuses a dropped slot — only valid after a trim that dropped ≥ 1 entry"
         );
-        Arc::make_mut(&mut self.entries).insert(0, note);
+        self.entries.push_front(note);
         // Reuse the last-dropped slot so survivor seqs stay stable and tip_seq
         // is unchanged: the marker now sits at seq `log_base - 1`.
         self.log_base = self.log_base.saturating_sub(1);
@@ -305,10 +312,11 @@ impl EventLog {
         }
 
         // Highest turn among the dropped entries (for the marker's through_turn).
-        let through_turn = self.entries[..dropped].iter().filter_map(note_turn).max();
+        let through_turn = self.entries.iter().take(dropped).filter_map(note_turn).max();
 
-        let v = Arc::make_mut(&mut self.entries);
-        v.drain(..dropped);
+        // Drop the front `dropped` entries: split_off(dropped) returns the tail
+        // `[dropped..]` (what we keep) and leaves the front behind to be dropped.
+        self.entries = self.entries.split_off(dropped);
         self.log_base += dropped as u64;
 
         Some(TrimResult {
@@ -661,6 +669,60 @@ mod tests {
         assert!(
             log.trim(10, 6, u64::MAX).is_some(),
             "crossing cap again trims"
+        );
+    }
+
+    /// The forwarder reads a `clone()` of the log taken at its wake; a later
+    /// append MUST NOT retroactively mutate that snapshot (it would tear the
+    /// tail the forwarder is mid-flush). Guards the immutable-snapshot contract
+    /// the whole watch/forwarder design leans on. (Holds for a persistent
+    /// vector by construction; this pins it so a future storage swap can't
+    /// quietly break it.)
+    #[test]
+    fn snapshot_clone_is_unaffected_by_later_pushes() {
+        let mut log = EventLog::new();
+        for i in 0..5 {
+            log.push(chunk("s", 0, 0, i, "old"));
+        }
+        let snap = log.clone(); // what publish_snapshot hands the forwarder
+        assert_eq!(snap.len(), 5);
+        for i in 5..10 {
+            log.push(chunk("s", 0, 0, i, "new"));
+        }
+        // The retained snapshot still sees exactly the 5 it captured.
+        assert_eq!(snap.len(), 5, "a held snapshot must not grow when the log does");
+        assert_eq!(snap.tip_seq(), 5);
+        assert_eq!(log.len(), 10, "the live log advanced independently");
+        // And the snapshot's tail is the ORIGINAL 5, not the new ones.
+        assert_eq!(snap.tail_from(0).len(), 5);
+    }
+
+    /// Perf regression (the FoF stall): appending while a snapshot is
+    /// outstanding must stay cheap. Under the old `Arc<Vec>` + `Arc::make_mut`,
+    /// every push with a live snapshot deep-cloned the WHOLE log (O(n) per push
+    /// → O(n²) over the session); 20k such pushes took tens of seconds. With the
+    /// persistent vector each push is O(log n), so this finishes in well under a
+    /// second. The threshold is deliberately loose (perf is genuine-gap #3, a
+    /// proxy not a precise gate) but the asymptotic gap is ~1000×, so it still
+    /// cleanly catches a reversion to copy-on-write.
+    #[test]
+    fn append_stays_cheap_with_outstanding_snapshot() {
+        let n = 20_000;
+        let mut log = EventLog::new();
+        let start = std::time::Instant::now();
+        let mut _held: Option<EventLog> = None;
+        for i in 0..n {
+            log.push(chunk("s", 0, 0, i, "payload-with-some-text"));
+            // Mirror publish_snapshot: retain a clone across the next push, the
+            // exact condition that forced copy-on-write in the old design.
+            _held = Some(log.clone());
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(log.len(), n as usize);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "20k snapshot-shared appends took {elapsed:?} — expected << 1s; a \
+             copy-on-write regression (O(n²)) would take tens of seconds"
         );
     }
 }

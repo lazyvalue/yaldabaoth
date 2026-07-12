@@ -21,6 +21,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io
 tokio-util = { version = "0.7", features = ["compat"] }
 shell-words = "1"
 futures = "0.3"
+# Persistent (structurally-shared) vector for the session event log: O(1) clone
+# + O(log n) append even while a snapshot is shared with the forwarder watch.
+# Replaces `Arc<Vec>`, whose copy-on-write deep-cloned the whole log on every
+# append once a snapshot was outstanding (O(n²) over a session — the FoF stall).
+imbl = "5"
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 tracing = "0.1"
