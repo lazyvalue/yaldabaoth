@@ -13,6 +13,19 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Event-log O(n²) append stall FIXED** — `NEEDS-RUNTIME` (2026-07-11, on
+  `main` `bf6bbe8`; `docs/worklog/2026-07-11-eventlog-on2-stall.md`). The
+  per-session event log was `Arc<Vec>`; publishing a snapshot every append left
+  an outstanding ref so the next push's `make_mut` deep-cloned the whole log —
+  O(n²) over a session, stalling the actor for seconds on a big session (FoF,
+  28k events) and making messages spool/release in bursts. Now backed by
+  `imbl::Vector` (O(1) clone, O(log n) append). Diagnosed live over the server
+  socket; full suite green + negative-controlled perf guard. Human check:
+  `restart all`, then confirm a long session streams smoothly with no bursty
+  stalls. Follow-up worth considering: an ADR on the persistent-vector choice.
+
+---
+
 ## Features
 
 - **Image paste into a session** — `NEEDS-RUNTIME` (built 2026-07-09, branch
