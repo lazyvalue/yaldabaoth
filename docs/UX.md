@@ -151,21 +151,22 @@ The agent input, in two placements (`InputModeKind`):
   **only mid-turn**; input steers/queues (INV-UX-7).
 - Both **word-wrap** (INV-UX-2) and keep the caret visible (INV-UX-1).
 
-### Agent bottom panels (`screens.rs::render_agent`)
+### Agent sidepanel (`screens.rs::render_agent`)
 
-Two side-by-side **columns above the compose**: **Plan / Tasklist** on the LEFT
-(`Cmd-1`) and **Subagents** on the RIGHT (`Cmd-2`), divided by a border. Each is a
-bordered, scrollable column, one row per entry; with one open it fills the width.
-Subagents are detected structurally from the harness and shown one-per-line
-(INV-UX-5); clicking a subagent row focuses its output.
+A segmented, fixed-width **sidepanel on the RIGHT** of the tile: **Plan / Tasklist**
+on TOP (`Cmd-1`) and **Subagents** BELOW (`Cmd-2`), divided by a segment border, both
+visible at once. Each segment is a scrollable strip, one row per entry; with one open
+it fills the sidepanel height. The main column (transcript + compose) takes the
+remaining width. Subagents are detected structurally from the harness and shown
+one-per-line (INV-UX-5); clicking a subagent row focuses its output.
 
-- **Panel focus (`Cmd-0`, INV-UX-12)** — focuses + enlarges the bottom region for
+- **Panel focus (`Cmd-0`, INV-UX-12)** — focuses + widens the sidepanel for
   keyboard use. Selection is **2-D**: **`h`/`l`** (or `←`/`→`) switch the active
-  **column** (Plan ↔ Subagents), **`j`/`k`** (or `↑`/`↓`) move the **row** within
-  it, **`g`/`G`** jump to top/bottom of the column. **`Enter`** activates (a
+  **segment** (Plan ↔ Subagents), **`j`/`k`** (or `↑`/`↓`) move the **row** within
+  it, **`g`/`G`** jump to top/bottom of the segment. **`Enter`** activates (a
   Subagent row focuses its output and exits; a Plan row has no target yet), **`Esc`**
   leaves and restores the prior focus. The mode is **modal** (other keys inert) and
-  re-seats / auto-exits when the active column closes. In an agent tile `Cmd-0` is
+  re-seats / auto-exits when the active segment closes. In an agent tile `Cmd-0` is
   panel-focus, not zoom-reset.
 
 ### Menus & overlays (`main.rs`)
@@ -198,7 +199,7 @@ at native size — **chrome stays fixed** under document zoom.
 `Cmd-=`/`Cmd-+` in, `Cmd--` out, `Cmd-0` reset — a `text_scale` multiplying body
 + heading sizes. It scales the buffer doc + edit views **and the agent transcript**
 (conversation prose + markdown blocks, INV-UX-13). Chrome (status bars, tab strip,
-browser rows, jump panel, agent gutter/labels, bottom panels, and the pixel-pinned
+browser rows, jump panel, agent gutter/labels, the right sidepanel, and the pixel-pinned
 compose input) stays at native size. `Cmd-0` resets everywhere except agent tiles,
 where it is panel-focus (INV-UX-12).
 

@@ -1,10 +1,17 @@
-# Spec: UX Invariants (canonical, cross-cutting)
+# Spec: UX Invariants (LEGACY — migrated to docs/components/)
 
-**Status:** LIVING — authoritative. This is the canonical contract for how UX
-elements behave across the whole app.
-**Last updated:** 2026-06-29
+> **⚠️ FROZEN / LEGACY.** Every `INV-UX-N` below has been migrated into a
+> per-component spec under `docs/components/` as a `UXI-<Component>-N` invariant,
+> which is now **authoritative**. This file is kept only so the `INV-UX-N`
+> references still living in code comments, tests, and prose resolve. **Do not add
+> or edit invariants here** — add `UXI-<Component>-N` in the owning component spec
+> (via `/new-ux`). The `INV-UX-N → UXI-<Component>-N` crosswalk is in
+> `docs/components/README.md`.
 
-## What this is
+**Status:** FROZEN — superseded by `docs/components/`.
+**Last updated:** 2026-06-29 (frozen 2026-07-12)
+
+## What this is (historical)
 
 The single, canonical list of **behavioral invariants every tile and UX element
 must honor.** Element-specific specs (`spec-chatbox-caret-containment.md`,
@@ -13,21 +20,19 @@ must honor.** Element-specific specs (`spec-chatbox-caret-containment.md`,
 so a reader (or reviewer, or future change) has one place that says "the cursor is
 always visible" without re-deriving it per surface.
 
-## How to use it (mandatory)
+## How to use it (historical — see `docs/components/`)
 
-- **Every code change must be checked against these invariants.** A change that
-  touches a tile, view, editor, scroll, caret, or input surface MUST NOT violate
-  an invariant below. If a change appears to require violating one, that is a
-  signal to stop and reconcile the spec first — not to ship the violation.
-- **This file is updated when new UX is designed.** When a new surface or behavior
-  is added, add or extend the relevant invariant here (and link the element spec).
-  New invariants get the next `INV-UX-N` id.
-- **Each invariant names its enforcement.** Prefer a headless regression test
-  (`verify_harness.rs` / `tests.rs`); where GPUI paint can't be driven headlessly,
-  say so and name the human runtime check. An invariant with neither is a gap.
-- **Conformance is tracked honestly.** Each invariant carries a status:
-  `honored` (conformant + guarded), `partial` (conformant on some surfaces),
-  or `target` (the contract, NOT yet conformant — a known gap to close).
+The rules below describe how this file worked while it was authoritative. It no
+longer is — the same disciplines now apply to the `UXI-<Component>-N` entries in the
+per-component specs under `docs/components/`:
+
+- **Every code change is still checked against the invariants** — but against the
+  owning component's `UXI` list, not this file.
+- **New UX is added as `UXI-<Component>-N`** in the component spec (via `/new-ux`),
+  never as a new `INV-UX-N` here.
+- **Each invariant still names its enforcement** and carries a status —
+  `implemented` / `partial` / `not implemented` (the old words here were
+  `honored` / `partial` / `target`).
 
 ## Invariants
 
@@ -197,9 +202,10 @@ collapses).
 **Enforcement.** Headless: `classify_subagent_detects_the_harness_task_shape`
 (Think+prompt detected, prompt captured; TodoWrite/Read excluded; name fallback) +
 `subagents_surfaces_registered_task_with_prompt` (end-to-end through the real
-`ToolCall`) + **PAINT proof** `subagent_panes_paint_above_the_compose` (the layout
-probe asserts the list strip is painted with its bottom at/above the compose box's
-top). Runtime: only click-to-show-output is left for a human eyeball.
+`ToolCall`) + **PAINT proof** `subagent_panes_paint_right_of_compose` (the layout
+probe asserts the list strip is painted in the right sidepanel, with its left edge
+at/right-of the compose box's right edge). Runtime: only click-to-show-output is
+left for a human eyeball.
 
 ### INV-UX-7 — A submit is delivered immediately (even mid-turn); failed sends queue, never drop (stop is ⌘., not Esc)
 
@@ -445,16 +451,23 @@ specific to this binding.
 keymap→action→handler dispatch: `ctrl-3` then `ctrl-1`, plus past-the-end no-op)
 and `workspace_number_skips_ephemeral` (numbering skips the ephemeral tab).
 
-### INV-UX-12 — `Cmd-0` focuses the agent bottom panels; vim selects (2-D), Esc restores
+### INV-UX-12 — `Cmd-0` focuses the agent sidepanel; vim selects (2-D), Esc restores
 
-**Statement.** The agent bottom panels render as **two side-by-side columns** above
-the compose — **Plan / Tasklist on the LEFT, Subagents on the RIGHT** (each shown
-only when open; Subagents only when non-empty; one open fills the width). In an
-agent tile `Cmd-0` enters **panel focus**: the region enlarges and one row in one
-column is selected. Selection is **2-D** — `panel_col` (which column) + `panel_sel`
-(the row WITHIN that column). `h`/`←` and `l`/`→` switch the active column to the
-adjacent **open** column (clamping the row into it); `j`/`k`/`↑`/`↓` move the row
-within the active column (clamped); `g`/`G` jump to its ends. **Highlighting a
+> **→ migrated to `UXI-AgentTile-1..3`** (`docs/components/agent-tile/sidepanel.md`).
+> That component spec is now authoritative for the sidepanel; this entry is kept for
+> the crosswalk + existing `INV-UX-12` code/test references.
+
+**Statement.** The agent Plan + Subagents panels render as a **segmented,
+fixed-width sidepanel on the RIGHT** of the agent tile — **Plan / Tasklist on TOP,
+Subagents BELOW** (each segment shown only when open; Subagents only when non-empty;
+one open fills the sidepanel height; both visible at once when both open). The
+sidepanel sits beside the main column (transcript + recap + compose), which takes
+the remaining width. In an agent tile `Cmd-0` enters **panel focus**: the sidepanel
+widens and one row in one segment is selected. Selection is **2-D** — `panel_col`
+(which segment) + `panel_sel` (the row WITHIN that segment). `h`/`←` and `l`/`→`
+switch the active segment to the adjacent **open** segment (clamping the row into
+it); `j`/`k`/`↑`/`↓` move the row within the active segment (clamped); `g`/`G` jump
+to its ends. **Highlighting a
 Subagent SWAPS the main view to its context** (see INV-UX-15) — entering the panel
 previews the first row too; highlighting a Plan row clears the swap so the main
 transcript returns (the plan is read in the panel itself). `Enter` **activates** the
@@ -476,23 +489,28 @@ GPUI's most-recent-first match prefers it); elsewhere `Cmd-0` still resets zoom.
 clears `focused_subagent`), the modal interception at the top of `handle_claude_key`,
 and the re-seat in `toggle_tasklist` / `toggle_subagents`.
 `main.rs`: the `FocusAgentPanel` action + `cmd-0` `AgentView` binding.
-`screens.rs::render_agent`: the two-column layout + enlarge + per-column selection
-highlight (Plan entries theme-colored + wrapped for full text) + `FocusAgentPanel`
-`on_action`.
+`screens.rs::render_agent`: the segmented right-sidepanel layout (`agent-sidepanel`
+container, `tasklist-panel` + `subagent-panes` segments stacked) + widen-on-focus +
+per-segment selection highlight (Plan entries theme-colored + wrapped for full text)
++ `FocusAgentPanel` `on_action`.
 
-**Why.** Keyboard-drive the bottom panels (view a subagent's context) without a
-mouse, with a clear enter/navigate/exit gesture that always returns you where you
-were; the column split keeps Plan and Subagents side by side. Highlight-to-swap makes
+**Why.** Keyboard-drive the Plan/Subagents panels (view a subagent's context)
+without a mouse, with a clear enter/navigate/exit gesture that always returns you
+where you were; the right sidepanel keeps both lists visible at once beside the
+conversation instead of stealing height above the compose. Highlight-to-swap makes
 selection *do* something visible — you scan the panel and the main view follows —
 rather than a bare selection with no feedback.
 
-**Status:** `honored` (headless; exact enlarge px / highlight color are gap-1).
+**Status:** `honored` (headless; exact widen px / highlight color are gap-1).
 
 **Enforcement.** `verify_harness.rs`: `agent_panel_cmd0_enters_and_esc_restores`,
 `agent_panel_vim_moves_selection`, `agent_panel_hl_switches_columns`,
 `agent_panel_enter_focuses_subagent`, `agent_panel_cmd0_binding_enters_panel` (real
 keymap dispatch proves the AgentView binding shadows zoom-reset),
 `agent_panel_closing_last_panel_exits_focus`,
+`subagent_panes_paint_right_of_compose` (PAINT proof the panels sit in the right
+sidepanel, beside the compose), `plan_and_subagents_share_the_sidepanel` (both
+segments painted stacked inside one `agent-sidepanel`),
 `panel_highlight_swaps_to_subagent` (highlight sets `focused_subagent`; unfocus
 clears it), `panel_enter_reveals_and_exits` (Enter leaves panel focus), plus the
 state-machine fuzzer ops + oracle (`focus ∈ {Compose,Transcript,Panel}`,
@@ -508,7 +526,7 @@ state): its action handler pushes `notify_transcript_views(TextStyle)` so every 
 `TranscriptView` re-renders and re-reads `text_scale` off the root (via
 `RootSnapshot`) — it is NOT a per-session `TranscriptSeqs` seq. As with buffers,
 **chrome stays at native size**: the turn/tool gutter labels, tool-card status
-glyphs, the bottom panels, the status footer, and the **compose input** (its caret
+glyphs, the right sidepanel (Plan/Subagents), the status footer, and the **compose input** (its caret
 and line-box are pixel-pinned for caret-containment — INV-UX-1 — so its font is held
 fixed; scaling it would require scaling the caret + `CHATBOX_CHAR_W` in lockstep, a
 separate change). `Cmd-0` resets zoom everywhere EXCEPT agent tiles, where it is
@@ -1021,6 +1039,54 @@ real switch path reaches the channel). `tests/model_switch_live.rs`
 (`set_model_round_trips_against_real_agent_live`, `#[ignore]`) closes the live
 round-trip. Negative controls documented at each test.
 
+### INV-UX-23 — A moved transcript fingerprint is ALWAYS rendered (no stale tail)
+
+**Statement.** When any input the agent transcript reads changes — most visibly
+the FINAL streamed chunk of a turn — the transcript re-renders that same frame.
+It is never left showing stale content until an unrelated event heals it. The
+symptom this bans: "the last agent message doesn't render in the tile" (it
+appears only after a keystroke / theme toggle / scroll).
+
+**Root cause it closes.** `TranscriptView` is a cached child that invalidates by
+`cx.observe`→`cx.notify()` on itself. GPUI's `mark_view_dirty` walks the
+committed frame's dispatch tree via `view_path`; if the view had no node in that
+frame (a view swap/rebind at the same slot, a tab hiding the tile, a
+`/clear`-then-stream race), the notify inserts nothing into `dirty_views` and is
+SILENTLY DROPPED — and since `TurnEnded` is the last event of the turn, nothing
+re-arms it, so the cached prepaint is reused stale. The self-notify hop is
+inherently droppable.
+
+**Mechanism (the backstop, Option A).** `render_agent` keys the cached
+transcript's element id on its render fingerprint:
+`div().id(("transcript-fp", TranscriptSeqs::of(state).fingerprint_hash()))`. A
+moved fingerprint yields a fresh `GlobalElementId`, so gpui's
+`with_element_state` misses and the transcript's `render()` is FORCED —
+independent of `mark_view_dirty`/`view_path`. The self-notify path stays the
+fast O(changed) invalidation; the id only closes the hole when a notify is
+dropped. A stable fingerprint keeps the id stable ⇒ cache hit ⇒ render-skip is
+preserved (typing in the chatbox never moves the transcript fingerprint), so the
+perf guarantee (INV under `transcript_021_*`) is untouched. The root is uncached
+and recomputes the id each frame, so the backstop can't itself be parked.
+
+**Applies to.** `screens.rs` `render_agent` (the id'd transcript wrapper);
+`transcript_view.rs` `TranscriptSeqs` (`Hash` derive + `fingerprint_hash`).
+
+**Why.** Every render input must be in the fingerprint (the cached-surface rule),
+but the fingerprint only busts the cache if its notify LANDS. Keying the element
+id on the fingerprint makes "fingerprint moved ⇒ render ran" true by construction
+of the element tree, not by a notify that a framework hole can eat.
+
+**Status:** `honored` (headless — the reuse-decision path is deterministic in the
+harness).
+
+**Enforcement.** `verify_harness.rs`:
+`transcript_dropped_notify_id_forces_render` — mutates the transcript editor
+WITHOUT notifying the session (deterministically reproducing a dropped notify),
+forces a root frame, and asserts the transcript render count still advances +1.
+Negative control (observed RED): revert the embed to the fingerprint-independent
+`cached_child(transcript_view)` and the count stays flat — the stale-tail bug
+reproduced.
+
 ## Cross-references
 
 - `spec-turn-steering.md` — the full steering design (queue, delivery modes, the
@@ -1038,6 +1104,15 @@ round-trip. Negative controls documented at each test.
 
 ## Revision history
 
+- 2026-07-12 — Added INV-UX-23: a moved transcript fingerprint is ALWAYS
+  rendered (no stale tail). Fixes the intermittent "last agent message doesn't
+  render" bug: the transcript's self-notify is silently dropped by gpui
+  `mark_view_dirty` when the view has no `view_path` in the committed frame, so
+  the cached prepaint is reused stale. Backstop keys the cached transcript's
+  element id on `TranscriptSeqs::fingerprint_hash()`, forcing a render via a
+  fresh `GlobalElementId` independent of the notify hop. Guard
+  `transcript_dropped_notify_id_forces_render` (verify_harness) with a
+  deterministic dropped-notify repro + negative control.
 - 2026-07-09 (2) — Added INV-UX-21: Cmd+V of a clipboard image stages it as a
   pending attachment (chip above the compose), sent on submit as an ACP
   `ContentBlock::Image` (both submit paths) with a `🖼` transcript marker;

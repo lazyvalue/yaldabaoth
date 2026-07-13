@@ -42,15 +42,24 @@ implement → verify → integrate → log lifecycle, the definition of done, pa
 work discipline, and the verification-harness plan. Key artifacts:
 
 - `docs/specs/` — design (what). Skill: `/spec`.
-- **`docs/ux-invariants.md` — the canonical, cross-cutting UX
-  behavior contract (cursor always visible + tracks text, compose word-wrap,
-  …).** LIVING and AUTHORITATIVE: **every code change that touches a tile / view
-  / editor / scroll / caret / input surface MUST be checked against it and MUST
-  NOT violate an invariant** — if a change seems to require violating one, stop
-  and reconcile the spec first. **Update it whenever new UX is designed** (add or
-  extend the relevant `INV-UX-N`, name its test or runtime check). It is the one
-  place that says e.g. "the cursor is always visible" without re-deriving it per
-  surface.
+- **`docs/components/` — per-component specs: each component (`Workspace`, `Tile`,
+  `AgentTile`, `TextEditing`, …) in one place — Description + References + its UX
+  invariants `UXI-<Component>-N`.** This is the home for new UX behavior. A new
+  behavioral requirement goes here via **`/new-ux`** (capture → interrogate to zero
+  ambiguity → check code+specs for prior art → spec as a `UXI` at `target` →
+  implement + guard test → reconcile status/deviations). Big components decompose
+  into a `<component>/` subdir; shared behavior lives in `docs/components/common/`.
+  See `docs/components/README.md`. **Every code change touching a tile / view /
+  editor / scroll / caret / input surface MUST be checked against the owning
+  component's `UXI` list and MUST NOT violate one** — if it seems to require
+  violating one, stop and reconcile the spec first.
+- **`docs/ux-invariants.md` — the LEGACY flat `INV-UX-N` contract, being migrated
+  into `docs/components/` incrementally.** Still authoritative for any `INV-UX-N`
+  not yet migrated (a migrated one carries a `→ migrated to UXI-…` pointer). Don't
+  add new invariants here — add them as `UXI-<Component>-N` in the component spec.
+- `docs/bugs/` — one file per bug (`bug-<NNNN>-<slug>.md`) with a timestamped log
+  of every attempt, indexed by `bug-manifest.md`. Fix bugs via **`/bug`**: check the
+  manifest first so we don't repeat a failed approach, then append the actual fix.
 - `docs/decisions/` — ADRs (why a path was chosen). Skill: `/decision`.
 - `docs/worklog/` + `docs/backlog.md` — what happened / what's open. Skill: `/worklog`.
 - `docs/projects/` — **multi-session project tickets** (see below).

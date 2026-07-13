@@ -1,0 +1,23 @@
+# Common components
+
+Shared elements and bodies of behavior that **more than one** component depends on.
+A component spec `References` these instead of duplicating their invariants.
+
+A "common" entry is anything cross-cutting: a reusable **behavior** (text editing,
+caret containment, copy-on-select), a reusable **visual element** (a segmented
+panel, a status strip), or a reusable **interaction** (leader menus). If exactly one
+component uses it, it belongs in that component's spec — promote it here only on the
+second consumer (reuse before abstraction).
+
+Invariants defined here still use `UXI-<Component>-N`, where `<Component>` is the
+common component's token (e.g. `UXI-TextEditing-1`). Consuming components reference
+them by id.
+
+## Index
+
+- [text-editing.md](text-editing.md) — `TextEditing`: the shared editing model
+  (cursor, motions, insert/normal, wrapping) that every editable surface obeys.
+- [selection.md](selection.md) — `Selection`: X11-style copy-on-select shared by
+  the doc view and the agent transcript.
+- [text-zoom.md](text-zoom.md) — `TextZoom`: document text zoom across the buffer
+  doc/edit views + the agent transcript.

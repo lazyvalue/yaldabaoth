@@ -13,6 +13,19 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Infinite-plane workspace** — `READY` (2026-07-12). Requirement (verbatim):
+  "each workspace is actually infinite — an unbounded grid of slots in all
+  directions; tiles can span multiple slots; zoom in/out; pan around; reset the
+  view to origin, where all workspaces start." Pinned via interrogation: workspace
+  *is* the plane (not a per-tab mode); multiple planes = multiple workspaces (=
+  the code's `Tab`s); tabs dissolve from the user model; **semantic** (discrete
+  level-of-detail) zoom, not a continuous transform; reset is **camera-only**;
+  new bindings distinct from `Cmd+=` text zoom. Design doc:
+  `docs/specs/spec-infinite-plane-workspace.md` (DRAFT, adversarial-reviewed).
+  Behavioral contract captured as `UXI-Workspace-2..7` in
+  `docs/components/workspace.md` (all `not implemented`). Reuses desktop-mode's
+  tile geometry engine; widens `Slot` to `i32`; adds a `Camera`. Not built.
+
 - **Event-log O(n²) append stall FIXED** — `NEEDS-RUNTIME` (2026-07-11, on
   `main` `bf6bbe8`; `docs/worklog/2026-07-11-eventlog-on2-stall.md`). The
   per-session event log was `Arc<Vec>`; publishing a snapshot every append left
@@ -92,6 +105,33 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   Esc-to-cancel drag at canvas root (global escape binding would shadow
   per-screen escape; needs a careful dispatch design); measured mono cell
   size (currently 0.6em/1.4em approximation in `desktop_tile_px`).
+
+- **Persist tile→session binding; resume-prompt in-tile on restart** —
+  `NEEDS-DECISION` / `READY` (requested 2026-07-12). Today `restore_agent_leaves`
+  (`main.rs:1873`) zips persisted sessions to leaves 1:1 and **auto-binds** via
+  `open_or_focus`; a tile only shows the picker as a *fallback* on a duplicate
+  sid. The ask: **remember which session was bound to which tile and persist it**,
+  and on restart render a **"Resume this session?" prompt inside the tile** (per
+  tile) instead of auto-binding or dropping to the free-session picker. Scope: (a)
+  persist the tile↔sid binding (extend `PersistedSlot` / the leaf-zip so the
+  binding is durable, not re-derived); (b) a new in-tile resume affordance
+  (a third `AgentTile` render state beside transcript + picker, or a flag on the
+  picker); (c) restore path renders the prompt rather than binding. Becomes an
+  `INV-UX-N` (in-tile resume prompt on restart) + a headless guard when built.
+  **Decision needed (ADR): resume-prompt vs auto-resume vs picker** — and what
+  happens if the persisted session is gone server-side (offer fresh?). Touches
+  `spec-agent-session-ownership.md` (restore contract), `persist.rs`,
+  `agent.rs::AgentTile`, `agent_ui.rs`, `main.rs::restore_agent_leaves`.
+- **Click anywhere on a tile focuses it** — `NEEDS-RUNTIME` / verify-first
+  (requested 2026-07-12). Appears **already implemented** for splits:
+  `chrome.rs:830` attaches `on_mouse_down(Left) → focus_window_by_click` to each
+  tile wrapper, gated on `multi_leaf && !is_focused`. Suspected real gaps to
+  confirm: clicking a tile in a **different tab/workspace**, or a child surface
+  (transcript selection sink, buttons, compose input) swallowing the click before
+  it bubbles to the wrapper. Action: reproduce the exact case the user sees, then
+  either widen the handler (ungate `multi_leaf`, cover cross-tab) or fix the
+  swallowing child; pin with an `INV-UX-N` ("a left-click anywhere in a tile body
+  focuses that tile") + a `simulate` / layout-probe guard.
 
 ## Bugs
 
