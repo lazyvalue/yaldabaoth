@@ -140,7 +140,7 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("cmd-+",             "ZoomIn",          GLOBAL, "Zoom", "Zoom in"),
     b!("cmd--",             "ZoomOut",         GLOBAL, "Zoom", "Zoom out"),
     b!("cmd-0",             "ZoomReset",       GLOBAL, "Zoom", "Reset zoom"),
-    b!("cmd-0",             "FocusAgentPanel", AV,     "Agent", "Focus + enlarge bottom panels"),
+    b!("cmd-0",             "FocusAgentPanel", AV,     "Agent", "Focus + widen the right sidepanel"),
     b!("cmd-c",             "CopyDocSelection", YV,    "Clipboard", "Copy doc-view selection"),
     b!("cmd-c",             "CopySelection",   GLOBAL, "Clipboard", "Copy selection"),
     b!("cmd-v",             "PasteFromClipboard", GLOBAL, "Clipboard", "Paste"),

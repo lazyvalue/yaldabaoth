@@ -747,7 +747,7 @@ impl YaldaGpuiView {
     // `gpui::list` can construct tool blocks without holding a borrow
     // of `self`.
 
-    /// Render the pinned session recap (recap-panel, INV-UX-20) for tile session
+    /// Render the pinned session recap (recap-panel, UXI-AgentTile-15) for tile session
     /// `id`, or `None` when this session has no recap. A full-width bordered box
     /// that sits ABOVE the subagents/tasks panels inside the agent tile: a header
     /// ("Recap" + session label + re-run/dismiss buttons) over a status-dependent
@@ -934,7 +934,24 @@ impl YaldaGpuiView {
         // then embed it via `cached_child` so a chatbox keystroke (which never
         // moves a transcript slice) skips the transcript's render entirely.
         let transcript_view = self.transcript_view_for(id, session_ent.clone(), cx);
-        let transcript_body: AnyElement = cached_child(transcript_view);
+        // Option A backstop (dropped-self-notify class → "last message never
+        // renders"): KEY the cached transcript's element id on its render
+        // fingerprint. A moved fingerprint yields a fresh `GlobalElementId`, so
+        // gpui's `with_element_state` misses and the transcript's `render()` is
+        // FORCED — independent of `mark_view_dirty`/`view_path`, the hop that
+        // silently no-ops when the view has no node in the committed frame (and
+        // leaves the cached prepaint reused stale). The self-notify path stays
+        // the fast O(changed) invalidation; this id only closes the hole when a
+        // notify is dropped. A stable fingerprint ⇒ stable id ⇒ cache hit ⇒
+        // render-skip preserved (typing elsewhere never moves it). The root
+        // (uncached) recomputes this each frame, so the backstop can't itself be
+        // parked. See `TranscriptSeqs::fingerprint_hash`.
+        let transcript_fp = TranscriptSeqs::of(&session_ent.read(cx).state).fingerprint_hash();
+        let transcript_body: AnyElement = div()
+            .id(("transcript-fp", transcript_fp))
+            .size_full()
+            .child(cached_child(transcript_view))
+            .into_any_element();
 
         // Build the status strips + compose + sidebars inside the session
         // entity's update — `c` is a real `&mut AgentState` for the chrome that
@@ -1095,7 +1112,7 @@ impl YaldaGpuiView {
             // Clickable when the agent advertised a model picklist: a click
             // opens the local (space) menu where the "switch model" submenu
             // lives — a mouse affordance for the keyboard `space M` path
-            // (INV-UX-22). Falls back to a plain label otherwise.
+            // (UXI-AgentTile-16). Falls back to a plain label otherwise.
             let has_models = !c.available_models.is_empty();
             if has_models {
                 strip = strip.child(
@@ -1329,7 +1346,7 @@ impl YaldaGpuiView {
         // inline-flush styling (no box chrome, conversation typography, `›`
         // gutter) + the cached-child promotion are a runtime-tuning follow-up;
         // for now both placements render the same panel so worksheet is usable.
-        // INV-UX-9 visibility (stage 2): the WORKSHEET shows the bottom compose box
+        // UXI-AgentTile-11 visibility (stage 2): the WORKSHEET shows the bottom compose box
         // ONLY mid-turn (the chatbox — rule 7). An idle You-block renders INLINE in
         // the transcript at its anchor (FlatItem::YouBlock), not here. Navigating
         // idle shows NO compose chrome. Chatbox mode always shows its pinned box.
@@ -1337,14 +1354,14 @@ impl YaldaGpuiView {
         let compose_panel = if !show_compose {
             None
         } else {
-            // INV-UX-9 rule 7 (bug-hunt 12): the bottom panel is now ALWAYS a pinned
+            // UXI-AgentTile-11 rule 7 (bug-hunt 12): the bottom panel is now ALWAYS a pinned
             // chatbox box — it renders only in chatbox mode or as the mid-turn
             // steering box (the idle worksheet draft renders INLINE as the YouBlock,
             // never here). So it never wears the worksheet flush/accent/"You" chrome.
             let is_worksheet = false;
             // Staged image attachments (pasted via Cmd+V) → chip labels, captured
             // before the mutable compose borrow below. Rendered as chips above the
-            // box so the user sees what will be sent (INV-UX-21).
+            // box so the user sees what will be sent (UXI-AgentTile-14).
             let pending_image_labels: Vec<SharedString> = c
                 .input_surface
                 .compose()
@@ -1400,11 +1417,11 @@ impl YaldaGpuiView {
             };
             let compose_bounds_sink = tb.bounds.clone();
 
-            // All logical lines, tab-expanded. INV-UX-2: each WORD-WRAPS to rows
+            // All logical lines, tab-expanded. UXI-AgentTile-9: each WORD-WRAPS to rows
             // of ≤ `visible_cols` columns (no horizontal scroll). The small vs
             // virtualized decision is on TOTAL VISUAL rows so one long wrapped
             // line can't overflow the un-scrolled small box and hide the caret
-            // (INV-UX-1).
+            // (UXI-TextEditing-1).
             let compose_lines: std::rc::Rc<Vec<String>> = {
                 let doc = tb.editor.document();
                 std::rc::Rc::new(
@@ -1489,7 +1506,7 @@ impl YaldaGpuiView {
                 // to its top on every newline).
                 let compose_edit_seq = tb.editor.document().edit_seq();
                 tb.list.reconcile(&lines_snap, compose_edit_seq);
-                // INV-UX-1 under INV-UX-2: once lines wrap, the box scrolls in
+                // UXI-TextEditing-1 under UXI-AgentTile-9: once lines wrap, the box scrolls in
                 // VISUAL rows, not logical lines — computing the window over
                 // logical lines stranded the caret below the fold (the recurring
                 // chatbox-cursor bug, reintroduced by word-wrap). So: compute the
@@ -1610,10 +1627,10 @@ impl YaldaGpuiView {
                 );
             }
             // Probe the compose box's OUTER (post-margin) bounds so the harness
-            // can prove the placement chrome differs (INV-UX-8): worksheet is
+            // can prove the placement chrome differs (UXI-AgentTile-10): worksheet is
             // flush (full column width, no margin) vs chatbox's inset box.
             // Image-attachment chips, above the box: one per staged paste, tinted
-            // with the accent so they read as pending payload (INV-UX-21).
+            // with the accent so they read as pending payload (UXI-AgentTile-14).
             if !pending_image_labels.is_empty() {
                 let mut chips = div()
                     .flex()
@@ -1645,13 +1662,14 @@ impl YaldaGpuiView {
             )
         };
 
-        // ---- Bottom panels (Tasklist / Subagents) ----
+        // ---- Right sidepanel (Tasklist / Subagents) ----
         //
-        // Two side-by-side COLUMNS above the compose: **Plan on the LEFT**,
-        // **Subagents on the RIGHT** (INV-UX-12). Each renders only when its
-        // `*_open` flag is true (and Subagents only when non-empty); with one
-        // open it fills the width. Panel focus (Cmd-0) enlarges the region;
-        // `h`/`l` switch the focused column, `j`/`k` move the row within it.
+        // A fixed-width sidepanel on the RIGHT of the agent tile, **segmented**:
+        // **Plan on TOP, Subagents BELOW** (UXI-AgentTile-3), both visible at once.
+        // Each segment renders only when its `*_open` flag is true (and Subagents
+        // only when non-empty); with one open it fills the sidepanel height.
+        // Panel focus (Cmd-0) widens the sidepanel; `h`/`l` switch the focused
+        // segment, `j`/`k` move the row within it.
         let sidebar_border: Hsla = nc(at.sidebar_border);
         let sidebar_header_fg: Hsla = nc(at.sidebar_header);
         let sidebar_dim_fg: Hsla = nc(at.dim);
@@ -1664,7 +1682,10 @@ impl YaldaGpuiView {
         let panel_focused = c.focus == AgentFocus::Panel;
         let panel_col = c.panel_col;
         let panel_sel = c.panel_sel;
-        let panel_max_h = if panel_focused { px(360.0) } else { px(132.0) };
+        // The panels live in a fixed-width RIGHT sidepanel now (segmented: Plan
+        // on top, Subagents below). Panel focus (Cmd-0) widens it a touch to
+        // preserve the "region enlarges" affordance of UXI-AgentTile-3.
+        let sidepanel_w = if panel_focused { px(340.0) } else { px(280.0) };
         let focus_border: Hsla = nc(at.warm_accent);
         let panel_transparent: Hsla = gpui::hsla(0.0, 0.0, 0.0, 0.0);
         let sel_bg: Hsla = {
@@ -1687,12 +1708,12 @@ impl YaldaGpuiView {
                 .flex_col()
                 .flex_1()
                 .min_w_0()
+                .min_h_0()
                 .gap(px(1.0))
                 .px_2()
                 .py_1()
-                .max_h(panel_max_h)
                 .overflow_y_scroll()
-                .border_t_1()
+                .border_b_1()
                 .border_color(if tasklist_lit { focus_border } else { sidebar_border })
                 .bg(sidebar_bg)
                 .text_size(px(11.0))
@@ -1783,18 +1804,20 @@ impl YaldaGpuiView {
                     .flex_col()
                     .flex_1()
                     .min_w_0()
+                    .min_h_0()
                     .gap_1()
                     .px_2()
                     .py_1()
-                    .max_h(panel_max_h)
                     .overflow_y_scroll()
-                    .border_t_1()
                     .border_color(if subagents_lit { focus_border } else { sidebar_border })
                     .bg(sidebar_bg)
                     .text_size(px(11.0))
                     .font_family(self.code_font.clone());
+                // Segment divider: a top border only when the Plan segment sits
+                // above it in the sidepanel (both open). When Subagents is the
+                // only/top segment it needs no cap — the sidepanel frames it.
                 if both_columns {
-                    strip = strip.border_l_1();
+                    strip = strip.border_t_1();
                 }
                 strip = strip.child(
                     div()
@@ -1888,18 +1911,31 @@ impl YaldaGpuiView {
             }
         };
 
-        // Combine the columns into one side-by-side row above the compose.
-        let bottom_panels: Option<gpui::AnyElement> = if tasklist_col.is_some()
+        // Stack the segments into one fixed-width sidepanel on the RIGHT: Plan on
+        // top, Subagents below. The container carries the left border dividing it
+        // from the main (transcript + compose) column; the segments share the
+        // sidepanel's height (each `flex_1` + own scroll).
+        let sidepanel: Option<gpui::AnyElement> = if tasklist_col.is_some()
             || subagent_col.is_some()
         {
-            let mut rowp = div().flex().flex_row().w_full().min_w_0();
+            let mut side = div()
+                .id("agent-sidepanel")
+                .flex()
+                .flex_col()
+                .flex_none()
+                .w(sidepanel_w)
+                .h_full()
+                .min_h_0()
+                .border_l_1()
+                .border_color(sidebar_border)
+                .bg(sidebar_bg);
             if let Some(t) = tasklist_col {
-                rowp = rowp.child(t);
+                side = side.child(t);
             }
             if let Some(s) = subagent_col {
-                rowp = rowp.child(s);
+                side = side.child(s);
             }
-            Some(rowp.into_any_element())
+            Some(probe_bounds("agent-sidepanel", side.into_any_element()))
         } else {
             None
         };
@@ -1911,7 +1947,7 @@ impl YaldaGpuiView {
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
-                // Subagent context swap (INV-UX-15): while a subagent is focused
+                // Subagent context swap (UXI-AgentTile-6): while a subagent is focused
                 // (`focused_subagent`, set by clicking / highlighting it in the
                 // panel), the main area shows THAT subagent's context — a Back
                 // header + its prompt/content/output — in place of the cached
@@ -1996,29 +2032,38 @@ impl YaldaGpuiView {
                 ),
         );
 
-        let mut col = div()
+        // Main column: transcript (flex_1) + recap + compose, stacked. It takes
+        // the width the right sidepanel leaves.
+        let mut main_col = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
             .min_h_0()
             .child(transcript_row);
-        // Recap (recap-panel, INV-UX-20): the pinned session summary sits ABOVE
-        // the subagents/tasks panels, specific to THIS tile's session
-        // (`self.recaps[id]`). Built with `weak_self` click handlers since we're
-        // inside the entity `update` (no `Context<Self>` here).
+        // Recap (recap-panel, UXI-AgentTile-15): the pinned session summary sits ABOVE
+        // the compose, specific to THIS tile's session (`self.recaps[id]`). Built
+        // with `weak_self` click handlers since we're inside the entity `update`
+        // (no `Context<Self>` here).
         if let Some(recap_el) = self.render_agent_recap(id, weak_self.clone()) {
-            col = col.child(recap_el);
-        }
-        // Bottom panels sit above the compose: Plan (left) + Subagents (right)
-        // side by side in one row.
-        if let Some(panels) = bottom_panels {
-            col = col.child(panels);
+            main_col = main_col.child(recap_el);
         }
         if let Some(panel) = compose_panel {
-            col = col.child(panel);
+            main_col = main_col.child(panel);
         }
-        let content_area: gpui::AnyElement = col.into_any_element();
+        // Content area: the main column on the left, the segmented Plan/Subagents
+        // sidepanel on the right (when either segment is open).
+        let mut content_row = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(main_col);
+        if let Some(side) = sidepanel {
+            content_row = content_row.child(side);
+        }
+        let content_area: gpui::AnyElement = content_row.into_any_element();
 
             (header, content_area)
         });

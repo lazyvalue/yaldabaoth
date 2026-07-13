@@ -671,7 +671,7 @@ fn doc_selection_drag_highlights_dragged_lines(cx: &mut TestAppContext) {
     );
 }
 
-/// INV-UX-14 (doc surface): X11-style select-to-clipboard. Finalizing a
+/// UXI-Selection-1 (doc surface): X11-style select-to-clipboard. Finalizing a
 /// non-empty mouse drag over the rendered doc writes the selected text to the
 /// system clipboard automatically — no Cmd-C. Drives the REAL `doc_mouse_*`
 /// handlers, then reads the clipboard back through the test platform.
@@ -858,7 +858,7 @@ fn jump_panel_renders_with_sessions(cx: &mut TestAppContext) {
     );
 }
 
-/// INV-UX-11: `ctrl-<n>` jumps straight to the n-th workspace — the digit the
+/// UXI-Workspace-1: `ctrl-<n>` jumps straight to the n-th workspace — the digit the
 /// jump panel shows. Exercises the FULL dispatch chain: `register_keymap`
 /// installed `ctrl-3 → GotoWorkspace3`, and the focused screen root wired
 /// `.workspace_nav(cx)` so the action lands on `goto_workspace_number`. A digit
@@ -977,7 +977,7 @@ fn workspace_number_skips_ephemeral(cx: &mut TestAppContext) {
     });
 }
 
-/// INV-UX-10: the jump-panel agent status dot reflects the session's turn phase.
+/// UXI-JumpPanel-1: the jump-panel agent status dot reflects the session's turn phase.
 /// `dot_status` is the headless-verifiable mapping (the actual hue is a paint
 /// detail — gap 1). Working while a reply is in flight; waiting-for-you once the
 /// turn finishes; neutral when disconnected.
@@ -4131,7 +4131,7 @@ fn boot_with_transcript<'a>(
     (view, vcx, id, session)
 }
 
-/// INV-UX-14 (agent surface): X11-style select-to-clipboard over the transcript.
+/// UXI-Selection-1 (agent surface): X11-style select-to-clipboard over the transcript.
 /// A real mouse drag over the rendered transcript selects text and auto-copies
 /// it to the system clipboard on release. Drives the REAL `simulate_mouse_*`
 /// path (dispatched to `TranscriptView::transcript_mouse_*`), picking drag
@@ -4315,6 +4315,68 @@ fn transcript_021_streaming_burst_final_append_renders(cx: &mut TestAppContext) 
     }
 }
 
+/// (b″) THE STALE-TAIL BACKSTOP (Option A): the fingerprint-keyed transcript
+/// element id must force a render even when the self-notify hop is DROPPED —
+/// the "last agent message never renders" bug. Root cause: the transcript's
+/// `cx.observe`→`cx.notify()` silently no-ops when the view has no `view_path`
+/// in the committed frame (`mark_view_dirty`, gpui window.rs), so the cached
+/// prepaint is reused STALE until an unrelated event heals it.
+///
+/// We reproduce a dropped notify DETERMINISTICALLY: mutate the transcript
+/// editor via `session.update` WITHOUT calling `cx.notify()`. That advances
+/// `edit_seq` (so `TranscriptSeqs` moves) while leaving the session's observers
+/// unfired — the transcript entity never enters `dirty_views`, exactly as when
+/// `mark_view_dirty` eats the notify. We then force a ROOT frame (the root is
+/// always in the tree; a real batch does this via `apply_server_batch`'s tail
+/// `cx.notify()`). With the fix, the moved fingerprint yields a fresh
+/// `GlobalElementId` ⇒ `with_element_state` misses ⇒ the transcript re-renders
+/// (+1). Render count is the ground-truth skip/no-skip oracle (a skipped render
+/// reuses the stale prepaint AND its paint).
+///
+/// NEGATIVE CONTROL (observed RED): revert `render_agent`'s transcript embed to
+/// the fingerprint-independent `cached_child(transcript_view)`. Then the id is
+/// stable, the transcript is not in `dirty_views`, and the bounds/mask/text
+/// cache key is unchanged ⇒ the prepaint is reused ⇒ count stays FLAT (base+0)
+/// — the stale-tail bug, reproduced. This is the ONLY path that re-renders the
+/// transcript here, so the delta is attributable solely to the id backstop.
+#[gpui::test]
+fn transcript_dropped_notify_id_forces_render(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (view, vcx, _id, session) = boot_with_transcript(cx);
+    // Settle the one-time jump-panel bounds inset (see the 021 tests) BEFORE
+    // the baseline, so what we measure is purely the id backstop — not chrome
+    // geometry settling busting the cache on its own.
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let base = crate::perf_render_count("transcript");
+    assert!(base >= 1, "transcript must render at least once on first frame");
+
+    // SILENT transcript mutation — the dropped-notify simulation. `edit_seq`
+    // advances (fingerprint moves) but NO `cx.notify()` fires, so the observe
+    // callback never runs and the transcript entity never enters `dirty_views`.
+    session.update(vcx, |s, _cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, "DROPPED_NOTIFY_TAIL\n");
+        // Deliberately NO cx.notify(): this is the dropped-notify condition.
+    });
+    // Force a ROOT frame without touching the session (root is always in the
+    // committed tree — its notify can't be parked). The transcript can ONLY
+    // re-render here via the fingerprint-keyed element id.
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    let after = crate::perf_render_count("transcript");
+    assert_eq!(
+        after,
+        base + 1,
+        "a transcript mutation whose self-notify was DROPPED must still force a \
+         render via the fingerprint-keyed element id (base {base}), got {after} — \
+         the stale-tail backstop failed"
+    );
+}
+
 /// (c) A tool-group expand toggle bumps `tools_gen`, which the observe filter
 /// watches ⇒ +1. Toggling expanded is the canonical tool-structure mutation.
 #[gpui::test]
@@ -4374,7 +4436,7 @@ fn transcript_021_theme_and_zoom_bust_cache(cx: &mut TestAppContext) {
     );
 }
 
-/// INV-UX-13: the transcript's conversation PROSE actually scales with document
+/// UXI-TextZoom-1: the transcript's conversation PROSE actually scales with document
 /// zoom — the painted height of a prose line grows when `text_scale` grows. The
 /// layout probe gives real painted bounds, so this is a headless guard for the
 /// font-px effect (not just the cache-bust). Pins the fix for "agent text didn't
@@ -5121,7 +5183,7 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
     assert!(rows.is_empty(), "closed session is gone from the roster");
 }
 
-/// Unit (jump-reorder, INV-UX-18): `order_grouped_rows` applies the user's
+/// Unit (jump-reorder, UXI-JumpPanel-2): `order_grouped_rows` applies the user's
 /// drag-reordered order on top of the cwd grouping, and is a total no-op when
 /// both order lists are empty (the default — alphabetical groups, by-label
 /// sessions). Doubles as the negative control: the empty-order assertion holds
@@ -5193,7 +5255,7 @@ fn jump_reorder_move_semantics() {
     assert_eq!(v, before, "absent dragged is a no-op");
 }
 
-/// jump-reorder (INV-UX-18), REAL path: seed two cwd groups on the roster, then
+/// jump-reorder (UXI-JumpPanel-2), REAL path: seed two cwd groups on the roster, then
 /// call the exact methods the drop handlers invoke. `reorder_cwd_group` reorders
 /// the headers (and persists the order); `reorder_session` reorders sessions
 /// WITHIN a group; and a cross-cwd `reorder_session` is REFUSED — a session can
@@ -5344,7 +5406,7 @@ fn jump_panel_groups_agent_rows_by_cwd() {
 fn clear_worksheet_you_block_keystroke_splices_item(cx: &mut TestAppContext) {
     let (view, vcx) = boot_worksheet_nav(cx);
     // Rest in the exact post-/clear typeable worksheet: fresh transcript, focus on
-    // the Compose (INV-UX-16 gate → inline You-block active), idle, Insert.
+    // the Compose (UXI-AgentTile-12 gate → inline You-block active), idle, Insert.
     view.update(vcx, |v, cx| {
         let id = v.focused_bound_session().expect("bound");
         v.with_session(id, cx, |c| {
@@ -5451,7 +5513,7 @@ fn jump_panel_toggle_hides_and_summons(cx: &mut TestAppContext) {
     );
 }
 
-/// VERIFICATION HARNESS (#3.2 — PAINTED-BOUNDS proof of INV-UX-1). The model-level
+/// VERIFICATION HARNESS (#3.2 — PAINTED-BOUNDS proof of UXI-TextEditing-1). The model-level
 /// guard `compose_wrapped_caret_never_below_the_fold` proves the window MATH; this
 /// proves the PAINT: in a compose draft that wraps far past the box, after a real
 /// layout/paint pass (`run_until_parked`) the caret's row must actually be painted
@@ -5509,7 +5571,7 @@ fn compose_caret_row_painted_inside_box_when_wrapped(cx: &mut TestAppContext) {
     let (_, caret_y, _, caret_h) = caret.unwrap_or_else(|| {
         panic!(
             "compose cursor row was NOT painted — the caret is below the fold \
-             (INV-UX-1 violated). box=[{box_y}, {}] h={box_h}",
+             (UXI-TextEditing-1 violated). box=[{box_y}, {}] h={box_h}",
             box_y + box_h
         )
     });
@@ -5537,10 +5599,10 @@ fn compose_caret_row_painted_inside_box_when_wrapped(cx: &mut TestAppContext) {
     );
 }
 
-/// VERIFICATION HARNESS (INV-UX-9, stage 2 — painted proof the two surfaces render
+/// VERIFICATION HARNESS (UXI-AgentTile-11, stage 2 — painted proof the two surfaces render
 /// in DIFFERENT places). The chatbox is a pinned box at the window bottom
 /// (`compose-box`); the worksheet's open You-block renders INLINE in the transcript
-/// (`you-block`), not at the bottom. (Supersedes the INV-UX-8 flush-vs-boxed
+/// (`you-block`), not at the bottom. (Supersedes the UXI-AgentTile-10 flush-vs-boxed
 /// geometry test, whose premise — an always-present worksheet compose box — is gone.)
 #[gpui::test]
 fn worksheet_renders_flush_chatbox_renders_boxed(cx: &mut TestAppContext) {
@@ -5622,7 +5684,7 @@ fn ws_bare_key(key: &str) -> gpui::KeyDownEvent {
 }
 
 /// Boot a real view with a bound session, switched to **Worksheet** mode resting
-/// in transcript navigation (INV-UX-9 default for the worksheet).
+/// in transcript navigation (UXI-AgentTile-11 default for the worksheet).
 fn boot_worksheet_nav(
     cx: &mut TestAppContext,
 ) -> (gpui::Entity<YaldaGpuiView>, &mut gpui::VisualTestContext) {
@@ -5638,7 +5700,7 @@ fn boot_worksheet_nav(
     (view, vcx)
 }
 
-/// INV-UX-21: Cmd+V with an image on the clipboard stages it as a pending
+/// UXI-AgentTile-14: Cmd+V with an image on the clipboard stages it as a pending
 /// attachment on the compose (rather than typing garbage), base64-encoded with
 /// its mime type — the payload that becomes an ACP `ContentBlock::Image`. Drives
 /// the REAL key handler (`handle_claude_key` → `paste_into_compose`) against the
@@ -5755,7 +5817,7 @@ fn worksheet_real_submit(
     vcx.run_until_parked();
 }
 
-/// INV-UX-21 (end-to-end, real submit path): a pasted image staged on the
+/// UXI-AgentTile-14 (end-to-end, real submit path): a pasted image staged on the
 /// compose rides a REAL worksheet submit — it reaches the channel as a
 /// `PromptPayload` carrying the image attachment, the transcript records a
 /// `🖼 image N (EXT)` marker for it, and the staged attachment clears after send.
@@ -5950,7 +6012,7 @@ fn real_midturn_worksheet_typed_draft_space_is_suppressed(cx: &mut TestAppContex
 
 /// A `ModelsAvailable` reply through the REAL reducer captures the advertised
 /// picklist into `available_models` and syncs `agent_model` to the current
-/// selection (INV-UX-22). Negative control: the list is empty before the reply.
+/// selection (UXI-AgentTile-16). Negative control: the list is empty before the reply.
 #[gpui::test]
 fn agent_reply_models_available_captures_picklist(cx: &mut TestAppContext) {
     use yalda::acp_channel::{ModelOption, ReplyEvent};
@@ -6073,7 +6135,7 @@ fn agent_authoritative_models_available_via_agent_stream(cx: &mut TestAppContext
 
 /// The agent tile menu grows a "switch model" submenu whose children are the
 /// advertised models — the current one marked ✓, each dispatching
-/// `set-model:<id>` (INV-UX-22). Negative control: no submenu before any model
+/// `set-model:<id>` (UXI-AgentTile-16). Negative control: no submenu before any model
 /// is advertised.
 #[gpui::test]
 fn agent_menu_lists_advertised_models_and_marks_current(cx: &mut TestAppContext) {
@@ -6564,7 +6626,7 @@ fn repro_clear_worksheet_typed_text_repaints_fresh_transcript_view(cx: &mut Test
 /// branch via the `FORCE_SERVER_CLEAR_BRANCH` seam (no live server needed —
 /// `spawn_create_agent_session` bails, leaving the placeholder mid-open), drives the
 /// REAL async completion, then a REAL keystroke, and asserts the typed char PAINTS an
-/// inline You-block inside the transcript viewport (INV-UX-16, cached-view-swap arm).
+/// inline You-block inside the transcript viewport (UXI-AgentTile-12, cached-view-swap arm).
 ///
 /// ROOT CAUSE this pins: `/clear` drops the old session's `TranscriptView` and the
 /// rebind creates a new one that GPUI hands the SAME entity slot; embedded at the same
@@ -6998,7 +7060,7 @@ fn focused_in_insert_mode_browser_arm(cx: &mut TestAppContext) {
     );
 }
 
-/// INV-UX-9 rules 1–3: in the worksheet, navigation is free (no compose chrome);
+/// UXI-AgentTile-11 rules 1–3: in the worksheet, navigation is free (no compose chrome);
 /// an Insert-entry key (`i`) opens a You-block (compose focus + Insert); leaving
 /// Insert with NO non-whitespace text DISCARDS it — the transcript is
 /// byte-identical to before and no chrome remains.
@@ -7047,7 +7109,7 @@ fn worksheet_insert_opens_and_empty_esc_discards_you_block(cx: &mut TestAppConte
     });
 }
 
-/// INV-UX-9 rule 4: a You-block with real text PERSISTS after Esc (pending the
+/// UXI-AgentTile-11 rule 4: a You-block with real text PERSISTS after Esc (pending the
 /// next Submit) — focus returns to navigation but the block stays open with its
 /// text. Re-entering Insert reuses the same single block (rule 6).
 #[gpui::test]
@@ -7132,7 +7194,7 @@ fn worksheet_block_normal_then_insert_again(cx: &mut TestAppContext) {
     });
 }
 
-/// INV-UX-9 rules 2/6/7 (painted, stage 2): navigating idle paints NEITHER the
+/// UXI-AgentTile-11 rules 2/6/7 (painted, stage 2): navigating idle paints NEITHER the
 /// inline You-block NOR the bottom chatbox; an open You-block paints INLINE (the
 /// `you-block` probe) and NOT the bottom box; mid-turn paints the bottom chatbox
 /// (`compose-box`) and NOT the inline block.
@@ -7375,7 +7437,7 @@ fn worksheet_cursor_on_existing_block_resumes_it(cx: &mut TestAppContext) {
     });
 }
 
-/// INV-UX-9 rule 6 (MULTIPLE insertion points end-to-end): open two blocks at
+/// UXI-AgentTile-11 rule 6 (MULTIPLE insertion points end-to-end): open two blocks at
 /// different anchors, confirm both render as separate inline `YouBlock`s, and that
 /// gather+freeze commits BOTH in place (each text present in the transcript).
 #[gpui::test]
@@ -7448,7 +7510,7 @@ fn worksheet_multiple_insertion_points(cx: &mut TestAppContext) {
     });
 }
 
-/// INV-UX-9 rule 6 (MULTIPLE insertion points): with a non-empty block open at
+/// UXI-AgentTile-11 rule 6 (MULTIPLE insertion points): with a non-empty block open at
 /// anchor A, navigating to a DIFFERENT legal line and pressing `i` opens a SECOND
 /// block there — PARKING the first at A (its text kept, never dragged to the new
 /// line). Pressing `i` at the SAME anchor resumes in place.
@@ -7643,7 +7705,7 @@ fn worksheet_midturn_typing_routes_to_chatbox(cx: &mut TestAppContext) {
 
 /// INTENT (co-authoring a document): a tall inline You-block GROWS to render every
 /// line (no internal window/scroll) AND the caret stays painted inside the transcript
-/// viewport — INV-UX-1 upheld by the transcript scroll following the caret, not by
+/// viewport — UXI-TextEditing-1 upheld by the transcript scroll following the caret, not by
 /// truncating the block. PAINTED proof (layout probe), not window math: type a block
 /// far taller than the viewport, then assert the caret's painted row lies inside the
 /// painted transcript viewport. (Replaces the old test that merely re-checked the
@@ -7699,10 +7761,10 @@ fn worksheet_tall_you_block_grows_caret_painted_in_viewport(cx: &mut TestAppCont
         "block height {bh} must exceed viewport {vh} (else the test is vacuous)"
     );
     let (_, cy, _, ch) =
-        caret.expect("caret row was NOT painted — the caret is below the fold (INV-UX-1)");
+        caret.expect("caret row was NOT painted — the caret is below the fold (UXI-TextEditing-1)");
     assert!(
         cy >= vy - 0.5 && cy + ch <= vy + vh + 0.5,
-        "INV-UX-1: caret row [{cy}, {}] must lie inside the transcript viewport [{vy}, {}] \
+        "UXI-TextEditing-1: caret row [{cy}, {}] must lie inside the transcript viewport [{vy}, {}] \
          (block {bh}px tall grew past the {vh}px viewport, yet the caret stays visible)",
         cy + ch,
         vy + vh
@@ -7906,16 +7968,20 @@ fn worksheet_turn_end_carries_over_draft_or_rests_in_nav(cx: &mut TestAppContext
     });
 }
 
-/// VERIFICATION HARNESS (#3.2 — painted-bounds proof of INV-UX-5 layout): the
-/// subagent (Task) list renders ABOVE the compose box, one per line. Register a
-/// Task subagent tool call so the list appears, drive a real paint pass, and
-/// assert (via the layout probe) that the `subagent-panes` strip is painted and
-/// its bottom is at/above the compose box's top — i.e. above the chatbox.
+/// VERIFICATION HARNESS (painted-bounds proof of UXI-AgentTile-3 layout): the subagent
+/// (Task) list renders in the RIGHT sidepanel — to the right of the compose box,
+/// one subagent per line. Register a Task subagent tool call so the list appears,
+/// drive a real paint pass, and assert (via the layout probe) that the
+/// `subagent-panes` strip is painted and its left edge is at/right-of the compose
+/// box's right edge — i.e. beside the chatbox, not above it.
+///
+/// Negative control: revert the sidepanel restructure (put the panels back above
+/// the compose in a `flex_col`) and `panes_x` drops below `box_x + box_w` → RED.
 #[gpui::test]
-fn subagent_panes_paint_above_the_compose(cx: &mut TestAppContext) {
+fn subagent_panes_paint_right_of_compose(cx: &mut TestAppContext) {
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
     // Need the bottom compose box on screen (default is worksheet now); the panes
-    // sit above it. Enter chatbox so the `compose-box` probe has a target.
+    // sit beside it. Enter chatbox so the `compose-box` probe has a target.
     view.update(vcx, |v, cx| v.toggle_agent_input_mode(cx));
 
     // Register a Task subagent (Think + prompt) into the bound session's tool
@@ -7945,18 +8011,76 @@ fn subagent_panes_paint_above_the_compose(cx: &mut TestAppContext) {
         view.update(vcx, |v, cx| v.agent_read(cx, |c| c.input_surface.compose().bounds.get()));
     crate::layout_probe_end();
 
-    let (_, box_y, _, box_h) = box_bounds.expect("compose box did not paint");
-    let (_, panes_y, _, panes_h) =
+    let (box_x, _, box_w, box_h) = box_bounds.expect("compose box did not paint");
+    let (panes_x, _, panes_w, panes_h) =
         panes.expect("subagent panes did NOT paint — they should appear when a subagent exists");
 
     assert!(panes_h > 1.0, "subagent panes have no height ({panes_h})");
+    assert!(panes_w > 1.0, "subagent panes have no width ({panes_w})");
     let _ = box_h;
-    // The list's bottom is at/above the compose box's (inner) top (slack for the
-    // 1px border) — i.e. it sits ABOVE the chatbox.
+    // The sidepanel's left edge is at/right-of the compose box's right edge (slack
+    // for the 1px border) — i.e. it sits BESIDE the chatbox, in the right column.
     assert!(
-        panes_y + panes_h <= box_y + 2.0,
-        "subagent list bottom {} is NOT above the compose top {box_y} — not above the chatbox",
-        panes_y + panes_h,
+        panes_x + 2.0 >= box_x + box_w,
+        "subagent panes left {panes_x} is NOT right of the compose right {} — not in the sidepanel",
+        box_x + box_w,
+    );
+}
+
+/// Both segments (Plan + Subagents) render in ONE sidepanel, stacked: the Plan
+/// segment on top, the Subagents segment below it, both inside the painted
+/// `agent-sidepanel` bounds. Proves the "both visible on the same sidepanel"
+/// requirement, not two mutually-exclusive views.
+#[gpui::test]
+fn plan_and_subagents_share_the_sidepanel(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+
+    // A live plan (opens the Plan segment) AND a Task subagent (opens Subagents).
+    set_plan(&view, vcx, 2);
+    view.update(vcx, |v, cx| {
+        use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
+        let mut c = v.agent_mut(cx).expect("agent");
+        c.tasklist_open = true;
+        let id: ToolCallId = "task-share".into();
+        let mut tc = ToolCall::new(id.clone(), "Explore repo".to_string());
+        tc.kind = ToolKind::Think;
+        tc.raw_input = Some(serde_json::json!({"prompt": "map the code"}));
+        let anchor = c.editor.anchor_for_line(0);
+        c.tools.register(crate::ToolCallKey::from_id(&id), tc, anchor);
+    });
+
+    for _ in 0..4 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    let side = crate::layout_probe_get("agent-sidepanel");
+    let plan = crate::layout_probe_get("tasklist-panel");
+    let subs = crate::layout_probe_get("subagent-panes");
+    crate::layout_probe_end();
+
+    let (sx, sy, sw, sh) = side.expect("sidepanel did not paint");
+    let (px_, py, _, ph) = plan.expect("Plan segment did not paint");
+    let (qx, qy, _, qh) = subs.expect("Subagents segment did not paint");
+
+    // Both segments live inside the sidepanel's painted box …
+    assert!(
+        px_ >= sx - 1.0 && py >= sy - 1.0 && py + ph <= sy + sh + 1.0,
+        "Plan segment not inside the sidepanel",
+    );
+    assert!(
+        qx >= sx - 1.0 && qy >= sy - 1.0 && qy + qh <= sy + sh + 1.0,
+        "Subagents segment not inside the sidepanel",
+    );
+    let _ = sw;
+    // … and Plan is stacked ABOVE Subagents (segmented, both visible).
+    assert!(
+        py + ph <= qy + 2.0,
+        "Plan segment bottom {} is not above the Subagents segment top {qy}",
+        py + ph,
     );
 }
 
@@ -8010,7 +8134,7 @@ fn panel_highlight_swaps_to_subagent(cx: &mut TestAppContext) {
     assert_eq!(after_back, None, "back must clear the subagent swap");
 }
 
-/// The subagent swap actually PAINTS (INV-UX-15): with a subagent focused, the
+/// The subagent swap actually PAINTS (UXI-AgentTile-6): with a subagent focused, the
 /// main area renders the `subagent-view` (Back header + its context) and the
 /// cached `transcript-viewport` is NOT painted — proving the view was replaced,
 /// not just a state flag flipped. Clearing focus (Back / Esc) restores it.
@@ -8111,7 +8235,7 @@ fn panel_enter_reveals_and_exits(cx: &mut TestAppContext) {
     );
 }
 
-// === Steering queue (spec-turn-steering.md, INV-UX-7) ===
+// === Steering queue (spec-turn-steering.md, UXI-AgentTile-13) ===
 
 /// Submitting while a turn is in flight DELIVERS the steer immediately (the
 /// worker forwards it mid-turn for promptQueueing agents) and commits the user
@@ -8250,7 +8374,7 @@ fn esc_does_not_stop_in_flight_turn(cx: &mut TestAppContext) {
     assert!(requested2, "explicit stop (⌘.) still requests a cancel");
 }
 
-/// Mid-turn ordering + echo-dedup (INV-UX-7), through the REAL reducer: a steer
+/// Mid-turn ordering + echo-dedup (UXI-AgentTile-13), through the REAL reducer: a steer
 /// sent while a turn is streaming commits AFTER the agent content that preceded
 /// it, exactly once — the agent's later echo of the same prompt is suppressed
 /// (no phantom / no duplicate).
@@ -8316,7 +8440,7 @@ fn steering_midturn_ordering_and_dedup(cx: &mut TestAppContext) {
 // REAL `YaldaGpuiView` through many deterministic-random operation sequences and,
 // AFTER EVERY operation, runs one cross-cutting ORACLE that re-checks the whole
 // invariant contract at once (`assert_agent_invariants`):
-//   • INV-UX-1 (model): the compose caret is always at a valid position (line in
+//   • UXI-TextEditing-1 (model): the compose caret is always at a valid position (line in
 //     range, col ≤ that line's length) — it can never point off the buffer.
 //   • INV-ORDER: the frozen transcript is append-only — its frozen-line count
 //     never decreases, so no operation can rewrite or drop committed history.
@@ -8357,7 +8481,7 @@ fn assert_agent_invariants(
             let frozen = (0..c.editor.document().line_count())
                 .filter(|&i| c.editor.is_frozen_line(i))
                 .count();
-            // INV-UX-12: panel focus is a legal focus, and you can only hold it
+            // UXI-AgentTile-3: panel focus is a legal focus, and you can only hold it
             // while at least one bottom panel is open (the toggles auto-exit when
             // the last one closes). The selected row is clamped at render, so the
             // stored `panel_sel` never indexes a panic.
@@ -8366,7 +8490,7 @@ fn assert_agent_invariants(
                 AgentFocus::Compose | AgentFocus::Transcript | AgentFocus::Panel
             ) && (c.focus != AgentFocus::Panel || c.tasklist_open || c.subagents_open);
             let stop_ok = !c.turn_phase.stop_requested() || c.turn_phase.is_awaiting();
-            // INV-UX-9: a You-block exists ONLY in the worksheet (never chatbox
+            // UXI-AgentTile-11: a You-block exists ONLY in the worksheet (never chatbox
             // mode). The stored anchor is deliberately NOT asserted legal here — it
             // may go transiently stale and is re-validated at every consumption site
             // (effective_you_block_anchor), so a stale stored value is harmless.
@@ -8392,8 +8516,8 @@ fn assert_agent_invariants(
         })
         .unwrap()
     });
-    assert!(caret_line_ok, "INV-UX-1: compose caret line out of range [{ctx}]");
-    assert!(caret_col_ok, "INV-UX-1: compose caret col past end of line [{ctx}]");
+    assert!(caret_line_ok, "UXI-TextEditing-1: compose caret line out of range [{ctx}]");
+    assert!(caret_col_ok, "UXI-TextEditing-1: compose caret col past end of line [{ctx}]");
     assert!(focus_ok, "focus is Compose or Transcript [{ctx}]");
     assert!(
         stop_ok,
@@ -8469,14 +8593,14 @@ fn agent_tile_statemachine_fuzz_holds_invariants(cx: &mut TestAppContext) {
                 }
                 9 => view.update(vcx, |v, cx| v.toggle_agent_focus(cx)),
                 10 => view.update(vcx, |v, cx| v.stop_agent_inner(cx)),
-                // INV-UX-9: drive the real You-block open / discard key paths so the
+                // UXI-AgentTile-11: drive the real You-block open / discard key paths so the
                 // fuzzer exercises the inline-edit lifecycle against the oracle.
                 11 => view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx)),
                 12 => {
                     view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx))
                 }
                 13 => view.update(vcx, |v, cx| v.toggle_subagents(cx)),
-                // INV-UX-12: enter/leave panel focus and navigate it through the
+                // UXI-AgentTile-3: enter/leave panel focus and navigate it through the
                 // real Cmd-0 handler + key path, against the oracle.
                 14 => view.update(vcx, |v, cx| v.focus_agent_panel(cx)),
                 15 => view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("j"), w, cx)),
@@ -8536,7 +8660,7 @@ fn set_plan(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContex
     vcx.run_until_parked();
 }
 
-/// INV-UX-12: `h`/`l` switch the active column (Plan left / Subagents right) and
+/// UXI-AgentTile-3: `h`/`l` switch the active column (Plan left / Subagents right) and
 /// `j`/`k` then move within that column; the per-column row index is preserved.
 #[gpui::test]
 fn agent_panel_hl_switches_columns(cx: &mut TestAppContext) {
@@ -8569,7 +8693,7 @@ fn agent_panel_hl_switches_columns(cx: &mut TestAppContext) {
     assert_eq!(col(&view, vcx).0, PanelColumn::Tasklist, "h at the left edge is a no-op");
 }
 
-/// INV-UX-12: `Cmd-0` (here through `focus_agent_panel`) enters panel focus when
+/// UXI-AgentTile-3: `Cmd-0` (here through `focus_agent_panel`) enters panel focus when
 /// the bottom region has rows, and `Esc` restores the focus captured on entry.
 #[gpui::test]
 fn agent_panel_cmd0_enters_and_esc_restores(cx: &mut TestAppContext) {
@@ -8591,7 +8715,7 @@ fn agent_panel_cmd0_enters_and_esc_restores(cx: &mut TestAppContext) {
     );
 }
 
-/// INV-UX-12: vim `j`/`k`/`g`/`G` move the panel selection, clamped to the row
+/// UXI-AgentTile-3: vim `j`/`k`/`g`/`G` move the panel selection, clamped to the row
 /// count.
 #[gpui::test]
 fn agent_panel_vim_moves_selection(cx: &mut TestAppContext) {
@@ -8617,7 +8741,7 @@ fn agent_panel_vim_moves_selection(cx: &mut TestAppContext) {
     assert_eq!(sel(&view, vcx), 2, "G jumps to the bottom");
 }
 
-/// INV-UX-12: `Enter` on a subagent row focuses that subagent's output and
+/// UXI-AgentTile-3: `Enter` on a subagent row focuses that subagent's output and
 /// leaves panel focus.
 #[gpui::test]
 fn agent_panel_enter_focuses_subagent(cx: &mut TestAppContext) {
@@ -8648,7 +8772,7 @@ fn agent_panel_enter_focuses_subagent(cx: &mut TestAppContext) {
     );
 }
 
-/// INV-UX-12: the real `cmd-0` keymap binding (AgentView-scoped) reaches the
+/// UXI-AgentTile-3: the real `cmd-0` keymap binding (AgentView-scoped) reaches the
 /// panel-focus handler — proving it shadows the global zoom-reset in agent tiles.
 #[gpui::test]
 fn agent_panel_cmd0_binding_enters_panel(cx: &mut TestAppContext) {
@@ -8665,7 +8789,7 @@ fn agent_panel_cmd0_binding_enters_panel(cx: &mut TestAppContext) {
     );
 }
 
-/// INV-UX-12: closing the last open panel while panel-focused auto-exits (you
+/// UXI-AgentTile-3: closing the last open panel while panel-focused auto-exits (you
 /// can never be panel-focused with no panel open).
 #[gpui::test]
 fn agent_panel_closing_last_panel_exits_focus(cx: &mut TestAppContext) {
@@ -8886,7 +9010,7 @@ fn keymap_body_is_cached_and_self_invalidates(cx: &mut TestAppContext) {
     );
 }
 
-// ── Session recap (recap-panel, INV-UX-20) ──────────────────────────────────
+// ── Session recap (recap-panel, UXI-AgentTile-15) ──────────────────────────────────
 //
 // A recap is an LLM prose summary of ONE agent session, keyed by `SessionId`
 // (`self.recaps`) and rendered INSIDE that session's agent tile above the
@@ -8895,7 +9019,7 @@ fn keymap_body_is_cached_and_self_invalidates(cx: &mut TestAppContext) {
 // `spawn_recap_worker` skips under `cfg(test)`; these tests drive the REAL entry
 // points — the menu dispatch (`recap-session` / `recap-dismiss`) and the reducer
 // methods the pump calls (`apply_recap_event` / `finalize_recap`) — so the panel
-// state machine (INV-UX-20 property 2) is fully covered headlessly.
+// state machine (UXI-AgentTile-15 property 2) is fully covered headlessly.
 
 /// Seed the focused session's transcript so a recap has something to summarize.
 fn seed_recap_transcript(
@@ -9028,7 +9152,7 @@ fn recap_dismiss_clears(cx: &mut TestAppContext) {
 }
 
 /// Re-running supersedes the prior run: the token bumps, the text resets, and a
-/// LATE event from the stale run is ignored (token guard, INV-UX-20 property 2).
+/// LATE event from the stale run is ignored (token guard, UXI-AgentTile-15 property 2).
 ///
 /// Negative control: drop the `r.token != token` guard in `apply_recap_event`
 /// and the stale-chunk assert fails RED (the old run scribbles on the new one).
@@ -9070,7 +9194,7 @@ fn recap_rerun_supersedes_stale_run(cx: &mut TestAppContext) {
 }
 
 /// The recap panel PAINTS inside the agent tile, ABOVE the compose box, when
-/// pinned (INV-UX-20). Asserts real painted geometry via the layout probe:
+/// pinned (UXI-AgentTile-15). Asserts real painted geometry via the layout probe:
 /// non-vacuous area, and positioned above the compose (its natural slot above
 /// the subagents/tasks panels).
 ///
@@ -9112,7 +9236,7 @@ fn recap_panel_paints_in_agent_tile(cx: &mut TestAppContext) {
     crate::layout_probe_end();
 
     let (_rx, ry, rw, rh) = recap.expect(
-        "recap-panel did not paint — the pinned recap is invisible (INV-UX-20 violated)",
+        "recap-panel did not paint — the pinned recap is invisible (UXI-AgentTile-15 violated)",
     );
     assert!(rw > 1.0 && rh > 1.0, "recap panel painted with no area (w={rw}, h={rh})");
     // It renders inside the tile, above the compose (its slot above the
