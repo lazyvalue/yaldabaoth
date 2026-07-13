@@ -269,7 +269,7 @@ actions!(
         // Agent window: open/close the Subagents sidebar (§32). Cmd-2.
         ToggleSubagents,
         // Agent window: focus + enlarge the bottom-panel region (Plan +
-        // Subagents) for vim-key selection (INV-UX-12). Cmd-0 in AgentView,
+        // Subagents) for vim-key selection (UXI-AgentTile-3). Cmd-0 in AgentView,
         // overriding the global zoom-reset there. Esc leaves it.
         FocusAgentPanel,
         // Agent window: interrupt the in-flight turn (ACP session/cancel).
@@ -690,7 +690,7 @@ impl BrowserWindow {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 enum EditMode {
     #[default]
     Normal,
@@ -1070,7 +1070,7 @@ impl EditState {
     /// Reconcile the row list to `lines` by splicing ONLY the changed range —
     /// never `reset()` (that drops scroll + measurements and snaps the viewport
     /// to the top on every newline edit) — then reveal the caret's line so it
-    /// stays on-screen (INV-UX-1). Shared by the Code and WordProcessor bodies so
+    /// stays on-screen (UXI-TextEditing-1). Shared by the Code and WordProcessor bodies so
     /// caret-follows-scroll lives in exactly one place, not two verbatim copies.
     /// Returns the reconciled row count.
     fn reconcile_and_reveal(
@@ -1624,7 +1624,7 @@ struct YaldaGpuiView {
     /// empty = by-label. A session never crosses cwd groups (drop is cwd-gated).
     jump_session_order: Vec<String>,
     /// Pinned session recaps (recap-panel), keyed by the session they summarize —
-    /// one per session, so a recap is SPECIFIC to its agent tile (INV-UX-20). An
+    /// one per session, so a recap is SPECIFIC to its agent tile (UXI-AgentTile-15). An
     /// entry appears when summoned (`recap-session`), is re-runnable and dismissed
     /// (`recap-dismiss`), and owns the throwaway recap worker + pump for the life
     /// of a generation. Rendered inside the agent tile, above the subagents/tasks
@@ -2716,7 +2716,7 @@ impl YaldaGpuiView {
             self.save_settings();
             // Text-zoom is GLOBAL, not session state (ticket 021): the action
             // handler notifies each live transcript view directly so the cached
-            // subtree re-renders with the new scale. INV-UX-13: the transcript's
+            // subtree re-renders with the new scale. UXI-TextZoom-1: the transcript's
             // conversation prose + markdown blocks scale by `text_scale` (read
             // from the root in `RootSnapshot`), like the buffer doc view; this is
             // the audited invalidation path that makes that re-read take effect.
@@ -4153,7 +4153,7 @@ impl YaldaGpuiView {
     /// The agent tile's local menu with a live "switch model" submenu grafted
     /// on. The base entries are static (`agent_local_menu`); the submenu's
     /// children are built from the focused session's advertised model list so
-    /// the picker reflects exactly what the agent offers (INV-UX-22). Each
+    /// the picker reflects exactly what the agent offers (UXI-AgentTile-16). Each
     /// child dispatches `set-model:<id>`; the active model is marked `✓`. The
     /// "switch model" entry is ALWAYS present for discoverability — when the
     /// agent hasn't advertised a picklist yet it drills into a single disabled
@@ -4340,7 +4340,7 @@ impl YaldaGpuiView {
                         // space on the blank block opens the menu). The chatbox is a
                         // real box: empty or not, it's text entry. Once the worksheet
                         // draft is non-empty, space types (multi-word). Same empty-draft
-                        // rule as the mid-turn steer below (INV-UX-9 rule 7).
+                        // rule as the mid-turn steer below (UXI-AgentTile-11 rule 7).
                         let compose_insert = c.focus == AgentFocus::Compose
                             && c.input_surface.compose().mode == EditMode::Insert
                             && (c.input_surface.is_chatbox() || !draft_empty);

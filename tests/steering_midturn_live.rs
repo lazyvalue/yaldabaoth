@@ -1,4 +1,4 @@
-//! LIVE integration test for mid-turn steering (spec-turn-steering.md, INV-UX-7).
+//! LIVE integration test for mid-turn steering (spec-turn-steering.md, UXI-AgentTile-13).
 //!
 //! Drives the REAL `AcpChannelClient` worker against the REAL `claude-agent-acp`
 //! agent: sends a slow first prompt, then a second prompt ~3s into that turn, and

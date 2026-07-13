@@ -191,7 +191,7 @@ pub(crate) enum FlatItem {
     TurnHeader { role: TurnRole },
     /// Pulsing indicator shown at transcript tail while awaiting reply.
     ThinkingIndicator,
-    /// The inline **You-block** (INV-UX-9 rules 5/6): an editable reply rendered
+    /// The inline **You-block** (UXI-AgentTile-11 rules 5/6): an editable reply rendered
     /// inside the transcript at its anchor while idle. Owns NO doc line — the draft
     /// lives outside the transcript (Model C). `parked = None` is the ACTIVE block
     /// (in `input_surface.compose`, caret-bearing); `parked = Some(i)` is the i-th
@@ -1399,7 +1399,7 @@ pub(crate) fn build_chatbox_line(
     // Headless harness (#3.2): tag the caret's visual row so a `#[gpui::test]`
     // can read its PAINTED bounds and prove it's inside the compose box — the
     // virtualized list never paints an off-screen row, so a missing probe means
-    // the caret fell below the fold. No-op in production. Pins INV-UX-1 at paint.
+    // the caret fell below the fold. No-op in production. Pins UXI-TextEditing-1 at paint.
     if is_cursor_line {
         probe_bounds("compose-cursor-row", el)
     } else {
@@ -1408,7 +1408,7 @@ pub(crate) fn build_chatbox_line(
 }
 
 /// Word-wrap a (tab-expanded) monospace line into visual-row char ranges of at
-/// most `width` columns each (INV-UX-2). Breaks at the last space strictly inside
+/// most `width` columns each (UXI-AgentTile-9). Breaks at the last space strictly inside
 /// `[start, start+width)`; a word longer than `width` is hard-broken at the limit.
 /// Returns half-open `[start, end)` ranges over the line covering EVERY char
 /// (nothing dropped — the caret must be addressable at every column), always ≥1
@@ -1416,7 +1416,7 @@ pub(crate) fn build_chatbox_line(
 ///
 /// Computed here (not in GPUI layout) because the compose is monospace and the
 /// box width in columns is known — so the caret's visual row/col stay exactly
-/// known (view-owns-its-coordinates), and INV-UX-1 holds without measuring the
+/// known (view-owns-its-coordinates), and UXI-TextEditing-1 holds without measuring the
 /// painted text. This supersedes the horizontal-scroll window the compose used
 /// (`spec-chatbox-caret-containment.md`): wrapped text never needs to scroll
 /// sideways.
@@ -1462,7 +1462,7 @@ pub(crate) fn caret_visual_row(rows: &[(usize, usize)], cursor_col: usize) -> us
     rows.len().saturating_sub(1)
 }
 
-/// Render one LOGICAL compose line as a column of wrapped visual rows (INV-UX-2).
+/// Render one LOGICAL compose line as a column of wrapped visual rows (UXI-AgentTile-9).
 /// Each visual row is drawn by [`build_chatbox_line`] over exactly its own char
 /// range, so nothing is clipped and no horizontal scroll is needed; the caret is
 /// placed on the single visual row that holds `cursor_col`.
@@ -1507,7 +1507,7 @@ pub(crate) fn build_chatbox_wrapped_line(
 }
 
 /// Vertical caret-containment metrics for the WRAPPED compose, in VISUAL-row
-/// space (INV-UX-1 under INV-UX-2). Once lines wrap, the box scrolls in visual
+/// space (UXI-TextEditing-1 under UXI-AgentTile-9). Once lines wrap, the box scrolls in visual
 /// rows — not logical lines — so the vertical window MUST be computed over visual
 /// rows or the caret falls below the fold (the recurring chatbox-cursor bug).
 /// Returns `(caret_visual_row, total_visual_rows, per_line_row_counts)`:
@@ -1854,7 +1854,7 @@ pub(crate) enum PanelItem {
 }
 
 /// Which bottom-panel COLUMN holds the selection while `focus == Panel`
-/// (INV-UX-12). The two columns render side by side — Plan on the LEFT,
+/// (UXI-AgentTile-3). The two columns render side by side — Plan on the LEFT,
 /// Subagents on the RIGHT — and `h`/`l` move between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum PanelColumn {
@@ -2907,7 +2907,7 @@ pub(crate) fn rebuild_agent_view_model(
         flat_items.push(FlatItem::ThinkingIndicator);
     }
 
-    // INVARIANT — no empty turn header (INV-UX-4): a `You`/`Claude` divider is
+    // INVARIANT — no empty turn header (UXI-AgentTile-5): a `You`/`Claude` divider is
     // rendered only for a turn that actually has visible content (a Line / Block /
     // ToolGroup / ThinkingIndicator) before the next header. The blank-collapse
     // pass can strip a turn's only (blank) lines, and a run of content-less turns
@@ -2941,7 +2941,7 @@ pub(crate) fn rebuild_agent_view_model(
         flat_items.truncate(j);
     }
 
-    // INV-UX-9 rule 5 (stage 2): inject the inline **You-block** at its anchor —
+    // UXI-AgentTile-11 rule 5 (stage 2): inject the inline **You-block** at its anchor —
     // immediately after the anchored doc line, or at the tail when unanchored. The
     // draft lives in the separate Compose (never the transcript), so this is purely
     // a render slot; the per-keystroke content change busts `TranscriptSeqs`, not
@@ -2972,7 +2972,7 @@ pub(crate) fn rebuild_agent_view_model(
         // the SAME pre-insertion list, then applied in DESCENDING order so an insert
         // never shifts a not-yet-applied (smaller) position.
         let mut inserts: Vec<(usize, Option<usize>)> = Vec::new();
-        // INV-UX-16: inject the inline You-block on the SAME gate the render/notify
+        // UXI-AgentTile-12: inject the inline You-block on the SAME gate the render/notify
         // paths use (`inline_you_block_active` — here it reduces to `you_block_open
         // || focus==Compose`, since the enclosing guard already ensures idle +
         // worksheet). Using the shared predicate keeps injection ⇔ paint ⇔ notify
@@ -3113,7 +3113,7 @@ pub(crate) struct AgentState {
     /// Worksheet a *workspace* (select history, `S` = send selection), shared by
     /// both placements. `Esc` from `Transcript` returns to `Compose`.
     pub(crate) focus: AgentFocus,
-    /// Worksheet inline-edit (spec-worksheet.md / INV-UX-9): whether a **You-block**
+    /// Worksheet inline-edit (spec-worksheet.md / UXI-AgentTile-11): whether a **You-block**
     /// is currently open — i.e. the `Compose` is acting as an inline editable reply
     /// attached to the transcript while the agent is idle. `false` = the worksheet
     /// is in pure navigation (no compose chrome shown). Entering Insert from
@@ -3122,7 +3122,7 @@ pub(crate) struct AgentState {
     /// Worksheet mode; the mid-turn chatbox (rule 7) is derived from `turn_phase`,
     /// not from this flag.
     pub(crate) you_block_open: bool,
-    /// Worksheet inline-edit (INV-UX-9 rule 5, stage 2): the doc line the open
+    /// Worksheet inline-edit (UXI-AgentTile-11 rule 5, stage 2): the doc line the open
     /// You-block is anchored AFTER — i.e. the block renders inline immediately
     /// below transcript line `Some(l)`, so a reply lands between two lines of the
     /// latest agent turn. `None` = tail (render after the last line). Only
@@ -3130,7 +3130,7 @@ pub(crate) struct AgentState {
     /// separate `Compose` (Model C: never in the transcript); this is purely a
     /// render/freeze position, set when Insert opens the block.
     pub(crate) you_block_anchor: Option<usize>,
-    /// Worksheet inline-edit (INV-UX-9 rule 6, MULTIPLE insertion points): the
+    /// Worksheet inline-edit (UXI-AgentTile-11 rule 6, MULTIPLE insertion points): the
     /// ADDITIONAL You-blocks the user has placed besides the active one. Each is a
     /// `(anchor, text)` pair — its draft text lives here (outside the transcript,
     /// Model C), rendered inline read-only; the ACTIVE block being typed stays in
@@ -3341,7 +3341,7 @@ impl AgentState {
             .collect()
     }
 
-    /// Re-seat panel focus after a panel open/close (INV-UX-12). If the active
+    /// Re-seat panel focus after a panel open/close (UXI-AgentTile-3). If the active
     /// column is no longer focusable, hop to another open column; if none
     /// remain, leave panel focus (restoring the captured focus). No-op unless
     /// `focus == Panel`.
@@ -3435,9 +3435,9 @@ impl AgentState {
             // name the mode or the divider wouldn't appear/disappear live.
             (self.mode == EditMode::Insert).hash(&mut h);
         }
-        // INV-UX-9 (stage 2) / INV-UX-16: the inline You-block is injected into the
+        // UXI-AgentTile-11 (stage 2) / UXI-AgentTile-12: the inline You-block is injected into the
         // flat list on the `inline_you_block_active()` gate, at its anchor — so a
-        // change in that gate (open/close, OR a `focus==Compose` flip per INV-UX-16)
+        // change in that gate (open/close, OR a `focus==Compose` flip per UXI-AgentTile-12)
         // restructures the list and must rebuild the memo. Keying the DERIVED gate
         // (not the raw `you_block_open`) is load-bearing: a Transcript→Compose focus
         // flip with a closed block now injects the block, so the memo MUST see it or
@@ -3691,7 +3691,7 @@ impl AgentState {
         }
     }
 
-    /// INV-UX-9 rule 5 (stage 2): like [`insert_user_turn`] but freezes the turn
+    /// UXI-AgentTile-11 rule 5 (stage 2): like [`insert_user_turn`] but freezes the turn
     /// INLINE after doc line `after_line` (a between-lines reply) instead of at EOF.
     /// Shares the same reconciler dedup/numbering chokepoint, so the agent's echo
     /// of this prompt is still suppressed. A tail anchor degrades to the EOF append.
@@ -3855,7 +3855,7 @@ impl AgentState {
         // left where it is.
         if !self.input_surface.is_chatbox() {
             self.move_cursor_to_tail();
-            // INV-UX-9 rule 7 turn-end: the mid-turn chatbox is gone now that we're
+            // UXI-AgentTile-11 rule 7 turn-end: the mid-turn chatbox is gone now that we're
             // idle. If the user typed a steer that wasn't sent, DON'T lose it —
             // carry it over as a tail You-block (so it stays visible + editable);
             // otherwise rest in transcript navigation. (bug-hunt 6 follow-through.)
@@ -3871,7 +3871,7 @@ impl AgentState {
         true
     }
 
-    /// INV-UX-9 rule 5: the `[start, end)` doc-line range of the most-recent agent
+    /// UXI-AgentTile-11 rule 5: the `[start, end)` doc-line range of the most-recent agent
     /// (`TurnId::Llm`) turn, or `None` if no agent turn is tagged yet. Drives the
     /// legal-insertion-point guard for opening a You-block — a reply may only be
     /// placed within the latest agent turn (after one of its newlines) or at the
@@ -3905,7 +3905,7 @@ impl AgentState {
         start.map(|s| (s, end))
     }
 
-    /// INV-UX-9 rule 5: may a You-block be opened with the caret on doc line `l`?
+    /// UXI-AgentTile-11 rule 5: may a You-block be opened with the caret on doc line `l`?
     /// Legal iff `l` is within the latest agent turn (insert after one of its
     /// newlines) OR at the transcript tail (reply at the end), OR there is no agent
     /// turn yet (reply to an empty transcript). Frozen content in OLDER turns is
@@ -4054,7 +4054,7 @@ impl AgentState {
     /// NOT clear the compose draft (owned by `InputSurface`; the caller decides).
     /// Call whenever a turn begins, on reset/replay, or when leaving the
     /// idle-worksheet state, so `you_block_open` can never outlive the state it
-    /// means (INV-UX-9: a block exists only while idle in the worksheet). Fixes the
+    /// means (UXI-AgentTile-11: a block exists only while idle in the worksheet). Fixes the
     /// toggle / replay / selection-send anchor-leak class (bug-hunt 1–4, 10).
     pub(crate) fn close_you_block(&mut self) {
         self.you_block_open = false;
@@ -4064,7 +4064,7 @@ impl AgentState {
         self.parked_you_blocks.clear();
     }
 
-    /// INV-UX-9 / INV-UX-16: is the inline You-block currently the live editing
+    /// UXI-AgentTile-11 / UXI-AgentTile-12: is the inline You-block currently the live editing
     /// surface — i.e. rendered inside the transcript at its anchor? True iff (a
     /// block is open OR **focus is on the compose**), the agent is idle, and we're
     /// in the worksheet.

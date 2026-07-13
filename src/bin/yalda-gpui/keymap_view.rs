@@ -594,7 +594,7 @@ impl KeymapView {
             .font_family(st.mono.clone())
             .text_size(st.base)
             .child(
-                // Cursor gutter marker (keeps INV-UX-1: the selected row is
+                // Cursor gutter marker (keeps UXI-TextEditing-1: the selected row is
                 // always visibly marked, not just background-tinted).
                 div()
                     .w(px(14.0))

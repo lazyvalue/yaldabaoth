@@ -531,7 +531,7 @@ fn worksheet_rebuild_reuses_parsed_blocks_by_identity() {
     );
 }
 
-/// INV-UX-9 rule 5: a You-block may be opened only within the latest agent turn
+/// UXI-AgentTile-11 rule 5: a You-block may be opened only within the latest agent turn
 /// (after one of its newlines) or at the transcript tail; an older frozen turn is
 /// not a legal insertion point. Drives the guard `you_block_anchor_is_legal` over a
 /// two-turn transcript built through the real `append_llm_chunk` tagging path.
@@ -887,7 +887,7 @@ fn has_user_header(flat: &[FlatItem]) -> bool {
 }
 
 /// REGRESSION (live screenshot: the transcript showed a stack of EMPTY
-/// alternating `You`/`Claude` dividers between real turns). INV-UX-4: a turn
+/// alternating `You`/`Claude` dividers between real turns). UXI-AgentTile-5: a turn
 /// header renders only for a turn with visible content. Build a transcript with
 /// EMPTY turns — blank lines carrying escalating turn numbers, the separator /
 /// resume artifacts behind the bug — interleaved with real turns, and assert no
@@ -1273,7 +1273,7 @@ fn chatbox_turn_end_leaves_caret_put() {
     );
 }
 
-/// INV-UX-2 (ux-invariants.md): the compose word-wraps. `wrap_line_cols`
+/// UXI-AgentTile-9 (ux-invariants.md): the compose word-wraps. `wrap_line_cols`
 /// partitions a line into ≤width visual rows, breaking at spaces, hard-breaking
 /// over-long words, covering EVERY char (so the caret is addressable everywhere),
 /// always ≥1 row.
@@ -1314,7 +1314,7 @@ fn wrap_line_cols_word_wraps_and_covers_every_char() {
     }
 }
 
-/// INV-UX-1 over the wrapped compose: the caret resolves to the single visual row
+/// UXI-TextEditing-1 over the wrapped compose: the caret resolves to the single visual row
 /// holding its column; a row-boundary column belongs to the NEXT row; end-of-line
 /// sits on the last row — so the caret is always on a rendered row (never lost).
 #[test]
@@ -1332,7 +1332,7 @@ fn caret_visual_row_places_caret_on_a_rendered_row() {
 }
 
 /// REGRESSION (live report: "I can move the cursor below the fold in the chatbox
-/// again"): INV-UX-1 under INV-UX-2. Once the compose word-wraps, the vertical
+/// again"): UXI-TextEditing-1 under UXI-AgentTile-9. Once the compose word-wraps, the vertical
 /// window MUST be computed over VISUAL rows, not logical lines — the wrap change
 /// computed it over logical lines, so the caret's visual row fell below the box.
 /// This drives the real path: `compose_visual_metrics` → `compose_first_visible_line`
@@ -1365,7 +1365,7 @@ fn compose_wrapped_caret_never_below_the_fold() {
 
             let top = compose_first_visible_line(caret_vrow, prev_top, total2, visible);
 
-            // INV-UX-1: the caret's VISUAL row is inside the visible window.
+            // UXI-TextEditing-1: the caret's VISUAL row is inside the visible window.
             assert!(
                 caret_vrow >= top && caret_vrow < top + visible,
                 "caret visual row {caret_vrow} fell outside window [{top}, {}) \
@@ -3026,7 +3026,7 @@ fn clear_then_empty_channel_open_keeps_worksheet_typeable() {
 
 /// EXHAUSTIVE truth table for `inline_you_block_active` — the gate that decides
 /// whether the inline You-block renders AND a worksheet keystroke busts the
-/// transcript cache (repaints). The predicate (INV-UX-16) is
+/// transcript cache (repaints). The predicate (UXI-AgentTile-12) is
 /// `(you_block_open || focus==Compose) && !awaiting && !chatbox`. Every clause
 /// must be load-bearing (mutation testing found the original three operands
 /// untested); the `|| focus==Compose` clause closes the recurring
@@ -3058,7 +3058,7 @@ fn inline_you_block_active_truth_table() {
     chatbox.input_surface = InputSurface::new(InputModeKind::Chatbox);
     assert!(!chatbox.inline_you_block_active(), "chatbox placement ⇒ inactive");
 
-    // INV-UX-16: the `|| focus==Compose` clause. "The hole" — focus on the compose
+    // UXI-AgentTile-12: the `|| focus==Compose` clause. "The hole" — focus on the compose
     // in an idle worksheet with the block CLOSED — must be ACTIVE (else keystrokes
     // route to a compose that paints nowhere: the invisible-text bug).
     let hole = || {
@@ -3069,7 +3069,7 @@ fn inline_you_block_active_truth_table() {
     };
     assert!(
         hole().inline_you_block_active(),
-        "INV-UX-16: focus=Compose + closed block + idle worksheet ⇒ ACTIVE (routing⇒painting)"
+        "UXI-AgentTile-12: focus=Compose + closed block + idle worksheet ⇒ ACTIVE (routing⇒painting)"
     );
     // But the compose-focus clause is still gated by !awaiting and !chatbox — a
     // focus=Compose that is mid-turn or chatbox has its draft in the bottom box.

@@ -1691,7 +1691,7 @@ impl Editor {
         }
     }
 
-    /// INV-UX-9 rule 5 (stage 2): freeze `text` as a committed user turn INSERTED
+    /// UXI-AgentTile-11 rule 5 (stage 2): freeze `text` as a committed user turn INSERTED
     /// after doc line `after_line` — an inline reply placed BETWEEN two agent lines,
     /// rather than appended at EOF. Mirrors [`freeze_as_user_turn`] but at the
     /// anchor; falls back to the EOF append when the anchor is the last line (the
@@ -1734,7 +1734,7 @@ impl Editor {
     /// (`mode=max` → "`m" | tool | "ode=max"). Any other boundary — whitespace,
     /// or sentence/word-terminating punctuation like the '.' ending "here." — is
     /// a legitimate `text → tool → text` interleave and returns `None`, so the
-    /// tool stays between the two statements (INV-UX-19). Alphanumeric-only is
+    /// tool stays between the two statements (UXI-AgentTile-8). Alphanumeric-only is
     /// conservative on purpose: it fixes the word-cut-in-half case (what reads
     /// worst) without guessing at ambiguous punctuation splits (a filename like
     /// "gate.sh" broken on '.' is left to interleave rather than mis-fused).
@@ -2189,7 +2189,7 @@ mod tests {
         );
     }
 
-    /// INV-UX-19 (complement of `post_tool_chunk_does_not_clobber_pre_tool_line`):
+    /// UXI-AgentTile-8 (complement of `post_tool_chunk_does_not_clobber_pre_tool_line`):
     /// when a tool interrupts an OPEN run MID-WORD — the pre-tool chunk ends on an
     /// alphanumeric and the post-tool chunk starts on one — the halves REJOIN onto
     /// one line (word kept whole) and the tool renders after, instead of splitting
@@ -2769,7 +2769,7 @@ mod tests {
 
     #[test]
     fn freeze_as_user_turn_at_inserts_between_agent_lines() {
-        // INV-UX-9 rule 5 (stage 2): a reply frozen AFTER a middle line of the
+        // UXI-AgentTile-11 rule 5 (stage 2): a reply frozen AFTER a middle line of the
         // agent's turn lands between the right lines, is frozen + tagged, and the
         // agent lines below it keep their tags (anchor-keyed metadata auto-shifts).
         let mut ed = new_editor("");

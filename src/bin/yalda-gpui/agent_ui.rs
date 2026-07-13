@@ -3231,7 +3231,7 @@ impl YaldaGpuiView {
     /// next ACP prompt, then lock the turn so that content can't be
     /// retroactively edited.
     /// Toggle the Tasklist (Plan) bottom panel (§24). If this closes the last
-    /// open panel while it holds focus, leave panel focus (INV-UX-12: you can't
+    /// open panel while it holds focus, leave panel focus (UXI-AgentTile-3: you can't
     /// be panel-focused with no panel open).
     pub(crate) fn toggle_tasklist(&mut self, cx: &mut Context<Self>) {
         if let Some(mut c) = self.agent_mut(cx) {
@@ -3242,7 +3242,7 @@ impl YaldaGpuiView {
     }
 
     /// Toggle the Subagents bottom panel (§28). Mirrors `toggle_tasklist`'s
-    /// re-seat of panel focus when the active column closes (INV-UX-12).
+    /// re-seat of panel focus when the active column closes (UXI-AgentTile-3).
     pub(crate) fn toggle_subagents(&mut self, cx: &mut Context<Self>) {
         if let Some(mut c) = self.agent_mut(cx) {
             c.subagents_open = !c.subagents_open;
@@ -3273,7 +3273,7 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Enter or leave the focused bottom-panel region (Cmd-0, INV-UX-12).
+    /// Enter or leave the focused bottom-panel region (Cmd-0, UXI-AgentTile-3).
     /// Toggle: already focused → exit (restore prior focus); otherwise focus it
     /// iff at least one column has a selectable row, landing on the first such
     /// column (Plan, else Subagents) and remembering the prior focus so `Esc`
@@ -3437,7 +3437,7 @@ impl YaldaGpuiView {
                 InputModeKind::Worksheet => InputModeKind::Chatbox,
                 InputModeKind::Chatbox => InputModeKind::Worksheet,
             };
-            // INV-UX-9: the worksheet rests in transcript navigation (free cursor
+            // UXI-AgentTile-11: the worksheet rests in transcript navigation (free cursor
             // in the buffer); the chatbox rests in the compose. Entering worksheet
             // with an existing draft keeps it as an open You-block; otherwise it
             // starts in pure navigation. Entering chatbox focuses the box.
@@ -3722,7 +3722,7 @@ impl YaldaGpuiView {
             return;
         };
 
-        // INV-UX-9 rules 5/6: an IDLE worksheet submit sends ALL You-blocks (the
+        // UXI-AgentTile-11 rules 5/6: an IDLE worksheet submit sends ALL You-blocks (the
         // active draft + every parked insertion point) as one combined prompt and
         // freezes each in place. MID-TURN there are no You-blocks (editing is
         // idle-only) — the compose is the steering chatbox, so fall through to the
@@ -3780,7 +3780,7 @@ impl YaldaGpuiView {
             return;
         }
 
-        // STEERING (spec-turn-steering.md, INV-UX-7): a submit is delivered
+        // STEERING (spec-turn-steering.md, UXI-AgentTile-13): a submit is delivered
         // IMMEDIATELY — even mid-turn. For agents that advertise `promptQueueing`
         // (claude-agent-acp) the worker forwards the prompt concurrently, so the
         // agent receives the steer while the current turn is still streaming and
@@ -3788,7 +3788,7 @@ impl YaldaGpuiView {
         // commits the user turn on a successful write. On send FAILURE we LEAVE
         // the draft in the compose (no clear, no queue) with a status so the user
         // can retry — the message is never moved out of sight or dropped.
-        // INV-UX-9 rule 5: a worksheet reply freezes IN PLACE at the You-block's
+        // UXI-AgentTile-11 rule 5: a worksheet reply freezes IN PLACE at the You-block's
         // anchor (between the latest turn's lines); chatbox / tail submits append
         // at EOF (anchor = None). Only meaningful when a block is open + idle.
         let anchor = self
@@ -3803,7 +3803,7 @@ impl YaldaGpuiView {
                 // Reset the compose, PRESERVING placement (Model C §4.1).
                 let mode = claude.input_surface.mode;
                 claude.input_surface = InputSurface::new(mode);
-                // INV-UX-9 (rule 4): a worksheet submit closes the You-block — the
+                // UXI-AgentTile-11 (rule 4): a worksheet submit closes the You-block — the
                 // reply was frozen by the reconciler — and rests in transcript NAV
                 // (focus=Transcript). It does NOT switch to focus=Compose: a turn can
                 // end via stop/force-restart (not just finalize), and focus=Compose
@@ -3824,7 +3824,7 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Worksheet submit (INV-UX-9 rules 5/6): gather every You-block (the active
+    /// Worksheet submit (UXI-AgentTile-11 rules 5/6): gather every You-block (the active
     /// draft + all parked insertion points), send their COMBINED text as one prompt,
     /// and on success freeze each block IN PLACE under one user turn, then rest in
     /// nav. On failure the drafts are kept. `/clear` as the sole content still routes
@@ -3973,7 +3973,7 @@ impl YaldaGpuiView {
                 // `LocalSubmit` always inserts + records so the stream echo that
                 // follows (server `UserPrompt` / agent `UserMessage`) is
                 // suppressed. Never advances the replay boundary on a live send.
-                // INV-UX-9 rule 5: a worksheet reply with a between-lines anchor
+                // UXI-AgentTile-11 rule 5: a worksheet reply with a between-lines anchor
                 // freezes IN PLACE; otherwise (chatbox / tail) it appends at EOF.
                 match anchor {
                     Some(after_line) => claude.insert_user_turn_at(
@@ -4007,7 +4007,7 @@ impl YaldaGpuiView {
     //
     // A recap is a one-off, LLM-generated prose summary of one agent session's
     // conversation, requested manually and pinned INSIDE that session's agent
-    // tile — above the subagents/tasks panels — until dismissed (INV-UX-20).
+    // tile — above the subagents/tasks panels — until dismissed (UXI-AgentTile-15).
     // Recaps are keyed by `SessionId` (`self.recaps`), so each is SPECIFIC to its
     // tile; two tiles can each hold their own. Generation runs on a THROWAWAY
     // `AcpChannelClient` — a private side-channel worker fed the transcript text
@@ -4412,7 +4412,7 @@ impl YaldaGpuiView {
     ) {
         let press = keystroke_to_keypress(&ev.keystroke);
 
-        // Panel focus (Cmd-0, INV-UX-12) is MODAL: while the bottom-panel region
+        // Panel focus (Cmd-0, UXI-AgentTile-3) is MODAL: while the bottom-panel region
         // holds focus, vim keys move the selection and everything else is inert
         // (no leaders, no compose typing) until `Esc` / `Enter` leaves it. Checked
         // before the leaders so `j`/`k` navigate rows instead of opening menus.
@@ -4511,7 +4511,7 @@ impl YaldaGpuiView {
             .unwrap_or(false);
         // The bare-`m`/`'` mark chord fires ONLY in genuine transcript navigation.
         // Mid-turn in the worksheet, `focus` stays on the transcript but input
-        // routes to the bottom chatbox (INV-UX-9 rule 7) — that is text entry, so
+        // routes to the bottom chatbox (UXI-AgentTile-11 rule 7) — that is text entry, so
         // `m` must TYPE, not start a chord. Use the SAME exclusion the leaders /
         // `transcript_focused` use. (Was `focus == Transcript` alone — the "mid-turn
         // m sets a mark" bug; the real fix lived only on the unmerged `jump-pane-nav`
@@ -4552,7 +4552,7 @@ impl YaldaGpuiView {
         // `S` sends the selection. Edits are inert: the transcript is all frozen
         // (guards no-op them) and we pin the editor to Normal so `i`/`a` can't
         // enter Insert.
-        // INV-UX-9 rule 7 (bug-hunt 6): mid-turn in the worksheet, input belongs to
+        // UXI-AgentTile-11 rule 7 (bug-hunt 6): mid-turn in the worksheet, input belongs to
         // the bottom chatbox — NOT transcript navigation. So treat the transcript as
         // unfocused while awaiting (keys fall through to the compose dispatch, which
         // edits the chatbox). Esc-interrupt / Ctrl-Enter-steer are handled earlier.
@@ -4563,7 +4563,7 @@ impl YaldaGpuiView {
             })
             .unwrap_or(false);
         if transcript_focused {
-            // INV-UX-9: in the WORKSHEET, an Insert-entry key from transcript
+            // UXI-AgentTile-11: in the WORKSHEET, an Insert-entry key from transcript
             // navigation opens a **You-block** — the `Compose` becomes an inline
             // editable reply attached to the conversation (rule 2). The draft lives
             // in the separate Compose (Model C: no draft in the transcript), so
@@ -4585,7 +4585,7 @@ impl YaldaGpuiView {
                 && press.modifiers.is_empty()
                 && matches!(press.key, Key::Char('i' | 'a' | 'o' | 'I' | 'A' | 'O'))
             {
-                // INV-UX-9 rule 6: one block at a time. If a block is ALREADY open,
+                // UXI-AgentTile-11 rule 6: one block at a time. If a block is ALREADY open,
                 // `i` RESUMES it in place (open_you_block_at_cursor is idempotent —
                 // it must NOT move the reply to the caret: the "jumps around" bug). A
                 // NEW block opens only at a legal point (rule 5): within the latest
@@ -4654,7 +4654,7 @@ impl YaldaGpuiView {
             return;
         }
 
-        // INV-UX-9: Esc in a worksheet You-block is LAYERED, like a vim/helix editor:
+        // UXI-AgentTile-11: Esc in a worksheet You-block is LAYERED, like a vim/helix editor:
         //   1st Esc (compose in Insert) → drop to Normal IN the block, keeping focus
         //      so the user can edit the reply with motions and `i`/`a` back in.
         //   2nd Esc (compose already Normal) → LEAVE the block to transcript nav. An
@@ -4717,7 +4717,7 @@ impl YaldaGpuiView {
         }) else {
             return;
         };
-        // INV-UX-9 bugfix (stale inline typing): when the compose is the INLINE
+        // UXI-AgentTile-11 bugfix (stale inline typing): when the compose is the INLINE
         // You-block it renders INSIDE the cached `TranscriptView`, whose
         // `cx.observe(&session)` fires only on a SESSION notify. `with_session_silent`
         // above did not notify the session, so a keystroke didn't bust the
@@ -4755,7 +4755,7 @@ impl YaldaGpuiView {
             ));
         }
         if inline_active {
-            // INV-UX-1: keep the inline block's caret in view as the reply grows.
+            // UXI-TextEditing-1: keep the inline block's caret in view as the reply grows.
             self.with_session_silent(focused_id, cx, |c| c.pending_reveal_cursor = true);
             if let Some(ent) = self.session_entity(focused_id) {
                 ent.update(cx, |_, scx| scx.notify());

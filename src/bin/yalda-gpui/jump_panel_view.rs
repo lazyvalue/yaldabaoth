@@ -118,7 +118,7 @@ pub(crate) enum AgentDotStatus {
 }
 
 impl AgentRow {
-    /// Map this row to its status-dot meaning (INV-UX-10). Disconnected wins
+    /// Map this row to its status-dot meaning (UXI-JumpPanel-1). Disconnected wins
     /// (nothing is happening); otherwise a known phase chooses working vs your-
     /// turn, and an unknown phase stays neutral.
     pub(crate) fn dot_status(&self) -> AgentDotStatus {

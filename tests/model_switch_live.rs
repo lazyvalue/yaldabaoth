@@ -1,4 +1,4 @@
-//! LIVE integration test for the in-app model switcher (INV-UX-22).
+//! LIVE integration test for the in-app model switcher (UXI-AgentTile-16).
 //!
 //! Drives the REAL `AcpChannelClient` worker against the REAL `claude-agent-acp`
 //! agent: waits for the model picklist the agent advertises on `session/new`,

@@ -46,7 +46,7 @@ pub(crate) const YOU_BLOCK_SPLICE_LABEL: &str = "you_block_splice";
 /// transcript `render()` reads; the observe callback recomputes the live values
 /// and self-notifies iff ANY differs from what was last rendered, logging which
 /// slice moved for the `YALDA_PERF` notify-reason counter.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) struct TranscriptSeqs {
     /// Document `edit_seq` — text content (insert/delete; freezing via
     /// `freeze_as_user_turn` is an edit so it bumps this too).
@@ -84,7 +84,7 @@ pub(crate) struct TranscriptSeqs {
     /// cursor-row bar render ONLY when focused; flipping focus must bust the
     /// cache so the caret appears/disappears.
     pub(crate) transcript_focused: bool,
-    /// INV-UX-9 (stage 2): the inline You-block renders the live `Compose` INSIDE
+    /// UXI-AgentTile-11 (stage 2): the inline You-block renders the live `Compose` INSIDE
     /// the transcript, so its draft text + caret + mode are render inputs of this
     /// cached view. Without them in the fingerprint, typing into the inline block
     /// would not bust the transcript cache (stale caret/text — the cached-surface
@@ -107,7 +107,7 @@ impl TranscriptSeqs {
     /// O(1) (len + last range), the rest are field reads.
     pub(crate) fn of(c: &AgentState) -> Self {
         let cursor = c.editor.cursor();
-        // INV-UX-9 (stage 2): the compose's text/caret/mode are render inputs of
+        // UXI-AgentTile-11 (stage 2): the compose's text/caret/mode are render inputs of
         // THIS cached view ONLY while the inline You-block is active (worksheet,
         // idle, block open). When the compose renders in the bottom panel instead
         // (chatbox mode, or the mid-turn chatbox), its changes must NOT bust the
@@ -167,6 +167,25 @@ impl TranscriptSeqs {
             // zoom). One label is enough for the audit trail.
             Some(MissReason::Dirtied)
         }
+    }
+
+    /// A u64 digest of the whole fingerprint, used to KEY the cached transcript
+    /// element's `GlobalElementId` (see `render_agent`). This is the durable
+    /// backstop for the dropped-self-notify class: the observe→`cx.notify()`
+    /// hop silently no-ops when the view has no `view_path` in the committed
+    /// frame (`mark_view_dirty`, gpui window.rs), so the cached prepaint is
+    /// reused STALE — the "last message never renders" bug. By folding this
+    /// digest into the element id, a moved fingerprint yields a fresh
+    /// `GlobalElementId` ⇒ `with_element_state` misses ⇒ `render()` is forced,
+    /// with NO dependence on `mark_view_dirty`/`view_path`. The self-notify path
+    /// stays the fast O(changed) invalidation; this only closes the hole when a
+    /// notify is dropped. Idle typing elsewhere leaves the fingerprint (and thus
+    /// the id) stable ⇒ cache hit ⇒ render-skip is preserved.
+    pub(crate) fn fingerprint_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut h);
+        h.finish()
     }
 }
 
@@ -301,7 +320,7 @@ impl TranscriptView {
 
     /// Begin a mouse drag-select: focus the transcript, place the cursor at the
     /// hit and drop the selection anchor there. A click on empty space (no token
-    /// hit) clears any existing selection. (INV-UX-14.)
+    /// hit) clears any existing selection. (UXI-Selection-1.)
     fn transcript_mouse_down(&mut self, ev: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
         let Some((line, col)) = self.transcript_pos_at(cx, ev.position) else {
             self.session
@@ -344,7 +363,7 @@ impl TranscriptView {
     }
 
     /// Finish the drag: X11-style, a non-empty selection auto-copies to the
-    /// system clipboard; an empty one (a bare click) is dropped. (INV-UX-14.)
+    /// system clipboard; an empty one (a bare click) is dropped. (UXI-Selection-1.)
     fn transcript_mouse_up(&mut self, _ev: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
         if !self.dragging {
             return;
@@ -569,7 +588,7 @@ impl TranscriptView {
                 }
             } else if c.pending_reveal_cursor {
                 c.pending_reveal_cursor = false;
-                // INV-UX-1 (stage 2): while the inline You-block is open the edit
+                // UXI-TextEditing-1 (stage 2): while the inline You-block is open the edit
                 // caret lives in the BLOCK, below its anchor line — so reveal the
                 // YouBlock item itself (it grows as you type), not the anchor line
                 // above it, or a multi-line reply's caret scrolls below the fold.
@@ -601,7 +620,7 @@ impl TranscriptView {
             let turn_started_snap = c.turn_phase.turn_started();
             let last_event_at_snap = c.turn_phase.last_event_at();
 
-            // INV-UX-9 (stage 2): snapshot the inline You-block draft (the separate
+            // UXI-AgentTile-11 (stage 2): snapshot the inline You-block draft (the separate
             // Compose) so the render arm draws it without re-borrowing the session.
             // Gate EXACTLY like the injection (agent.rs) — `you_block_open` alone
             // would allocate a snapshot every streaming-frame for a block left open
@@ -730,7 +749,7 @@ impl TranscriptView {
         // until an unrelated event (jump bar, chatbox toggle) forces a splice. When
         // the block's render-input hash moves, splice exactly its item so GPUI
         // re-measures it. Targets `YouBlock { parked: None }` (the active block; a
-        // parked block's text is frozen). Serves INV-UX-1 — the caret + its text
+        // parked block's text is frozen). Serves UXI-TextEditing-1 — the caret + its text
         // stay visible as you type. Pinned by
         // `clear_worksheet_you_block_keystroke_splices_item`.
         if you_block_seq != self.scroll.last_you_block_seq {
@@ -761,7 +780,7 @@ impl TranscriptView {
             // tall block. So when the reveal targets the active block, scroll to the
             // caret's VISUAL ROW within it, parked ~2 rows above the viewport bottom —
             // the doc-authoring feel (you type at the tail; earlier lines flow up),
-            // and INV-UX-1 holds for any block height. Pinned by
+            // and UXI-TextEditing-1 holds for any block height. Pinned by
             // `worksheet_tall_you_block_grows_caret_painted_in_viewport`.
             let active_yb_item = flat_items_arc
                 .iter()
@@ -807,7 +826,7 @@ impl TranscriptView {
             ranges.iter().any(|&(s, e)| line_idx >= s && line_idx < e)
         };
 
-        // INV-UX-9 (stage 2): the inline You-block snapshot is shared into the
+        // UXI-AgentTile-11 (stage 2): the inline You-block snapshot is shared into the
         // per-item render closure by refcount (it owns Vecs, so not `Copy`).
         let you_block_snap = std::rc::Rc::new(you_block_snap);
         let you_parked_snap = std::rc::Rc::new(you_parked_snap);
@@ -882,7 +901,7 @@ impl TranscriptView {
                             // Transcript prose renders in the PROPORTIONAL body
                             // font (`styled_line_element` keeps inline-code spans
                             // on `code_font`). The compose box stays monospace —
-                            // its caret containment (INV-UX-1) depends on a fixed
+                            // its caret containment (UXI-TextEditing-1) depends on a fixed
                             // char width.
                             &body_font_snap,
                             &code_font_snap,
@@ -929,7 +948,7 @@ impl TranscriptView {
                                 Some(TurnId::System) | None => ("   ".into(), dim_fg),
                             }
                         };
-                        // INV-UX-3: agent transcript text sits on the normal
+                        // UXI-AgentTile-4: agent transcript text sits on the normal
                         // tile/desktop background — no per-turn card tint. The only
                         // row background is the transient focus highlight on the
                         // cursor row, which appears ONLY while the transcript is
@@ -950,7 +969,7 @@ impl TranscriptView {
                             .w_full()
                             .py(px(2.0))
                             .bg(row_bg)
-                            // INV-UX-13: scale the conversation prose on the line's
+                            // UXI-TextZoom-1: scale the conversation prose on the line's
                             // own wrapper (the `claude-body` ambient does NOT reach
                             // across the `gpui::list` item boundary — the working
                             // doc/WP views set the size on each line wrapper too).
@@ -969,7 +988,7 @@ impl TranscriptView {
                             )
                             .child(div().w(px(3.0)).flex_none().bg(bar_color).mr_2())
                             // Probe the FIRST line's painted content so the harness
-                            // can prove the prose height grows with zoom (INV-UX-13)
+                            // can prove the prose height grows with zoom (UXI-TextZoom-1)
                             // — turning the font-px check from a human gap into a
                             // headless guard (`transcript_prose_scales_with_zoom`).
                             .child(if line_idx == 0 {
@@ -1143,7 +1162,7 @@ impl TranscriptView {
                             theme: &theme_snap,
                             body_font: body_font_snap.clone(),
                             code_font: code_font_snap.clone(),
-                            // INV-UX-13: markdown blocks (headings/code/tables) in
+                            // UXI-TextZoom-1: markdown blocks (headings/code/tables) in
                             // the transcript scale with zoom, like the doc view.
                             text_scale,
                             cursor_block: None,
@@ -1260,13 +1279,13 @@ impl TranscriptView {
                             .into_any_element()
                     }
                     FlatItem::YouBlock { parked } => {
-                        // INV-UX-9 rules 5/6: an inline You-block rendered INSIDE the
+                        // UXI-AgentTile-11 rules 5/6: an inline You-block rendered INSIDE the
                         // transcript at its anchor. `parked = None` is the ACTIVE block
                         // (live compose snapshot, caret-bearing, measured width); a
                         // `parked = Some(i)` is an additional insertion point shown
                         // read-only from its stored text. Draft text always lives
-                        // OUTSIDE the transcript (Model C). Word-wrapped (INV-UX-2);
-                        // active caret on its visual row, windowed (INV-UX-1).
+                        // OUTSIDE the transcript (Model C). Word-wrapped (UXI-AgentTile-9);
+                        // active caret on its visual row, windowed (UXI-TextEditing-1).
                         let accent = cursor_color;
                         let fg = self_editor_fg;
                         let sel_bg = nc(at_snap.selection_bg);
@@ -1312,7 +1331,7 @@ impl TranscriptView {
                         // view. Keeping the caret visible is the TRANSCRIPT scroll's job
                         // (reveal/follow the caret row below), not an internal window.
                         // (Was windowed to 10 logical lines around the caret — the "You
-                        // div has limited space and scrolls after a while" bug. INV-UX-1
+                        // div has limited space and scrolls after a while" bug. UXI-TextEditing-1
                         // is now upheld by revealing the caret's row within the block, not
                         // by truncating the block.)
                         let mut inner = div().flex().flex_col().w_full().min_w_0();
@@ -1407,7 +1426,7 @@ impl TranscriptView {
             .min_h_0()
             .px_6()
             .py_3()
-            // Select-to-clipboard (INV-UX-14): mouse drag over the transcript
+            // Select-to-clipboard (UXI-Selection-1): mouse drag over the transcript
             // selects text and auto-copies on release. Hit-testing maps the
             // window point to a `(line, char)` via the painted-token sink.
             .on_mouse_down(
@@ -1425,7 +1444,7 @@ impl TranscriptView {
                     this.transcript_mouse_up(ev, cx);
                 }),
             )
-            // INV-UX-13: the conversation prose scales with document zoom (the
+            // UXI-TextZoom-1: the conversation prose scales with document zoom (the
             // FlatItem::Line rows inherit this base size); chrome keeps fixed px.
             .text_size(px(13.0 * text_scale))
             .font_family(code_font.clone())
@@ -1456,7 +1475,7 @@ struct RootSnapshot {
     /// `notify_transcript_views`, so it busts the cache without a per-session
     /// seq. Threaded into the `FlatItem::Block` `RenderCtx`.
     show_heading_markers: bool,
-    /// Document text-zoom multiplier (INV-UX-13). GLOBAL, not session state;
+    /// Document text-zoom multiplier (UXI-TextZoom-1). GLOBAL, not session state;
     /// pushed via `notify_transcript_views(TextStyle)` on every zoom change, so
     /// it busts the cache without a per-session seq. Multiplies the transcript's
     /// conversation prose + markdown-block sizes, the same way the buffer doc
@@ -1488,7 +1507,7 @@ struct TranscriptPrep {
     block_ranges_active: bool,
     follow_tail: bool,
     pending_reveal_line: Option<usize>,
-    /// INV-UX-9 (stage 2): live snapshot of the inline You-block's draft for the
+    /// UXI-AgentTile-11 (stage 2): live snapshot of the inline You-block's draft for the
     /// `FlatItem::YouBlock` render arm — the per-logical-line text, the caret
     /// position, and the edit mode. `None` when no block is open.
     you_block_snap: Option<YouBlockSnap>,
@@ -1505,7 +1524,7 @@ struct TranscriptPrep {
 }
 
 /// Per-frame snapshot of the inline You-block draft (the separate `Compose`),
-/// rendered inside the transcript at its anchor (INV-UX-9 rule 5, stage 2).
+/// rendered inside the transcript at its anchor (UXI-AgentTile-11 rule 5, stage 2).
 struct YouBlockSnap {
     lines: Vec<String>,
     cursor_line: usize,
@@ -1513,7 +1532,7 @@ struct YouBlockSnap {
     mode: EditMode,
     /// The doc line the block is anchored at (tail → the last line) — the transcript
     /// nav cursor "is on" the block when it sits on this line, which drives the
-    /// focus highlight in nav, matching agent rows (INV-UX-9 nav feedback).
+    /// focus highlight in nav, matching agent rows (UXI-AgentTile-11 nav feedback).
     anchor_line: usize,
     /// Whether the compose holds focus. The caret renders ONLY when focused — a
     /// persisted (non-empty Esc) block shows no caret while the user navigates the
@@ -1524,6 +1543,6 @@ struct YouBlockSnap {
     selection: Option<((usize, usize), (usize, usize))>,
     /// Measured inner width sink (shared with the `Compose`) — written via
     /// `CaptureBounds` during paint, read next frame to word-wrap at the real
-    /// column count (INV-UX-2), exactly like the bottom-panel chatbox.
+    /// column count (UXI-AgentTile-9), exactly like the bottom-panel chatbox.
     bounds: std::rc::Rc<std::cell::Cell<(f32, f32, f32, f32)>>,
 }
