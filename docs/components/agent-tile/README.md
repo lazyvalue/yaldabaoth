@@ -34,9 +34,11 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
   worksheet vs chatbox, paint-on-route, immediate submit, image paste).
 - [recap.md](recap.md) — `UXI-AgentTile-15`: the pinned, isolated session recap.
 - [model.md](model.md) — `UXI-AgentTile-16`: the per-session model selector.
+- [session-binding.md](session-binding.md) — `UXI-AgentTile-18..19`: durable
+  tile↔session identity + auto-resume on restart (and the unresumable-session notice).
 
 <!-- Add facets as more of the agent tile's behavior is migrated in:
-     session-binding.md, status-strip.md, … -->
+     status-strip.md, … -->
 
 ## UX invariant index (authoritative list)
 
@@ -59,3 +61,5 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-15 | recap | A summoned session recap is pinned and isolated | implemented |
 | UXI-AgentTile-16 | model | The agent model is switchable per session, from what the agent advertises | implemented |
 | UXI-AgentTile-17 | sidepanel | A subagent row stacks label over prompt (two lines, not side-by-side columns) | implemented |
+| UXI-AgentTile-18 | session-binding | A tile auto-resumes ITS OWN session on restart (identity, not index) | implemented |
+| UXI-AgentTile-19 | session-binding | An unresumable session shows an inline "start fresh" notice, never a picker | implemented |

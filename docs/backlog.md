@@ -115,22 +115,29 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   per-screen escape; needs a careful dispatch design); measured mono cell
   size (currently 0.6em/1.4em approximation in `desktop_tile_px`).
 
-- **Persist tile→session binding; resume-prompt in-tile on restart** —
-  `NEEDS-DECISION` / `READY` (requested 2026-07-12). Today `restore_agent_leaves`
-  (`main.rs:1873`) zips persisted sessions to leaves 1:1 and **auto-binds** via
-  `open_or_focus`; a tile only shows the picker as a *fallback* on a duplicate
-  sid. The ask: **remember which session was bound to which tile and persist it**,
-  and on restart render a **"Resume this session?" prompt inside the tile** (per
-  tile) instead of auto-binding or dropping to the free-session picker. Scope: (a)
-  persist the tile↔sid binding (extend `PersistedSlot` / the leaf-zip so the
-  binding is durable, not re-derived); (b) a new in-tile resume affordance
-  (a third `AgentTile` render state beside transcript + picker, or a flag on the
-  picker); (c) restore path renders the prompt rather than binding. Becomes an
-  `INV-UX-N` (in-tile resume prompt on restart) + a headless guard when built.
-  **Decision needed (ADR): resume-prompt vs auto-resume vs picker** — and what
-  happens if the persisted session is gone server-side (offer fresh?). Touches
-  `spec-agent-session-ownership.md` (restore contract), `persist.rs`,
-  `agent.rs::AgentTile`, `agent_ui.rs`, `main.rs::restore_agent_leaves`.
+- **Auto-resume the same session in each agent tile on restart (identity-based)** —
+  `NEEDS-RUNTIME` (Part 1 built 2026-07-13 via `/new-ux`; `UXI-AgentTile-18`,
+  ADR-0025, `docs/components/agent-tile/session-binding.md`). Requirement (verbatim,
+  07-13): "Yalda should remember what agent tiles are occupied by what sessions. When
+  I restart the system it should automatically resume those agent connections IN
+  those tiles. I do not want to need to select from a picker again." Root cause was
+  **positional index-zip** (`workspace.json` wrote `Agent { session_id: None }` and
+  `restore_agent_leaves` zipped sessions to leaves by index → picker whenever the zip
+  broke). **Fixed by identity:** each agent leaf now persists its bound session's
+  server id in the layout (`resume_sid` cached on the tile by `save_agent_ring`,
+  written by `snapshot_content`); `restore_agent_leaves` rebinds each tile to its OWN
+  id — no positional zip, no picker on restart. Headless guard
+  `agent_tile_persists_session_identity_not_index` (negative-controlled RED); 358
+  suite green. **Human check (harness gap #2):** restart yalda (GUI-only AND full
+  reboot) → each tile reconnects to the session it held, no picker. **Part 2 BUILT
+  (`UXI-AgentTile-19`):** a genuinely unresumable session (permanent "no such
+  session" on the resuming attach) shows an inline "session unavailable — start
+  fresh" notice, never the picker — `spawn_attach_sessions` gained a `resuming` flag
+  routing it to `reconcile_session_unavailable`; identity kept for a later
+  re-attempt; "Start fresh" opens a new session in the tile. Guard
+  `unresumable_session_shows_inline_notice_not_picker` (state + PAINT,
+  negative-controlled RED); 359 suite green. Human check (gap #2): the live "session
+  gone" attach result actually reaches this path on a real dead session.
 - **Click anywhere on a tile focuses it** — `NEEDS-RUNTIME` / verify-first
   (requested 2026-07-12). Appears **already implemented** for splits:
   `chrome.rs:830` attaches `on_mouse_down(Left) → focus_window_by_click` to each

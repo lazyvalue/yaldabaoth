@@ -1754,7 +1754,9 @@ impl YaldaGpuiView {
             return false;
         };
         let mut ws: workspace::Workspace<App> = workspace::Workspace::new();
-        let mut agent_leaf_ids: Vec<workspace::WindowId> = Vec::new();
+        // Each agent leaf carries its persisted session id (identity), so restore
+        // rebinds it to ITS OWN session (UXI-AgentTile-18), not by index.
+        let mut agent_leaf_ids: Vec<(workspace::WindowId, Option<String>)> = Vec::new();
         for ptab in snap.tabs {
             let (layout, max_id, agents) = restore_layout(&mut ws, &self.theme, ptab.layout);
             ws.next_window_id = ws.next_window_id.max(max_id + 1);
@@ -1870,22 +1872,53 @@ impl YaldaGpuiView {
     /// Replace Browser stubs at the given leaf IDs with live agent sessions.
     /// Called as a post-pass after `restore_workspace_from_disk` installs the
     /// layout — by that point `self.workspace` is populated and we have `cx`.
-    fn restore_agent_leaves(&mut self, leaf_ids: &[workspace::WindowId], cx: &mut Context<Self>) {
+    fn restore_agent_leaves(
+        &mut self,
+        leaves: &[(workspace::WindowId, Option<String>)],
+        cx: &mut Context<Self>,
+    ) {
         let proc_cwd = process_cwd();
         let persisted = load_persisted_acp_sessions(&proc_cwd);
 
         if self.session_server.is_some() {
             self.start_server_pump(cx);
-            // Strict 1:1: zip persisted slots to leaves, ONE session per tile.
-            // Each leaf binds its OWN sid up front (no per-leaf re-list, which
-            // would hand every tile the same Attached([S1,S2,…]) and race them
-            // onto the first sid). Attach the bound sids once, together.
+            // Identity, not index: each leaf rebinds to ITS OWN persisted session
+            // (UXI-AgentTile-18). Details (mode/draft/cwd) come from the id-keyed
+            // side-channel; the leaf's own id is authoritative for the binding.
+            // Bind up front + attach the bound sids once, together (no per-leaf
+            // re-list, which would race every tile onto the first sid).
             let mut attach_sids: Vec<String> = Vec::new();
-            for (i, &leaf_id) in leaf_ids.iter().enumerate() {
-                self.install_agent_tile(leaf_id, AgentTile::new());
-                self.focus_window_for_restore(leaf_id);
+            let by_id: std::collections::HashMap<String, PersistedSlot> =
+                persisted.iter().cloned().map(|s| (s.id.clone(), s)).collect();
+            // Positional fallback ONLY for an old (pre-identity) workspace.json
+            // where every leaf's persisted id is None; a fresh save writes ids.
+            let any_identity = leaves
+                .iter()
+                .any(|(_, sid)| sid.as_deref().is_some_and(|s| !s.is_empty()));
+            for (i, (leaf_id, persisted_sid)) in leaves.iter().enumerate() {
+                self.install_agent_tile(*leaf_id, AgentTile::new());
+                self.focus_window_for_restore(*leaf_id);
 
-                match persisted.get(i).cloned() {
+                let slot: Option<PersistedSlot> = match persisted_sid.as_deref() {
+                    Some(s) if !s.is_empty() => Some(by_id.get(s).cloned().unwrap_or_else(|| {
+                        // Layout knows the id but the details side-channel doesn't
+                        // (e.g. cwd changed) — still bind the id, with defaults.
+                        PersistedSlot {
+                            id: s.to_string(),
+                            label: "claude".into(),
+                            active: false,
+                            mode: InputModeKind::Worksheet,
+                            tasklist_open: false,
+                            subagents_open: false,
+                            cwd: None,
+                            compose_draft: None,
+                        }
+                    })),
+                    _ if any_identity => None,
+                    _ => persisted.get(i).cloned(),
+                };
+
+                match slot {
                     Some(slot) => {
                         // Bind this leaf to its OWN persisted sid via the store's
                         // idempotent choke. `Created` ⇒ this leaf owns the sid.
@@ -1923,6 +1956,9 @@ impl YaldaGpuiView {
                                 if let Some(tile) = self.agent_tile_mut() {
                                     tile.bound = Some(sid_id);
                                     tile.picker = None;
+                                    // Re-cache identity so the next save re-persists
+                                    // this tile↔session binding (UXI-AgentTile-18).
+                                    tile.resume_sid = Some(slot.id.clone());
                                 }
                                 attach_sids.push(slot.id.clone());
                             }
@@ -1949,14 +1985,16 @@ impl YaldaGpuiView {
                 }
             }
             if !attach_sids.is_empty() {
-                self.spawn_attach_sessions(attach_sids, cx);
+                // resuming = true: a gone remembered session → unavailable notice.
+                self.spawn_attach_sessions(attach_sids, true, cx);
             }
         } else {
-            // Legacy direct-spawn path. One tile shows one session; zip slots to
-            // leaves, fresh claude-1 for leaves past the persisted list.
-            for (i, &leaf_id) in leaf_ids.iter().enumerate() {
-                self.install_agent_tile(leaf_id, AgentTile::new());
-                self.focus_window_for_restore(leaf_id);
+            // Legacy direct-spawn path (no session server). One tile shows one
+            // session; still positional here — identity restore is the
+            // server-managed path above. Fresh claude-1 past the persisted list.
+            for (i, (leaf_id, _persisted_sid)) in leaves.iter().enumerate() {
+                self.install_agent_tile(*leaf_id, AgentTile::new());
+                self.focus_window_for_restore(*leaf_id);
                 let id = match persisted.get(i).cloned() {
                     None => {
                         let state = self.create_agent_session(None, proc_cwd.clone(), cx);

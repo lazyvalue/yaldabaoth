@@ -4339,6 +4339,20 @@ pub(crate) struct AgentTile {
     /// When `Some` (and `bound == None`), this tile shows the in-tile session
     /// picker instead of a transcript. Cleared the moment a session is bound.
     pub(crate) picker: Option<SessionPicker>,
+    /// The bound session's DURABLE server id (`resume_id`), cached here so the
+    /// cx-free layout snapshot (`snapshot_content`) can persist WHICH session
+    /// occupies this tile — the identity that `restore_agent_leaves` rebinds each
+    /// tile to on restart (UXI-AgentTile-18), instead of zipping sessions to tiles
+    /// by index. Refreshed by `save_agent_ring` (which already resolves the id)
+    /// and set at the restore bind site. `None` until the session's id is known.
+    pub(crate) resume_sid: Option<String>,
+    /// When `Some` (and `bound == None`), the session this tile REMEMBERED
+    /// (`resume_sid`) could not be resumed on restart — the daemon GC'd it /
+    /// `session/load` failed with "no such session". The tile shows an inline
+    /// "session unavailable — start fresh" notice (UXI-AgentTile-19), never the
+    /// picker. Holds the lost session's label for the notice. Cleared when the
+    /// user starts fresh (or otherwise binds a session).
+    pub(crate) unavailable: Option<SharedString>,
 }
 
 impl AgentTile {
@@ -4347,6 +4361,8 @@ impl AgentTile {
             bound: None,
             pending_open_token: None,
             picker: None,
+            resume_sid: None,
+            unavailable: None,
         }
     }
 }

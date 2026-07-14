@@ -323,6 +323,18 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// "Start fresh" from a tile's unavailable-session notice (UXI-AgentTile-19):
+    /// clear the unavailable state + the dead remembered id, then open a new
+    /// session in this same tile (the picker's new-session path).
+    pub(crate) fn start_fresh_after_unavailable(&mut self, cx: &mut Context<Self>) {
+        if let Some(tile) = self.agent_tile_mut() {
+            tile.unavailable = None;
+            tile.resume_sid = None;
+        }
+        let cwd = self.agent_base_cwd();
+        self.picker_start_new(cwd, cx);
+    }
+
     /// Picker → attach an existing session. The sid / acp id / permission mode
     /// all came from the `list_sessions` result, so we feed the bind+attach
     /// path directly: bind a placeholder session to this tile stamped with the
@@ -527,7 +539,8 @@ impl YaldaGpuiView {
         // the session is already bound. Deferred off the paint thread.
         let targets = bound_sids;
         if !targets.is_empty() {
-            self.spawn_attach_sessions(targets, cx);
+            // Live re-attach (not a restart resume): keep the close→picker path.
+            self.spawn_attach_sessions(targets, false, cx);
         }
     }
 
@@ -745,7 +758,17 @@ impl YaldaGpuiView {
     /// every replayed notification because its slot already exists. A failed
     /// attach is reconciled back into the slot status so a dead session is
     /// visible instead of silently broken.
-    pub(crate) fn spawn_attach_sessions(&self, sids: Vec<String>, cx: &mut Context<Self>) {
+    /// `resuming` = these attaches are auto-resumes of REMEMBERED sessions on
+    /// restart (from `restore_agent_leaves`). A permanent "session gone" then means
+    /// the remembered session is unresumable → the tile shows the inline
+    /// unavailable notice (UXI-AgentTile-19), not the picker. For a live re-attach
+    /// (`resuming = false`) a gone session keeps the existing close→picker path.
+    pub(crate) fn spawn_attach_sessions(
+        &self,
+        sids: Vec<String>,
+        resuming: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
             return;
         };
@@ -805,7 +828,15 @@ impl YaldaGpuiView {
                 // a buffer). Then re-persist so the stale id doesn't resume.
                 let mut dropped_any = false;
                 for sid in &dead_sids {
-                    if this.reconcile_session_closed(sid, cx) {
+                    // A remembered session that won't resume → inline unavailable
+                    // notice (UXI-AgentTile-19), never the picker. A live re-attach
+                    // that lost its session → the existing close→picker path.
+                    let flipped = if resuming {
+                        this.reconcile_session_unavailable(sid, cx)
+                    } else {
+                        this.reconcile_session_closed(sid, cx)
+                    };
+                    if flipped {
                         dropped_any = true;
                     }
                 }
@@ -1301,11 +1332,16 @@ impl YaldaGpuiView {
     /// background tab would be saved-but-not-restored or vice versa. The first
     /// bound session is marked active. Free sessions (no tile) are not persisted
     /// — they only live for the running process. Best-effort.
-    pub(crate) fn save_agent_ring(&self, cx: &GpuiApp) {
+    pub(crate) fn save_agent_ring(&mut self, cx: &GpuiApp) {
         let Ok(cwd) = std::env::current_dir() else {
             return;
         };
         let mut snaps: Vec<SessionSnapshot> = Vec::new();
+        // (tile SessionId → durable server id) collected in the read pass so the
+        // write pass below can stamp each tile's `resume_sid` — the identity the
+        // layout snapshot persists so restore rebinds each tile to ITS OWN
+        // session (UXI-AgentTile-18), not by index.
+        let mut resolved: Vec<(SessionId, String)> = Vec::new();
         for tab in self.workspace.tabs.iter() {
             tab.layout.for_each_leaf(&mut |window| {
                 if let App::Agent(tile) = &window.content
@@ -1321,6 +1357,7 @@ impl YaldaGpuiView {
                         .or_else(|| session.state.channel.as_ref().and_then(|c| c.session_id()));
                     if let Some(rid) = resolved_id {
                         let draft = session.state.input_surface.compose().text();
+                        resolved.push((id, rid.clone()));
                         snaps.push(SessionSnapshot {
                             id: rid,
                             label: session.label.clone(),
@@ -1332,6 +1369,20 @@ impl YaldaGpuiView {
                             compose_draft: (!draft.trim().is_empty()).then_some(draft),
                         });
                     }
+                }
+            });
+        }
+        // Write pass: cache the resolved id on each tile so the cx-free
+        // `snapshot_content` can persist it into `workspace.json` (identity).
+        for tab in self.workspace.tabs.iter_mut() {
+            tab.layout.for_each_leaf_content_mut(&mut |app| {
+                if let App::Agent(tile) = app
+                    && let Some(id) = tile.bound
+                {
+                    tile.resume_sid = resolved
+                        .iter()
+                        .find(|(sid, _)| *sid == id)
+                        .map(|(_, rid)| rid.clone());
                 }
             });
         }
@@ -1566,7 +1617,8 @@ impl YaldaGpuiView {
         // attach round-trips inline here, as before, also froze rendering.)
         let n = sids.len();
         if !sids.is_empty() {
-            self.spawn_attach_sessions(sids, cx);
+            // Live reconnect re-attach (not a restart resume): keep close→picker.
+            self.spawn_attach_sessions(sids, false, cx);
         }
         eprintln!("[yalda-gpui] session-server reconnected; re-attaching {n} session(s)");
         Some((note_rx, wake_rx))
@@ -1829,6 +1881,46 @@ impl YaldaGpuiView {
         // gone after this). Refresh to be safe on non-broadcast close paths.
         let _ = tile_found;
         self.refresh_roster(cx);
+        true
+    }
+
+    /// A REMEMBERED session (`resume_sid`) failed to resume on restart — the
+    /// daemon GC'd it. Unlike `reconcile_session_closed` (which drops the tile to
+    /// the picker), the tile keeps its identity and shows an inline "session
+    /// unavailable — start fresh" notice (UXI-AgentTile-19), never the picker.
+    /// Keeps `resume_sid` so the layout re-persists the id (a later restart
+    /// re-attempts the resume rather than silently forgetting it). Returns whether
+    /// a tile was flipped.
+    pub(crate) fn reconcile_session_unavailable(&mut self, sid: &str, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.sessions.locate(sid) else {
+            return false;
+        };
+        // The lost session's label, for the notice (captured before close).
+        let label: SharedString = self
+            .session_entity(id)
+            .map(|e| e.read(cx).label.clone().into())
+            .unwrap_or_else(|| sid.chars().take(8).collect::<String>().into());
+        let mut tile_found = false;
+        for tab in self.workspace.tabs.iter_mut() {
+            tab.layout.for_each_leaf_content_mut(&mut |content| {
+                if let App::Agent(tile) = content
+                    && tile.bound == Some(id)
+                {
+                    tile_found = true;
+                    if tile.pending_open_token.is_none() {
+                        tile.bound = None;
+                        tile.picker = None;
+                        tile.unavailable = Some(label.clone());
+                    }
+                }
+            });
+        }
+        if !tile_found {
+            return false;
+        }
+        self.transcript_views.remove(&id);
+        self.sessions.close(id);
+        cx.notify();
         true
     }
 

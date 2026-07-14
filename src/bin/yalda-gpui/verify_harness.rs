@@ -9298,3 +9298,65 @@ fn recap_panel_paints_in_agent_tile(cx: &mut TestAppContext) {
         "recap panel must paint ABOVE the compose (recap y={ry}, compose y={cy})"
     );
 }
+
+/// UXI-AgentTile-19: a REMEMBERED session that can't be resumed on restart flips
+/// its tile to the inline "session unavailable — start fresh" notice — NOT the
+/// picker — and the notice PAINTS. Drives the real method the auto-resume
+/// attach-failure path (`spawn_attach_sessions` with `resuming = true`) invokes on
+/// a permanent "session gone" error.
+///
+/// Negative control: route the dead sid to `reconcile_session_closed` instead (the
+/// pre-fix behavior) → the tile shows `picker`, `unavailable` is None → the state
+/// and paint asserts fail RED.
+#[gpui::test]
+fn unresumable_session_shows_inline_notice_not_picker(cx: &mut TestAppContext) {
+    use crate::App;
+
+    // Painting harness: an agent tile bound to session sid "S1" (splash dismissed
+    // so `render_agent` actually runs).
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+
+    let win = view.update(vcx, |v, _cx| {
+        // Simulate a RESTORED (remembered) tile: it cached the id it's resuming.
+        if let Some(tile) = v.agent_tile_mut() {
+            tile.resume_sid = Some("S1".into());
+        }
+        v.workspace.focused_window_id().expect("focused")
+    });
+
+    // The remembered session turned out gone server-side (the resuming attach-fail
+    // path calls exactly this).
+    view.update(vcx, |v, cx| {
+        v.reconcile_session_unavailable("S1", cx);
+    });
+    vcx.run_until_parked();
+
+    // State: unavailable, NOT the picker; identity kept for a later re-attempt.
+    view.read_with(vcx, |v, _cx| {
+        for tab in v.workspace.tabs.iter() {
+            if let Some(w) = tab.layout.find_leaf(win)
+                && let App::Agent(t) = &w.content
+            {
+                assert!(t.bound.is_none(), "tile is unbound after the session went away");
+                assert!(t.picker.is_none(), "must NOT drop to the picker");
+                assert!(t.unavailable.is_some(), "shows the inline unavailable notice");
+                assert_eq!(
+                    t.resume_sid.as_deref(),
+                    Some("S1"),
+                    "identity kept so a later restart re-attempts the resume"
+                );
+                return;
+            }
+        }
+        panic!("agent tile not found");
+    });
+
+    // Paint: the notice actually renders with area (non-vacuous).
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let notice = crate::layout_probe_get("agent-unavailable");
+    crate::layout_probe_end();
+    let (_, _, w, h) = notice.expect("the unavailable notice did NOT paint");
+    assert!(w > 1.0 && h > 1.0, "notice has no area ({w}x{h})");
+}

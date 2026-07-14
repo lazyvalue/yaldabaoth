@@ -3295,3 +3295,51 @@ fn inv_order_interleaved_turns_stay_chronological() {
         "the draft is untouched by any number of turns (INV-2)"
     );
 }
+
+/// UXI-AgentTile-18 (identity, not index): the layout snapshot persists WHICH
+/// session occupies each tile (`resume_sid`), and `restore_layout` hands each
+/// leaf back paired with ITS OWN session id — so a restart rebinds tiles by
+/// identity, never by list position. This is the persistence-layer proof of the
+/// fix; the live re-attach is the runtime tail (harness gap #2).
+///
+/// Negative control: revert `snapshot_content`'s agent arm to
+/// `session_id: None` and the restored leaves come back `(_, None)` → the
+/// identity assertion fails RED.
+#[test]
+fn agent_tile_persists_session_identity_not_index() {
+    let mut t1 = AgentTile::new();
+    t1.resume_sid = Some("SID-A".to_string());
+    let mut t2 = AgentTile::new();
+    t2.resume_sid = Some("SID-B".to_string());
+    let layout: workspace::Layout<App> = workspace::Layout::Split {
+        dir: workspace::SplitDir::V,
+        children: vec![
+            (
+                1.0,
+                workspace::Layout::Leaf(workspace::Window { id: 10, content: App::Agent(t1) }),
+            ),
+            (
+                1.0,
+                workspace::Layout::Leaf(workspace::Window { id: 20, content: App::Agent(t2) }),
+            ),
+        ],
+    };
+
+    // Save side: the persisted layout carries each leaf's session id.
+    let snap = snapshot_layout(&layout);
+
+    // Restore side: each leaf comes back paired with ITS OWN id — identity
+    // travels with the leaf, independent of any session-list ordering.
+    let mut ws = workspace::Workspace::<App>::new();
+    let theme = Theme::default();
+    let (_lay, _max, agents) = restore_layout(&mut ws, &theme, snap);
+
+    assert_eq!(
+        agents,
+        vec![
+            (10, Some("SID-A".to_string())),
+            (20, Some("SID-B".to_string())),
+        ],
+        "each tile restores bound to its OWN session id (identity, not index)"
+    );
+}

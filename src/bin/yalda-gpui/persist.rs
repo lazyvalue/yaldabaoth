@@ -621,14 +621,17 @@ pub(crate) fn snapshot_content(content: &App) -> PersistedKind {
                 dir: b.fb.current_dir().to_path_buf(),
             },
         },
-        App::Agent(_tile) => {
-            // The layout snapshot only records "this tile is an Agent" so the
-            // tab survives restore; the session id itself is restored from the
-            // ACP-session side-channel (acp_sessions.json), not from here. The
-            // channel/sid live in the store now, which `snapshot_content` does
-            // not have access to — so we always persist `None` and let
-            // `restore_agent_leaves` rebind via the side-channel.
-            PersistedKind::Agent { session_id: None }
+        App::Agent(tile) => {
+            // Persist WHICH session occupies this tile (identity), so restore
+            // rebinds each tile to its OWN session (UXI-AgentTile-18) instead of
+            // zipping sessions to tiles by index. `snapshot_content` has no cx to
+            // read the store, so the durable server id is cached on the tile as
+            // `resume_sid` by `save_agent_ring` (which resolves it anyway). `None`
+            // (session id not yet known, or an old snapshot) → restore falls back
+            // to the free-session selector for that tile.
+            PersistedKind::Agent {
+                session_id: tile.resume_sid.clone(),
+            }
         }
         App::Linear(_tile) => PersistedKind::Linear {},
         App::Keymap(_tile) => PersistedKind::Keymap {},
@@ -717,7 +720,9 @@ pub(crate) fn restore_rail(
 /// file-backed leaves through `ws`'s buffer pool so two restored views of the
 /// same file share one core. Returns the live layout plus the max window id
 /// seen (so the caller can advance the id allocator past restored ids).
-/// Returns (layout, max_window_id, agent_leaf_ids).
+/// Returns (layout, max_window_id, agent_leaves). Each agent leaf carries its
+/// persisted session id (`Option<String>`) so restore rebinds each tile to its
+/// OWN session by identity (UXI-AgentTile-18), not by index.
 pub(crate) fn restore_layout(
     ws: &mut workspace::Workspace<App>,
     theme: &Theme,
@@ -725,14 +730,20 @@ pub(crate) fn restore_layout(
 ) -> (
     workspace::Layout<App>,
     workspace::WindowId,
-    Vec<workspace::WindowId>,
+    Vec<(workspace::WindowId, Option<String>)>,
 ) {
     match layout {
         PersistedLayout::Leaf(leaf) => {
             let id = leaf.id;
-            let is_agent = matches!(&leaf.kind, PersistedKind::Agent { .. });
+            let agent_sid = match &leaf.kind {
+                PersistedKind::Agent { session_id } => Some(session_id.clone()),
+                _ => None,
+            };
             let content = restore_content(ws, theme, leaf.kind);
-            let agents = if is_agent { vec![id] } else { vec![] };
+            let agents = match agent_sid {
+                Some(sid) => vec![(id, sid)],
+                None => vec![],
+            };
             (
                 workspace::Layout::Leaf(workspace::Window { id, content }),
                 id,

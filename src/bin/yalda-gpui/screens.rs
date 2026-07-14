@@ -903,6 +903,12 @@ impl YaldaGpuiView {
         // (SessionPicker), not a transcript. This is the canonical unbound
         // state (session close / unbind / rebind all land here).
         let Some(id) = tile.bound else {
+            // A REMEMBERED session that couldn't be resumed on restart shows an
+            // inline "session unavailable — start fresh" notice (UXI-AgentTile-19),
+            // never the picker.
+            if let Some(lost) = tile.unavailable.clone() {
+                return self.render_agent_unavailable(root, lost, cx);
+            }
             return self.render_agent_picker(root, tile, cx);
         };
         // The bound session is a GPUI entity (spec-agent-session-ownership.md /
@@ -2374,6 +2380,90 @@ impl YaldaGpuiView {
     /// sessions for this cwd. Keys go through `handle_picker_key`; rows are
     /// also clickable. Selecting a row binds the ring's first slot and clears
     /// the picker, after which `render_agent` takes over.
+    /// The inline "session unavailable — start fresh" screen (UXI-AgentTile-19):
+    /// a REMEMBERED session couldn't be resumed on restart. NOT the picker — one
+    /// click binds a fresh session in this same tile.
+    pub(crate) fn render_agent_unavailable(
+        &mut self,
+        root: gpui::Div,
+        lost: SharedString,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let ov = &self.theme.overlay;
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px_4()
+            .py_1()
+            .h(px(28.0))
+            .bg(nc(ov.bg))
+            .text_color(nc(ov.accent))
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::new_static("⚠ session unavailable"));
+
+        let button = div()
+            .id("agent-unavailable-start-fresh")
+            .flex_none()
+            .px_3()
+            .py_1()
+            .bg(nc(ov.accent))
+            .text_color(nc(ov.bg))
+            .font_weight(FontWeight::BOLD)
+            .cursor_pointer()
+            .child(SharedString::new_static("Start fresh"))
+            .on_click(cx.listener(|this, _ev: &gpui::ClickEvent, _w, cx| {
+                this.start_fresh_after_unavailable(cx);
+            }));
+
+        let body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .px_4()
+            .text_color(nc(ov.fg))
+            .child(
+                div()
+                    .text_color(nc(ov.label))
+                    .child(SharedString::from(format!(
+                        "“{lost}” could not be resumed — it's no longer on the server."
+                    ))),
+            )
+            .child(button);
+
+        root.key_context("AgentUnavailableView")
+            .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::restart))
+            .on_action(cx.listener(Self::close_window))
+            .on_action(cx.listener(Self::open_agent))
+            .on_action(cx.listener(Self::open_linear))
+            .on_action(cx.listener(Self::open_keymap))
+            .on_action(cx.listener(Self::open_browser))
+            .on_action(cx.listener(Self::focus_left))
+            .on_action(cx.listener(Self::focus_right))
+            .on_action(cx.listener(Self::focus_up))
+            .on_action(cx.listener(Self::focus_down))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::move_tile))
+            .on_action(cx.listener(Self::also_show_tile))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::toggle_theme))
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(nc(ov.bg))
+            .text_color(nc(ov.fg))
+            .child(header)
+            .child(probe_bounds("agent-unavailable", body.into_any_element()))
+    }
+
     pub(crate) fn render_agent_picker(
         &self,
         root: gpui::Div,
