@@ -776,6 +776,12 @@ impl Element for RegisterTokenOnPaint {
 thread_local! {
     static LAYOUT_PROBE: RefCell<Option<HashMap<&'static str, (f32, f32, f32, f32)>>> =
         const { RefCell::new(None) };
+    // Dynamic-label sibling: per-tile probe tags (`plane-card-{id}`,
+    // `plane-tile-content-{id}`) can't be `&'static str`, so they record here
+    // under an owned `String`. Shares the same begin/end lifecycle as
+    // `LAYOUT_PROBE`; `layout_probe_get` checks BOTH maps.
+    static LAYOUT_PROBE_DYN: RefCell<Option<HashMap<String, (f32, f32, f32, f32)>>> =
+        const { RefCell::new(None) };
 }
 
 /// Start recording painted bounds for [`probe_bounds`]-tagged elements. Call in a
@@ -783,6 +789,7 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn layout_probe_begin() {
     LAYOUT_PROBE.with(|p| *p.borrow_mut() = Some(HashMap::new()));
+    LAYOUT_PROBE_DYN.with(|p| *p.borrow_mut() = Some(HashMap::new()));
 }
 
 /// The last painted bounds `(x, y, w, h)` of the element tagged `label`, or
@@ -791,13 +798,18 @@ pub(crate) fn layout_probe_begin() {
 /// means the caret is off-screen).
 #[cfg(test)]
 pub(crate) fn layout_probe_get(label: &str) -> Option<(f32, f32, f32, f32)> {
-    LAYOUT_PROBE.with(|p| p.borrow().as_ref().and_then(|m| m.get(label).copied()))
+    LAYOUT_PROBE
+        .with(|p| p.borrow().as_ref().and_then(|m| m.get(label).copied()))
+        .or_else(|| {
+            LAYOUT_PROBE_DYN.with(|p| p.borrow().as_ref().and_then(|m| m.get(label).copied()))
+        })
 }
 
 /// Stop recording and clear (test teardown).
 #[cfg(test)]
 pub(crate) fn layout_probe_end() {
     LAYOUT_PROBE.with(|p| *p.borrow_mut() = None);
+    LAYOUT_PROBE_DYN.with(|p| *p.borrow_mut() = None);
 }
 
 fn layout_probe_record(label: &'static str, b: (f32, f32, f32, f32)) {
@@ -808,10 +820,96 @@ fn layout_probe_record(label: &'static str, b: (f32, f32, f32, f32)) {
     });
 }
 
+fn layout_probe_record_dyn(label: &str, b: (f32, f32, f32, f32)) {
+    LAYOUT_PROBE_DYN.with(|p| {
+        if let Some(m) = p.borrow_mut().as_mut() {
+            m.insert(label.to_string(), b);
+        }
+    });
+}
+
 /// Wrap `inner` so its PAINTED bounds are recorded under `label` when the layout
 /// probe is active (no-op otherwise). The headless geometry-assertion primitive.
 pub(crate) fn probe_bounds(label: &'static str, inner: AnyElement) -> AnyElement {
     ProbeBounds { label, inner }.into_any_element()
+}
+
+/// Dynamic-label sibling of [`probe_bounds`] for per-instance tags whose label
+/// isn't `&'static` (e.g. `plane-card-{id}`). Recorded into `LAYOUT_PROBE_DYN`;
+/// no-op unless the probe is active (production never activates it). The
+/// `String` is retained by the element and only allocates once per frame per
+/// tagged tile — negligible next to building the tile itself.
+pub(crate) fn probe_bounds_dyn(label: String, inner: AnyElement) -> AnyElement {
+    ProbeBoundsDyn { label, inner }.into_any_element()
+}
+
+struct ProbeBoundsDyn {
+    label: String,
+    inner: AnyElement,
+}
+
+impl IntoElement for ProbeBoundsDyn {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for ProbeBoundsDyn {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) -> (LayoutId, ()) {
+        (self.inner.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) {
+        self.inner.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        _prepaint: &mut (),
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) {
+        layout_probe_record_dyn(
+            &self.label,
+            (
+                f32::from(bounds.origin.x),
+                f32::from(bounds.origin.y),
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height),
+            ),
+        );
+        self.inner.paint(window, cx);
+    }
 }
 
 struct ProbeBounds {

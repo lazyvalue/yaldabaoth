@@ -42,8 +42,9 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 - [buffer.md](buffer.md) — `Buffer` (Picking / Viewing / Editing).
 - [linear.md](linear.md) — `Linear`.
 - [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..2`.
-- [workspace.md](workspace.md) — `Workspace` (tabs + splits + layout modes).
-  `UXI-Workspace-1`.
+- [workspace.md](workspace.md) — `Workspace` (the infinite-plane model: signed
+  all-directions slot grid + pan/semantic-zoom camera + reset-to-origin;
+  layout-mode/split surface retired). `UXI-Workspace-1..7`.
 - [rail.md](rail.md) — `Rail`.
 - [keybindings.md](keybindings.md) — `Keybindings`. `UXI-Keybindings-1`.
 - [common/](common/README.md) — shared behaviors: `TextEditing`, `Selection`,

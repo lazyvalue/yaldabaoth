@@ -9360,3 +9360,330 @@ fn unresumable_session_shows_inline_notice_not_picker(cx: &mut TestAppContext) {
     let (_, _, w, h) = notice.expect("the unavailable notice did NOT paint");
     assert!(w > 1.0 && h > 1.0, "notice has no area ({w}x{h})");
 }
+
+// ─────────────── Stage C — infinite-plane semantic-zoom (UXI-Workspace-4) ───────────────
+//
+// LOD render + culling via the layout probe (spec-infinite-plane-workspace.md
+// § Verification "LOD render + culling"). These drive the REAL `render_desktop`
+// path headlessly and assert on PAINT (`probe_bounds_dyn` tags `plane-card-{id}`
+// / `plane-tile-content-{id}`), per the anti-circling rules — a state assert
+// can't catch "the placeholder didn't paint" or "live content leaked at Card".
+
+/// Boot a desktop-mode plane with two tiles: `focused` at the origin slot and
+/// `other` far off to the right (col 100), on a small known canvas so the far
+/// tile is genuinely outside the viewport. Auto-pan is pinned OFF
+/// (`last_reveal = focused`) so the camera rests at the origin and placement is
+/// deterministic. Returns `(view, vcx, focused_id, other_id)`.
+#[cfg(test)]
+fn boot_desktop_two_tiles<'a>(
+    cx: &'a mut TestAppContext,
+) -> (
+    gpui::Entity<YaldaGpuiView>,
+    &'a mut gpui::VisualTestContext,
+    crate::workspace::WindowId,
+    crate::workspace::WindowId,
+) {
+    use crate::{AgentSession, AgentState, AgentTile, App};
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    let (focused_id, other_id) = view.update(vcx, |v, cx| {
+        let mk = |label: &str| AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: label.into(),
+            cwd: PathBuf::from("."),
+            resume_id: None,
+        };
+        // Tile A (origin) — bind a session so `render_agent` builds live content.
+        v.set_screen(App::Agent(AgentTile::new()));
+        let id_a = v.show_local_session(mk("A"), cx);
+        v.sessions.bind_sid(id_a, "A".into()).unwrap();
+        let win_a = v.workspace.focused_window_id().expect("focused A");
+        // Split → tile B; bind a session.
+        v.workspace
+            .split_focused(crate::workspace::SplitDir::H, App::Agent(AgentTile::new()));
+        let id_b = v.show_local_session(mk("B"), cx);
+        v.sessions.bind_sid(id_b, "B".into()).unwrap();
+        let win_b = v.workspace.focused_window_id().expect("focused B");
+
+        // Force a small, KNOWN desktop canvas + a coarse grid so the pitch is
+        // small and slot 100 is unambiguously off-viewport. `desktop_grid_*`
+        // divide the canvas into tiles; a 2×2 grid over 800×600 gives a
+        // ~260px pitch, so col 100 sits ~26000px right of the origin.
+        v.desktop_grid_cols = 2;
+        v.desktop_grid_rows = 2;
+        v.viewport_width_px = 800.0;
+        v.viewport_height_px = 600.0;
+        v.desktop_canvas_bounds.set((0.0, 0.0, 800.0, 600.0));
+
+        // Every tab is a plane now (infinite-plane, Stage D); place the tiles.
+        let tab = v.workspace.active_tab_mut().unwrap();
+        tab.layout_mode = crate::workspace::LayoutMode::Plane;
+        let leaves = tab.layout.leaf_ids();
+        tab.desktop.reconcile(&leaves);
+        tab.desktop.set_anchor(win_a, crate::workspace::Slot::new(0, 0));
+        tab.desktop.set_anchor(win_b, crate::workspace::Slot::new(0, 100));
+        // Focus A (the origin tile) and pin the reveal so auto-pan won't drag
+        // the camera to wherever focus is — the camera rests at (0,0).
+        tab.focused = win_a;
+        tab.desktop.last_reveal = Some(win_a);
+        tab.desktop.camera.pan = (0.0, 0.0);
+        cx.notify();
+        (win_a, win_b)
+    });
+    vcx.run_until_parked();
+    (view, vcx, focused_id, other_id)
+}
+
+/// At `Card` zoom, every tile is a CHEAP placeholder: the `plane-card-{id}`
+/// probe paints, and the live-content probe (`plane-tile-content-{id}`, the
+/// agent transcript element) is ABSENT (never built). This is the semantic-zoom
+/// contract (spec Behavior 3 / Constraint C2 / UXI-Workspace-4).
+///
+/// NEGATIVE CONTROL (observed RED): in `render_desktop`, change the placeholder
+/// branch guard from `if zoom != Detail::Full` to `if false` (so Card falls
+/// through to the live path). Re-run: `plane-card-*` never paints AND
+/// `plane-tile-content-*` DOES → both asserts fire. Restored after.
+#[gpui::test]
+fn plane_card_zoom_paints_placeholders_not_live_content(cx: &mut TestAppContext) {
+    let (view, vcx, focused_id, _other) = boot_desktop_two_tiles(cx);
+
+    // Zoom to Card.
+    view.update(vcx, |v, cx| {
+        let tab = v.workspace.active_tab_mut().unwrap();
+        tab.desktop.camera.zoom = crate::workspace::Detail::Card;
+        cx.notify();
+    });
+    for _ in 0..2 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let card = crate::layout_probe_get(&format!("plane-card-{focused_id}"));
+    let live = crate::layout_probe_get(&format!("plane-tile-content-{focused_id}"));
+    crate::layout_probe_end();
+
+    let (_x, _y, w, h) = card.expect(
+        "plane-card probe did NOT paint at Card zoom — the focused tile's card \
+         placeholder is invisible (UXI-Workspace-4 violated)",
+    );
+    assert!(w > 1.0 && h > 1.0, "card placeholder painted with no area (w={w}, h={h})");
+    assert!(
+        live.is_none(),
+        "LIVE tile content painted at Card zoom (plane-tile-content-{focused_id}) — \
+         the placeholder must NOT build live App content (Constraint C2)"
+    );
+}
+
+/// The focused tile ALWAYS renders even when it's off-viewport (C5): it carries
+/// the focus handle + per-screen wiring, so culling it strands the keyboard. An
+/// UNFOCUSED off-viewport tile is culled. Focused tile A sits at the origin;
+/// unfocused B at col 100 (far off-view). To make the test NON-vacuous we prove
+/// A's OWN painted rect extends beyond the canvas is not required — instead we
+/// place A off-view too: we pan the camera far away so A's slot is outside the
+/// viewport, then assert A (focused) still paints while B (unfocused, also
+/// off-view) does not.
+///
+/// NEGATIVE CONTROL (observed RED): remove the focus exemption in
+/// `render_desktop` (change `if !visible && !is_focused` to `if !visible`).
+/// Re-run: focused A no longer paints when off-view → the "A must paint" assert
+/// fires. Restored after.
+#[gpui::test]
+fn plane_focused_tile_renders_when_off_viewport(cx: &mut TestAppContext) {
+    let (view, vcx, focused_id, other_id) = boot_desktop_two_tiles(cx);
+
+    // Pan the camera far to the right (in SLOT units) so BOTH tiles are off the
+    // 800×600 viewport: A (origin, col 0) is now far LEFT of view; B (col 100)
+    // is still far right. Neither slot intersects the viewport.
+    view.update(vcx, |v, cx| {
+        let tab = v.workspace.active_tab_mut().unwrap();
+        tab.desktop.camera.pan = (50.0, 0.0); // 50 slots right — origin is off-left
+        tab.desktop.last_reveal = Some(focused_id); // keep auto-pan from re-revealing
+        cx.notify();
+    });
+    for _ in 0..2 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let focused = crate::layout_probe_get(&format!("plane-tile-content-{focused_id}"));
+    let other = crate::layout_probe_get(&format!("plane-tile-content-{other_id}"));
+    // Non-vacuity: confirm the focused tile's painted x is genuinely LEFT of the
+    // viewport (x + w <= 0), i.e. it really is off-screen, not merely at an edge.
+    crate::layout_probe_end();
+
+    let (fx, _fy, fw, _fh) = focused.expect(
+        "focused tile did NOT paint when off-viewport (C5 violated) — culling it \
+         strands the keyboard",
+    );
+    assert!(
+        fx + fw <= 0.0,
+        "focused tile is NOT actually off-viewport (x={fx}, w={fw}) — the test is \
+         vacuous; it must sit left of x=0"
+    );
+    assert!(
+        other.is_none(),
+        "an UNFOCUSED off-viewport tile painted (plane-tile-content-{other_id}) — \
+         culling is not running (a vacuous focus-exemption test)"
+    );
+}
+
+/// Perf proxy (spec Verification, optional): panning the plane at Card must NOT
+/// re-render the (non-Full) transcript surfaces — at Card no live transcript is
+/// built at all, so the cached `TranscriptView` render count stays flat across a
+/// pan. Mirrors the `transcript_021_*` render-count discipline.
+#[gpui::test]
+fn plane_pan_at_card_leaves_transcript_render_flat(cx: &mut TestAppContext) {
+    crate::perf_reset("transcript");
+    let (view, vcx, _focused, _other) = boot_desktop_two_tiles(cx);
+    // Zoom to Card and settle.
+    view.update(vcx, |v, cx| {
+        v.workspace.active_tab_mut().unwrap().desktop.camera.zoom =
+            crate::workspace::Detail::Card;
+        cx.notify();
+    });
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    let base = crate::perf_render_count("transcript");
+
+    // Pan the plane several times in slot units (the bare-scroll path).
+    for _ in 0..5 {
+        view.update(vcx, |v, cx| {
+            v.workspace.active_tab_mut().unwrap().desktop.pan_by(0.5, 0.0);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    }
+    let after = crate::perf_render_count("transcript");
+    assert_eq!(
+        base, after,
+        "panning at Card re-rendered the transcript ({base} → {after}) — Card must \
+         not build live transcript content (Constraint C2)"
+    );
+}
+
+/// `Ctrl-W 0` resets the active plane's camera to the origin (Behavior 6,
+/// UXI-Workspace-5) through the REAL keymap → `ResetWorkspaceView` action →
+/// `reset_workspace_view` handler dispatch. Drives the production keymap
+/// (`register_keymap` + `simulate_keystrokes`), not a hand-called method: after
+/// panning + zooming AWAY, the chord must return `camera == Camera::default()`
+/// while the slots/spans (tile placement) stay untouched (the reset is
+/// view-only, Constraint C1).
+///
+/// NEGATIVE CONTROL (observed RED): comment out the `desktop.reset_view()` line
+/// in `reset_workspace_view` (main.rs) — the handler becomes a no-op — and the
+/// camera-equals-default assert fires (camera stays at the panned/zoomed pose).
+/// Restored after. (The post-`Ctrl-W` digit `0` firing under the REAL macOS OS
+/// keymap is the documented key gap, CLAUDE.md rule 4 / spec Verification: a
+/// human runtime check confirms the chord; the action+handler are headless-tested
+/// here.)
+#[gpui::test]
+fn ctrl_w_reset_returns_camera_to_origin(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx, _focused, _other) = boot_desktop_two_tiles(cx);
+
+    // Snapshot the tile placement so we can prove the reset is view-only.
+    let slots_before = view.update(vcx, |v, _| {
+        v.workspace.active_tab().unwrap().desktop.slots.clone()
+    });
+
+    // Pan AND zoom the camera AWAY from the origin — reset must undo BOTH. Zoom
+    // to Minimap deliberately: the plane-camera actions live on the CANVAS root
+    // (chrome.rs), which renders at every Detail, so the chord must still fire
+    // when the focused tile is a Minimap placeholder (the C5 path).
+    view.update(vcx, |v, cx| {
+        let d = &mut v.workspace.active_tab_mut().unwrap().desktop;
+        d.pan_by(7.0, -4.0);
+        d.camera.zoom = crate::workspace::Detail::Minimap;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let moved = view.update(vcx, |v, _| v.workspace.active_tab().unwrap().desktop.camera);
+    assert_ne!(
+        moved,
+        crate::workspace::Camera::default(),
+        "precondition: camera must be away from origin before the reset"
+    );
+
+    // Act: the REAL Ctrl-W 0 sequence through the production keymap.
+    vcx.simulate_keystrokes("ctrl-w 0");
+    vcx.run_until_parked();
+
+    let (camera, slots_after) = view.update(vcx, |v, _| {
+        let d = &v.workspace.active_tab().unwrap().desktop;
+        (d.camera, d.slots.clone())
+    });
+    assert_eq!(
+        camera,
+        crate::workspace::Camera::default(),
+        "Ctrl-W 0 must return the camera to the origin (pan=(0,0), zoom=Full)"
+    );
+    assert_eq!(
+        slots_after, slots_before,
+        "reset is view-only — tile slots must be untouched (Constraint C1)"
+    );
+}
+
+/// `Ctrl-W -` / `Ctrl-W =` step the active plane's semantic zoom through the REAL
+/// keymap → `ZoomOutWorkspace` / `ZoomInWorkspace` action → handler dispatch
+/// (Behavior 3). From `Full`: `Ctrl-W -` → `Card` → `Minimap`, clamped at
+/// `Minimap`; `Ctrl-W =` steps back toward `Full`.
+///
+/// NEGATIVE CONTROL (observed RED): unbind the `Ctrl-W -` row in
+/// `keymap_registry.rs` (delete the `ZoomOutWorkspace` binding) — the first
+/// `simulate_keystrokes("ctrl-w -")` no longer dispatches, so the zoom stays at
+/// `Full` and the `== Card` assert fires. Restored after.
+#[gpui::test]
+fn ctrl_w_zoom_steps_detail(cx: &mut TestAppContext) {
+    use crate::workspace::Detail;
+    cx.update(crate::register_keymap);
+    let (view, vcx, _focused, _other) = boot_desktop_two_tiles(cx);
+
+    let zoom = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, _| {
+            v.workspace.active_tab().unwrap().desktop.camera.zoom
+        })
+    };
+
+    // Precondition: fresh plane rests at Full.
+    assert_eq!(zoom(&view, vcx), Detail::Full, "plane starts at Full");
+
+    // Ctrl-W - : Full → Card. Repeated `ctrl-w X` sequences dispatch cleanly
+    // because the plane-camera actions live on the CANVAS root (chrome.rs) — the
+    // one element that renders at every Detail — so a step that lands focus on a
+    // Card/Minimap placeholder still has the handler in its ancestry.
+    vcx.simulate_keystrokes("ctrl-w -");
+    vcx.run_until_parked();
+    assert_eq!(zoom(&view, vcx), Detail::Card, "one step out ⇒ Card");
+
+    // Ctrl-W - : Card → Minimap.
+    vcx.simulate_keystrokes("ctrl-w -");
+    vcx.run_until_parked();
+    assert_eq!(zoom(&view, vcx), Detail::Minimap, "two steps out ⇒ Minimap");
+
+    // Ctrl-W - : Minimap is the clamp — stays Minimap.
+    vcx.simulate_keystrokes("ctrl-w -");
+    vcx.run_until_parked();
+    assert_eq!(
+        zoom(&view, vcx),
+        Detail::Minimap,
+        "zoom-out clamps at Minimap (no wrap / no panic)"
+    );
+
+    // Ctrl-W = : Minimap → Card (steps back in).
+    vcx.simulate_keystrokes("ctrl-w =");
+    vcx.run_until_parked();
+    assert_eq!(zoom(&view, vcx), Detail::Card, "one step in ⇒ Card");
+}

@@ -537,6 +537,21 @@ pub(crate) fn default_rail_width() -> f32 {
     workspace::RAIL_DEFAULT_WIDTH
 }
 
+/// Persisted shadow of a plane's [`workspace::Camera`]
+/// (`spec-infinite-plane-workspace.md` D4): pan (slot units) + semantic-zoom
+/// Detail. `zoom` deserializes through `Detail`'s HAND-ROLLED
+/// `Deserialize` (workspace.rs), which falls back to `Full` on any unknown
+/// string — so a `zoom` value from a newer binary DEGRADES the camera to
+/// origin-detail rather than failing the parse and dropping the whole snapshot
+/// (the loader's "failed parse ⇒ discard" rule). That fallback lives in
+/// `Detail`, so a plain `#[derive(Deserialize)]` here is safe: it can never
+/// hard-error on the zoom field. `pan` is a pair of `f32`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PersistedCamera {
+    pub(crate) pan: (f32, f32),
+    pub(crate) zoom: workspace::Detail,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PersistedTab {
     pub(crate) auto_name: String,
@@ -559,15 +574,26 @@ pub(crate) struct PersistedTab {
     /// keyed by the same stable per-leaf `WindowId` the layout snapshot
     /// uses — NOT positional, so a mismatched entry degrades to
     /// reconciliation instead of scrambling the arrangement. Absent in old
-    /// snapshots → seed on the first desktop render.
+    /// snapshots → seed on the first desktop render. `(id, row, col)`; the
+    /// row/col are SIGNED (`i32`) on the infinite plane
+    /// (`spec-infinite-plane-workspace.md` D4) — old snapshots stored
+    /// non-negative `u32` values, which deserialize as the same positive
+    /// signed coordinates (the old top-right quadrant), so they load
+    /// transparently.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) desktop_slots: Vec<(workspace::WindowId, u32, u32)>,
+    pub(crate) desktop_slots: Vec<(workspace::WindowId, i32, i32)>,
     /// Desktop tile spans (spec-desktop-mode.md Behavior 4b), keyed by the
     /// same `WindowId`. Parallel to `desktop_slots` and holds only non-default
     /// (≠ 1 × 1) tiles, so older snapshots (no field) load every tile at
     /// 1 × 1 and span-free arrangements omit it entirely. `(id, rows, cols)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) desktop_spans: Vec<(workspace::WindowId, u32, u32)>,
+    /// The plane's persisted camera (`spec-infinite-plane-workspace.md`
+    /// Behavior 7 / D4): pan + semantic-zoom Detail, so a workspace reopens
+    /// exactly where the view was left. Absent in old snapshots → restored as
+    /// `Camera::default()` (origin, `Full`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) camera: Option<PersistedCamera>,
     /// The workspace's working directory (ADR-0023). `None` in old snapshots
     /// (pre-typed-cwd) → migrated from `legacy_kv["cwd"]` on restore, else the
     /// process dir.
@@ -871,6 +897,8 @@ pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<App>) -> PersistedWor
                     .desktop
                     .slots
                     .iter()
+                    // Slots are signed on the plane (D4); persist row/col
+                    // directly as `i32` — negative anchors round-trip.
                     .map(|&(id, s)| (id, s.row, s.col))
                     .collect(),
                 desktop_spans: t
@@ -879,6 +907,12 @@ pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<App>) -> PersistedWor
                     .iter()
                     .map(|(&id, sp)| (id, sp.rows, sp.cols))
                     .collect(),
+                // The plane's camera (pan + semantic-zoom Detail), so the view
+                // reopens where it was left (D4 / Behavior 7).
+                camera: Some(PersistedCamera {
+                    pan: t.desktop.camera.pan,
+                    zoom: t.desktop.camera.zoom,
+                }),
                 cwd: Some(t.cwd().path().display().to_string()),
                 legacy_kv: HashMap::new(),
             })
