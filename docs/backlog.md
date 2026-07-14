@@ -13,6 +13,15 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Subagent row rendering in the sidepanel** — `NEEDS-RUNTIME` (built 2026-07-13
+  via `/new-ux`; `UXI-AgentTile-17`). The old one-line glyph+label+prompt row read
+  as two cramped mismatched-color columns in the 280px sidepanel. Now a **two-line
+  stacked row**: line 1 = glyph + label (foreground; warm accent when focused);
+  line 2 = the prompt snippet, dimmed + indented, single-line ellipsized (rows stay
+  short). Headless PAINT guard `subagent_row_stacks_label_over_prompt`
+  (negative-controlled RED); full suite 357 green. Human check (gap 1): the exact
+  indent/dim look in the live sidepanel.
+
 - **Infinite-plane workspace** — `READY` (2026-07-12). Requirement (verbatim):
   "each workspace is actually infinite — an unbounded grid of slots in all
   directions; tiles can span multiple slots; zoom in/out; pan around; reset the

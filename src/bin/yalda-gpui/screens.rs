@@ -1844,11 +1844,6 @@ impl YaldaGpuiView {
                         ToolCallStatus::Pending => nc(at.tool_pending),
                         _ => prompt_fg,
                     };
-                    let trunc_label: String = if sa.label.chars().count() > 24 {
-                        format!("{}…", sa.label.chars().take(23).collect::<String>())
-                    } else {
-                        sa.label.clone()
-                    };
                     // Prompt snippet: first non-empty line, truncated — the user
                     // wants to see WHAT each subagent was asked, not just a label.
                     let prompt_snip: Option<String> = sa.prompt.as_deref().map(|p| {
@@ -1860,14 +1855,17 @@ impl YaldaGpuiView {
                         }
                     });
                     let is_focused = focused_key.as_ref() == Some(&sa.tool_call_id);
-                    // One subagent per LINE (not a card): status glyph + label,
-                    // then the prompt snippet dimmed and ellipsised to fill the row.
+                    let label_fg = if is_focused { nc(at.warm_accent) } else { self.editor_fg() };
+                    // Two-line row (UXI-AgentTile-17): line 1 = status glyph + label;
+                    // line 2 = the spawn-prompt snippet, dimmed + indented under the
+                    // label, on a single ellipsised line so rows stay short. The label
+                    // and prompt NEVER sit side by side — the old black-label /
+                    // brown-prompt one-line layout read as two cramped columns in the
+                    // narrow sidepanel. `.truncate()` keeps each line to one row.
                     let mut row = div()
                         .id(SharedString::from(format!("subagent-pane-{i}")))
                         .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
+                        .flex_col()
                         .w_full()
                         .min_w_0()
                         .px_1()
@@ -1884,23 +1882,50 @@ impl YaldaGpuiView {
                             });
                         },
                     );
-                    row = row
-                        .child(div().flex_none().text_color(glyph_fg).child(SharedString::new_static(glyph)))
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_color(if is_focused { nc(at.warm_accent) } else { self.editor_fg() })
-                                .child(SharedString::from(trunc_label)),
-                        );
+                    // Line 1: status glyph + label (full width, ellipsised to one line).
+                    let label_el = div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(label_fg)
+                        .child(SharedString::from(sa.label.clone()));
+                    let label_el = if i == 0 {
+                        probe_bounds("subagent-row0-label", label_el.into_any_element())
+                    } else {
+                        label_el.into_any_element()
+                    };
+                    row = row.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .w_full()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(glyph_fg)
+                                    .child(SharedString::new_static(glyph)),
+                            )
+                            .child(label_el),
+                    );
+                    // Line 2: dimmed prompt snippet, indented under the label, one line.
                     if let Some(snip) = prompt_snip {
                         if !snip.is_empty() {
-                            row = row.child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_color(prompt_fg)
-                                    .child(SharedString::from(snip)),
-                            );
+                            let prompt_el = div()
+                                .w_full()
+                                .min_w_0()
+                                .pl_4()
+                                .truncate()
+                                .text_color(prompt_fg)
+                                .child(SharedString::from(snip));
+                            let prompt_el = if i == 0 {
+                                probe_bounds("subagent-row0-prompt", prompt_el.into_any_element())
+                            } else {
+                                prompt_el.into_any_element()
+                            };
+                            row = row.child(prompt_el);
                         }
                     }
                     strip = strip.child(row);

@@ -90,3 +90,30 @@ a clear enter/navigate/exit gesture that always returns you where you were.
 `agent_panel_enter_focuses_subagent`, `agent_panel_cmd0_binding_enters_panel`,
 `agent_panel_closing_last_panel_exits_focus`, `panel_highlight_swaps_to_subagent`,
 `panel_enter_reveals_and_exits`, plus the state-machine fuzzer + oracle.
+
+### UXI-AgentTile-17 — A subagent row stacks label over prompt (two lines, not side-by-side columns)
+
+**Statement.** Each subagent in the Subagents segment renders as a **two-line row**:
+line 1 is the status glyph + the subagent label in a single foreground color (warm
+accent when that subagent is focused, else the normal editor foreground); line 2 is
+the spawn-prompt snippet, **dimmed and indented under the label**, on a **single
+ellipsized line** so rows stay short. The label and prompt are NEVER placed
+side-by-side on one line — the old two-tone "black label + brown prompt column"
+layout is removed. A subagent with no prompt renders line 1 only.
+
+**Applies to.** `screens.rs::render_agent` — the `subagent-panes` rows
+(`subagent-pane-{i}`): a `flex_col` row with a glyph+label line and an indented
+dimmed prompt line, each `.truncate()`d to a single line.
+
+**Why.** In the ~280px sidepanel the single-line glyph + label + prompt layout read
+as two cramped, mismatched-color columns. Stacking gives a clean primary/secondary
+hierarchy that reads in a narrow column.
+
+**Status.** `implemented` (headless — stacking is proven by the layout probe; exact
+indent px / dim color are a paint gap).
+
+**Enforcement.** `verify_harness.rs::subagent_row_stacks_label_over_prompt` — layout
+probe: with a subagent carrying a prompt, the prompt line's painted top is at/below
+the label line's painted bottom (stacked, not side-by-side), both non-empty.
+Negative-controlled (reverting the row to `flex_row` fired it RED: prompt top 90 vs
+label bottom 107.5). No deviation from plan.

@@ -8027,6 +8027,56 @@ fn subagent_panes_paint_right_of_compose(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-AgentTile-17 (PAINT proof): a subagent row STACKS its label over its prompt
+/// snippet — two lines, not two side-by-side columns. Register a Task subagent WITH
+/// a prompt, drive a real paint, and assert (via the layout probe) that the prompt
+/// line's painted top is at/below the label line's painted bottom, both non-empty.
+///
+/// Negative control: revert the row to `.flex_row()` (label + prompt side by side)
+/// and the prompt top sits at the label top → `prompt_y >= label_y + label_h` fails.
+#[gpui::test]
+fn subagent_row_stacks_label_over_prompt(cx: &mut TestAppContext) {
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+
+    // Register a Task subagent (Think + prompt) so a row with BOTH a label and a
+    // prompt snippet renders (this is row 0, the probed one).
+    view.update(vcx, |v, cx| {
+        use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
+        let mut c = v.agent_mut(cx).expect("agent");
+        let id: ToolCallId = "task-stack".into();
+        let mut tc = ToolCall::new(id.clone(), "Explore the repository layout".to_string());
+        tc.kind = ToolKind::Think;
+        tc.raw_input = Some(serde_json::json!({"prompt": "map the code and report the module structure"}));
+        let anchor = c.editor.anchor_for_line(0);
+        c.tools.register(crate::ToolCallKey::from_id(&id), tc, anchor);
+    });
+
+    for _ in 0..4 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    let label = crate::layout_probe_get("subagent-row0-label");
+    let prompt = crate::layout_probe_get("subagent-row0-prompt");
+    crate::layout_probe_end();
+
+    let (_, label_y, _, label_h) = label.expect("subagent row label did not paint");
+    let (_, prompt_y, _, prompt_h) = prompt.expect("subagent row prompt did not paint");
+
+    assert!(label_h > 1.0, "label line has no height ({label_h})");
+    assert!(prompt_h > 1.0, "prompt line has no height ({prompt_h})");
+    // The prompt line is STACKED BELOW the label line (its top at/below the label's
+    // bottom, small slack), not on the same row beside it.
+    assert!(
+        prompt_y + 1.0 >= label_y + label_h,
+        "prompt top {prompt_y} is not below the label bottom {} — the row is not stacked",
+        label_y + label_h,
+    );
+}
+
 /// Both segments (Plan + Subagents) render in ONE sidepanel, stacked: the Plan
 /// segment on top, the Subagents segment below it, both inside the painted
 /// `agent-sidepanel` bounds. Proves the "both visible on the same sidepanel"

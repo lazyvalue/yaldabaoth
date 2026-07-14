@@ -58,3 +58,4 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-14 | compose | A pasted image is staged, shown, and sent as a content block | implemented |
 | UXI-AgentTile-15 | recap | A summoned session recap is pinned and isolated | implemented |
 | UXI-AgentTile-16 | model | The agent model is switchable per session, from what the agent advertises | implemented |
+| UXI-AgentTile-17 | sidepanel | A subagent row stacks label over prompt (two lines, not side-by-side columns) | implemented |
