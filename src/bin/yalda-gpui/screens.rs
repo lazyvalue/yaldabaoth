@@ -178,44 +178,13 @@ impl YaldaGpuiView {
             .text_color(fg_or(bot, 0x666666))
             .text_size(px(11.0))
             .child({
-                let layout_sigil = self
-                    .workspace
-                    .active_tab()
-                    .map(|t| t.layout_mode)
-                    .unwrap_or_default();
-                if layout_sigil == workspace::LayoutMode::Monocle {
-                    // Dynamic [n/N] for monocle
-                    let leaf_ids = self
-                        .workspace
-                        .active_tab()
-                        .map(|t| t.layout.leaf_ids())
-                        .unwrap_or_default();
-                    let total = leaf_ids.len();
-                    let pos = self
-                        .workspace
-                        .focused_window_id()
-                        .and_then(|fid| leaf_ids.iter().position(|&id| id == fid))
-                        .map(|p| p + 1)
-                        .unwrap_or(0);
-                    format!(
-                        "[{pos}/{total}] block {} / {}",
-                        d.cursor_block.saturating_add(1),
-                        d.blocks.len()
-                    )
-                } else if layout_sigil == workspace::LayoutMode::Manual {
-                    format!(
-                        "block {} / {}",
-                        d.cursor_block.saturating_add(1),
-                        d.blocks.len()
-                    )
-                } else {
-                    format!(
-                        "{} block {} / {}",
-                        layout_sigil.sigil(),
-                        d.cursor_block.saturating_add(1),
-                        d.blocks.len()
-                    )
-                }
+                // The workspace interior is always a Plane (infinite-plane,
+                // Stage D) — no layout-mode sigil. Just the block counter.
+                format!(
+                    "block {} / {}",
+                    d.cursor_block.saturating_add(1),
+                    d.blocks.len()
+                )
             })
             .child(SharedString::new_static(
                 "j/k scroll · h/l block · g/G top/bot · Ctrl-O browse · Space tile menu · . workspace menu",
@@ -257,15 +226,13 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::focus_down))
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
-            .on_action(cx.listener(Self::resize_shrink))
-            .on_action(cx.listener(Self::resize_grow))
-            .on_action(cx.listener(Self::equalize))
-            // Layout patterns
-            .on_action(cx.listener(Self::cycle_layout_mode))
+            // Plane camera (spec-infinite-plane-workspace.md): Ctrl-W -/=/0.
+            // Wired on EVERY screen root (like workspace_nav / toggle_jump_panel)
+            // so the action lands whichever tile has focus.
+            .on_action(cx.listener(Self::zoom_out_workspace))
+            .on_action(cx.listener(Self::zoom_in_workspace))
+            .on_action(cx.listener(Self::reset_workspace_view))
             .on_action(cx.listener(Self::desktop_tile_size_overlay))
-            .on_action(cx.listener(Self::promote_to_master))
-            .on_action(cx.listener(Self::increase_master_count))
-            .on_action(cx.listener(Self::decrease_master_count))
             .on_action(cx.listener(Self::tag_view_chord))
             .on_action(cx.listener(Self::tag_toggle_chord))
             .on_action(cx.listener(Self::clear_tag_view))
@@ -346,32 +313,9 @@ impl YaldaGpuiView {
                 (el - sl) + 1
             }
         });
-        let layout_prefix = {
-            let lm = self
-                .workspace
-                .active_tab()
-                .map(|t| t.layout_mode)
-                .unwrap_or_default();
-            if lm == workspace::LayoutMode::Manual {
-                String::new()
-            } else if lm == workspace::LayoutMode::Monocle {
-                let leaf_ids = self
-                    .workspace
-                    .active_tab()
-                    .map(|t| t.layout.leaf_ids())
-                    .unwrap_or_default();
-                let total = leaf_ids.len();
-                let pos = self
-                    .workspace
-                    .focused_window_id()
-                    .and_then(|fid| leaf_ids.iter().position(|&id| id == fid))
-                    .map(|p| p + 1)
-                    .unwrap_or(0);
-                format!("[{pos}/{total}] ")
-            } else {
-                format!("{} ", lm.sigil())
-            }
-        };
+        // The workspace interior is always a Plane (infinite-plane, Stage D) —
+        // no layout-mode sigil prefix in the status line.
+        let layout_prefix = String::new();
         let mut left_status = format!(
             "{}{} {} {}{} · L{}:C{}",
             layout_prefix,
@@ -441,12 +385,11 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::focus_down))
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
-            // Layout patterns
-            .on_action(cx.listener(Self::cycle_layout_mode))
+            // Plane camera (spec-infinite-plane-workspace.md): Ctrl-W -/=/0.
+            .on_action(cx.listener(Self::zoom_out_workspace))
+            .on_action(cx.listener(Self::zoom_in_workspace))
+            .on_action(cx.listener(Self::reset_workspace_view))
             .on_action(cx.listener(Self::desktop_tile_size_overlay))
-            .on_action(cx.listener(Self::promote_to_master))
-            .on_action(cx.listener(Self::increase_master_count))
-            .on_action(cx.listener(Self::decrease_master_count))
             .on_action(cx.listener(Self::tag_view_chord))
             .on_action(cx.listener(Self::tag_toggle_chord))
             .on_action(cx.listener(Self::clear_tag_view))
@@ -2114,12 +2057,11 @@ impl YaldaGpuiView {
             .workspace_nav(cx)
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
-            // Layout patterns
-            .on_action(cx.listener(Self::cycle_layout_mode))
+            // Plane camera (spec-infinite-plane-workspace.md): Ctrl-W -/=/0.
+            .on_action(cx.listener(Self::zoom_out_workspace))
+            .on_action(cx.listener(Self::zoom_in_workspace))
+            .on_action(cx.listener(Self::reset_workspace_view))
             .on_action(cx.listener(Self::desktop_tile_size_overlay))
-            .on_action(cx.listener(Self::promote_to_master))
-            .on_action(cx.listener(Self::increase_master_count))
-            .on_action(cx.listener(Self::decrease_master_count))
             .on_action(cx.listener(Self::tag_view_chord))
             .on_action(cx.listener(Self::tag_toggle_chord))
             .on_action(cx.listener(Self::clear_tag_view));
@@ -2260,11 +2202,11 @@ impl YaldaGpuiView {
             .workspace_nav(cx)
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
-            .on_action(cx.listener(Self::cycle_layout_mode))
+            // Plane camera (spec-infinite-plane-workspace.md): Ctrl-W -/=/0.
+            .on_action(cx.listener(Self::zoom_out_workspace))
+            .on_action(cx.listener(Self::zoom_in_workspace))
+            .on_action(cx.listener(Self::reset_workspace_view))
             .on_action(cx.listener(Self::desktop_tile_size_overlay))
-            .on_action(cx.listener(Self::promote_to_master))
-            .on_action(cx.listener(Self::increase_master_count))
-            .on_action(cx.listener(Self::decrease_master_count))
             .on_action(cx.listener(Self::tag_view_chord))
             .on_action(cx.listener(Self::tag_toggle_chord))
             .on_action(cx.listener(Self::clear_tag_view))
@@ -2329,11 +2271,11 @@ impl YaldaGpuiView {
             .workspace_nav(cx)
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
-            .on_action(cx.listener(Self::cycle_layout_mode))
+            // Plane camera (spec-infinite-plane-workspace.md): Ctrl-W -/=/0.
+            .on_action(cx.listener(Self::zoom_out_workspace))
+            .on_action(cx.listener(Self::zoom_in_workspace))
+            .on_action(cx.listener(Self::reset_workspace_view))
             .on_action(cx.listener(Self::desktop_tile_size_overlay))
-            .on_action(cx.listener(Self::promote_to_master))
-            .on_action(cx.listener(Self::increase_master_count))
-            .on_action(cx.listener(Self::decrease_master_count))
             .on_action(cx.listener(Self::tag_view_chord))
             .on_action(cx.listener(Self::tag_toggle_chord))
             .on_action(cx.listener(Self::clear_tag_view))
@@ -2845,12 +2787,11 @@ impl YaldaGpuiView {
             .workspace_nav(cx)
             .on_action(cx.listener(Self::toggle_outline_rail))
             .on_action(cx.listener(Self::flip_rail_side))
-            // Layout patterns
-            .on_action(cx.listener(Self::cycle_layout_mode))
+            // Plane camera (spec-infinite-plane-workspace.md): Ctrl-W -/=/0.
+            .on_action(cx.listener(Self::zoom_out_workspace))
+            .on_action(cx.listener(Self::zoom_in_workspace))
+            .on_action(cx.listener(Self::reset_workspace_view))
             .on_action(cx.listener(Self::desktop_tile_size_overlay))
-            .on_action(cx.listener(Self::promote_to_master))
-            .on_action(cx.listener(Self::increase_master_count))
-            .on_action(cx.listener(Self::decrease_master_count))
             .on_action(cx.listener(Self::tag_view_chord))
             .on_action(cx.listener(Self::tag_toggle_chord))
             .on_action(cx.listener(Self::clear_tag_view))

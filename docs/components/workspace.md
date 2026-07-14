@@ -64,3 +64,224 @@ specific to this binding.
 **Enforcement.** `verify_harness.rs`: `ctrl_digit_switches_workspace` (full
 keymap→action→handler dispatch: `ctrl-3` then `ctrl-1`, plus past-the-end no-op)
 and `workspace_number_skips_ephemeral` (numbering skips the ephemeral tab).
+
+---
+
+_The invariants below (`UXI-Workspace-2..7`) define the **infinite-plane** model
+(`docs/specs/spec-infinite-plane-workspace.md`). All are `implemented` (headless-
+guarded; the `Ctrl-W 0/-/=` chord firing is the one `NEEDS-RUNTIME` gap). They built
+on the desktop-mode geometry engine and **supersede** the split-tree / layout-mode
+behavior in this component's Description above — a workspace is now one infinite
+plane; the `LayoutMode` cycle, master-stack, split-resize, and equalize surface are
+retired (`SplitH`/`SplitV` remain only as the plane's new-tile mechanism). The
+Description prose is due a rewrite around the plane in a follow-up pass._
+
+### UXI-Workspace-2 — A workspace is one infinite, all-directions signed plane
+
+**Statement.** Each workspace's interior is a single **Plane**: an unbounded grid
+of slots addressed by *signed* coordinates `Slot { row: i32, col: i32 }`, origin
+`(0,0)`, extending without bound up/down/left/right. A tile anchors at a signed
+slot and occupies a `Span` (`rows × cols`, each ≥ 1) rectangle; **no two tiles'
+rectangles overlap**. There is no split tree, no layout-mode choice, and no `0`
+wall — the plane is the only interior. Multiple planes = multiple workspaces
+(the code's `Tab`s); tab-management gestures re-cast as new/close/switch **plane**
+(`NewTab`→new plane, `CloseTab`→close plane, `next_tab`/`prev_tab`→switch plane).
+
+**Applies to.** `workspace.rs`: `Slot` widened `u32→i32`; `DesktopState` becomes
+the plane; `occupied_extent` returns a signed min+max bounding box (not a lone
+`u32` max corner); `clamp_resize` drops the origin-wall clamp (keeps the
+Block-rule clamp against other tiles). The `LayoutMode` enum + `Ctrl-W s/v/c/o`
+split ops + mode cycling are retired from the user surface.
+
+**Why.** The user's model is a boundless spatial canvas per workspace, not a
+bounded tiled quadrant; the retired split/mode machinery is what makes "the
+workspace is infinite" untrue today.
+
+**Status.** `implemented`.
+
+**Enforcement.** `workspace.rs` desktop_tests: `occupied_extent_signed_min_max_box`
+(negative anchors, min+max corners, no underflow), `clamp_resize_west_crosses_origin`
+(west growth crosses into negative slots yet still Block-clamps a negative-col
+neighbor — proves the `0`-wall removal didn't remove the neighbor wall). Both
+negative-control-verified RED-then-green.
+
+**Deviation from plan.** `LayoutMode` was **collapsed to a single `Plane` variant**,
+not deleted (≈100 call sites made a stub cleaner; its `Deserialize` maps any old
+mode string → `Plane`). `SplitH`/`SplitV`/`split_focused` were **kept** — they are
+load-bearing for new-tile creation on the plane; only the *mode / master-stack /
+resize / equalize* surface + `Ctrl-W Space` cycling were retired (consistent with
+Behavior 1: "split ops retired from the *user surface*"). The `chrome.rs`
+`layout_mode==Desktop` gate is now unconditional and `render_layout` (the split-tree
+branch) is deleted.
+
+### UXI-Workspace-3 — The camera is view-only; it never moves a tile
+
+**Statement.** A workspace carries a `Camera { pan, zoom }` over its plane. Pan,
+zoom, reset, and window resize mutate the camera (and viewport) **only** — they
+never change a tile's anchor or span. `pan` is expressed in **pitch-independent
+slot units** (a given `pan` names the same plane location at every zoom level;
+pixels = `pan · slot_pitch(zoom)`). The only slot/span mutations are seeding,
+drag-drop, edge-resize, and reconcile (UXI-Workspace-6).
+
+**Applies to.** `workspace.rs`: `Camera` + `Detail` on `DesktopState` (replacing
+the bare `pan: (f32,f32)`); `pan_by`, `zoom_in`/`zoom_out`, `reset_view` mutate
+only the camera. The focused tile always renders even when panned/zoomed off
+view (carries focus + `on_action` wiring); plane-level actions are wired on the
+canvas root (desktop-mode C5, inherited).
+
+**Why.** Separating view from placement is what makes zoom/pan/reset safe and
+what lets "reset the view" be a pure navigation gesture rather than a
+destructive re-layout.
+
+**Status.** `implemented`.
+
+**Enforcement.** `verify_harness.rs`: `ctrl_w_reset_returns_camera_to_origin`
+(pan+zoom away, then reset → camera at origin AND `slots`/`spans` unchanged) and
+`ctrl_w_zoom_steps_detail` (zoom steps mutate only the camera). Negative-control-
+verified (no-op'd `reset_view` → camera stuck; observed RED).
+
+**Deviation from plan.** `pan` is in slot units as specced, but the Statement's
+`pixels = pan · slot_pitch(zoom)` is realized as `pan ⊗ (desktop_tile_px ⊗
+detail_scale(zoom))` — pitch is **per-axis and viewport-derived**, not a scalar
+`slot_pitch` (see UXI-Workspace-4). `zoom_in`/`zoom_out` take an explicit `anchor:
+Slot` (focused tile or viewport center, resolved by the caller).
+
+### UXI-Workspace-4 — Zoom is semantic: discrete detail levels, not a scale transform
+
+**Statement.** Zoom is one of three discrete **Detail** levels — `Full` (0, live
+tiles), `Card` (−1, title/label/status card, no live content), `Minimap` (−2,
+a span-sized pip; label only on the focused pip) — each laid out on the same
+signed grid at its own slot pitch. Zoom out steps `Full→Card→Minimap`; zoom in
+steps back; clamped to `[Minimap, Full]` (no zoom-in past Full in v1). A zoom
+step re-anchors on the focused tile (or viewport center) so it feels centered.
+Selecting a card/pip returns to `Full` centered on that tile. Zoom bindings are
+distinct from the `Cmd+=/-/0` document-text zoom (`UXI-TextZoom-1`).
+
+**Applies to.** `chrome.rs` (the `render_desktop` path — NOT `screens.rs`) +
+`workspace.rs`: per-`Detail` render representations + `detail_scale(detail)` off
+the per-axis viewport-derived Full pitch (`desktop_tile_px`); `zoom_in`/`zoom_out`;
+frame-level culling renders cheap placeholders at Card/Minimap (per-frame cost
+O(visible tiles), *lower* than Full); maximize is Full-only. Bindings live in
+`keymap_registry.rs`, reflowed in one pass (`Ctrl-W =`/`Ctrl-W -` reclaimed from
+`Equalize`/`ResizeShrink`); `Cmd`/`Ctrl`+scroll zooms.
+
+**Why.** GPUI has no cheap arbitrary-scale transform, and shrunk live tiles are
+illegible and expensive; discrete LOD stays legible and gets *cheaper* zoomed
+out, which is the whole point of an overview.
+
+**Status.** `implemented`.
+
+**Enforcement.** `verify_harness.rs`:
+`plane_card_zoom_paints_placeholders_not_live_content` (at Card the `plane-card-{id}`
+probe paints while the live `plane-tile-content-{id}` probe is absent),
+`plane_focused_tile_renders_when_off_viewport` (focused tile painted with `x+w ≤ 0`
+— genuinely off-screen — while an unfocused off-viewport tile is culled; non-vacuous),
+`plane_pan_at_card_leaves_transcript_render_flat` (Card render is O(visible), not
+live). All negative-control-verified RED.
+
+**Deviation from plan.** `slot_pitch(detail)->f32` was **infeasible** (pitch is
+anisotropic + viewport-derived); realized as `detail_scale(Detail)->f32` (Full 1.0 /
+Card 0.5 / Minimap 0.2) multiplied against the per-axis `desktop_tile_px` Full pitch.
+Wheel routing landed as: `Cmd`/`Ctrl`+scroll steps zoom at every level; bare scroll
+pans in slot units (at Full a bubble-phase canvas handler hit-tests `occupant` so
+tile-content scroll wins over a tile, empty canvas pans; at Card/Minimap bare scroll
+pans everywhere). Probe tags added: `plane-card-{id}`, `plane-tile-content-{id}`
+(via a new String-keyed `probe_bounds_dyn`). Exact scroll *feel* is `NEEDS-RUNTIME`.
+
+### UXI-Workspace-5 — Reset-to-origin returns the view to (0,0) at full detail
+
+**Statement.** A single action sets `camera = { pan: (0,0), zoom: Full }` for the
+active workspace. It is **view-only** — no tile moves, none is re-seeded, focus is
+unchanged. Every plane's origin is the same canonical `(0,0)@Full` — "where all
+workspaces start" — so reset is the reliable "get me back to the start" gesture.
+
+**Applies to.** `workspace.rs`: `reset_view` (= `Camera::default()`); `main.rs`
+action + binding (indicative `Ctrl-W 0`, a two-key sequence so the digit is a
+plain key — the post-leader digit is the known macOS key gap, CLAUDE.md rule 4).
+
+**Why.** Unbounded pan/zoom can lose the tiles entirely; a fixed, well-known home
+is what makes an infinite plane navigable rather than a place to get lost.
+
+**Status.** `implemented` (headless; chord-firing is `NEEDS-RUNTIME`).
+
+**Enforcement.** `verify_harness.rs`: `ctrl_w_reset_returns_camera_to_origin` drives
+the real keymap (`register_keymap` + `simulate_keystrokes("ctrl-w 0")`) → action →
+handler and asserts camera == `Camera::default()` AND `slots`/`spans` unchanged.
+Negative-control-verified (no-op'd `reset_view` → RED, camera stuck at
+`(7,-4) Minimap`). The binding is `Ctrl-W 0` (a two-key sequence — the plain digit
+after the leader). Per CLAUDE.md rule 4, `simulate_keystrokes` is focus-accurate but
+not OS-accurate, so the real macOS chord firing is a **human runtime check** (the one
+genuine gap for this UXI).
+
+### UXI-Workspace-6 — Placement is free and origin-seeded; no insert-shift shelf
+
+**Statement.** New tiles seed at the **first free slot on an outward ring-spiral
+from the origin** (skipping occupied rectangles) — new work clusters near origin.
+Dragging a tile moves it to the dropped slot iff its whole rectangle lands on
+free slots; an overlapping drop is **rejected** (returns home). There is **no**
+row-major insert-and-shift ripple. Closing a tile leaves a gap; neighbors never
+move. `focus_next`/`focus_prev` traverse `slots` in signed row-major **reading
+order** (top→bottom, left→right); spatial directional focus is unchanged.
+
+**Applies to.** `workspace.rs`: `seed_slot` (ring-spiral, replaces the shelf
+`first_free_slot`); free-placement drop (desktop-mode Behavior 4 gesture, ripple
+removed); edge-resize `clamp_resize` unchanged in spirit (Block rule);
+`sequence_neighbor` retained for traversal only (decoupled from placement).
+
+**Why.** The row-major shelf assumed a top-left origin and a wrap width — neither
+survives an all-directions plane; free placement + origin seeding is the natural
+model for a boundless canvas.
+
+**Status.** `implemented`.
+
+**Enforcement.** `workspace.rs` desktop_tests: `seed_slot_spiral_deterministic`
+(origin-first, occupied origin ⇒ next lands on the exact reading-order ring slot,
+deterministic) and `free_drop_rejects_overlap_without_moving_neighbors` (overlapping
+drop leaves every tile's slot unchanged — no ripple). Both negative-control-verified
+RED. Existing signed-adapted desktop_tests cover the type-only reuses.
+
+**Deviation from plan.** The dead shelf code was deleted (`Slot::succ`, `first_free`,
+`seed(leaves,w)`, `insert_shift`, `absorbable_run`, `effective_width`); `reconcile`
+lost its `focused`/`w` params and now spiral-seeds slotless leaves (order-free). The
+free-drop seam is `DesktopState::free_drop(id, target) -> bool`.
+
+### UXI-Workspace-7 — The plane persists (tiles + camera) and migrates old layouts cleanly
+
+**Statement.** A workspace persists its tiles (signed `desktop_slots`,
+`desktop_spans`) **and** its camera (`pan` in slot units, `zoom`), so it reopens
+exactly where the view was left (reset-to-origin is then a meaningful distinct
+state). Old `workspace.json` loads transparently: unsigned slots are valid signed
+slots (the old quadrant); an absent camera restores as origin+Full; a persisted
+`layout_mode` (`master_stack`/`monocle`/`columns`/…) is **ignored** — every tab is
+forced to a plane, reflowing its tree leaves via origin ring-spiral once (content
+preserved, not lost). Unknown `Detail`/`LayoutMode` strings **fall back**
+(`Detail`→`Full`) rather than dropping the whole snapshot.
+
+**Applies to.** `persist.rs`: `PersistedTab.desktop_slots` tuple widened to
+`(u64,i32,i32)`; new `PersistedCamera { pan, zoom }`; `Detail` + camera use a
+**hand-rolled** unknown-variant `Deserialize` (mirroring `LayoutMode`
+workspace.rs:449 — a `#[derive]` would hard-error and reset the snapshot). Loader
+ignores `layout_mode`. Tests must use the `*_PATH_OVERRIDE`/`None`-under-`cfg(test)`
+seam — never touch `~/.yalda`.
+
+**Why.** Persisting the camera is what makes each plane feel like a durable place;
+the migration rules prevent an old `workspace.json` (or a downgrade) from silently
+wiping a user's arrangement.
+
+**Status.** `implemented`.
+
+**Enforcement.** `tests.rs` (pure serde, no `~/.yalda`):
+`plane_persist_round_trips_signed_slots_and_camera` (negative-coord slots + a
+non-default camera round-trip faithfully), `old_workspace_json_loads_as_plane_with_origin_camera`
+(literal old-format JSON: `u32` slots, no `camera`, `layout_mode:"master_stack"` →
+slots intact, camera origin+Full, no panic, snapshot not dropped),
+`unknown_detail_zoom_falls_back_to_full` (`"zoom":"hyper"` → `Full`, snapshot kept).
+Negative-control-verified (a strict deserialize dropped the snapshot → RED).
+
+**Deviation from plan.** `Detail`'s hand-rolled `Serialize`/`Deserialize` live in
+`workspace.rs` (where `Detail` is defined); `PersistedCamera` safely `#[derive]`s serde
+because the unknown-variant hardening is inside `Detail`. Stage A left a temporary
+negative-slot save clamp that Stage B removed (signed rows/cols now persist directly).
+The "force plane / ignore `layout_mode`" + one-time reflow is realized via the
+existing seed/reconcile-on-first-render path (retired-mode tabs bulk-seed their
+leaves through `seed_slot`).

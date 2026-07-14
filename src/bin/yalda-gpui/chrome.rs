@@ -45,10 +45,11 @@ impl YaldaGpuiView {
         // &mut Layout<App> (a field inside self.workspace.tabs)
         // is disjoint from &self.render_X's other field accesses.
         let layout = unsafe { &mut *layout_ptr };
-        if self.workspace.tabs[tab_idx].layout_mode == workspace::LayoutMode::Desktop {
-            return self.render_desktop(root, layout, focused_id, attach_focus, rail_focusable, cx);
-        }
-        self.render_layout(root, layout, focused_id, attach_focus, rail_focusable, cx)
+        // The plane is the ONLY workspace interior (infinite-plane, Stage D): a
+        // workspace IS a Plane (Behavior 1), so the tab always renders as the
+        // desktop/plane canvas. The old split-tree branch (`render_layout`) is
+        // retired along with the mode surface.
+        self.render_desktop(root, layout, focused_id, attach_focus, rail_focusable, cx)
     }
 
     /// Desktop mode (spec-desktop-mode.md): fixed-size tiles at slot
@@ -67,8 +68,7 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tab_idx = self.workspace.active_tab;
-        let tile = self.desktop_tile_px();
-        let g = DESKTOP_GUTTER;
+        let full_tile = self.desktop_tile_px();
         let (_, _, mut canvas_w, mut canvas_h) = self.desktop_canvas_bounds.get();
         // First frame: bounds not captured yet — approximate with the window
         // viewport; the next frame self-corrects.
@@ -78,51 +78,66 @@ impl YaldaGpuiView {
         if canvas_h <= 0.0 {
             canvas_h = self.viewport_height_px.max(1.0);
         }
-        // Grid semantics: the wrap width IS the configured column count —
-        // no longer derived from the viewport (the viewport now derives the
-        // tile SIZE instead).
-        let eff_w = self.desktop_grid_cols.max(1);
+        // Semantic-zoom Detail (Stage C, spec Behavior 3): the level chooses the
+        // tile REPRESENTATION (Full live tile · Card placeholder · Minimap pip)
+        // AND the slot pitch. Pitch is derived per-axis from the Full pitch
+        // scaled by `detail_scale(zoom)` — ONE conversion boundary: `tile` and
+        // `g` below are the level-effective tile size + gutter, and ALL slot
+        // geometry (`slot_origin`/`tile_rect`/`slot_at`, dot grid, drag, reveal)
+        // runs against them, so zooming out shrinks the whole plane uniformly
+        // without touching a single slot/span.
+        let zoom = self.workspace.tabs[tab_idx].desktop.camera.zoom;
+        let scale = workspace::detail_scale(zoom);
+        let tile = (full_tile.0 * scale, full_tile.1 * scale);
+        let g = DESKTOP_GUTTER * scale;
+        // Per-axis effective slot pitch (pixels per slot): cell = tile + gutter.
+        // Camera pan is in pitch-independent SLOT units; pixels are derived here
+        // at the view boundary (`pan_px = cam.pan · pitch`), and pan MUTATIONS
+        // divide back by pitch. Because both `tile` and `g` scale by the same
+        // factor, `pan` in slot units names the SAME plane location at every
+        // Detail (spec D2) — the zoom re-anchor needs no cross-pitch conversion.
+        let pitch = (tile.0 + g, tile.1 + g);
 
-        // ── Slot upkeep: seed on first entry, reconcile every frame (cheap,
-        // O(n), no-op when the Behavior-2 invariant already holds), reveal
-        // the focused tile when focus changed, clamp pan to the occupied
-        // bounding box + one slot of margin. ──
+        // ── Slot upkeep: seed/reconcile every frame (cheap, O(n), no-op when
+        // the non-overlap invariant already holds; slotless leaves seed on the
+        // origin ring-spiral), reveal the focused tile when focus changed. Pan
+        // is UNCLAMPED now — the plane is infinite in all directions
+        // (Behavior 5). ──
         {
             let tab = &mut self.workspace.tabs[tab_idx];
             let leaves = tab.layout.leaf_ids();
-            if tab.desktop.slots.is_empty() && !leaves.is_empty() {
-                tab.desktop.seed(&leaves, eff_w);
-            } else {
-                tab.desktop.reconcile(&leaves, focused_id, eff_w);
-            }
+            tab.desktop.reconcile(&leaves);
             if tab.desktop.last_reveal != Some(focused_id) {
                 if let Some(slot) = tab.desktop.slot_of(focused_id) {
                     let (x, y) = workspace::slot_origin(slot, tile, g);
-                    let pan = &mut tab.desktop.pan;
-                    if x - g < pan.0 {
-                        pan.0 = (x - g).max(0.0);
-                    } else if x + tile.0 + g > pan.0 + canvas_w {
-                        pan.0 = x + tile.0 + g - canvas_w;
+                    // Reveal in pixel space, then store the pan back in slot units.
+                    let mut pan_px = (
+                        tab.desktop.camera.pan.0 * pitch.0,
+                        tab.desktop.camera.pan.1 * pitch.1,
+                    );
+                    if x - g < pan_px.0 {
+                        pan_px.0 = x - g;
+                    } else if x + tile.0 + g > pan_px.0 + canvas_w {
+                        pan_px.0 = x + tile.0 + g - canvas_w;
                     }
-                    if y - g < pan.1 {
-                        pan.1 = (y - g).max(0.0);
-                    } else if y + tile.1 + g > pan.1 + canvas_h {
-                        pan.1 = y + tile.1 + g - canvas_h;
+                    if y - g < pan_px.1 {
+                        pan_px.1 = y - g;
+                    } else if y + tile.1 + g > pan_px.1 + canvas_h {
+                        pan_px.1 = y + tile.1 + g - canvas_h;
                     }
+                    tab.desktop.camera.pan = (pan_px.0 / pitch.0, pan_px.1 / pitch.1);
                 }
                 tab.desktop.last_reveal = Some(focused_id);
             }
-            let (max_r, max_c) = tab.desktop.occupied_extent().unwrap_or((0, 0));
-            // Pannable extent: through one margin slot beyond occupied.
-            let extent =
-                workspace::slot_origin(workspace::Slot::new(max_r + 2, max_c + 2), tile, g);
-            let pan = &mut tab.desktop.pan;
-            pan.0 = pan.0.clamp(0.0, (extent.0 - canvas_w).max(0.0));
-            pan.1 = pan.1.clamp(0.0, (extent.1 - canvas_h).max(0.0));
         }
 
         let tab = &self.workspace.tabs[tab_idx];
-        let pan = tab.desktop.pan;
+        // Derived pixel pan for the rest of this render (all existing pixel math
+        // reads `pan`).
+        let pan = (
+            tab.desktop.camera.pan.0 * pitch.0,
+            tab.desktop.camera.pan.1 * pitch.1,
+        );
         let drag = tab.desktop.drag;
         let slot_list: Vec<(workspace::WindowId, workspace::Slot, workspace::Span)> = tab
             .desktop
@@ -134,7 +149,10 @@ impl YaldaGpuiView {
         // strand it in a single grid quadrant (the jump-panel virtual
         // workspace lands here). Drag/resize/pan are meaningless with one
         // tile, so the maximized branch ignores slot geometry entirely.
-        let maximized = slot_list.len() == 1;
+        // Full-ONLY (Stage C, spec Behavior 3): at Card/Minimap a maximize would
+        // fill the viewport with one card/pip and defeat the overview, so every
+        // tile renders at its true slot geometry once zoomed out.
+        let maximized = slot_list.len() == 1 && zoom == workspace::Detail::Full;
         // Live edge-resize preview (spec Behavior 4b): the clamped anchor +
         // span the resized tile renders at this frame, which is also what
         // commits. West/North move the anchor, so the preview carries it.
@@ -157,10 +175,27 @@ impl YaldaGpuiView {
             .size_full()
             .overflow_hidden()
             .bg(base_bg)
-            // Swallow scroll-wheel on the desktop canvas so tile content
-            // scrolls stay contained and the desktop itself never pans from
-            // the mousewheel. Pan is available via drag or keyboard.
-            .on_scroll_wheel(cx.listener(|_this, _ev: &gpui::ScrollWheelEvent, _w, _cx| {}))
+            // Plane-camera keymap actions (Ctrl-W -/=/0) live on the CANVAS root,
+            // not the per-screen leaf roots — the canvas is the common ancestor
+            // of every tile AND the ONLY thing that renders at Card/Minimap (where
+            // tiles are placeholders with no per-screen `on_action` wiring). Wiring
+            // here is what lets you zoom back IN from Minimap; the focused tile /
+            // placeholder carries the focus handle inside this subtree so the
+            // action always has a handler in its ancestry (spec Behavior 3, C5).
+            .on_action(cx.listener(Self::zoom_out_workspace))
+            .on_action(cx.listener(Self::zoom_in_workspace))
+            .on_action(cx.listener(Self::reset_workspace_view))
+            // Wheel/trackpad routing (Stage C, spec Behavior 5). This handler
+            // fires in the BUBBLE phase, so at Full a scroll a live tile's inner
+            // list already consumed still reaches here — `desktop_scroll` guards
+            // that by testing whether the pointer sits over a tile at Full and
+            // swallowing there (tile content scrolls). At Card/Minimap content
+            // isn't live, so bare wheel pans the plane everywhere; and
+            // `Cmd`/`Ctrl`+scroll steps the zoom at EVERY level (anchored on the
+            // focused tile). Exact scroll FEEL is a NEEDS-RUNTIME gap.
+            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _w, cx| {
+                this.desktop_scroll(ev, cx);
+            }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
                 this.desktop_pointer_move((f32::from(ev.position.x), f32::from(ev.position.y)), cx);
             }))
@@ -180,13 +215,15 @@ impl YaldaGpuiView {
                 }),
             );
 
-        // ── Dot grid over the visible area (slot-pitch corners). ──
+        // ── Dot grid over the visible area (slot-pitch corners). Signed: the
+        // viewport may sit left/above the origin, so the first visible slot is
+        // derived from the (possibly negative) pixel pan via `.floor() as i32`
+        // (NOT a bare `as i32`, which truncates toward zero). ──
         {
-            let pitch = (tile.0 + g, tile.1 + g);
-            let first_col = (pan.0 / pitch.0).floor().max(0.0) as u32;
-            let first_row = (pan.1 / pitch.1).floor().max(0.0) as u32;
-            let ncols = (canvas_w / pitch.0).ceil() as u32 + 1;
-            let nrows = (canvas_h / pitch.1).ceil() as u32 + 1;
+            let first_col = (pan.0 / pitch.0).floor() as i32;
+            let first_row = (pan.1 / pitch.1).floor() as i32;
+            let ncols = (canvas_w / pitch.0).ceil() as i32 + 1;
+            let nrows = (canvas_h / pitch.1).ceil() as i32 + 1;
             let dot = dim.opacity(0.35);
             for r in first_row..first_row + nrows {
                 for c in first_col..first_col + ncols {
@@ -294,6 +331,22 @@ impl YaldaGpuiView {
             let title = Self::desktop_tile_title(&self.sessions, content, cx);
             let mark = self.workspace.marks.mark_for_window(id);
 
+            // ── Semantic-zoom placeholders (Stage C, spec Behavior 3). At
+            // Card/Minimap the tile is a CHEAP placeholder — NO live App content
+            // (no transcript, no doc render), so per-frame cost is O(visible
+            // tiles) and strictly lower than Full (Constraint C2). The focused
+            // tile still carries the focus handle here (C5) so the keyboard
+            // survives; plane-level actions live on the canvas root regardless. ──
+            if zoom != workspace::Detail::Full {
+                let glyph = Self::desktop_status_glyph(&self.sessions, content, cx);
+                let placeholder = self.desktop_placeholder(
+                    zoom, id, x, y, tw, th, is_focused, attach_focus, &title, glyph, mark, accent,
+                    dim, tile_bg, title_bg, content_fg,
+                );
+                canvas = canvas.child(placeholder);
+                continue;
+            }
+
             // The leaf-root CONTRACT (see `screen_root` in render() and the
             // split-child roots in render_layout): the per-kind renderers
             // never set their own root layout — they expect a div that is
@@ -327,6 +380,12 @@ impl YaldaGpuiView {
                 App::Linear(tile) => self.render_linear(leaf_root, tile, cx).into_any_element(),
                 App::Keymap(tile) => self.render_keymap(leaf_root, tile, cx).into_any_element(),
             };
+            // Tag the LIVE content so the layout probe can assert it paints at
+            // Full and is ABSENT at Card/Minimap (the semantic-zoom guard,
+            // `plane_card_zoom_paints_placeholders_not_live_content`). Only the
+            // Full branch reaches here — the Card/Minimap branch above returns
+            // early with no live content built.
+            let inner = probe_bounds_dyn(format!("plane-tile-content-{id}"), inner);
 
             let mut title_bar = div()
                 .flex()
@@ -489,7 +548,7 @@ impl YaldaGpuiView {
     /// around), so changing the grid — or the window — resizes tiles while
     /// slots stay untouched (slots, not pixels, remain the stored unit).
     /// Floors keep tiles usable when the window gets tiny.
-    fn desktop_tile_px(&self) -> (f32, f32) {
+    pub(crate) fn desktop_tile_px(&self) -> (f32, f32) {
         let (_, _, mut w, mut h) = self.desktop_canvas_bounds.get();
         if w <= 0.0 {
             w = self.viewport_width_px.max(1.0);
@@ -525,6 +584,223 @@ impl YaldaGpuiView {
         }
     }
 
+    /// A one-char status glyph for a tile's Card representation (Stage C, spec
+    /// Behavior 3): agent tiles show `●` while a turn is awaiting a reply,
+    /// otherwise `○`; other App kinds use a per-kind static glyph. Takes
+    /// `sessions` directly for the same disjoint-borrow reason as
+    /// [`desktop_tile_title`](Self::desktop_tile_title).
+    fn desktop_status_glyph(sessions: &AgentSessions, content: &App, cx: &GpuiApp) -> &'static str {
+        match content {
+            App::Agent(tile) => {
+                let busy = tile
+                    .bound
+                    .and_then(|id| sessions.get(id))
+                    .map(|s| s.read(cx).state.turn_phase.is_awaiting())
+                    .unwrap_or(false);
+                if busy { "●" } else { "○" }
+            }
+            App::Buffer(BufferApp::Editing(_)) => "✎",
+            App::Buffer(BufferApp::Viewing(_)) => "▢",
+            App::Buffer(BufferApp::Picking(_)) => "◇",
+            App::Linear(_) => "◈",
+            App::Keymap(_) => "⌘",
+        }
+    }
+
+    /// Build the Card / Minimap placeholder for one tile (Stage C, spec
+    /// Behavior 3). CHEAP — no live App content (Constraint C2): a `Card` is a
+    /// compact frame (title/label + status glyph + mark badge) at the tile's
+    /// true slot rect; a `Minimap` pip is a filled rect over the tile's span,
+    /// labelled only when focused. The focused placeholder carries the focus
+    /// handle so the keyboard survives a zoomed-out overview (C5). Tagged
+    /// `plane-card-{id}` for the layout-probe guard.
+    #[allow(clippy::too_many_arguments)]
+    fn desktop_placeholder(
+        &self,
+        zoom: workspace::Detail,
+        id: workspace::WindowId,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        is_focused: bool,
+        attach_focus: bool,
+        title: &str,
+        glyph: &'static str,
+        mark: Option<char>,
+        accent: Hsla,
+        dim: Hsla,
+        tile_bg: Hsla,
+        title_bg: Hsla,
+        content_fg: Hsla,
+    ) -> AnyElement {
+        let mut frame = div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(w))
+            .h(px(h))
+            .overflow_hidden()
+            .border_1()
+            .border_color(if is_focused { accent } else { dim.opacity(0.4) });
+        // The focused placeholder carries the focus handle (C5) — plane-level
+        // actions live on the canvas root, but the handle must exist somewhere
+        // in the tree or the keyboard strands. No per-screen `on_action` wiring
+        // (content isn't live at Card/Minimap).
+        if is_focused && attach_focus {
+            frame = frame.track_focus(&self.focus_handle);
+        }
+
+        let body: AnyElement = match zoom {
+            workspace::Detail::Minimap => {
+                // A pip: a filled rect the size of the tile's span. Label only on
+                // the FOCUSED pip (spec Behavior 3).
+                let mut pip = div()
+                    .size_full()
+                    .rounded_sm()
+                    .bg(if is_focused { accent.opacity(0.55) } else { dim.opacity(0.45) });
+                if is_focused {
+                    pip = pip.child(
+                        div()
+                            .px_1()
+                            .text_size(px(8.0))
+                            .text_color(content_fg)
+                            .child(title.to_string()),
+                    );
+                }
+                pip.into_any_element()
+            }
+            _ => {
+                // Card: title/label + status glyph + mark badge. No live content.
+                let mut header = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .h(px(DESKTOP_TITLE_H))
+                    .px_2()
+                    .flex_none()
+                    .bg(title_bg)
+                    .text_size(px(11.0))
+                    .text_color(if is_focused { accent } else { dim })
+                    .child(div().child(glyph.to_string()))
+                    .child(div().child(title.to_string()));
+                if let Some(m) = mark {
+                    header = header
+                        .child(div().px_1().text_color(accent).child(format!("[{m}]")));
+                }
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .rounded_md()
+                    .bg(tile_bg)
+                    .child(header)
+                    .into_any_element()
+            }
+        };
+        let frame = frame.child(body).into_any_element();
+        probe_bounds_dyn(format!("plane-card-{id}"), frame)
+    }
+
+    /// The slot a semantic-zoom step re-anchors on (Stage C, spec Behavior 3):
+    /// the focused tile's slot, or the viewport-center slot when nothing is
+    /// focused / the focused tile has no slot. `pitch` is the current effective
+    /// per-axis pitch; `pan` is the derived pixel pan.
+    pub(crate) fn desktop_zoom_anchor(
+        &self,
+        tab_idx: usize,
+        focused_id: workspace::WindowId,
+        tile: (f32, f32),
+        g: f32,
+        pan: (f32, f32),
+        canvas_w: f32,
+        canvas_h: f32,
+    ) -> workspace::Slot {
+        let tab = &self.workspace.tabs[tab_idx];
+        if let Some(s) = tab.desktop.slot_of(focused_id) {
+            return s;
+        }
+        // Viewport center in desktop (pre-pan) pixels → slot.
+        let center = (pan.0 + canvas_w / 2.0, pan.1 + canvas_h / 2.0);
+        workspace::slot_at(center, tile, g)
+    }
+
+    /// Wheel/trackpad routing on the desktop canvas (Stage C, spec Behavior 5).
+    /// `Cmd`/`Ctrl`+scroll steps the semantic zoom (anchored on the focused tile,
+    /// or viewport center) at every level. Bare scroll pans the plane — at
+    /// Card/Minimap always (content isn't live); at Full only when the pointer
+    /// is NOT over a live tile (this handler fires in the bubble phase, so a
+    /// scroll a tile's inner list consumed still reaches here — we swallow it
+    /// over a tile so the tile keeps scrolling, and pan over empty canvas). Pan
+    /// is mutated in SLOT units (pixel delta ÷ pitch). Exact feel is
+    /// NEEDS-RUNTIME.
+    pub(crate) fn desktop_scroll(
+        &mut self,
+        ev: &gpui::ScrollWheelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let full_tile = self.desktop_tile_px();
+        let (cx0, cy0, mut cw, mut ch) = self.desktop_canvas_bounds.get();
+        if cw <= 0.0 {
+            cw = self.viewport_width_px.max(1.0);
+        }
+        if ch <= 0.0 {
+            ch = self.viewport_height_px.max(1.0);
+        }
+        let tab_idx = self.workspace.active_tab;
+        let zoom = self.workspace.tabs[tab_idx].desktop.camera.zoom;
+        let scale = workspace::detail_scale(zoom);
+        let tile = (full_tile.0 * scale, full_tile.1 * scale);
+        let g = DESKTOP_GUTTER * scale;
+        let pitch = (tile.0 + g, tile.1 + g);
+        let pan = {
+            let cam = self.workspace.tabs[tab_idx].desktop.camera;
+            (cam.pan.0 * pitch.0, cam.pan.1 * pitch.1)
+        };
+
+        // Pixel delta (line deltas are scaled by a nominal line height).
+        let delta = ev.delta.pixel_delta(px(16.0));
+        let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
+
+        // Zoom: `Cmd`/`Ctrl`+scroll steps Detail (secondary() is Cmd on macOS,
+        // the platform key; also accept raw control for portability).
+        if ev.modifiers.secondary() || ev.modifiers.control {
+            let focused_id = self.workspace.tabs[tab_idx].focused;
+            let anchor = self.desktop_zoom_anchor(tab_idx, focused_id, tile, g, pan, cw, ch);
+            let tab = &mut self.workspace.tabs[tab_idx];
+            if dy > 0.0 {
+                tab.desktop.zoom_in(anchor);
+            } else if dy < 0.0 {
+                tab.desktop.zoom_out(anchor);
+            } else {
+                return;
+            }
+            self.save_workspace_state();
+            cx.notify();
+            return;
+        }
+
+        // Bare scroll at Full over a LIVE tile: swallow so the tile's own inner
+        // scroll wins (empty-canvas scroll pans). At Card/Minimap always pan.
+        if zoom == workspace::Detail::Full {
+            let desktop_pos = (
+                f32::from(ev.position.x) - cx0 + pan.0,
+                f32::from(ev.position.y) - cy0 + pan.1,
+            );
+            let over_slot = workspace::slot_at(desktop_pos, tile, g);
+            if self.workspace.tabs[tab_idx].desktop.occupant(over_slot).is_some() {
+                return;
+            }
+        }
+
+        // Pan in slot units (trackpad "content follows fingers" → subtract).
+        let tab = &mut self.workspace.tabs[tab_idx];
+        tab.desktop.pan_by(-dx / pitch.0, -dy / pitch.1);
+        self.save_workspace_state();
+        cx.notify();
+    }
+
     /// Mouse-down on a tile title bar: focus the tile (spec Behavior 4 —
     /// arming a drag also focuses) and arm a drag. The drag activates only
     /// once the pointer crosses the click threshold in
@@ -544,7 +820,11 @@ impl YaldaGpuiView {
             cx.notify();
             return;
         };
-        let pan = tab.desktop.pan;
+        let pitch = (tile.0 + DESKTOP_GUTTER, tile.1 + DESKTOP_GUTTER);
+        let pan = (
+            tab.desktop.camera.pan.0 * pitch.0,
+            tab.desktop.camera.pan.1 * pitch.1,
+        );
         let desktop_pos = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
         let (ox, oy) = workspace::slot_origin(slot, tile, DESKTOP_GUTTER);
         tab.desktop.drag = Some(workspace::DesktopDrag {
@@ -569,10 +849,15 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
     ) {
         let (cx0, cy0, _, _) = self.desktop_canvas_bounds.get();
+        let tile = self.desktop_tile_px();
         let tab_idx = self.workspace.active_tab;
         let tab = &mut self.workspace.tabs[tab_idx];
         tab.focused = id;
-        let pan = tab.desktop.pan;
+        let pitch = (tile.0 + DESKTOP_GUTTER, tile.1 + DESKTOP_GUTTER);
+        let pan = (
+            tab.desktop.camera.pan.0 * pitch.0,
+            tab.desktop.camera.pan.1 * pitch.1,
+        );
         let desktop_pos = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
         tab.desktop.resize = Some(workspace::DesktopResize {
             id,
@@ -609,11 +894,11 @@ impl YaldaGpuiView {
             // column/row the pointer lands on). Far edge sits at anchor + span.
             workspace::ResizeEdge::West => {
                 let near = workspace::slot_at(r.pointer, tile, g).col;
-                (anchor.col + span.cols).saturating_sub(near).max(1)
+                (anchor.col + span.cols as i32 - near).max(1) as u32
             }
             workspace::ResizeEdge::North => {
                 let near = workspace::slot_at(r.pointer, tile, g).row;
-                (anchor.row + span.rows).saturating_sub(near).max(1)
+                (anchor.row + span.rows as i32 - near).max(1) as u32
             }
         };
         tab.desktop.clamp_resize(r.id, r.edge, desired)
@@ -624,6 +909,7 @@ impl YaldaGpuiView {
     pub(crate) fn desktop_pointer_move(&mut self, window_pos: (f32, f32), cx: &mut Context<Self>) {
         let (cx0, cy0, cw, ch) = self.desktop_canvas_bounds.get();
         let tile = self.desktop_tile_px();
+        let pitch = (tile.0 + DESKTOP_GUTTER, tile.1 + DESKTOP_GUTTER);
         let tab_idx = self.workspace.active_tab;
 
         // A live resize takes precedence over (and is mutually exclusive with)
@@ -631,7 +917,10 @@ impl YaldaGpuiView {
         {
             let tab = &mut self.workspace.tabs[tab_idx];
             if let Some(mut r) = tab.desktop.resize {
-                let pan = tab.desktop.pan;
+                let pan = (
+                    tab.desktop.camera.pan.0 * pitch.0,
+                    tab.desktop.camera.pan.1 * pitch.1,
+                );
                 r.pointer = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
                 tab.desktop.resize = Some(r);
                 cx.notify();
@@ -657,10 +946,15 @@ impl YaldaGpuiView {
             } else if rel.1 > ch - DESKTOP_EDGE_PAN_BAND {
                 pan_delta.1 = DESKTOP_EDGE_PAN_STEP;
             }
-            tab.desktop.pan.0 = (tab.desktop.pan.0 + pan_delta.0).max(0.0);
-            tab.desktop.pan.1 = (tab.desktop.pan.1 + pan_delta.1).max(0.0);
+            // Edge auto-pan is a pixel delta; convert to slot units. Unclamped
+            // — the plane is infinite in all directions (Behavior 5).
+            tab.desktop
+                .pan_by(pan_delta.0 / pitch.0, pan_delta.1 / pitch.1);
         }
-        let pan = tab.desktop.pan;
+        let pan = (
+            tab.desktop.camera.pan.0 * pitch.0,
+            tab.desktop.camera.pan.1 * pitch.1,
+        );
         let desktop_pos = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
 
         if !d.active {
@@ -686,7 +980,6 @@ impl YaldaGpuiView {
     /// Canvas mouse-up: commit the drop (insert-and-shift) or treat as a
     /// click when the threshold was never crossed.
     pub(crate) fn desktop_drop(&mut self, cx: &mut Context<Self>) {
-        let eff_w = self.desktop_grid_cols.max(1);
         let tab_idx = self.workspace.active_tab;
 
         // Commit a live edge resize (spec Behavior 4b) — the clamped anchor +
@@ -710,7 +1003,10 @@ impl YaldaGpuiView {
             && let Some(target) = d.target
             && tab.desktop.slot_of(d.id) != Some(target)
         {
-            tab.desktop.insert_shift(d.id, target, eff_w);
+            // Free placement (Behavior 4): commit iff the whole rectangle lands
+            // on free slots; an overlapping drop is rejected (returns home,
+            // no ripple).
+            tab.desktop.free_drop(d.id, target);
             self.save_workspace_state();
         }
         cx.notify();
@@ -723,281 +1019,6 @@ impl YaldaGpuiView {
         if d.drag.take().is_some() || d.resize.take().is_some() {
             cx.notify();
         }
-    }
-
-    /// Mouse click into a tile focuses it (untitled.md Workspace TODO). No-op
-    /// when `id` is already focused so an ordinary click inside the focused
-    /// tile doesn't thrash persistence. Mirrors the keyboard focus-motion side
-    /// effects (`focus_next`): re-assert the view focus, sync the rail,
-    /// persist, notify.
-    pub(crate) fn focus_window_by_click(
-        &mut self,
-        id: workspace::WindowId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let already = self
-            .workspace
-            .active_tab()
-            .map(|t| t.focused == id)
-            .unwrap_or(false);
-        if already {
-            return;
-        }
-        if let Some(tab) = self.workspace.active_tab_mut() {
-            tab.focused = id;
-        }
-        self.focus_handle.focus(window);
-        self.sync_rail_focus_after_motion();
-        self.save_workspace_state();
-        cx.notify();
-    }
-
-    /// Recursively render a `Layout<App>`. The `root` div is used
-    /// only for the leaf case (so leaves can attach focus + key bindings);
-    /// split branches build their own container.
-    ///
-    /// `attach_focus` is true when no overlay is open — in that case the
-    /// focused leaf attaches `track_focus(&self.focus_handle)` so the focus
-    /// handle sits inside that leaf's key context. When an overlay is open,
-    /// focus belongs on the overlay wrapper and no leaf attaches it.
-    pub(crate) fn render_layout(
-        &mut self,
-        root: gpui::Div,
-        layout: &mut workspace::Layout<App>,
-        focused_id: workspace::WindowId,
-        attach_focus: bool,
-        rail_focusable: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        match layout {
-            workspace::Layout::Empty => div().size_full().into_any_element(),
-            workspace::Layout::Leaf(window) => {
-                let is_focused = window.id == focused_id;
-                let content_ptr: *mut App = &mut window.content as *mut _;
-                // SAFETY: same as in render_focused_window — the leaf's
-                // content sits inside a layout tree we won't structurally
-                // mutate during this render call.
-                let content = unsafe { &mut *content_ptr };
-                let leaf_root = if is_focused && attach_focus {
-                    root.track_focus(&self.focus_handle)
-                } else {
-                    root
-                };
-                let painted: AnyElement = match content {
-                    App::Buffer(BufferApp::Viewing(d)) => {
-                        self.render_doc(leaf_root, d, cx).into_any_element()
-                    }
-                    App::Buffer(BufferApp::Editing(e)) => {
-                        self.render_edit(leaf_root, e, cx).into_any_element()
-                    }
-                    App::Buffer(BufferApp::Picking(b)) => {
-                        self.render_browser(leaf_root, b, cx).into_any_element()
-                    }
-                    App::Agent(tile) => self.render_agent(leaf_root, tile, cx).into_any_element(),
-                    App::Linear(tile) => {
-                        self.render_linear(leaf_root, tile, cx).into_any_element()
-                    }
-                    App::Keymap(tile) => {
-                        self.render_keymap(leaf_root, tile, cx).into_any_element()
-                    }
-                };
-                // Pin the rail to the leaf it was opened from, not whichever
-                // leaf currently has focus. Falls back to the focused leaf
-                // when no pinned_to is set (single-tile case).
-                let is_rail_pinned = self
-                    .workspace
-                    .active_tab()
-                    .and_then(|t| t.rail.as_ref())
-                    .map(|r| r.pinned_to == window.id)
-                    .unwrap_or(false);
-                let with_rail = if is_rail_pinned {
-                    self.wrap_leaf_with_rail(painted, rail_focusable, cx)
-                } else {
-                    painted
-                };
-                // Focus indicator: thick border around the whole tile+rail
-                // group when there's more than one leaf, plus a small "focused"
-                // tag in the upper-right corner.
-                let multi_leaf = self.active_tab_leaf_count() > 1;
-                let mark_ch = self.workspace.marks.mark_for_window(window.id);
-                // Wrap whenever there's more than one leaf (so every tile can
-                // catch a focus click) or this leaf carries a mark badge.
-                if multi_leaf || mark_ch.is_some() {
-                    let accent: Hsla = rgb(STATUS_FG).into();
-                    let mut wrapper = div().size_full().relative();
-                    // Click into an unfocused tile focuses it (untitled.md
-                    // Workspace TODO). Bubble phase, so a click inside an
-                    // editor positions the caret first, then focus follows.
-                    if multi_leaf && !is_focused {
-                        let wid = window.id;
-                        wrapper = wrapper.on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |view, _ev: &MouseDownEvent, w, cx| {
-                                view.focus_window_by_click(wid, w, cx);
-                            }),
-                        );
-                    }
-                    if is_focused && multi_leaf {
-                        wrapper = wrapper.border_2().border_color(accent);
-                    }
-                    wrapper = wrapper.child(with_rail);
-                    if is_focused && multi_leaf {
-                        let tag = div()
-                            .absolute()
-                            .top_1()
-                            .right_1()
-                            .px_1p5()
-                            .py_0p5()
-                            .bg(accent)
-                            .text_color(rgb(BG))
-                            .text_size(px(10.0))
-                            .font_weight(FontWeight::BOLD)
-                            .rounded_sm()
-                            .child("focused");
-                        wrapper = wrapper.child(tag);
-                    }
-                    // Mark badge: small orange label in top-left corner
-                    if let Some(ch) = mark_ch {
-                        let mark_badge = div()
-                            .absolute()
-                            .top_1()
-                            .left_1()
-                            .px_1p5()
-                            .py_0p5()
-                            .bg(gpui::hsla(0.08, 0.9, 0.55, 1.0))
-                            .text_color(gpui::hsla(0.0, 0.0, 0.0, 1.0))
-                            .text_size(px(10.0))
-                            .font_weight(FontWeight::BOLD)
-                            .rounded_sm()
-                            .child(SharedString::from(format!("[{ch}]")));
-                        wrapper = wrapper.child(mark_badge);
-                    }
-                    wrapper.into_any_element()
-                } else {
-                    with_rail
-                }
-            }
-            workspace::Layout::Split { dir, children } => {
-                // Monocle mode: render only the child subtree containing
-                // the focused leaf, giving it the full area.
-                let is_monocle = self
-                    .workspace
-                    .active_tab()
-                    .map(|t| t.layout_mode == workspace::LayoutMode::Monocle)
-                    .unwrap_or(false);
-                if is_monocle {
-                    // Find the child subtree containing the focused leaf.
-                    let focused_idx = children
-                        .iter()
-                        .position(|(_, child)| child.contains_leaf(focused_id))
-                        .unwrap_or(0);
-                    let (_, child) = &mut children[focused_idx];
-                    let child_root = div()
-                        .size_full()
-                        .flex()
-                        .flex_col()
-                        .bg(self.editor_bg())
-                        .text_color(self.editor_fg());
-                    let child_el = self.render_layout(
-                        child_root,
-                        child,
-                        focused_id,
-                        attach_focus,
-                        rail_focusable,
-                        cx,
-                    );
-                    return root.child(child_el).into_any_element();
-                }
-
-                // The `root` div carries `track_focus(&self.focus_handle)`
-                // when no overlay is open, so we must include it in the
-                // tree. Without it the focus handle isn't attached to any
-                // rendered element and global key bindings (e.g. Space →
-                // OpenMenu) have nowhere to dispatch. Wrap the split's
-                // flex container inside `root` rather than discarding it.
-                // Tag view filtering: when active, check which children
-                // have visible leaves and skip the rest.
-                let tag_view = self
-                    .workspace
-                    .active_tab()
-                    .map(|t| &t.tag_view)
-                    .cloned()
-                    .unwrap_or_default();
-                let has_tag_filter = !tag_view.is_empty();
-                let visible_mask: Vec<bool> = if has_tag_filter {
-                    children
-                        .iter()
-                        .map(|(_, child)| {
-                            Self::subtree_has_visible_leaf(
-                                child,
-                                &tag_view,
-                                &self.workspace.file_buffers,
-                            )
-                        })
-                        .collect()
-                } else {
-                    vec![true; children.len()]
-                };
-                // Calculate total visible weight for redistribution.
-                let total_visible_weight: f32 = children
-                    .iter()
-                    .zip(visible_mask.iter())
-                    .filter(|&(_, vis)| *vis)
-                    .map(|((w, _), _)| *w)
-                    .sum();
-
-                let mut container = div().size_full().flex().min_w_0().min_h_0();
-                container = match dir {
-                    workspace::SplitDir::V => container.flex_row(),
-                    workspace::SplitDir::H => container.flex_col(),
-                };
-                let editor_bg = self.editor_bg();
-                let editor_fg = self.editor_fg();
-                for (i, (weight, child)) in children.iter_mut().enumerate() {
-                    if !visible_mask[i] {
-                        continue;
-                    }
-                    let w = if has_tag_filter && total_visible_weight > 0.0 {
-                        *weight / total_visible_weight
-                    } else {
-                        *weight
-                    };
-                    let child_root = div()
-                        .size_full()
-                        .flex()
-                        .flex_col()
-                        .bg(editor_bg)
-                        .text_color(editor_fg);
-                    let child_el = self.render_layout(
-                        child_root,
-                        child,
-                        focused_id,
-                        attach_focus,
-                        rail_focusable,
-                        cx,
-                    );
-                    let mut slot = div().min_w_0().min_h_0().overflow_hidden();
-                    {
-                        let style = slot.style();
-                        style.flex_grow = Some(w);
-                        style.flex_shrink = Some(1.0);
-                        style.flex_basis = Some(gpui::relative(0.0).into());
-                    }
-                    slot = slot.child(child_el);
-                    container = container.child(slot);
-                }
-                root.child(container).into_any_element()
-            }
-        }
-    }
-
-    /// How many leaves does the active tab's layout contain?
-    pub(crate) fn active_tab_leaf_count(&self) -> usize {
-        self.workspace
-            .active_tab()
-            .map(|t| t.layout.leaf_count())
-            .unwrap_or(0)
     }
 
     /// If the workspace has more than one tab, stack a thin horizontal tab

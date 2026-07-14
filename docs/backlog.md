@@ -13,18 +13,23 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
-- **Infinite-plane workspace** — `READY` (2026-07-12). Requirement (verbatim):
-  "each workspace is actually infinite — an unbounded grid of slots in all
-  directions; tiles can span multiple slots; zoom in/out; pan around; reset the
-  view to origin, where all workspaces start." Pinned via interrogation: workspace
-  *is* the plane (not a per-tab mode); multiple planes = multiple workspaces (=
-  the code's `Tab`s); tabs dissolve from the user model; **semantic** (discrete
-  level-of-detail) zoom, not a continuous transform; reset is **camera-only**;
-  new bindings distinct from `Cmd+=` text zoom. Design doc:
-  `docs/specs/spec-infinite-plane-workspace.md` (DRAFT, adversarial-reviewed).
-  Behavioral contract captured as `UXI-Workspace-2..7` in
-  `docs/components/workspace.md` (all `not implemented`). Reuses desktop-mode's
-  tile geometry engine; widens `Slot` to `i32`; adds a `Camera`. Not built.
+- **Infinite-plane workspace** — `NEEDS-RUNTIME` (2026-07-12, on branch
+  `infinite-plane`, uncommitted). "each workspace is actually infinite — an
+  unbounded grid of slots in all directions; tiles can span multiple slots;
+  zoom in/out; pan around; reset the view to origin, where all workspaces start."
+  A workspace is now one infinite signed-coordinate plane with a pan +
+  discrete-semantic-zoom (`Full`/`Card`/`Minimap`) camera + reset-to-origin;
+  the layout-mode / master-stack / split-resize / equalize surface is retired
+  (`SplitH`/`SplitV` remain as the plane's new-tile mechanism). Built in 4 staged
+  subagent passes (engine → persistence → Detail render → surface-retirement +
+  binding reflow). `UXI-Workspace-2..7` all `implemented` + headless-guarded (12
+  new tests, each negative-control-verified RED-then-green); design doc
+  `docs/specs/spec-infinite-plane-workspace.md`. Build clean; full suite green
+  (gpui bin **362 pass**, lib **154 pass**). **Runtime checks pending:** the
+  `Ctrl-W 0/-/=` chord firing (macOS post-leader-digit key gap, rule 4), and the
+  pan/zoom scroll *feel* + Card/Minimap pixels. Follow-ups: rewrite the
+  `workspace.md` Description prose around the plane; the branch is uncommitted on
+  `main`'s worktree — awaiting user go-ahead to commit/merge.
 
 - **Event-log O(n²) append stall FIXED** — `NEEDS-RUNTIME` (2026-07-11, on
   `main` `bf6bbe8`; `docs/worklog/2026-07-11-eventlog-on2-stall.md`). The

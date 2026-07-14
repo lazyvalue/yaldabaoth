@@ -123,16 +123,13 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("ctrl-w j",          "FocusDown",       GLOBAL, "Splits & focus", "Focus tile down"),
     b!("ctrl-w w",          "FocusNext",       GLOBAL, "Splits & focus", "Focus next tile"),
     b!("ctrl-w shift-w",    "FocusPrev",       GLOBAL, "Splits & focus", "Focus previous tile"),
-    b!("ctrl-w <",          "ResizeShrink",    GLOBAL, "Splits & focus", "Shrink tile"),
-    b!("ctrl-w -",          "ResizeShrink",    GLOBAL, "Splits & focus", "Shrink tile"),
-    b!("ctrl-w >",          "ResizeGrow",      GLOBAL, "Splits & focus", "Grow tile"),
-    b!("ctrl-w +",          "ResizeGrow",      GLOBAL, "Splits & focus", "Grow tile"),
-    b!("ctrl-w =",          "Equalize",        GLOBAL, "Splits & focus", "Equalize tiles"),
-    b!("ctrl-w space",      "CycleLayoutMode", GLOBAL, "Layout", "Cycle layout mode"),
-    b!("ctrl-w p",          "DesktopTileSize", GLOBAL, "Layout", "Set desktop tile size"),
-    b!("ctrl-w enter",      "PromoteToMaster", GLOBAL, "Layout", "Promote tile to master"),
-    b!("ctrl-w i",          "IncreaseMasterCount", GLOBAL, "Layout", "Increase master count"),
-    b!("ctrl-w d",          "DecreaseMasterCount", GLOBAL, "Layout", "Decrease master count"),
+    // Plane camera (spec-infinite-plane-workspace.md). `Ctrl-W`+plain-key
+    // SEQUENCES (reliable on macOS; a bare `Ctrl`+digit is not). `Ctrl-W -/=` are
+    // reclaimed from the retired ResizeShrink/Equalize; `Ctrl-W 0` is new.
+    b!("ctrl-w -",          "ZoomOutWorkspace",   GLOBAL, "Plane", "Zoom the plane out"),
+    b!("ctrl-w =",          "ZoomInWorkspace",    GLOBAL, "Plane", "Zoom the plane in"),
+    b!("ctrl-w 0",          "ResetWorkspaceView", GLOBAL, "Plane", "Reset plane view to origin"),
+    b!("ctrl-w p",          "DesktopTileSize", GLOBAL, "Plane", "Set desktop tile size"),
     b!("ctrl-w t",          "TagViewChord",    GLOBAL, "Layout", "Tag: view by tag"),
     b!("ctrl-w ctrl-t",     "TagToggleChord",  GLOBAL, "Layout", "Tag: toggle tag on tile"),
     b!("ctrl-w shift-t",    "ClearTagView",    GLOBAL, "Layout", "Tag: clear tag view"),

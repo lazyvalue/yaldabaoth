@@ -88,11 +88,6 @@ impl<C> Layout<C> {
         }
     }
 
-    /// Does this subtree contain a leaf with the given id?
-    pub fn contains_leaf(&self, id: WindowId) -> bool {
-        self.find_leaf(id).is_some()
-    }
-
     /// Find the leaf with the given id (mutable, recursive).
     pub fn find_leaf_mut(&mut self, id: WindowId) -> Option<&mut Window<C>> {
         match self {
@@ -189,15 +184,6 @@ impl<C> Layout<C> {
         Some(cur)
     }
 
-    /// Count the number of leaves in this subtree.
-    pub fn leaf_count(&self) -> usize {
-        match self {
-            Layout::Empty => 0,
-            Layout::Leaf(_) => 1,
-            Layout::Split { children, .. } => children.iter().map(|(_, c)| c.leaf_count()).sum(),
-        }
-    }
-
     /// Yield the ids of every leaf in tree order.
     pub fn leaf_ids(&self) -> Vec<WindowId> {
         let mut out = Vec::new();
@@ -205,37 +191,6 @@ impl<C> Layout<C> {
         out
     }
 
-    /// Swap the content of two leaves in the tree, identified by their window ids.
-    /// Both ids must exist in this tree. No-op if either is missing.
-    pub fn swap_leaf_contents(&mut self, id_a: WindowId, id_b: WindowId) {
-        // Collect raw pointers to the two windows, then swap their contents.
-        // SAFETY: `id_a != id_b` guarantees the two pointers are non-aliasing.
-        if id_a == id_b {
-            return;
-        }
-        let ptr_a = self.find_leaf_mut(id_a).map(|w| w as *mut Window<C>);
-        let ptr_b = self.find_leaf_mut(id_b).map(|w| w as *mut Window<C>);
-        if let (Some(pa), Some(pb)) = (ptr_a, ptr_b) {
-            // SAFETY: we verified id_a != id_b so these can't alias.
-            unsafe {
-                std::ptr::swap(&mut (*pa).content, &mut (*pb).content);
-            }
-        }
-    }
-
-    /// Extract the tree shape as a [`LayoutSkeleton`] (ids + weights + dirs,
-    /// no content). Used to save the manual tree before switching to an
-    /// automatic layout mode.
-    pub fn skeleton(&self) -> LayoutSkeleton {
-        match self {
-            Layout::Empty => LayoutSkeleton::Empty,
-            Layout::Leaf(w) => LayoutSkeleton::Leaf(w.id),
-            Layout::Split { dir, children } => LayoutSkeleton::Split {
-                dir: *dir,
-                children: children.iter().map(|(w, c)| (*w, c.skeleton())).collect(),
-            },
-        }
-    }
 }
 
 /// Normalize a vector of weights so they sum to 1.0. If the sum is zero or
@@ -424,64 +379,30 @@ impl MarkTable {
 // Automatic layouts (spec-layout-patterns.md Phase 2)
 // ---------------------------------------------------------------------------
 
-/// Layout mode for a tab. `Desktop` (spec-desktop-mode.md) is the default: it
-/// keeps the split tree as the CONTENT owner and takes geometry from the tab's
-/// [`DesktopState`] slot map, never draining/rebuilding the tree. `Manual` is a
-/// user-built split tree; the automatic modes (MasterStack/Monocle/Columns)
-/// compute the tree algorithmically on each structural change.
+/// The interior of a workspace `Tab`. Post-Stage-D there is exactly ONE:
+/// `Plane` — the infinite signed-grid + semantic-zoom camera
+/// (`spec-infinite-plane-workspace.md`). The retired multi-mode surface
+/// (Manual/MasterStack/Monocle/Columns) collapsed into this single value; the
+/// enum is retained only so the persisted `layout_mode` field still has a type
+/// and old snapshots deserialize (any value is force-mapped to `Plane`, and the
+/// field is ignored on load — Behavior 7). The `Layout<C>` tree remains the
+/// CONTENT owner; geometry + camera live in the tab's [`DesktopState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutMode {
-    Manual,
-    MasterStack,
-    Monocle,
-    Columns,
     #[default]
-    Desktop,
+    Plane,
 }
 
-/// Hand-rolled deserialize with an unknown-variant fallback to `Manual`
-/// (spec-desktop-mode.md Behavior 7): the workspace snapshot loader treats a
-/// failed parse as "no snapshot", so a derived deserializer meeting a mode
-/// string from a NEWER binary would discard — and on next save overwrite —
-/// the user's whole arrangement. Falling back degrades one tab's layout mode
-/// instead. Keep in sync with the variant list (a test enforces round-trip).
+/// Deserialize any persisted mode string (`manual`/`master_stack`/`monocle`/
+/// `columns`/`desktop`/anything from a newer binary) to the sole `Plane` value.
+/// Every workspace is a plane now (Behavior 1); the load path ignores this field
+/// regardless (Behavior 7), so this just keeps old snapshots parseable rather
+/// than failing the whole snapshot and overwriting the user's arrangement.
 impl<'de> serde::Deserialize<'de> for LayoutMode {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        Ok(match s.as_str() {
-            "master_stack" => LayoutMode::MasterStack,
-            "monocle" => LayoutMode::Monocle,
-            "columns" => LayoutMode::Columns,
-            "desktop" => LayoutMode::Desktop,
-            // "manual" and any string from the future
-            _ => LayoutMode::Manual,
-        })
-    }
-}
-
-impl LayoutMode {
-    /// Cycle to the next mode:
-    /// Manual → MasterStack → Monocle → Columns → Desktop → Manual.
-    pub fn cycle(self) -> Self {
-        match self {
-            LayoutMode::Manual => LayoutMode::MasterStack,
-            LayoutMode::MasterStack => LayoutMode::Monocle,
-            LayoutMode::Monocle => LayoutMode::Columns,
-            LayoutMode::Columns => LayoutMode::Desktop,
-            LayoutMode::Desktop => LayoutMode::Manual,
-        }
-    }
-
-    /// Short sigil for the status bar (spec-layout-patterns.md Behavior 16).
-    pub fn sigil(&self) -> &'static str {
-        match self {
-            LayoutMode::Manual => "[]=",
-            LayoutMode::MasterStack => "[M]=",
-            LayoutMode::Monocle => "[M]", // caller computes [n/N] dynamically
-            LayoutMode::Columns => "|||",
-            LayoutMode::Desktop => "[#]",
-        }
+        let _ = String::deserialize(d)?;
+        Ok(LayoutMode::Plane)
     }
 }
 
@@ -489,32 +410,119 @@ impl LayoutMode {
 // Desktop mode (spec-desktop-mode.md)
 // ---------------------------------------------------------------------------
 
-/// A cell address on the unbounded desktop grid. Origin top-left; growth is
-/// rightward/downward (no negative coordinates). Ordered row-major — the
-/// derived `(row, col)` lexicographic `Ord` IS the sequence order that
-/// insert-and-shift and `focus_next/prev` operate on.
+/// A cell address on the unbounded, **signed** plane grid
+/// (`spec-infinite-plane-workspace.md`). Origin `(0, 0)`; the plane grows in all
+/// four directions (rows/cols may be negative). Ordered row-major — the derived
+/// `(row, col)` lexicographic `Ord` is the signed reading order that
+/// `focus_next/prev` traverses (placement no longer uses it — the shelf is
+/// retired).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Slot {
-    pub row: u32,
-    pub col: u32,
+    pub row: i32,
+    pub col: i32,
 }
 
 impl Slot {
-    pub fn new(row: u32, col: u32) -> Self {
+    pub fn new(row: i32, col: i32) -> Self {
         Self { row, col }
     }
+}
 
-    /// Row-major successor under the W-wrapped chain (spec Behavior 4):
-    /// `(row, col+1)` while `col + 1 < w`, else `(row+1, 0)`. Slots at
-    /// `col >= w` are OUTSIDE every successor chain by construction — ripples
-    /// never touch them.
-    pub fn succ(self, w: u32) -> Slot {
-        let w = w.max(1);
-        if self.col + 1 < w {
-            Slot::new(self.row, self.col + 1)
-        } else {
-            Slot::new(self.row + 1, 0)
+/// Discrete semantic-zoom level (`spec-infinite-plane-workspace.md` Behavior 3).
+/// Lower = zoomed further out = coarser, cheaper tile representation. Not a
+/// continuous scale: exactly three levels, one representation each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    /// 0 — full live tiles (the default and the reset target).
+    Full,
+    /// −1 — each tile collapses to a card (label/status, no live content).
+    Card,
+    /// −2 — each tile is a span-sized pip (plane shape only).
+    Minimap,
+}
+
+/// Serialize `Detail` as `"full" | "card" | "minimap"` (the persisted camera
+/// zoom, `spec-infinite-plane-workspace.md` D4).
+impl serde::Serialize for Detail {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            Detail::Full => "full",
+            Detail::Card => "card",
+            Detail::Minimap => "minimap",
+        })
+    }
+}
+
+/// Hand-rolled deserialize with an unknown-string fallback to `Full` — the
+/// SAME safety `LayoutMode` uses (workspace.rs, above). The workspace snapshot
+/// loader treats a failed parse as "no snapshot" and overwrites it on the next
+/// save, so a derived deserializer meeting a zoom string from a NEWER binary
+/// would silently reset the whole workspace arrangement. Falling back to `Full`
+/// degrades one plane's camera zoom instead of dropping the snapshot.
+impl<'de> serde::Deserialize<'de> for Detail {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "card" => Detail::Card,
+            "minimap" => Detail::Minimap,
+            // "full" and any string from the future
+            _ => Detail::Full,
+        })
+    }
+}
+
+impl Detail {
+    /// One step out (toward `Minimap`), clamped at the far end.
+    fn out(self) -> Detail {
+        match self {
+            Detail::Full => Detail::Card,
+            Detail::Card => Detail::Minimap,
+            Detail::Minimap => Detail::Minimap,
         }
+    }
+
+    /// One step in (toward `Full`), clamped at the near end.
+    fn inn(self) -> Detail {
+        match self {
+            Detail::Minimap => Detail::Card,
+            Detail::Card => Detail::Full,
+            Detail::Full => Detail::Full,
+        }
+    }
+}
+
+/// The per-plane view state (`spec-infinite-plane-workspace.md` D2). Pure view;
+/// it never moves a tile (Constraint C1). `pan` is the plane point at the
+/// viewport's top-left expressed in **pitch-independent slot units** — a given
+/// `pan` names the same plane location at every `zoom`; the view derives pixels
+/// as `pan · slot_pitch(zoom)` at its boundary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Camera {
+    pub pan: (f32, f32),
+    pub zoom: Detail,
+}
+
+impl Default for Camera {
+    /// The origin: `pan = (0,0)`, `zoom = Full` — where every plane starts and
+    /// what reset-to-origin returns the view to.
+    fn default() -> Self {
+        Self {
+            pan: (0.0, 0.0),
+            zoom: Detail::Full,
+        }
+    }
+}
+
+/// The multiplier applied to the **Full** slot pitch for a Detail level — the
+/// one place the three levels' relative sizes are defined. Pitch itself is
+/// per-axis and viewport-derived (`desktop_tile_px` in `chrome.rs`), so a scalar
+/// pitch is deliberately NOT defined here; the view scales its per-axis Full
+/// pitch by this factor.
+pub fn detail_scale(detail: Detail) -> f32 {
+    match detail {
+        Detail::Full => 1.0,
+        Detail::Card => 0.5,
+        Detail::Minimap => 0.2,
     }
 }
 
@@ -601,9 +609,10 @@ pub struct DesktopState {
     /// Per-tile extent (spec Behavior 4b); absent = 1 × 1. Sparse: only tiles
     /// grown past 1 × 1 appear here, so the common case stays empty.
     pub spans: HashMap<WindowId, Span>,
-    /// Viewport pan over the desktop, in pixels. Transient-but-kept across
-    /// mode switches; not persisted.
-    pub pan: (f32, f32),
+    /// The plane's view state: pan (in slot units) + semantic-zoom Detail
+    /// (`spec-infinite-plane-workspace.md` D2/D3). Replaces the old bare
+    /// `pan: (f32,f32)`; pixels are derived at the view boundary.
+    pub camera: Camera,
     /// Live drag, if any.
     pub drag: Option<DesktopDrag>,
     /// Live edge resize, if any (spec Behavior 4b).
@@ -625,9 +634,9 @@ impl DesktopState {
         self.slots.iter().find_map(|&(id, anchor)| {
             let sp = self.span_of(id);
             let covers = slot.row >= anchor.row
-                && slot.row < anchor.row + sp.rows
+                && slot.row < anchor.row + sp.rows as i32
                 && slot.col >= anchor.col
-                && slot.col < anchor.col + sp.cols;
+                && slot.col < anchor.col + sp.cols as i32;
             covers.then_some(id)
         })
     }
@@ -654,8 +663,8 @@ impl DesktopState {
     /// True if every slot in the rectangle at `anchor` of `span` is free of
     /// any tile other than `exclude`.
     fn rect_free(&self, anchor: Slot, span: Span, exclude: WindowId) -> bool {
-        for dr in 0..span.rows {
-            for dc in 0..span.cols {
+        for dr in 0..span.rows as i32 {
+            for dc in 0..span.cols as i32 {
                 let cell = Slot::new(anchor.row + dr, anchor.col + dc);
                 if matches!(self.occupant(cell), Some(id) if id != exclude) {
                     return false;
@@ -699,14 +708,15 @@ impl DesktopState {
                 };
                 (anchor, span)
             }
-            // Far-edge-fixed: the anchor moves toward the origin. `desired` is
-            // the new total extent along the axis; the target near edge is the
-            // far edge minus that. Shrinking (target nearer the far edge) is
-            // always free; growing extends toward the target while each new
-            // line of cells is free.
+            // Far-edge-fixed: the anchor moves toward (and past) the origin.
+            // `desired` is the new total extent along the axis; the target near
+            // edge is the far edge minus that. On the infinite plane there is
+            // NO `0` wall — the anchor may cross into negative slots; only the
+            // Block rule against other tiles clamps growth. Shrinking (target
+            // nearer the far edge) is always free.
             ResizeEdge::West => {
-                let right = anchor.col + cur.cols;
-                let target_left = right.saturating_sub(desired.min(right));
+                let right = anchor.col + cur.cols as i32; // exclusive far edge
+                let target_left = right - desired as i32;
                 let mut left = anchor.col;
                 if target_left >= anchor.col {
                     left = target_left; // shrink toward the east edge
@@ -714,18 +724,21 @@ impl DesktopState {
                     while left > target_left
                         && self.rect_free(
                             Slot::new(anchor.row, left - 1),
-                            Span::new(cur.rows, right - (left - 1)),
+                            Span::new(cur.rows, (right - (left - 1)) as u32),
                             id,
                         )
                     {
                         left -= 1;
                     }
                 }
-                (Slot::new(anchor.row, left), Span::new(cur.rows, right - left))
+                (
+                    Slot::new(anchor.row, left),
+                    Span::new(cur.rows, (right - left) as u32),
+                )
             }
             ResizeEdge::North => {
-                let bottom = anchor.row + cur.rows;
-                let target_top = bottom.saturating_sub(desired.min(bottom));
+                let bottom = anchor.row + cur.rows as i32; // exclusive far edge
+                let target_top = bottom - desired as i32;
                 let mut top = anchor.row;
                 if target_top >= anchor.row {
                     top = target_top; // shrink toward the south edge
@@ -733,14 +746,17 @@ impl DesktopState {
                     while top > target_top
                         && self.rect_free(
                             Slot::new(top - 1, anchor.col),
-                            Span::new(bottom - (top - 1), cur.cols),
+                            Span::new((bottom - (top - 1)) as u32, cur.cols),
                             id,
                         )
                     {
                         top -= 1;
                     }
                 }
-                (Slot::new(top, anchor.col), Span::new(bottom - top, cur.cols))
+                (
+                    Slot::new(top, anchor.col),
+                    Span::new((bottom - top) as u32, cur.cols),
+                )
             }
         }
     }
@@ -760,33 +776,39 @@ impl DesktopState {
         self.slots.sort_by_key(|&(_, s)| s);
     }
 
-    /// First unoccupied slot in W-wrapped chain order starting at the origin.
-    fn first_free(&self, w: u32) -> Slot {
-        let mut s = Slot::new(0, 0);
-        while self.occupant(s).is_some() {
-            s = s.succ(w);
+    /// The first free slot on an outward ring-spiral from the origin
+    /// (`spec-infinite-plane-workspace.md` Behavior 4): ring radius `r = 0, 1,
+    /// 2, …`; within each ring, rows `-r..=r` × cols `-r..=r` in reading order,
+    /// skipping the already-scanned interior (`|dr| < r && |dc| < r`) and any
+    /// slot inside an existing tile's rectangle (`occupant`). Deterministic;
+    /// independent of camera. Runs once per new tile, never per frame.
+    pub fn seed_slot(&self) -> Slot {
+        let mut r: i32 = 0;
+        loop {
+            for row in -r..=r {
+                for col in -r..=r {
+                    // Interior of this ring was covered by a smaller radius.
+                    if row.abs() < r && col.abs() < r {
+                        continue;
+                    }
+                    let cand = Slot::new(row, col);
+                    if self.occupant(cand).is_none() {
+                        return cand;
+                    }
+                }
+            }
+            r += 1;
         }
-        s
     }
 
-    /// First-entry placement (spec Behavior 1): leaves in tree order, row-
-    /// major at effective width `w`. Replaces any existing map.
-    pub fn seed(&mut self, leaves: &[WindowId], w: u32) {
-        self.slots.clear();
-        let mut s = Slot::new(0, 0);
-        for &id in leaves {
-            self.slots.push((id, s));
-            s = s.succ(w);
-        }
-        // Built in chain order = already sorted.
-    }
-
-    /// Restore the Behavior-2 invariant: drop entries whose window is gone
-    /// (their slot becomes a gap — neighbors never move); give every slotless
-    /// leaf a placement after the focused tile (insert-and-shift), or at the
-    /// first free slot when the focused tile has no slot yet. Returns true
-    /// if anything changed.
-    pub fn reconcile(&mut self, leaves: &[WindowId], focused: WindowId, w: u32) -> bool {
+    /// Restore the plane invariant (non-overlap + one anchor per live leaf):
+    /// drop entries whose window is gone (their slot becomes a gap — neighbors
+    /// never move) and give every slotless leaf a free slot via the origin
+    /// ring-spiral ([`seed_slot`](Self::seed_slot)). Order-free — there is no
+    /// sequence, no insert-and-shift ripple (Behavior 4). Returns true if
+    /// anything changed. Fast path: a leaf that already has a slot is skipped,
+    /// so the spiral runs only for genuinely slotless leaves.
+    pub fn reconcile(&mut self, leaves: &[WindowId]) -> bool {
         let mut changed = false;
         let before = self.slots.len();
         self.slots.retain(|(id, _)| leaves.contains(id));
@@ -798,89 +820,27 @@ impl DesktopState {
 
         for &leaf in leaves {
             if self.slot_of(leaf).is_some() {
-                continue;
+                continue; // already placed — the spiral never runs for it
             }
-            // New leaves are always 1 × 1. Prefer the slot after the focused
-            // tile; if that insertion is wall-rejected (Behavior 4b), fall back
-            // to the first free slot, which is guaranteed to accept.
-            let target = match self.slot_of(focused) {
-                Some(f) => f.succ(w),
-                None => self.first_free(w),
-            };
-            if !self.insert_shift(leaf, target, w) {
-                let free = self.first_free(w);
-                self.insert_shift(leaf, free, w);
-            }
+            let slot = self.seed_slot();
+            self.slots.push((leaf, slot));
+            self.sort();
             changed = true;
         }
         changed
     }
 
-    /// The Behavior-4 drop, rectangle-aware (Behavior 4b). Returns whether
-    /// `id` was placed at `target`.
-    ///
-    /// A 1 × 1 tile inserts via the W-wrapped run, which collects only 1 × 1
-    /// occupants; a multi-slot tile (and a run that never meets a gap) is a
-    /// **wall** — a wall-blocked insertion is REJECTED and `id` stays at its
-    /// original slot. A multi-slot tile is placed only when its whole
-    /// rectangle is free; otherwise rejected. Either outcome preserves the
-    /// non-overlapping-rectangles invariant.
-    pub fn insert_shift(&mut self, id: WindowId, target: Slot, w: u32) -> bool {
-        let orig = self.slot_of(id);
+    /// Free-placement drop (`spec-infinite-plane-workspace.md` Behavior 4):
+    /// move `id`'s whole rectangle to `target` iff every slot it would cover is
+    /// otherwise free. An overlapping drop is **rejected** — `id` stays home,
+    /// no neighbor moves (no ripple). Returns whether the move committed.
+    pub fn free_drop(&mut self, id: WindowId, target: Slot) -> bool {
         let span = self.span_of(id);
-        // Tentatively vacate so `id` never collides with itself.
-        self.slots.retain(|(wid, _)| *wid != id);
-
-        let placed = if span != Span::ONE {
-            // Spanned tile: place only if the whole rectangle is free.
-            if self.rect_free(target, span, id) {
-                self.slots.push((id, target));
-                true
-            } else {
-                false
-            }
-        } else if let Some(run) = self.absorbable_run(target, w) {
-            // Shift the run back-to-front so no two tiles collide mid-flight.
-            for &(occ, from) in run.iter().rev() {
-                if let Some(entry) = self.slots.iter_mut().find(|(wid, _)| *wid == occ) {
-                    entry.1 = from.succ(w);
-                }
-            }
-            self.slots.push((id, target));
-            true
-        } else {
-            false
-        };
-
-        if !placed {
-            if let Some(o) = orig {
-                self.slots.push((id, o)); // drop rejected — restore.
-            }
+        if !self.rect_free(target, span, id) {
+            return false; // overlap — reject, leave every slot unchanged
         }
-        self.sort();
-        placed
-    }
-
-    /// The contiguous 1 × 1 occupied run starting at `target` along the
-    /// W-wrapped chain, IF a gap absorbs it. `None` when the run meets a
-    /// **wall** (a multi-slot tile) before any gap — an unabsorbable
-    /// insertion. Terminates: `succ` strictly increases in row-major order
-    /// and the tiles are finite, so a gap is always reached.
-    fn absorbable_run(&self, target: Slot, w: u32) -> Option<Vec<(WindowId, Slot)>> {
-        let mut run: Vec<(WindowId, Slot)> = Vec::new();
-        let mut s = target;
-        loop {
-            match self.occupant(s) {
-                None => return Some(run), // gap absorbs the ripple
-                Some(occ) => {
-                    if self.span_of(occ) != Span::ONE {
-                        return None; // multi-slot wall
-                    }
-                    run.push((occ, s));
-                    s = s.succ(w);
-                }
-            }
-        }
+        self.set_anchor(id, target);
+        true
     }
 
     /// Spatial focus navigation (spec Behavior 5): nearest occupied slot
@@ -927,20 +887,77 @@ impl DesktopState {
         Some(self.slots[next].0)
     }
 
-    /// Bounding box of occupied slots: `(max_row, max_col)` inclusive, or
-    /// `None` when empty. The pan clamp allows one slot of margin beyond it.
-    pub fn occupied_extent(&self) -> Option<(u32, u32)> {
-        let mut max: Option<(u32, u32)> = None;
+    /// Signed bounding box of occupied slots (`spec-infinite-plane-workspace.md`
+    /// D1): `Some((min, max))` where `min` is the min over anchors and `max`
+    /// the max over each tile's inclusive far corner `anchor + span − 1`;
+    /// `None` when the plane is empty. Both corners are needed now that tiles
+    /// may sit left/above the origin — the old lone `(u32, u32)` max corner
+    /// underflowed on negative anchors and couldn't express a min.
+    pub fn occupied_extent(&self) -> Option<(Slot, Slot)> {
+        let mut bb: Option<(Slot, Slot)> = None;
         for &(id, s) in &self.slots {
             let sp = self.span_of(id);
             // Inclusive far corner of the tile's rectangle.
-            let corner = (s.row + sp.rows - 1, s.col + sp.cols - 1);
-            max = Some(match max {
-                Some((mr, mc)) => (mr.max(corner.0), mc.max(corner.1)),
-                None => corner,
+            let far = Slot::new(s.row + sp.rows as i32 - 1, s.col + sp.cols as i32 - 1);
+            bb = Some(match bb {
+                Some((min, max)) => (
+                    Slot::new(min.row.min(s.row), min.col.min(s.col)),
+                    Slot::new(max.row.max(far.row), max.col.max(far.col)),
+                ),
+                None => (s, far),
             });
         }
-        max
+        bb
+    }
+
+    // ── Camera (spec-infinite-plane-workspace.md Interfaces) ────────────────
+    // Pure view ops over the plane; they mutate ONLY the camera (Constraint C1).
+
+    /// Pan the viewport by `(dx, dy)` **slot units**, unclamped — the plane is
+    /// infinite in all directions (Behavior 5); the viewport may travel into
+    /// empty space.
+    pub fn pan_by(&mut self, dx: f32, dy: f32) {
+        self.camera.pan.0 += dx;
+        self.camera.pan.1 += dy;
+    }
+
+    /// Step the semantic zoom one level out (`Full → Card → Minimap`), clamped
+    /// at `Minimap`, re-anchoring `pan` so the anchor slot stays under the same
+    /// viewport point (Behavior 3). `anchor` is the focused tile's slot, or the
+    /// viewport-center slot when nothing is focused.
+    pub fn zoom_out(&mut self, anchor: Slot) {
+        self.rezoom(self.camera.zoom.out(), anchor);
+    }
+
+    /// Step the semantic zoom one level in (`Minimap → Card → Full`), clamped
+    /// at `Full`, re-anchoring on `anchor` (Behavior 3).
+    pub fn zoom_in(&mut self, anchor: Slot) {
+        self.rezoom(self.camera.zoom.inn(), anchor);
+    }
+
+    /// Apply a new Detail level, re-anchoring `pan` per-axis so `anchor` stays
+    /// under the same viewport point. Because `pan` is in pitch-independent
+    /// slot units, the re-anchor keeps `(anchor − pan)` constant *in pixels*:
+    /// `(anchor − pan_new)·scale_new = (anchor − pan_old)·scale_old`, i.e.
+    /// `pan_new = anchor − (anchor − pan_old)·scale_old/scale_new`. A no-op
+    /// (already at the clamp) leaves the camera untouched.
+    fn rezoom(&mut self, next: Detail, anchor: Slot) {
+        if next == self.camera.zoom {
+            return;
+        }
+        let old = detail_scale(self.camera.zoom);
+        let new = detail_scale(next);
+        let ratio = old / new;
+        let (ax, ay) = (anchor.col as f32, anchor.row as f32);
+        let (px, py) = self.camera.pan;
+        self.camera.pan = (ax - (ax - px) * ratio, ay - (ay - py) * ratio);
+        self.camera.zoom = next;
+    }
+
+    /// Reset-to-origin (Behavior 6): `pan = (0,0)`, `zoom = Full`. View-only —
+    /// no tile moves or is re-seeded.
+    pub fn reset_view(&mut self) {
+        self.camera = Camera::default();
     }
 }
 
@@ -974,32 +991,14 @@ pub fn tile_rect(slot: Slot, span: Span, tile: (f32, f32), gutter: f32) -> (f32,
     (x, y, w, h)
 }
 
-/// The slot whose cell contains (or is nearest to) a desktop-coordinate
-/// point. Clamps to the non-negative grid.
+/// The slot whose cell contains a desktop-coordinate point. Signed: a point
+/// left/above the origin maps to a negative col/row. `.floor()` (NOT a bare
+/// `as i32`, which truncates toward zero) gives the correct cell for negatives.
 pub fn slot_at(point: (f32, f32), tile: (f32, f32), gutter: f32) -> Slot {
     let cell = (tile.0 + gutter, tile.1 + gutter);
-    let col = ((point.0 - gutter) / cell.0).floor().max(0.0) as u32;
-    let row = ((point.1 - gutter) / cell.1).floor().max(0.0) as u32;
+    let col = ((point.0 - gutter) / cell.0).floor() as i32;
+    let row = ((point.1 - gutter) / cell.1).floor() as i32;
     Slot::new(row, col)
-}
-
-/// Drop-time effective width W (spec Overview): tile columns that fit the
-/// viewport, minimum 1. Stored slots are never re-derived from it.
-pub fn effective_width(viewport_w: f32, tile_w: f32, gutter: f32) -> u32 {
-    (((viewport_w - gutter) / (tile_w + gutter)).floor() as i64).max(1) as u32
-}
-
-/// A skeleton of a layout tree — just the shape (window ids, weights, split
-/// dirs) without the actual content. Used to save the manual tree when
-/// switching to an automatic mode, so it can be restored later.
-#[derive(Debug, Clone)]
-pub enum LayoutSkeleton {
-    Empty,
-    Leaf(WindowId),
-    Split {
-        dir: SplitDir,
-        children: Vec<(f32, LayoutSkeleton)>,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,14 +1035,13 @@ pub struct Tab<C> {
     /// [`Workspace::set_active_tab`]. `false` for every real workspace.
     pub ephemeral: bool,
     // --- Layout patterns (spec-layout-patterns.md) ---
-    /// Current layout algorithm. `Desktop` is the default (free tile placement).
+    /// The tab interior. Always [`LayoutMode::Plane`] (infinite-plane, Stage D);
+    /// persisted for snapshot-format stability but ignored on load (Behavior 7).
     pub layout_mode: LayoutMode,
-    /// Saved manual tree shape. When switching from Manual to an automatic
-    /// mode, the manual tree's skeleton is saved here so it can be restored.
-    pub saved_manual_layout: Option<LayoutSkeleton>,
-    /// MasterStack: fraction of tab width allocated to the master region.
+    /// Inert persisted fields from the retired MasterStack mode. No longer read
+    /// by any layout logic (the plane never re-tiles); kept only so the on-disk
+    /// snapshot shape (`PersistedTab`) stays stable and old snapshots round-trip.
     pub master_ratio: f32,
-    /// MasterStack: number of windows in the master region.
     pub master_count: usize,
     /// Tag-view filter. When non-empty, the tab shows only windows whose
     /// buffer carries at least one tag in this set. Empty = show all.
@@ -1103,7 +1101,6 @@ impl<C> Tab<C> {
             rail: None,
             ephemeral: false,
             layout_mode: LayoutMode::default(),
-            saved_manual_layout: None,
             master_ratio: 0.6,
             master_count: 1,
             tag_view: BTreeSet::new(),
@@ -1777,92 +1774,23 @@ impl<C> Workspace<C> {
         Ok(())
     }
 
-    /// Shift weight between the focused leaf and its immediate next sibling
-    /// inside the parent `Split`. `delta` is added to the focused leaf's
-    /// weight and subtracted from the sibling's; both clamp to a 5%/95%
-    /// floor/ceiling per slot. No-op if the focused leaf has no sibling in
-    /// the requested direction.
-    pub fn resize_focused(&mut self, delta: f32) -> Result<(), ()> {
-        let tab = self.active_tab_mut().ok_or(())?;
-        let focused = tab.focused;
-        let path = tab.layout.path_to(focused).ok_or(())?;
-        if path.is_empty() {
-            return Ok(()); // No parent to resize against.
-        }
-        let (parent_path, tail) = path.split_at(path.len() - 1);
-        let leaf_idx = tail[0];
-        let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
-        let Layout::Split { children, .. } = parent else {
-            return Err(());
-        };
-        let sibling_idx = if leaf_idx + 1 < children.len() {
-            leaf_idx + 1
-        } else if leaf_idx > 0 {
-            leaf_idx - 1
-        } else {
-            return Ok(());
-        };
-        let (a, b) = if leaf_idx < sibling_idx {
-            (leaf_idx, sibling_idx)
-        } else {
-            (sibling_idx, leaf_idx)
-        };
-        // Borrow split: take both weights.
-        let (left, right) = children.split_at_mut(b);
-        let leaf_w = &mut left[a].0;
-        let sib_w = &mut right[0].0;
-        let signed_delta = if leaf_idx < sibling_idx {
-            delta
-        } else {
-            -delta
-        };
-        let new_leaf = (*leaf_w + signed_delta).clamp(0.05, 0.95);
-        let new_sib = (*sib_w - signed_delta).clamp(0.05, 0.95);
-        *leaf_w = new_leaf;
-        *sib_w = new_sib;
-        renormalize(children);
-        Ok(())
-    }
-
-    /// Cycle focus to the next leaf in tree order (depth-first, in
-    /// `children` order). Wraps from the last leaf to the first. No-op if
-    /// the active tab has fewer than 2 leaves.
+    /// Cycle focus to the next tile in the plane's row-major slot order
+    /// (spec-infinite-plane-workspace.md Behavior 5). No-op if the active tab
+    /// has fewer than 2 tiles.
     pub fn focus_next(&mut self) -> Result<(), ()> {
         let tab = self.active_tab_mut().ok_or(())?;
-        // Desktop mode: the sequence is the row-major slot order, not tree
-        // order (spec-desktop-mode.md Behavior 5).
-        if tab.layout_mode == LayoutMode::Desktop {
-            if let Some(next) = tab.desktop.sequence_neighbor(tab.focused, true) {
-                tab.focused = next;
-            }
-            return Ok(());
+        if let Some(next) = tab.desktop.sequence_neighbor(tab.focused, true) {
+            tab.focused = next;
         }
-        let ids = tab.layout.leaf_ids();
-        if ids.len() < 2 {
-            return Ok(());
-        }
-        let pos = ids.iter().position(|&id| id == tab.focused).ok_or(())?;
-        let next = (pos + 1) % ids.len();
-        tab.focused = ids[next];
         Ok(())
     }
 
-    /// Cycle focus to the previous leaf in tree order.
+    /// Cycle focus to the previous tile in the plane's row-major slot order.
     pub fn focus_prev(&mut self) -> Result<(), ()> {
         let tab = self.active_tab_mut().ok_or(())?;
-        if tab.layout_mode == LayoutMode::Desktop {
-            if let Some(prev) = tab.desktop.sequence_neighbor(tab.focused, false) {
-                tab.focused = prev;
-            }
-            return Ok(());
+        if let Some(prev) = tab.desktop.sequence_neighbor(tab.focused, false) {
+            tab.focused = prev;
         }
-        let ids = tab.layout.leaf_ids();
-        if ids.len() < 2 {
-            return Ok(());
-        }
-        let pos = ids.iter().position(|&id| id == tab.focused).ok_or(())?;
-        let prev = if pos == 0 { ids.len() - 1 } else { pos - 1 };
-        tab.focused = ids[prev];
         Ok(())
     }
 
@@ -1882,83 +1810,16 @@ impl<C> Workspace<C> {
     /// No-op when there's no sibling in the requested direction.
     pub fn focus_motion(&mut self, dir: FocusDir) -> Result<(), ()> {
         let tab = self.active_tab_mut().ok_or(())?;
-        // Desktop mode: spatial navigation over slots, not tree topology
-        // (spec-desktop-mode.md Behavior 5). No candidate = no-op.
-        if tab.layout_mode == LayoutMode::Desktop {
-            let sdir = match dir {
-                FocusDir::Left => SpatialDir::Left,
-                FocusDir::Right => SpatialDir::Right,
-                FocusDir::Up => SpatialDir::Up,
-                FocusDir::Down => SpatialDir::Down,
-            };
-            if let Some(next) = tab.desktop.spatial_neighbor(tab.focused, sdir) {
-                tab.focused = next;
-            }
-            return Ok(());
-        }
-        let focused = tab.focused;
-        let path = tab.layout.path_to(focused).ok_or(())?;
-        if path.is_empty() {
-            return Ok(());
-        }
-        let want_dir = match dir {
-            FocusDir::Left | FocusDir::Right => SplitDir::V,
-            FocusDir::Up | FocusDir::Down => SplitDir::H,
+        // Spatial navigation over plane slots (spec-infinite-plane-workspace.md
+        // Behavior 5). No candidate = no-op.
+        let sdir = match dir {
+            FocusDir::Left => SpatialDir::Left,
+            FocusDir::Right => SpatialDir::Right,
+            FocusDir::Up => SpatialDir::Up,
+            FocusDir::Down => SpatialDir::Down,
         };
-        let delta: isize = match dir {
-            FocusDir::Right | FocusDir::Down => 1,
-            FocusDir::Left | FocusDir::Up => -1,
-        };
-
-        // Walk path back-to-front looking for the nearest matching-direction
-        // ancestor that has a sibling in the requested direction.
-        for depth in (0..path.len()).rev() {
-            let parent_path = &path[..depth];
-            let child_idx = path[depth];
-            let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
-            let Layout::Split {
-                dir: parent_dir,
-                children,
-            } = parent
-            else {
-                continue;
-            };
-            if *parent_dir != want_dir {
-                continue;
-            }
-            let target_idx = (child_idx as isize) + delta;
-            if target_idx < 0 || target_idx as usize >= children.len() {
-                continue; // No sibling in this direction at this depth.
-            }
-            // Descend into the target sibling's first leaf (or itself if leaf).
-            let target_layout = &children[target_idx as usize].1;
-            if let Some(&first_leaf_id) = target_layout.leaf_ids().first() {
-                tab.focused = first_leaf_id;
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
-
-    /// Equalize all weights in the focused window's parent split. No-op if
-    /// the focused leaf is the tab's root.
-    pub fn equalize_focused(&mut self) -> Result<(), ()> {
-        let tab = self.active_tab_mut().ok_or(())?;
-        let focused = tab.focused;
-        let path = tab.layout.path_to(focused).ok_or(())?;
-        if path.is_empty() {
-            return Ok(());
-        }
-        let (parent_path, _) = path.split_at(path.len() - 1);
-        let parent = tab.layout.node_at_path_mut(parent_path).ok_or(())?;
-        if let Layout::Split { children, .. } = parent {
-            let n = children.len();
-            if n > 0 {
-                let even = 1.0 / n as f32;
-                for (w, _) in children.iter_mut() {
-                    *w = even;
-                }
-            }
+        if let Some(next) = tab.desktop.spatial_neighbor(tab.focused, sdir) {
+            tab.focused = next;
         }
         Ok(())
     }
@@ -1983,87 +1844,12 @@ impl<C> Workspace<C> {
         out
     }
 
-    // --- Layout patterns: automatic layouts (Phase 2) ----------------------
-
-    /// Re-tile the active tab's layout according to its current `layout_mode`.
-    /// No-op in Manual mode. Called after split/close/mode-switch.
-    pub fn retile_active(&mut self) {
-        let tab = match self.active_tab_mut() {
-            Some(t) => t,
-            None => return,
-        };
-        // Manual: the user's hand-built tree IS the layout. Desktop: the tree
-        // is the content owner only — geometry lives in `tab.desktop`
-        // (spec-desktop-mode.md); draining/rebuilding here would destroy the
-        // tree the next Manual restore appends leftovers to. Neither retiles.
-        if matches!(tab.layout_mode, LayoutMode::Manual | LayoutMode::Desktop) {
-            return;
-        }
-        let focused = tab.focused;
-        let windows = drain_leaves(&mut tab.layout);
-        if windows.is_empty() {
-            return;
-        }
-        let has_focused = windows.iter().any(|w| w.id == focused);
-
-        tab.layout = match tab.layout_mode {
-            LayoutMode::Manual | LayoutMode::Desktop => unreachable!(),
-            LayoutMode::MasterStack => {
-                build_master_stack(windows, tab.master_count, tab.master_ratio)
-            }
-            LayoutMode::Monocle => build_monocle(windows),
-            LayoutMode::Columns => build_columns(windows),
-        };
-
-        if has_focused {
-            tab.focused = focused;
-        } else if let Some(&first) = tab.layout.leaf_ids().first() {
-            tab.focused = first;
-        }
-    }
-
-    /// Switch the active tab's layout mode. Saves/restores the manual tree
-    /// as needed.
-    pub fn set_layout_mode(&mut self, new_mode: LayoutMode) {
-        let tab = match self.active_tab_mut() {
-            Some(t) => t,
-            None => return,
-        };
-        let old_mode = tab.layout_mode;
-        if old_mode == new_mode {
-            return;
-        }
-
-        // Save manual tree skeleton when leaving Manual mode.
-        if old_mode == LayoutMode::Manual && new_mode != LayoutMode::Manual {
-            tab.saved_manual_layout = Some(tab.layout.skeleton());
-        }
-
-        tab.layout_mode = new_mode;
-
-        // Restore manual tree when returning to Manual mode.
-        if new_mode == LayoutMode::Manual {
-            if let Some(skeleton) = tab.saved_manual_layout.take() {
-                let mut current_windows = drain_leaves(&mut tab.layout);
-                tab.layout = restore_from_skeleton(skeleton, &mut current_windows);
-                // Append any windows created during auto mode that don't
-                // exist in the saved skeleton as new leaves.
-                for leftover in current_windows {
-                    let root = std::mem::take(&mut tab.layout);
-                    tab.layout = match root {
-                        Layout::Empty => Layout::Leaf(leftover),
-                        _ => Layout::Split {
-                            dir: SplitDir::V,
-                            children: vec![(0.9, root), (0.1, Layout::Leaf(leftover))],
-                        },
-                    };
-                }
-            }
-            return;
-        }
-
-        self.retile_active();
-    }
+    /// Retained no-op (infinite-plane, Stage D). The plane's `Layout<C>` tree is
+    /// the CONTENT owner only; geometry lives in `tab.desktop` and never rebuilds
+    /// the tree, so there is nothing to re-tile. Kept as a stable seam so the
+    /// (many) callers that punctuated a structural mutation with a "settle the
+    /// layout" call don't each need editing; on a plane it does nothing.
+    pub fn retile_active(&mut self) {}
 }
 
 impl<C> Default for Workspace<C> {
@@ -2078,228 +1864,78 @@ pub fn auto_tab_name(idx: usize) -> String {
     format!("workspace-{idx}")
 }
 
-// ---------------------------------------------------------------------------
-// Layout algorithms (spec-layout-patterns.md Phase 2)
-// ---------------------------------------------------------------------------
-
-/// Recursively extract all leaf windows from a layout tree, leaving `Empty`.
-pub fn drain_leaves<C>(layout: &mut Layout<C>) -> Vec<Window<C>> {
-    let mut out = Vec::new();
-    drain_leaves_inner(layout, &mut out);
-    out
-}
-
-fn drain_leaves_inner<C>(layout: &mut Layout<C>, out: &mut Vec<Window<C>>) {
-    let taken = std::mem::take(layout);
-    match taken {
-        Layout::Empty => {}
-        Layout::Leaf(w) => out.push(w),
-        Layout::Split { children, .. } => {
-            for (_, mut child) in children {
-                drain_leaves_inner(&mut child, out);
-            }
-        }
-    }
-}
-
-/// Build a MasterStack layout: master region on the left, stack on the right.
-/// `master_count` windows go in the left column (stacked vertically if >1),
-/// remaining windows go in the right column (stacked vertically).
-pub fn build_master_stack<C>(
-    mut windows: Vec<Window<C>>,
-    master_count: usize,
-    master_ratio: f32,
-) -> Layout<C> {
-    if windows.is_empty() {
-        return Layout::Empty;
-    }
-    if windows.len() == 1 {
-        return Layout::Leaf(windows.remove(0));
-    }
-    let mc = master_count.min(windows.len());
-    let stack_windows: Vec<Window<C>> = windows.split_off(mc);
-    let master_windows = windows;
-
-    let master_layout = stack_vertical(master_windows);
-
-    if stack_windows.is_empty() {
-        return master_layout;
-    }
-
-    let stack_layout = stack_vertical(stack_windows);
-
-    Layout::Split {
-        dir: SplitDir::V,
-        children: vec![
-            (master_ratio, master_layout),
-            (1.0 - master_ratio, stack_layout),
-        ],
-    }
-}
-
-/// Build a Monocle layout: flat split of all windows. Only the focused one
-/// is rendered (handled by the render path).
-pub fn build_monocle<C>(windows: Vec<Window<C>>) -> Layout<C> {
-    stack_vertical(windows)
-}
-
-/// Build a Columns layout: equal-width vertical columns, full height each.
-pub fn build_columns<C>(windows: Vec<Window<C>>) -> Layout<C> {
-    if windows.is_empty() {
-        return Layout::Empty;
-    }
-    if windows.len() == 1 {
-        return Layout::Leaf(windows.into_iter().next().unwrap());
-    }
-    let n = windows.len() as f32;
-    Layout::Split {
-        dir: SplitDir::V,
-        children: windows
-            .into_iter()
-            .map(|w| (1.0 / n, Layout::Leaf(w)))
-            .collect(),
-    }
-}
-
-/// Helper: stack windows vertically (H-split) with equal heights.
-fn stack_vertical<C>(windows: Vec<Window<C>>) -> Layout<C> {
-    if windows.is_empty() {
-        return Layout::Empty;
-    }
-    if windows.len() == 1 {
-        return Layout::Leaf(windows.into_iter().next().unwrap());
-    }
-    let n = windows.len() as f32;
-    Layout::Split {
-        dir: SplitDir::H,
-        children: windows
-            .into_iter()
-            .map(|w| (1.0 / n, Layout::Leaf(w)))
-            .collect(),
-    }
-}
-
-/// Reconstruct a layout from a saved [`LayoutSkeleton`] by matching window ids.
-/// Windows matched by id are placed in their saved positions; unmatched slots
-/// become `Empty`. Consumed windows are removed from `pool` so the caller can
-/// detect leftovers (windows created after the skeleton was saved).
-fn restore_from_skeleton<C>(skeleton: LayoutSkeleton, pool: &mut Vec<Window<C>>) -> Layout<C> {
-    match skeleton {
-        LayoutSkeleton::Empty => Layout::Empty,
-        LayoutSkeleton::Leaf(id) => {
-            if let Some(pos) = pool.iter().position(|w| w.id == id) {
-                Layout::Leaf(pool.remove(pos))
-            } else {
-                Layout::Empty
-            }
-        }
-        LayoutSkeleton::Split { dir, children } => {
-            let mut rebuilt: Vec<(f32, Layout<C>)> = children
-                .into_iter()
-                .map(|(w, skel)| (w, restore_from_skeleton(skel, pool)))
-                .filter(|(_, layout)| !matches!(layout, Layout::Empty))
-                .collect();
-            match rebuilt.len() {
-                0 => Layout::Empty,
-                1 => rebuilt.remove(0).1,
-                _ => {
-                    renormalize(&mut rebuilt);
-                    Layout::Split {
-                        dir,
-                        children: rebuilt,
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod desktop_tests {
     use super::*;
 
-    fn slots_of(d: &DesktopState) -> Vec<(WindowId, (u32, u32))> {
-        d.slots
-            .iter()
-            .map(|&(id, s)| (id, (s.row, s.col)))
-            .collect()
+    /// Place `id` at an explicit slot (test scaffold; the shelf `seed` is
+    /// retired — planes place via `reconcile`/`seed_slot`/`free_drop`).
+    fn put(d: &mut DesktopState, id: WindowId, row: i32, col: i32) {
+        d.slots.retain(|(w, _)| *w != id);
+        d.slots.push((id, Slot::new(row, col)));
+        d.sort();
     }
 
+    /// Free placement (Behavior 4): seed the plane, then drop a tile onto a
+    /// free slot — it moves and leaves a gap; no neighbor shifts.
     #[test]
     fn seed_fills_row_major_at_width() {
+        // (Kept name for continuity; now asserts ring-spiral seeding from
+        // empty via reconcile — origin-first, deterministic.)
         let mut d = DesktopState::default();
-        d.seed(&[1, 2, 3, 4, 5], 3);
-        assert_eq!(
-            slots_of(&d),
-            vec![
-                (1, (0, 0)),
-                (2, (0, 1)),
-                (3, (0, 2)),
-                (4, (1, 0)),
-                (5, (1, 1)),
-            ]
-        );
+        assert!(d.reconcile(&[1, 2, 3, 4, 5]));
+        // Spiral order from origin: (0,0) then ring 1 in reading order.
+        assert_eq!(d.slot_of(1), Some(Slot::new(0, 0)));
+        assert_eq!(d.slot_of(2), Some(Slot::new(-1, -1)));
+        assert_eq!(d.slot_of(3), Some(Slot::new(-1, 0)));
+        assert_eq!(d.slot_of(4), Some(Slot::new(-1, 1)));
+        assert_eq!(d.slot_of(5), Some(Slot::new(0, -1)));
     }
 
+    /// A drop onto a free slot is a plain move leaving a gap (Behavior 4).
     #[test]
-    fn drop_on_empty_slot_is_plain_move_leaving_gap() {
+    fn drop_on_occupied_slot_ripples_run_until_gap() {
+        // (Kept name; NEW behavior — a drop onto a FREE slot moves cleanly and
+        // leaves the old slot a gap; nothing ripples.)
         let mut d = DesktopState::default();
-        d.seed(&[1, 2, 3], 3);
-        d.insert_shift(1, Slot::new(2, 2), 3);
+        put(&mut d, 1, 0, 0);
+        put(&mut d, 2, 0, 1);
+        put(&mut d, 3, 0, 2);
+        assert!(d.free_drop(1, Slot::new(2, 2)));
         assert_eq!(d.slot_of(1), Some(Slot::new(2, 2)));
-        assert_eq!(d.slot_of(2), Some(Slot::new(0, 1)));
-        assert_eq!(d.slot_of(3), Some(Slot::new(0, 2)));
+        assert_eq!(d.slot_of(2), Some(Slot::new(0, 1)), "neighbor unmoved");
+        assert_eq!(d.slot_of(3), Some(Slot::new(0, 2)), "neighbor unmoved");
         assert_eq!(d.occupant(Slot::new(0, 0)), None, "old slot becomes a gap");
     }
 
-    #[test]
-    fn drop_on_occupied_slot_ripples_run_until_gap() {
-        let mut d = DesktopState::default();
-        d.seed(&[1, 2, 3, 4], 3); // (0,0) (0,1) (0,2) (1,0)
-        // Drop 4 onto 2's slot (0,1). 4's own (1,0) is vacated FIRST, so the
-        // run is [2 @ (0,1), 3 @ (0,2)] and 3's wrap target (1,0) is the gap
-        // that absorbs the ripple.
-        d.insert_shift(4, Slot::new(0, 1), 3);
-        assert_eq!(d.slot_of(4), Some(Slot::new(0, 1)));
-        assert_eq!(d.slot_of(2), Some(Slot::new(0, 2)));
-        assert_eq!(d.slot_of(3), Some(Slot::new(1, 0)));
-        assert_eq!(
-            d.slot_of(1),
-            Some(Slot::new(0, 0)),
-            "tile before the run never moves"
-        );
-    }
-
+    /// An overlapping drop is rejected — the tile stays home, no neighbor
+    /// moves (Behavior 4: free placement, no ripple).
     #[test]
     fn ripple_wraps_rows_at_effective_width() {
+        // (Kept name; NEW behavior — a drop onto an OCCUPIED slot is rejected.)
         let mut d = DesktopState::default();
-        d.seed(&[1, 2], 2); // (0,0), (0,1)
-        // Drop 2 onto (0,0): run = [1 @ (0,0)] → 1 shifts to (0,1) (2's gap).
-        d.insert_shift(2, Slot::new(0, 0), 2);
-        assert_eq!(d.slot_of(2), Some(Slot::new(0, 0)));
-        assert_eq!(d.slot_of(1), Some(Slot::new(0, 1)));
-        // Drop 2 onto (0,1): run = [1 @ (0,1)] → 1 wraps to (1,0).
-        d.insert_shift(2, Slot::new(0, 1), 2);
-        assert_eq!(d.slot_of(2), Some(Slot::new(0, 1)));
-        assert_eq!(d.slot_of(1), Some(Slot::new(1, 0)));
+        put(&mut d, 1, 0, 0);
+        put(&mut d, 2, 0, 1);
+        assert!(!d.free_drop(2, Slot::new(0, 0)), "overlap rejected");
+        assert_eq!(d.slot_of(2), Some(Slot::new(0, 1)), "2 stays home");
+        assert_eq!(d.slot_of(1), Some(Slot::new(0, 0)), "1 never moves");
     }
 
-    /// Spec Behavior 4: tiles at `col >= W` sit outside every successor
-    /// chain — ripples never touch them.
+    /// Closing a tile leaves a gap; reconcile drops it and never moves a
+    /// neighbor (Behavior 4).
     #[test]
     fn tiles_beyond_effective_width_never_ripple() {
+        // (Kept name; NEW behavior — closing a tile leaves a gap, no ripple.)
         let mut d = DesktopState::default();
-        d.seed(&[1, 2, 3], 5); // seeded wide: cols 0, 1, 2
-        // Window narrowed to W = 2; tile 3 at (0,2) is beyond W.
-        d.insert_shift(2, Slot::new(0, 0), 2);
-        // Run at (0,0) = [1]; succ((0,0), 2) = (0,1), 2's vacated gap.
-        assert_eq!(d.slot_of(2), Some(Slot::new(0, 0)));
-        assert_eq!(d.slot_of(1), Some(Slot::new(0, 1)));
-        assert_eq!(
-            d.slot_of(3),
-            Some(Slot::new(0, 2)),
-            "beyond-W tile untouched"
-        );
+        put(&mut d, 1, 0, 0);
+        put(&mut d, 2, 0, 1);
+        put(&mut d, 3, 0, 2);
+        // Tile 2 closes; 1 and 3 keep their exact slots (gap at (0,1)).
+        assert!(d.reconcile(&[1, 3]));
+        assert_eq!(d.slot_of(2), None);
+        assert_eq!(d.slot_of(1), Some(Slot::new(0, 0)), "unmoved");
+        assert_eq!(d.slot_of(3), Some(Slot::new(0, 2)), "unmoved");
+        assert_eq!(d.occupant(Slot::new(0, 1)), None, "gap, not backfilled");
     }
 
     // ── Tile span / edge resize (spec Behavior 4b) ──────────────────────
@@ -2319,11 +1955,12 @@ mod desktop_tests {
     #[test]
     fn resize_east_grows_into_free_desktop_and_clamps_at_neighbor() {
         let mut d = DesktopState::default();
-        d.seed(&[1, 2], 5); // 1@(0,0), 2@(0,1)
+        put(&mut d, 1, 0, 0);
+        put(&mut d, 2, 0, 1);
         // Tile 1 wants to grow east a lot, but tile 2 sits at (0,1).
         assert_eq!(d.clamp_resize(1, ResizeEdge::East, 4).1, Span::new(1, 1));
         // Move 2 out of the way; now 1 can grow east up to the requested cols.
-        d.insert_shift(2, Slot::new(0, 4), 5);
+        assert!(d.free_drop(2, Slot::new(0, 4)));
         assert_eq!(d.clamp_resize(1, ResizeEdge::East, 3).1, Span::new(1, 3));
         // ...but not past the relocated neighbor at col 4.
         assert_eq!(d.clamp_resize(1, ResizeEdge::East, 9).1, Span::new(1, 4));
@@ -2352,19 +1989,17 @@ mod desktop_tests {
         assert_eq!(d.clamp_resize(1, ResizeEdge::South, 1).1, Span::new(1, 3));
     }
 
+    /// A spanned tile is a wall: a free drop landing anywhere inside its
+    /// rectangle is rejected (Behavior 4 — free placement, no ripple).
     #[test]
     fn spanned_tile_is_a_wall_that_rejects_unabsorbable_inserts() {
         let mut d = DesktopState::default();
-        d.seed(&[1, 2, 3], 3); // 1@(0,0) 2@(0,1) 3@(0,2)
-        d.set_span(2, Span::new(1, 2)); // 2 now covers (0,1),(0,2) — overlaps 3!
-        // (Set up directly for the test; reposition 3 to avoid overlap.)
-        d.slots.retain(|(id, _)| *id != 3);
-        d.slots.push((3, Slot::new(1, 0)));
-        d.sort();
-        // Drop 3 onto (0,0): run = [1@(0,0)], next is (0,1) which is the
-        // spanned tile 2 → wall, no gap before it → rejected, nothing moves.
-        let placed = d.insert_shift(3, Slot::new(0, 0), 3);
-        assert!(!placed, "insertion blocked by the spanned wall");
+        put(&mut d, 1, 0, 0);
+        put(&mut d, 2, 0, 1);
+        d.set_span(2, Span::new(1, 2)); // 2 covers (0,1),(0,2)
+        put(&mut d, 3, 1, 0);
+        // Drop 3 onto (0,2) — inside 2's rectangle → rejected, nothing moves.
+        assert!(!d.free_drop(3, Slot::new(0, 2)), "wall rejects the drop");
         assert_eq!(d.slot_of(3), Some(Slot::new(1, 0)), "3 stays home");
         assert_eq!(d.slot_of(1), Some(Slot::new(0, 0)), "1 didn't move");
     }
@@ -2372,69 +2007,75 @@ mod desktop_tests {
     #[test]
     fn drop_onto_a_spanned_tile_is_rejected() {
         let mut d = DesktopState::default();
-        d.slots.push((1, Slot::new(0, 0)));
+        put(&mut d, 1, 0, 0);
         d.set_span(1, Span::new(2, 2));
-        d.slots.push((2, Slot::new(2, 2)));
-        d.sort();
+        put(&mut d, 2, 2, 2);
         // Drop 2 onto (0,1) — inside 1's rectangle.
-        let placed = d.insert_shift(2, Slot::new(0, 1), 4);
-        assert!(!placed);
-        assert_eq!(d.slot_of(2), Some(Slot::new(2, 2)), "2 returns home");
+        assert!(!d.free_drop(2, Slot::new(0, 1)));
+        assert_eq!(d.slot_of(2), Some(Slot::new(2, 2)), "2 stays home");
     }
 
     #[test]
     fn spanned_tile_moves_only_onto_a_free_rectangle() {
         let mut d = DesktopState::default();
-        d.slots.push((1, Slot::new(0, 0)));
+        put(&mut d, 1, 0, 0);
         d.set_span(1, Span::new(2, 2));
-        d.slots.push((2, Slot::new(0, 2)));
-        d.sort();
-        // 1 (2×2) onto (0,1) would overlap 2 at (0,2)..(1,2)? 1's rect there is
-        // (0,1)(0,2)(1,1)(1,2) — overlaps 2@(0,2). Rejected.
-        assert!(!d.insert_shift(1, Slot::new(0, 1), 8));
+        put(&mut d, 2, 0, 2);
+        // 1 (2×2) onto (0,1): rect (0,1)(0,2)(1,1)(1,2) overlaps 2@(0,2).
+        // Rejected.
+        assert!(!d.free_drop(1, Slot::new(0, 1)));
         assert_eq!(d.slot_of(1), Some(Slot::new(0, 0)), "stayed home");
         // Onto (2,0): rect (2,0)(2,1)(3,0)(3,1) — all free. Accepted.
-        assert!(d.insert_shift(1, Slot::new(2, 0), 8));
+        assert!(d.free_drop(1, Slot::new(2, 0)));
         assert_eq!(d.slot_of(1), Some(Slot::new(2, 0)));
     }
 
     #[test]
     fn occupied_extent_accounts_for_span() {
         let mut d = DesktopState::default();
-        d.slots.push((1, Slot::new(0, 0)));
+        put(&mut d, 1, 0, 0);
         d.set_span(1, Span::new(2, 3));
-        // Far corner is (0+2-1, 0+3-1) = (1, 2).
-        assert_eq!(d.occupied_extent(), Some((1, 2)));
+        // Signed box: min = anchor (0,0), max = far corner (0+2-1, 0+3-1)=(1,2).
+        assert_eq!(
+            d.occupied_extent(),
+            Some((Slot::new(0, 0), Slot::new(1, 2)))
+        );
     }
 
     #[test]
     fn reconcile_drops_spans_of_closed_tiles() {
         let mut d = DesktopState::default();
-        d.seed(&[1, 2], 3);
+        put(&mut d, 1, 0, 0);
+        put(&mut d, 2, 0, 1);
         d.set_span(1, Span::new(2, 2));
         // Tile 1 closes; only 2 remains.
-        d.reconcile(&[2], 2, 3);
+        d.reconcile(&[2]);
         assert_eq!(d.span_of(1), Span::ONE, "stale span dropped");
         assert!(d.spans.is_empty());
         assert_eq!(d.slot_of(2), Some(Slot::new(0, 1)), "2's slot untouched");
     }
 
+    /// Reconcile is order-free: it drops stale entries and seeds slotless
+    /// leaves via the origin ring-spiral; placed leaves never move (Behavior 4).
     #[test]
     fn reconcile_drops_stale_and_inserts_after_focused() {
+        // (Kept name for continuity; NEW behavior — spiral seeding, not
+        // insert-after-focused.)
         let mut d = DesktopState::default();
-        d.seed(&[1, 2, 3], 3);
-        // Window 2 closed; window 9 opened; focused = 1.
-        let changed = d.reconcile(&[1, 3, 9], 1, 3);
+        put(&mut d, 1, 0, 0);
+        put(&mut d, 2, 0, 1);
+        put(&mut d, 3, 0, 2);
+        // Window 2 closed; window 9 opened.
+        let changed = d.reconcile(&[1, 3, 9]);
         assert!(changed);
         assert_eq!(d.slot_of(2), None);
-        assert_eq!(
-            d.slot_of(9),
-            Some(Slot::new(0, 1)),
-            "new window lands after focused, in the gap 2 left"
-        );
-        assert_eq!(d.slot_of(3), Some(Slot::new(0, 2)), "no ripple needed");
+        // 9 seeds at the first free spiral slot. (0,0),(0,2) occupied; spiral
+        // from origin: (0,0) taken → ring 1 (-1,-1) is free and first.
+        assert_eq!(d.slot_of(9), Some(Slot::new(-1, -1)), "spiral-seeded");
+        assert_eq!(d.slot_of(1), Some(Slot::new(0, 0)), "placed leaf unmoved");
+        assert_eq!(d.slot_of(3), Some(Slot::new(0, 2)), "placed leaf unmoved");
         assert!(
-            !d.reconcile(&[1, 3, 9], 1, 3),
+            !d.reconcile(&[1, 3, 9]),
             "idempotent when the invariant already holds"
         );
     }
@@ -2467,29 +2108,117 @@ mod desktop_tests {
         let s = Slot::new(2, 3);
         let (x, y) = slot_origin(s, tile, g);
         assert_eq!(slot_at((x + 5.0, y + 5.0), tile, g), s);
-        assert_eq!(effective_width(2000.0, tile.0, g), 2);
-        assert_eq!(effective_width(100.0, tile.0, g), 1, "minimum 1");
+        // Signed round-trip: a point in a negative-slot cell maps back to it
+        // (floor, not truncate-toward-zero).
+        let ns = Slot::new(-2, -3);
+        let (nx, ny) = slot_origin(ns, tile, g);
+        assert_eq!(slot_at((nx + 5.0, ny + 5.0), tile, g), ns);
     }
 
-    /// Old-binary safety (spec Behavior 7): unknown mode strings fall back
-    /// to Manual instead of failing the whole snapshot parse; known strings
-    /// round-trip.
+    // ── Infinite-plane engine (spec-infinite-plane-workspace.md) ────────────
+
+    /// D1: `occupied_extent` is a signed min+max bounding box — negative
+    /// anchors give a negative min corner, and the far corner adds the span;
+    /// no `u32` underflow/panic on the negative side.
     #[test]
-    fn layout_mode_deserialize_falls_back_to_manual() {
-        for (s, want) in [
-            ("\"manual\"", LayoutMode::Manual),
-            ("\"master_stack\"", LayoutMode::MasterStack),
-            ("\"monocle\"", LayoutMode::Monocle),
-            ("\"columns\"", LayoutMode::Columns),
-            ("\"desktop\"", LayoutMode::Desktop),
-            ("\"some_future_mode\"", LayoutMode::Manual),
+    fn occupied_extent_signed_min_max_box() {
+        let mut d = DesktopState::default();
+        put(&mut d, 1, -3, -5); // anchor left/above origin
+        put(&mut d, 2, 2, 1);
+        d.set_span(2, Span::new(2, 3)); // far corner (2+2-1, 1+3-1) = (3, 3)
+        let (min, max) = d.occupied_extent().expect("non-empty");
+        assert_eq!(min, Slot::new(-3, -5), "min over anchors, may be negative");
+        assert_eq!(max, Slot::new(3, 3), "max over anchor+span-1");
+        // Empty plane yields None (no panic).
+        assert_eq!(DesktopState::default().occupied_extent(), None);
+    }
+
+    /// Behavior 4 / D1: west edge-resize crosses the origin (no `0` wall) but
+    /// STILL Block-clamps on a neighbor sitting at a negative col — proving the
+    /// removed 0-wall didn't remove the neighbor wall.
+    #[test]
+    fn clamp_resize_west_crosses_origin() {
+        let mut d = DesktopState::default();
+        // Target tile at (0,0); a neighbor occupies the NEGATIVE col (0,-2).
+        put(&mut d, 1, 0, 0);
+        put(&mut d, 2, 0, -2);
+        // Pull tile 1 West a lot: it grows past col 0 into negatives, but the
+        // neighbor at col -2 blocks it — anchor clamps at col -1 (span 2).
+        let (a, s) = d.clamp_resize(1, ResizeEdge::West, 9);
+        assert_eq!(a, Slot::new(0, -1), "crossed origin, blocked by neighbor");
+        assert_eq!(s, Span::new(1, 2));
+        // With no neighbor, the same pull crosses origin unimpeded.
+        let mut d2 = DesktopState::default();
+        put(&mut d2, 1, 0, 0);
+        let (a2, s2) = d2.clamp_resize(1, ResizeEdge::West, 4);
+        assert_eq!(a2, Slot::new(0, -3), "no 0-wall: anchor goes negative");
+        assert_eq!(s2, Span::new(1, 4));
+    }
+
+    /// Behavior 4: `seed_slot` walks the origin ring-spiral deterministically —
+    /// origin first when free, else the exact next reading-order ring slot.
+    #[test]
+    fn seed_slot_spiral_deterministic() {
+        let mut d = DesktopState::default();
+        // Empty plane: origin is the first free slot.
+        assert_eq!(d.seed_slot(), Slot::new(0, 0));
+        // Occupy the origin; the spiral's next reading-order slot is (-1,-1)
+        // (ring 1: rows -1..=1 × cols -1..=1, interior (0,0) skipped later).
+        put(&mut d, 1, 0, 0);
+        assert_ne!(d.seed_slot(), Slot::new(0, 0));
+        assert_eq!(d.seed_slot(), Slot::new(-1, -1));
+        // Fill the whole of ring 1's leading edge up to (0,-1); next is... the
+        // first still-free ring-1 slot after the occupied ones.
+        put(&mut d, 2, -1, -1);
+        put(&mut d, 3, -1, 0);
+        assert_eq!(d.seed_slot(), Slot::new(-1, 1), "reading order within ring");
+    }
+
+    /// Behavior 4: an overlapping free drop is rejected and moves NOTHING —
+    /// every tile's slot is byte-identical before and after.
+    #[test]
+    fn free_drop_rejects_overlap_without_moving_neighbors() {
+        let mut d = DesktopState::default();
+        put(&mut d, 1, 0, 0);
+        put(&mut d, 2, 0, 1);
+        put(&mut d, 3, 1, 0);
+        let before: Vec<(WindowId, Slot)> = {
+            let mut v = d.slots.clone();
+            v.sort_by_key(|&(id, _)| id);
+            v
+        };
+        // Drop 3 onto (0,1) — occupied by 2 → rejected.
+        assert!(!d.free_drop(3, Slot::new(0, 1)));
+        let after: Vec<(WindowId, Slot)> = {
+            let mut v = d.slots.clone();
+            v.sort_by_key(|&(id, _)| id);
+            v
+        };
+        assert_eq!(before, after, "rejected drop moved nothing");
+    }
+
+    /// Old-binary safety (spec Behavior 7): the multi-mode surface is retired,
+    /// so EVERY persisted mode string — the old known ones and anything from a
+    /// newer binary — deserializes to the sole `Plane` value instead of failing
+    /// the whole snapshot parse. (The load path ignores this field regardless.)
+    #[test]
+    fn layout_mode_deserialize_collapses_every_string_to_plane() {
+        for s in [
+            "\"manual\"",
+            "\"master_stack\"",
+            "\"monocle\"",
+            "\"columns\"",
+            "\"desktop\"",
+            "\"plane\"",
+            "\"some_future_mode\"",
         ] {
             let got: LayoutMode = serde_json::from_str(s).unwrap();
-            assert_eq!(got, want, "{s}");
+            assert_eq!(got, LayoutMode::Plane, "{s}");
         }
+        // The sole variant serializes as "plane" (snake_case of `Plane`).
         assert_eq!(
-            serde_json::to_string(&LayoutMode::Desktop).unwrap(),
-            "\"desktop\""
+            serde_json::to_string(&LayoutMode::Plane).unwrap(),
+            "\"plane\""
         );
     }
 }
@@ -2510,25 +2239,24 @@ mod tests {
         })
     }
 
-    // Edge resize (Behavior 4b). West/North move the anchor toward the origin
-    // (pull-to-enlarge) while the far edge stays put; East/South hold the
-    // anchor and grow the far edge. All four are Block-clamped against
-    // neighbours and the `0` wall.
+    // Edge resize (Behavior 4b). West/North move the anchor (pull-to-enlarge)
+    // while the far edge stays put; East/South hold the anchor and grow the far
+    // edge. Block-clamped against neighbours — but NOT against a `0` wall
+    // (infinite plane): the anchor may cross into negative slots.
     #[test]
     fn clamp_resize_west_north_move_anchor() {
         let mut d = DesktopState::default();
-        // A 1×1 tile at (1,1) with open desktop around it.
-        d.seed(&[7], 100);
-        d.set_anchor(7, Slot::new(1, 1));
+        // A 1×1 tile at (1,1) with open plane around it.
+        d.slots.push((7, Slot::new(1, 1)));
 
-        // Pull West two columns: anchor moves to col 0 (hits the wall), the
-        // east edge stays at col 2, span widens to 2.
-        let (a, s) = d.clamp_resize(7, ResizeEdge::West, 3);
+        // Pull West two columns: no 0-wall, so the anchor moves freely to col 0
+        // (far edge fixed at exclusive col 2), span widens to 2.
+        let (a, s) = d.clamp_resize(7, ResizeEdge::West, 2);
         assert_eq!(a, Slot::new(1, 0));
         assert_eq!(s, Span::new(1, 2));
 
         // Pull North two rows: anchor moves to row 0, span heightens to 2.
-        let (a, s) = d.clamp_resize(7, ResizeEdge::North, 3);
+        let (a, s) = d.clamp_resize(7, ResizeEdge::North, 2);
         assert_eq!(a, Slot::new(0, 1));
         assert_eq!(s, Span::new(2, 1));
 
@@ -2541,11 +2269,11 @@ mod tests {
     #[test]
     fn clamp_resize_blocks_on_neighbor_and_shrinks_freely() {
         let mut d = DesktopState::default();
-        d.seed(&[1, 2], 100);
+        d.slots.push((1, Slot::new(0, 0)));
+        d.slots.push((2, Slot::new(0, 2)));
+        d.sort();
         // Tile 1 at (0,0), tile 2 at (0,2). Tile 2 pulled West can only reach
         // col 1 — col 0 is owned by tile 1 (Block rule).
-        d.set_anchor(1, Slot::new(0, 0));
-        d.set_anchor(2, Slot::new(0, 2));
         let (a, s) = d.clamp_resize(2, ResizeEdge::West, 9);
         assert_eq!(a, Slot::new(0, 1));
         assert_eq!(s, Span::new(1, 2));
@@ -2694,8 +2422,7 @@ mod tests {
             focused,
             rail: None,
             ephemeral: false,
-            layout_mode: LayoutMode::Manual,
-            saved_manual_layout: None,
+            layout_mode: LayoutMode::Plane,
             master_ratio: 0.6,
             master_count: 1,
             tag_view: BTreeSet::new(),
@@ -2847,113 +2574,22 @@ mod tests {
         assert_eq!(tab.layout.leaf_ids(), vec![3]);
     }
 
-    #[test]
-    fn resize_focused_shifts_weights() {
-        let layout = Layout::Split {
-            dir: SplitDir::V,
-            children: vec![(0.5, leaf(1, "a")), (0.5, leaf(2, "b"))],
-        };
-        let mut ws = ws_with_layout(layout, 1);
-        // Grow leaf 1's weight by 0.1; sibling 2 shrinks by 0.1.
-        ws.resize_focused(0.1).unwrap();
-        let tab = ws.active_tab().unwrap();
-        if let Layout::Split { children, .. } = &tab.layout {
-            assert!((children[0].0 - 0.6).abs() < 1e-5);
-            assert!((children[1].0 - 0.4).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn focus_next_cycles_in_tree_order() {
-        let layout = Layout::Split {
-            dir: SplitDir::V,
-            children: vec![
-                (0.5, leaf(1, "a")),
-                (
-                    0.5,
-                    Layout::Split {
-                        dir: SplitDir::H,
-                        children: vec![(0.5, leaf(2, "b")), (0.5, leaf(3, "c"))],
-                    },
-                ),
-            ],
-        };
-        let mut ws = ws_with_layout(layout, 1);
-        ws.focus_next().unwrap();
-        assert_eq!(ws.active_tab().unwrap().focused, 2);
-        ws.focus_next().unwrap();
-        assert_eq!(ws.active_tab().unwrap().focused, 3);
-        ws.focus_next().unwrap();
-        assert_eq!(ws.active_tab().unwrap().focused, 1, "wraps around");
-    }
-
-    #[test]
-    fn focus_motion_left_right_walks_v_split() {
-        // [a | b | c] — V split with three children.
-        let layout = Layout::Split {
-            dir: SplitDir::V,
-            children: vec![
-                (0.33, leaf(1, "a")),
-                (0.34, leaf(2, "b")),
-                (0.33, leaf(3, "c")),
-            ],
-        };
-        let mut ws = ws_with_layout(layout, 2);
-        ws.focus_motion(FocusDir::Right).unwrap();
-        assert_eq!(ws.active_tab().unwrap().focused, 3);
-        ws.focus_motion(FocusDir::Right).unwrap();
-        assert_eq!(ws.active_tab().unwrap().focused, 3, "no-op at right edge");
-        ws.focus_motion(FocusDir::Left).unwrap();
-        assert_eq!(ws.active_tab().unwrap().focused, 2);
-    }
-
-    #[test]
-    fn focus_motion_down_descends_through_nested_split() {
-        // Outer H split [top / bottom]; bottom is a V split [b | c].
-        // From top (1), Down should land on bottom's first leaf (b → 2).
-        let layout = Layout::Split {
-            dir: SplitDir::H,
-            children: vec![
-                (0.5, leaf(1, "top")),
-                (
-                    0.5,
-                    Layout::Split {
-                        dir: SplitDir::V,
-                        children: vec![(0.5, leaf(2, "b")), (0.5, leaf(3, "c"))],
-                    },
-                ),
-            ],
-        };
-        let mut ws = ws_with_layout(layout, 1);
-        ws.focus_motion(FocusDir::Down).unwrap();
-        assert_eq!(ws.active_tab().unwrap().focused, 2);
-    }
+    // NOTE (infinite-plane, Stage D): the retired split-tree topology tests
+    // `resize_focused_shifts_weights`, `focus_next_cycles_in_tree_order`,
+    // `focus_motion_left_right_walks_v_split`,
+    // `focus_motion_down_descends_through_nested_split`, and
+    // `equalize_focused_resets_to_equal` were REMOVED — the weight-resize /
+    // equalize / tree-order-focus behaviors they guarded no longer exist (the
+    // plane is the only interior; focus traverses slot order, not tree order).
+    // Plane focus navigation is covered by the `desktop_tests` module
+    // (`spatial_neighbor_prefers_aligned_then_nearest`, `reconcile_*`).
 
     #[test]
     fn focus_motion_no_op_at_root() {
+        // A single unseeded tile has no slot neighbor — focus_motion is a no-op.
         let mut ws = ws_with_layout(leaf(1, "only"), 1);
         ws.focus_motion(FocusDir::Right).unwrap();
         assert_eq!(ws.active_tab().unwrap().focused, 1);
-    }
-
-    #[test]
-    fn equalize_focused_resets_to_equal() {
-        let layout = Layout::Split {
-            dir: SplitDir::V,
-            children: vec![
-                (0.7, leaf(1, "a")),
-                (0.2, leaf(2, "b")),
-                (0.1, leaf(3, "c")),
-            ],
-        };
-        let mut ws = ws_with_layout(layout, 2);
-        ws.equalize_focused().unwrap();
-        let tab = ws.active_tab().unwrap();
-        if let Layout::Split { children, .. } = &tab.layout {
-            for (w, _) in children {
-                assert!((w - 1.0 / 3.0).abs() < 1e-5);
-            }
-        }
     }
 
     #[test]
@@ -3088,8 +2724,7 @@ mod tests {
             focused: 0,
             rail: None,
             ephemeral: false,
-            layout_mode: LayoutMode::Manual,
-            saved_manual_layout: None,
+            layout_mode: LayoutMode::Plane,
             master_ratio: 0.6,
             master_count: 1,
             tag_view: BTreeSet::new(),
@@ -3118,8 +2753,7 @@ mod tests {
             focused: 5,
             rail: None,
             ephemeral: false,
-            layout_mode: LayoutMode::Manual,
-            saved_manual_layout: None,
+            layout_mode: LayoutMode::Plane,
             master_ratio: 0.6,
             master_count: 1,
             tag_view: BTreeSet::new(),
@@ -3157,8 +2791,7 @@ mod tests {
             focused: 0,
             rail: None,
             ephemeral: false,
-            layout_mode: LayoutMode::Manual,
-            saved_manual_layout: None,
+            layout_mode: LayoutMode::Plane,
             master_ratio: 0.6,
             master_count: 1,
             tag_view: BTreeSet::new(),

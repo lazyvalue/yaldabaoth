@@ -229,10 +229,6 @@ actions!(
         FocusDown,
         FocusNext,
         FocusPrev,
-        // Resize the focused tile vs. its sibling
-        ResizeShrink,
-        ResizeGrow,
-        Equalize,
         // Browser view
         BrowserDown,
         BrowserUp,
@@ -293,13 +289,13 @@ actions!(
         RailCycleSort,
         RailWorktrees,
         RailFilter,
-        // Layout patterns (spec-layout-patterns.md)
-        // Phase 2: automatic layouts
-        CycleLayoutMode,
+        // Plane camera (spec-infinite-plane-workspace.md Interfaces). Each is a
+        // `Ctrl-W`+plain-key SEQUENCE (reliable on macOS, unlike a bare
+        // `Ctrl`+digit chord). Anchor = focused tile's slot, else viewport center.
+        ZoomOutWorkspace,
+        ZoomInWorkspace,
+        ResetWorkspaceView,
         DesktopTileSize,
-        PromoteToMaster,
-        IncreaseMasterCount,
-        DecreaseMasterCount,
         // Phase 3: tags
         ClearTagView,
         TagViewChord,
@@ -1363,13 +1359,11 @@ fn gpui_menu() -> Vec<MenuNode> {
         ),
         MenuNode::submenu(
             "l",
-            "layout",
+            "plane view",
             vec![
-                MenuNode::entry("m", "manual", "layout-manual"),
-                MenuNode::entry("s", "master stack", "layout-master-stack"),
-                MenuNode::entry("o", "monocle", "layout-monocle"),
-                MenuNode::entry("c", "columns", "layout-columns"),
-                MenuNode::entry("d", "desktop", "layout-desktop"),
+                MenuNode::entry("=", "zoom in", "plane-zoom-in"),
+                MenuNode::entry("-", "zoom out", "plane-zoom-out"),
+                MenuNode::entry("0", "reset to origin", "plane-reset-view"),
             ],
         ),
         MenuNode::entry("r", "rebuild and restart gui", "dev-restart-gui"),
@@ -1775,7 +1769,13 @@ impl YaldaGpuiView {
             );
             tab.display_name = ptab.display_name;
             tab.rail = ptab.rail.map(|r| restore_rail(r, ptab.focused_window));
-            tab.layout_mode = ptab.layout_mode;
+            // IGNORE the persisted layout mode (spec-infinite-plane-workspace.md
+            // Behavior 7): every workspace is a Plane now. `ptab.layout_mode`
+            // deserializes any old mode string to `Plane` already; force it here
+            // so the intent is explicit and a retired-mode snapshot can never
+            // resurrect a mode. Content (tree leaves) is preserved; geometry
+            // reflows once via the first render's seed/reconcile below.
+            tab.layout_mode = workspace::LayoutMode::Plane;
             tab.master_ratio = ptab.master_ratio;
             tab.master_count = ptab.master_count;
             tab.tag_view = ptab.tag_view;
@@ -1788,6 +1788,9 @@ impl YaldaGpuiView {
                     let mut v: Vec<(workspace::WindowId, workspace::Slot)> = ptab
                         .desktop_slots
                         .into_iter()
+                        // Slots are signed on the plane (D4). Old snapshots
+                        // stored non-negative values, which deserialize as the
+                        // same positive `i32` (the old top-right quadrant).
                         .map(|(id, row, col)| (id, workspace::Slot::new(row, col)))
                         .collect();
                     v.sort_by_key(|&(_, s)| s);
@@ -1798,7 +1801,15 @@ impl YaldaGpuiView {
                     .into_iter()
                     .map(|(id, rows, cols)| (id, workspace::Span::new(rows, cols)))
                     .collect(),
-                pan: (0.0, 0.0),
+                // Restore the plane's saved camera (D4 / Behavior 7); an absent
+                // field (old snapshot) falls back to the origin at Full.
+                camera: ptab
+                    .camera
+                    .map(|c| workspace::Camera {
+                        pan: c.pan,
+                        zoom: c.zoom,
+                    })
+                    .unwrap_or_default(),
                 drag: None,
                 resize: None,
                 last_reveal: None,
@@ -1828,36 +1839,14 @@ impl YaldaGpuiView {
                 buf.tags = tags.iter().cloned().collect();
             }
         }
-        // If a tab was saved in automatic layout mode, retile now. Manual
-        // keeps the restored tree verbatim; Desktop also keeps it — the tree
-        // is the content owner and geometry comes from the restored slot map
-        // (spec-desktop-mode.md), seeded/reconciled on first render.
-        for t in &mut ws.tabs {
-            if !matches!(
-                t.layout_mode,
-                workspace::LayoutMode::Manual | workspace::LayoutMode::Desktop
-            ) {
-                // Retile in-place for automatic-mode tabs.
-                let windows: Vec<workspace::Window<App>> = workspace::drain_leaves(&mut t.layout);
-                if !windows.is_empty() {
-                    let focused = t.focused;
-                    t.layout = match t.layout_mode {
-                        workspace::LayoutMode::MasterStack => {
-                            workspace::build_master_stack(windows, t.master_count, t.master_ratio)
-                        }
-                        workspace::LayoutMode::Monocle => workspace::build_monocle(windows),
-                        workspace::LayoutMode::Columns => workspace::build_columns(windows),
-                        workspace::LayoutMode::Manual | workspace::LayoutMode::Desktop => {
-                            unreachable!()
-                        }
-                    };
-                    // Restore focus
-                    if t.layout.find_leaf(focused).is_some() {
-                        t.focused = focused;
-                    }
-                }
-            }
-        }
+        // No retile-on-restore (infinite-plane, Stage D): every tab is a Plane
+        // (Behavior 1/7). The `Layout<C>` tree restored above is the CONTENT
+        // owner verbatim; geometry comes from the restored `desktop` slot map (a
+        // tab with `desktop_slots` round-trips its arrangement) or, for a
+        // retired-mode snapshot that has none, from the first desktop render's
+        // seed/reconcile — which bulk-seeds every tree leaf onto the plane by
+        // origin ring-spiral (chrome.rs `render_desktop` → `reconcile`). Content
+        // is preserved; only geometry reflows once.
         self.workspace = ws;
 
         // Post-pass: replace Browser stubs with live agent sessions.
@@ -3548,25 +3537,70 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// `Ctrl-W <` / `Ctrl-W -` — shrink the focused tile by 5% (gives the
-    /// space to its next sibling within the parent split).
-    fn resize_shrink(&mut self, _: &ResizeShrink, _w: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.workspace.resize_focused(-0.05);
+    /// The slot a KEYBOARD-driven semantic-zoom step re-anchors on
+    /// (spec-infinite-plane-workspace.md Behavior 3): the focused tile's slot,
+    /// or the viewport-center slot when nothing is focused / the focused tile has
+    /// no slot. Mirrors the pixel-context setup `desktop_scroll` builds for
+    /// `desktop_zoom_anchor`, but sourced from the active tab + captured canvas
+    /// bounds (there's no pointer event here).
+    fn plane_keyboard_zoom_anchor(&self) -> workspace::Slot {
+        let tab_idx = self.workspace.active_tab;
+        let full_tile = self.desktop_tile_px();
+        let (_, _, mut cw, mut ch) = self.desktop_canvas_bounds.get();
+        if cw <= 0.0 {
+            cw = self.viewport_width_px.max(1.0);
+        }
+        if ch <= 0.0 {
+            ch = self.viewport_height_px.max(1.0);
+        }
+        let cam = self.workspace.tabs[tab_idx].desktop.camera;
+        let scale = workspace::detail_scale(cam.zoom);
+        let tile = (full_tile.0 * scale, full_tile.1 * scale);
+        let g = 12.0 * scale; // DESKTOP_GUTTER (chrome.rs); pitch-independent.
+        let pitch = (tile.0 + g, tile.1 + g);
+        let pan = (cam.pan.0 * pitch.0, cam.pan.1 * pitch.1);
+        let focused_id = self.workspace.tabs[tab_idx].focused;
+        self.desktop_zoom_anchor(tab_idx, focused_id, tile, g, pan, cw, ch)
+    }
+
+    /// `Ctrl-W -` — step the active plane's semantic zoom one level OUT
+    /// (`Full → Card → Minimap`, clamped), re-anchored on the focused tile / view
+    /// center (spec-infinite-plane-workspace.md Behavior 3). Reclaimed from the
+    /// retired `ResizeShrink`.
+    fn zoom_out_workspace(
+        &mut self,
+        _: &ZoomOutWorkspace,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let anchor = self.plane_keyboard_zoom_anchor();
+        let tab_idx = self.workspace.active_tab;
+        self.workspace.tabs[tab_idx].desktop.zoom_out(anchor);
         self.save_workspace_state();
         cx.notify();
     }
 
-    /// `Ctrl-W >` / `Ctrl-W +` — grow the focused tile by 5%.
-    fn resize_grow(&mut self, _: &ResizeGrow, _w: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.workspace.resize_focused(0.05);
+    /// `Ctrl-W =` — step the active plane's semantic zoom one level IN
+    /// (`Minimap → Card → Full`, clamped). Reclaimed from the retired `Equalize`.
+    fn zoom_in_workspace(&mut self, _: &ZoomInWorkspace, _w: &mut Window, cx: &mut Context<Self>) {
+        let anchor = self.plane_keyboard_zoom_anchor();
+        let tab_idx = self.workspace.active_tab;
+        self.workspace.tabs[tab_idx].desktop.zoom_in(anchor);
         self.save_workspace_state();
         cx.notify();
     }
 
-    /// `Ctrl-W =` — even out all sibling weights in the focused tile's
-    /// parent split.
-    fn equalize(&mut self, _: &Equalize, _w: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.workspace.equalize_focused();
+    /// `Ctrl-W 0` — reset the active plane's camera to the origin
+    /// (`pan=(0,0)`, `zoom=Full`; spec-infinite-plane-workspace.md Behavior 6).
+    /// View-only: no tile moves or is re-seeded.
+    fn reset_workspace_view(
+        &mut self,
+        _: &ResetWorkspaceView,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_idx = self.workspace.active_tab;
+        self.workspace.tabs[tab_idx].desktop.reset_view();
         self.save_workspace_state();
         cx.notify();
     }
@@ -3692,86 +3726,6 @@ impl YaldaGpuiView {
         if let Some(tab) = self.workspace.active_tab_mut() {
             tab.focused = target_id;
         }
-    }
-
-    // Phase 2: automatic layouts
-
-    fn cycle_layout_mode(&mut self, _: &CycleLayoutMode, _w: &mut Window, cx: &mut Context<Self>) {
-        let new_mode = self
-            .workspace
-            .active_tab()
-            .map(|t| t.layout_mode.cycle())
-            .unwrap_or(workspace::LayoutMode::Manual);
-        self.workspace.set_layout_mode(new_mode);
-        let sigil = new_mode.sigil();
-        self.transient_status = Some(format!("layout: {sigil}").into());
-        self.save_workspace_state();
-        cx.notify();
-    }
-
-    fn promote_to_master(&mut self, _: &PromoteToMaster, _w: &mut Window, cx: &mut Context<Self>) {
-        let is_master_stack = self
-            .workspace
-            .active_tab()
-            .map(|t| t.layout_mode == workspace::LayoutMode::MasterStack)
-            .unwrap_or(false);
-        if !is_master_stack {
-            return;
-        }
-        // Swap focused window with master (first in tree order).
-        let tab = match self.workspace.active_tab_mut() {
-            Some(t) => t,
-            None => return,
-        };
-        let ids = tab.layout.leaf_ids();
-        if ids.len() < 2 {
-            return;
-        }
-        let focused = tab.focused;
-        let master_id = ids[0];
-        if focused == master_id {
-            return;
-        }
-        // Swap the content of the two leaves in place.
-        tab.layout.swap_leaf_contents(focused, master_id);
-        self.workspace.retile_active();
-        self.save_workspace_state();
-        cx.notify();
-    }
-
-    fn increase_master_count(
-        &mut self,
-        _: &IncreaseMasterCount,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(tab) = self.workspace.active_tab_mut() {
-            if tab.layout_mode != workspace::LayoutMode::MasterStack {
-                return;
-            }
-            let max = tab.layout.leaf_count().saturating_sub(1).max(1);
-            tab.master_count = (tab.master_count + 1).min(max);
-        }
-        self.workspace.retile_active();
-        self.save_workspace_state();
-        cx.notify();
-    }
-
-    fn decrease_master_count(
-        &mut self,
-        _: &DecreaseMasterCount,
-        _w: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(tab) = self.workspace.active_tab_mut() {
-            if tab.layout_mode != workspace::LayoutMode::MasterStack {
-                return;
-            }
-            tab.master_count = tab.master_count.saturating_sub(1).max(1);
-        }
-        self.workspace.retile_active();
-        self.save_workspace_state();
-        cx.notify();
     }
 
     // Phase 3: tags
@@ -3902,23 +3856,6 @@ impl YaldaGpuiView {
             return false;
         };
         buf.tags.iter().any(|t| tag_view.contains(t))
-    }
-
-    /// Check if a layout subtree has any visible leaves for the given tag view.
-    fn subtree_has_visible_leaf(
-        layout: &workspace::Layout<App>,
-        tag_view: &workspace::TagSet,
-        file_buffers: &HashMap<workspace::FileBufferId, workspace::FileBuffer>,
-    ) -> bool {
-        match layout {
-            workspace::Layout::Empty => false,
-            workspace::Layout::Leaf(w) => {
-                Self::window_visible_for_tag_view(&w.content, tag_view, file_buffers)
-            }
-            workspace::Layout::Split { children, .. } => children
-                .iter()
-                .any(|(_, c)| Self::subtree_has_visible_leaf(c, tag_view, file_buffers)),
-        }
     }
 
     /// If the focused window is hidden by the tag filter, move focus to the
@@ -4594,21 +4531,6 @@ impl YaldaGpuiView {
                 self.save_workspace_state();
                 cx.notify();
             }
-            "resize-shrink" => {
-                let _ = self.workspace.resize_focused(-0.05);
-                self.save_workspace_state();
-                cx.notify();
-            }
-            "resize-grow" => {
-                let _ = self.workspace.resize_focused(0.05);
-                self.save_workspace_state();
-                cx.notify();
-            }
-            "equalize" => {
-                let _ = self.workspace.equalize_focused();
-                self.save_workspace_state();
-                cx.notify();
-            }
             "new-tab" => {
                 let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.workspace.push_initial_tab(
@@ -4644,72 +4566,29 @@ impl YaldaGpuiView {
             }
             "move-tile" => self.open_workspace_picker(WorkspacePickerMode::Move, cx),
             "also-show-tile" => self.open_workspace_picker(WorkspacePickerMode::AlsoShow, cx),
-            // Layout patterns
-            "cycle-layout" => {
-                self.workspace.set_layout_mode(
-                    self.workspace
-                        .active_tab()
-                        .map(|t| t.layout_mode.cycle())
-                        .unwrap_or_default(),
-                );
-                let sigil = self
-                    .workspace
-                    .active_tab()
-                    .map(|t| t.layout_mode.sigil())
-                    .unwrap_or("");
-                self.transient_status = Some(format!("layout: {sigil}").into());
+            // Plane view (spec-infinite-plane-workspace.md). Routed through the
+            // same camera ops as the `Ctrl-W -/=/0` bindings.
+            "plane-zoom-in" => {
+                let anchor = self.plane_keyboard_zoom_anchor();
+                let tab_idx = self.workspace.active_tab;
+                self.workspace.tabs[tab_idx].desktop.zoom_in(anchor);
                 self.save_workspace_state();
                 cx.notify();
             }
-            // Direct layout-mode selection — same effect as cycling to the
-            // mode, without the round trip.
-            "layout-manual" => self.set_layout_mode_direct(workspace::LayoutMode::Manual, cx),
-            "layout-master-stack" => {
-                self.set_layout_mode_direct(workspace::LayoutMode::MasterStack, cx)
+            "plane-zoom-out" => {
+                let anchor = self.plane_keyboard_zoom_anchor();
+                let tab_idx = self.workspace.active_tab;
+                self.workspace.tabs[tab_idx].desktop.zoom_out(anchor);
+                self.save_workspace_state();
+                cx.notify();
             }
-            "layout-monocle" => self.set_layout_mode_direct(workspace::LayoutMode::Monocle, cx),
-            "layout-columns" => self.set_layout_mode_direct(workspace::LayoutMode::Columns, cx),
-            "layout-desktop" => self.set_layout_mode_direct(workspace::LayoutMode::Desktop, cx),
+            "plane-reset-view" => {
+                let tab_idx = self.workspace.active_tab;
+                self.workspace.tabs[tab_idx].desktop.reset_view();
+                self.save_workspace_state();
+                cx.notify();
+            }
             "desktop-grid" => self.open_desktop_grid_overlay(cx),
-            "promote-master" => {
-                let is_ms = self
-                    .workspace
-                    .active_tab()
-                    .map(|t| t.layout_mode == workspace::LayoutMode::MasterStack)
-                    .unwrap_or(false);
-                if is_ms {
-                    if let Some(tab) = self.workspace.active_tab_mut() {
-                        let ids = tab.layout.leaf_ids();
-                        if ids.len() >= 2 && tab.focused != ids[0] {
-                            tab.layout.swap_leaf_contents(tab.focused, ids[0]);
-                        }
-                    }
-                    self.workspace.retile_active();
-                    self.save_workspace_state();
-                    cx.notify();
-                }
-            }
-            "inc-master" => {
-                if let Some(tab) = self.workspace.active_tab_mut()
-                    && tab.layout_mode == workspace::LayoutMode::MasterStack
-                {
-                    let max = tab.layout.leaf_count().saturating_sub(1).max(1);
-                    tab.master_count = (tab.master_count + 1).min(max);
-                }
-                self.workspace.retile_active();
-                self.save_workspace_state();
-                cx.notify();
-            }
-            "dec-master" => {
-                if let Some(tab) = self.workspace.active_tab_mut()
-                    && tab.layout_mode == workspace::LayoutMode::MasterStack
-                {
-                    tab.master_count = tab.master_count.saturating_sub(1).max(1);
-                }
-                self.workspace.retile_active();
-                self.save_workspace_state();
-                cx.notify();
-            }
             "mark-tile" => {
                 // Begin a set-mark chord on the focused tile: the next char
                 // typed assigns the mark (same as the bare `m{char}` chord).
@@ -5397,19 +5276,6 @@ impl YaldaGpuiView {
             text,
             target: RenameTarget::DesktopTileSize,
         }));
-        cx.notify();
-    }
-
-    /// Direct layout-mode selection from the menu (no cycling).
-    fn set_layout_mode_direct(&mut self, mode: workspace::LayoutMode, cx: &mut Context<Self>) {
-        self.workspace.set_layout_mode(mode);
-        let sigil = self
-            .workspace
-            .active_tab()
-            .map(|t| t.layout_mode.sigil())
-            .unwrap_or("");
-        self.transient_status = Some(format!("layout: {sigil}").into());
-        self.save_workspace_state();
         cx.notify();
     }
 

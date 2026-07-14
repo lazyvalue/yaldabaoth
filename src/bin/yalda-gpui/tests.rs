@@ -2496,10 +2496,10 @@ fn gpui_menu_has_required_entries() {
     let mut leaf_actions: Vec<&str> = Vec::new();
     collect_leaves(&menu, &mut leaf_actions);
     // The expected leaf actions — change here if gpui_menu changes.
-    // Per untitled.md "Workspace › Commands (12 jun)" the workspace menu holds:
-    // set cwd, new agent/buffer/linear, theme nightfox/folio, layout
-    // manual/master-stack/monocle/columns/desktop, rebuild+restart, mark tile,
-    // close tile.
+    // Workspace menu holds: set cwd, new agent/buffer/linear, theme
+    // nightfox/folio, plane view zoom-in/zoom-out/reset (the retired
+    // manual/master-stack/monocle/columns/desktop mode leaves are gone —
+    // infinite-plane Stage D), rebuild+restart, mark tile, close tile.
     let expected = [
         "workspace-set-cwd",
         "new-agent-tile",
@@ -2507,11 +2507,9 @@ fn gpui_menu_has_required_entries() {
         "new-linear-tile",
         "theme-nightfox",
         "theme-folio",
-        "layout-manual",
-        "layout-master-stack",
-        "layout-monocle",
-        "layout-columns",
-        "layout-desktop",
+        "plane-zoom-in",
+        "plane-zoom-out",
+        "plane-reset-view",
         "dev-restart-gui",
         "dev-restart-all",
         "mark-tile",
@@ -3293,5 +3291,147 @@ fn inv_order_interleaved_turns_stay_chronological() {
         st.input_surface.compose().text(),
         "scratch draft",
         "the draft is untouched by any number of turns (INV-2)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Infinite-plane persistence (spec-infinite-plane-workspace.md Behavior 7 / D4)
+// ---------------------------------------------------------------------------
+
+/// Minimal well-formed `PersistedTab` for the plane-persistence serde tests:
+/// one Agent leaf, no rail, default layout params. The caller sets the plane
+/// fields (`desktop_slots`, `camera`) under test.
+#[cfg(test)]
+fn plane_persist_test_tab() -> PersistedTab {
+    PersistedTab {
+        auto_name: "plane-1".into(),
+        display_name: None,
+        focused_window: 1,
+        layout: PersistedLayout::Leaf(PersistedLeaf {
+            id: 1,
+            kind: PersistedKind::Agent { session_id: None },
+        }),
+        rail: None,
+        layout_mode: workspace::LayoutMode::Plane,
+        master_ratio: default_master_ratio(),
+        master_count: default_master_count(),
+        tag_view: Default::default(),
+        desktop_slots: Vec::new(),
+        desktop_spans: Vec::new(),
+        camera: None,
+        cwd: Some("/tmp".into()),
+        legacy_kv: Default::default(),
+    }
+}
+
+/// A `PersistedTab` carrying NEGATIVE-coordinate slots and a NON-default camera
+/// round-trips byte-faithfully through serialize → deserialize (D4: signed
+/// slots + persisted camera). Guards the `i32` slot widening and the
+/// pan/zoom camera field.
+#[test]
+fn plane_persist_round_trips_signed_slots_and_camera() {
+    let mut tab = plane_persist_test_tab();
+    tab.desktop_slots = vec![(1, -3, -7), (2, 0, 0), (3, 5, -2)];
+    tab.desktop_spans = vec![(1, 2, 1)];
+    tab.camera = Some(PersistedCamera {
+        pan: (-2.5, 4.0),
+        zoom: workspace::Detail::Minimap,
+    });
+
+    let json = serde_json::to_string(&tab).expect("serialize");
+    let back: PersistedTab = serde_json::from_str(&json).expect("deserialize");
+
+    assert_eq!(back.desktop_slots, tab.desktop_slots, "signed slots survive");
+    assert_eq!(back.desktop_spans, tab.desktop_spans, "spans survive");
+    assert_eq!(back.camera, tab.camera, "camera (pan + zoom) survives");
+    // Explicitly pin the signed slot: a naive u32 tuple would have refused to
+    // parse `-3` at all, so a passing round-trip proves the widening.
+    assert!(
+        back.desktop_slots.contains(&(1, -3, -7)),
+        "negative-coordinate slot round-trips intact: {:?}",
+        back.desktop_slots
+    );
+}
+
+/// A LITERAL old-format `workspace.json` tab (unsigned `desktop_slots`, NO
+/// `camera` field, a retired `"layout_mode":"master_stack"`) deserializes with
+/// its slots intact and the camera defaulting to origin+Full — NO panic, the
+/// snapshot is NOT dropped (D4 / Behavior 7: existing files load transparently).
+#[test]
+fn old_workspace_json_loads_as_plane_with_origin_camera() {
+    // Note: `desktop_slots` here are the old NON-NEGATIVE values, written by a
+    // pre-plane binary as `u32`. They deserialize as the same positive `i32`.
+    let old = r#"{
+        "auto_name": "plane-1",
+        "display_name": null,
+        "focused_window": 1,
+        "layout": { "leaf": { "id": 1, "kind": "claude", "data": { "session_id": null } } },
+        "layout_mode": "master_stack",
+        "master_ratio": 0.6,
+        "master_count": 1,
+        "desktop_slots": [[1, 0, 0], [2, 1, 3]],
+        "cwd": "/tmp"
+    }"#;
+
+    let tab: PersistedTab =
+        serde_json::from_str(old).expect("old-format tab must load, not drop the snapshot");
+
+    assert_eq!(
+        tab.desktop_slots,
+        vec![(1, 0, 0), (2, 1, 3)],
+        "old unsigned slots load as the same positive signed slots"
+    );
+    assert!(
+        tab.camera.is_none(),
+        "absent camera field stays None (restored as Camera::default() = origin+Full)"
+    );
+    // The restore path turns an absent camera into the origin at Full.
+    let restored = tab
+        .camera
+        .map(|c| workspace::Camera {
+            pan: c.pan,
+            zoom: c.zoom,
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        restored,
+        workspace::Camera::default(),
+        "no persisted camera ⇒ origin+Full"
+    );
+    // Behavior 7 (Stage D): the retired mode surface is gone, so a persisted
+    // `"master_stack"` (or any old mode string) deserializes to the sole `Plane`
+    // value rather than failing the parse and dropping the snapshot. The load
+    // path ignores this field regardless — every workspace is a plane.
+    assert_eq!(tab.layout_mode, workspace::LayoutMode::Plane);
+}
+
+/// A camera whose `zoom` string is unknown to this binary (a value from a NEWER
+/// build) deserializes to `Full` via `Detail`'s hand-rolled fallback — it does
+/// NOT raise a serde error that would discard the whole snapshot (D4). This is
+/// the anti-circling guard: a derived `Detail` deserializer would hard-error
+/// here and silently reset the workspace on the next save.
+#[test]
+fn unknown_detail_zoom_falls_back_to_full() {
+    let json = r#"{ "pan": [1.0, 2.0], "zoom": "hyper" }"#;
+    let cam: PersistedCamera =
+        serde_json::from_str(json).expect("unknown zoom must fall back, not error");
+    assert_eq!(cam.zoom, workspace::Detail::Full, "unknown zoom ⇒ Full");
+    assert_eq!(cam.pan, (1.0, 2.0), "pan is unaffected by the zoom fallback");
+
+    // Direct `Detail` parse, mirroring the LayoutMode fallback test.
+    let d: workspace::Detail = serde_json::from_str("\"hyper\"").expect("unknown detail string");
+    assert_eq!(d, workspace::Detail::Full);
+    // Known strings still round-trip.
+    for (s, want) in [
+        ("\"full\"", workspace::Detail::Full),
+        ("\"card\"", workspace::Detail::Card),
+        ("\"minimap\"", workspace::Detail::Minimap),
+    ] {
+        let got: workspace::Detail = serde_json::from_str(s).unwrap();
+        assert_eq!(got, want, "{s}");
+    }
+    assert_eq!(
+        serde_json::to_string(&workspace::Detail::Minimap).unwrap(),
+        "\"minimap\""
     );
 }

@@ -135,6 +135,12 @@ Selecting a tile at `Card`/`Minimap` (click a card/pip, or focus-navigate to it
 then zoom in) returns to `Full` centered on that tile — the primary way back
 from a zoomed-out overview to work.
 
+**Maximized lone-tile is a `Full`-only affordance.** Desktop mode's existing
+"single tile fills the canvas, ignoring slot geometry" branch
+(`chrome.rs`, the maximize path) applies **only at `Full`**. At `Card`/`Minimap`
+every tile renders as its card/pip at its true slot position — a maximize at
+overview zoom would defeat the whole point of the overview.
+
 ### 4 · Placement — free, origin-seeded [DRAFT]
 
 Desktop mode's row-major **insert-and-shift shelf** (its Behavior 4, with the
@@ -176,6 +182,13 @@ empty plane is legitimately just origin + dot grid). A soft **recenter affordanc
 Keyboard focus changes auto-pan the minimum needed to reveal the focused tile
 (inherited from desktop mode). Empty plane shows a faint dot grid at the current
 slot pitch, with the origin slot marked distinctly.
+
+**Wheel/trackpad routing** (resolving desktop mode's canvas scroll-swallow at
+`chrome.rs`): at **`Full`**, scroll over a tile scrolls the tile's content
+(unchanged); scroll over empty canvas pans the plane. At **`Card`/`Minimap`**
+tile content isn't live, so bare wheel/trackpad pans the plane everywhere.
+`Cmd`/`Ctrl`+scroll zooms (steps `Detail`) at every level. Exact scroll *feel*
+is a `NEEDS-RUNTIME` gap.
 
 **Focus traversal.** Spatial directional focus (`spatial_neighbor`, unchanged —
 nearest occupied tile in a direction) is the primary motion. `focus_next` /
@@ -252,7 +265,7 @@ functions the Interfaces "reused unchanged" line covers.
 pub enum Detail { Full, Card, Minimap }          // 0, -1, -2
 
 pub struct Camera {
-    pub pan: (f32, f32),   // viewport offset in plane pixels at current Detail
+    pub pan: (f32, f32),   // top-left plane point in SLOT units (pitch-independent)
     pub zoom: Detail,      // current semantic-zoom level
 }
 impl Default for Camera {                         // origin
@@ -306,17 +319,27 @@ data, *module-internal* — called by the GPUI view layer):
   (Behavior 3). [DRAFT]
 - **`reset_view()`** — `camera = Camera::default()` (Behavior 6). [DRAFT]
 - **`pan_by(dx, dy)`** — unclamped viewport translation (Behavior 5). [DRAFT]
-- **`slot_pitch(detail) -> f32`** — pixels-per-slot for a Detail level; the one
-  place Full/Card/Minimap sizes are defined. [DRAFT]
+- **`detail_scale(detail) -> f32`** — the multiplier applied to the **Full**
+  pitch for a Detail level (`Full`→1.0, `Card`→smaller, `Minimap`→smallest); the
+  one place the three levels' relative sizes are defined. Pitch itself is
+  **per-axis and viewport-derived** (`desktop_tile_px()` in `chrome.rs` computes
+  `(w, h)` from the viewport ÷ `desktop_grid_{cols,rows}`), so the effective
+  pitch is `(f32, f32) = full_pitch ⊗ detail_scale(zoom)`. A scalar
+  `slot_pitch(detail) -> f32` is **infeasible** — pitch is anisotropic and
+  changes on window resize; keep `Preferences`' grid config as the single sizing
+  source and scale off it. [DRAFT]
 - **`seed_slot(&self) -> Slot`** — first free slot on the origin ring-spiral
   (Behavior 4). Replaces desktop-mode's `first_free_slot` shelf variant. [DRAFT]
 - Reused **type-only** from desktop mode (logic identical, `Slot` now `i32`):
-  `occupant`, `rect_of`, `set_anchor`, `spatial_neighbor`, `span_of`,
-  `sequence_neighbor` (still drives `focus_next/prev`, Behavior 5). Reused with
-  **semantic edits** (D1): `occupied_extent` (signed min+max box), `clamp_resize`
-  (no `0` wall), `slot_top_left` / `tile_rect` / `drop_target` (signed pixels),
+  `rect_of`, `set_anchor`, `spatial_neighbor`, `span_of`, `sequence_neighbor`
+  (still drives `focus_next/prev`, Behavior 5). Reused with **semantic edits**
+  (D1): `occupied_extent` (signed min+max box), `clamp_resize` (no `0` wall),
+  `occupant` / `rect_free` (mix `i32` anchor + `u32` span → need `as i32` casts,
+  NOT purely type-only), `slot_top_left` / `tile_rect` / `slot_at` (signed
+  pixels; `slot_at` drops its `.max(0.0)` clamps, keeps `.floor() as i32`),
   `reconcile` (now order-free: invariant is non-overlap + one-anchor-per-leaf,
-  no sequence). [DRAFT]
+  no sequence). **Note:** there is no `drop_target` function — the real drop seam
+  is `slot_at` + the commit in `chrome.rs::desktop_drop`. [DRAFT]
 
 **Commands / bindings** (indicative — final keys are a runtime detail; note the
 macOS `Ctrl`+digit / `Ctrl-Tab` unreliability from CLAUDE.md, so prefer chord
