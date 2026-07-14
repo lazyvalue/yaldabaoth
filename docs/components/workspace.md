@@ -182,11 +182,25 @@ live). All negative-control-verified RED.
 **Deviation from plan.** `slot_pitch(detail)->f32` was **infeasible** (pitch is
 anisotropic + viewport-derived); realized as `detail_scale(Detail)->f32` (Full 1.0 /
 Card 0.5 / Minimap 0.2) multiplied against the per-axis `desktop_tile_px` Full pitch.
-Wheel routing landed as: `Cmd`/`Ctrl`+scroll steps zoom at every level; bare scroll
-pans in slot units (at Full a bubble-phase canvas handler hit-tests `occupant` so
-tile-content scroll wins over a tile, empty canvas pans; at Card/Minimap bare scroll
-pans everywhere). Probe tags added: `plane-card-{id}`, `plane-tile-content-{id}`
-(via a new String-keyed `probe_bounds_dyn`). Exact scroll *feel* is `NEEDS-RUNTIME`.
+Input routing (refined after runtime use — see below): `Cmd`/`Ctrl`+scroll steps
+zoom at every level; **panning is `Cmd+Shift`+left-drag** (bare scroll no longer
+pans — it bubbles so tile content still scrolls). Probe tags added:
+`plane-card-{id}`, `plane-tile-content-{id}` (via a new String-keyed
+`probe_bounds_dyn`). Exact scroll/drag *feel* is `NEEDS-RUNTIME`.
+
+**Pan gesture (`Cmd+Shift`+drag), added 2026-07-14 after runtime feedback.**
+`DesktopState.pan_drag` (transient) + `chrome.rs::desktop_pan_grab` /
+`desktop_pointer_move` / `desktop_drop`: `Cmd+Shift`+left mouse-down on the
+canvas records the grab; mouse-move sets `camera.pan = start_pan − delta/pitch`
+(slot units, at the current zoom pitch), taking precedence over any tile
+drag/resize; mouse-up commits + persists. Bare scroll's panning was removed.
+**Enforcement.** `verify_harness.rs`: `cmd_shift_drag_pans_the_plane` (real
+`simulate_mouse_*` dispatch → the camera pans AND no tile moves; NC: neuter the
+pan application → RED) and `cmd_only_drag_does_not_pan_the_plane` (Cmd without
+Shift reaches the handler but must not pan; NC: drop `&& modifiers.shift` → RED).
+Note: GPUI's simulated dispatch doesn't deliver a *modifier-less* canvas down to
+the handler, so the shift requirement is guarded via the Cmd-only case, not a
+bare drag.
 
 ### UXI-Workspace-5 — Reset-to-origin returns the view to (0,0) at full detail
 

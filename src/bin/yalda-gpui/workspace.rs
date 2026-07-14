@@ -594,6 +594,17 @@ pub struct DesktopResize {
     pub pointer: (f32, f32),
 }
 
+/// Transient canvas-pan gesture (`Cmd+Shift`+left-drag pans the plane;
+/// `spec-infinite-plane-workspace.md` Behavior 5). Plain window-space pixels +
+/// the pan (slot units) captured at grab; never persisted.
+#[derive(Debug, Clone, Copy)]
+pub struct DesktopPan {
+    /// Window-space pointer at grab.
+    pub start_pointer: (f32, f32),
+    /// Camera `pan` (slot units) at grab — the drag is applied relative to this.
+    pub start_pan: (f32, f32),
+}
+
 /// Per-tab desktop-mode geometry (spec-desktop-mode.md). The layout tree
 /// remains the content owner; this owns ONLY placement. Invariant
 /// (Behavior 2): exactly one entry per tree leaf, no two entries share a
@@ -617,6 +628,8 @@ pub struct DesktopState {
     pub drag: Option<DesktopDrag>,
     /// Live edge resize, if any (spec Behavior 4b).
     pub resize: Option<DesktopResize>,
+    /// Live canvas pan gesture (`Cmd+Shift`+drag), if any. Transient.
+    pub pan_drag: Option<DesktopPan>,
     /// The window the auto-pan last revealed. The render path pans to the
     /// focused tile only when focus CHANGED since the last frame, so a
     /// manual pan away from the focused tile isn't fought every frame.

@@ -1349,11 +1349,20 @@ impl YaldaGpuiView {
                     && let Some(ent) = self.sessions.get(id)
                 {
                     let session = ent.read(cx);
-                    // resume_id wins over the channel id (keep retrying the
-                    // original id even when load fell back).
-                    let resolved_id = session
-                        .resume_id
-                        .clone()
+                    // The store's sid binding is authoritative and covers BOTH
+                    // created AND resumed sessions. A freshly-CREATED
+                    // server-managed session has `resume_id == None` (it was never
+                    // resumed) and `channel == None` (the daemon owns the channel),
+                    // so the old `resume_id / channel.session_id()` resolution
+                    // returned None for it → it was never persisted → its tile came
+                    // back as a picker on restart. `sid_of` is the id the store
+                    // bound at create/attach time; fall back to the old sources
+                    // only if the store somehow lacks it.
+                    let resolved_id = self
+                        .sessions
+                        .sid_of(id)
+                        .map(|s| s.to_string())
+                        .or_else(|| session.resume_id.clone())
                         .or_else(|| session.state.channel.as_ref().and_then(|c| c.session_id()));
                     if let Some(rid) = resolved_id {
                         let draft = session.state.input_surface.compose().text();

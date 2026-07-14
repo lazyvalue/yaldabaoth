@@ -196,6 +196,19 @@ impl YaldaGpuiView {
             .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _w, cx| {
                 this.desktop_scroll(ev, cx);
             }))
+            // `Cmd+Shift`+left-drag pans the plane (spec Behavior 5). Armed on
+            // the canvas root so it works over tiles too; the pan gesture takes
+            // precedence over any tile drag in `desktop_pointer_move`.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                    this.desktop_pan_grab(
+                        (f32::from(ev.position.x), f32::from(ev.position.y)),
+                        ev.modifiers,
+                        cx,
+                    );
+                }),
+            )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
                 this.desktop_pointer_move((f32::from(ev.position.x), f32::from(ev.position.y)), cx);
             }))
@@ -781,23 +794,33 @@ impl YaldaGpuiView {
             return;
         }
 
-        // Bare scroll at Full over a LIVE tile: swallow so the tile's own inner
-        // scroll wins (empty-canvas scroll pans). At Card/Minimap always pan.
-        if zoom == workspace::Detail::Full {
-            let desktop_pos = (
-                f32::from(ev.position.x) - cx0 + pan.0,
-                f32::from(ev.position.y) - cy0 + pan.1,
-            );
-            let over_slot = workspace::slot_at(desktop_pos, tile, g);
-            if self.workspace.tabs[tab_idx].desktop.occupant(over_slot).is_some() {
-                return;
-            }
-        }
+        // Bare scroll does NOT pan — panning is `Cmd+Shift`+drag (Behavior 5).
+        // Let the event bubble so a tile's own inner content still scrolls;
+        // over empty canvas it is simply a no-op.
+        let _ = (dx, cx0, cy0, g);
+    }
 
-        // Pan in slot units (trackpad "content follows fingers" → subtract).
-        let tab = &mut self.workspace.tabs[tab_idx];
-        tab.desktop.pan_by(-dx / pitch.0, -dy / pitch.1);
-        self.save_workspace_state();
+    /// `Cmd+Shift`+left mouse-down anywhere on the canvas arms a plane pan
+    /// (spec Behavior 5). Without both modifiers it is a no-op, so ordinary
+    /// clicks / tile drags are unaffected. The gesture is applied in
+    /// [`desktop_pointer_move`](Self::desktop_pointer_move) and ended in
+    /// [`desktop_drop`](Self::desktop_drop).
+    pub(crate) fn desktop_pan_grab(
+        &mut self,
+        window_pos: (f32, f32),
+        modifiers: gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        // `secondary()` is Cmd on macOS (the platform key); require Shift too.
+        if !(modifiers.secondary() && modifiers.shift) {
+            return;
+        }
+        let tab_idx = self.workspace.active_tab;
+        let start_pan = self.workspace.tabs[tab_idx].desktop.camera.pan;
+        self.workspace.tabs[tab_idx].desktop.pan_drag = Some(workspace::DesktopPan {
+            start_pointer: window_pos,
+            start_pan,
+        });
         cx.notify();
     }
 
@@ -912,6 +935,25 @@ impl YaldaGpuiView {
         let pitch = (tile.0 + DESKTOP_GUTTER, tile.1 + DESKTOP_GUTTER);
         let tab_idx = self.workspace.active_tab;
 
+        // A `Cmd+Shift` canvas pan takes precedence over any tile drag/resize:
+        // move the camera relative to the grab, converting the pixel delta to
+        // slot units at the CURRENT zoom pitch (pan is pitch-independent).
+        if let Some(p) = self.workspace.tabs[tab_idx].desktop.pan_drag {
+            let scale = workspace::detail_scale(self.workspace.tabs[tab_idx].desktop.camera.zoom);
+            let zpitch = (
+                (tile.0 * scale) + DESKTOP_GUTTER * scale,
+                (tile.1 * scale) + DESKTOP_GUTTER * scale,
+            );
+            let dx = window_pos.0 - p.start_pointer.0;
+            let dy = window_pos.1 - p.start_pointer.1;
+            // Grab-and-drag: content follows the cursor, so the camera pan moves
+            // opposite the pointer.
+            self.workspace.tabs[tab_idx].desktop.camera.pan =
+                (p.start_pan.0 - dx / zpitch.0, p.start_pan.1 - dy / zpitch.1);
+            cx.notify();
+            return;
+        }
+
         // A live resize takes precedence over (and is mutually exclusive with)
         // a drag: just track the pointer; the render pass clamps the span.
         {
@@ -981,6 +1023,13 @@ impl YaldaGpuiView {
     /// click when the threshold was never crossed.
     pub(crate) fn desktop_drop(&mut self, cx: &mut Context<Self>) {
         let tab_idx = self.workspace.active_tab;
+
+        // End a `Cmd+Shift` canvas pan (Behavior 5) — persist the final view.
+        if self.workspace.tabs[tab_idx].desktop.pan_drag.take().is_some() {
+            self.save_workspace_state();
+            cx.notify();
+            return;
+        }
 
         // Commit a live edge resize (spec Behavior 4b) — the clamped anchor +
         // span the preview showed become the stored placement. West/North move

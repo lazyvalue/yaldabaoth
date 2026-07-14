@@ -9687,3 +9687,145 @@ fn ctrl_w_zoom_steps_detail(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     assert_eq!(zoom(&view, vcx), Detail::Card, "one step in ⇒ Card");
 }
+
+/// `Cmd+Shift`+left-drag pans the plane camera (spec Behavior 5) and moves NO
+/// tile. Drives the REAL mouse dispatch (`simulate_mouse_*` → the canvas root's
+/// `on_mouse_down`/`on_mouse_move`/`on_mouse_up` → `desktop_pan_grab` /
+/// `desktop_pointer_move` / `desktop_drop`), not the handlers directly.
+///
+/// NEGATIVE CONTROL (observed RED): drop the `&& modifiers.shift` guard in
+/// `desktop_pan_grab` → the bare-drag sibling test below starts panning and its
+/// `pan == (0,0)` assert fails.
+#[gpui::test]
+fn cmd_shift_drag_pans_the_plane(cx: &mut TestAppContext) {
+    use gpui::{point, px, Modifiers, MouseButton};
+    let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
+
+    let slots_before = view.read_with(vcx, |v, _| {
+        let d = &v.workspace.active_tab().unwrap().desktop;
+        (d.slot_of(win_a), d.slot_of(win_b))
+    });
+
+    // Drag over EMPTY canvas (tiles sit at slots (0,0) and (0,100); x≈600 is
+    // empty) so the canvas-root pan handler owns the gesture.
+    let cmd_shift = Modifiers {
+        platform: true,
+        shift: true,
+        ..Default::default()
+    };
+    vcx.simulate_mouse_down(point(px(600.0), px(400.0)), MouseButton::Left, cmd_shift);
+    vcx.simulate_mouse_move(
+        point(px(450.0), px(320.0)),
+        Some(MouseButton::Left),
+        cmd_shift,
+    );
+    vcx.simulate_mouse_up(point(px(450.0), px(320.0)), MouseButton::Left, cmd_shift);
+    vcx.run_until_parked();
+
+    let (pan, slots_after) = view.read_with(vcx, |v, _| {
+        let d = &v.workspace.active_tab().unwrap().desktop;
+        (d.camera.pan, (d.slot_of(win_a), d.slot_of(win_b)))
+    });
+    // Pointer moved left+up; content follows the cursor, so the camera pan
+    // moves positive on both axes. Non-vacuous (a real, sizable shift).
+    assert!(
+        pan.0 > 0.1 && pan.1 > 0.1,
+        "Cmd+Shift drag pans the camera (got {pan:?})"
+    );
+    assert_eq!(
+        slots_before, slots_after,
+        "panning is view-only — it must NOT move a tile"
+    );
+}
+
+/// The **Shift** requirement is load-bearing: a `Cmd`-ONLY drag (which DOES
+/// reach `desktop_pan_grab`, unlike a modifier-less down) must NOT pan, because
+/// `shift` is absent. This is the non-vacuous negative control for the shift
+/// half of the guard: revert `&& modifiers.shift` and this test goes RED.
+#[gpui::test]
+fn cmd_only_drag_does_not_pan_the_plane(cx: &mut TestAppContext) {
+    use gpui::{point, px, Modifiers, MouseButton};
+    let (view, vcx, _win_a, _win_b) = boot_desktop_two_tiles(cx);
+
+    // Cmd held, Shift NOT held — over the same empty canvas the Cmd+Shift test
+    // uses (so the gesture reaches the canvas-root handler).
+    let cmd_only = Modifiers {
+        platform: true,
+        ..Default::default()
+    };
+    vcx.simulate_mouse_down(point(px(600.0), px(400.0)), MouseButton::Left, cmd_only);
+    vcx.simulate_mouse_move(point(px(450.0), px(320.0)), Some(MouseButton::Left), cmd_only);
+    vcx.simulate_mouse_up(point(px(450.0), px(320.0)), MouseButton::Left, cmd_only);
+    vcx.run_until_parked();
+
+    let pan = view.read_with(vcx, |v, _| {
+        v.workspace.active_tab().unwrap().desktop.camera.pan
+    });
+    assert_eq!(pan, (0.0, 0.0), "Cmd WITHOUT Shift must not pan the plane");
+}
+
+/// REGRESSION (bug-0001): a freshly-CREATED server-managed session — `resume_id`
+/// None (never resumed) and `channel` None (the daemon owns the channel) — must
+/// STILL be persisted so its tile auto-resumes on restart (UXI-AgentTile-18). Its
+/// server id lives ONLY in the store's sid binding, so `save_agent_ring` must
+/// resolve it via `sid_of`, not `resume_id` / `channel.session_id()` (both None
+/// here). This is the real bug behind "still prompted with a picker": only RESUMED
+/// sessions were being persisted; created ones came back as pickers. Drives the
+/// REAL `save_agent_ring` and asserts the tile's `resume_sid` + the persisted
+/// layout leaf carry the id.
+///
+/// Negative control: revert `save_agent_ring` to the `resume_id`/`channel` chain →
+/// `resolved_id` is None → the tile is never stamped → `resume_sid` stays None →
+/// both asserts fail RED.
+#[gpui::test]
+fn created_server_session_persists_its_id_for_restore(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState, AgentTile, App};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("acp_sessions.json");
+
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    let win = view.update(vcx, |v, cx| {
+        v.set_screen(App::Agent(AgentTile::new()));
+        // A CREATED server-managed session: resume_id None + channel None.
+        let id = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(None),
+                label: "claude-created".into(),
+                cwd: PathBuf::from("."),
+                resume_id: None,
+            },
+            cx,
+        );
+        // The store binds the server-assigned sid (as the create resolution does).
+        v.sessions.bind_sid(id, "SID-CREATED".into()).unwrap();
+        crate::persist::with_acp_persist_path(file.clone(), || v.save_agent_ring(cx));
+        v.workspace.focused_window_id().expect("focused")
+    });
+
+    view.read_with(vcx, |v, _cx| {
+        for tab in v.workspace.tabs.iter() {
+            if let Some(w) = tab.layout.find_leaf(win)
+                && let App::Agent(t) = &w.content
+            {
+                assert_eq!(
+                    t.resume_sid.as_deref(),
+                    Some("SID-CREATED"),
+                    "a created session's id must be cached on the tile for persistence"
+                );
+                // Full chain: the persisted layout leaf carries the id.
+                match crate::persist::snapshot_content(&w.content) {
+                    crate::persist::PersistedKind::Agent { session_id } => assert_eq!(
+                        session_id.as_deref(),
+                        Some("SID-CREATED"),
+                        "workspace.json leaf must persist the created session id"
+                    ),
+                    other => panic!("expected Agent kind, got {other:?}"),
+                }
+                return;
+            }
+        }
+        panic!("agent tile not found");
+    });
+}

@@ -1814,6 +1814,7 @@ impl YaldaGpuiView {
                     .unwrap_or_default(),
                 drag: None,
                 resize: None,
+                pan_drag: None,
                 last_reveal: None,
             };
             ws.tabs.push(tab);

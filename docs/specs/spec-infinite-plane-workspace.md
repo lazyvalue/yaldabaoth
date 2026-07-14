@@ -183,12 +183,13 @@ Keyboard focus changes auto-pan the minimum needed to reveal the focused tile
 (inherited from desktop mode). Empty plane shows a faint dot grid at the current
 slot pitch, with the origin slot marked distinctly.
 
-**Wheel/trackpad routing** (resolving desktop mode's canvas scroll-swallow at
-`chrome.rs`): at **`Full`**, scroll over a tile scrolls the tile's content
-(unchanged); scroll over empty canvas pans the plane. At **`Card`/`Minimap`**
-tile content isn't live, so bare wheel/trackpad pans the plane everywhere.
-`Cmd`/`Ctrl`+scroll zooms (steps `Detail`) at every level. Exact scroll *feel*
-is a `NEEDS-RUNTIME` gap.
+**Input routing** (SHIPPED — refined after runtime use): **`Cmd`/`Ctrl`+scroll
+zooms** (steps `Detail`, anchored on the focused tile) at every level. **Panning
+is `Cmd+Shift`+left-drag** on the canvas (armed at the canvas root so it works
+over tiles too, and takes precedence over any tile drag). **Bare scroll does
+NOT pan** — it bubbles so a tile's own inner content still scrolls, and is a
+no-op over empty canvas. Keyboard focus changes still auto-pan to reveal the
+focused tile. Exact drag/scroll *feel* is a `NEEDS-RUNTIME` gap.
 
 **Focus traversal.** Spatial directional focus (`spatial_neighbor`, unchanged —
 nearest occupied tile in a direction) is the primary motion. `focus_next` /
