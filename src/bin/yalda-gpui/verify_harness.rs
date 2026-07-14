@@ -9829,3 +9829,77 @@ fn created_server_session_persists_its_id_for_restore(cx: &mut TestAppContext) {
         panic!("agent tile not found");
     });
 }
+
+/// REGRESSION (bug-0001, 2nd mechanism): `save_agent_ring` stamps `resume_sid` in
+/// memory + writes acp_sessions.json, but the per-tile id RESTORE reads lives in
+/// `workspace.json` (written by `save_workspace_state`, which otherwise only runs
+/// on structural changes). If save_agent_ring doesn't persist the layout,
+/// workspace.json goes STALE and a session you create-and-use comes back as a
+/// picker. Drives the REAL `save_agent_ring` and asserts the ON-DISK
+/// workspace.json — the exact file restore loads — carries the session id.
+///
+/// Negative control: drop the `self.save_workspace_state()` at the end of
+/// `save_agent_ring` → workspace.json is never written / lacks the id → RED.
+#[gpui::test]
+fn save_agent_ring_persists_session_id_to_workspace_json(cx: &mut TestAppContext) {
+    use crate::persist::{
+        PersistedKind, PersistedLayout, load_persisted_workspace, with_acp_persist_path,
+        with_workspace_path,
+    };
+    use crate::{AgentSession, AgentState, AgentTile, App};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ws_file = dir.path().join("workspace.json");
+    let acp_file = dir.path().join("acp_sessions.json");
+
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        v.set_screen(App::Agent(AgentTile::new()));
+        let id = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(None),
+                label: "claude-created".into(),
+                cwd: PathBuf::from("."),
+                resume_id: None,
+            },
+            cx,
+        );
+        v.sessions.bind_sid(id, "SID-WS".into()).unwrap();
+        with_workspace_path(ws_file.clone(), || {
+            with_acp_persist_path(acp_file.clone(), || {
+                v.save_agent_ring(cx);
+            });
+        });
+    });
+
+    // Load the ACTUAL workspace.json the restore path reads.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let found = with_workspace_path(ws_file.clone(), || {
+        let ws = load_persisted_workspace(&cwd).expect("workspace.json was written");
+        fn collect(l: &PersistedLayout, out: &mut Vec<Option<String>>) {
+            match l {
+                PersistedLayout::Leaf(leaf) => {
+                    if let PersistedKind::Agent { session_id } = &leaf.kind {
+                        out.push(session_id.clone());
+                    }
+                }
+                PersistedLayout::Split { children, .. } => {
+                    for (_, c) in children {
+                        collect(c, out);
+                    }
+                }
+            }
+        }
+        let mut ids = Vec::new();
+        for t in &ws.tabs {
+            collect(&t.layout, &mut ids);
+        }
+        ids
+    });
+
+    assert!(
+        found.iter().any(|s| s.as_deref() == Some("SID-WS")),
+        "workspace.json (the file restore reads) must carry the created session's id; got {found:?}"
+    );
+}

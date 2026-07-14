@@ -1885,6 +1885,16 @@ impl YaldaGpuiView {
             let any_identity = leaves
                 .iter()
                 .any(|(_, sid)| sid.as_deref().is_some_and(|s| !s.is_empty()));
+            eprintln!(
+                "[yalda-gpui] restore(server): {} agent leaves, {} persisted sessions, any_identity={}; leaf ids: {:?}",
+                leaves.len(),
+                persisted.len(),
+                any_identity,
+                leaves
+                    .iter()
+                    .map(|(w, sid)| (w, sid.as_deref().map(|s| &s[..s.len().min(8)])))
+                    .collect::<Vec<_>>(),
+            );
             for (i, (leaf_id, persisted_sid)) in leaves.iter().enumerate() {
                 self.install_agent_tile(*leaf_id, AgentTile::new());
                 self.focus_window_for_restore(*leaf_id);
@@ -1951,6 +1961,10 @@ impl YaldaGpuiView {
                                     tile.resume_sid = Some(slot.id.clone());
                                 }
                                 attach_sids.push(slot.id.clone());
+                                eprintln!(
+                                    "[yalda-gpui] restore leaf {leaf_id}: BOUND+resume {}",
+                                    &slot.id[..slot.id.len().min(8)]
+                                );
                             }
                             agent_sessions::Bind::AlreadyOpen(_) => {
                                 if let Some(tile) = self.agent_tile_mut() {
@@ -1959,6 +1973,10 @@ impl YaldaGpuiView {
                                 }
                                 // Selector projects from the roster; seed it.
                                 self.refresh_roster(cx);
+                                eprintln!(
+                                    "[yalda-gpui] restore leaf {leaf_id}: PICKER (sid {} already open — duplicate)",
+                                    &slot.id[..slot.id.len().min(8)]
+                                );
                             }
                         }
                     }
@@ -1971,6 +1989,9 @@ impl YaldaGpuiView {
                             tile.picker = Some(SessionPicker::new());
                         }
                         self.refresh_roster(cx);
+                        eprintln!(
+                            "[yalda-gpui] restore leaf {leaf_id}: PICKER (no persisted id for this leaf)"
+                        );
                     }
                 }
             }

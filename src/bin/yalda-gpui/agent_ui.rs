@@ -1396,6 +1396,14 @@ impl YaldaGpuiView {
             });
         }
         save_persisted_acp_sessions(&cwd, &snaps);
+        // CRITICAL (bug-0001): we just stamped `resume_sid` on the tiles, but the
+        // per-tile session id that RESTORE reads lives in `workspace.json`, written
+        // by `save_workspace_state` — which otherwise only runs on structural
+        // changes (split/close/move). Without this, a session you create and merely
+        // *use* never gets its id into `workspace.json` (acp_sessions.json updates,
+        // workspace.json goes stale) → restart shows a picker. Persist the layout
+        // now so the two files stay in sync.
+        self.save_workspace_state();
     }
 
     /// Build an `AgentState` with an ACP attach thread (direct-spawn path).

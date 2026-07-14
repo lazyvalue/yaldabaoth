@@ -21,7 +21,7 @@ and a **timestamped log** of every actual attempt.
 
 | Id | Slug | Status | First seen | Times addressed | One-line |
 |----|------|--------|------------|-----------------|----------|
-| bug-0001 | created-session-not-persisted | FIXED | 2026-07-14 | 1 | created server-managed sessions weren't persisted (resume_id/channel both None) → picker on restart; fixed by resolving the sid via the store's `sid_of` |
+| bug-0001 | created-session-not-persisted | RECURRED→FIXED | 2026-07-14 | 3 | created server-managed sessions weren't persisted (resume_id/channel both None) → picker on restart; fixed by resolving the sid via the store's `sid_of` |
 
 <!-- Example row once populated:
 | bug-0001 | chatbox-caret-offscreen | RECURRED | 2026-05-02 | 16 | caret + text scroll out of the visible chatbox; no single owner of caret-in-viewport |
