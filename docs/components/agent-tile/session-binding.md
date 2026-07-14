@@ -47,12 +47,15 @@ automatically.
 **Status.** `implemented` (persistence layer, headless — identity round-trips per
 leaf; the live re-attach of the resumed session is the runtime tail, harness gap #2).
 
-**Enforcement.** `tests.rs::agent_tile_persists_session_identity_not_index` — a
-layout with two agent tiles round-trips through `snapshot_layout`/`restore_layout`
-and each leaf comes back paired with ITS OWN session id (identity independent of
-list order). Negative-controlled (reverting `snapshot_content` to `None` → RED).
-Live re-attach: human runtime check (restart yalda, tiles reconnect to their
-sessions).
+**Enforcement.** `tests.rs::agent_tile_persists_session_identity_not_index` — the
+identity round-trips per leaf through `snapshot_layout`/`restore_layout` (independent
+of list order; negative-controlled). AND
+`verify_harness.rs::created_server_session_persists_its_id_for_restore` — drives the
+REAL `save_agent_ring` for a freshly-CREATED server-managed session (`resume_id`
+None, `channel` None) and asserts its id IS persisted (via the store's `sid_of`), not
+dropped. **The second test is load-bearing:** the first passed while the app was
+still broken because it set `resume_sid` by hand and never exercised the save path
+that resolves a created session's id (bug-0001). Live re-attach: human runtime check.
 
 ### UXI-AgentTile-19 — An unresumable session shows an inline "start fresh" notice, never a picker
 
