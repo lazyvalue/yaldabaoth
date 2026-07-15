@@ -2478,6 +2478,102 @@ fn agent_reducer_rebaselines_on_newer_generation(cx: &mut TestAppContext) {
     );
 }
 
+/// bug-0002 — restore drops the replayed history when a respawn (generation
+/// bump) happened while the §9 gate was still closed (the earliest generation
+/// never completed a turn, e.g. the agent crashed/timed-out on the first turn).
+///
+/// This drives the REAL `apply_server_batch` with the MIXED stream the pump sees
+/// on a full-log replay: for each content event the server records the canonical
+/// `Agent` twin THEN the legacy `ReplyEvent` (Command::Record ordering). The gate
+/// starts closed, so the legacy stream renders the replayed history while the
+/// reducer only observes boundaries. The bug: the generation bump's rebaseline
+/// was DEFERRED (pre-gate non-boundary Agent events skipped) until the new
+/// generation's `ReplayEnd` boundary — and `reset_for_replay` there wiped the
+/// legacy-rendered history that the reducer had skipped, so it vanished.
+///
+/// The fix applies the rebaseline the instant the newer generation is observed
+/// (its `ChannelOpened`), which only wipes the superseded older generation; the
+/// new generation's replay then survives. Assert the replayed answer is present.
+#[gpui::test]
+fn restore_keeps_replayed_history_across_a_gate_closed_generation_bump(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::agent_event::{AgentEventKind as K, ChunkRole, TurnOutcome};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_with_bound_slot(cx, "S1");
+
+    let reply = |event: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event,
+    };
+
+    // The full-log replay a restarted GUI attaches to. Generation 0 is the first
+    // channel (initial `channel_generation == 0`), whose ONLY turn crashed before
+    // completing (NO `TurnEnded`) — so the §9 gate never flipped. A respawn bumps
+    // to generation 1, which replays the recovered history and ends on ReplayEnd.
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            // ── generation 0: a crashed first turn, no boundary ──────────────
+            agent_note("S1", 0, 0, 0, K::ChannelOpened { resumed: false }),
+            ServerNotification::UserPrompt {
+                session_id: "S1".into(),
+                text: "the question".into(),
+            },
+            agent_note(
+                "S1",
+                0,
+                0,
+                1,
+                K::Chunk {
+                    text: "GEN0-PARTIAL-then-crash".into(),
+                    role: ChunkRole::Message,
+                },
+            ),
+            reply(ReplyEvent::Chunk("GEN0-PARTIAL-then-crash".into())),
+            // ── generation 1: respawn re-emits the full history, ends ReplayEnd
+            agent_note("S1", 1, 0, 0, K::ChannelOpened { resumed: true }),
+            agent_note("S1", 1, 0, 1, K::UserMessage { text: "the question".into() }),
+            reply(ReplyEvent::UserMessage("the question".into())),
+            agent_note(
+                "S1",
+                1,
+                0,
+                2,
+                K::Chunk {
+                    text: "REPLAYED-ANSWER-must-survive".into(),
+                    role: ChunkRole::Message,
+                },
+            ),
+            reply(ReplyEvent::Chunk("REPLAYED-ANSWER-must-survive".into())),
+            agent_note(
+                "S1",
+                1,
+                0,
+                3,
+                K::TurnEnded {
+                    outcome: TurnOutcome::ReplayEnd,
+                },
+            ),
+            reply(ReplyEvent::ReplayComplete),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+
+    let text = active_transcript_text(&view, vcx);
+    assert!(
+        text.contains("REPLAYED-ANSWER-must-survive"),
+        "the replayed history must survive a gate-closed generation bump on \
+         restore (bug-0002); transcript was:\n{text}"
+    );
+    // The crashed generation-0 attempt is correctly superseded by the respawn's
+    // replay — it must NOT linger alongside the recovered history.
+    assert!(
+        !text.contains("GEN0-PARTIAL-then-crash"),
+        "the superseded (older-generation) crashed attempt must be wiped; \
+         transcript was:\n{text}"
+    );
+}
+
 /// §7/§8 explicit Unknown + CompactedSummary arms: Unknown renders nothing (but
 /// is not an error), CompactedSummary inserts a deterministic placeholder.
 #[gpui::test]

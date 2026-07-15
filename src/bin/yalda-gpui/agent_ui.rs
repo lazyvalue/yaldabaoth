@@ -2099,7 +2099,28 @@ impl YaldaGpuiView {
                                 &event.kind,
                                 yalda::agent_event::AgentEventKind::TurnEnded { .. }
                             );
-                            if authoritative_before || is_boundary {
+                            // A strictly-newer generation is the §4 rebaseline
+                            // signal — the respawned channel's `ChannelOpened` is
+                            // its first event (session-server publishes it before
+                            // any content). It MUST be applied the instant it is
+                            // observed, even pre-gate: `apply_agent_event` runs
+                            // `reset_for_replay` on the bump. If instead we DEFER
+                            // it (skip pre-gate non-boundary events) the reset
+                            // lands on the new generation's first *boundary* — by
+                            // which point the legacy stream has rendered the whole
+                            // replayed history for the intervening generation(s),
+                            // and `reset_for_replay` wipes it. The gated reducer
+                            // skipped the Agent-stream copies, so that history can
+                            // never be rebuilt → on restore the transcript loses
+                            // everything up to the last live turn (bug-0002).
+                            // Rebaselining HERE resets only strictly-older
+                            // (superseded) content; the new generation's replay
+                            // then renders via the legacy stream and survives (no
+                            // later same-generation reset). `ChannelOpened` is
+                            // content-free, so applying it pre-gate cannot
+                            // double-apply against the legacy stream.
+                            let is_rebaseline = event.generation > claude.generation;
+                            if authoritative_before || is_boundary || is_rebaseline {
                                 let effect = Self::apply_agent_event(claude, event);
                                 Self::settle_agent_effect(claude, effect);
                             }
