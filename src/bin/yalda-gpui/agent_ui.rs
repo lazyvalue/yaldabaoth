@@ -51,8 +51,8 @@ impl YaldaGpuiView {
             // Open the tile straight into the picker (unbound). The picker
             // projects the FREE sessions for the cwd + "start new" from the
             // universal roster (universal-agent-list); refresh it in case it's
-            // stale since the last seed.
-            tile.picker = Some(SessionPicker::new());
+            // stale since the last seed. (A fresh `AgentTile::new()` is already
+            // `Selecting`, so no explicit picker set is needed.)
             self.start_server_pump(cx);
             self.set_screen(App::Agent(tile));
             self.refresh_roster(cx);
@@ -209,7 +209,7 @@ impl YaldaGpuiView {
         for tab in self.workspace.tabs.iter() {
             tab.layout.for_each_leaf(&mut |w| {
                 if let App::Agent(tile) = &w.content
-                    && let Some(id) = tile.bound
+                    && let Some(id) = tile.session()
                     && let Some(sid) = self.sessions.sid_of(id)
                 {
                     bound.insert(sid.to_string());
@@ -221,14 +221,14 @@ impl YaldaGpuiView {
 
     /// Move the picker highlight (j/k or ↑/↓). No-op outside picker mode.
     pub(crate) fn agent_picker_move(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.agent_tile().and_then(|t| t.picker.as_ref()).is_none() {
+        if self.agent_tile().and_then(|t| t.picker()).is_none() {
             return;
         }
         // Row count = "start new" + the FREE roster rows for the active
         // workspace's LIVE cwd (same source the picker renders/creates from).
         let cwd = self.agent_base_cwd();
         let n = (1 + self.picker_projection(&cwd).0.len()) as isize;
-        if let Some(picker) = self.agent_tile_mut().and_then(|t| t.picker.as_mut()) {
+        if let Some(picker) = self.agent_tile_mut().and_then(|t| t.picker_mut()) {
             if n > 0 {
                 picker.selected = (picker.selected as isize + delta).rem_euclid(n) as usize;
             }
@@ -258,7 +258,7 @@ impl YaldaGpuiView {
         // session" creates the agent in the dir you just set. Rows are PROJECTED
         // from the universal roster for that same cwd (the list
         // `render_agent_picker` shows), so row indices resolve against it.
-        let has_picker = self.agent_tile().and_then(|t| t.picker.as_ref()).is_some();
+        let has_picker = self.agent_tile().and_then(|t| t.picker()).is_some();
         let choice = if !has_picker {
             None
         } else {
@@ -313,7 +313,7 @@ impl YaldaGpuiView {
             cx,
         );
         if let Some(tile) = self.agent_tile_mut() {
-            tile.pending_open_token = Some(open_token);
+            tile.set_pending(Some(open_token));
         }
         self.spawn_create_agent_session(open_token, label, cwd, None, cx);
         if let Some(mut c) = self.agent_mut(cx) {
@@ -327,9 +327,10 @@ impl YaldaGpuiView {
     /// clear the unavailable state + the dead remembered id, then open a new
     /// session in this same tile (the picker's new-session path).
     pub(crate) fn start_fresh_after_unavailable(&mut self, cx: &mut Context<Self>) {
+        // Leave the Unavailable state; `picker_start_new` immediately binds a fresh
+        // session into this tile (Selecting → Bound).
         if let Some(tile) = self.agent_tile_mut() {
-            tile.unavailable = None;
-            tile.resume_sid = None;
+            tile.show_picker();
         }
         let cwd = self.agent_base_cwd();
         self.picker_start_new(cwd, cx);
@@ -365,7 +366,7 @@ impl YaldaGpuiView {
             cx,
         );
         if let Some(tile) = self.agent_tile_mut() {
-            tile.pending_open_token = Some(open_token);
+            tile.set_pending(Some(open_token));
         }
         let status = if connected {
             "reconnecting…"
@@ -405,7 +406,7 @@ impl YaldaGpuiView {
             Key::Enter => {
                 if let Some(row) = self
                     .agent_tile()
-                    .and_then(|t| t.picker.as_ref())
+                    .and_then(|t| t.picker())
                     .map(|p| p.selected)
                 {
                     self.agent_picker_activate(row, cx);
@@ -551,9 +552,9 @@ impl YaldaGpuiView {
             let mut found = None;
             tab.layout.for_each_leaf(&mut |w| {
                 if let App::Agent(tile) = &w.content
-                    && tile.pending_open_token == Some(token)
+                    && tile.pending_token() == Some(token)
                 {
-                    found = tile.bound;
+                    found = tile.session();
                 }
             });
             if found.is_some() {
@@ -575,7 +576,7 @@ impl YaldaGpuiView {
             let mut found = None;
             tab.layout.for_each_leaf(&mut |w| {
                 if let App::Agent(tile) = &w.content
-                    && tile.bound == Some(sid)
+                    && tile.session() == Some(sid)
                 {
                     found = Some(w.id);
                 }
@@ -602,7 +603,7 @@ impl YaldaGpuiView {
             self.jump_to_window(wid);
         } else {
             let mut tile = AgentTile::new();
-            tile.bound = Some(sid);
+            tile.bind(sid);
             self.workspace.open_ephemeral_tab(App::Agent(tile));
         }
         cx.notify();
@@ -679,9 +680,9 @@ impl YaldaGpuiView {
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
                 if let App::Agent(tile) = content
-                    && tile.pending_open_token == Some(token)
+                    && tile.pending_token() == Some(token)
                 {
-                    tile.pending_open_token = None;
+                    tile.set_pending(None);
                 }
             });
         }
@@ -730,9 +731,7 @@ impl YaldaGpuiView {
         match self.agent_tile_id_bound_to(owner) {
             Some(owner_win) if Some(owner_win) != current => {
                 if let Some(tile) = self.agent_tile_mut() {
-                    tile.bound = None;
-                    tile.pending_open_token = None;
-                    tile.picker = Some(SessionPicker::new());
+                    tile.show_picker();
                 }
                 // The selector projects from the roster; the owner is now
                 // filtered out as bound. Refresh the roster, then reveal the
@@ -744,9 +743,8 @@ impl YaldaGpuiView {
             }
             _ => {
                 if let Some(tile) = self.agent_tile_mut() {
-                    tile.bound = Some(owner);
-                    tile.picker = None;
-                    tile.pending_open_token = None;
+                    tile.bind(owner);
+                    tile.set_pending(None);
                 }
             }
         }
@@ -918,7 +916,7 @@ impl YaldaGpuiView {
                 cx,
             );
             if let Some(tile) = self.agent_tile_mut() {
-                tile.pending_open_token = Some(open_token);
+                tile.set_pending(Some(open_token));
             }
             self.spawn_create_agent_session(open_token, label, slot_cwd, None, cx);
         } else {
@@ -982,7 +980,7 @@ impl YaldaGpuiView {
             );
             self.start_server_pump(cx);
             if let Some(tile) = self.agent_tile_mut() {
-                tile.pending_open_token = Some(open_token);
+                tile.set_pending(Some(open_token));
             }
             if let Some(mut c) = self.agent_mut(cx) {
                 c.editor.begin_insert();
@@ -1194,7 +1192,7 @@ impl YaldaGpuiView {
             }
             // Stamp the focused tile (which shows this session) with the token.
             if let Some(tile) = self.agent_tile_mut() {
-                tile.pending_open_token = Some(open_token);
+                tile.set_pending(Some(open_token));
             }
             self.spawn_create_agent_session(
                 open_token,
@@ -1234,7 +1232,7 @@ impl YaldaGpuiView {
     /// tile so the caller can bind fresh.
     pub(crate) fn release_focused_session_for_rebind(&mut self) {
         let bound = self.focused_bound_session();
-        let pending = self.agent_tile().and_then(|t| t.pending_open_token);
+        let pending = self.agent_tile().and_then(|t| t.pending_token());
         if let Some(id) = bound {
             let sid_less = self.sessions.sid_of(id).is_none();
             if sid_less && pending.is_some() {
@@ -1246,9 +1244,8 @@ impl YaldaGpuiView {
             }
         }
         if let Some(tile) = self.agent_tile_mut() {
-            tile.bound = None;
-            tile.picker = None;
-            tile.pending_open_token = None;
+            tile.show_picker();
+            tile.set_pending(None);
         }
     }
 
@@ -1258,9 +1255,7 @@ impl YaldaGpuiView {
     /// state with no usable keys. Used by close / reconcile.
     pub(crate) fn show_selector_on_focused_tile(&mut self, cx: &mut Context<Self>) {
         if let Some(tile) = self.agent_tile_mut() {
-            tile.bound = None;
-            tile.pending_open_token = None;
-            tile.picker = Some(SessionPicker::new());
+            tile.show_picker();
         }
         // The selector projects from the roster; refresh in case it's stale.
         self.refresh_roster(cx);
@@ -1341,23 +1336,18 @@ impl YaldaGpuiView {
         // write pass below can stamp each tile's `resume_sid` — the identity the
         // layout snapshot persists so restore rebinds each tile to ITS OWN
         // session (UXI-AgentTile-18), not by index.
-        let mut resolved: Vec<(SessionId, String)> = Vec::new();
         for tab in self.workspace.tabs.iter() {
             tab.layout.for_each_leaf(&mut |window| {
                 if let App::Agent(tile) = &window.content
-                    && let Some(id) = tile.bound
+                    && let Some(id) = tile.session()
                     && let Some(ent) = self.sessions.get(id)
                 {
                     let session = ent.read(cx);
                     // The store's sid binding is authoritative and covers BOTH
-                    // created AND resumed sessions. A freshly-CREATED
-                    // server-managed session has `resume_id == None` (it was never
-                    // resumed) and `channel == None` (the daemon owns the channel),
-                    // so the old `resume_id / channel.session_id()` resolution
-                    // returned None for it → it was never persisted → its tile came
-                    // back as a picker on restart. `sid_of` is the id the store
-                    // bound at create/attach time; fall back to the old sources
-                    // only if the store somehow lacks it.
+                    // created AND resumed sessions (a freshly-created server-managed
+                    // session has `resume_id == None` + `channel == None`, so those
+                    // sources miss it — bug-0001). `sid_of` is the id the store
+                    // bound at create/attach time.
                     let resolved_id = self
                         .sessions
                         .sid_of(id)
@@ -1366,7 +1356,6 @@ impl YaldaGpuiView {
                         .or_else(|| session.state.channel.as_ref().and_then(|c| c.session_id()));
                     if let Some(rid) = resolved_id {
                         let draft = session.state.input_surface.compose().text();
-                        resolved.push((id, rid.clone()));
                         snaps.push(SessionSnapshot {
                             id: rid,
                             label: session.label.clone(),
@@ -1381,28 +1370,13 @@ impl YaldaGpuiView {
                 }
             });
         }
-        // Write pass: cache the resolved id on each tile so the cx-free
-        // `snapshot_content` can persist it into `workspace.json` (identity).
-        for tab in self.workspace.tabs.iter_mut() {
-            tab.layout.for_each_leaf_content_mut(&mut |app| {
-                if let App::Agent(tile) = app
-                    && let Some(id) = tile.bound
-                {
-                    tile.resume_sid = resolved
-                        .iter()
-                        .find(|(sid, _)| *sid == id)
-                        .map(|(_, rid)| rid.clone());
-                }
-            });
-        }
         save_persisted_acp_sessions(&cwd, &snaps);
-        // CRITICAL (bug-0001): we just stamped `resume_sid` on the tiles, but the
-        // per-tile session id that RESTORE reads lives in `workspace.json`, written
-        // by `save_workspace_state` — which otherwise only runs on structural
-        // changes (split/close/move). Without this, a session you create and merely
-        // *use* never gets its id into `workspace.json` (acp_sessions.json updates,
-        // workspace.json goes stale) → restart shows a picker. Persist the layout
-        // now so the two files stay in sync.
+        // CRITICAL (bug-0001): the per-tile session id that RESTORE reads lives in
+        // `workspace.json`, written by `save_workspace_state` — which otherwise only
+        // runs on structural changes. `snapshot_content` resolves each `Bound` tile's
+        // sid from the store (ADR-0026: single source of truth, no cache), so
+        // persisting the layout here keeps `workspace.json` and `acp_sessions.json`
+        // in sync (a used-but-not-restructured session no longer comes back a picker).
         self.save_workspace_state();
     }
 
@@ -1875,14 +1849,13 @@ impl YaldaGpuiView {
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
                 if let App::Agent(tile) = content
-                    && tile.bound == Some(id)
+                    && tile.session() == Some(id)
                 {
                     tile_found = true;
-                    if tile.pending_open_token.is_some() {
+                    if tile.pending_token().is_some() {
                         tile_was_respawning = true;
                     } else {
-                        tile.bound = None;
-                        tile.picker = Some(SessionPicker::new());
+                        tile.show_picker();
                     }
                 }
             });
@@ -1921,13 +1894,11 @@ impl YaldaGpuiView {
         for tab in self.workspace.tabs.iter_mut() {
             tab.layout.for_each_leaf_content_mut(&mut |content| {
                 if let App::Agent(tile) = content
-                    && tile.bound == Some(id)
+                    && tile.session() == Some(id)
                 {
                     tile_found = true;
-                    if tile.pending_open_token.is_none() {
-                        tile.bound = None;
-                        tile.picker = None;
-                        tile.unavailable = Some(label.clone());
+                    if tile.pending_token().is_none() {
+                        tile.mark_unavailable(sid.to_string(), label.clone());
                     }
                 }
             });
@@ -2986,8 +2957,7 @@ impl YaldaGpuiView {
         self.transcript_views.remove(&id);
         self.sessions.close(id);
         if let Some(tile) = self.agent_tile_mut() {
-            tile.bound = None;
-            tile.picker = None;
+            tile.show_picker();
         }
         crate::clear_log(&format!(
             "clear_agent_session: closed old_id={id:?} server_is_some={}",
@@ -3016,7 +2986,7 @@ impl YaldaGpuiView {
                 cx,
             );
             if let Some(tile) = self.agent_tile_mut() {
-                tile.pending_open_token = Some(open_token);
+                tile.set_pending(Some(open_token));
             }
             self.spawn_create_agent_session(open_token, label, slot_cwd, desired_mode, cx);
         } else {

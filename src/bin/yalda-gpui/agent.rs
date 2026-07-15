@@ -4323,46 +4323,116 @@ impl SessionPicker {
 /// converts the tile to a fresh `BufferApp::Picking`; the pooled file buffers
 /// stay reachable via Cmd+O regardless.
 ///
-/// A tile shows EXACTLY ONE session (`bound`). `bound == None` ⇒ the tile
-/// renders the `picker` (free-session chooser / rebind / "new"). Strict 1:1: a
-/// given `SessionId` is bound by at most one tile (INV-2); rebinding points the
-/// tile at a free session and frees (does not kill) the previous one. Session
-/// close / unbind / rebind all keep the tile `App::Agent` with `bound = None`.
-pub(crate) struct AgentTile {
-    /// The session shown here; `None` ⇒ render the picker (the selector).
-    pub(crate) bound: Option<SessionId>,
-    /// Set while an async server open/create round-trip for this tile is in
-    /// flight; the resolution binds back to this tile by matching the token
-    /// across the whole workspace. Globally unique (see `alloc_open_token`).
-    /// Cleared once the round-trip resolves.
-    pub(crate) pending_open_token: Option<u64>,
-    /// When `Some` (and `bound == None`), this tile shows the in-tile session
-    /// picker instead of a transcript. Cleared the moment a session is bound.
-    pub(crate) picker: Option<SessionPicker>,
-    /// The bound session's DURABLE server id (`resume_id`), cached here so the
-    /// cx-free layout snapshot (`snapshot_content`) can persist WHICH session
-    /// occupies this tile — the identity that `restore_agent_leaves` rebinds each
-    /// tile to on restart (UXI-AgentTile-18), instead of zipping sessions to tiles
-    /// by index. Refreshed by `save_agent_ring` (which already resolves the id)
-    /// and set at the restore bind site. `None` until the session's id is known.
-    pub(crate) resume_sid: Option<String>,
-    /// When `Some` (and `bound == None`), the session this tile REMEMBERED
-    /// (`resume_sid`) could not be resumed on restart — the daemon GC'd it /
-    /// `session/load` failed with "no such session". The tile shows an inline
-    /// "session unavailable — start fresh" notice (UXI-AgentTile-19), never the
-    /// picker. Holds the lost session's label for the notice. Cleared when the
-    /// user starts fresh (or otherwise binds a session).
-    pub(crate) unavailable: Option<SharedString>,
+/// A tile is a **state machine, not a bag of Options** (ADR-0026: make impossible
+/// states unrepresentable). It is EXACTLY ONE of:
+/// - `Selecting` — no session bound; renders the free-session selector.
+/// - `Bound` — showing one session (the common case), optionally mid-reopen.
+/// - `Unavailable` — a remembered session that couldn't be resumed on restart.
+///
+/// The old `bound`/`picker`/`unavailable`/`resume_sid`/`pending_open_token`
+/// Option-soup let illegal combinations (bound-AND-picker, all-none,
+/// unavailable-while-bound) be constructed — the drift class of bug behind
+/// bug-0001. As an enum the compiler forces every consumer to handle each state
+/// and rejects the illegal ones. Strict 1:1 (a given `SessionId` is bound by at
+/// most one tile, INV-2) still holds; the session STATE lives in
+/// `YaldaGpuiView::sessions`, the tile holds only the key.
+pub(crate) enum AgentTile {
+    /// No session bound — the tile renders the free-session selector. The
+    /// `SessionPicker` is the selector's transient cursor (row highlight) only.
+    Selecting(SessionPicker),
+    /// Bound to one session. `reopening` carries the in-flight open token while a
+    /// create / attach / change-cwd round-trip is resolving (the respawn state);
+    /// the resolution rebinds this tile by matching the token, then clears it.
+    Bound {
+        session: SessionId,
+        reopening: Option<u64>,
+    },
+    /// A REMEMBERED session (`remembered` = its server id) could not be resumed on
+    /// restart — the daemon GC'd it / `session/load` failed. The tile shows an
+    /// inline "session unavailable — start fresh" notice (UXI-AgentTile-19), never
+    /// the picker; `remembered` is kept so a later restart re-attempts, `lost` is
+    /// the label for the notice.
+    Unavailable {
+        remembered: String,
+        lost: SharedString,
+    },
 }
 
 impl AgentTile {
+    /// A fresh, unbound tile → the session selector.
     pub(crate) fn new() -> Self {
-        Self {
-            bound: None,
-            pending_open_token: None,
-            picker: None,
-            resume_sid: None,
-            unavailable: None,
+        AgentTile::Selecting(SessionPicker::new())
+    }
+
+    /// The bound session, if any (was `tile.bound`).
+    pub(crate) fn session(&self) -> Option<SessionId> {
+        match self {
+            AgentTile::Bound { session, .. } => Some(*session),
+            _ => None,
+        }
+    }
+    /// The in-flight open/reopen token, if any (was `tile.pending_open_token`).
+    pub(crate) fn pending_token(&self) -> Option<u64> {
+        match self {
+            AgentTile::Bound { reopening, .. } => *reopening,
+            _ => None,
+        }
+    }
+    /// The selector cursor, if this tile is selecting (was `tile.picker`).
+    pub(crate) fn picker(&self) -> Option<&SessionPicker> {
+        match self {
+            AgentTile::Selecting(p) => Some(p),
+            _ => None,
+        }
+    }
+    pub(crate) fn picker_mut(&mut self) -> Option<&mut SessionPicker> {
+        match self {
+            AgentTile::Selecting(p) => Some(p),
+            _ => None,
+        }
+    }
+    /// The lost session's label, if this tile is Unavailable (was `tile.unavailable`).
+    pub(crate) fn unavailable_label(&self) -> Option<SharedString> {
+        match self {
+            AgentTile::Unavailable { lost, .. } => Some(lost.clone()),
+            _ => None,
+        }
+    }
+
+    // ---- transitions (the only way tile state changes) ----
+
+    /// Bind this tile to `session` (leaves any picker / unavailable / pending).
+    pub(crate) fn bind(&mut self, session: SessionId) {
+        *self = AgentTile::Bound { session, reopening: None };
+    }
+    /// Set/clear the in-flight open token. Only meaningful while `Bound` (every
+    /// open path binds a placeholder session first, then stamps the token).
+    pub(crate) fn set_pending(&mut self, token: Option<u64>) {
+        if let AgentTile::Bound { reopening, .. } = self {
+            *reopening = token;
+        }
+    }
+    /// Drop to the free-session selector (session closed / unbound / rebind).
+    pub(crate) fn show_picker(&mut self) {
+        *self = AgentTile::Selecting(SessionPicker::new());
+    }
+    /// Show the inline "session unavailable" notice for a remembered id.
+    pub(crate) fn mark_unavailable(&mut self, remembered: String, lost: SharedString) {
+        *self = AgentTile::Unavailable { remembered, lost };
+    }
+
+    /// The durable server id this tile remembers, for persistence into the layout
+    /// leaf. `Bound` resolves it from the store (SINGLE source of truth — pass
+    /// `sid_of`); `Unavailable` carries it; `Selecting` has none. No cached copy —
+    /// this is what removed the `resume_sid` drift (bug-0001 / ADR-0026).
+    pub(crate) fn remembered_sid(
+        &self,
+        resolve: impl FnOnce(SessionId) -> Option<String>,
+    ) -> Option<String> {
+        match self {
+            AgentTile::Bound { session, .. } => resolve(*session),
+            AgentTile::Unavailable { remembered, .. } => Some(remembered.clone()),
+            AgentTile::Selecting(_) => None,
         }
     }
 }

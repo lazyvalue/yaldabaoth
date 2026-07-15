@@ -845,11 +845,11 @@ impl YaldaGpuiView {
         // Unbound tile (`bound == None`) ⇒ render the session selector
         // (SessionPicker), not a transcript. This is the canonical unbound
         // state (session close / unbind / rebind all land here).
-        let Some(id) = tile.bound else {
+        let Some(id) = tile.session() else {
             // A REMEMBERED session that couldn't be resumed on restart shows an
             // inline "session unavailable — start fresh" notice (UXI-AgentTile-19),
             // never the picker.
-            if let Some(lost) = tile.unavailable.clone() {
+            if let Some(lost) = tile.unavailable_label() {
                 return self.render_agent_unavailable(root, lost, cx);
             }
             return self.render_agent_picker(root, tile, cx);
@@ -2426,9 +2426,7 @@ impl YaldaGpuiView {
         // Clamp the highlight to the current row count (the projection may have
         // shrunk since the user last moved).
         let row_count = 1 + free.len();
-        let selected = tile
-            .picker
-            .as_ref()
+        let selected = tile.picker()
             .map(|p| p.selected.min(row_count.saturating_sub(1)))
             .unwrap_or(0);
 

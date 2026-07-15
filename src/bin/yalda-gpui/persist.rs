@@ -627,10 +627,15 @@ pub(crate) struct PersistedWorkspace {
     pub(crate) buffer_tags: HashMap<String, Vec<String>>,
 }
 
+/// Resolve a bound tile's local `SessionId` to its durable server id — the store's
+/// `sid_of`, passed in so the (cx-free) snapshot has the SINGLE source of truth for
+/// which session occupies a tile (ADR-0026: no `resume_sid` cache to drift).
+pub(crate) type SidResolver<'a> = &'a dyn Fn(SessionId) -> Option<String>;
+
 /// Snapshot a live `App` into its persisted shadow. Returns `None`
 /// for content kinds that aren't worth persisting (e.g., an unattached
 /// transient state we'd lose nothing by skipping).
-pub(crate) fn snapshot_content(content: &App) -> PersistedKind {
+pub(crate) fn snapshot_content(content: &App, resolve: SidResolver) -> PersistedKind {
     match content {
         App::Buffer(BufferApp::Viewing(d)) => PersistedKind::Buffer {
             mode: PersistedBufferMode::Viewing {
@@ -650,13 +655,12 @@ pub(crate) fn snapshot_content(content: &App) -> PersistedKind {
         App::Agent(tile) => {
             // Persist WHICH session occupies this tile (identity), so restore
             // rebinds each tile to its OWN session (UXI-AgentTile-18) instead of
-            // zipping sessions to tiles by index. `snapshot_content` has no cx to
-            // read the store, so the durable server id is cached on the tile as
-            // `resume_sid` by `save_agent_ring` (which resolves it anyway). `None`
-            // (session id not yet known, or an old snapshot) → restore falls back
-            // to the free-session selector for that tile.
+            // zipping sessions to tiles by index. The id is resolved from the store
+            // via `resolve` (single source of truth — a `Bound` tile has no cached
+            // copy). `None` (Selecting, or the store lacks a sid) ⇒ restore shows
+            // the selector for that tile.
             PersistedKind::Agent {
-                session_id: tile.resume_sid.clone(),
+                session_id: tile.remembered_sid(resolve),
             }
         }
         App::Linear(_tile) => PersistedKind::Linear {},
@@ -665,7 +669,10 @@ pub(crate) fn snapshot_content(content: &App) -> PersistedKind {
 }
 
 /// Snapshot a live `Layout<App>` into its persisted shadow.
-pub(crate) fn snapshot_layout(layout: &workspace::Layout<App>) -> PersistedLayout {
+pub(crate) fn snapshot_layout(
+    layout: &workspace::Layout<App>,
+    resolve: SidResolver,
+) -> PersistedLayout {
     match layout {
         workspace::Layout::Empty => PersistedLayout::Leaf(PersistedLeaf {
             id: 0,
@@ -677,13 +684,13 @@ pub(crate) fn snapshot_layout(layout: &workspace::Layout<App>) -> PersistedLayou
         }),
         workspace::Layout::Leaf(win) => PersistedLayout::Leaf(PersistedLeaf {
             id: win.id,
-            kind: snapshot_content(&win.content),
+            kind: snapshot_content(&win.content, resolve),
         }),
         workspace::Layout::Split { dir, children } => PersistedLayout::Split {
             dir: *dir,
             children: children
                 .iter()
-                .map(|(w, c)| (*w, snapshot_layout(c)))
+                .map(|(w, c)| (*w, snapshot_layout(c, resolve)))
                 .collect(),
         },
     }
@@ -872,7 +879,10 @@ pub(crate) fn restore_content(
 }
 
 /// Snapshot a live workspace into a fully serializable shape.
-pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<App>) -> PersistedWorkspace {
+pub(crate) fn snapshot_workspace(
+    ws: &workspace::Workspace<App>,
+    resolve: SidResolver,
+) -> PersistedWorkspace {
     // Ephemeral virtual workspaces (ADR-0021) are transient and never persisted;
     // they're always the last tab, so filtering them keeps the remaining indices
     // contiguous. `active_tab` is clamped into the surviving range so a restore
@@ -887,7 +897,7 @@ pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<App>) -> PersistedWor
                 auto_name: t.auto_name.clone(),
                 display_name: t.display_name.clone(),
                 focused_window: t.focused,
-                layout: snapshot_layout(&t.layout),
+                layout: snapshot_layout(&t.layout, resolve),
                 rail: t.rail.as_ref().map(snapshot_rail),
                 layout_mode: t.layout_mode,
                 master_ratio: t.master_ratio,
@@ -937,7 +947,11 @@ pub(crate) fn snapshot_workspace(ws: &workspace::Workspace<App>) -> PersistedWor
 
 /// Best-effort write of the workspace snapshot for `cwd`. Silently no-ops
 /// on any I/O / serialization failure (Behavior 23: best-effort + silent).
-pub(crate) fn save_persisted_workspace(cwd: &std::path::Path, ws: &workspace::Workspace<App>) {
+pub(crate) fn save_persisted_workspace(
+    cwd: &std::path::Path,
+    ws: &workspace::Workspace<App>,
+    resolve: SidResolver,
+) {
     let Some(path) = workspace_persist_path() else {
         return;
     };
@@ -951,7 +965,7 @@ pub(crate) fn save_persisted_workspace(cwd: &std::path::Path, ws: &workspace::Wo
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
-    let snap = snapshot_workspace(ws);
+    let snap = snapshot_workspace(ws, resolve);
     if let Ok(v) = serde_json::to_value(&snap) {
         // Drop any entry saved under the old raw spelling so the file doesn't
         // accumulate a canonical + raw duplicate for the same dir (ADR-0010:

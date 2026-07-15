@@ -3305,10 +3305,12 @@ fn inv_order_interleaved_turns_stay_chronological() {
 /// identity assertion fails RED.
 #[test]
 fn agent_tile_persists_session_identity_not_index() {
-    let mut t1 = AgentTile::new();
-    t1.resume_sid = Some("SID-A".to_string());
-    let mut t2 = AgentTile::new();
-    t2.resume_sid = Some("SID-B".to_string());
+    use crate::agent_sessions::SessionId;
+    // Two Bound tiles (ADR-0026 enum); each carries a local SessionId. The durable
+    // server id is resolved from the store via the SidResolver (single source of
+    // truth — no cached resume_sid).
+    let t1 = AgentTile::Bound { session: SessionId(1), reopening: None };
+    let t2 = AgentTile::Bound { session: SessionId(2), reopening: None };
     let layout: workspace::Layout<App> = workspace::Layout::Split {
         dir: workspace::SplitDir::V,
         children: vec![
@@ -3323,8 +3325,15 @@ fn agent_tile_persists_session_identity_not_index() {
         ],
     };
 
-    // Save side: the persisted layout carries each leaf's session id.
-    let snap = snapshot_layout(&layout);
+    // The store resolver maps each tile's SessionId → its server sid.
+    let resolve = |id: SessionId| match id {
+        SessionId(1) => Some("SID-A".to_string()),
+        SessionId(2) => Some("SID-B".to_string()),
+        _ => None,
+    };
+
+    // Save side: the persisted layout carries each leaf's resolved session id.
+    let snap = snapshot_layout(&layout, &resolve);
 
     // Restore side: each leaf comes back paired with ITS OWN id — identity
     // travels with the leaf, independent of any session-list ordering.

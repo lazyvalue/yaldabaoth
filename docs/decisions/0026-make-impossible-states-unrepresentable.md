@@ -170,6 +170,22 @@ pretended into the type system.
 - **Leave the id stringly-typed "for convenience."** The convenience is what let the
   two id-spaces and the two persistence files silently disagree.
 
+## Status of the refactor
+
+- **`AgentTile` enum — DONE** (this ADR's commit). ~95 field-access sites + 24
+  constructors converted to `match`/transition methods; the `resume_sid` cache is
+  **deleted**; persistence resolves the sid from the store via a `SidResolver`
+  threaded through `snapshot_content`/`snapshot_layout`/`save_persisted_workspace`
+  (single source of truth — `sid_of` is cx-free, so no cache is needed). 369 tests
+  green incl. the state-machine fuzzer + oracle. The bug-0001 guards
+  (`agent_tile_persists_session_identity_not_index`,
+  `save_agent_ring_persists_session_id_to_workspace_json`,
+  `created_server_session_persists_its_id_for_restore`) now drive the enum.
+- **`ServerSid` newtype — PENDING** (separate pass). The server sid is still `String`
+  across the store / persist / wire; newtyping it kills the id-space smell but is a
+  large mechanical ripple that crosses the `session_proto` wire boundary and has not
+  itself caused a bug — lower leverage than the enum, tracked as follow-up.
+
 ## Consequences
 
 - A real refactor across the render, save, and restore paths (every `tile.bound` /

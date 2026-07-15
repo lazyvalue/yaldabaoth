@@ -1734,7 +1734,13 @@ impl YaldaGpuiView {
         // dirty ones stay pooled for recovery.
         self.workspace.gc_buffers();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        save_persisted_workspace(&cwd, &self.workspace);
+        // Resolve each Bound tile's durable server id from the store (single source
+        // of truth — ADR-0026). `sid_of` is cx-free, so the layout snapshot needs no
+        // cached copy on the tile. Borrows `self.sessions` (disjoint from the
+        // `&self.workspace` snapshot borrow).
+        let sessions = &self.sessions;
+        let resolve = |id| sessions.sid_of(id).map(|s| s.to_string());
+        save_persisted_workspace(&cwd, &self.workspace, &resolve);
     }
 
     /// Replace `self.workspace` with one rebuilt from the persisted snapshot
@@ -1954,11 +1960,9 @@ impl YaldaGpuiView {
                                     state.subagents_open = slot.subagents_open;
                                 });
                                 if let Some(tile) = self.agent_tile_mut() {
-                                    tile.bound = Some(sid_id);
-                                    tile.picker = None;
-                                    // Re-cache identity so the next save re-persists
-                                    // this tile↔session binding (UXI-AgentTile-18).
-                                    tile.resume_sid = Some(slot.id.clone());
+                                    // `open_or_focus` bound `slot.id` in the store, so
+                                    // the next save resolves it via `sid_of` — no cache.
+                                    tile.bind(sid_id);
                                 }
                                 attach_sids.push(slot.id.clone());
                                 eprintln!(
@@ -1968,8 +1972,7 @@ impl YaldaGpuiView {
                             }
                             agent_sessions::Bind::AlreadyOpen(_) => {
                                 if let Some(tile) = self.agent_tile_mut() {
-                                    tile.bound = None;
-                                    tile.picker = Some(SessionPicker::new());
+                                    tile.show_picker();
                                 }
                                 // Selector projects from the roster; seed it.
                                 self.refresh_roster(cx);
@@ -1985,8 +1988,7 @@ impl YaldaGpuiView {
                         // one straight into the free-session selector (it
                         // projects from the universal roster — seed it).
                         if let Some(tile) = self.agent_tile_mut() {
-                            tile.bound = None;
-                            tile.picker = Some(SessionPicker::new());
+                            tile.show_picker();
                         }
                         self.refresh_roster(cx);
                         eprintln!(
@@ -2210,7 +2212,7 @@ impl YaldaGpuiView {
     /// caller can drop the workspace borrow before touching `self.sessions`.
     fn focused_bound_session(&self) -> Option<SessionId> {
         match self.workspace.focused_content().expect("no focused window") {
-            App::Agent(tile) => tile.bound,
+            App::Agent(tile) => tile.session(),
             _ => None,
         }
     }
@@ -2273,9 +2275,8 @@ impl YaldaGpuiView {
         });
         let id = bind.id();
         if let Some(tile) = self.agent_tile_mut() {
-            tile.bound = Some(id);
-            tile.picker = None;
-            tile.pending_open_token = None;
+            tile.bind(id);
+            tile.set_pending(None);
         }
         id
     }
@@ -2287,8 +2288,7 @@ impl YaldaGpuiView {
         let ent = cx.new(|_| session);
         let id = self.sessions.create_local(|_id| ent);
         if let Some(tile) = self.agent_tile_mut() {
-            tile.bound = Some(id);
-            tile.picker = None;
+            tile.bind(id);
         }
         crate::clear_log(&format!("show_local_session: new_id={id:?} bound to tile"));
         id
@@ -4303,7 +4303,7 @@ impl YaldaGpuiView {
                 b.fb.filter_mode || b.fb.rename.is_some()
             }
             Some(App::Agent(tile)) => {
-                if tile.bound.is_none() {
+                if tile.session().is_none() {
                     false // unbound = session picker = navigation
                 } else {
                     // Model C: a bound agent tile is "in text entry" iff focus is

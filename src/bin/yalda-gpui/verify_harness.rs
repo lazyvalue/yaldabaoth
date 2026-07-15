@@ -1191,7 +1191,7 @@ fn agent_session_binds_at_most_one_tile(cx: &mut TestAppContext) {
         for tab in v.workspace.tabs.iter() {
             tab.layout.for_each_leaf(&mut |w| {
                 if let App::Agent(t) = &w.content
-                    && t.bound == Some(owner)
+                    && t.session() == Some(owner)
                 {
                     n += 1;
                 }
@@ -3180,7 +3180,7 @@ fn install_agent_picker(
             });
         }
         let mut tile = AgentTile::new();
-        tile.picker = Some(SessionPicker::new());
+        tile.show_picker();
         v.set_screen(App::Agent(tile));
     });
 }
@@ -3206,7 +3206,7 @@ fn session_picker_renders_empty_ring(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     view.read_with(vcx, |v, cx| {
         let tile = v.agent_tile().expect("agent tile");
-        assert!(tile.bound.is_none(), "tile stays unbound until a row binds");
+        assert!(tile.session().is_none(), "tile stays unbound until a row binds");
         // The picker has no cached cwd — it projects from the active workspace's
         // live cwd (`agent_base_cwd`).
         let cwd = v.agent_base_cwd();
@@ -3255,7 +3255,7 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
     // An unbound selector tile. Both sessions are FREE.
     view.update(vcx, |v, cx| {
         let mut t = AgentTile::new();
-        t.picker = Some(SessionPicker::new());
+        t.show_picker();
         v.set_screen(App::Agent(t));
     });
     let cwd = view.read_with(vcx, |v, _| v.agent_base_cwd());
@@ -3337,7 +3337,7 @@ fn new_agent_uses_live_workspace_cwd_after_set_cwd(cx: &mut TestAppContext) {
     // An agent tile sitting in its selector (picker open) BEFORE any Set CWD.
     view.update(vcx, |v, _cx| {
         let mut t = AgentTile::new();
-        t.picker = Some(SessionPicker::new());
+        t.show_picker();
         v.set_screen(App::Agent(t));
     });
 
@@ -3356,7 +3356,7 @@ fn new_agent_uses_live_workspace_cwd_after_set_cwd(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let session_cwd = view.read_with(vcx, |v, cx| {
-        let id = v.agent_tile().expect("agent tile").bound.expect("a session bound");
+        let id = v.agent_tile().expect("agent tile").session().expect("a session bound");
         v.sessions.get(id).expect("session").read(cx).cwd.clone()
     });
     assert_eq!(
@@ -3425,7 +3425,7 @@ fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContex
             if let Some(w) = tab.layout.find_leaf(id)
                 && let App::Agent(t) = &w.content
             {
-                return Some((t.bound.is_some(), t.picker.is_some()));
+                return Some((t.session().is_some(), t.picker().is_some()));
             }
         }
         None
@@ -3512,7 +3512,7 @@ fn session_picker_navigation_wraps(cx: &mut TestAppContext) {
 
     let selected = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         view.read_with(vcx, |v, cx| {
-            v.agent_tile().unwrap().picker.as_ref().unwrap().selected
+            v.agent_tile().unwrap().picker().unwrap().selected
         })
     };
 
@@ -3553,12 +3553,12 @@ fn session_picker_activation_binds_slot(cx: &mut TestAppContext) {
     view.read_with(vcx, |v, cx| {
         let tile = v.agent_tile().expect("agent tile");
         assert!(
-            tile.bound.is_some(),
+            tile.session().is_some(),
             "a session is bound after activation and survives the attach"
         );
-        assert!(tile.picker.is_none(), "picker cleared once a session binds");
+        assert!(tile.picker().is_none(), "picker cleared once a session binds");
         assert_eq!(v.sessions.len(), 1, "exactly one session in the store");
-        let id = tile.bound.unwrap();
+        let id = tile.session().unwrap();
         assert_eq!(
             v.sessions.sid_of(id),
             Some("S2"),
@@ -3687,7 +3687,7 @@ fn duplicate_resolution_closes_orphan_and_focuses_owner(cx: &mut TestAppContext)
             cx,
         );
         if let Some(tile) = v.agent_tile_mut() {
-            tile.pending_open_token = Some(token);
+            tile.set_pending(Some(token));
         }
         let before = v.sessions.len();
         assert_eq!(before, 2, "owner + orphan placeholder");
@@ -3711,11 +3711,11 @@ fn duplicate_resolution_closes_orphan_and_focuses_owner(cx: &mut TestAppContext)
         );
         let tile = v.agent_tile().expect("focused agent tile");
         assert_eq!(
-            tile.bound,
+            tile.session(),
             Some(owner_id),
             "the focused tile now shows the existing owner (focus-on-conflict)"
         );
-        assert!(tile.picker.is_none());
+        assert!(tile.picker().is_none());
     });
 }
 
@@ -3742,7 +3742,7 @@ fn clear_async_bind_leaves_worksheet_typeable(cx: &mut TestAppContext) {
         });
         let token = crate::alloc_open_token();
         if let Some(tile) = v.agent_tile_mut() {
-            tile.pending_open_token = Some(token);
+            tile.set_pending(Some(token));
         }
         token
     });
@@ -6706,7 +6706,7 @@ fn real_clear_server_branch_then_type_paints(cx: &mut TestAppContext) {
 
     // The placeholder tile carries the token `/clear` minted for the async round-trip.
     let token = view
-        .update(vcx, |v, _| v.agent_tile().and_then(|t| t.pending_open_token))
+        .update(vcx, |v, _| v.agent_tile().and_then(|t| t.pending_token()))
         .expect("clear left a pending open token on the placeholder tile");
 
     // REAL async completion: the server round-trip binds the fresh sid + re-settles.
@@ -9316,13 +9316,8 @@ fn unresumable_session_shows_inline_notice_not_picker(cx: &mut TestAppContext) {
     // so `render_agent` actually runs).
     let (view, vcx, _id, _session) = boot_with_transcript(cx);
 
-    let win = view.update(vcx, |v, _cx| {
-        // Simulate a RESTORED (remembered) tile: it cached the id it's resuming.
-        if let Some(tile) = v.agent_tile_mut() {
-            tile.resume_sid = Some("S1".into());
-        }
-        v.workspace.focused_window_id().expect("focused")
-    });
+    // The tile is Bound to session sid "S1" (bound by boot_with_transcript).
+    let win = view.update(vcx, |v, _cx| v.workspace.focused_window_id().expect("focused"));
 
     // The remembered session turned out gone server-side (the resuming attach-fail
     // path calls exactly this).
@@ -9337,14 +9332,17 @@ fn unresumable_session_shows_inline_notice_not_picker(cx: &mut TestAppContext) {
             if let Some(w) = tab.layout.find_leaf(win)
                 && let App::Agent(t) = &w.content
             {
-                assert!(t.bound.is_none(), "tile is unbound after the session went away");
-                assert!(t.picker.is_none(), "must NOT drop to the picker");
-                assert!(t.unavailable.is_some(), "shows the inline unavailable notice");
-                assert_eq!(
-                    t.resume_sid.as_deref(),
-                    Some("S1"),
-                    "identity kept so a later restart re-attempts the resume"
-                );
+                assert!(t.session().is_none(), "tile is unbound after the session went away");
+                assert!(t.picker().is_none(), "must NOT drop to the picker");
+                assert!(t.unavailable_label().is_some(), "shows the inline unavailable notice");
+                // The Unavailable variant KEEPS the remembered sid so a later restart
+                // re-attempts the resume (ADR-0026: the state carries its own data).
+                match t {
+                    crate::AgentTile::Unavailable { remembered, .. } => {
+                        assert_eq!(remembered, "S1", "remembered id kept for re-attempt")
+                    }
+                    _ => panic!("expected Unavailable state"),
+                }
                 return;
             }
         }
@@ -9809,13 +9807,11 @@ fn created_server_session_persists_its_id_for_restore(cx: &mut TestAppContext) {
             if let Some(w) = tab.layout.find_leaf(win)
                 && let App::Agent(t) = &w.content
             {
-                assert_eq!(
-                    t.resume_sid.as_deref(),
-                    Some("SID-CREATED"),
-                    "a created session's id must be cached on the tile for persistence"
-                );
-                // Full chain: the persisted layout leaf carries the id.
-                match crate::persist::snapshot_content(&w.content) {
+                // The layout snapshot resolves the Bound tile's id from the store
+                // (SINGLE source of truth — no cached resume_sid). A created session
+                // (resume_id None, channel None) must still resolve via `sid_of`.
+                let resolve = |id| v.sessions.sid_of(id).map(|s: &str| s.to_string());
+                match crate::persist::snapshot_content(&w.content, &resolve) {
                     crate::persist::PersistedKind::Agent { session_id } => assert_eq!(
                         session_id.as_deref(),
                         Some("SID-CREATED"),

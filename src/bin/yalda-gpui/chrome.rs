@@ -587,8 +587,7 @@ impl YaldaGpuiView {
             App::Buffer(BufferApp::Viewing(d)) => d.file_label.to_string(),
             App::Buffer(BufferApp::Editing(e)) => e.file_label.to_string(),
             App::Buffer(BufferApp::Picking(_)) => "files".to_string(),
-            App::Agent(tile) => tile
-                .bound
+            App::Agent(tile) => tile.session()
                 .and_then(|id| sessions.get(id))
                 .map(|s| s.read(cx).label.clone())
                 .unwrap_or_else(|| "claude".to_string()),
@@ -605,8 +604,7 @@ impl YaldaGpuiView {
     fn desktop_status_glyph(sessions: &AgentSessions, content: &App, cx: &GpuiApp) -> &'static str {
         match content {
             App::Agent(tile) => {
-                let busy = tile
-                    .bound
+                let busy = tile.session()
                     .and_then(|id| sessions.get(id))
                     .map(|s| s.read(cx).state.turn_phase.is_awaiting())
                     .unwrap_or(false);
