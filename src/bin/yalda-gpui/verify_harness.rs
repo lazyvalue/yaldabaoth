@@ -23,6 +23,7 @@
 use gpui::{AppContext, TestAppContext, point, px};
 
 use crate::YaldaGpuiView;
+use crate::agent_sessions::ServerSid;
 use std::path::PathBuf;
 use yalda::theme::Theme;
 
@@ -791,7 +792,9 @@ fn install_agent_slot(
         };
         let id = v.show_local_session(session, cx);
         if let Some(sid) = sid {
-            v.sessions.bind_sid(id, sid).expect("fresh sid binds");
+            v.sessions
+                .bind_sid(id, ServerSid::new(sid))
+                .expect("fresh sid binds");
         }
         let _ = id;
     });
@@ -1119,7 +1122,7 @@ fn jump_to_bound_session_focuses_existing_tile(cx: &mut TestAppContext) {
     // Workspace 0: an agent tile bound to S1.
     install_agent_slot(&view, vcx, Some("S1"));
     let (sid, owner_tab, owner_wid) = view.update(vcx, |v, _| {
-        let sid = v.sessions.locate("S1").expect("S1 bound");
+        let sid = v.sessions.locate(&ServerSid::new("S1")).expect("S1 bound");
         let wid = v.agent_tile_id_bound_to(sid).expect("S1 has a tile");
         let tab = v.workspace.tab_containing(wid).expect("tile in a tab");
         (sid, tab, wid)
@@ -1173,7 +1176,7 @@ fn agent_session_binds_at_most_one_tile(cx: &mut TestAppContext) {
 
     // Workspace 0: an agent tile bound to session "S1".
     install_agent_slot(&view, vcx, Some("S1"));
-    let owner = view.update(vcx, |v, _| v.sessions.locate("S1").expect("S1 bound"));
+    let owner = view.update(vcx, |v, _| v.sessions.locate(&ServerSid::new("S1")).expect("S1 bound"));
 
     // Workspace 1: a fresh agent tile, now focused.
     view.update(vcx, |v, _cx| {
@@ -3406,7 +3409,7 @@ fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContex
     // must resolve to A by BINDING, even though B holds focus. This is the
     // exact value a revert to `focused_window_id()` would get wrong.
     view.read_with(vcx, |v, cx| {
-        let sid_a = v.sessions.locate("A").expect("sid A in store");
+        let sid_a = v.sessions.locate(&ServerSid::new("A")).expect("sid A in store");
         assert_eq!(
             v.agent_tile_id_bound_to(sid_a),
             Some(win_a),
@@ -3560,7 +3563,7 @@ fn session_picker_activation_binds_slot(cx: &mut TestAppContext) {
         assert_eq!(v.sessions.len(), 1, "exactly one session in the store");
         let id = tile.session().unwrap();
         assert_eq!(
-            v.sessions.sid_of(id),
+            v.sessions.sid_of(id).map(|s| s.as_str()),
             Some("S2"),
             "the bound session carries the chosen session id"
         );
@@ -3816,10 +3819,10 @@ fn multi_session_persistence_round_trips_distinct_sids() {
 
     assert_eq!(loaded.len(), 2, "both sessions round-trip");
     // Each slot kept its OWN sid + label (no cross-binding).
-    assert_eq!(loaded[0].id, "SID-A");
+    assert_eq!(loaded[0].id.as_str(), "SID-A");
     assert_eq!(loaded[0].label, "claude-A");
     assert!(loaded[0].active, "first session is the active one");
-    assert_eq!(loaded[1].id, "SID-B");
+    assert_eq!(loaded[1].id.as_str(), "SID-B");
     assert_eq!(loaded[1].label, "claude-B");
     assert_eq!(loaded[1].mode, InputModeKind::Worksheet);
     assert!(loaded[1].tasklist_open);
@@ -9339,7 +9342,7 @@ fn unresumable_session_shows_inline_notice_not_picker(cx: &mut TestAppContext) {
                 // re-attempts the resume (ADR-0026: the state carries its own data).
                 match t {
                     crate::AgentTile::Unavailable { remembered, .. } => {
-                        assert_eq!(remembered, "S1", "remembered id kept for re-attempt")
+                        assert_eq!(remembered.as_str(), "S1", "remembered id kept for re-attempt")
                     }
                     _ => panic!("expected Unavailable state"),
                 }
@@ -9810,10 +9813,10 @@ fn created_server_session_persists_its_id_for_restore(cx: &mut TestAppContext) {
                 // The layout snapshot resolves the Bound tile's id from the store
                 // (SINGLE source of truth — no cached resume_sid). A created session
                 // (resume_id None, channel None) must still resolve via `sid_of`.
-                let resolve = |id| v.sessions.sid_of(id).map(|s: &str| s.to_string());
+                let resolve = |id| v.sessions.sid_of(id).cloned();
                 match crate::persist::snapshot_content(&w.content, &resolve) {
                     crate::persist::PersistedKind::Agent { session_id } => assert_eq!(
-                        session_id.as_deref(),
+                        session_id.as_ref().map(|s| s.as_str()),
                         Some("SID-CREATED"),
                         "workspace.json leaf must persist the created session id"
                     ),
@@ -9877,7 +9880,7 @@ fn save_agent_ring_persists_session_id_to_workspace_json(cx: &mut TestAppContext
             match l {
                 PersistedLayout::Leaf(leaf) => {
                     if let PersistedKind::Agent { session_id } = &leaf.kind {
-                        out.push(session_id.clone());
+                        out.push(session_id.as_ref().map(|s| s.to_string()));
                     }
                 }
                 PersistedLayout::Split { children, .. } => {

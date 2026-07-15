@@ -4251,7 +4251,7 @@ pub(crate) struct AgentSession {
     /// The id this session was created from on persistence restore. Stays this
     /// value even if `session/load` fell back to `session/new`, so the next
     /// reboot retries the original load. `None` for fresh `claude-new` sessions.
-    pub(crate) resume_id: Option<String>,
+    pub(crate) resume_id: Option<ServerSid>,
 }
 
 impl std::ops::Deref for AgentSession {
@@ -4353,7 +4353,7 @@ pub(crate) enum AgentTile {
     /// the picker; `remembered` is kept so a later restart re-attempts, `lost` is
     /// the label for the notice.
     Unavailable {
-        remembered: String,
+        remembered: ServerSid,
         lost: SharedString,
     },
 }
@@ -4417,7 +4417,7 @@ impl AgentTile {
         *self = AgentTile::Selecting(SessionPicker::new());
     }
     /// Show the inline "session unavailable" notice for a remembered id.
-    pub(crate) fn mark_unavailable(&mut self, remembered: String, lost: SharedString) {
+    pub(crate) fn mark_unavailable(&mut self, remembered: ServerSid, lost: SharedString) {
         *self = AgentTile::Unavailable { remembered, lost };
     }
 
@@ -4427,8 +4427,8 @@ impl AgentTile {
     /// this is what removed the `resume_sid` drift (bug-0001 / ADR-0026).
     pub(crate) fn remembered_sid(
         &self,
-        resolve: impl FnOnce(SessionId) -> Option<String>,
-    ) -> Option<String> {
+        resolve: impl FnOnce(SessionId) -> Option<ServerSid>,
+    ) -> Option<ServerSid> {
         match self {
             AgentTile::Bound { session, .. } => resolve(*session),
             AgentTile::Unavailable { remembered, .. } => Some(remembered.clone()),

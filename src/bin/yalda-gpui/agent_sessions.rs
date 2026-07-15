@@ -20,6 +20,50 @@ use std::collections::BTreeMap;
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub(crate) struct SessionId(pub(crate) u64);
 
+/// The **server** session id — the id the session-server / ACP wire uses to
+/// name a session (`SessionInfo.session_id`, `attach(sid)`, `session/load`).
+/// A distinct id-space from the local [`SessionId`] (a `u64` handle): mixing
+/// them must not compile (ADR-0026 § "distinct id-spaces get newtypes").
+///
+/// Parse-don't-validate: the inner `String` is PRIVATE, so a `ServerSid` can
+/// only be minted at a wire boundary via [`ServerSid::new`] / `From<String>`
+/// and read back via [`ServerSid::as_str`]. Those conversion points are the
+/// only places the raw string is exposed.
+///
+/// `#[serde(transparent)]` keeps the on-disk representation a **bare string** —
+/// a `ServerSid` serializes/deserializes byte-identically to the `String` it
+/// wraps, so `workspace.json` / `acp_sessions.json` are unchanged.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ServerSid(String);
+
+impl ServerSid {
+    pub(crate) fn new(s: impl Into<String>) -> Self {
+        ServerSid(s.into())
+    }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ServerSid {
+    fn from(s: String) -> Self {
+        ServerSid(s)
+    }
+}
+
+impl From<&str> for ServerSid {
+    fn from(s: &str) -> Self {
+        ServerSid(s.to_string())
+    }
+}
+
+impl std::fmt::Display for ServerSid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Outcome of an idempotent bind: did we mint a new session, or is the sid
 /// already shown somewhere (so the caller should focus that tile, not bind a
 /// second copy)?
@@ -48,13 +92,13 @@ struct Entry<P> {
     /// The bound server session id, or `None` for a pre-attach local session.
     /// Stored HERE, not on the payload, so there is exactly one source of truth
     /// for the binding and nothing to keep in sync.
-    sid: Option<String>,
+    sid: Option<ServerSid>,
 }
 
 /// The owner. Private fields — the app reaches sessions only through this API.
 pub(crate) struct SessionStore<P> {
     entries: BTreeMap<SessionId, Entry<P>>,
-    by_sid: HashMap<String, SessionId>,
+    by_sid: HashMap<ServerSid, SessionId>,
     next: u64,
 }
 
@@ -83,7 +127,11 @@ impl<P> SessionStore<P> {
     /// If a session already carries `sid`, returns `AlreadyOpen(id)` and mutates
     /// nothing. Otherwise mints a session (payload built by `make`) bound to
     /// `sid` and returns `Created(id)`.
-    pub(crate) fn open_or_focus(&mut self, sid: &str, make: impl FnOnce(SessionId) -> P) -> Bind {
+    pub(crate) fn open_or_focus(
+        &mut self,
+        sid: &ServerSid,
+        make: impl FnOnce(SessionId) -> P,
+    ) -> Bind {
         if let Some(&id) = self.by_sid.get(sid) {
             return Bind::AlreadyOpen(id);
         }
@@ -92,10 +140,10 @@ impl<P> SessionStore<P> {
             id,
             Entry {
                 payload: make(id),
-                sid: Some(sid.to_string()),
+                sid: Some(sid.clone()),
             },
         );
-        self.by_sid.insert(sid.to_string(), id);
+        self.by_sid.insert(sid.clone(), id);
         Bind::Created(id)
     }
 
@@ -116,7 +164,7 @@ impl<P> SessionStore<P> {
     /// Bind `sid` to an existing local session. Errors with the *current* owner
     /// if `sid` is already bound elsewhere — the caller drops the duplicate
     /// session rather than creating a second binding (INV-1/INV-3).
-    pub(crate) fn bind_sid(&mut self, id: SessionId, sid: String) -> Result<(), AlreadyBound> {
+    pub(crate) fn bind_sid(&mut self, id: SessionId, sid: ServerSid) -> Result<(), AlreadyBound> {
         if let Some(&owner) = self.by_sid.get(&sid) {
             return if owner == id {
                 Ok(()) // idempotent re-bind of the same pairing
@@ -141,7 +189,7 @@ impl<P> SessionStore<P> {
     /// `SessionClosed(sid)` broadcast can't locate — and destroy — a session
     /// that is being respawned (the close-before-create race). Returns the
     /// released sid for teardown bookkeeping.
-    pub(crate) fn clear_sid(&mut self, id: SessionId) -> Option<String> {
+    pub(crate) fn clear_sid(&mut self, id: SessionId) -> Option<ServerSid> {
         let entry = self.entries.get_mut(&id)?;
         let old = entry.sid.take()?;
         self.by_sid.remove(&old);
@@ -149,12 +197,12 @@ impl<P> SessionStore<P> {
     }
 
     /// O(1) routing: the session bound to `sid`, if any (INV-4).
-    pub(crate) fn locate(&self, sid: &str) -> Option<SessionId> {
+    pub(crate) fn locate(&self, sid: &ServerSid) -> Option<SessionId> {
         self.by_sid.get(sid).copied()
     }
 
-    pub(crate) fn sid_of(&self, id: SessionId) -> Option<&str> {
-        self.entries.get(&id).and_then(|e| e.sid.as_deref())
+    pub(crate) fn sid_of(&self, id: SessionId) -> Option<&ServerSid> {
+        self.entries.get(&id).and_then(|e| e.sid.as_ref())
     }
 
     pub(crate) fn contains(&self, id: SessionId) -> bool {
@@ -179,7 +227,7 @@ impl<P> SessionStore<P> {
 
     /// Convenience: locate by sid and borrow mutably in one step (the routing
     /// hot path). `None` if no session is bound to `sid`.
-    pub(crate) fn get_by_sid_mut(&mut self, sid: &str) -> Option<&mut P> {
+    pub(crate) fn get_by_sid_mut(&mut self, sid: &ServerSid) -> Option<&mut P> {
         let id = self.by_sid.get(sid).copied()?;
         self.entries.get_mut(&id).map(|e| &mut e.payload)
     }
@@ -211,11 +259,16 @@ mod tests {
     // (gpui-bound) AgentSession.
     type Store = SessionStore<u32>;
 
+    /// Terse `ServerSid` constructor for the store tests.
+    fn sid(s: &str) -> ServerSid {
+        ServerSid::new(s)
+    }
+
     #[test]
     fn open_or_focus_is_idempotent_per_sid() {
         let mut s = Store::new();
-        let first = s.open_or_focus("S1", |_| 10);
-        let second = s.open_or_focus("S1", |_| 999); // make MUST NOT run
+        let first = s.open_or_focus(&sid("S1"), |_| 10);
+        let second = s.open_or_focus(&sid("S1"), |_| 999); // make MUST NOT run
         assert!(matches!(first, Bind::Created(_)));
         assert_eq!(second, Bind::AlreadyOpen(first.id()));
         assert_eq!(s.len(), 1, "one sid → exactly one session (INV-1)");
@@ -229,12 +282,12 @@ mod tests {
     #[test]
     fn distinct_sids_get_distinct_sessions() {
         let mut s = Store::new();
-        let a = s.open_or_focus("A", |_| 1).id();
-        let b = s.open_or_focus("B", |_| 2).id();
+        let a = s.open_or_focus(&sid("A"), |_| 1).id();
+        let b = s.open_or_focus(&sid("B"), |_| 2).id();
         assert_ne!(a, b);
         assert_eq!(s.len(), 2);
-        assert_eq!(s.locate("A"), Some(a));
-        assert_eq!(s.locate("B"), Some(b));
+        assert_eq!(s.locate(&sid("A")), Some(a));
+        assert_eq!(s.locate(&sid("B")), Some(b));
     }
 
     #[test]
@@ -242,26 +295,26 @@ mod tests {
         let mut s = Store::new();
         let a = s.create_local(|_| 1);
         let b = s.create_local(|_| 2);
-        assert!(s.bind_sid(a, "S".into()).is_ok());
+        assert!(s.bind_sid(a, sid("S")).is_ok());
         // Binding the same sid to a different session is refused with the owner.
-        assert_eq!(s.bind_sid(b, "S".into()), Err(AlreadyBound(a)));
+        assert_eq!(s.bind_sid(b, sid("S")), Err(AlreadyBound(a)));
         // Re-binding the same pairing is a no-op success (idempotent).
-        assert!(s.bind_sid(a, "S".into()).is_ok());
-        assert_eq!(s.locate("S"), Some(a));
+        assert!(s.bind_sid(a, sid("S")).is_ok());
+        assert_eq!(s.locate(&sid("S")), Some(a));
         assert_eq!(s.sid_of(b), None, "b never got the sid");
     }
 
     #[test]
     fn close_frees_the_sid_for_reattach() {
         let mut s = Store::new();
-        let a = s.open_or_focus("S", |_| 1).id();
-        assert_eq!(s.locate("S"), Some(a));
+        let a = s.open_or_focus(&sid("S"), |_| 1).id();
+        assert_eq!(s.locate(&sid("S")), Some(a));
         let payload = s.close(a);
         assert_eq!(payload, Some(1));
-        assert_eq!(s.locate("S"), None, "sid released on close");
+        assert_eq!(s.locate(&sid("S")), None, "sid released on close");
         assert!(s.is_empty());
         // A fresh open for the same sid mints a NEW id (no reuse).
-        let b = s.open_or_focus("S", |_| 2).id();
+        let b = s.open_or_focus(&sid("S"), |_| 2).id();
         assert_ne!(a, b);
     }
 
@@ -270,10 +323,10 @@ mod tests {
         let mut s = Store::new();
         let id = s.create_local(|_| 7);
         assert_eq!(s.sid_of(id), None);
-        assert_eq!(s.locate("X"), None);
-        s.bind_sid(id, "X".into()).unwrap();
-        assert_eq!(s.sid_of(id), Some("X"));
-        assert_eq!(s.get_by_sid_mut("X"), Some(&mut 7));
+        assert_eq!(s.locate(&sid("X")), None);
+        s.bind_sid(id, sid("X")).unwrap();
+        assert_eq!(s.sid_of(id), Some(&sid("X")));
+        assert_eq!(s.get_by_sid_mut(&sid("X")), Some(&mut 7));
     }
 
     #[test]
@@ -282,11 +335,11 @@ mod tests {
         // `by_sid` stays total (the sid-replacement branch of `bind_sid`).
         let mut s = Store::new();
         let id = s.create_local(|_| 1);
-        s.bind_sid(id, "A".into()).unwrap();
-        s.bind_sid(id, "B".into()).unwrap();
-        assert_eq!(s.locate("A"), None, "old sid released");
-        assert_eq!(s.locate("B"), Some(id), "new sid routes");
-        assert_eq!(s.sid_of(id), Some("B"));
+        s.bind_sid(id, sid("A")).unwrap();
+        s.bind_sid(id, sid("B")).unwrap();
+        assert_eq!(s.locate(&sid("A")), None, "old sid released");
+        assert_eq!(s.locate(&sid("B")), Some(id), "new sid routes");
+        assert_eq!(s.sid_of(id), Some(&sid("B")));
     }
 
     #[test]
@@ -294,14 +347,14 @@ mod tests {
         // `clear_sid` drops only the sid binding; the session payload and id
         // survive so a respawn can re-bind without losing transcript state.
         let mut s = Store::new();
-        let id = s.open_or_focus("S", |_| 9).id();
-        assert_eq!(s.clear_sid(id), Some("S".to_string()));
-        assert_eq!(s.locate("S"), None, "sid no longer routable");
+        let id = s.open_or_focus(&sid("S"), |_| 9).id();
+        assert_eq!(s.clear_sid(id), Some(sid("S")));
+        assert_eq!(s.locate(&sid("S")), None, "sid no longer routable");
         assert_eq!(s.sid_of(id), None, "session carries no sid");
         assert!(s.contains(id), "session itself survives");
         assert_eq!(s.get(id), Some(&9), "payload preserved");
         // Re-bind works afterward.
-        s.bind_sid(id, "S2".into()).unwrap();
-        assert_eq!(s.locate("S2"), Some(id));
+        s.bind_sid(id, sid("S2")).unwrap();
+        assert_eq!(s.locate(&sid("S2")), Some(id));
     }
 }

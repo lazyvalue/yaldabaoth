@@ -181,10 +181,17 @@ pretended into the type system.
   (`agent_tile_persists_session_identity_not_index`,
   `save_agent_ring_persists_session_id_to_workspace_json`,
   `created_server_session_persists_its_id_for_restore`) now drive the enum.
-- **`ServerSid` newtype — PENDING** (separate pass). The server sid is still `String`
-  across the store / persist / wire; newtyping it kills the id-space smell but is a
-  large mechanical ripple that crosses the `session_proto` wire boundary and has not
-  itself caused a bug — lower leverage than the enum, tracked as follow-up.
+- **`ServerSid` newtype — DONE** (dispatched to a worker agent, independently
+  reviewed by a second agent — adversarial verify). A `#[serde(transparent)]`
+  `ServerSid(String)` now types the server sid across the store (`by_sid` / `sid` /
+  `bind_sid` / `locate` / `sid_of`), persistence (`PersistedSlot` / `SessionSnapshot`
+  / `PersistedKind::Agent` / `SidResolver`), and the tile enum
+  (`Unavailable.remembered`, `resume_id`); the shared wire crates (`session_proto` /
+  `session_client` / `yalda-session-server`) stay `String` and the GUI converts at
+  the boundary. **On-disk JSON verified byte-identical** (transparent serde; old
+  `workspace.json`/`acp_sessions.json` still load — proven with a negative-controlled
+  serialization test), 369 tests green. `SessionId` (local u64) stays distinct — the
+  two id-spaces are now non-interchangeable at the type level.
 
 ## Consequences
 

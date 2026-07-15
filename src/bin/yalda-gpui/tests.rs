@@ -3327,8 +3327,8 @@ fn agent_tile_persists_session_identity_not_index() {
 
     // The store resolver maps each tile's SessionId → its server sid.
     let resolve = |id: SessionId| match id {
-        SessionId(1) => Some("SID-A".to_string()),
-        SessionId(2) => Some("SID-B".to_string()),
+        SessionId(1) => Some(crate::agent_sessions::ServerSid::new("SID-A")),
+        SessionId(2) => Some(crate::agent_sessions::ServerSid::new("SID-B")),
         _ => None,
     };
 
@@ -3344,8 +3344,8 @@ fn agent_tile_persists_session_identity_not_index() {
     assert_eq!(
         agents,
         vec![
-            (10, Some("SID-A".to_string())),
-            (20, Some("SID-B".to_string())),
+            (10, Some(crate::agent_sessions::ServerSid::new("SID-A"))),
+            (20, Some(crate::agent_sessions::ServerSid::new("SID-B"))),
         ],
         "each tile restores bound to its OWN session id (identity, not index)"
     );

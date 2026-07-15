@@ -463,8 +463,12 @@ pub(crate) enum PersistedKind {
     Buffer { mode: PersistedBufferMode },
     /// JSON tag stays as "claude" so the ACP-session side-channel keys line up;
     /// the in-memory variant is `Agent` to match the rename pass.
+    /// `session_id` is a `ServerSid`, but its `#[serde(transparent)]` makes the
+    /// on-disk shape a bare string — byte-identical to the pre-newtype
+    /// `Option<String>`, so old `workspace.json` files load and new ones don't
+    /// change shape.
     #[serde(rename = "claude")]
-    Agent { session_id: Option<String> },
+    Agent { session_id: Option<ServerSid> },
     /// A Linear tile. The loaded issue/project isn't persisted — restore opens
     /// an empty Linear tile and the user re-enters the identifier (the data is
     /// remote and cheap to re-fetch).
@@ -630,7 +634,7 @@ pub(crate) struct PersistedWorkspace {
 /// Resolve a bound tile's local `SessionId` to its durable server id — the store's
 /// `sid_of`, passed in so the (cx-free) snapshot has the SINGLE source of truth for
 /// which session occupies a tile (ADR-0026: no `resume_sid` cache to drift).
-pub(crate) type SidResolver<'a> = &'a dyn Fn(SessionId) -> Option<String>;
+pub(crate) type SidResolver<'a> = &'a dyn Fn(SessionId) -> Option<ServerSid>;
 
 /// Snapshot a live `App` into its persisted shadow. Returns `None`
 /// for content kinds that aren't worth persisting (e.g., an unattached
@@ -763,7 +767,7 @@ pub(crate) fn restore_layout(
 ) -> (
     workspace::Layout<App>,
     workspace::WindowId,
-    Vec<(workspace::WindowId, Option<String>)>,
+    Vec<(workspace::WindowId, Option<ServerSid>)>,
 ) {
     match layout {
         PersistedLayout::Leaf(leaf) => {
@@ -1003,7 +1007,7 @@ pub(crate) fn load_persisted_workspace(cwd: &std::path::Path) -> Option<Persiste
 /// resolves to the process cwd at restore time per §1.
 #[derive(Debug, Clone)]
 pub(crate) struct PersistedSlot {
-    pub(crate) id: String,
+    pub(crate) id: ServerSid,
     pub(crate) label: String,
     pub(crate) active: bool,
     pub(crate) mode: InputModeKind,
@@ -1044,7 +1048,8 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
     // spec-§35 defaults for the missing fields.
     if let Some(id) = entry.as_str() {
         return vec![PersistedSlot {
-            id: id.to_string(),
+            // Wire boundary: the legacy single-string id becomes a `ServerSid`.
+            id: ServerSid::new(id),
             label: "claude-1".into(),
             active: true,
             mode: InputModeKind::Chatbox,
@@ -1060,7 +1065,8 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
     arr.iter()
         .filter_map(|v| {
             let obj = v.as_object()?;
-            let id = obj.get("id")?.as_str()?.to_string();
+            // Wire boundary: the persisted id string becomes a `ServerSid`.
+            let id = ServerSid::new(obj.get("id")?.as_str()?);
             let label = obj
                 .get("label")
                 .and_then(|s| s.as_str())
@@ -1201,7 +1207,7 @@ pub(crate) fn forget_persisted_acp_session_ids(ids: &[String]) {
 /// ownership.md). Gathered by `YaldaGpuiView::save_agent_ring` from the tiles'
 /// bound sessions in the store, then written by `save_persisted_acp_sessions`.
 pub(crate) struct SessionSnapshot {
-    pub(crate) id: String,
+    pub(crate) id: ServerSid,
     pub(crate) label: String,
     pub(crate) active: bool,
     pub(crate) mode: InputModeKind,
@@ -1225,7 +1231,11 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[Sessio
         .iter()
         .map(|snap| {
             let mut obj = serde_json::Map::new();
-            obj.insert("id".into(), serde_json::Value::String(snap.id.clone()));
+            // Wire boundary: write the `ServerSid` back out as a bare string.
+            obj.insert(
+                "id".into(),
+                serde_json::Value::String(snap.id.to_string()),
+            );
             obj.insert(
                 "label".into(),
                 serde_json::Value::String(snap.label.clone()),

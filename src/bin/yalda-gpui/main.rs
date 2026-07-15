@@ -1739,7 +1739,7 @@ impl YaldaGpuiView {
         // cached copy on the tile. Borrows `self.sessions` (disjoint from the
         // `&self.workspace` snapshot borrow).
         let sessions = &self.sessions;
-        let resolve = |id| sessions.sid_of(id).map(|s| s.to_string());
+        let resolve = |id| sessions.sid_of(id).cloned();
         save_persisted_workspace(&cwd, &self.workspace, &resolve);
     }
 
@@ -1756,7 +1756,7 @@ impl YaldaGpuiView {
         let mut ws: workspace::Workspace<App> = workspace::Workspace::new();
         // Each agent leaf carries its persisted session id (identity), so restore
         // rebinds it to ITS OWN session (UXI-AgentTile-18), not by index.
-        let mut agent_leaf_ids: Vec<(workspace::WindowId, Option<String>)> = Vec::new();
+        let mut agent_leaf_ids: Vec<(workspace::WindowId, Option<ServerSid>)> = Vec::new();
         for ptab in snap.tabs {
             let (layout, max_id, agents) = restore_layout(&mut ws, &self.theme, ptab.layout);
             ws.next_window_id = ws.next_window_id.max(max_id + 1);
@@ -1870,7 +1870,7 @@ impl YaldaGpuiView {
     /// layout — by that point `self.workspace` is populated and we have `cx`.
     fn restore_agent_leaves(
         &mut self,
-        leaves: &[(workspace::WindowId, Option<String>)],
+        leaves: &[(workspace::WindowId, Option<ServerSid>)],
         cx: &mut Context<Self>,
     ) {
         let proc_cwd = process_cwd();
@@ -1883,14 +1883,16 @@ impl YaldaGpuiView {
             // side-channel; the leaf's own id is authoritative for the binding.
             // Bind up front + attach the bound sids once, together (no per-leaf
             // re-list, which would race every tile onto the first sid).
+            // `attach_sids` leaves to the server's attach (wire); it stays a
+            // `Vec<String>`, filled from `ServerSid` via `.to_string()`.
             let mut attach_sids: Vec<String> = Vec::new();
-            let by_id: std::collections::HashMap<String, PersistedSlot> =
+            let by_id: std::collections::HashMap<ServerSid, PersistedSlot> =
                 persisted.iter().cloned().map(|s| (s.id.clone(), s)).collect();
             // Positional fallback ONLY for an old (pre-identity) workspace.json
             // where every leaf's persisted id is None; a fresh save writes ids.
             let any_identity = leaves
                 .iter()
-                .any(|(_, sid)| sid.as_deref().is_some_and(|s| !s.is_empty()));
+                .any(|(_, sid)| sid.as_ref().is_some_and(|s| !s.as_str().is_empty()));
             eprintln!(
                 "[yalda-gpui] restore(server): {} agent leaves, {} persisted sessions, any_identity={}; leaf ids: {:?}",
                 leaves.len(),
@@ -1898,31 +1900,34 @@ impl YaldaGpuiView {
                 any_identity,
                 leaves
                     .iter()
-                    .map(|(w, sid)| (w, sid.as_deref().map(|s| &s[..s.len().min(8)])))
+                    .map(|(w, sid)| {
+                        (w, sid.as_ref().map(|s| s.as_str()[..s.as_str().len().min(8)].to_string()))
+                    })
                     .collect::<Vec<_>>(),
             );
             for (i, (leaf_id, persisted_sid)) in leaves.iter().enumerate() {
                 self.install_agent_tile(*leaf_id, AgentTile::new());
                 self.focus_window_for_restore(*leaf_id);
 
-                let slot: Option<PersistedSlot> = match persisted_sid.as_deref() {
-                    Some(s) if !s.is_empty() => Some(by_id.get(s).cloned().unwrap_or_else(|| {
-                        // Layout knows the id but the details side-channel doesn't
-                        // (e.g. cwd changed) — still bind the id, with defaults.
-                        PersistedSlot {
-                            id: s.to_string(),
-                            label: "claude".into(),
-                            active: false,
-                            mode: InputModeKind::Worksheet,
-                            tasklist_open: false,
-                            subagents_open: false,
-                            cwd: None,
-                            compose_draft: None,
-                        }
-                    })),
-                    _ if any_identity => None,
-                    _ => persisted.get(i).cloned(),
-                };
+                let slot: Option<PersistedSlot> =
+                    match persisted_sid.as_ref().filter(|s| !s.as_str().is_empty()) {
+                        Some(s) => Some(by_id.get(s).cloned().unwrap_or_else(|| {
+                            // Layout knows the id but the details side-channel doesn't
+                            // (e.g. cwd changed) — still bind the id, with defaults.
+                            PersistedSlot {
+                                id: s.clone(),
+                                label: "claude".into(),
+                                active: false,
+                                mode: InputModeKind::Worksheet,
+                                tasklist_open: false,
+                                subagents_open: false,
+                                cwd: None,
+                                compose_draft: None,
+                            }
+                        })),
+                        _ if any_identity => None,
+                        _ => persisted.get(i).cloned(),
+                    };
 
                 match slot {
                     Some(slot) => {
@@ -1964,10 +1969,11 @@ impl YaldaGpuiView {
                                     // the next save resolves it via `sid_of` — no cache.
                                     tile.bind(sid_id);
                                 }
-                                attach_sids.push(slot.id.clone());
+                                // Wire boundary: the bound sid leaves to attach.
+                                attach_sids.push(slot.id.to_string());
                                 eprintln!(
                                     "[yalda-gpui] restore leaf {leaf_id}: BOUND+resume {}",
-                                    &slot.id[..slot.id.len().min(8)]
+                                    &slot.id.as_str()[..slot.id.as_str().len().min(8)]
                                 );
                             }
                             agent_sessions::Bind::AlreadyOpen(_) => {
@@ -1978,7 +1984,7 @@ impl YaldaGpuiView {
                                 self.refresh_roster(cx);
                                 eprintln!(
                                     "[yalda-gpui] restore leaf {leaf_id}: PICKER (sid {} already open — duplicate)",
-                                    &slot.id[..slot.id.len().min(8)]
+                                    &slot.id.as_str()[..slot.id.as_str().len().min(8)]
                                 );
                             }
                         }
@@ -2264,12 +2270,13 @@ impl YaldaGpuiView {
         // The payload entity is built lazily only when a NEW session is minted
         // (so the entity is created exactly once per sid, never on the focus
         // path where `open_or_focus` returns the existing one).
-        let bind = self.sessions.open_or_focus(sid, |_id| {
+        // Wire boundary: `sid` / `resume_id` arrive as raw strings; type them.
+        let bind = self.sessions.open_or_focus(&ServerSid::new(sid), |_id| {
             let session = AgentSession {
                 state: make_state(),
                 label,
                 cwd,
-                resume_id,
+                resume_id: resume_id.map(ServerSid::new),
             };
             cx.new(|_| session)
         });

@@ -152,7 +152,8 @@ impl YaldaGpuiView {
             // it's open; roster-only sessions have no local phase (`None`).
             let opened = self
                 .sessions
-                .locate(&info.session_id)
+                // Wire boundary: the roster carries raw String sids from the server.
+                .locate(&ServerSid::new(info.session_id.clone()))
                 .and_then(|id| self.sessions.get(id));
             let label = opened
                 .map(|e| e.read(cx).label.clone())
@@ -172,7 +173,7 @@ impl YaldaGpuiView {
         // placeholder whose sid isn't bound yet, or before the first refresh).
         for (id, ent) in self.sessions.iter() {
             if let Some(sid) = self.sessions.sid_of(id)
-                && seen.contains(sid)
+                && seen.contains(sid.as_str())
             {
                 continue;
             }

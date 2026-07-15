@@ -472,7 +472,8 @@ impl YaldaGpuiView {
                 BindOutcome::Bound => {
                     if let Some(ent) = self.session_entity(id) {
                         ent.update(cx, |session, scx| {
-                            session.resume_id = acp_id;
+                            // Wire boundary: the ACP session id becomes the typed resume id.
+                            session.resume_id = acp_id.map(ServerSid::new);
                             session.state.permission_mode = permission_mode;
                             session.state.status =
                                 Some("attaching to ACP agent via session server…".into());
@@ -519,7 +520,8 @@ impl YaldaGpuiView {
                             if let Some(ent) = self.session_entity(id) {
                                 ent.update(cx, |session, scx| {
                                     session.label = label;
-                                    session.resume_id = acp_id;
+                                    // Wire boundary: ACP session id → typed resume id.
+                                    session.resume_id = acp_id.map(ServerSid::new);
                                     session.state.permission_mode = permission_mode;
                                     session.state.status = Some(status.into());
                                     scx.notify();
@@ -626,7 +628,9 @@ impl YaldaGpuiView {
     /// virtual workspace (ADR-0021) and attach the session into it, reusing the
     /// picker's bind+attach path (`picker_attach_existing`).
     pub(crate) fn jump_to_roster_session(&mut self, sid: String, cx: &mut Context<Self>) {
-        if let Some(id) = self.sessions.locate(&sid) {
+        // Wire boundary: the roster/jump-target sid is a raw String; type it for
+        // the store lookup.
+        if let Some(id) = self.sessions.locate(&ServerSid::new(sid.clone())) {
             self.jump_to_session(id, cx);
             return;
         }
@@ -700,7 +704,9 @@ impl YaldaGpuiView {
     ///   `show_session` implements). Returns [`BindOutcome`] so the caller can
     ///   skip the (redundant) attach for the focus case.
     fn bind_session_sid(&mut self, id: SessionId, sid: &str) -> BindOutcome {
-        match self.sessions.bind_sid(id, sid.to_string()) {
+        // Wire boundary: `sid` arrives as a raw string from the open/attach
+        // resolution; type it for the store bind.
+        match self.sessions.bind_sid(id, ServerSid::new(sid)) {
             Ok(()) => BindOutcome::Bound,
             Err(AlreadyBound(owner)) => {
                 eprintln!(
@@ -812,7 +818,7 @@ impl YaldaGpuiView {
                         }
                     };
                     if let Some(s) = status
-                        && let Some(sid_id) = this.sessions.locate(&sid)
+                        && let Some(sid_id) = this.sessions.locate(&ServerSid::new(sid.clone()))
                     {
                         this.with_session(sid_id, cx, |st| {
                             st.status = Some(s);
@@ -1174,7 +1180,8 @@ impl YaldaGpuiView {
             // new sid onto the same live session/transcript.
             let old_sid = self.sessions.clear_sid(id);
             if let Some(old_sid) = old_sid {
-                self.spawn_close_session(old_sid, cx);
+                // Wire boundary: the released sid leaves to the server's close.
+                self.spawn_close_session(old_sid.to_string(), cx);
             }
             let open_token = alloc_open_token();
             if let Some(ent) = self.session_entity(id) {
@@ -1348,12 +1355,20 @@ impl YaldaGpuiView {
                     // session has `resume_id == None` + `channel == None`, so those
                     // sources miss it — bug-0001). `sid_of` is the id the store
                     // bound at create/attach time.
-                    let resolved_id = self
+                    let resolved_id: Option<ServerSid> = self
                         .sessions
                         .sid_of(id)
-                        .map(|s| s.to_string())
+                        .cloned()
                         .or_else(|| session.resume_id.clone())
-                        .or_else(|| session.state.channel.as_ref().and_then(|c| c.session_id()));
+                        // Wire boundary: the channel's ACP session id enters as a String.
+                        .or_else(|| {
+                            session
+                                .state
+                                .channel
+                                .as_ref()
+                                .and_then(|c| c.session_id())
+                                .map(ServerSid::new)
+                        });
                     if let Some(rid) = resolved_id {
                         let draft = session.state.input_surface.compose().text();
                         snaps.push(SessionSnapshot {
@@ -1388,7 +1403,7 @@ impl YaldaGpuiView {
     /// monotonic-index fragility).
     pub(crate) fn create_agent_session(
         &mut self,
-        resume_id: Option<String>,
+        resume_id: Option<ServerSid>,
         cwd: PathBuf,
         _cx: &mut Context<Self>,
     ) -> AgentState {
@@ -1396,13 +1411,15 @@ impl YaldaGpuiView {
             std::sync::mpsc::channel::<std::io::Result<AcpChannelClient>>();
         let cmd = std::env::var("YALDA_ACP_AGENT").unwrap_or_default();
         let spawn_cwd = Some(cwd);
+        // Wire boundary: the resume id leaves to the ACP channel as a bare String.
+        let resume_wire = resume_id.map(|s| s.to_string());
         let _ = std::thread::Builder::new()
             .name("yalda-acp-attach".into())
             .spawn(move || {
                 let _ = attach_tx.send(AcpChannelClient::spawn_with_resume_in(
                     &cmd,
                     spawn_cwd,
-                    resume_id,
+                    resume_wire,
                     yalda::acp_channel::YaldaFrontend::Gpui,
                 ));
             });
@@ -1809,7 +1826,8 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
         mut f: impl FnMut(&mut AgentSession),
     ) -> bool {
-        let Some(id) = self.sessions.locate(sid) else {
+        // Wire boundary: `sid` arrives as a raw string from a server notification.
+        let Some(id) = self.sessions.locate(&ServerSid::new(sid)) else {
             return false;
         };
         let Some(ent) = self.session_entity(id) else {
@@ -1837,7 +1855,8 @@ impl YaldaGpuiView {
     /// close (so `locate` already misses), and here we additionally skip a tile
     /// whose token is in flight.
     pub(crate) fn reconcile_session_closed(&mut self, sid: &str, cx: &mut Context<Self>) -> bool {
-        let Some(id) = self.sessions.locate(sid) else {
+        // Wire boundary: `sid` is a raw string from a SessionClosed notification.
+        let Some(id) = self.sessions.locate(&ServerSid::new(sid)) else {
             return false;
         };
         // Find the tile that showed this session (at most one, INV-2). Skip a
@@ -1882,7 +1901,9 @@ impl YaldaGpuiView {
     /// re-attempts the resume rather than silently forgetting it). Returns whether
     /// a tile was flipped.
     pub(crate) fn reconcile_session_unavailable(&mut self, sid: &str, cx: &mut Context<Self>) -> bool {
-        let Some(id) = self.sessions.locate(sid) else {
+        // Wire boundary: `sid` is a raw string from a failed-resume attach.
+        let remembered = ServerSid::new(sid);
+        let Some(id) = self.sessions.locate(&remembered) else {
             return false;
         };
         // The lost session's label, for the notice (captured before close).
@@ -1898,7 +1919,7 @@ impl YaldaGpuiView {
                 {
                     tile_found = true;
                     if tile.pending_token().is_none() {
-                        tile.mark_unavailable(sid.to_string(), label.clone());
+                        tile.mark_unavailable(remembered.clone(), label.clone());
                     }
                 }
             });
@@ -1920,7 +1941,8 @@ impl YaldaGpuiView {
         label: &str,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(id) = self.sessions.locate(sid) else {
+        // Wire boundary: `sid` is a raw string from a SessionRenamed notification.
+        let Some(id) = self.sessions.locate(&ServerSid::new(sid)) else {
             return false;
         };
         let Some(ent) = self.session_entity(id) else {
@@ -3768,7 +3790,8 @@ impl YaldaGpuiView {
             });
         if let Some(ent) = self.session_entity(id) {
             ent.update(cx, |session, scx| {
-                session.resume_id = resume_id;
+                // Wire boundary: the channel's ACP session id → typed resume id.
+                session.resume_id = resume_id.map(ServerSid::new);
                 session.state.channel = None; // Drop → kills the wedged subprocess.
                 session.state.attach_pending = Some(attach_rx);
                 session.state.turn_phase = TurnPhase::Idle;
