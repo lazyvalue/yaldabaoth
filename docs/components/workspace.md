@@ -299,3 +299,52 @@ negative-slot save clamp that Stage B removed (signed rows/cols now persist dire
 The "force plane / ignore `layout_mode`" + one-time reflow is realized via the
 existing seed/reconcile-on-first-render path (retired-mode tabs bulk-seed their
 leaves through `seed_slot`).
+
+### UXI-Workspace-8 — Moving or resizing a tile rests the view cell-aligned (no fractional pan)
+
+**Statement.** Committing a **tile move** (drag-drop to a new slot) or a **tile
+edge-resize** leaves the camera pan on **whole slot units**, so the plane grid rests
+aligned to the viewport the same way tiles align to cells — no residual
+fraction-of-a-cell offset. The offending drift comes from the drag **edge auto-pan**
+(`pan_by(step/pitch)`, a fractional slot step per frame) and, on the reveal path, from
+the right/bottom edge-reveal storing `pan = (x+tile+g−canvas)/pitch`; both are snapped
+to the nearest whole slot at commit. **Focus reveal** (`chrome.rs` reveal block) also
+cell-snaps, **but only when it actually had to pan** to bring the focused tile into
+view — a focus change to an already-fully-visible tile does **not** move the view
+(matches the "only pans when the tile isn't fully visible" clause). The snap is
+**view-only** (Constraint C1 / `UXI-Workspace-3`): it never touches a tile's anchor or
+span. The deliberate `Cmd+Shift` free-pan (`UXI-Workspace-4`) is out of scope — it
+stays continuous.
+
+**Applies to.** `workspace.rs`: `DesktopState::snap_camera_to_slots` (rounds
+`camera.pan` per-axis to the nearest integer). `chrome.rs`: `desktop_drop` calls it
+after the free-drop commit (drag branch, only when the drag was `active`) and after
+the edge-resize commit; the `render_desktop` reveal block calls it only when a reveal
+adjustment fired.
+
+**Why.** The user drags a tile onto a clean cell but the *view* lands a fraction of a
+cell off, so the whole plane looks subtly misaligned — "the window snapped to the grid
+but the workspace didn't." Cell-aligning the camera at commit makes the view snap to
+the same cells the tile does.
+
+**Status.** `implemented`.
+
+**Enforcement.** `verify_harness.rs::tile_drag_rests_view_cell_aligned` drives a real
+tile drag (`desktop_grab` → `desktop_pointer_move` into the canvas edge band → edge
+auto-pan leaves a fractional pan → `desktop_drop`) and asserts the pan is fractional
+*before* the drop (non-vacuous) then integral on both axes after, and the un-dragged
+tile never moved (view-only). `workspace.rs` desktop_tests:
+`snap_camera_to_slots_rounds_and_preserves_slots` covers the pure round + no
+slot/span mutation. Both negative-control-verified RED (drop-branch
+`snap_camera_to_slots()` commented out → drag test fails; `.round()` dropped → unit
+test fails).
+
+**Deviation from plan.** The reveal path snaps only when a reveal adjustment actually
+fired (a focus change to an already-visible tile leaves the view still, honoring the
+"only pans when not fully visible" clause). The drag branch snaps on **any active
+drag** (even a rejected/no-op drop) since the edge auto-pan runs independently of
+whether the drop commits. `Cmd+Shift` free-pan is intentionally left un-snapped
+(continuous camera gesture, out of scope). Round-to-nearest is used (not directional)
+— on a right/bottom reveal this could in principle clip a tile edge by <½ cell, but
+the reveal keeps a full gutter of slack and tiles are ≥1 slot, so it is not observed
+in practice; revisit to directional rounding only if a clipped reveal is reported.

@@ -1113,6 +1113,18 @@ pub(crate) fn build_wrapped_line(
 ) -> AnyElement {
     let mut row = div().flex().flex_row().flex_wrap().flex_1().min_w_0();
 
+    // Register a painted element's covered char range into the hit-test sink (if
+    // this is the selectable transcript). Used on EVERY render path — including
+    // the cursor line — so `hit_test_tokens` has full per-line coverage
+    // regardless of focus/caret state (bug-0003: the caret line used to register
+    // nothing, so a mouse-down anchoring on it snapped to the wrong line).
+    let reg = |el: AnyElement, start_char: usize, char_count: usize| -> AnyElement {
+        match token_sink {
+            Some(sink) => register_token_on_paint(el, sink.clone(), line_idx, start_char, char_count),
+            None => el,
+        }
+    };
+
     // Tokenize each segment into runs of whitespace vs non-whitespace,
     // preserving the segment's style on each token.
     let mut tokens: Vec<Segment> = Vec::new();
@@ -1140,17 +1152,13 @@ pub(crate) fn build_wrapped_line(
         }
     }
 
-    // Empty-line placeholder so the row still occupies a visual line.
+    // Empty-line placeholder so the row still occupies a visual line. Register a
+    // zero-width hit at col 0 so a click/drag can still anchor on a blank line.
     if tokens.is_empty() {
         let line = segments_to_styled_line(&[(" ".to_string(), base_style)]);
-        row = row.child(styled_line_element(
-            &line,
-            base_style,
-            base_fg,
-            line_font,
-            code_font,
-            selection_bg,
-        ));
+        let el =
+            styled_line_element(&line, base_style, base_fg, line_font, code_font, selection_bg);
+        row = row.child(reg(el, 0, 0));
         if is_cursor_line {
             row = row.child(make_caret(mode, ' ', cursor_color));
         }
@@ -1164,13 +1172,7 @@ pub(crate) fn build_wrapped_line(
             let line = segments_to_styled_line(&[(text.clone(), *style)]);
             let el =
                 styled_line_element(&line, base_style, base_fg, line_font, code_font, selection_bg);
-            let el = match token_sink {
-                Some(sink) => {
-                    register_token_on_paint(el, sink.clone(), line_idx, char_so_far, token_chars)
-                }
-                None => el,
-            };
-            row = row.child(el);
+            row = row.child(reg(el, char_so_far, token_chars));
             char_so_far += token_chars;
         }
         return row.into_any_element();
@@ -1185,7 +1187,11 @@ pub(crate) fn build_wrapped_line(
     // past the last char (EOL beam / trailing block).
     let caret_owner = caret_token_split(&token_lens, cursor_col);
 
+    // `char_base` tracks the doc-char offset at the start of the current token,
+    // so each emitted piece registers the right (start_char, count) into the sink.
+    let mut char_base = 0usize;
     for (i, (text, style)) in tokens.iter().enumerate() {
+        let token_len = token_lens[i];
         let owner_split = caret_owner.and_then(|(oi, sp)| (oi == i).then_some(sp));
 
         if let Some(split_point) = owner_split {
@@ -1193,17 +1199,25 @@ pub(crate) fn build_wrapped_line(
             let before: String = chars[..split_point].iter().collect();
             if !before.is_empty() {
                 let line = segments_to_styled_line(&[(before, *style)]);
-                row = row.child(styled_line_element(
+                let el = styled_line_element(
                     &line,
                     base_style,
                     base_fg,
                     line_font,
                     code_font,
                     selection_bg,
-                ));
+                );
+                row = row.child(reg(el, char_base, split_point));
             }
             let cursor_char = chars.get(split_point).copied().unwrap_or(' ');
-            row = row.child(make_caret(mode, cursor_char, cursor_color));
+            // The caret cell covers the char at `split_point` in Normal mode; in
+            // Insert mode it's a zero-width beam sitting BEFORE that char.
+            let caret_count = match mode {
+                EditMode::Normal => 1,
+                EditMode::Insert => 0,
+            };
+            let caret_el = make_caret(mode, cursor_char, cursor_color);
+            row = row.child(reg(caret_el, char_base + split_point, caret_count));
             // After-the-caret: in Normal mode the cursor cell consumed the
             // char at split_point; in Insert mode it's a zero-width beam so
             // the char at split_point still belongs to the after-stream.
@@ -1214,31 +1228,36 @@ pub(crate) fn build_wrapped_line(
             if after_start < chars.len() {
                 let after: String = chars[after_start..].iter().collect();
                 let line = segments_to_styled_line(&[(after, *style)]);
-                row = row.child(styled_line_element(
+                let el = styled_line_element(
                     &line,
                     base_style,
                     base_fg,
                     line_font,
                     code_font,
                     selection_bg,
-                ));
+                );
+                row = row.child(reg(el, char_base + after_start, token_len - after_start));
             }
         } else {
             let line = segments_to_styled_line(&[(text.clone(), *style)]);
-            row = row.child(styled_line_element(
+            let el = styled_line_element(
                 &line,
                 base_style,
                 base_fg,
                 line_font,
                 code_font,
                 selection_bg,
-            ));
+            );
+            row = row.child(reg(el, char_base, token_len));
         }
+        char_base += token_len;
     }
 
-    // Cursor sits past the last char (e.g., end-of-line in Insert mode).
+    // Cursor sits past the last char (e.g., end-of-line in Insert mode). Register
+    // a zero-width hit at the line end so a click there still anchors on-line.
     if caret_owner.is_none() {
-        row = row.child(make_caret(mode, ' ', cursor_color));
+        let caret_el = make_caret(mode, ' ', cursor_color);
+        row = row.child(reg(caret_el, char_base, 0));
     }
 
     row.into_any_element()
@@ -3189,6 +3208,13 @@ pub(crate) struct AgentState {
     pub(crate) tasklist_open: bool,
     /// Whether the Subagents bottom panel is open (§28).
     pub(crate) subagents_open: bool,
+    /// Whether the whole right sidepanel is force-hidden (UXI-AgentTile-20).
+    /// Orthogonal to `tasklist_open`/`subagents_open` (which choose *which*
+    /// segments are open): when `true` the sidepanel does not render even if a
+    /// segment has content, and it does not auto-reappear when new plan/subagent
+    /// content arrives. Toggled by `Cmd-B`; cleared by `Cmd-0` (focus_agent_panel).
+    /// Persisted per session alongside the §35 flags.
+    pub(crate) sidepanel_hidden: bool,
     /// Which bottom-panel column holds the selection while `focus == Panel`
     /// (`h`/`l` switch). Meaningless otherwise.
     pub(crate) panel_col: PanelColumn,
@@ -3500,6 +3526,7 @@ impl AgentState {
             // Subagent panes auto-appear at the tile bottom when subagents exist;
             // Cmd-2 (ToggleSubagents) collapses them.
             subagents_open: true,
+            sidepanel_hidden: false,
             panel_col: PanelColumn::Tasklist,
             panel_sel: 0,
             panel_return_focus: AgentFocus::Compose,
@@ -3561,6 +3588,7 @@ impl AgentState {
             // Subagent panes auto-appear at the tile bottom when subagents exist;
             // Cmd-2 (ToggleSubagents) collapses them.
             subagents_open: true,
+            sidepanel_hidden: false,
             panel_col: PanelColumn::Tasklist,
             panel_sel: 0,
             panel_return_focus: AgentFocus::Compose,
@@ -3939,17 +3967,44 @@ impl AgentState {
             == Some(TurnId::Llm(latest))
     }
 
+    /// The doc line a You-block anchored at `anchor` renders under (`None`/tail →
+    /// the last document line).
+    fn you_block_effective_line(&self, anchor: Option<usize>) -> usize {
+        anchor.unwrap_or_else(|| self.editor.document().line_count().saturating_sub(1))
+    }
+
+    /// Would two You-blocks anchored at `a` and `b` render **adjacent** — i.e. with
+    /// no surviving non-blank line between them, so the blank lines collapse and the
+    /// two divs land in the same slot? (UXI-AgentTile-11 rule 6: two adjacent you-
+    /// blocks must never happen — the "second you-div next to the first" bug.) Same
+    /// effective line is trivially adjacent; otherwise adjacency ⇔ every doc line
+    /// strictly between the two anchors is blank (all collapse away).
+    fn you_blocks_would_be_adjacent(&self, a: Option<usize>, b: Option<usize>) -> bool {
+        let (la, lb) = (
+            self.you_block_effective_line(a),
+            self.you_block_effective_line(b),
+        );
+        let (lo, hi) = (la.min(lb), la.max(lb));
+        let doc = self.editor.document();
+        (lo + 1..=hi).all(|i| doc.line_text(i).trim().is_empty())
+    }
+
     /// Open / RESUME / ADD an inline You-block for editing at the caret, focus the
     /// compose in Insert and reveal it. The anchor is SNAPPED to the nearest
     /// navigable stop at-or-above the caret (`snap_nav_stop`) so the freeze position
     /// matches where the block RENDERS (an un-snapped anchor inside a parsed block
     /// would render above it but freeze after it — bug-hunt-2 B7).
     ///
-    /// MULTIPLE insertion points (rule 6 corrected): if a block is already active
-    /// and the caret is at a DIFFERENT legal anchor, the active block is PARKED (a
-    /// second insertion point) and a fresh one opens at the new anchor. Same anchor
-    /// (or an illegal caret) RESUMES the active block in place — never moving the
-    /// reply (the "jumps around" bug). Caller ensures worksheet + idle.
+    /// Insertion points resolve by RENDER SLOT, not raw anchor (rule 6, revised —
+    /// bug-0004): the caret's snapped anchor is matched against every existing block
+    /// by whether they'd render ADJACENT (no surviving line between). Two you-blocks
+    /// must never render next to each other, so:
+    ///   • adjacent to the ACTIVE block → resume it in place (never spawn a neighbour).
+    ///   • adjacent to a PARKED block   → resume THAT block (swap it in).
+    ///   • a genuinely SEPARATED legal anchor (surviving content between) → park the
+    ///     active, open a fresh block there (real multiple insertion points).
+    ///   • illegal caret, nothing open  → open a tail block.
+    /// Caller ensures worksheet + idle.
     pub(crate) fn open_you_block_at_cursor(&mut self) {
         let l = self.editor.cursor().line;
         let snapped = if self.you_block_anchor_is_legal(l) {
@@ -3957,46 +4012,39 @@ impl AgentState {
         } else {
             None
         };
-        // Deterministic editing (runtime report: "sometimes edits an existing block,
-        // sometimes creates a new one"). Resolve the caret's snapped anchor against
-        // ALL blocks, not just the active one:
-        //   • matches the ACTIVE block's anchor → resume it in place.
-        //   • matches a PARKED block's anchor    → resume THAT block (swap it in).
-        //   • a new legal anchor                 → park the active, open fresh here.
-        //   • illegal caret                      → resume whatever's active.
-        if self.you_block_open && snapped == self.you_block_anchor {
-            // resume active in place (covers the same-anchor and snapped==active cases)
-        } else if let Some(new_anchor) = snapped {
-            let parked_idx = self
-                .parked_you_blocks
-                .iter()
-                .position(|(a, _)| *a == Some(new_anchor));
-            if let Some(pi) = parked_idx {
-                // Resume a PARKED block: stash the current active (if any non-empty),
-                // then load the parked one into the active Compose.
-                if self.you_block_open {
-                    let text = self.input_surface.compose().text();
-                    if !text.trim().is_empty() {
-                        self.parked_you_blocks
-                            .push((self.you_block_anchor, text));
-                    }
+        if self.you_block_open && self.you_blocks_would_be_adjacent(self.you_block_anchor, snapped)
+        {
+            // Resume the active block in place — the caret's target is the same slot,
+            // so a new block there would render adjacent (bug-0004).
+        } else if let Some(pi) = self
+            .parked_you_blocks
+            .iter()
+            .position(|(a, _)| self.you_blocks_would_be_adjacent(*a, snapped))
+        {
+            // Resume a PARKED block occupying that slot: stash the current active (if
+            // non-empty), then load the parked one into the active Compose.
+            if self.you_block_open {
+                let text = self.input_surface.compose().text();
+                if !text.trim().is_empty() {
+                    self.parked_you_blocks.push((self.you_block_anchor, text));
                 }
-                let (panchor, ptext) = self.parked_you_blocks.remove(pi);
-                self.input_surface = InputSurface::with_draft(InputModeKind::Worksheet, &ptext);
-                self.you_block_open = true;
-                self.you_block_anchor = panchor;
-            } else if !self.you_block_open && self.parked_you_blocks.is_empty() {
+            }
+            let (panchor, ptext) = self.parked_you_blocks.remove(pi);
+            self.input_surface = InputSurface::with_draft(InputModeKind::Worksheet, &ptext);
+            self.you_block_open = true;
+            self.you_block_anchor = panchor;
+        } else if let Some(new_anchor) = snapped {
+            if !self.you_block_open && self.parked_you_blocks.is_empty() {
                 // First block.
                 self.you_block_open = true;
                 self.you_block_anchor = Some(new_anchor);
             } else {
-                // A NEW insertion point at a fresh anchor: park the active (if it has
+                // A genuinely SEPARATED insertion point: park the active (if it has
                 // text) and open a fresh block here.
                 if self.you_block_open {
                     let text = self.input_surface.compose().text();
                     if !text.trim().is_empty() {
-                        self.parked_you_blocks
-                            .push((self.you_block_anchor, text));
+                        self.parked_you_blocks.push((self.you_block_anchor, text));
                     }
                 }
                 self.input_surface = InputSurface::new(InputModeKind::Worksheet);

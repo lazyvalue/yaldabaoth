@@ -3893,6 +3893,7 @@ fn multi_session_persistence_round_trips_distinct_sids() {
             mode: InputModeKind::Chatbox,
             tasklist_open: false,
             subagents_open: false,
+            sidepanel_hidden: false,
             cwd: cwd.clone(),
             compose_draft: None,
         },
@@ -3903,6 +3904,8 @@ fn multi_session_persistence_round_trips_distinct_sids() {
             mode: InputModeKind::Worksheet,
             tasklist_open: true,
             subagents_open: false,
+            // UXI-AgentTile-20: force-hidden sidepanel round-trips per session.
+            sidepanel_hidden: true,
             cwd: cwd.clone(),
             compose_draft: None,
         },
@@ -3922,6 +3925,9 @@ fn multi_session_persistence_round_trips_distinct_sids() {
     assert_eq!(loaded[1].label, "claude-B");
     assert_eq!(loaded[1].mode, InputModeKind::Worksheet);
     assert!(loaded[1].tasklist_open);
+    // UXI-AgentTile-20: the hidden flag round-trips (A shown, B hidden).
+    assert!(!loaded[0].sidepanel_hidden, "SID-A sidepanel stays shown");
+    assert!(loaded[1].sidepanel_hidden, "SID-B sidepanel restores hidden");
 }
 
 // ---- Render-skip keystone + invalidation model (rev 2) -------------------
@@ -4310,6 +4316,89 @@ fn transcript_drag_autocopies_selection_to_clipboard(cx: &mut TestAppContext) {
     assert!(
         clip.contains("Hello agent world"),
         "clipboard {clip:?} does not hold the dragged first-line text"
+    );
+}
+
+/// bug-0003: when the transcript is FOCUSED, the caret's line renders via the
+/// caret-injection path. That path used to register NO token hits, so a
+/// mouse-down anchoring on the caret line snapped to a different line and the
+/// copied selection was wrong. This drives the real focused path: caret parked
+/// on line 1, drag ACROSS line 1, assert the clipboard holds line 1's text —
+/// not line 0's. Negative control: revert the cursor-line `reg(...)` calls in
+/// `build_wrapped_line` and line 1 registers no tokens → `!line1.is_empty()`
+/// fires (right reason: caret line contributed nothing to the hit-test sink).
+#[gpui::test]
+fn transcript_drag_on_focused_caret_line_copies_that_line(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, "Hello agent world here\nsecond line here\n");
+        // Focus the transcript and park the caret ON line 1 — this is the state
+        // that makes line 1 render through the caret path.
+        s.state.focus = crate::AgentFocus::Transcript;
+        s.state.editor.cursor_mut().line = 1;
+        s.state.editor.cursor_mut().col = 3;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    view.update(vcx, |_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("SENTINEL-NOT-COPIED".into()))
+    });
+
+    let tv = view
+        .update(vcx, |v, _| v.transcript_views.get(&id).cloned())
+        .expect("transcript view exists");
+    let tokens: Vec<crate::TokenHit> = tv.update(vcx, |t, _| t.token_hits.borrow().clone());
+
+    // The caret line (line 1) MUST contribute tokens even though it's the
+    // focused cursor line — this is the bug-0003 regression point.
+    let line1: Vec<&crate::TokenHit> = tokens.iter().filter(|t| t.line_idx == 1).collect();
+    assert!(
+        !line1.is_empty(),
+        "focused caret line (line 1) registered no token hits — a mouse-down there \
+         would snap to the wrong line (bug-0003)"
+    );
+
+    let left = line1
+        .iter()
+        .map(|t| t.bounds.left())
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap();
+    let right = line1
+        .iter()
+        .map(|t| t.bounds.right())
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap();
+    let midy = line1[0].bounds.top() + (line1[0].bounds.bottom() - line1[0].bounds.top()) / 2.0;
+    let start = point(left + px(1.0), midy);
+    let end = point(right - px(1.0), midy);
+
+    vcx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    vcx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    vcx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    vcx.run_until_parked();
+
+    let clip = view
+        .update(vcx, |_, cx| cx.read_from_clipboard())
+        .and_then(|it| it.text())
+        .unwrap_or_default();
+    assert_ne!(
+        clip, "SENTINEL-NOT-COPIED",
+        "drag on the focused caret line did not copy anything"
+    );
+    assert!(
+        clip.contains("second line"),
+        "clipboard {clip:?} should hold the caret line's text (line 1), not another line's"
+    );
+    assert!(
+        !clip.contains("Hello agent"),
+        "clipboard {clip:?} leaked line 0 text — the drag anchored on the wrong line (bug-0003)"
     );
 }
 
@@ -7609,6 +7698,81 @@ fn worksheet_multiple_insertion_points(cx: &mut TestAppContext) {
     });
 }
 
+/// REGRESSION (bug-0004): two You-blocks must NEVER render adjacent (next to each
+/// other). Repro: open a tail You-block ("hi", visible at the bottom), Esc-Esc to
+/// nav, move the caret UP one line onto the last agent line, press `o`. The blank
+/// tail line between the two anchors collapses, so the old code's "second insertion
+/// point" landed in the SAME slot → two adjacent `YouBlock`s. The fix resolves by
+/// render slot: `o` there resumes the existing "hi" block instead of spawning a
+/// neighbour. A genuinely separated insertion point (agent content between) still
+/// opens a second block — covered by `worksheet_multiple_insertion_points`.
+///
+/// Asserts on the RENDERED flat_items (no two consecutive YouBlock items), not just
+/// state. Negative control: revert `open_you_block_at_cursor` to match on raw anchor
+/// equality (`snapped == self.you_block_anchor`) instead of `you_blocks_would_be_adjacent`
+/// → parked=1, two adjacent YouBlocks → the adjacency assert fires RED.
+#[gpui::test]
+fn worksheet_you_blocks_never_render_adjacent(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("alpha\nbeta\ngamma\ndelta\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // Open a TAIL You-block (the div at the bottom), type "hi", Esc-Esc to nav.
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).expect("agent").move_cursor_to_tail();
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("o"), w, cx));
+    for ch in ["h", "i"] {
+        view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key(ch), w, cx));
+    }
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    vcx.run_until_parked();
+
+    // Move the caret UP one legal line and press `o` — the exact reported gesture.
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).expect("agent").editor.cursor_mut().line = 3;
+    });
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("o"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        // The rendered list must have NO two consecutive YouBlock items.
+        let items = &c.view_model.flat_items_cache;
+        let adjacent = items.windows(2).any(|w| {
+            matches!(w[0], crate::FlatItem::YouBlock { .. })
+                && matches!(w[1], crate::FlatItem::YouBlock { .. })
+        });
+        assert!(!adjacent, "two You-blocks rendered adjacent (bug-0004): {items:?}");
+        // And the "hi" reply was RESUMED (not orphaned into a hidden parked block).
+        assert!(c.parked_you_blocks.is_empty(), "no spurious second insertion point");
+        assert_eq!(c.input_surface.compose().text().trim(), "hi", "the existing reply is resumed");
+        let n_you = items
+            .iter()
+            .filter(|it| matches!(it, crate::FlatItem::YouBlock { .. }))
+            .count();
+        assert_eq!(n_you, 1, "exactly one You-block renders");
+    });
+}
+
 /// UXI-AgentTile-11 rule 6 (MULTIPLE insertion points): with a non-empty block open at
 /// anchor A, navigating to a DIFFERENT legal line and pressing `i` opens a SECOND
 /// block there — PARKING the first at A (its text kept, never dragged to the new
@@ -8230,6 +8394,73 @@ fn plan_and_subagents_share_the_sidepanel(cx: &mut TestAppContext) {
         py + ph <= qy + 2.0,
         "Plan segment bottom {} is not above the Subagents segment top {qy}",
         py + ph,
+    );
+}
+
+/// UXI-AgentTile-20: `Cmd-B` (`toggle_agent_sidepanel`) force-hides the whole
+/// sidepanel even while Plan/Subagents has content, and `Cmd-0`
+/// (`focus_agent_panel`) un-hides + focuses it. Asserts on PAINT (the
+/// `agent-sidepanel` probe present ⇒ absent ⇒ present) with content held
+/// constant, so a state-only pass can't fake it.
+///
+/// Negative control: revert the `!c.sidepanel_hidden` gate in `render_agent`
+/// and step 2 fails RED (sidepanel keeps painting while hidden).
+#[gpui::test]
+fn cmd_b_hides_and_cmd_0_reshows_the_sidepanel(cx: &mut TestAppContext) {
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+
+    // Content that opens the Plan segment (so the sidepanel would show).
+    set_plan(&view, vcx, 2);
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| c.tasklist_open = true);
+    });
+
+    let probe_sidepanel = |view: &gpui::Entity<YaldaGpuiView>,
+                           vcx: &mut gpui::VisualTestContext| {
+        for _ in 0..3 {
+            view.update(vcx, |_, cx| cx.notify());
+            vcx.run_until_parked();
+        }
+        crate::layout_probe_begin();
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let side = crate::layout_probe_get("agent-sidepanel");
+        crate::layout_probe_end();
+        side
+    };
+
+    // 1) With content present, the sidepanel paints.
+    assert!(
+        probe_sidepanel(&view, vcx).is_some(),
+        "sidepanel should paint while Plan has content",
+    );
+
+    // 2) Cmd-B hides it — gone from paint though the plan content is UNCHANGED.
+    view.update(vcx, |v, cx| v.toggle_agent_sidepanel(cx));
+    let (hidden, plan_still_there, tasklist_still_open) =
+        view.read_with(vcx, |v, cx| {
+            v.read_session(id, cx, |c| {
+                (c.sidepanel_hidden, c.current_plan.is_some(), c.tasklist_open)
+            })
+            .unwrap()
+        });
+    assert!(hidden, "toggle set sidepanel_hidden");
+    assert!(plan_still_there && tasklist_still_open, "content is unchanged by hiding");
+    assert!(
+        probe_sidepanel(&view, vcx).is_none(),
+        "sidepanel must NOT paint while hidden, even with plan content",
+    );
+
+    // 3) Cmd-0 (focus_agent_panel) un-hides AND focuses the panel.
+    view.update(vcx, |v, cx| v.focus_agent_panel(cx));
+    let (unhidden, focus) = view.read_with(vcx, |v, cx| {
+        v.read_session(id, cx, |c| (c.sidepanel_hidden, c.focus)).unwrap()
+    });
+    assert!(!unhidden, "Cmd-0 clears sidepanel_hidden");
+    assert_eq!(focus, crate::AgentFocus::Panel, "Cmd-0 lands in panel focus");
+    assert!(
+        probe_sidepanel(&view, vcx).is_some(),
+        "sidepanel paints again after Cmd-0 un-hides it",
     );
 }
 
@@ -9859,6 +10090,65 @@ fn cmd_only_drag_does_not_pan_the_plane(cx: &mut TestAppContext) {
         v.workspace.active_tab().unwrap().desktop.camera.pan
     });
     assert_eq!(pan, (0.0, 0.0), "Cmd WITHOUT Shift must not pan the plane");
+}
+
+/// UXI-Workspace-8: dragging a tile near a canvas edge (which edge-auto-pans the
+/// camera by a *fractional* slot step) rests the view CELL-ALIGNED on drop — the
+/// camera pan lands on whole slot units, like the tile snaps to a cell. Drives the
+/// REAL tile-drag path (`desktop_grab` → `desktop_pointer_move` → `desktop_drop`).
+///
+/// Non-vacuous: it asserts the pan was genuinely fractional *before* the drop (so a
+/// no-op would fail the "fractional then integral" story). NEGATIVE CONTROL
+/// (observed RED): remove the `snap_camera_to_slots()` call in `desktop_drop`'s drag
+/// branch → the fractional pan survives the drop and the integral asserts fail.
+#[gpui::test]
+fn tile_drag_rests_view_cell_aligned(cx: &mut TestAppContext) {
+    let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
+
+    let slot_b_before = view.read_with(vcx, |v, _| {
+        v.workspace.active_tab().unwrap().desktop.slot_of(win_b)
+    });
+
+    // Use the REAL painted canvas rect (boot's final paint sets it; a set here
+    // would be overwritten). Target the actual edge bands relative to it.
+    let (cx0, cy0, cw, ch) = view.read_with(vcx, |v, _| v.desktop_canvas_bounds.get());
+    let br = (cx0 + cw - 5.0, cy0 + ch - 5.0); // inside the bottom-right edge band
+
+    // Grab tile A, then drag toward the bottom-right edge band so the edge
+    // auto-pan fires (it only fires once the drag is ACTIVE, i.e. after the
+    // threshold-crossing first move — so the near-edge moves come after).
+    view.update(vcx, |v, cx| v.desktop_grab(win_a, (cx0 + 50.0, cy0 + 50.0), cx));
+    view.update(vcx, |v, cx| {
+        v.desktop_pointer_move((cx0 + cw * 0.5, cy0 + ch * 0.5), cx)
+    }); // activate
+    for _ in 0..8 {
+        // Past both the right (>cw-30) and bottom (>ch-30) bands → auto-pan
+        // both axes by DESKTOP_EDGE_PAN_STEP/pitch (a fractional slot step).
+        view.update(vcx, |v, cx| v.desktop_pointer_move(br, cx));
+    }
+
+    // The pan is now fractional (proving the auto-pan ran) — the exact condition
+    // the drop must clean up.
+    let pan_before = view.read_with(vcx, |v, _| {
+        v.workspace.active_tab().unwrap().desktop.camera.pan
+    });
+    assert!(
+        pan_before.0.fract() != 0.0 || pan_before.1.fract() != 0.0,
+        "precondition: edge auto-pan left a FRACTIONAL pan (got {pan_before:?})",
+    );
+
+    view.update(vcx, |v, cx| v.desktop_drop(cx));
+
+    let (pan_after, slot_b_after) = view.read_with(vcx, |v, _| {
+        let d = &v.workspace.active_tab().unwrap().desktop;
+        (d.camera.pan, d.slot_of(win_b))
+    });
+    assert_eq!(pan_after.0.fract(), 0.0, "pan.0 rests on a whole slot (got {pan_after:?})");
+    assert_eq!(pan_after.1.fract(), 0.0, "pan.1 rests on a whole slot (got {pan_after:?})");
+    assert_eq!(
+        slot_b_before, slot_b_after,
+        "the un-dragged tile B never moves — the snap is view-only",
+    );
 }
 
 /// REGRESSION (bug-0001): a freshly-CREATED server-managed session — `resume_id`

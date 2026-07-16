@@ -115,17 +115,29 @@ impl YaldaGpuiView {
                         tab.desktop.camera.pan.0 * pitch.0,
                         tab.desktop.camera.pan.1 * pitch.1,
                     );
+                    // Whether we actually had to pan to reveal the tile — a focus
+                    // change to an already-fully-visible tile must NOT move the view
+                    // (UXI-Workspace-8: only snap when a reveal actually fired).
+                    let mut revealed = false;
                     if x - g < pan_px.0 {
                         pan_px.0 = x - g;
+                        revealed = true;
                     } else if x + tile.0 + g > pan_px.0 + canvas_w {
                         pan_px.0 = x + tile.0 + g - canvas_w;
+                        revealed = true;
                     }
                     if y - g < pan_px.1 {
                         pan_px.1 = y - g;
+                        revealed = true;
                     } else if y + tile.1 + g > pan_px.1 + canvas_h {
                         pan_px.1 = y + tile.1 + g - canvas_h;
+                        revealed = true;
                     }
-                    tab.desktop.camera.pan = (pan_px.0 / pitch.0, pan_px.1 / pitch.1);
+                    if revealed {
+                        tab.desktop.camera.pan = (pan_px.0 / pitch.0, pan_px.1 / pitch.1);
+                        // Rest the view cell-aligned like the tile (UXI-Workspace-8).
+                        tab.desktop.snap_camera_to_slots();
+                    }
                 }
                 tab.desktop.last_reveal = Some(focused_id);
             }
@@ -1037,6 +1049,8 @@ impl YaldaGpuiView {
             let d = &mut self.workspace.tabs[tab_idx].desktop;
             d.set_anchor(r.id, slot);
             d.set_span(r.id, span);
+            // Rest the view cell-aligned like the resized tile (UXI-Workspace-8).
+            d.snap_camera_to_slots();
             self.save_workspace_state();
             cx.notify();
             return;
@@ -1046,15 +1060,25 @@ impl YaldaGpuiView {
         let Some(d) = tab.desktop.drag.take() else {
             return;
         };
-        if d.active
-            && let Some(target) = d.target
-            && tab.desktop.slot_of(d.id) != Some(target)
-        {
-            // Free placement (Behavior 4): commit iff the whole rectangle lands
-            // on free slots; an overlapping drop is rejected (returns home,
-            // no ripple).
-            tab.desktop.free_drop(d.id, target);
-            self.save_workspace_state();
+        if d.active {
+            let committed = if let Some(target) = d.target
+                && tab.desktop.slot_of(d.id) != Some(target)
+            {
+                // Free placement (Behavior 4): commit iff the whole rectangle
+                // lands on free slots; an overlapping drop is rejected (returns
+                // home, no ripple).
+                tab.desktop.free_drop(d.id, target);
+                true
+            } else {
+                false
+            };
+            // Any active drag may have edge-auto-panned the view to a fractional
+            // slot; rest it cell-aligned like the tile (UXI-Workspace-8) even when
+            // the drop itself was rejected/no-op.
+            tab.desktop.snap_camera_to_slots();
+            if committed {
+                self.save_workspace_state();
+            }
         }
         cx.notify();
     }

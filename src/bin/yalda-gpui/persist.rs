@@ -1013,6 +1013,9 @@ pub(crate) struct PersistedSlot {
     pub(crate) mode: InputModeKind,
     pub(crate) tasklist_open: bool,
     pub(crate) subagents_open: bool,
+    /// Force-hidden sidepanel (UXI-AgentTile-20). Missing key ⇒ `false` (shown),
+    /// same migration as the §35 flags above.
+    pub(crate) sidepanel_hidden: bool,
     pub(crate) cwd: Option<PathBuf>,
     /// The unsent compose draft (Model C — `design-c.md` §4.4). `None`/absent =
     /// no draft. Seeded into the compose buffer on restore so a draft survives an
@@ -1055,6 +1058,7 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
             mode: InputModeKind::Chatbox,
             tasklist_open: false,
             subagents_open: false,
+            sidepanel_hidden: false,
             cwd: None,
             compose_draft: None,
         }];
@@ -1092,6 +1096,11 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
                 .get("subagents_open")
                 .and_then(|b| b.as_bool())
                 .unwrap_or(false);
+            // UXI-AgentTile-20: force-hidden sidepanel. Absent (old file) => false.
+            let sidepanel_hidden = obj
+                .get("sidepanel_hidden")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
             // spec-agent-cwd.md §5: optional per-slot cwd. Absent (old
             // file, or pre-spec save) is loaded as None so the restore
             // path can fall back to process cwd per §1.
@@ -1108,6 +1117,7 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
                 mode,
                 tasklist_open,
                 subagents_open,
+                sidepanel_hidden,
                 cwd,
                 compose_draft,
             })
@@ -1213,6 +1223,8 @@ pub(crate) struct SessionSnapshot {
     pub(crate) mode: InputModeKind,
     pub(crate) tasklist_open: bool,
     pub(crate) subagents_open: bool,
+    /// Force-hidden sidepanel (UXI-AgentTile-20).
+    pub(crate) sidepanel_hidden: bool,
     pub(crate) cwd: PathBuf,
     /// The unsent compose draft (Model C — `design-c.md` §4.4). `None`/empty is
     /// not written; a non-empty draft round-trips through `compose_draft`.
@@ -1260,6 +1272,12 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[Sessio
                 "subagents_open".into(),
                 serde_json::Value::Bool(snap.subagents_open),
             );
+            // UXI-AgentTile-20: persist force-hidden sidepanel per session. Only
+            // write when true — an absent key restores as shown (false), matching
+            // the §35 fields' downgrade contract.
+            if snap.sidepanel_hidden {
+                obj.insert("sidepanel_hidden".into(), serde_json::Value::Bool(true));
+            }
             // spec-agent-cwd.md §5: persist the session's working directory.
             obj.insert(
                 "cwd".into(),

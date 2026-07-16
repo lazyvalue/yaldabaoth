@@ -143,6 +143,9 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("cmd-v",             "PasteFromClipboard", GLOBAL, "Clipboard", "Paste"),
     b!("cmd-shift-r",       "RenameTab",       GLOBAL, "Tabs & workspaces", "Rename tab"),
     b!("cmd-b",             "ToggleFileBrowserRail", GLOBAL, "Rails", "Toggle file-browser rail"),
+    // AgentView-scoped cmd-b shadows the global rail toggle (same precedent as
+    // cmd-0 FocusAgentPanel shadowing the global ZoomReset): hide the sidepanel.
+    b!("cmd-b",             "ToggleAgentSidepanel", AV,     "Agent", "Hide / show the right sidepanel"),
     b!("cmd-shift-o",       "ToggleOutlineRail", GLOBAL, "Rails", "Toggle outline rail"),
     b!("cmd-shift-b",       "FlipRailSide",    GLOBAL, "Rails", "Flip rail to other side"),
     b!("cmd-j",             "ToggleJumpPanel", GLOBAL, "Tabs & workspaces", "Toggle jump panel"),

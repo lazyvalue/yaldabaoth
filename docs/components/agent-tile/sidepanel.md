@@ -1,6 +1,6 @@
 # Agent Tile — Sidepanel (Plan + Subagents)
 
-Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-1..3`.
+Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-1..3`, `-17`, `-20`.
 
 ## Description
 
@@ -117,3 +117,55 @@ probe: with a subagent carrying a prompt, the prompt line's painted top is at/be
 the label line's painted bottom (stacked, not side-by-side), both non-empty.
 Negative-controlled (reverting the row to `flex_row` fired it RED: prompt top 90 vs
 label bottom 107.5). No deviation from plan.
+
+### UXI-AgentTile-20 — `Cmd-B` hides the whole sidepanel; it stays hidden until re-shown
+
+**Statement.** `Cmd-B`, while an agent tile is focused, **toggles the entire right
+sidepanel hidden/shown** for that session. When hidden the sidepanel does not render
+**even if Plan or Subagents has content**, and it does **not** re-appear on its own
+when a new plan entry or subagent arrives — it stays hidden until the user shows it
+again. Hiding is orthogonal to the per-segment `Cmd-1`/`Cmd-2` toggles: those choose
+*which* segments are open; `Cmd-B` suppresses the panel wholesale and, when shown
+again, the previously-open segments return unchanged. Hiding while the panel holds
+focus (`AgentFocus::Panel`) drops panel focus back to its return target (you can't be
+panel-focused with a hidden panel — the UXI-AgentTile-3 rule). **`Cmd-0`
+(`FocusAgentPanel`) un-hides and focuses** the panel, so hiding is never a dead end.
+The hidden flag **persists per session** across restart (alongside the §35
+`tasklist_open`/`subagents_open` state).
+
+**Applies to.** `AgentState.sidepanel_hidden` (agent.rs, default `false`, next to
+`tasklist_open`/`subagents_open`); `screens.rs::render_agent` gates the
+`agent-sidepanel` container on `!c.sidepanel_hidden`; `agent_ui.rs::toggle_agent_sidepanel`
+(the handler, drops panel focus when hiding) and `focus_agent_panel` (clears
+`sidepanel_hidden` when entering panel focus); `main.rs` action `ToggleAgentSidepanel`;
+`keymap_registry.rs` `cmd-b` in `AgentView` context (shadowing the global
+`ToggleFileBrowserRail`, exactly as `cmd-0` shadows the global `ZoomReset` in
+`AgentView`); `persist.rs` `PersistedSlot`/`SessionSnapshot` gain a `sidepanel_hidden`
+field with the same missing-key-defaults-false migration as the §35 fields.
+
+**Why.** The sidepanel is otherwise purely content-driven — it appears whenever Plan
+or Subagents is non-empty and there was no gesture to force it away; a user who wants
+the transcript full-width had no way to reclaim the ~280px. This gives one dedicated
+toggle instead of remembering which of `Cmd-1`/`Cmd-2` were open.
+
+**Status.** `implemented` (headless; real `cmd-b` chord firing is the one
+`NEEDS-RUNTIME` gap).
+
+**Enforcement.** `verify_harness.rs::cmd_b_hides_and_cmd_0_reshows_the_sidepanel`
+— layout probe: (1) with plan content the `agent-sidepanel` probe paints, (2) after
+`toggle_agent_sidepanel` the probe is **absent** while `current_plan`/`tasklist_open`
+are unchanged, (3) `focus_agent_panel` clears the flag, lands in `AgentFocus::Panel`,
+and the probe paints again. Negative-control-verified RED (reverting the
+`!c.sidepanel_hidden` gate → sidepanel paints while hidden → step 2 fails).
+Persistence: `verify_harness.rs::two_sessions_round_trip` now round-trips
+`sidepanel_hidden` (SID-A shown, SID-B hidden). Real `Cmd-B` OS chord firing is the
+genuine gap (CLAUDE.md rule 4; `Cmd-B` is a reliable Cmd chord, low risk).
+
+**Deviation from plan.** The hidden flag is stored on `AgentState`
+(`sidepanel_hidden`), i.e. **per session**, next to the §35 `tasklist_open`/
+`subagents_open` flags — not literally per *tile*. Under the store's strict 1:1
+binding (`spec-agent-session-ownership.md`) a bound session has exactly one tile, so
+per-session == per-tile for every bound session; the choice keeps it consistent with
+the sibling panel flags and reuses their persistence seam. It differs only across an
+unbind→rebind (the hidden state follows the session, which is the more intuitive of
+the two).

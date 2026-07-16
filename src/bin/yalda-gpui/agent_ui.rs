@@ -96,6 +96,7 @@ impl YaldaGpuiView {
                 state.settle_input_focus();
                 state.tasklist_open = slot.tasklist_open;
                 state.subagents_open = slot.subagents_open;
+                state.sidepanel_hidden = slot.sidepanel_hidden;
                 self.show_local_session(
                     AgentSession {
                         state,
@@ -1378,6 +1379,7 @@ impl YaldaGpuiView {
                             mode: session.state.input_surface.mode(),
                             tasklist_open: session.state.tasklist_open,
                             subagents_open: session.state.subagents_open,
+                            sidepanel_hidden: session.state.sidepanel_hidden,
                             cwd: session.cwd.clone(),
                             compose_draft: (!draft.trim().is_empty()).then_some(draft),
                         });
@@ -1461,6 +1463,7 @@ impl YaldaGpuiView {
             focused_subagent: None,
             tasklist_open: false,
             subagents_open: false,
+            sidepanel_hidden: false,
             panel_col: PanelColumn::Tasklist,
             panel_sel: 0,
             panel_return_focus: AgentFocus::Compose,
@@ -3373,6 +3376,21 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// Force-hide or show the whole right sidepanel (UXI-AgentTile-20, Cmd-B).
+    /// Orthogonal to the per-segment `Cmd-1`/`Cmd-2` toggles: the open segments
+    /// are preserved and return unchanged when shown again. Hiding while the
+    /// panel holds focus drops panel focus (you can't be panel-focused with a
+    /// hidden panel — UXI-AgentTile-3). `Cmd-0` (`focus_agent_panel`) un-hides.
+    pub(crate) fn toggle_agent_sidepanel(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut c) = self.agent_mut(cx) {
+            c.sidepanel_hidden = !c.sidepanel_hidden;
+            if c.sidepanel_hidden && c.focus == AgentFocus::Panel {
+                c.focus = c.panel_return_focus;
+            }
+        }
+        cx.notify();
+    }
+
     /// Set the focused sub-agent by its stable tool-call key (§27). The
     /// main transcript swap is purely a render-time decision; this just
     /// flips the field. Keying by `ToolCallKey` (not a positional index)
@@ -3405,6 +3423,9 @@ impl YaldaGpuiView {
             if c.focus == AgentFocus::Panel {
                 c.focus = c.panel_return_focus;
             } else {
+                // Entering panel focus un-hides a force-hidden sidepanel
+                // (UXI-AgentTile-20: Cmd-0 is never a dead end).
+                c.sidepanel_hidden = false;
                 let cols = c.panel_open_columns();
                 if cols.is_empty() {
                     c.status = Some("no panel to focus — open Plan/Subagents".into());

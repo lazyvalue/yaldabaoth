@@ -268,6 +268,9 @@ actions!(
         // Subagents) for vim-key selection (UXI-AgentTile-3). Cmd-0 in AgentView,
         // overriding the global zoom-reset there. Esc leaves it.
         FocusAgentPanel,
+        // Agent window: force-hide/show the whole right sidepanel (UXI-AgentTile-20).
+        // Cmd-B in AgentView, shadowing the global ToggleFileBrowserRail there.
+        ToggleAgentSidepanel,
         // Agent window: interrupt the in-flight turn (ACP session/cancel).
         // Bound to Cmd-. and surfaced as a Stop button while a reply is
         // pending.
@@ -1921,6 +1924,7 @@ impl YaldaGpuiView {
                                 mode: InputModeKind::Worksheet,
                                 tasklist_open: false,
                                 subagents_open: false,
+                                sidepanel_hidden: false,
                                 cwd: None,
                                 compose_draft: None,
                             }
@@ -1963,6 +1967,7 @@ impl YaldaGpuiView {
                                     );
                                     state.tasklist_open = slot.tasklist_open;
                                     state.subagents_open = slot.subagents_open;
+                                    state.sidepanel_hidden = slot.sidepanel_hidden;
                                 });
                                 if let Some(tile) = self.agent_tile_mut() {
                                     // `open_or_focus` bound `slot.id` in the store, so
@@ -2037,6 +2042,7 @@ impl YaldaGpuiView {
                         );
                         state.tasklist_open = slot.tasklist_open;
                         state.subagents_open = slot.subagents_open;
+                        state.sidepanel_hidden = slot.sidepanel_hidden;
                         self.show_local_session(
                             AgentSession {
                                 state,

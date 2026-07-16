@@ -13,6 +13,21 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Plane view pans slightly on tile drag/resize** — `NEEDS-RUNTIME` (built this
+  session via `/new-ux`; `UXI-Workspace-8`). Committing a tile drag or edge-resize now
+  snaps the camera pan to whole slot units (`DesktopState::snap_camera_to_slots`,
+  called from `chrome.rs::desktop_drop` + the reveal block), so the view rests
+  cell-aligned like the tile instead of the fractional edge-auto-pan drift. Guards:
+  `tile_drag_rests_view_cell_aligned` + `snap_camera_to_slots_rounds_and_preserves_slots`,
+  both NC-verified. Awaiting human confirmation that the drift is gone / feel is right.
+
+- **No way to hide the agent sidepanel** — `NEEDS-RUNTIME` (built this session via
+  `/new-ux`; `UXI-AgentTile-20`). `Cmd-B` (AgentView-scoped, shadowing the global rail
+  toggle) force-hides the whole right sidepanel via `AgentState::sidepanel_hidden`;
+  stays hidden even with plan/subagent content; `Cmd-0` un-hides+focuses; persists per
+  session. Guard: `cmd_b_hides_and_cmd_0_reshows_the_sidepanel` (NC-verified) + persist
+  round-trip. Awaiting human check of the real `Cmd-B` chord (rule-4 gap).
+
 - **Subagent row rendering in the sidepanel** — `NEEDS-RUNTIME` (built 2026-07-13
   via `/new-ux`; `UXI-AgentTile-17`). The old one-line glyph+label+prompt row read
   as two cramped mismatched-color columns in the 280px sidepanel. Now a **two-line

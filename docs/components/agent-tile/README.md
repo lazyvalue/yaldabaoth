@@ -26,8 +26,8 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 
 ## Facets (decomposed files)
 
-- [sidepanel.md](sidepanel.md) — `UXI-AgentTile-1..3`: the segmented right sidepanel
-  (Plan + Subagents) and its keyboard focus model.
+- [sidepanel.md](sidepanel.md) — `UXI-AgentTile-1..3`, `-17`, `-20`: the segmented
+  right sidepanel (Plan + Subagents), its keyboard focus model, and `Cmd-B` hide.
 - [transcript.md](transcript.md) — `UXI-AgentTile-4..8`: the transcript reading
   surface (background, turn headers, subagent swap, render freshness, token splits).
 - [compose.md](compose.md) — `UXI-AgentTile-9..14`: the compose input (word-wrap,
@@ -63,3 +63,4 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-17 | sidepanel | A subagent row stacks label over prompt (two lines, not side-by-side columns) | implemented |
 | UXI-AgentTile-18 | session-binding | A tile auto-resumes ITS OWN session on restart (identity, not index) | implemented |
 | UXI-AgentTile-19 | session-binding | An unresumable session shows an inline "start fresh" notice, never a picker | implemented |
+| UXI-AgentTile-20 | sidepanel | `Cmd-B` force-hides the whole sidepanel; `Cmd-0` un-hides; persists per session | implemented |

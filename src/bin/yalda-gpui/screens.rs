@@ -1889,8 +1889,10 @@ impl YaldaGpuiView {
         // top, Subagents below. The container carries the left border dividing it
         // from the main (transcript + compose) column; the segments share the
         // sidepanel's height (each `flex_1` + own scroll).
-        let sidepanel: Option<gpui::AnyElement> = if tasklist_col.is_some()
-            || subagent_col.is_some()
+        // UXI-AgentTile-20: `Cmd-B` force-hides the whole sidepanel even when a
+        // segment has content — so gate the container on `!sidepanel_hidden`.
+        let sidepanel: Option<gpui::AnyElement> = if !c.sidepanel_hidden
+            && (tasklist_col.is_some() || subagent_col.is_some())
         {
             let mut side = div()
                 .id("agent-sidepanel")
@@ -2072,6 +2074,9 @@ impl YaldaGpuiView {
             }))
             .on_action(cx.listener(|this, _: &FocusAgentPanel, _w, cx| {
                 this.focus_agent_panel(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleAgentSidepanel, _w, cx| {
+                this.toggle_agent_sidepanel(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleAgentInputMode, _w, cx| {
                 this.toggle_agent_input_mode(cx);

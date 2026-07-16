@@ -972,6 +972,16 @@ impl DesktopState {
     pub fn reset_view(&mut self) {
         self.camera = Camera::default();
     }
+
+    /// Snap the camera pan to whole slot units so the plane grid rests aligned to
+    /// the viewport the same way tiles align to cells (UXI-Workspace-8). A drag's
+    /// edge auto-pan (a fractional `step/pitch` slot step) and the right/bottom
+    /// edge-reveal both leave `pan` on a fraction of a cell, which shows the whole
+    /// grid subtly offset; rounding each axis re-aligns the view. View-only — never
+    /// touches a tile's anchor or span (Constraint C1 / UXI-Workspace-3).
+    pub fn snap_camera_to_slots(&mut self) {
+        self.camera.pan = (self.camera.pan.0.round(), self.camera.pan.1.round());
+    }
 }
 
 /// Direction for desktop spatial focus navigation.
@@ -2166,6 +2176,33 @@ mod desktop_tests {
         let (a2, s2) = d2.clamp_resize(1, ResizeEdge::West, 4);
         assert_eq!(a2, Slot::new(0, -3), "no 0-wall: anchor goes negative");
         assert_eq!(s2, Span::new(1, 4));
+    }
+
+    /// UXI-Workspace-8: `snap_camera_to_slots` rounds the camera pan to whole
+    /// slot units (cell-aligning the view like the tiles) WITHOUT moving any
+    /// tile — view-only (Constraint C1).
+    ///
+    /// Negative control: replace the body with `self.camera.pan = self.camera.pan`
+    /// (drop the `.round()`) → the fractional pan survives and the integral
+    /// asserts fail RED.
+    #[test]
+    fn snap_camera_to_slots_rounds_and_preserves_slots() {
+        let mut d = DesktopState::default();
+        put(&mut d, 1, 0, 0);
+        put(&mut d, 2, 3, -2);
+        d.set_span(2, Span::new(2, 3));
+        let slots_before: Vec<_> = d.slots.clone();
+        let span_before = d.span_of(2);
+
+        // A fractional pan (as a drag's edge auto-pan / a right-edge reveal leaves).
+        d.camera.pan = (2.73, -1.19);
+        d.snap_camera_to_slots();
+
+        assert_eq!(d.camera.pan, (3.0, -1.0), "pan rounds to the nearest whole slot");
+        assert_eq!(d.camera.pan.0.fract(), 0.0, "pan.0 is integral");
+        assert_eq!(d.camera.pan.1.fract(), 0.0, "pan.1 is integral");
+        assert_eq!(d.slots, slots_before, "snap moves no tile (view-only)");
+        assert_eq!(d.span_of(2), span_before, "snap changes no span (view-only)");
     }
 
     /// Behavior 4: `seed_slot` walks the origin ring-spiral deterministically —

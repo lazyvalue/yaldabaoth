@@ -120,10 +120,23 @@ per `spec-worksheet.md` (AUTHORITATIVE). Concretely:
    pending reply; the next Submit sends it and freezes it as a committed user turn.
 5. **Insert is bounded** — a You-block can be opened **only within the most-recent
    agent turn, only after an agent newline**; frozen content is not editable.
-6. **Multiple insertion points** — Insert at a new legal point opens another block
-   (the previous parks in place, text kept); one is active, the rest render inline
-   read-only; Submit sends them all combined + freezes each in place. A fresh
-   (empty) session opens one tail block so there's always a visible input.
+6. **Multiple insertion points — but never two ADJACENT** (adjacency clarified
+   2026-07-16, bug-0004). Insert at a **genuinely separated** legal point (surviving
+   non-blank content between it and the existing blocks) opens another block (the
+   previous parks in place, text kept); one is active, the rest render inline
+   read-only; Submit sends them all combined + freezes each in place. A fresh (empty)
+   session opens one tail block so there's always a visible input.
+   - **Two You-blocks must NEVER render next to each other.** Insertion points are
+     resolved by RENDER SLOT, not raw anchor: if the caret's snapped anchor would
+     render adjacent to an existing block (no surviving non-blank line between — e.g.
+     the blank tail line between them collapses), the insert **resumes that block**
+     instead of spawning a neighbour. Enforced in
+     `AgentState::open_you_block_at_cursor` via `you_blocks_would_be_adjacent`
+     (every doc line strictly between the two anchors is blank ⇒ they collapse into
+     one slot ⇒ resume). Pinned by `worksheet_you_blocks_never_render_adjacent`
+     (NC-verified: matching on raw anchor equality renders two adjacent YouBlocks →
+     RED); genuine separated multi-insertion still covered by
+     `worksheet_multiple_insertion_points`.
    - **The You-block is a DOCUMENT, not a text box (intent, 2026-07-01).** It renders
      EVERY line and GROWS with its content — it must never become a fixed-height
      region that scrolls its own text out of view (you are co-authoring a doc, not
