@@ -10890,3 +10890,177 @@ fn save_agent_ring_persists_session_id_to_workspace_json(cx: &mut TestAppContext
         "workspace.json (the file restore reads) must carry the created session's id; got {found:?}"
     );
 }
+
+/// UXI-Workspace-9 (click-to-focus): a LEFT press in the BODY of an unfocused
+/// Full-detail tile focuses that tile, and the press is CONSUMED — the tile's
+/// content never sees it. Drives the REAL mouse dispatch (`simulate_mouse_down`
+/// through the capture-phase listener on the tile body), not the handlers
+/// directly, so it actually exercises `capture_any_mouse_down` +
+/// `stop_propagation`.
+///
+/// Non-vacuous by construction: the SAME synthetic press at the SAME point is
+/// replayed once the tile IS focused and must then reach the transcript
+/// (`transcript_mouse_down` flips `focus` to `Transcript`). Without that second
+/// half, "the content didn't act" could pass simply because the point missed all
+/// live content.
+#[gpui::test]
+fn click_in_unfocused_tile_body_focuses_and_is_consumed(cx: &mut TestAppContext) {
+    use crate::{AgentFocus, App};
+    use gpui::{point, px, Modifiers, MouseButton};
+    let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
+
+    // `boot_desktop_two_tiles` parks B at col 100 (~26000px off-viewport) to
+    // exercise culling. Bring it next to A so it actually renders LIVE content —
+    // a culled tile builds no transcript and there'd be nothing to click.
+    view.update(vcx, |v, cx| {
+        let tab = v.workspace.active_tab_mut().unwrap();
+        tab.desktop
+            .set_anchor(win_b, crate::workspace::Slot::new(0, 1));
+        tab.desktop.camera.pan = (0.0, 0.0);
+        tab.desktop.last_reveal = Some(win_a);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    // Session bound to tile B (the tile we'll click into).
+    let id_b = view.update(vcx, |v, _| {
+        let ti = v.workspace.active_tab;
+        match &v.workspace.tabs[ti]
+            .layout
+            .find_leaf_mut(win_b)
+            .expect("tile B leaf")
+            .content
+        {
+            App::Agent(t) => t.session().expect("B is bound"),
+            _ => panic!("tile B is not an agent tile"),
+        }
+    });
+
+    // Give B a transcript with real painted tokens, and park its focus on the
+    // compose (so "focus became Transcript" is an unambiguous signal that the
+    // transcript handled a click).
+    let sess_b = view
+        .update(vcx, |v, _| v.session_entity(id_b))
+        .expect("session B entity");
+    sess_b.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, "alpha line one\nbeta line two\n");
+        s.state.editor.add_frozen_lines(0, 2);
+        s.state.focus = AgentFocus::Compose;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    // Focus tile A ⇒ tile B is the UNFOCUSED tile under test.
+    view.update(vcx, |v, cx| {
+        let ti = v.workspace.active_tab;
+        v.workspace.tabs[ti].focused = win_a;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.workspace.focused_window_id(), Some(win_a), "A starts focused");
+    });
+
+    // A point over a REAL painted token inside B's transcript body (not the
+    // title bar, not a resize band).
+    let tv_b = view
+        .update(vcx, |v, _| v.transcript_views.get(&id_b).cloned())
+        .expect("transcript view for B");
+    let tokens: Vec<crate::TokenHit> = tv_b.update(vcx, |t, _| t.token_hits.borrow().clone());
+    let line0: Vec<&crate::TokenHit> = tokens.iter().filter(|t| t.line_idx == 0).collect();
+    assert!(
+        !line0.is_empty(),
+        "tile B's transcript painted no tokens — the click point would be vacuous"
+    );
+    let bx = line0[0].bounds.left() + px(2.0);
+    let by = line0[0].bounds.top() + (line0[0].bounds.bottom() - line0[0].bounds.top()) / 2.0;
+    let pt = point(bx, by);
+
+    // ── The invariant: first press focuses B and is swallowed. ──
+    vcx.simulate_mouse_down(pt, MouseButton::Left, Modifiers::default());
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.focused_window_id(),
+            Some(win_b),
+            "a click in the unfocused tile's BODY must focus that tile"
+        );
+    });
+    sess_b.read_with(vcx, |s, _| {
+        assert_eq!(
+            s.state.focus,
+            AgentFocus::Compose,
+            "the focus-changing click must be CONSUMED — the transcript must not have acted on it"
+        );
+    });
+    vcx.simulate_mouse_up(pt, MouseButton::Left, Modifiers::default());
+    vcx.run_until_parked();
+
+    // ── Non-vacuity: the same press, now that B IS focused, reaches the content. ──
+    vcx.simulate_mouse_down(pt, MouseButton::Left, Modifiers::default());
+    vcx.run_until_parked();
+    sess_b.read_with(vcx, |s, _| {
+        assert_eq!(
+            s.state.focus,
+            AgentFocus::Transcript,
+            "once the tile is focused, an identical press must reach the transcript \
+             (otherwise the 'consumed' assert above is vacuous)"
+        );
+    });
+    vcx.simulate_mouse_up(pt, MouseButton::Left, Modifiers::default());
+    vcx.run_until_parked();
+}
+
+/// UXI-Workspace-9 carve-out 1: the title bar is NOT covered by the swallow rule —
+/// pressing an UNFOCUSED tile's title bar still focuses it AND arms the move drag
+/// in one gesture (`desktop_grab`). Guards against widening the capture handler
+/// from the tile body to the whole frame, which would make dragging an unfocused
+/// tile a two-press gesture.
+#[gpui::test]
+fn title_bar_press_on_unfocused_tile_still_focuses_and_arms_drag(cx: &mut TestAppContext) {
+    use gpui::{point, px, Modifiers, MouseButton};
+    let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
+
+    // Put B next to A so its card is on-screen and hit-testable.
+    view.update(vcx, |v, cx| {
+        let tab = v.workspace.active_tab_mut().unwrap();
+        tab.desktop
+            .set_anchor(win_b, crate::workspace::Slot::new(0, 1));
+        tab.desktop.camera.pan = (0.0, 0.0);
+        tab.desktop.last_reveal = Some(win_a);
+        tab.focused = win_a;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    // Real synthetic press on B's TITLE BAR (the top 20px strip of its card).
+    // Driving the element tree — NOT `desktop_grab` directly — is what makes this
+    // a guard: widening the body's capture handler to the whole frame would
+    // swallow this press and leave the drag unarmed.
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    // At Full detail the live-content region is probed; the title bar is the
+    // DESKTOP_TITLE_H (20px) strip directly ABOVE it.
+    let body = crate::layout_probe_get(&format!("plane-tile-content-{win_b}"))
+        .expect("tile B's live content paints");
+    crate::layout_probe_end();
+    let title_pt = point(px(body.0 + body.2 * 0.5), px(body.1 - 10.0));
+    vcx.simulate_mouse_down(title_pt, MouseButton::Left, Modifiers::default());
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.focused_window_id(),
+            Some(win_b),
+            "title-bar press focuses the tile"
+        );
+        let ti = v.workspace.active_tab;
+        assert!(
+            v.workspace.tabs[ti].desktop.drag.is_some(),
+            "title-bar press ALSO arms the drag in the same gesture (carve-out 1)"
+        );
+    });
+}

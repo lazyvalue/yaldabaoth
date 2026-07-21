@@ -105,6 +105,15 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ## Features
 
+- **Close session needs a confirm** — `NEEDS-DECISION` (captured 2026-07-21).
+  Verbatim: "Closing a session needs a confirm. Do this in the agent tile. Append
+  to the session text (but do not send to the agent): `> <Yaldabaoth System>:
+  Confirm close session (yes or any key for no)?`". Today the agent space-menu
+  `x` ("close session") → `close_active_agent_session` kills the session with no
+  confirmation. Wanted: an in-transcript system prompt line (not sent to the
+  agent) plus a keypress gate. Ambiguities under interrogation: what counts as
+  "yes", whether the prompt line persists after answering, behavior mid-turn.
+  Will land as a `UXI-AgentTile-N`.
 - **Image paste into a session** — `NEEDS-RUNTIME` (built 2026-07-09, branch
   `image-paste`, NOT yet merged; INV-UX-21). Cmd+V of a clipboard image stages it
   as a pending attachment (chip above the compose), sent on submit as an ACP
@@ -193,16 +202,19 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   `unresumable_session_shows_inline_notice_not_picker` (state + PAINT,
   negative-controlled RED); 359 suite green. Human check (gap #2): the live "session
   gone" attach result actually reaches this path on a real dead session.
-- **Click anywhere on a tile focuses it** — `NEEDS-RUNTIME` / verify-first
-  (requested 2026-07-12). Appears **already implemented** for splits:
-  `chrome.rs:830` attaches `on_mouse_down(Left) → focus_window_by_click` to each
-  tile wrapper, gated on `multi_leaf && !is_focused`. Suspected real gaps to
-  confirm: clicking a tile in a **different tab/workspace**, or a child surface
-  (transcript selection sink, buttons, compose input) swallowing the click before
-  it bubbles to the wrapper. Action: reproduce the exact case the user sees, then
-  either widen the handler (ungate `multi_leaf`, cover cross-tab) or fix the
-  swallowing child; pin with an `INV-UX-N` ("a left-click anywhere in a tile body
-  focuses that tile") + a `simulate` / layout-probe guard.
+- **Click anywhere on a tile focuses it** — **DONE** (2026-07-20), spec'd as
+  `UXI-Workspace-9`. A left press in an unfocused Full tile's **body** focuses it and
+  is **consumed** (click-to-focus: first click only focuses, second click interacts) —
+  capture-phase `capture_any_mouse_down` + `stop_propagation` on the tile-body div in
+  `chrome.rs render_desktop`, plus `desktop_focus_click`. Carve-outs: title bar /
+  resize bands keep focus-and-drag in one gesture; Card/Minimap placeholders out of
+  scope. Guards `click_in_unfocused_tile_body_focuses_and_is_consumed` +
+  `title_bar_press_on_unfocused_tile_still_focuses_and_arms_drag`, both
+  negative-controlled RED; 389 suite green. Runtime-unverified (feel of the
+  two-click interaction is a human check).
+  <br>*(stale) 2026-07-12 note:* "already implemented for splits — chrome.rs:830
+  `on_mouse_down(Left) → focus_window_by_click`" — that code was deleted by the
+  infinite-plane refactor (5fe623c); the plane had no click-to-focus at all.
 
 ## Bugs
 

@@ -522,6 +522,33 @@ impl YaldaGpuiView {
                     }),
                 );
 
+            // UXI-Workspace-9 (click-to-focus): a LEFT press in the tile BODY focuses
+            // an unfocused tile and is CONSUMED — capture phase + `stop_propagation`
+            // breaks out of the capture loop AND skips the whole bubble loop, so the
+            // content (transcript selection sink, compose input, buttons) never sees
+            // the focus-changing click. You click again to interact. Focus is resolved
+            // at EVENT time, not captured from this render (the interactive-rows rule
+            // in `yux/CLAUDE.md` — a cache hit would otherwise reuse a stale flag).
+            // The title bar and the four resize bands are SIBLINGS of this div, so
+            // their focus-and-arm-a-gesture behavior is untouched by construction.
+            let tile_body = div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(inner)
+                .capture_any_mouse_down(cx.listener(
+                    move |this, ev: &MouseDownEvent, _w, cx| {
+                        if ev.button != MouseButton::Left {
+                            return;
+                        }
+                        if this.workspace.focused_window_id() == Some(id) {
+                            return; // already focused ⇒ normal interaction, nothing swallowed
+                        }
+                        this.desktop_focus_click(id, cx);
+                        cx.stop_propagation();
+                    },
+                ));
+
             let mut frame = div()
                 .absolute()
                 .left(px(x))
@@ -536,7 +563,7 @@ impl YaldaGpuiView {
                 .border_1()
                 .border_color(if is_focused { accent } else { dim.opacity(0.4) })
                 .child(title_bar)
-                .child(div().flex_1().min_h_0().overflow_hidden().child(inner));
+                .child(tile_body);
             if !maximized {
                 frame = frame
                     .child(east_band)
@@ -867,6 +894,22 @@ impl YaldaGpuiView {
             target: None,
             active: false,
         });
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    /// Click-to-focus (UXI-Workspace-9): focus a tile because the user pressed
+    /// inside its **body**, WITHOUT arming a drag. This is the focus-only twin of
+    /// `desktop_grab` — the title bar / resize bands focus *and* arm a gesture, the
+    /// content area only focuses (and the press is consumed by the caller, so the
+    /// content never sees the focus-changing click).
+    pub(crate) fn desktop_focus_click(
+        &mut self,
+        id: workspace::WindowId,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_idx = self.workspace.active_tab;
+        self.workspace.tabs[tab_idx].focused = id;
         self.save_workspace_state();
         cx.notify();
     }

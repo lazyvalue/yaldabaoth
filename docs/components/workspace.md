@@ -353,3 +353,87 @@ Round-to-nearest is used (not directional)
 — on a right/bottom reveal this could in principle clip a tile edge by <½ cell, but
 the reveal keeps a full gutter of slack and tiles are ≥1 slot, so it is not observed
 in practice; revisit to directional rounding only if a clipped reveal is reported.
+
+### UXI-Workspace-9 — A click in an unfocused tile's body focuses it, and is consumed
+
+**Statement.** A **left mouse-down anywhere in the body (content area) of a Full-detail
+tile that is not currently focused** focuses that tile, and that press is **consumed** —
+the tile's content never sees it. This is the classic *click-to-focus* model: the first
+click on an unfocused tile only focuses; a **second** click interacts with the content
+(places a caret, starts a transcript selection, presses a button, hits a wiki link).
+Once the tile **is** focused, mouse-down behaves completely normally — nothing is
+intercepted or swallowed, so ordinary interaction inside the focused tile is unchanged.
+
+**Scope — deliberately narrow (three carve-outs):**
+
+1. **Title bar and resize bands are NOT covered.** They keep today's one-gesture
+   behavior: pressing them focuses the tile *and* arms the move/edge-resize
+   (`desktop_grab` / `desktop_resize_grab`; `spec-desktop-mode.md` "arming a drag also
+   focuses the grabbed tile", and its ~4px sub-threshold "focus click"). Requiring a
+   focus-click first would make dragging or resizing an unfocused tile a two-press
+   gesture — a regression in feel. The invariant covers the **content area only**.
+2. **Card / Minimap placeholders are out of scope.** At non-Full detail a tile is a
+   cheap placeholder with no live content, so there is nothing to consume; whether a
+   card/pip click focuses and/or returns to Full is left to the plane-zoom work
+   (`spec-infinite-plane-workspace.md` §"click a card/pip", still unimplemented).
+3. **Left button only.** Right-click keeps its existing canvas meaning (cancel an
+   in-flight drag/resize).
+
+**Applies to.** `chrome.rs` `render_desktop`: the per-tile **content wrapper** child of
+`frame` (the `div().flex_1().min_h_0().overflow_hidden().child(inner)` sibling of
+`title_bar` and the four resize bands). The handler must run in the **capture** phase —
+a bubble-phase handler is too late, because the content child (transcript selection
+sink, compose input, buttons) has already acted by the time the event bubbles. It is
+gated on `!is_focused`, so it is inert for the focused tile and cannot interfere with
+normal interaction.
+
+**Why.** On the plane the only way to focus a tile with the mouse is to hit its title
+bar or a resize band — clicking into the tile's content does nothing, so the keyboard
+keeps talking to the previously focused tile while the user is looking at (and clicking
+in) another one. Click-to-focus is the expected desktop behavior. Consuming the first
+click prevents the focus-changing press from *also* mutating the newly focused content
+(dropping a caret mid-document, starting a stray selection) — you focus first, then act
+deliberately.
+
+**Status.** `implemented`.
+
+**Enforcement.** Two headless guards in `verify_harness.rs`, both driving the REAL
+mouse dispatch (`simulate_mouse_down` through the element tree — not the handlers
+directly), so they actually exercise `capture_any_mouse_down` + `stop_propagation`:
+
+- `click_in_unfocused_tile_body_focuses_and_is_consumed` — two-tile plane, tile B
+  seeded with transcript text; the click point is derived from a REAL painted token
+  (`TranscriptView::token_hits`), so it is provably over live content. Asserts
+  **(a)** the press focuses B and **(b)** B's `state.focus` stays `Compose` (the
+  transcript did not act). **Non-vacuity is structural:** the identical press is
+  replayed once B *is* focused and must then flip `state.focus` to `Transcript` —
+  so "the content didn't act" cannot pass merely by missing all content.
+  *Negative control (observed RED):* handler removed ⇒ focus stays on A
+  (`Some(1)` vs `Some(2)`).
+- `title_bar_press_on_unfocused_tile_still_focuses_and_arms_drag` — keeps carve-out 1
+  honest: a synthetic press on the title-bar strip (derived from the
+  `plane-tile-content-{id}` probe, the band directly above it) still focuses **and**
+  arms the drag. *Negative control (observed RED):* moving the capture handler from
+  the tile body up to the whole `frame` swallows the title-bar press and leaves the
+  drag unarmed — the exact widening mistake this guard exists to catch.
+
+**Deviation from plan.** Three things differ from the step-4 plan:
+
+1. **Attach point is the content wrapper, not the frame.** The handler lives on the
+   `tile_body` div (sibling of `title_bar` and the resize bands) rather than on
+   `frame` with region tests. This makes carve-out 1 true *by construction* instead
+   of by conditional — there is no code path where a title-bar or resize-band press
+   can reach the focus handler.
+2. **Focus is resolved at EVENT time, not gated at render time.** The handler is
+   attached unconditionally and checks `focused_window_id() == Some(id)` inside the
+   closure. Gating attachment on a render-time `!is_focused` would violate the
+   interactive-rows rule in `yux/CLAUDE.md` (a cache hit reuses prepaint whose
+   closures captured the previous render's state).
+3. **`capture_any_mouse_down` has no button filter.** GPUI 0.2.2 offers no
+   `capture_mouse_down(button, …)`, so the left-button check is done inside the
+   closure. Also note there was **no prior capture-phase mouse handler in this repo**
+   — this is the first (capture phase was previously keys-only).
+
+**Not covered (deliberate).** Card/Minimap placeholders (carve-out 2) remain
+unimplemented — clicking a card/pip still does nothing. If that is wanted, it belongs
+with the plane-zoom work, not here.
