@@ -1269,6 +1269,48 @@ impl YaldaGpuiView {
         self.refresh_roster(cx);
     }
 
+    /// The confirmation line appended to the transcript when a close is armed
+    /// (UXI-AgentTile-22). Local-only — it is never sent to the agent.
+    pub(crate) const CLOSE_CONFIRM_PROMPT: &'static str =
+        "> <Yaldabaoth System>: Confirm close session (yes or any key for no)?";
+
+    /// Arm the close-session confirmation (UXI-AgentTile-22). This is what the
+    /// space-menu `x` now does INSTEAD of closing: append the prompt line to
+    /// this session's transcript (never sent to the agent) and set the flag the
+    /// next submit consumes. Deliberately changes nothing else — no focus move,
+    /// no You-block, no compose clear (the user ruled those out). Arms
+    /// regardless of turn state; a no-op on an unbound tile. Pressing `x` again
+    /// appends a second line and re-arms.
+    pub(crate) fn arm_close_confirm(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.focused_bound_session() else {
+            return;
+        };
+        self.with_session(id, cx, |claude| {
+            Self::append_system_line(claude, Self::CLOSE_CONFIRM_PROMPT);
+            claude.close_confirm_armed = true;
+        });
+        cx.notify();
+    }
+
+    /// If a close confirm is armed, CONSUME this submit and report `true` (the
+    /// caller must not send). Trimmed `yes` closes the session; anything else
+    /// disarms and cancels, leaving the draft exactly where it was.
+    fn consume_close_confirm(&mut self, id: SessionId, text: &str, cx: &mut Context<Self>) -> bool {
+        let armed = self
+            .read_session(id, cx, |c| c.close_confirm_armed)
+            .unwrap_or(false);
+        if !armed {
+            return false;
+        }
+        // Disarm first so neither branch can leave it hot.
+        self.with_session(id, cx, |c| c.close_confirm_armed = false);
+        if text.trim() == "yes" {
+            self.close_active_agent_session(cx);
+        }
+        cx.notify();
+        true
+    }
+
     /// Close the focused session. The tile stays an Agent tile, transitioning
     /// to a LIVE unbound selector — an agent tile never falls back to a buffer.
     pub(crate) fn close_active_agent_session(&mut self, cx: &mut Context<Self>) {
@@ -1464,6 +1506,7 @@ impl YaldaGpuiView {
             tasklist_open: false,
             subagents_open: false,
             sidepanel_hidden: false,
+            close_confirm_armed: false,
             panel_col: PanelColumn::Tasklist,
             panel_sel: 0,
             panel_return_focus: AgentFocus::Compose,
@@ -2452,6 +2495,14 @@ impl YaldaGpuiView {
     /// next agent chunk's `Llm(k)` lookup keys off the last `Llm`-tagged line,
     /// a `System`-tagged notice can't perturb it (Finding 5, INV-3).
     pub(crate) fn append_system_notice(claude: &mut AgentState, msg: &str) {
+        Self::append_system_line(claude, &format!("― {msg}"));
+    }
+
+    /// Splice one RAW yalda-local line into the transcript, `TurnId::System`-
+    /// tagged (see `append_system_notice` for why the tag matters). Unlike
+    /// `append_system_notice` the caller owns the whole line — used by the
+    /// close confirm (UXI-AgentTile-22), whose prompt is a `>` blockquote.
+    pub(crate) fn append_system_line(claude: &mut AgentState, line: &str) {
         // Ensure the transcript ends on a newline so the notice starts on its
         // OWN line. Otherwise the notice's leading `\n` splices onto the prior
         // (possibly in-flight `Llm(k)`) line, and `append_llm_chunk` re-tags
@@ -2462,7 +2513,7 @@ impl YaldaGpuiView {
             let eof = doc.rope().len_chars();
             claude.editor.programmatic_insert(eof, "\n");
         }
-        let notice_line = format!("― {msg}\n");
+        let notice_line = format!("{line}\n");
         // Floor the splice to the top of any user worksheet draft so a notice
         // arriving mid-compose lands above it, not below (interspersed-content
         // bug — same invariant as LLM chunks and tool anchors).
@@ -3865,6 +3916,32 @@ impl YaldaGpuiView {
         let Some(id) = self.focused_bound_session() else {
             return;
         };
+
+        // UXI-AgentTile-22: an armed close confirm swallows the NEXT submit on
+        // EITHER surface, so this sits above the worksheet/chatbox branch. The
+        // answer is whatever the user would have sent — the worksheet's combined
+        // You-block text, or the chatbox draft.
+        let worksheet_idle_for_confirm = self
+            .agent_read(cx, |c| {
+                !c.input_surface.is_chatbox() && !c.turn_phase.is_awaiting()
+            })
+            .unwrap_or(false);
+        let answer = if worksheet_idle_for_confirm {
+            self.agent_read(cx, |c| {
+                c.collect_you_blocks()
+                    .iter()
+                    .map(|(_, t)| t.trim().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+        } else {
+            self.agent_read(cx, |c| c.input_surface.compose().text())
+                .unwrap_or_default()
+        };
+        if self.consume_close_confirm(id, &answer, cx) {
+            return;
+        }
 
         // UXI-AgentTile-11 rules 5/6: an IDLE worksheet submit sends ALL You-blocks (the
         // active draft + every parked insertion point) as one combined prompt and

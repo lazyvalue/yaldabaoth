@@ -4470,7 +4470,7 @@ impl YaldaGpuiView {
     /// Unknown names are ignored (the menu is curated; new entries here
     /// require both a `MenuNode::entry` line in `gpui_menu()` and a
     /// match arm here).
-    fn dispatch_menu_command(&mut self, name: &str, cx: &mut Context<Self>) {
+    pub(crate) fn dispatch_menu_command(&mut self, name: &str, cx: &mut Context<Self>) {
         // Dynamic model-switch entries carry the target model id in the command
         // name (`set-model:<id>`); route them before the static match.
         if let Some(model_id) = name.strip_prefix("set-model:") {
@@ -4511,7 +4511,8 @@ impl YaldaGpuiView {
                     self.stop_agent_inner(cx);
                 }
             }
-            "claude-close" => self.close_active_agent_session(cx),
+            // UXI-AgentTile-22: `x` arms a confirm, it does not close.
+            "claude-close" => self.arm_close_confirm(cx),
             "claude-reboot" => self.reboot_into_claude(cx),
             "claude-mode-cycle" => self.cycle_claude_permission_mode(cx),
             "claude-clear" => self.clear_agent_session(cx),

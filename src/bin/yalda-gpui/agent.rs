@@ -3370,6 +3370,13 @@ pub(crate) struct AgentState {
     /// content arrives. Toggled by `Cmd-B`; cleared by `Cmd-0` (focus_agent_panel).
     /// Persisted per session alongside the §35 flags.
     pub(crate) sidepanel_hidden: bool,
+    /// A close-session confirmation is armed (UXI-AgentTile-22). Set by the
+    /// space-menu `x` (which also appends the `<Yaldabaoth System>` prompt line
+    /// to the transcript); consumed by the NEXT submit on any input surface —
+    /// trimmed `yes` closes the session, anything else disarms and cancels. In
+    /// both cases nothing reaches the agent. Deliberately NOT persisted: an
+    /// armed confirm is a live, in-the-moment gesture, not session state.
+    pub(crate) close_confirm_armed: bool,
     /// Which bottom-panel column holds the selection while `focus == Panel`
     /// (`h`/`l` switch). Meaningless otherwise.
     pub(crate) panel_col: PanelColumn,
@@ -3682,6 +3689,7 @@ impl AgentState {
             // Cmd-2 (ToggleSubagents) collapses them.
             subagents_open: true,
             sidepanel_hidden: false,
+            close_confirm_armed: false,
             panel_col: PanelColumn::Tasklist,
             panel_sel: 0,
             panel_return_focus: AgentFocus::Compose,
@@ -3744,6 +3752,7 @@ impl AgentState {
             // Cmd-2 (ToggleSubagents) collapses them.
             subagents_open: true,
             sidepanel_hidden: false,
+            close_confirm_armed: false,
             panel_col: PanelColumn::Tasklist,
             panel_sel: 0,
             panel_return_focus: AgentFocus::Compose,

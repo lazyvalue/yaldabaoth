@@ -105,15 +105,17 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ## Features
 
-- **Close session needs a confirm** — `NEEDS-DECISION` (captured 2026-07-21).
-  Verbatim: "Closing a session needs a confirm. Do this in the agent tile. Append
-  to the session text (but do not send to the agent): `> <Yaldabaoth System>:
-  Confirm close session (yes or any key for no)?`". Today the agent space-menu
-  `x` ("close session") → `close_active_agent_session` kills the session with no
-  confirmation. Wanted: an in-transcript system prompt line (not sent to the
-  agent) plus a keypress gate. Ambiguities under interrogation: what counts as
-  "yes", whether the prompt line persists after answering, behavior mid-turn.
-  Will land as a `UXI-AgentTile-N`.
+- **Close session needs a confirm** — `NEEDS-RUNTIME` (built 2026-07-21 via
+  `/new-ux`; `UXI-AgentTile-22`). The agent space-menu `x` no longer closes: it
+  appends `> <Yaldabaoth System>: Confirm close session (yes or any key for no)?`
+  to the session's own transcript (never sent to the agent) and arms a gate that
+  swallows the next submit on either surface. Trimmed `yes` → real close; anything
+  else cancels, sends nothing, and leaves the draft untouched. Arms regardless of
+  turn state; no focus move / no You-block opened (user's call); the prompt line
+  stays as a permanent record and a second `x` appends another. Guard
+  `close_session_requires_typed_yes_confirmation` (channel-level "nothing sent"
+  assert), 2 negative controls observed RED; 397 bin + 156 lib green. Runtime
+  check (gap 1): the `>`-quoted line renders as intended in the live transcript.
 - **Image paste into a session** — `NEEDS-RUNTIME` (built 2026-07-09, branch
   `image-paste`, NOT yet merged; INV-UX-21). Cmd+V of a clipboard image stages it
   as a pending attachment (chip above the compose), sent on submit as an ACP

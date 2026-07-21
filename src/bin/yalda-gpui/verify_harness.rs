@@ -11064,3 +11064,90 @@ fn title_bar_press_on_unfocused_tile_still_focuses_and_arms_drag(cx: &mut TestAp
         );
     });
 }
+
+/// UXI-AgentTile-22 (end-to-end, REAL menu + REAL submit path): the space-menu
+/// `x` no longer closes a session — it appends the `<Yaldabaoth System>` confirm
+/// line to the transcript and arms a gate that swallows the next submit. Only a
+/// trimmed `yes` closes; anything else cancels, sends nothing, and leaves the
+/// draft alone.
+///
+/// Drives `dispatch_menu_command("claude-close")` (the exact command the `x`
+/// menu entry carries) and `submit_agent` → `submit_compose` against the
+/// in-process test channel, so "nothing reached the agent" is proven on the wire
+/// (`prompt_rx`), not inferred from state.
+///
+/// Negative control: point `"claude-close"` back at `close_active_agent_session`
+/// (or drop the `consume_close_confirm` call in `submit_compose`) → the
+/// still-bound assert after arming (resp. the cancel asserts) fire RED.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn close_session_requires_typed_yes_confirmation(cx: &mut TestAppContext) {
+    let (view, vcx, id, controls) = boot_worksheet_channel(cx);
+
+    // 1. ARM through the real menu command. The session must SURVIVE, and the
+    //    prompt line must be in its transcript.
+    view.update(vcx, |v, cx| v.dispatch_menu_command("claude-close", cx));
+    vcx.run_until_parked();
+    let (bound, transcript) = view.update(vcx, |v, cx| {
+        (
+            v.focused_bound_session(),
+            v.read_session(id, cx, |c| c.editor.document().full_text())
+                .unwrap_or_default(),
+        )
+    });
+    assert_eq!(bound, Some(id), "arming the confirm must NOT close the session");
+    assert!(
+        transcript.contains(YaldaGpuiView::CLOSE_CONFIRM_PROMPT),
+        "the confirm prompt must be appended to the transcript, got: {transcript:?}"
+    );
+
+    // 2. A non-`yes` submit CANCELS: nothing on the wire, session still bound,
+    //    draft still sitting in the compose.
+    worksheet_real_submit(&view, vcx, "nope");
+    assert!(
+        controls.prompt_rx.try_recv().is_err(),
+        "a submit consumed by the confirm must never reach the agent"
+    );
+    let (bound, draft) = view.update(vcx, |v, cx| {
+        (
+            v.focused_bound_session(),
+            v.read_session(id, cx, |c| c.input_surface.compose().text())
+                .unwrap_or_default(),
+        )
+    });
+    assert_eq!(bound, Some(id), "a non-`yes` answer must not close the session");
+    assert!(
+        draft.contains("nope"),
+        "the cancelled draft must be left in the compose, got: {draft:?}"
+    );
+
+    // 3. The gate is ONE-SHOT: the same draft resubmitted now really sends.
+    view.update(vcx, |v, cx| v.submit_agent(cx));
+    vcx.run_until_parked();
+    let payload = controls
+        .prompt_rx
+        .try_recv()
+        .expect("after cancelling, the next submit sends normally");
+    assert_eq!(payload.text.trim(), "nope");
+
+    // 4. Re-arm MID-TURN (rule 4: arms regardless of turn state — step 3 left a
+    //    turn in flight, so this is the chatbox surface) and answer `yes` → the
+    //    session actually closes (tile unbinds).
+    view.update(vcx, |v, cx| v.dispatch_menu_command("claude-close", cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            for ch in "yes".chars() {
+                c.input_surface.compose_mut().editor.insert_char(ch);
+            }
+        });
+    });
+    view.update(vcx, |v, cx| v.submit_agent(cx));
+    vcx.run_until_parked();
+    assert!(
+        controls.prompt_rx.try_recv().is_err(),
+        "the `yes` answer is never sent to the agent either"
+    );
+    let bound = view.update(vcx, |v, _| v.focused_bound_session());
+    assert_eq!(bound, None, "a typed `yes` closes the session (tile unbinds)");
+}
