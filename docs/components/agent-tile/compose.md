@@ -1,6 +1,6 @@
 # Agent Tile — Compose
 
-Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-9..14`.
+Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-9..14`, `-21`.
 
 ## Description
 
@@ -419,3 +419,87 @@ cleared). `acp_channel.rs`: `prompt_payload_builds_text_then_image_blocks` /
 `_image_only_omits_empty_text_block` / `_empty_yields_one_text_block`.
 `session_proto.rs`: `prompt_deserializes_without_images` / `prompt_round_trips_images`.
 Negative controls documented at each test.
+
+### UXI-AgentTile-21 — `[N]r` over agent text opens a reply You-block seeded with a quotation
+
+**Statement.** In an **idle worksheet** with the **transcript focused** (Normal
+mode) and the caret resting on an **agent line** at a legal insertion point,
+pressing `r` opens a You-block — exactly like `o`/`i` (same open/park/legality
+mechanics) — but **seeded** with a quotation of the agent text the caret is on:
+
+```
+re
+> <first N sentences of the caret's line, joined on one line>
+▏
+```
+
+Concretely:
+
+1. **The quoted block is the caret's line.** The "agent block" is the rope line
+   under the caret (the nav-highlighted element; a wrapped paragraph is one
+   logical line). The quote is drawn from that line's text only — it **never
+   spills** into the next line/paragraph.
+2. **Count = sentences.** A vim-style numeric prefix chooses how many sentences
+   to quote: `3r` quotes the first three sentences; a bare `r` quotes the first
+   one. `N` is read from the same `pending_count` used by every other counted
+   action (`keybind.rs`). The count **clamps** to the sentences available (`9r`
+   on a 3-sentence line quotes all 3, no error).
+3. **Sentence definition.** A sentence ends at `.`/`!`/`?` **followed by
+   whitespace or end-of-text**. A decimal point (`3.5` — the dot is followed by a
+   digit, not whitespace) and a common abbreviation (`e.g.`, `i.e.`, `vs.`,
+   `etc.`, `Mr.`, `Dr.`, …) do **not** split. Sentences are joined by a single
+   space onto **one** quote line (Option A — not one `>` line per sentence). This
+   is a heuristic; exotic punctuation is out of scope.
+4. **Caret lands after the quote.** The seed ends in a trailing newline, so the
+   compose caret (via `Compose::seeded`, cursor-at-end) rests on the **blank line
+   below the quote**, in Insert, ready to type the reply. The literal first line
+   is the two characters `re`.
+5. **Same legality gate as `o`/`i` — no new surfaces.** `r` fires only where a
+   You-block may open: idle (not mid-turn), transcript-focused, and the caret at
+   a `you_block_anchor_is_legal` point (the latest agent turn or the tail). Over
+   an older/frozen turn, over your own text, or mid-turn, `r` is a **no-op** (no
+   block opens; a status hint is shown), matching `o`. A blank line or a line
+   with **no sentence text** is also a no-op (nothing to quote).
+
+**Applies to.** `agent_ui.rs` — the worksheet Normal-mode transcript dispatch
+(`handle_claude_key`), a new `r` branch beside the `i`/`a`/`o` branch that calls
+`AgentState::reply_quote_at_cursor`. `agent.rs` — `reply_quote_at_cursor`
+(reads+clears the count via `keybinds.take_count`, checks legality, extracts the
+quote, opens the block, seeds the compose) and the pure `first_n_sentences`
+splitter. Reuses `open_you_block_at_cursor` (open/park/anchor), `Compose::seeded`
+(caret-at-end), and `you_block_anchor_is_legal` (gate). Builds on
+[UXI-AgentTile-11](#uxi-agenttile-11--the-worksheet-is-an-inline-editable-conversation-buffer-chatbox-is-mid-turn-only).
+
+**Why.** Replying to a specific thing the agent said meant hand-retyping or
+manually quoting it. `r` makes "reply, quoting what you just said" a single
+keystroke (with a count for how much), reusing the whole You-block machinery so
+the reply is an ordinary pending user turn — sent and frozen like any other.
+
+**Status.** `implemented` — `reply_quote_at_cursor` + `first_n_sentences`
+(`agent.rs`) and the `r` branch in `handle_claude_key` (`agent_ui.rs`). The inline
+caret tint over the reply is a paint/human-eye detail (harness gap #1); the
+behaviour (open, seed text, caret line, count, no-op) is headless.
+
+**Deviation from plan.** (1) The count-overflow **clamp** and the no-terminator /
+blank cases are guarded at the pure-function level (`first_n_sentences`) rather
+than through a keystroke, because the harness end-to-end tests already cover the
+1- and 3-sentence keystroke paths; the clamp is a property of the splitter, not
+the dispatch. (2) The planned "`r` refused over an OLDER turn" keystroke test was
+replaced by `worksheet_r_noop_on_blank_line` (a legal-but-empty tail anchor):
+the two-turn synthetic batch didn't tag distinct turns in the harness, and the
+older-turn refusal is the SAME `you_block_anchor_is_legal` gate already guarded
+for `o` (`worksheet_stale_anchor_is_rejected`). (3) Edge: `r` on a slot that
+already holds a parked/active draft **reseeds** it (the open reuses that slot,
+then the seed replaces the draft) — a reply is a fresh quote by intent; every
+OTHER parked block is preserved by `open_you_block_at_cursor`.
+
+**Enforcement.** Headless: `verify_harness.rs::worksheet_r_seeds_reply_quote_from_agent_line`
+(real `handle_claude_key(r)` over a multi-sentence agent line → the open You-block
+draft is exactly `re\n> First sentence.\n` and the compose caret is at line 2 col 0,
+the blank tail), `worksheet_count_r_quotes_n_sentences` (`3` then `r` through the
+real dispatch → `re\n> One. Two. Three.\n`, exercising the shared `pending_count`),
+and `worksheet_r_noop_on_blank_line` (legal-but-empty tail → no block opens). Pure
+unit: `tests.rs::first_n_sentences_splits_and_respects_abbrevs` (count/join, clamp,
+`e.g.`/decimal no-split, `?`/`!` terminators, blank ⇒ `""`). Negative control
+(observed): reverting the seed to `""` turns both draft-equality asserts RED with
+`left: ""` / `right: "re\n> …"`.

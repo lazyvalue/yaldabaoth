@@ -1066,15 +1066,19 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
     let Some(arr) = entry.as_array() else {
         return Vec::new();
     };
-    arr.iter()
+    let mut slots: Vec<PersistedSlot> = arr
+        .iter()
         .filter_map(|v| {
             let obj = v.as_object()?;
             // Wire boundary: the persisted id string becomes a `ServerSid`.
             let id = ServerSid::new(obj.get("id")?.as_str()?);
+            // A MISSING label loads as empty (not bare "claude") so the dedupe pass
+            // below always assigns it a numbered `claude-N` — bug-0005 (two sessions
+            // named "claude" after restore).
             let label = obj
                 .get("label")
                 .and_then(|s| s.as_str())
-                .unwrap_or("claude")
+                .unwrap_or("")
                 .to_string();
             let active = obj.get("active").and_then(|b| b.as_bool()).unwrap_or(false);
             // Spec §35 additions. Missing keys default per the same
@@ -1122,7 +1126,37 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
                 compose_draft,
             })
         })
-        .collect()
+        .collect();
+    // bug-0005: no two restored sessions in one cwd may share a label. A
+    // missing/empty (loaded as "") or duplicate label is reassigned to the next
+    // free `claude-N`; valid distinct labels are left untouched.
+    dedupe_slot_labels(&mut slots);
+    slots
+}
+
+/// Return a unique session label given the names already in use: `desired` verbatim
+/// when it is non-empty and free, otherwise the smallest free `claude-N` (bug-0005).
+/// Does NOT mutate `used` — the caller records the result.
+pub(crate) fn unique_label(desired: &str, used: &std::collections::HashSet<String>) -> String {
+    if !desired.trim().is_empty() && !used.contains(desired) {
+        return desired.to_string();
+    }
+    (1..)
+        .map(|n| format!("claude-{n}"))
+        .find(|l| !used.contains(l))
+        .expect("infinite range always yields a free label")
+}
+
+/// Ensure every slot's `label` is unique within the cwd (bug-0005 — "two sessions
+/// named 'claude' after restore"). Processed in ring order: the FIRST occurrence of
+/// a valid label keeps it; an empty or already-seen label is reassigned to the
+/// smallest free `claude-N`. A no-op when the labels are already distinct + non-empty.
+pub(crate) fn dedupe_slot_labels(slots: &mut [PersistedSlot]) {
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in slots.iter_mut() {
+        s.label = unique_label(&s.label, &used);
+        used.insert(s.label.clone());
+    }
 }
 
 /// Classify an attach error string as the PERMANENT "session is gone" case.

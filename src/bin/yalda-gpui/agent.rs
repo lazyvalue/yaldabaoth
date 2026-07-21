@@ -1089,6 +1089,37 @@ pub(crate) fn caret_token_split(token_lens: &[usize], cursor_col: usize) -> Opti
     None
 }
 
+/// Map each char of the STRIPPED (markdown-removed) render of a line to its column in
+/// the RAW document line (bug-0006). Stripping only DELETES chars, so the rendered
+/// string is a subsequence of the raw line; align greedily left-to-right. Returns a
+/// vec of length `stripped.chars().count() + 1`: entry `i` is the raw col of the i-th
+/// rendered char, and the final entry is the raw col just past the last matched char
+/// (the line-end position for hit-testing). Identity when `stripped == raw`.
+pub(crate) fn stripped_to_raw_cols(raw: &str, stripped: &str) -> Vec<usize> {
+    let raw_chars: Vec<char> = raw.chars().collect();
+    let mut map = Vec::with_capacity(stripped.chars().count() + 1);
+    let mut ri = 0usize;
+    for sc in stripped.chars() {
+        while ri < raw_chars.len() && raw_chars[ri] != sc {
+            ri += 1;
+        }
+        map.push(ri.min(raw_chars.len()));
+        if ri < raw_chars.len() {
+            ri += 1;
+        }
+    }
+    map.push(ri.min(raw_chars.len()));
+    map
+}
+
+/// Inverse of [`stripped_to_raw_cols`]: the rendered/stripped column for a RAW column
+/// = the number of rendered chars whose raw col is `< raw_col`. Used to convert a raw
+/// selection range into rendered space for the painted selection band.
+pub(crate) fn raw_to_stripped_col(map: &[usize], raw_col: usize) -> usize {
+    let n = map.len().saturating_sub(1); // drop the end sentinel
+    map[..n].partition_point(|&r| r < raw_col)
+}
+
 pub(crate) fn build_wrapped_line(
     segs: &[Segment],
     line_str: &str,
@@ -1118,9 +1149,23 @@ pub(crate) fn build_wrapped_line(
     // the cursor line — so `hit_test_tokens` has full per-line coverage
     // regardless of focus/caret state (bug-0003: the caret line used to register
     // nothing, so a mouse-down anchoring on it snapped to the wrong line).
+    // bug-0006: the `segs` for a frozen line are markdown-STRIPPED, so a token's
+    // char offset into them is a RENDERED column — but the editor selection +
+    // `selection_text()` slice the RAW document. Register each token's RAW start_char
+    // (mapped through the stripped→raw alignment) so a hit-test maps to the correct
+    // document column; `char_count` stays in rendered units so the monospace width
+    // math is unchanged. `None` when nothing was stripped (identity — the common
+    // editable/raw case, incl. every non-transcript surface).
+    let stripped_render: String = segs.iter().map(|(t, _)| t.as_str()).collect();
+    let raw_cols: Option<Vec<usize>> = (stripped_render != line_str)
+        .then(|| stripped_to_raw_cols(line_str, &stripped_render));
     let reg = |el: AnyElement, start_char: usize, char_count: usize| -> AnyElement {
+        let raw_start = match &raw_cols {
+            Some(map) => map.get(start_char).copied().unwrap_or(start_char),
+            None => start_char,
+        };
         match token_sink {
-            Some(sink) => register_token_on_paint(el, sink.clone(), line_idx, start_char, char_count),
+            Some(sink) => register_token_on_paint(el, sink.clone(), line_idx, raw_start, char_count),
             None => el,
         }
     };
@@ -1822,6 +1867,72 @@ pub(crate) fn finalize_agent_turn(editor: &mut Editor) {
     // Perf cache (finding 2): the turn is over; invalidate the LLM-tail hint so
     // the next turn re-anchors from scratch instead of trusting a stale line.
     editor.clear_cached_llm_line();
+}
+
+/// UXI-AgentTile-21: return the first `n` sentences of `text`, joined by a
+/// single space and trimmed. A sentence ends at `.`/`!`/`?` **followed by
+/// whitespace or end-of-text**; a decimal point (the dot is followed by a digit,
+/// so it never meets the whitespace rule — `3.5`) and a common abbreviation
+/// (`e.g.`, `i.e.`, `vs.`, `etc.`, `Mr.`, …) do NOT split. Fewer than `n`
+/// sentences ⇒ all of them (clamp); a trailing run with no terminator counts as
+/// one sentence. A blank / whitespace-only `text` yields `""` (the caller treats
+/// that as "nothing to quote"). Heuristic — exotic punctuation is out of scope.
+pub(crate) fn first_n_sentences(text: &str, n: usize) -> String {
+    // Lower-cased, dot-stripped abbreviation stems (matched against the
+    // `[alpha.]` run ending at a candidate terminator).
+    const ABBREVS: &[&str] = &[
+        "e.g", "i.e", "vs", "etc", "cf", "al", "mr", "mrs", "ms", "dr", "st",
+        "sr", "jr", "no", "fig", "inc", "ltd", "co", "vol", "pp", "approx",
+    ];
+    if n == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut sentences: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    for i in 0..chars.len() {
+        if !matches!(chars[i], '.' | '!' | '?') {
+            continue;
+        }
+        // A terminator only ends a sentence when followed by whitespace or EOT.
+        // (This alone handles decimals: the `.` in `3.5` is followed by a digit.)
+        if chars.get(i + 1).is_some_and(|c| !c.is_whitespace()) {
+            continue;
+        }
+        // A `.` closing a known abbreviation does not split.
+        if chars[i] == '.' {
+            let mut j = i;
+            while j > 0 && (chars[j - 1].is_alphabetic() || chars[j - 1] == '.') {
+                j -= 1;
+            }
+            let word = chars[j..i]
+                .iter()
+                .collect::<String>()
+                .trim_matches('.')
+                .to_lowercase();
+            if ABBREVS.contains(&word.as_str()) {
+                continue;
+            }
+        }
+        let s = chars[start..=i].iter().collect::<String>().trim().to_string();
+        if !s.is_empty() {
+            sentences.push(s);
+        }
+        start = i + 1;
+        if sentences.len() >= n {
+            break;
+        }
+    }
+    // A trailing run with no terminal punctuation is one sentence (e.g. an agent
+    // line with no period at all — the whole line is the "first sentence").
+    if sentences.len() < n && start < chars.len() {
+        let s = chars[start..].iter().collect::<String>().trim().to_string();
+        if !s.is_empty() {
+            sentences.push(s);
+        }
+    }
+    sentences.truncate(n);
+    sentences.join(" ")
 }
 
 /// Which input surface the agent window is currently presenting. Per
@@ -4063,6 +4174,40 @@ impl AgentState {
         self.pending_reveal_cursor = true;
     }
 
+    /// UXI-AgentTile-21: reply-with-quotation. Over an agent line at a legal
+    /// insertion point, open a You-block exactly like `o` (same anchor / park /
+    /// legality mechanics) but **seeded** `re\n> <first N sentences>\n`, with the
+    /// caret on the trailing blank line (`Compose::seeded` leaves the cursor at
+    /// end, and the seed ends in `\n`). `N` is the vim-style pending count
+    /// (default 1), clamped to the sentences available on the line. Returns
+    /// `false` — no block opens, caller shows a hint — when the caret is not a
+    /// legal anchor (older/frozen turn, mid-turn is gated by the caller) or the
+    /// line has no sentence text (blank line). The count is read-and-cleared
+    /// regardless, so a stale prefix never lingers.
+    pub(crate) fn reply_quote_at_cursor(&mut self) -> bool {
+        let count = self.keybinds.take_count().unwrap_or(1).max(1);
+        let l = self.editor.cursor().line;
+        if !self.you_block_anchor_is_legal(l) {
+            return false;
+        }
+        let line = self.editor.document().line_text(l);
+        let quote = first_n_sentences(line.trim_end_matches('\n'), count);
+        if quote.is_empty() {
+            return false;
+        }
+        // Open like `o` (establishes the legal anchor + parks any other active
+        // block), then REPLACE the compose draft with the seed. Replacing after
+        // the open discards only a draft parked AT THIS slot (a reply reseeds
+        // fresh by intent); every other parked block is preserved by the open.
+        self.open_you_block_at_cursor();
+        self.input_surface =
+            InputSurface::with_draft(InputModeKind::Worksheet, &format!("re\n> {quote}\n"));
+        self.input_surface.compose_mut().mode = EditMode::Insert;
+        self.focus = AgentFocus::Compose;
+        self.pending_reveal_cursor = true;
+        true
+    }
+
     /// Gather the worksheet's You-blocks (parked + the active draft) as
     /// `(effective_anchor, text)`, dropping whitespace-only ones, in DOCUMENT order
     /// (ascending anchor; `None`/tail last). The submit path sends their combined
@@ -4154,6 +4299,12 @@ impl AgentState {
     pub(crate) fn move_cursor_to_tail(&mut self) {
         let last = self.editor.document().line_count().saturating_sub(1);
         let col = self.editor.document().line_len_chars(last);
+        // bug-0010: this is a forced caret JUMP (turn-end / reopen), not a drag.
+        // Collapse any lingering transcript selection so a persisted anchor from
+        // an earlier click / copy-on-select doesn't balloon anchor..tail — i.e.
+        // so new content isn't auto-selected. The transcript selection head IS
+        // the caret; jumping it must not silently extend the selection.
+        self.editor.clear_selection();
         self.editor.cursor_mut().line = last;
         self.editor.cursor_mut().col = col;
         self.pending_reveal_cursor = true;

@@ -4236,6 +4236,80 @@ fn boot_with_transcript<'a>(
     (view, vcx, id, session)
 }
 
+/// REGRESSION (bug-0006): on a FROZEN line that renders markdown-stripped, a drag
+/// selection must copy the VISUALLY-selected text, not a shifted raw-document slice.
+/// Repro: freeze a line `**Email:** <email>` (renders `Email: <email>`), drag across
+/// the painted email token, and assert the clipboard holds the email — NOT the
+/// `:** scott+...` garbage the raw/stripped column mismatch produced.
+///
+/// Negative control: revert the raw-offset mapping in `build_wrapped_line` (register
+/// the stripped `start_char` again) → the clipboard gets the shifted `:** …` slice
+/// and the `contains(email)` / `!contains(":**")` asserts fail RED.
+#[gpui::test]
+fn transcript_drag_on_frozen_markdown_line_copies_visual_span(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+
+    const EMAIL: &str = "scott+coralpoint@fulcrumo.com";
+    // A frozen agent line with leading markdown emphasis, so it renders STRIPPED
+    // (`Email: <email>`) while the raw document keeps the `**`s.
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, &format!("**Email:** {EMAIL}\n"));
+        s.state.editor.add_frozen_lines(0, 1);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    view.update(vcx, |_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("SENTINEL-NOT-COPIED".into()))
+    });
+
+    let tv = view
+        .update(vcx, |v, _| v.transcript_views.get(&id).cloned())
+        .expect("transcript view exists");
+    let tokens: Vec<crate::TokenHit> = tv.update(vcx, |t, _| t.token_hits.borrow().clone());
+    // The email is one non-whitespace token; find it by the char span it covers in
+    // the RAW document (start col 11 = just past "**Email:** ").
+    let line0: Vec<&crate::TokenHit> = tokens.iter().filter(|t| t.line_idx == 0).collect();
+    assert!(!line0.is_empty(), "frozen line painted no tokens");
+    // The email is the RIGHTMOST painted token (it ends the line). Drag across just
+    // it — the exact reported gesture (select the email). The copy must be the email
+    // the user sees, not the raw-column-shifted `:** scott+…` fragment.
+    let email_tok = line0
+        .iter()
+        .max_by(|a, b| a.bounds.left().partial_cmp(&b.bounds.left()).unwrap())
+        .unwrap();
+    let midy = email_tok.bounds.top()
+        + (email_tok.bounds.bottom() - email_tok.bounds.top()) / 2.0;
+    let start = point(email_tok.bounds.left() + px(1.0), midy);
+    let end = point(email_tok.bounds.right() - px(1.0), midy);
+
+    vcx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    vcx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    vcx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    vcx.run_until_parked();
+
+    let clip = view
+        .update(vcx, |_, cx| cx.read_from_clipboard())
+        .and_then(|it| it.text())
+        .unwrap_or_default();
+    assert_ne!(clip, "SENTINEL-NOT-COPIED", "auto-copy never fired");
+    // The copied text is the email the user selected — NOT a raw slice shifted left
+    // (which would drop the trailing `.com` and leak the stripped `:** ` markers).
+    assert!(
+        clip.contains(EMAIL),
+        "clipboard {clip:?} does not contain the full email {EMAIL:?} (raw/stripped col mismatch)"
+    );
+    assert!(
+        !clip.contains('*'),
+        "clipboard {clip:?} leaked stripped `**` markers — wrong (raw) column mapping"
+    );
+}
+
 /// UXI-Selection-1 (agent surface): X11-style select-to-clipboard over the transcript.
 /// A real mouse drag over the rendered transcript selects text and auto-copies
 /// it to the system clipboard on release. Drives the REAL `simulate_mouse_*`
@@ -4317,6 +4391,185 @@ fn transcript_drag_autocopies_selection_to_clipboard(cx: &mut TestAppContext) {
         clip.contains("Hello agent world"),
         "clipboard {clip:?} does not hold the dragged first-line text"
     );
+}
+
+/// REGRESSION (bug-0010): after a real drag-select in the transcript leaves an
+/// anchor set (X11 copy-on-select keeps the highlight), a forced caret JUMP to
+/// the editable tail — the move the turn-finalize / reopen path runs — must
+/// COLLAPSE that selection, not balloon it from the old anchor to the tail. The
+/// live report: "when new text arrives it automatically gets selected" because
+/// `selection_range` is `anchor..cursor` and the transcript caret auto-advances.
+///
+/// Drives the REAL paths end to end: a real mouse drag (→ `transcript_mouse_*`)
+/// creates the persisted anchor, then the REAL `move_cursor_to_tail` (invoked by
+/// `finalize_agent_turn_idem` / `finish_replay`) performs the caret jump.
+///
+/// Negative control: remove the `clear_selection()` added to `move_cursor_to_tail`
+/// and the post-jump `selection_range()` is `Some(((0,_)..(tail,_)))` — the
+/// `is_none()` assert fires RED (the ballooned selection).
+#[gpui::test]
+fn transcript_tail_jump_collapses_stale_selection(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+
+    // Known frozen content — several lines so a top selection + tail jump span
+    // is unmistakably non-trivial.
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, "alpha line one\nbeta line two\ngamma line three\n");
+        s.state.editor.add_frozen_lines(0, 3);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    // Real drag across the FIRST line → selection + copy-on-select leaves the
+    // anchor set (the "I clicked on the tile" precondition).
+    let tv = view
+        .update(vcx, |v, _| v.transcript_views.get(&id).cloned())
+        .expect("transcript view exists");
+    let tokens: Vec<crate::TokenHit> = tv.update(vcx, |t, _| t.token_hits.borrow().clone());
+    let line0: Vec<&crate::TokenHit> = tokens.iter().filter(|t| t.line_idx == 0).collect();
+    assert!(!line0.is_empty(), "first transcript line painted no tokens");
+    let left = line0
+        .iter()
+        .map(|t| t.bounds.left())
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap();
+    let right = line0
+        .iter()
+        .map(|t| t.bounds.right())
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap();
+    let midy = line0[0].bounds.top() + (line0[0].bounds.bottom() - line0[0].bounds.top()) / 2.0;
+    vcx.simulate_mouse_down(point(left + px(1.0), midy), MouseButton::Left, Modifiers::default());
+    vcx.simulate_mouse_move(
+        point(right - px(1.0), midy),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    vcx.simulate_mouse_up(point(right - px(1.0), midy), MouseButton::Left, Modifiers::default());
+    vcx.run_until_parked();
+
+    // Precondition: a real, non-empty selection persists after the drag.
+    let before = view
+        .update(vcx, |v, cx| v.agent_read(cx, |c| c.editor.selection_range()))
+        .expect("session");
+    assert!(
+        matches!(before, Some((a, b)) if a != b),
+        "precondition: the drag left a persisted non-empty selection, got {before:?}"
+    );
+
+    // The REAL caret jump the turn-finalize / reopen path runs.
+    view.update(vcx, |v, cx| {
+        v.agent_mut(cx).expect("agent").move_cursor_to_tail();
+    });
+
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        let last = c.editor.document().line_count().saturating_sub(1);
+        assert_eq!(c.editor.cursor().line, last, "caret jumped to the tail");
+        assert!(
+            c.editor.selection_range().is_none(),
+            "the caret jump must COLLAPSE the stale selection — new content is not \
+             auto-selected (bug-0010), got {:?}",
+            c.editor.selection_range()
+        );
+    });
+}
+
+/// REGRESSION (bug-0008): a parsed BLOCK (markdown table / bullet list / code) used
+/// to render with NO token-hit registration at all, so the mouse could not select any
+/// of its content ("can't select a table / bullets"). This drives the real render:
+/// freeze a markdown table so it renders as a `FlatItem::Block`, then (1) assert the
+/// paint-time hit sink now has hits covering the table's raw lines, and (2) drag
+/// across it and assert the clipboard holds the table's content.
+///
+/// Negative control: remove the `register_block_lines_on_paint` wrapper in the
+/// `FlatItem::Block` arm → the block registers zero hits for its lines → the
+/// non-empty-hits assert fails RED (and the drag copies nothing / the wrong line).
+#[gpui::test]
+fn transcript_block_table_is_mouse_selectable(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+
+    // A markdown table, frozen so it renders as a parsed block (not prose lines).
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state.editor.programmatic_insert(
+            0,
+            "| Name | Email |\n| --- | --- |\n| Scott | scott@x.com |\n",
+        );
+        s.state.editor.add_frozen_lines(0, 3);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    // The table must actually render as a Block (else it's prose and already
+    // selectable — not the bug under test).
+    let has_block = session.read_with(vcx, |s, _| {
+        s.state
+            .view_model
+            .flat_items_cache
+            .iter()
+            .any(|it| matches!(it, crate::FlatItem::Block(_)))
+    });
+    assert!(has_block, "the frozen table did not render as a FlatItem::Block");
+
+    let tv = view
+        .update(vcx, |v, _| v.transcript_views.get(&id).cloned())
+        .expect("transcript view exists");
+    let tokens: Vec<crate::TokenHit> = tv.update(vcx, |t, _| t.token_hits.borrow().clone());
+    // The core defect: the block's raw lines (0..3) must now register hit bands.
+    let table_hits: Vec<&crate::TokenHit> =
+        tokens.iter().filter(|t| t.line_idx < 3).collect();
+    assert!(
+        !table_hits.is_empty(),
+        "the table block registered NO hit-test tokens — its content is unselectable (bug-0008)"
+    );
+
+    let _ = MouseButton::Left;
+    let _ = Modifiers::default();
+
+    // PER-CELL precision: the data row (raw line 2) registers a hit for the EMAIL
+    // cell keyed to its exact raw char span (`scott@x.com` = chars 10..21), distinct
+    // from the `Scott` cell (chars 2..7). A whole-line band would give ONE line-2 hit
+    // at start_char 0 — the presence of a start_char==10 cell hit is the per-cell
+    // property.
+    let email_cell = table_hits
+        .iter()
+        .find(|t| t.line_idx == 2 && t.start_char == 10)
+        .expect("data row registers the EMAIL cell at its raw char span (per-cell, bug-0008)");
+    assert_eq!(email_cell.char_count, 11, "email cell covers exactly `scott@x.com`");
+    assert!(
+        table_hits.iter().any(|t| t.line_idx == 2 && t.start_char == 2),
+        "the `Scott` cell is a SEPARATE hit — cells are distinct, not one row"
+    );
+
+    // Drive the REAL hit-test (`hit_test_tokens`, the function the mouse path uses):
+    // the email cell's center maps to the data row and a column inside the cell, and
+    // its LEFT edge maps to the cell START (char 10) — proving the cell, not the row.
+    let midy = email_cell.bounds.top()
+        + (email_cell.bounds.bottom() - email_cell.bounds.top()) / 2.0;
+    let center = point(
+        (email_cell.bounds.left() + email_cell.bounds.right()) / 2.0,
+        midy,
+    );
+    let (hl, hc) = crate::hit_test_tokens(center, &tokens).expect("center hits a token");
+    assert_eq!(hl, 2, "email cell center hit-tests to the data row");
+    assert!(
+        (10..=21).contains(&hc),
+        "and to a column INSIDE the email cell (got {hc})"
+    );
+    let (ll, lc) = crate::hit_test_tokens(
+        point(email_cell.bounds.left() + px(1.0), midy),
+        &tokens,
+    )
+    .expect("left edge hits a token");
+    assert_eq!((ll, lc), (2, 10), "the cell's left edge maps to the cell START char");
 }
 
 /// bug-0003: when the transcript is FOCUSED, the caret's line renders via the
@@ -5369,6 +5622,65 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
     });
     let rows = view.update(vcx, |v, cx| v.jump_panel_agent_rows(cx));
     assert!(rows.is_empty(), "closed session is gone from the roster");
+}
+
+/// REGRESSION (bug-0006): the jump panel's agent rows are ordered by label across
+/// BOTH roster-known and local-only sessions, so a session doesn't spontaneously
+/// reorder when the async roster refresh catches up to a locally-created session.
+/// Before the fix a local-only session was appended LAST regardless of its label, so
+/// a `claude-1` created locally rendered after a roster `claude-2`, then HOPPED to
+/// the top once the roster learned about it — "sessions reorder for some weird reason".
+///
+/// Negative control: remove the final `rows.sort_by(... label ...)` in
+/// `jump_panel_agent_rows` → the local `claude-1` stays appended last (`["claude-2",
+/// "claude-1"]`) and the label-order assert fails RED.
+#[gpui::test]
+fn jump_panel_orders_local_and_roster_sessions_by_label(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState, AgentTile, App};
+    use yalda::session_proto::{Notification as SN, SessionInfo};
+    let (view, vcx) = boot_browser(cx);
+    // A roster session `claude-2` (created on the server, never opened here).
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![SN::SessionCreated {
+                session: SessionInfo {
+                    session_id: "srv-2".into(),
+                    acp_session_id: None,
+                    label: "claude-2".into(),
+                    cwd: PathBuf::from("."),
+                    turns: 0,
+                    connected: true,
+                    permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
+                },
+            }],
+            cx,
+        );
+    });
+    // A local-only session `claude-1` (sorts BEFORE claude-2) bound to an agent tile,
+    // its sid not yet in the roster — the just-created placeholder case.
+    view.update(vcx, |v, cx| {
+        v.set_screen(App::Agent(AgentTile::new()));
+        let _ = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(None),
+                label: "claude-1".into(),
+                cwd: PathBuf::from("."),
+                resume_id: None,
+            },
+            cx,
+        );
+    });
+    let labels: Vec<String> = view
+        .update(vcx, |v, cx| v.jump_panel_agent_rows(cx))
+        .iter()
+        .map(|r| r.label.clone())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["claude-1".to_string(), "claude-2".to_string()],
+        "local-only + roster sessions order by label together — no hop when the \
+         roster catches up (bug-0006)"
+    );
 }
 
 /// Unit (jump-reorder, UXI-JumpPanel-2): `order_grouped_rows` applies the user's
@@ -7524,6 +7836,152 @@ fn worksheet_you_block_anchors_at_cursor_not_tail(cx: &mut TestAppContext) {
              tail (idx {yb} of {}) — falling to the tail is the 'jumps around' bug",
             fi.len()
         );
+    });
+}
+
+/// UXI-AgentTile-21: `r` over an agent line opens a reply You-block seeded
+/// `re\n> <first sentence>\n` with the caret parked on the trailing blank line.
+/// Drives the REAL dispatch (`handle_claude_key`) the keystroke invokes.
+/// Negative control: revert the seed line in `reply_quote_at_cursor` (open an
+/// empty block) → the text-equality assert goes RED.
+#[gpui::test]
+fn worksheet_r_seeds_reply_quote_from_agent_line(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, _id, _session) = boot_with_transcript(cx); // worksheet nav
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk(
+                    "First sentence. Second sentence. Third sentence.\n".into(),
+                )),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // Park the caret on the agent line (first line of the latest turn).
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+    });
+
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(c.you_block_open, "r opened a You-block");
+        assert_eq!(
+            c.input_surface.compose().text(),
+            "re\n> First sentence.\n",
+            "seeded `re` + the FIRST sentence as a one-line blockquote"
+        );
+        // Caret rests on the blank line BELOW the quote (line 2, col 0).
+        let cur = c.input_surface.compose().editor.cursor();
+        assert_eq!(
+            (cur.line, cur.col),
+            (2, 0),
+            "caret parked on the trailing blank line, after the quote"
+        );
+    });
+}
+
+/// UXI-AgentTile-21: a vim count prefix quotes that many sentences — `3r` quotes
+/// the first three, joined on one `>` line. Exercises the shared `pending_count`
+/// path end-to-end (`3` accumulates, `r` consumes via `take_count`).
+#[gpui::test]
+fn worksheet_count_r_quotes_n_sentences(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("One. Two. Three. Four.\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+        c.editor.cursor_mut().line = s;
+    });
+
+    // `3` accumulates the count; `r` consumes it → the first THREE sentences.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("3"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert_eq!(
+            c.input_surface.compose().text(),
+            "re\n> One. Two. Three.\n",
+            "3r quotes the first three sentences on one line"
+        );
+    });
+}
+
+/// UXI-AgentTile-21: `r` on a line with no sentence text (the blank tail — a
+/// LEGAL anchor, but nothing to quote) is a no-op — no block opens. Guards the
+/// "nothing to quote" branch of `reply_quote_at_cursor`.
+#[gpui::test]
+fn worksheet_r_noop_on_blank_line(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("Some agent text.\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // Park the caret on the blank tail line: a legal anchor (`l >= last`) with no
+    // sentence text.
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        let last = c.editor.document().line_count().saturating_sub(1);
+        c.editor.cursor_mut().line = last;
+        assert!(c.you_block_anchor_is_legal(last), "the tail is a legal anchor");
+        assert!(
+            c.editor.document().line_text(last).trim().is_empty(),
+            "the tail line is blank — nothing to quote"
+        );
+    });
+
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(!c.you_block_open, "r is a no-op when there is nothing to quote");
     });
 }
 
@@ -9703,6 +10161,27 @@ fn unresumable_session_shows_inline_notice_not_picker(cx: &mut TestAppContext) {
 /// (`last_reveal = focused`) so the camera rests at the origin and placement is
 /// deterministic. Returns `(view, vcx, focused_id, other_id)`.
 #[cfg(test)]
+/// Endpoints for a `Cmd+Shift` free-pan gesture, derived from the REAL painted
+/// canvas + tile geometry (pitch = tile + gutter). Mouse-DOWN lands in the empty
+/// bottom-right corner (so the canvas-root pan handler owns the gesture, not a
+/// tile title bar); the end point is ~1.4 pitch up-and-left, so the pan is a
+/// fraction mid-gesture (fract ≈ 0.4) and rounds to a positive whole slot on
+/// release. Returns `(down, up)` window points.
+fn pan_drag_endpoints(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+) -> (gpui::Point<gpui::Pixels>, gpui::Point<gpui::Pixels>) {
+    use gpui::{point, px};
+    let (cx0, cy0, cw, ch, tile) = view.read_with(vcx, |v, _| {
+        let (x, y, w, h) = v.desktop_canvas_bounds.get();
+        (x, y, w, h, v.desktop_tile_px())
+    });
+    let pitch = (tile.0 + 12.0, tile.1 + 12.0); // DESKTOP_GUTTER = 12.0
+    let start = (cx0 + cw * 0.9, cy0 + ch * 0.9);
+    let end = (start.0 - 1.4 * pitch.0, start.1 - 1.4 * pitch.1);
+    (point(px(start.0), px(start.1)), point(px(end.0), px(end.1)))
+}
+
 fn boot_desktop_two_tiles<'a>(
     cx: &'a mut TestAppContext,
 ) -> (
@@ -10034,20 +10513,21 @@ fn cmd_shift_drag_pans_the_plane(cx: &mut TestAppContext) {
         (d.slot_of(win_a), d.slot_of(win_b))
     });
 
-    // Drag over EMPTY canvas (tiles sit at slots (0,0) and (0,100); x≈600 is
-    // empty) so the canvas-root pan handler owns the gesture.
     let cmd_shift = Modifiers {
         platform: true,
         shift: true,
         ..Default::default()
     };
-    vcx.simulate_mouse_down(point(px(600.0), px(400.0)), MouseButton::Left, cmd_shift);
-    vcx.simulate_mouse_move(
-        point(px(450.0), px(320.0)),
-        Some(MouseButton::Left),
-        cmd_shift,
-    );
-    vcx.simulate_mouse_up(point(px(450.0), px(320.0)), MouseButton::Left, cmd_shift);
+    // Derive endpoints from the REAL painted geometry (pitch varies with the
+    // painted canvas). Mouse-DOWN in the empty bottom-right corner so the
+    // canvas-root pan handler (not a tile title bar) owns the gesture; the drag
+    // moves > 1 pitch on each axis so the release-snap (bug-0009) rounds BOTH
+    // axes to a positive whole slot instead of down to 0 — keeping the "pans"
+    // claim non-vacuous now that the pan settles cell-aligned on release.
+    let (start, end) = pan_drag_endpoints(&view, vcx);
+    vcx.simulate_mouse_down(start, MouseButton::Left, cmd_shift);
+    vcx.simulate_mouse_move(end, Some(MouseButton::Left), cmd_shift);
+    vcx.simulate_mouse_up(end, MouseButton::Left, cmd_shift);
     vcx.run_until_parked();
 
     let (pan, slots_after) = view.read_with(vcx, |v, _| {
@@ -10057,7 +10537,7 @@ fn cmd_shift_drag_pans_the_plane(cx: &mut TestAppContext) {
     // Pointer moved left+up; content follows the cursor, so the camera pan
     // moves positive on both axes. Non-vacuous (a real, sizable shift).
     assert!(
-        pan.0 > 0.1 && pan.1 > 0.1,
+        pan.0 >= 1.0 && pan.1 >= 1.0,
         "Cmd+Shift drag pans the camera (got {pan:?})"
     );
     assert_eq!(
@@ -10090,6 +10570,65 @@ fn cmd_only_drag_does_not_pan_the_plane(cx: &mut TestAppContext) {
         v.workspace.active_tab().unwrap().desktop.camera.pan
     });
     assert_eq!(pan, (0.0, 0.0), "Cmd WITHOUT Shift must not pan the plane");
+}
+
+/// bug-0009 / UXI-Workspace-8: a `Cmd+Shift` free-pan is continuous WHILE
+/// dragging but rests the view CELL-ALIGNED on release — the camera pan lands on
+/// whole slot units, the same contract a tile drag/edge-resize already honors.
+/// Drives the REAL mouse dispatch (`simulate_mouse_*` → the canvas root handlers
+/// → `desktop_pan_grab` / `desktop_pointer_move` / `desktop_drop`).
+///
+/// Non-vacuous: it reads the pan MID-gesture (after the move, before the up) and
+/// asserts it is genuinely FRACTIONAL, so the post-release integrality isn't a
+/// no-op. NEGATIVE CONTROL (observed RED): remove the `snap_camera_to_slots()`
+/// call in `desktop_drop`'s `pan_drag` branch → the fractional mid-pan survives
+/// the release and the integral asserts fail.
+#[gpui::test]
+fn cmd_shift_pan_rests_view_cell_aligned(cx: &mut TestAppContext) {
+    use gpui::{point, px, Modifiers, MouseButton};
+    let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
+
+    let slots_before = view.read_with(vcx, |v, _| {
+        let d = &v.workspace.active_tab().unwrap().desktop;
+        (d.slot_of(win_a), d.slot_of(win_b))
+    });
+
+    let cmd_shift = Modifiers {
+        platform: true,
+        shift: true,
+        ..Default::default()
+    };
+    // Down (empty corner) + move ~1.4 pitch: leaves a FRACTIONAL pan mid-gesture
+    // that snaps to a positive whole slot on release. Endpoints derived from the
+    // real painted geometry.
+    let (start, end) = pan_drag_endpoints(&view, vcx);
+    vcx.simulate_mouse_down(start, MouseButton::Left, cmd_shift);
+    vcx.simulate_mouse_move(end, Some(MouseButton::Left), cmd_shift);
+    vcx.run_until_parked();
+
+    // Precondition: mid-gesture the pan is fractional (proves the snap has real
+    // work to do — the release isn't landing on an already-integral pan).
+    let pan_mid = view.read_with(vcx, |v, _| {
+        v.workspace.active_tab().unwrap().desktop.camera.pan
+    });
+    assert!(
+        pan_mid.0.fract() != 0.0 || pan_mid.1.fract() != 0.0,
+        "precondition: mid-pan is FRACTIONAL (got {pan_mid:?})",
+    );
+
+    vcx.simulate_mouse_up(end, MouseButton::Left, cmd_shift);
+    vcx.run_until_parked();
+
+    let (pan_after, slots_after) = view.read_with(vcx, |v, _| {
+        let d = &v.workspace.active_tab().unwrap().desktop;
+        (d.camera.pan, (d.slot_of(win_a), d.slot_of(win_b)))
+    });
+    assert_eq!(pan_after.0.fract(), 0.0, "pan.0 rests on a whole slot (got {pan_after:?})");
+    assert_eq!(pan_after.1.fract(), 0.0, "pan.1 rests on a whole slot (got {pan_after:?})");
+    assert_eq!(
+        slots_before, slots_after,
+        "the pan is view-only — no tile moves",
+    );
 }
 
 /// UXI-Workspace-8: dragging a tile near a canvas edge (which edge-auto-pans the

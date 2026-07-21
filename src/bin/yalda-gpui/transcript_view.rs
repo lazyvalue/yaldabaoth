@@ -472,6 +472,7 @@ impl TranscriptView {
             new_count,
             edit_seq,
             block_ranges_active,
+            block_ranges_snap,
             follow_tail,
             pending_reveal_line,
             you_block_snap,
@@ -726,6 +727,7 @@ impl TranscriptView {
                 new_count,
                 edit_seq,
                 block_ranges_active,
+                block_ranges_snap: c.block_ranges.clone(),
                 follow_tail,
                 pending_reveal_line,
                 you_block_snap,
@@ -734,6 +736,22 @@ impl TranscriptView {
                 you_block_seq,
             }
         });
+
+        // Per-flat-item raw line range for each `FlatItem::Block`, paired in the
+        // SAME ascending order the renderer emits blocks (bug-0008). Lets the block
+        // render arm register per-raw-line hit-test bands so tables/lists/code are
+        // mouse-selectable. Built before `reconcile_list` borrows `block_ranges_active`.
+        let block_ranges_by_item: std::rc::Rc<Vec<Option<(usize, usize)>>> = {
+            let mut v = vec![None; flat_items_arc.len()];
+            let mut bi = 0usize;
+            for (i, it) in flat_items_arc.iter().enumerate() {
+                if matches!(it, FlatItem::Block(_)) {
+                    v[i] = block_ranges_snap.get(bi).copied();
+                    bi += 1;
+                }
+            }
+            std::rc::Rc::new(v)
+        };
 
         // ── Reconcile (count parity → splice/reset) + follow-scroll, on the
         // view-owned `TranscriptScroll`. The session borrow is dropped. ──
@@ -849,6 +867,7 @@ impl TranscriptView {
             let at_snap = at_snap.clone();
             let self_editor_fg = editor_fg;
             let token_sink_snap = token_sink.clone();
+            let block_ranges_by_item = block_ranges_by_item.clone();
             move |idx: usize, _w: &mut Window, _app: &mut GpuiApp| -> AnyElement {
                 let item = &flat_items[idx];
                 match item {
@@ -880,7 +899,30 @@ impl TranscriptView {
                                 line_selection_range(sel, line_idx, line_chars)
                                 && e_col > s
                             {
-                                segs = apply_selection_bg(&segs, s, e_col, at_snap.selection_bg);
+                                // The editor selection is in RAW document columns; on a
+                                // frozen (stripped) line the segs are rendered, so map
+                                // the band into rendered space so it lines up with the
+                                // painted text (bug-0006). Identity for raw lines.
+                                let (bs, be) = if is_frozen {
+                                    let rendered: String =
+                                        segs.iter().map(|(t, _)| t.as_str()).collect();
+                                    if rendered == line_str {
+                                        (s, e_col)
+                                    } else {
+                                        let map =
+                                            crate::stripped_to_raw_cols(&line_str, &rendered);
+                                        (
+                                            crate::raw_to_stripped_col(&map, s),
+                                            crate::raw_to_stripped_col(&map, e_col),
+                                        )
+                                    }
+                                } else {
+                                    (s, e_col)
+                                };
+                                if be > bs {
+                                    segs =
+                                        apply_selection_bg(&segs, bs, be, at_snap.selection_bg);
+                                }
                             }
                         }
 
@@ -1174,12 +1216,42 @@ impl TranscriptView {
                             block_count: 0,
                             show_heading_markers,
                         };
+                        let is_table = matches!(**rendered_block, RenderedBlock::Table { .. });
                         let inner = block_inner(&ctx, rendered_block);
-                        div()
-                            .mt(px(4.0))
-                            .mb(px(4.0))
-                            .child(inner)
-                            .into_any_element()
+                        let el = div().mt(px(4.0)).mb(px(4.0)).child(inner).into_any_element();
+                        // bug-0008: register hit-test bands so the mouse can select a
+                        // parsed block's content (tables / bullets / code) — otherwise
+                        // a block registers NO tokens and is unselectable. Tables get
+                        // PER-CELL bands (skip the non-rendered `---` separator row so
+                        // vertical bands align to painted rows); other blocks get one
+                        // full-width band per raw line.
+                        match block_ranges_by_item.get(idx).copied().flatten() {
+                            Some((s, e)) if e > s => {
+                                let rows: Vec<(usize, Vec<(usize, usize)>)> = if is_table {
+                                    (s..e)
+                                        .filter_map(|l| {
+                                            let t = lines_snap.get(l)?;
+                                            if !t.contains('|') || is_table_separator_line(t) {
+                                                return None;
+                                            }
+                                            Some((l, parse_table_cell_ranges(t)))
+                                        })
+                                        .collect()
+                                } else {
+                                    (s..e)
+                                        .map(|l| {
+                                            let len = lines_snap
+                                                .get(l)
+                                                .map(|t| t.chars().count())
+                                                .unwrap_or(0);
+                                            (l, vec![(0usize, len)])
+                                        })
+                                        .collect()
+                                };
+                                register_block_hits_on_paint(el, token_sink_snap.clone(), rows)
+                            }
+                            _ => el,
+                        }
                     }
                     FlatItem::TurnHeader { role } => {
                         let (label, accent): (&str, Hsla) = match role {
@@ -1505,6 +1577,9 @@ struct TranscriptPrep {
     new_count: usize,
     edit_seq: u64,
     block_ranges_active: bool,
+    /// Raw (start,end) line range of each parsed block, ascending — paired with the
+    /// `FlatItem::Block` render order to register per-line hit-test bands (bug-0008).
+    block_ranges_snap: Vec<(usize, usize)>,
     follow_tail: bool,
     pending_reveal_line: Option<usize>,
     /// UXI-AgentTile-11 (stage 2): live snapshot of the inline You-block's draft for the

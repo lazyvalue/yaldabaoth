@@ -950,6 +950,17 @@ impl EditorView {
         self.selection_anchor = None;
     }
 
+    /// Move the live selection anchor to a new document position (no-op when no
+    /// selection is active). Used by the programmatic splice paths so an
+    /// agent-streamed edit keeps a selection pinned to its original characters
+    /// instead of ballooning as the caret advances (bug-0010).
+    pub fn move_selection_anchor(&mut self, line: usize, col: usize) {
+        if let Some(a) = self.selection_anchor.as_mut() {
+            a.line = line;
+            a.col = col;
+        }
+    }
+
     pub fn collapse_selection(&mut self) {
         self.selection_anchor = None;
     }
@@ -1470,13 +1481,28 @@ impl Editor {
             (c.line, c.col)
         };
         let cursor_char = self.core.document().line_col_to_char(cl, cc);
+        // bug-0010: a live selection anchor must track a programmatic insert the
+        // same way the cursor does. `selection_range` is `anchor..cursor`, so
+        // shifting only the cursor leaves the anchor stranded at its old absolute
+        // position and the selection balloons over agent-streamed text the user
+        // never dragged over.
+        let anchor_char = self
+            .view
+            .selection_anchor()
+            .map(|a| self.core.document().line_col_to_char(a.line, a.col));
         self.core.programmatic_insert(char_idx, text);
+        let n = text.chars().count();
         if char_idx <= cursor_char {
-            let shifted = cursor_char + text.chars().count();
-            let (l, c) = char_to_line_col(self.core.document(), shifted);
+            let (l, c) = char_to_line_col(self.core.document(), cursor_char + n);
             let cur = self.view.cursor_mut();
             cur.line = l;
             cur.col = c;
+        }
+        if let Some(ac) = anchor_char
+            && char_idx <= ac
+        {
+            let (l, c) = char_to_line_col(self.core.document(), ac + n);
+            self.view.move_selection_anchor(l, c);
         }
     }
 
@@ -1489,18 +1515,31 @@ impl Editor {
             (c.line, c.col)
         };
         let cursor_char = self.core.document().line_col_to_char(cl, cc);
+        // bug-0010: keep a live selection anchor pinned through programmatic
+        // deletes for the same reason as `splice_insert` — remap it with the
+        // identical rule as the cursor.
+        let anchor_char = self
+            .view
+            .selection_anchor()
+            .map(|a| self.core.document().line_col_to_char(a.line, a.col));
         self.core.programmatic_delete(del_s, del_e);
-        let new_char = if cursor_char >= del_e {
-            cursor_char - del_e.saturating_sub(del_s)
-        } else if cursor_char > del_s {
-            del_s
-        } else {
-            cursor_char
+        let remap = |ch: usize| -> usize {
+            if ch >= del_e {
+                ch - del_e.saturating_sub(del_s)
+            } else if ch > del_s {
+                del_s
+            } else {
+                ch
+            }
         };
-        let (l, c) = char_to_line_col(self.core.document(), new_char);
+        let (l, c) = char_to_line_col(self.core.document(), remap(cursor_char));
         let cur = self.view.cursor_mut();
         cur.line = l;
         cur.col = c;
+        if let Some(ac) = anchor_char {
+            let (l, c) = char_to_line_col(self.core.document(), remap(ac));
+            self.view.move_selection_anchor(l, c);
+        }
     }
 
     pub fn programmatic_insert(&mut self, char_idx: usize, text: &str) {
@@ -2637,6 +2676,38 @@ mod tests {
             "caret tracked the draft down past the streamed chunk (no drift)"
         );
         assert_eq!(ed.cursor().col, 5, "caret column preserved within the draft");
+    }
+
+    #[test]
+    fn append_llm_chunk_shifts_selection_anchor_with_cursor() {
+        // bug-0010: a persisted transcript selection must stay pinned to the SAME
+        // characters when the agent streams text ABOVE it. `selection_range` is
+        // `anchor..cursor`; the cursor already tracks the shift
+        // (`append_llm_chunk_keeps_caret_on_draft_pushed_down`), so the anchor
+        // must too or the selection balloons over the streamed content.
+        let mut ed = new_editor("Hi from agent.\nuser draft here\n");
+        ed.add_frozen_lines(0, 1);
+        let a0 = ed.anchor_for_line(0);
+        ed.metadata_mut::<TurnId>().insert(a0, TurnId::Llm(1));
+        // The user selected "draft" inside the draft line: anchor (1,5)→cursor (1,10).
+        ed.cursor_mut().line = 1;
+        ed.cursor_mut().col = 5;
+        ed.anchor_at_cursor();
+        ed.cursor_mut().col = 10;
+        assert_eq!(ed.selection_text().as_deref(), Some("draft"));
+
+        // A chunk streams ABOVE the draft (same turn), pushing the draft to line 2.
+        ed.append_llm_chunk(TurnId::Llm(1), "And more!\n");
+
+        // Both endpoints tracked the draft down — the selection is STILL "draft",
+        // not the ballooned span from the stale anchor on the "And more!" line.
+        assert_eq!(ed.document().line_text(2), "user draft here\n");
+        assert_eq!(
+            ed.selection_range(),
+            Some(((2, 5), (2, 10))),
+            "anchor tracked the programmatic insert (bug-0010)"
+        );
+        assert_eq!(ed.selection_text().as_deref(), Some("draft"));
     }
 
     #[test]

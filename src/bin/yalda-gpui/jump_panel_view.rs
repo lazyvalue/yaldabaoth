@@ -186,7 +186,23 @@ impl YaldaGpuiView {
                 awaiting: Some(ent.read(cx).state.turn_phase.is_awaiting()),
             });
         }
+        // Order the COMBINED list (roster + local-only) by label, so a session sits
+        // in the SAME slot whether or not the async roster refresh has caught up to
+        // it yet. Otherwise a freshly-created local session renders LAST (appended
+        // above), then HOPS into its label-sorted slot once the roster catches up —
+        // the "sessions spontaneously reorder for some weird reason" bug (bug-0006).
+        // Stable tiebreak by target key keeps equal labels deterministic.
+        rows.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| jump_target_key(&a.target).cmp(&jump_target_key(&b.target))));
         rows
+    }
+}
+
+/// A stable, total-order key for a jump target — the tiebreak when two rows share a
+/// label, so the combined roster+local ordering is deterministic across renders.
+fn jump_target_key(t: &JumpTarget) -> String {
+    match t {
+        JumpTarget::Roster(sid) => format!("r:{sid}"),
+        JumpTarget::Local(id) => format!("l:{id:?}"),
     }
 }
 

@@ -761,6 +761,146 @@ impl Element for RegisterTokenOnPaint {
     }
 }
 
+/// Is a raw markdown table line the SEPARATOR row (`| --- | :--: |`)? — its content
+/// is only pipes, dashes, colons and spaces. The separator has no rendered row, so it
+/// must be skipped when aligning hit bands to painted rows.
+pub(crate) fn is_table_separator_line(raw: &str) -> bool {
+    let t = raw.trim();
+    !t.is_empty()
+        && t.contains('-')
+        && t.chars().all(|c| c == '|' || c == '-' || c == ':' || c == ' ')
+}
+
+/// Char ranges `(start_char, count)` of each cell's TRIMMED content in a raw markdown
+/// table row: `| ab | c |` → `[(2, 2), (7, 1)]`. Cells are the spans between pipes.
+pub(crate) fn parse_table_cell_ranges(raw: &str) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = raw.chars().collect();
+    let pipes: Vec<usize> = chars
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c == '|')
+        .map(|(i, _)| i)
+        .collect();
+    let mut cells = Vec::new();
+    for w in pipes.windows(2) {
+        let (mut s, b) = (w[0] + 1, w[1]);
+        while s < b && chars[s] == ' ' {
+            s += 1;
+        }
+        let mut e = b;
+        while e > s && chars[e - 1] == ' ' {
+            e -= 1;
+        }
+        cells.push((s, e - s));
+    }
+    cells
+}
+
+/// Wrap a rendered BLOCK (`FlatItem::Block` — table / bullet list / code / heading)
+/// so it registers hit-test bands into `sink` at paint time. Parsed blocks otherwise
+/// register NO `TokenHit`s at all, so the mouse has nothing to grab and their content
+/// is unselectable (bug-0008). `rows` is one entry per PAINTED row, each
+/// `(raw_line, cells)` where `cells` are `(start_char, count)` spans within that raw
+/// line. The block's painted height is split into `rows.len()` equal horizontal
+/// bands; each band's width is split into `cells.len()` equal columns (table cells
+/// render `flex_1` = equal width, so this lands on the real cells), and each column
+/// registers a hit mapping to its cell's raw `(line, start_char, count)`. Non-table
+/// blocks pass one full-width cell per line.
+pub(crate) fn register_block_hits_on_paint(
+    inner: AnyElement,
+    sink: std::rc::Rc<RefCell<Vec<TokenHit>>>,
+    rows: Vec<(usize, Vec<(usize, usize)>)>,
+) -> AnyElement {
+    RegisterBlockHitsOnPaint { inner, sink, rows }.into_any_element()
+}
+
+struct RegisterBlockHitsOnPaint {
+    inner: AnyElement,
+    sink: std::rc::Rc<RefCell<Vec<TokenHit>>>,
+    rows: Vec<(usize, Vec<(usize, usize)>)>,
+}
+
+impl IntoElement for RegisterBlockHitsOnPaint {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for RegisterBlockHitsOnPaint {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) -> (LayoutId, ()) {
+        (self.inner.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) {
+        self.inner.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        _prepaint: &mut (),
+        window: &mut Window,
+        cx: &mut GpuiApp,
+    ) {
+        let nrows = self.rows.len().max(1);
+        let h = f32::from(bounds.size.height);
+        let full_w = f32::from(bounds.size.width);
+        let x0 = f32::from(bounds.origin.x);
+        let y0 = f32::from(bounds.origin.y);
+        let band_h = h / nrows as f32;
+        {
+            let mut sink = self.sink.borrow_mut();
+            for (ri, (raw_line, cells)) in self.rows.iter().enumerate() {
+                let top = y0 + band_h * ri as f32;
+                let ncols = cells.len().max(1);
+                let col_w = full_w / ncols as f32;
+                for (ci, (start_char, count)) in cells.iter().enumerate() {
+                    let left = x0 + col_w * ci as f32;
+                    sink.push(TokenHit {
+                        line_idx: *raw_line,
+                        start_char: *start_char,
+                        char_count: *count,
+                        bounds: Bounds {
+                            origin: gpui::point(px(left), px(top)),
+                            size: gpui::size(px(col_w), px(band_h)),
+                        },
+                    });
+                }
+            }
+        }
+        self.inner.paint(window, cx);
+    }
+}
+
 // ───────────────────────── Layout probe (headless harness #3.2) ─────────────
 //
 // The verification-harness gap that let the caret-visibility class keep

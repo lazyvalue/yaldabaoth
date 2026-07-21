@@ -13,6 +13,20 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Worksheet `r` = reply-with-quotation** — `NEEDS-RUNTIME` (built via
+  `/new-ux`; `UXI-AgentTile-21`). In an idle worksheet, transcript-focused, with
+  the caret on an agent line at a legal insertion point, `r` opens a You-block
+  like `o` but **seeded** `re\n> <first N sentences of the caret's line>\n`, caret
+  on the trailing blank line. `N` is the shared vim `pending_count` (default 1,
+  clamps to available); `3r` quotes three sentences. Sentence = `.`/`!`/`?` +
+  whitespace/EOT, with abbreviation/decimal special-casing (`first_n_sentences`).
+  Same idle/legality gate as `o`; blank/no-sentence line → no-op.
+  `agent.rs::reply_quote_at_cursor` + `first_n_sentences`, `agent_ui.rs` `r`
+  branch. Guards: `worksheet_r_seeds_reply_quote_from_agent_line`,
+  `worksheet_count_r_quotes_n_sentences`, `worksheet_r_noop_on_blank_line`,
+  `first_n_sentences_splits_and_respects_abbrevs` (386 pass, NC observed). Runtime
+  gap: the inline caret tint over the reply is a human-eye check (harness gap #1).
+
 - **Plane view pans slightly on tile drag/resize** — `NEEDS-RUNTIME` (built this
   session via `/new-ux`; `UXI-Workspace-8`). Committing a tile drag or edge-resize now
   snaps the camera pan to whole slot units (`DesktopState::snap_camera_to_slots`,

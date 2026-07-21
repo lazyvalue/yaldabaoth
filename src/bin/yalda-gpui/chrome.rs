@@ -1034,8 +1034,12 @@ impl YaldaGpuiView {
     pub(crate) fn desktop_drop(&mut self, cx: &mut Context<Self>) {
         let tab_idx = self.workspace.active_tab;
 
-        // End a `Cmd+Shift` canvas pan (Behavior 5) — persist the final view.
+        // End a `Cmd+Shift` canvas pan (Behavior 5) — the gesture is continuous
+        // while dragging but rests the view cell-aligned on release, the same
+        // contract as a tile drag/edge-resize (UXI-Workspace-8 / bug-0009); then
+        // persist the final view.
         if self.workspace.tabs[tab_idx].desktop.pan_drag.take().is_some() {
+            self.workspace.tabs[tab_idx].desktop.snap_camera_to_slots();
             self.save_workspace_state();
             cx.notify();
             return;

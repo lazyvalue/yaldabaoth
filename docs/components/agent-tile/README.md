@@ -30,8 +30,8 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
   right sidepanel (Plan + Subagents), its keyboard focus model, and `Cmd-B` hide.
 - [transcript.md](transcript.md) — `UXI-AgentTile-4..8`: the transcript reading
   surface (background, turn headers, subagent swap, render freshness, token splits).
-- [compose.md](compose.md) — `UXI-AgentTile-9..14`: the compose input (word-wrap,
-  worksheet vs chatbox, paint-on-route, immediate submit, image paste).
+- [compose.md](compose.md) — `UXI-AgentTile-9..14`, `-21`: the compose input (word-wrap,
+  worksheet vs chatbox, paint-on-route, immediate submit, image paste, reply-with-quote).
 - [recap.md](recap.md) — `UXI-AgentTile-15`: the pinned, isolated session recap.
 - [model.md](model.md) — `UXI-AgentTile-16`: the per-session model selector.
 - [session-binding.md](session-binding.md) — `UXI-AgentTile-18..19`: durable
@@ -64,3 +64,4 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-18 | session-binding | A tile auto-resumes ITS OWN session on restart (identity, not index) | implemented |
 | UXI-AgentTile-19 | session-binding | An unresumable session shows an inline "start fresh" notice, never a picker | implemented |
 | UXI-AgentTile-20 | sidepanel | `Cmd-B` force-hides the whole sidepanel; `Cmd-0` un-hides; persists per session | implemented |
+| UXI-AgentTile-21 | compose | `[N]r` over agent text opens a reply You-block seeded with a quotation | implemented |

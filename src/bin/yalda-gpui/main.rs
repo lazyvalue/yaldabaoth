@@ -1889,6 +1889,11 @@ impl YaldaGpuiView {
             // `attach_sids` leaves to the server's attach (wire); it stays a
             // `Vec<String>`, filled from `ServerSid` via `.to_string()`.
             let mut attach_sids: Vec<String> = Vec::new();
+            // bug-0005: no two restored sessions in one cwd may share a label. The
+            // loaded slots are already deduped, but a by-id-MISS fabricated slot (or
+            // a leaf pulled positionally) can still collide, so uniquify each label
+            // against a running set as the leaves bind.
+            let mut used_labels: std::collections::HashSet<String> = std::collections::HashSet::new();
             let by_id: std::collections::HashMap<ServerSid, PersistedSlot> =
                 persisted.iter().cloned().map(|s| (s.id.clone(), s)).collect();
             // Positional fallback ONLY for an old (pre-identity) workspace.json
@@ -1919,7 +1924,9 @@ impl YaldaGpuiView {
                             // (e.g. cwd changed) — still bind the id, with defaults.
                             PersistedSlot {
                                 id: s.clone(),
-                                label: "claude".into(),
+                                // Empty → the dedupe below assigns a unique claude-N
+                                // instead of a bare "claude" (bug-0005).
+                                label: String::new(),
                                 active: false,
                                 mode: InputModeKind::Worksheet,
                                 tasklist_open: false,
@@ -1942,7 +1949,10 @@ impl YaldaGpuiView {
                         // exactly how the same session showed up in two
                         // workspaces), so this leaf falls to the free selector.
                         let slot_cwd = slot.cwd.clone().unwrap_or_else(|| proc_cwd.clone());
-                        let label = slot.label.clone();
+                        // bug-0005: uniquify against the labels already bound this
+                        // restore so two leaves never end up both "claude".
+                        let label = crate::persist::unique_label(&slot.label, &used_labels);
+                        used_labels.insert(label.clone());
                         let make_cwd = slot_cwd.clone();
                         let bind = self.sessions.open_or_focus(&slot.id, |_id| {
                             cx.new(|_| AgentSession {
@@ -2015,17 +2025,22 @@ impl YaldaGpuiView {
         } else {
             // Legacy direct-spawn path (no session server). One tile shows one
             // session; still positional here — identity restore is the
-            // server-managed path above. Fresh claude-1 past the persisted list.
+            // server-managed path above. Fresh claude-N past the persisted list.
+            let mut used_labels: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for (i, (leaf_id, _persisted_sid)) in leaves.iter().enumerate() {
                 self.install_agent_tile(*leaf_id, AgentTile::new());
                 self.focus_window_for_restore(*leaf_id);
                 let id = match persisted.get(i).cloned() {
                     None => {
                         let state = self.create_agent_session(None, proc_cwd.clone(), cx);
+                        // bug-0005: unique label, never a bare/duplicate "claude".
+                        let label = crate::persist::unique_label("", &used_labels);
+                        used_labels.insert(label.clone());
                         self.show_local_session(
                             AgentSession {
                                 state,
-                                label: "claude-1".into(),
+                                label,
                                 cwd: proc_cwd.clone(),
                                 resume_id: None,
                             },
@@ -2043,10 +2058,13 @@ impl YaldaGpuiView {
                         state.tasklist_open = slot.tasklist_open;
                         state.subagents_open = slot.subagents_open;
                         state.sidepanel_hidden = slot.sidepanel_hidden;
+                        // bug-0005: uniquify against labels already bound this restore.
+                        let label = crate::persist::unique_label(&slot.label, &used_labels);
+                        used_labels.insert(label.clone());
                         self.show_local_session(
                             AgentSession {
                                 state,
-                                label: slot.label,
+                                label,
                                 cwd: slot_cwd,
                                 resume_id: Some(slot.id),
                             },

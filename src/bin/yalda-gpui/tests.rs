@@ -2,6 +2,34 @@
 
 use super::*;
 
+/// UXI-AgentTile-21: the sentence splitter behind `[N]r` reply-with-quotation.
+/// Counts + joins the first N sentences; a decimal point and a common
+/// abbreviation do NOT split; a run with no terminator is one sentence; blank
+/// yields "" (the caller's "nothing to quote" signal).
+#[test]
+fn first_n_sentences_splits_and_respects_abbrevs() {
+    // Count + single-space join.
+    assert_eq!(first_n_sentences("One. Two. Three. Four.", 1), "One.");
+    assert_eq!(first_n_sentences("One. Two. Three. Four.", 3), "One. Two. Three.");
+    // Clamp: more requested than available → all of them, no error.
+    assert_eq!(first_n_sentences("One. Two.", 9), "One. Two.");
+    // Abbreviation dot does not split.
+    assert_eq!(
+        first_n_sentences("Use foo, e.g. bar, here. Next.", 1),
+        "Use foo, e.g. bar, here."
+    );
+    // Decimal dot does not split (followed by a digit, not whitespace).
+    assert_eq!(first_n_sentences("It is 3.5 now. Next.", 1), "It is 3.5 now.");
+    // `?` and `!` also terminate.
+    assert_eq!(first_n_sentences("Really? Yes! Ok.", 2), "Really? Yes!");
+    // No terminator at all → the whole text is one sentence.
+    assert_eq!(first_n_sentences("no period here", 1), "no period here");
+    // Blank / empty → "" (no-op signal).
+    assert_eq!(first_n_sentences("   ", 1), "");
+    assert_eq!(first_n_sentences("", 2), "");
+    assert_eq!(first_n_sentences("anything", 0), "");
+}
+
 /// Agent-chat heading-marker toggle (the only markdown the user wants visible
 /// in transcripts): `heading_line_with_markers` re-inserts the literal `#`
 /// markers pulldown strips, as a leading span, with one space before the text.
@@ -3172,6 +3200,69 @@ fn compose_draft_persist_roundtrip() {
     });
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// REGRESSION (bug-0005): two sessions in one cwd must never restore with the SAME
+/// label ("two sessions named 'claude'"). Drives the REAL loader
+/// (`load_persisted_acp_sessions`) against a raw `acp_sessions.json` carrying the
+/// fallback shapes that produced the bug — two slots explicitly labeled "claude" plus
+/// one with a MISSING label — and asserts every restored label is non-empty and
+/// distinct.
+///
+/// Negative control: remove the `dedupe_slot_labels(&mut slots)` call in
+/// `load_persisted_acp_sessions` → the two "claude"s survive and the missing one
+/// loads empty → the uniqueness + non-empty asserts fail RED.
+#[test]
+fn restore_dedupes_duplicate_claude_labels() {
+    let dir = std::env::temp_dir().join(format!("yalda_label_dedup_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("acp_sessions.json");
+    let cwd = std::path::Path::new("/tmp/yalda-dedup-cwd");
+    let json = format!(
+        r#"{{ "{}": [
+            {{"id":"S-a","label":"claude","active":true}},
+            {{"id":"S-b","label":"claude"}},
+            {{"id":"S-c"}}
+        ]}}"#,
+        cwd.to_string_lossy()
+    );
+    std::fs::write(&path, json).unwrap();
+
+    let loaded =
+        persist::with_acp_persist_path(path.clone(), || persist::load_persisted_acp_sessions(cwd));
+    assert_eq!(loaded.len(), 3, "all three slots load");
+    let labels: Vec<String> = loaded.iter().map(|s| s.label.clone()).collect();
+    assert!(
+        labels.iter().all(|l| !l.trim().is_empty()),
+        "no restored label is empty/bare: {labels:?}"
+    );
+    let uniq: std::collections::HashSet<&String> = labels.iter().collect();
+    assert_eq!(
+        uniq.len(),
+        labels.len(),
+        "every restored session label is unique — never two 'claude': {labels:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Unit: `unique_label` keeps a free non-empty name and otherwise hands out the
+/// smallest free `claude-N` (the core of the bug-0005 dedupe).
+#[test]
+fn unique_label_fills_gaps_and_replaces_empty_or_dup() {
+    use std::collections::HashSet;
+    let mut used: HashSet<String> = HashSet::new();
+    // A free, valid label is kept verbatim.
+    let a = persist::unique_label("claude-1", &used);
+    assert_eq!(a, "claude-1");
+    used.insert(a);
+    // A DUPLICATE gets the next free number.
+    let b = persist::unique_label("claude-1", &used);
+    assert_eq!(b, "claude-2");
+    used.insert(b);
+    // An EMPTY label gets the next free number, never bare "claude".
+    let c = persist::unique_label("", &used);
+    assert_eq!(c, "claude-3");
 }
 
 // ----------------------------------------------------------------------------

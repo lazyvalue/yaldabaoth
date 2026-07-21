@@ -4748,6 +4748,22 @@ impl YaldaGpuiView {
                 cx.notify();
                 return;
             }
+            // UXI-AgentTile-21: `[N]r` over an agent line opens a reply You-block
+            // seeded with a quotation of that line's first N sentences (count from
+            // the shared vim pending-count prefix, default 1). Same idle/legality
+            // gate as `o` — refused (with a hint) over an older turn or a line with
+            // no sentence text. Placed before the fall-through dispatch so `r` never
+            // reaches the Normal-mode keybinds.
+            if worksheet && press.modifiers.is_empty() && press.key == Key::Char('r') {
+                let quoted = self
+                    .with_session(focused_id, cx, |c| c.reply_quote_at_cursor())
+                    .unwrap_or(false);
+                if !quoted && let Some(mut c) = self.agent_mut(cx) {
+                    c.status = Some("nothing to quote here".into());
+                }
+                cx.notify();
+                return;
+            }
             if press.modifiers.is_empty() && press.key == Key::Esc {
                 // Esc from transcript navigation returns focus to the compose ONLY
                 // where a compose surface is actually visible: the chatbox box, or
