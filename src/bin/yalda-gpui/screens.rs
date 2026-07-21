@@ -2582,6 +2582,12 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
             .on_action(cx.listener(Self::toggle_theme))
+            // Workspace navigation must reach the picker: an unbound agent tile
+            // showing the selector is still a full tile, so ctrl-<n> / cmd-shift-[]
+            // (GotoWorkspace1-10 + Next/PrevTab) and the jump panel must dispatch
+            // here just like on a bound AgentView (bug-0011).
+            .on_action(cx.listener(Self::toggle_jump_panel))
+            .workspace_nav(cx)
             .flex()
             .flex_col()
             .size_full()

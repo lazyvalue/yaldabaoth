@@ -916,6 +916,69 @@ fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
     });
 }
 
+/// bug-0011 REGRESSION: an UNBOUND agent tile (the session selector/picker,
+/// `render_agent_picker`) was the one screen root missing `.workspace_nav(cx)`, so
+/// while the picker was focused `ctrl-<n>` (GotoWorkspace) and `cmd-shift-[]`
+/// (Next/PrevTab) dispatched into a dead chain — the picker "ate" workspace-switch
+/// keys. Drives the REAL keymap over a focused picker tile. RED before the fix
+/// (the picker root wires workspace_nav): `active_tab` stays 0.
+#[gpui::test]
+fn agent_picker_does_not_eat_workspace_switch_keys(cx: &mut TestAppContext) {
+    use crate::workspace::WorkspaceCwd;
+    use crate::{App, BrowserWindow, BufferApp};
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+
+    // Four real workspaces; start on workspace 1.
+    view.update(vcx, |v, _| {
+        let cwd = PathBuf::from(".");
+        for _ in 0..3 {
+            v.workspace.push_initial_tab(
+                App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
+                WorkspaceCwd::new(cwd.clone()),
+            );
+        }
+        v.workspace.set_active_tab(0);
+    });
+    // Replace workspace 1's tile with an UNBOUND agent tile → the selector/picker
+    // is now the focused screen root. Force a repaint so the picker actually
+    // RENDERS and becomes the focused node in the dispatch tree (set_screen alone
+    // doesn't notify, leaving the stale boot-browser leaf — which HAS workspace_nav
+    // — in the dispatch tree and masking the bug).
+    install_agent_picker(&view, &mut *vcx, &[]);
+    view.update(vcx, |_v, cx| cx.notify());
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let tile = v.agent_tile().expect("agent tile on workspace 1");
+        assert!(tile.session().is_none(), "tile is unbound → picker is showing");
+        assert_eq!(v.workspace.active_tab, 0);
+    });
+
+    // ctrl-3 FROM THE PICKER → third workspace. This is the bug: RED without
+    // workspace_nav on the picker root (action falls into a dead chain, stays 0).
+    vcx.simulate_keystrokes("ctrl-3");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.active_tab, 2,
+            "ctrl-3 must switch workspace even while the session picker is focused"
+        );
+    });
+
+    // And cycling (Next/PrevTab) must reach the picker too — go back to it, then
+    // cmd-shift-] forward.
+    view.update(vcx, |v, _| v.workspace.set_active_tab(0));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("cmd-shift-]");
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.active_tab, 1,
+            "cmd-shift-] must advance the workspace from the picker (Next/PrevTab wiring)"
+        );
+    });
+}
+
 /// REGRESSION ("ctrl-tab does nothing"): tab-cycling (NextTab/PrevTab) was wired ONLY
 /// on the doc screen, so it was DEAD whenever an agent/worksheet tile was focused
 /// (where the user actually was). It's now in `workspace_nav`, wired on every screen.
