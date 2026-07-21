@@ -1,5 +1,5 @@
 use crate::highlight::Highlighter;
-use crate::style::Style;
+use crate::style::{Modifier, Style};
 use crate::theme::Theme;
 
 /// A highlighted chunk of text: owned string + style.
@@ -235,10 +235,18 @@ fn highlight_source_line(line: &str, theme: &Theme, strip: bool) -> Vec<Segment>
     // Blockquote: consume a leading '>' marker (possibly repeated).
     let (quote_prefix, after_quote) = split_quote_prefix(rest);
     if !quote_prefix.is_empty() {
+        let quote_start = segs.len();
         if !strip {
             segs.push((quote_prefix.to_string(), theme.blockquote_bar));
         }
         tokenize_inline(after_quote, theme.blockquote_text, theme, &mut segs, strip);
+        // UXI-Blockquote-1: blockquoted text renders ITALIC on every surface.
+        // Applied to every segment the quote produced — not just the base style —
+        // so nested `**bold**` / `` `code` `` / link spans (which `tokenize_inline`
+        // gives their OWN style, overwriting the blockquote base) stay italic too.
+        for (_, st) in &mut segs[quote_start..] {
+            *st = st.add_modifier(Modifier::ITALIC);
+        }
         return segs;
     }
 
@@ -516,4 +524,47 @@ fn find_single_emphasis(bytes: &[u8], from: usize, marker: u8) -> Option<usize> 
         i += 1;
     }
     None
+}
+
+#[cfg(test)]
+mod blockquote_italic_tests {
+    use super::*;
+
+    /// UXI-Blockquote-1: EVERY segment produced by a `>` line carries
+    /// `Modifier::ITALIC` — including nested inline spans (`**bold**`,
+    /// `` `code` ``), which `tokenize_inline` gives their OWN style and which
+    /// would otherwise drop the blockquote styling. This is the data-level guard
+    /// behind "quoted text is italic everywhere" on the per-line surfaces (the
+    /// agent transcript's source-highlighted lines and the RAW edit view).
+    #[test]
+    fn blockquote_segments_are_italic() {
+        let theme = Theme::default();
+        let quoted = highlight_markdown_lines(&["> quoted **bold** text".to_string()], &theme);
+        let segs = &quoted[0];
+        assert!(!segs.is_empty(), "the quote produced segments");
+        for (text, style) in segs {
+            assert!(
+                style.modifier.contains(Modifier::ITALIC),
+                "segment {text:?} on a blockquote line must be ITALIC"
+            );
+        }
+
+        // Nested quotes (`>>`) too.
+        let nested = highlight_markdown_lines(&[">> deeper".to_string()], &theme);
+        assert!(
+            nested[0]
+                .iter()
+                .all(|(_, s)| s.modifier.contains(Modifier::ITALIC)),
+            "a nested blockquote is italic as well"
+        );
+
+        // A NON-quoted line is not italicised wholesale.
+        let plain = highlight_markdown_lines(&["ordinary text".to_string()], &theme);
+        assert!(
+            plain[0]
+                .iter()
+                .all(|(_, s)| !s.modifier.contains(Modifier::ITALIC)),
+            "a plain line stays upright"
+        );
+    }
 }

@@ -13,6 +13,20 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Blockquoted text is italic everywhere** — `NEEDS-RUNTIME` (built 2026-07-21,
+  branch `quote-parser-blockquote-italic`, NOT yet merged; `UXI-Blockquote-1`,
+  new spec `docs/components/common/blockquote.md`). `>`-quoted text renders italic
+  on ALL six render paths. Three already did (rendered doc block, transcript
+  parsed block, WP view); three did not and now do: the `md_highlight` per-line
+  path (agent transcript source-highlighted lines + RAW edit view) via
+  `Modifier::ITALIC` on **every** segment of the quote — so nested `**bold**` /
+  `` `code` `` spans don't punch upright holes — and the compose / virtualized
+  compose / inline You-block via `.italic()` in `build_chatbox_wrapped_line`
+  (single choke point for all three). Only a line-leading `>` counts (`a > b`
+  stays upright). Guards: `blockquote_segments_are_italic` (lib, NC observed) +
+  `is_blockquote_line_matches_leading_marker_only`. Runtime check: the italic
+  actually shows in the live compose/RAW view (harness gap #1 — paint, not state).
+
 - **Worksheet `r` = reply-with-quotation** — `NEEDS-RUNTIME` (built via
   `/new-ux`; `UXI-AgentTile-21`). In an idle worksheet, transcript-focused, with
   the caret on an agent line at a legal insertion point, `r` opens a You-block
@@ -26,6 +40,14 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   `worksheet_count_r_quotes_n_sentences`, `worksheet_r_noop_on_blank_line`,
   `first_n_sentences_splits_and_respects_abbrevs` (386 pass, NC observed). Runtime
   gap: the inline caret tint over the reply is a human-eye check (harness gap #1).
+  - **Bold-breaks-the-parser FIXED** (2026-07-21, branch
+    `quote-parser-blockquote-italic`): `*this sentence is bold.*` put a `*` between
+    the `.` and the space, so the terminator+whitespace rule missed the boundary
+    and the sentence ran on into the next one. `first_n_sentences` now consumes a
+    run of closing markup (`*_`` ` ``~)]}"'»”’`) after the terminator and keeps it
+    inside the sentence, so quoted markup stays balanced. Guard
+    `first_n_sentences_terminates_through_closing_markup`; NC reproduced the exact
+    symptom (`"*this sentence is bold.* Next one."`).
 
 - **Plane view pans slightly on tile drag/resize** — `NEEDS-RUNTIME` (built this
   session via `/new-ux`; `UXI-Workspace-8`). Committing a tile drag or edge-resize now

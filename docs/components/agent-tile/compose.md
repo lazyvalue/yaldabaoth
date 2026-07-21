@@ -444,12 +444,20 @@ Concretely:
    one. `N` is read from the same `pending_count` used by every other counted
    action (`keybind.rs`). The count **clamps** to the sentences available (`9r`
    on a 3-sentence line quotes all 3, no error).
-3. **Sentence definition.** A sentence ends at `.`/`!`/`?` **followed by
-   whitespace or end-of-text**. A decimal point (`3.5` — the dot is followed by a
-   digit, not whitespace) and a common abbreviation (`e.g.`, `i.e.`, `vs.`,
-   `etc.`, `Mr.`, `Dr.`, …) do **not** split. Sentences are joined by a single
-   space onto **one** quote line (Option A — not one `>` line per sentence). This
-   is a heuristic; exotic punctuation is out of scope.
+3. **Sentence definition.** A sentence ends at `.`/`!`/`?` — optionally followed
+   by a run of **closing markup** (`*`, `_`, `` ` ``, `~`, `)`, `]`, `}`, `"`,
+   `'`, `»`, `”`, `’`) — **then whitespace or end-of-text**. A decimal point
+   (`3.5` — the dot is followed by a digit) and a common abbreviation (`e.g.`,
+   `i.e.`, `vs.`, `etc.`, `Mr.`, `Dr.`, …) do **not** split. Sentences are joined
+   by a single space onto **one** quote line (Option A — not one `>` line per
+   sentence). This is a heuristic; exotic punctuation is out of scope.
+   - **Closing markup must not swallow the boundary** (fixed 2026-07-21, reported
+     as "bold breaks the sentence parser"). `*this sentence is bold.*` put a `*`
+     between the `.` and the space, so the whitespace rule failed and the sentence
+     ran on into the next one. The closers are consumed AND kept **inside** the
+     returned sentence, so the quoted markup stays balanced. A `*` that is not
+     followed by whitespace still doesn't fabricate a boundary (`a.*b` is one
+     sentence).
 4. **Caret lands after the quote.** The seed ends in a trailing newline, so the
    compose caret (via `Compose::seeded`, cursor-at-end) rests on the **blank line
    below the quote**, in Insert, ready to type the reply. The literal first line
@@ -500,6 +508,12 @@ the blank tail), `worksheet_count_r_quotes_n_sentences` (`3` then `r` through th
 real dispatch → `re\n> One. Two. Three.\n`, exercising the shared `pending_count`),
 and `worksheet_r_noop_on_blank_line` (legal-but-empty tail → no block opens). Pure
 unit: `tests.rs::first_n_sentences_splits_and_respects_abbrevs` (count/join, clamp,
-`e.g.`/decimal no-split, `?`/`!` terminators, blank ⇒ `""`). Negative control
-(observed): reverting the seed to `""` turns both draft-equality asserts RED with
-`left: ""` / `right: "re\n> …"`.
+`e.g.`/decimal no-split, `?`/`!` terminators, blank ⇒ `""`) and
+`tests.rs::first_n_sentences_terminates_through_closing_markup` (the bold/emphasis
+regression: `*…bold.*`, `**Bold.**`, `_Emph._`, `` `code.` ``, `(Aside.)`,
+`"go."`, counting across emphasised sentences, and `a.*b` NOT splitting). Negative
+controls (both observed): reverting the seed to `""` turns the draft-equality
+asserts RED (`left: ""`); disabling the closing-markup run turns the bold case RED
+with `left: "*this sentence is bold.* Next one."` — the exact reported symptom.
+The seeded `> ` quote renders italic per
+[UXI-Blockquote-1](../common/blockquote.md).
