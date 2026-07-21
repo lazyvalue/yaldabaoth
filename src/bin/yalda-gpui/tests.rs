@@ -30,6 +30,60 @@ fn first_n_sentences_splits_and_respects_abbrevs() {
     assert_eq!(first_n_sentences("anything", 0), "");
 }
 
+/// UXI-AgentTile-21 REGRESSION ("bold breaks the sentence parser"): a terminator
+/// wrapped in closing markup — `*italic.*`, `**bold.**`, `` `code.` ``,
+/// `(aside.)`, `"quoted."` — still ends the sentence. Before the fix the `.` was
+/// followed by `*` (not whitespace), so the boundary was missed and the sentence
+/// ran on into the next one. The closers stay IN the returned sentence so the
+/// quoted markup remains balanced.
+#[test]
+fn first_n_sentences_terminates_through_closing_markup() {
+    // The reported case: emphasis around a whole sentence.
+    assert_eq!(
+        first_n_sentences("*this sentence is bold.* Next one.", 1),
+        "*this sentence is bold.*",
+        "a `.` before a closing `*` still ends the sentence"
+    );
+    // Double-asterisk bold: a RUN of closers is consumed.
+    assert_eq!(first_n_sentences("**Bold.** Next.", 1), "**Bold.**");
+    // Underscore emphasis, inline code, parens, quotes.
+    assert_eq!(first_n_sentences("_Emph._ Next.", 1), "_Emph._");
+    assert_eq!(first_n_sentences("`code.` Next.", 1), "`code.`");
+    assert_eq!(first_n_sentences("(Aside.) Next.", 1), "(Aside.)");
+    assert_eq!(first_n_sentences("He said \"go.\" Then left.", 1), "He said \"go.\"");
+    // Counting still works ACROSS emphasised sentences.
+    assert_eq!(
+        first_n_sentences("*One.* Two. Three.", 2),
+        "*One.* Two.",
+        "2r spans an emphasised first sentence and a plain second"
+    );
+    // Closing markup at end-of-text also terminates.
+    assert_eq!(first_n_sentences("*Only one.*", 1), "*Only one.*");
+    // A closer must still be followed by whitespace/EOT — `*` mid-word doesn't
+    // fabricate a boundary, and decimals are untouched.
+    assert_eq!(first_n_sentences("a.*b continues here", 1), "a.*b continues here");
+    assert_eq!(first_n_sentences("It is 3.5 now. Next.", 1), "It is 3.5 now.");
+}
+
+/// UXI-Blockquote-1: the classification seam behind italicising `>` text on the
+/// compose / You-block surfaces (where the markdown highlighter never runs). The
+/// italic PAINT itself is a human-eye check (harness gap #1); this pins WHICH
+/// lines get it, matching `md_highlight::split_quote_prefix`'s rule.
+#[test]
+fn is_blockquote_line_matches_leading_marker_only() {
+    assert!(is_blockquote_line("> quoted"));
+    assert!(is_blockquote_line(">no space still counts"));
+    assert!(is_blockquote_line(">> nested"));
+    // Leading whitespace is allowed before the marker.
+    assert!(is_blockquote_line("   > indented quote"));
+    // A `>` that is not line-leading is NOT a quote (comparisons, arrows, code).
+    assert!(!is_blockquote_line("a > b"));
+    assert!(!is_blockquote_line("if x >= 3"));
+    assert!(!is_blockquote_line("ordinary text"));
+    assert!(!is_blockquote_line(""));
+    assert!(!is_blockquote_line("   "));
+}
+
 /// Agent-chat heading-marker toggle (the only markdown the user wants visible
 /// in transcripts): `heading_line_with_markers` re-inserts the literal `#`
 /// markers pulldown strips, as a leading span, with one space before the text.

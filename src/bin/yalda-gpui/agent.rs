@@ -1531,6 +1531,16 @@ pub(crate) fn caret_visual_row(rows: &[(usize, usize)], cursor_col: usize) -> us
 /// range, so nothing is clipped and no horizontal scroll is needed; the caret is
 /// placed on the single visual row that holds `cursor_col`.
 #[allow(clippy::too_many_arguments)]
+/// UXI-Blockquote-1: is `line` a markdown blockquote line — a `>` marker after
+/// at most leading whitespace? The classification seam behind the italic styling
+/// of `>`-quoted text on the compose / You-block surfaces (the paint itself is a
+/// human-eye check, harness gap #1). Matches `md_highlight::split_quote_prefix`'s
+/// rule so every surface agrees on what "quoted" means: nested `>>` counts, and a
+/// `>` that is not line-leading (e.g. `a > b`) does not.
+pub(crate) fn is_blockquote_line(line: &str) -> bool {
+    line.trim_start().starts_with('>')
+}
+
 pub(crate) fn build_chatbox_wrapped_line(
     full_text: &str,
     is_cursor_line: bool,
@@ -1550,6 +1560,17 @@ pub(crate) fn build_chatbox_wrapped_line(
     let caret_row = is_cursor_line.then(|| caret_visual_row(&rows, cursor_col));
 
     let mut col = div().flex().flex_col().w_full().min_w_0();
+    // UXI-Blockquote-1: a blockquoted line renders ITALIC on EVERY surface. This
+    // covers the three surfaces the per-line markdown highlighter never reaches —
+    // the small-draft compose, the virtualized compose, and the inline You-block
+    // in the transcript (all three route through here). Set on the line container
+    // so it cascades to every wrapped visual row; `build_chatbox_line` emits plain
+    // `.child(text)` with no font override, so the refinement carries down. The
+    // compose is monospace, so italic keeps the uniform advance the char-count
+    // caret math (UXI-TextEditing-1) depends on.
+    if is_blockquote_line(full_text) {
+        col = col.italic();
+    }
     for (r, &(rs, re)) in rows.iter().enumerate() {
         col = col.child(build_chatbox_line(
             full_text,
@@ -1870,13 +1891,15 @@ pub(crate) fn finalize_agent_turn(editor: &mut Editor) {
 }
 
 /// UXI-AgentTile-21: return the first `n` sentences of `text`, joined by a
-/// single space and trimmed. A sentence ends at `.`/`!`/`?` **followed by
-/// whitespace or end-of-text**; a decimal point (the dot is followed by a digit,
-/// so it never meets the whitespace rule — `3.5`) and a common abbreviation
-/// (`e.g.`, `i.e.`, `vs.`, `etc.`, `Mr.`, …) do NOT split. Fewer than `n`
-/// sentences ⇒ all of them (clamp); a trailing run with no terminator counts as
-/// one sentence. A blank / whitespace-only `text` yields `""` (the caller treats
-/// that as "nothing to quote"). Heuristic — exotic punctuation is out of scope.
+/// single space and trimmed. A sentence ends at `.`/`!`/`?` — optionally
+/// followed by a run of **closing markup** (`*`, `_`, `` ` ``, `)`, `"`, …) —
+/// **then whitespace or end-of-text**; a decimal point (the dot is followed by a
+/// digit, so it never meets the whitespace rule — `3.5`) and a common
+/// abbreviation (`e.g.`, `i.e.`, `vs.`, `etc.`, `Mr.`, …) do NOT split. Fewer
+/// than `n` sentences ⇒ all of them (clamp); a trailing run with no terminator
+/// counts as one sentence. A blank / whitespace-only `text` yields `""` (the
+/// caller treats that as "nothing to quote"). Heuristic — exotic punctuation is
+/// out of scope.
 pub(crate) fn first_n_sentences(text: &str, n: usize) -> String {
     // Lower-cased, dot-stripped abbreviation stems (matched against the
     // `[alpha.]` run ending at a candidate terminator).
@@ -1884,19 +1907,38 @@ pub(crate) fn first_n_sentences(text: &str, n: usize) -> String {
         "e.g", "i.e", "vs", "etc", "cf", "al", "mr", "mrs", "ms", "dr", "st",
         "sr", "jr", "no", "fig", "inc", "ltd", "co", "vol", "pp", "approx",
     ];
+    // Closing markup/punctuation allowed BETWEEN the terminator and the
+    // whitespace that actually ends the sentence: `*emphasis.*`, `**bold.**`,
+    // `` `code.` ``, `(aside.)`, `"quoted."`. Without this the terminator looks
+    // mid-word and the sentence runs on into the next one — the reported
+    // "bold breaks the sentence parser" bug. The closers are INCLUDED in the
+    // returned sentence so the quote keeps its markup balanced.
+    const CLOSERS: &[char] = &[
+        '*', '_', '`', '~', ')', ']', '}', '"', '\'', '»', '”', '’',
+    ];
     if n == 0 {
         return String::new();
     }
     let chars: Vec<char> = text.chars().collect();
     let mut sentences: Vec<String> = Vec::new();
     let mut start = 0usize;
-    for i in 0..chars.len() {
+    let mut i = 0usize;
+    while i < chars.len() {
         if !matches!(chars[i], '.' | '!' | '?') {
+            i += 1;
             continue;
         }
-        // A terminator only ends a sentence when followed by whitespace or EOT.
-        // (This alone handles decimals: the `.` in `3.5` is followed by a digit.)
-        if chars.get(i + 1).is_some_and(|c| !c.is_whitespace()) {
+        // Consume any run of closing markup after the terminator — the sentence
+        // ends AFTER the `*`/`)`/`"`, not before it.
+        let mut end = i + 1;
+        while chars.get(end).is_some_and(|c| CLOSERS.contains(c)) {
+            end += 1;
+        }
+        // A terminator only ends a sentence when what follows is whitespace or
+        // EOT. (This also handles decimals: the `.` in `3.5` is followed by a
+        // digit, which is neither a closer nor whitespace.)
+        if chars.get(end).is_some_and(|c| !c.is_whitespace()) {
+            i += 1;
             continue;
         }
         // A `.` closing a known abbreviation does not split.
@@ -1911,17 +1953,19 @@ pub(crate) fn first_n_sentences(text: &str, n: usize) -> String {
                 .trim_matches('.')
                 .to_lowercase();
             if ABBREVS.contains(&word.as_str()) {
+                i += 1;
                 continue;
             }
         }
-        let s = chars[start..=i].iter().collect::<String>().trim().to_string();
+        let s = chars[start..end].iter().collect::<String>().trim().to_string();
         if !s.is_empty() {
             sentences.push(s);
         }
-        start = i + 1;
+        start = end;
         if sentences.len() >= n {
             break;
         }
+        i = end;
     }
     // A trailing run with no terminal punctuation is one sentence (e.g. an agent
     // line with no period at all — the whole line is the "first sentence").

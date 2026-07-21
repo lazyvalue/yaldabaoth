@@ -21,3 +21,5 @@ them by id.
   the doc view and the agent transcript.
 - [text-zoom.md](text-zoom.md) — `TextZoom`: document text zoom across the buffer
   doc/edit views + the agent transcript.
+- [blockquote.md](blockquote.md) — `Blockquote`: `>`-quoted text renders italic on
+  every surface (doc view, transcript, both edit views, compose / You-block).
