@@ -1087,6 +1087,7 @@ fn agent_status_dot_reflects_turn_phase(cx: &mut TestAppContext) {
 fn agent_dot_status_mapping() {
     use crate::{AgentDotStatus, AgentRow, JumpTarget};
     let row = |connected, awaiting| AgentRow {
+        order_sid: None,
         target: JumpTarget::Roster("s".into()),
         label: "x".into(),
         cwd: std::path::PathBuf::from("/"),
@@ -5763,6 +5764,7 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
         bound: false,
         connected: true,
         awaiting: None,
+        order_sid: Some(sid.into()),
     };
     // Two projects; alpha has two sessions (incoming by-label a,b), beta one.
     let mk = || {
@@ -5904,6 +5906,120 @@ fn jump_reorder_methods_reorder_and_gate_by_cwd(cx: &mut TestAppContext) {
     assert!(g.iter().all(|(k, rows)| k != "/proj/alpha" || !rows.contains(&"b-one".to_string())));
 }
 
+/// bug-0007 (RECURRED), REAL path: a session must NEVER change slot in the jump
+/// panel because of `/clear`. `/clear` kills the server session and creates a new
+/// one with a NEW sid; the user's drag order (`jump_session_order`) ranks by sid,
+/// so the replacement was unranked (`usize::MAX`) and fell to the BOTTOM of its
+/// cwd group — "one agent session moved to the bottom of the list after a clear".
+///
+/// Drives the REAL `clear_agent_session` (forced down the server branch) and the
+/// REAL async `Created` resolution, snapshotting the ordered/grouped rows exactly
+/// as `render_jump_panel` builds them, at BOTH moments the row could hop: while
+/// the placeholder is local-only (mid-open) and after it binds the fresh sid.
+///
+/// Negative control (mandatory, observed RED): revert `order_sid` to `None` for a
+/// local placeholder → the mid-open assert fails ("z-one" last); revert
+/// `inherit_order_slot` → the post-bind assert + the `jump_session_order` assert
+/// fail. Non-vacuous: the user's order is the REVERSE of label order, so a slot
+/// that survives can only have come from the order list.
+#[gpui::test]
+fn clear_keeps_the_sessions_jump_panel_slot(cx: &mut TestAppContext) {
+    use yalda::session_proto::SessionInfo;
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    install_agent_slot(&view, &mut *vcx, Some("S1"));
+    vcx.run_until_parked();
+
+    let info = |sid: &str, label: &str| SessionInfo {
+        session_id: sid.into(),
+        acp_session_id: None,
+        label: label.into(),
+        cwd: std::path::PathBuf::from("/proj/x"),
+        turns: 0,
+        connected: true,
+        permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
+    };
+    // One cwd group, two sessions. Labels are chosen so the USER's order is the
+    // reverse of by-label order: any surviving slot proves the order list drove it.
+    view.update(vcx, |v, cx| {
+        v.agent_roster.upsert(info("S1", "z-one"));
+        v.agent_roster.upsert(info("S2", "a-two"));
+        let id = v.focused_bound_session().expect("bound session");
+        if let Some(ent) = v.session_entity(id) {
+            ent.update(cx, |s, _| {
+                s.label = "z-one".into();
+                s.cwd = std::path::PathBuf::from("/proj/x");
+            });
+        }
+        v.jump_session_order = vec!["S1".into(), "S2".into()];
+    });
+    vcx.run_until_parked();
+
+    let snapshot = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            crate::order_grouped_rows(
+                crate::group_agent_rows_by_cwd(v.jump_panel_agent_rows(cx)),
+                &v.jump_cwd_order,
+                &v.jump_session_order,
+            )
+            .into_iter()
+            .flat_map(|(_, rows)| rows.into_iter().map(|(_, r)| r.label))
+            .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(
+        snapshot(&view, vcx),
+        vec!["z-one", "a-two"],
+        "precondition: the user's drag order puts z-one first (label order would not)"
+    );
+
+    // REAL `/clear`, server branch. The old sid is closed on the server (mirror
+    // the resulting broadcast by dropping it from the roster) and a local-only
+    // placeholder takes the tile until the create round-trip resolves.
+    view.update(vcx, |v, cx| {
+        crate::with_server_clear_branch(|| v.clear_agent_session(cx));
+        v.agent_roster.remove("S1");
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        snapshot(&view, vcx),
+        vec!["z-one", "a-two"],
+        "MID-OPEN: the /clear placeholder must hold the killed session's slot, not sink"
+    );
+
+    // REAL async completion: the fresh sid binds.
+    let token = view
+        .update(vcx, |v, _| v.agent_tile().and_then(|t| t.pending_token()))
+        .expect("clear left a pending open token");
+    view.update(vcx, |v, cx| {
+        v.apply_open_agent_resolution(
+            token,
+            crate::OpenResolution::Created {
+                sid: "S-fresh".into(),
+                acp_id: None,
+                permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            },
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    assert_eq!(
+        snapshot(&view, vcx),
+        vec!["z-one", "a-two"],
+        "POST-BIND: the cleared session keeps its slot under its new sid"
+    );
+    assert_eq!(
+        view.update(vcx, |v, _| v.jump_session_order.clone()),
+        vec!["S-fresh".to_string(), "S2".to_string()],
+        "the persisted order inherits the slot in place (no append, no duplicate)"
+    );
+}
+
 /// Unit: the jump panel groups agent-session rows under per-cwd subheaders
 /// (agent-sessions-by-cwd). Sessions sharing a cwd land in one group; groups are
 /// ordered by their display path (stable, alphabetized headers); and every row
@@ -5913,6 +6029,7 @@ fn jump_reorder_methods_reorder_and_gate_by_cwd(cx: &mut TestAppContext) {
 fn jump_panel_groups_agent_rows_by_cwd() {
     use crate::{group_agent_rows_by_cwd, AgentRow, JumpTarget};
     let row = |label: &str, cwd: &str| AgentRow {
+        order_sid: Some(label.into()),
         target: JumpTarget::Roster(label.into()),
         label: label.into(),
         cwd: std::path::PathBuf::from(cwd),
@@ -11150,4 +11267,194 @@ fn close_session_requires_typed_yes_confirmation(cx: &mut TestAppContext) {
     );
     let bound = view.update(vcx, |v, _| v.focused_bound_session());
     assert_eq!(bound, None, "a typed `yes` closes the session (tile unbinds)");
+}
+
+/// bug-0013 (`UXI-AgentTile-8`, widened): a tool call that interrupts an OPEN run
+/// MID-SENTENCE must not split the sentence — even when the break is NOT
+/// alphanumeric-on-both-sides, which is all `dbe67be`'s mid-word rule covered.
+/// Both cases are lifted in shape from the 2026-07-21 11:33 screenshot:
+///
+/// 1. the continuation starts with a SPACE (`…the fix for` | tool | ` it on my side…`),
+/// 2. the continuation is bare punctuation (`…subagents` | tool | `.`), which used to
+///    strand a line containing only `.`.
+///
+/// Drives the REAL reducer (`apply_server_batch` → `append_llm_chunk_floored`).
+/// Negative control: restore the `chunk_head.is_alphanumeric()` / `last_char
+/// .is_alphanumeric()` pair in `continuation_rejoin_point` → both asserts fail.
+#[gpui::test]
+fn tool_call_midsentence_does_not_split_agent_sentence(cx: &mut TestAppContext) {
+    use yalda::acp_channel::{ReplyEvent, ToolCall};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        let batch = vec![
+            // Case 1: break at a whitespace boundary MID-sentence.
+            ev(ReplyEvent::Chunk(
+                "To close the loop on your question: the fix for".into(),
+            )),
+            ev(ReplyEvent::ToolCallStarted(ToolCall::new("t1", "Bash"))),
+            ev(ReplyEvent::Chunk(
+                " it on my side is to stop delegating long test runs to subagents".into(),
+            )),
+            // Case 2: the sentence's terminating '.' arrives after another tool.
+            ev(ReplyEvent::ToolCallStarted(ToolCall::new("t2", "Bash"))),
+            ev(ReplyEvent::Chunk(".\n".into())),
+        ];
+        v.apply_server_batch(batch, cx);
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        let text = c.editor.document().full_text();
+        assert!(
+            text.contains(
+                "the fix for it on my side is to stop delegating long test runs to subagents."
+            ),
+            "a tool must not cut a sentence at a non-word boundary; got:\n{text:?}"
+        );
+        // Non-vacuity: no line is left holding only the stranded terminator.
+        assert!(
+            !text.lines().any(|l| l.trim() == "."),
+            "the trailing '.' must rejoin its sentence, not strand its own line; got:\n{text:?}"
+        );
+    });
+}
+
+
+/// bug-0015 (`UXI-Selection-1`): pressing the mouse inside a multiline code block
+/// must NOT move the block. The transcript's blank-line collapse protects the line
+/// the cursor sits on; a press moves that cursor, so the previously-protected blank
+/// collapsed away, the flat-item list lost an entry, and the whole block repainted
+/// ~25px lower — MID-GESTURE, under the pointer. 25px > the 20px line height, so
+/// every later `hit_test_tokens` came back a line off and dragging inside a code
+/// block selected the wrong lines ("can't select in a multiline code block").
+///
+/// Asserts on PAINTED geometry (the band tops), not on state: the defect is that
+/// the pixels move. Drives the REAL `transcript_mouse_down`, then re-reads the
+/// paint-time token sink.
+///
+/// Negative control: drop `drag_protect_line` from `protect_line` in
+/// `rebuild_agent_view_model` (back to the bare cursor line) → the bands shift +25px
+/// and the equality assert fires RED.
+#[gpui::test]
+fn code_block_does_not_shift_when_clicked(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+
+    // A frozen fenced code block, and a trailing blank line for the cursor to rest
+    // on (the line whose protection the press used to drop).
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, "```rust\nlet a = 1;\nlet b = 2;\n```\n");
+        s.state.editor.add_frozen_lines(0, 4);
+        s.state.editor.cursor_mut().line = 4;
+        s.state.editor.cursor_mut().col = 0;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    let tv = view
+        .update(vcx, |v, _| v.transcript_views.get(&id).cloned())
+        .expect("transcript view exists");
+    let bands = |vcx: &mut gpui::VisualTestContext| -> Vec<(usize, f32)> {
+        tv.update(vcx, |t, _| t.token_hits.borrow().clone())
+            .iter()
+            .map(|t| (t.line_idx, f32::from(t.bounds.top())))
+            .collect()
+    };
+
+    let before = bands(vcx);
+    // Non-vacuity: the block really did paint per-line bands to compare.
+    assert!(
+        before.iter().filter(|(l, _)| *l < 4).count() >= 4,
+        "the code block painted no per-line bands to compare; got {before:?}"
+    );
+    let line1 = tv
+        .update(vcx, |t, _| t.token_hits.borrow().clone())
+        .into_iter()
+        .find(|t| t.line_idx == 1)
+        .expect("band for the first code line");
+    let inside = point(
+        line1.bounds.left() + px(1.0),
+        line1.bounds.top() + (line1.bounds.bottom() - line1.bounds.top()) / 2.0,
+    );
+
+    // The REAL press the mouse dispatches to, landing INSIDE the block.
+    tv.update(vcx, |t, cx| {
+        t.transcript_mouse_down(
+            &gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position: inside,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            },
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let after = bands(vcx);
+
+    let tops = |v: &[(usize, f32)]| -> Vec<(usize, f32)> {
+        v.iter().filter(|(l, _)| *l < 4).cloned().collect()
+    };
+    assert_eq!(
+        tops(&before),
+        tops(&after),
+        "the code block MOVED under the pointer when clicked (bug-0015)"
+    );
+
+    // And the drag that follows still selects across lines (the user-visible point).
+    let l2 = tv
+        .update(vcx, |t, _| t.token_hits.borrow().clone())
+        .into_iter()
+        .find(|t| t.line_idx == 2)
+        .expect("band for the second code line");
+    let end = point(
+        l2.bounds.right() - px(1.0),
+        l2.bounds.top() + (l2.bounds.bottom() - l2.bounds.top()) / 2.0,
+    );
+    tv.update(vcx, |t, cx| {
+        t.transcript_mouse_move(
+            &gpui::MouseMoveEvent {
+                position: end,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            },
+            cx,
+        );
+        t.transcript_mouse_up(
+            &gpui::MouseUpEvent {
+                button: MouseButton::Left,
+                position: end,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            },
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let clip = view
+        .update(vcx, |_, cx| cx.read_from_clipboard())
+        .and_then(|it| it.text())
+        .unwrap_or_default();
+    assert!(
+        clip.contains("let a = 1;") && clip.contains("let b = 2;"),
+        "a drag across both code lines copies both; got {clip:?}"
+    );
+    // The freeze is released once the gesture ends.
+    let protect = session.read_with(vcx, |s, _| s.state.drag_protect_line);
+    assert_eq!(protect, None, "the drag protection must clear on mouse-up");
 }

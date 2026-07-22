@@ -94,6 +94,19 @@ drags. Items not yet in an order list sort after the listed ones, keeping their
 default position. Only roster-backed sessions (stable sid) drag; local mid-create
 placeholders don't.
 
+4. **A row NEVER moves except by a user drag.** Nothing else — an async roster
+   refresh, a `SessionCreated`/`SessionDeleted` broadcast, a reconnect, or a
+   `/clear` — may change a session's slot. `/clear` is the load-bearing case: it
+   kills the server session and creates a new one with a NEW sid, so the row is
+   the *same session* to the user but a different key to the order list. Its
+   continuity is carried by an explicit **order succession**
+   (`jump_order_succession`: placeholder `SessionId` → predecessor sid): the
+   mid-open placeholder ranks by `AgentRow::order_sid` = the predecessor's sid,
+   and at bind time `inherit_order_slot` substitutes the fresh sid for the
+   predecessor's IN PLACE in `jump_session_order`. Any future
+   "kill and re-create the same session" flow must record a succession the same
+   way, or the row will sink to the bottom of its group (bug-0007).
+
 **Applies to.** `jump_panel_view.rs` (`SessionDrag`/`CwdDrag` payloads,
 `JumpDragPreview`, `group_agent_rows_by_cwd` + `order_grouped_rows` +
 `reorder_move`, `reorder_cwd_group`/`reorder_session`, and the `on_drag` /
@@ -118,3 +131,7 @@ negative-control default), `jump_reorder_move_semantics` (list surgery), and
 `jump_reorder_methods_reorder_and_gate_by_cwd` (drives the REAL
 `reorder_cwd_group` / `reorder_session` the drop handlers call: headers reorder,
 sessions reorder within group, cross-cwd refused).
+Clause 4 (slot stability across `/clear`) is pinned by
+`clear_keeps_the_sessions_jump_panel_slot`, which drives the REAL
+`clear_agent_session` + the REAL async `Created` resolution and asserts the slot
+both mid-open and post-bind (negative controls observed RED on each arm).

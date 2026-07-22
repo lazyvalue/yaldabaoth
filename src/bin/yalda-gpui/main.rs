@@ -1620,6 +1620,15 @@ struct YaldaGpuiView {
     /// (jump-reorder; `Preferences::jump_session_order`). Ordered server sids;
     /// empty = by-label. A session never crosses cwd groups (drop is cwd-gated).
     jump_session_order: Vec<String>,
+    /// Jump-panel **order succession**: a placeholder session that is the
+    /// continuation of a killed one (today: `/clear`, which closes the server
+    /// session and creates a fresh one) maps to its PREDECESSOR's sid, so it
+    /// keeps the predecessor's slot in `jump_session_order` — before it binds
+    /// (via `AgentRow::order_sid`) and after (the sid is substituted in place in
+    /// `jump_session_order` at bind time). Without this a cleared session's new
+    /// sid is unranked and drops to the bottom of its cwd group — bug-0007's
+    /// recurrence. Entries are consumed at bind and dropped on close.
+    jump_order_succession: HashMap<SessionId, String>,
     /// Pinned session recaps (recap-panel), keyed by the session they summarize —
     /// one per session, so a recap is SPECIFIC to its agent tile (UXI-AgentTile-15). An
     /// entry appears when summoned (`recap-session`), is re-runnable and dismissed
@@ -1676,6 +1685,7 @@ impl YaldaGpuiView {
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
+            jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
         }
     }
@@ -1717,6 +1727,7 @@ impl YaldaGpuiView {
             jump_panel_visible: true,
             jump_cwd_order: Vec::new(),
             jump_session_order: Vec::new(),
+            jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
         }
     }

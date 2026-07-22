@@ -708,7 +708,10 @@ impl YaldaGpuiView {
         // Wire boundary: `sid` arrives as a raw string from the open/attach
         // resolution; type it for the store bind.
         match self.sessions.bind_sid(id, ServerSid::new(sid)) {
-            Ok(()) => BindOutcome::Bound,
+            Ok(()) => {
+                self.inherit_order_slot(id, sid);
+                BindOutcome::Bound
+            }
             Err(AlreadyBound(owner)) => {
                 eprintln!(
                     "[yalda-gpui] sid {} already owned by another session; \
@@ -723,6 +726,39 @@ impl YaldaGpuiView {
                 BindOutcome::Focused(owner)
             }
         }
+    }
+
+    /// Record that placeholder session `new_id` CONTINUES the killed session
+    /// whose server sid was `predecessor` (today: `/clear`). Until it binds, the
+    /// jump panel ranks its row by the predecessor's sid, so the row never
+    /// leaves its slot (bug-0007). No-op when the dead session had no sid (it
+    /// was never in the user's order to begin with).
+    pub(crate) fn record_order_succession(&mut self, new_id: SessionId, predecessor: Option<String>) {
+        if let Some(sid) = predecessor {
+            self.jump_order_succession.insert(new_id, sid);
+        }
+    }
+
+    /// Consume a pending order succession at bind time: substitute the new `sid`
+    /// for its predecessor IN PLACE in `jump_session_order`, so the user's
+    /// drag-order keeps ranking the row exactly where it was (bug-0007). Only
+    /// touches prefs when the predecessor was actually ranked.
+    fn inherit_order_slot(&mut self, id: SessionId, sid: &str) {
+        let Some(old) = self.jump_order_succession.remove(&id) else {
+            return;
+        };
+        if old == sid {
+            return;
+        }
+        let Some(pos) = self.jump_session_order.iter().position(|s| *s == old) else {
+            return;
+        };
+        // Drop any pre-existing entry for the new sid first so the list stays a
+        // set; then take the predecessor's exact index.
+        self.jump_session_order[pos] = sid.to_string();
+        let mut seen = std::collections::HashSet::new();
+        self.jump_session_order.retain(|s| seen.insert(s.clone()));
+        self.save_settings();
     }
 
     /// Resolve an AlreadyBound conflict: the sid we tried to bind is already
@@ -3048,7 +3084,11 @@ impl YaldaGpuiView {
 
         // KILL the old session (clear discards the conversation): close it on
         // the server, drop it from the store, unbind the tile.
-        if let Some(sid) = self.sessions.sid_of(id).map(|s| s.to_string()) {
+        // Remember the dying sid: the replacement session inherits its slot in
+        // the jump panel's user order (bug-0007 — otherwise the new sid is
+        // unranked and the row drops to the bottom of its cwd group).
+        let predecessor_sid = self.sessions.sid_of(id).map(|s| s.to_string());
+        if let Some(sid) = predecessor_sid.clone() {
             self.spawn_close_session(sid, cx);
         }
         self.transcript_views.remove(&id);
@@ -3073,7 +3113,7 @@ impl YaldaGpuiView {
             let mut state =
                 AgentState::new_server_managed(Some("connecting to session server…".into()));
             state.settle_input_focus();
-            self.show_local_session(
+            let new_id = self.show_local_session(
                 AgentSession {
                     state,
                     label: label.clone(),
@@ -3082,6 +3122,7 @@ impl YaldaGpuiView {
                 },
                 cx,
             );
+            self.record_order_succession(new_id, predecessor_sid.clone());
             if let Some(tile) = self.agent_tile_mut() {
                 tile.set_pending(Some(open_token));
             }
@@ -3101,6 +3142,7 @@ impl YaldaGpuiView {
                 },
                 cx,
             );
+            self.record_order_succession(new_id, predecessor_sid.clone());
             self.start_session_pump(new_id, cx);
         }
 

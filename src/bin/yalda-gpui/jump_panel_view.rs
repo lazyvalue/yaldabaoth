@@ -57,6 +57,13 @@ pub(crate) struct AgentRow {
     /// here), so the phase is unknown and the dot stays neutral. Drives the
     /// status-dot color in `render_jump_panel`.
     pub(crate) awaiting: Option<bool>,
+    /// The sid this row occupies in the user's drag order (`jump_session_order`).
+    /// For a roster row that is its own sid. For a local-only placeholder it is
+    /// its PREDECESSOR's sid when the placeholder continues a killed session
+    /// (`jump_order_succession`, e.g. `/clear`) — so the row holds its slot
+    /// through the whole close→create→bind window instead of falling to the
+    /// bottom (bug-0007). `None` = genuinely new, unranked, sorts after.
+    pub(crate) order_sid: Option<String>,
 }
 
 /// Drag payload for a session row being reordered (jump-reorder). Carries the
@@ -166,6 +173,7 @@ impl YaldaGpuiView {
                 bound,
                 connected: info.connected,
                 awaiting,
+                order_sid: Some(info.session_id.clone()),
             });
         }
 
@@ -184,6 +192,14 @@ impl YaldaGpuiView {
                 bound: self.agent_tile_id_bound_to(id).is_some(),
                 connected: true,
                 awaiting: Some(ent.read(cx).state.turn_phase.is_awaiting()),
+                // Its own sid when it has one (bound but the roster hasn't listed
+                // it yet), else — for a `/clear` placeholder — the killed
+                // session's sid, whose order slot it inherits.
+                order_sid: self
+                    .sessions
+                    .sid_of(id)
+                    .map(|s| s.as_str().to_string())
+                    .or_else(|| self.jump_order_succession.get(&id).cloned()),
             });
         }
         // Order the COMBINED list (roster + local-only) by label, so a session sits
@@ -244,12 +260,14 @@ pub(crate) fn order_grouped_rows(
 ) -> Vec<(String, Vec<(usize, AgentRow)>)> {
     let cwd_rank =
         |key: &str| cwd_order.iter().position(|k| k.as_str() == key).unwrap_or(usize::MAX);
+    // Rank by the row's ORDER sid, not its target: a `/clear` placeholder carries
+    // its predecessor's sid (`order_sid`) and so keeps that slot across the
+    // close→create→bind window (bug-0007).
     let sess_rank = |row: &AgentRow| {
-        match &row.target {
-            JumpTarget::Roster(sid) => session_order.iter().position(|s| s.as_str() == sid),
-            JumpTarget::Local(_) => None,
-        }
-        .unwrap_or(usize::MAX)
+        row.order_sid
+            .as_ref()
+            .and_then(|sid| session_order.iter().position(|s| s == sid))
+            .unwrap_or(usize::MAX)
     };
     for (_key, group) in groups.iter_mut() {
         group.sort_by_key(|(_, row)| sess_rank(row));
