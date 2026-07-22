@@ -68,6 +68,13 @@ pub enum RenderedBlock {
         alt: String,
         url: String,
     },
+    /// A document's leading frontmatter (`---` … `---`, or `+++` … `+++`), one
+    /// `StyledLine` per source line. Structurally distinct from a paragraph so
+    /// renderers can de-emphasize it: it is metadata ABOUT the document, not the
+    /// document's own prose, and it must never read as the title (bug-0014).
+    Metadata {
+        lines: Vec<StyledLine>,
+    },
 }
 
 impl StyledSpan {

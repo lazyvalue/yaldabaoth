@@ -184,6 +184,34 @@ impl<'a, 't> Renderer<'a, 't> {
                     blocks.push(RenderedBlock::HorizontalRule);
                     i += 1;
                 }
+                // Frontmatter (bug-0014). The parser hands us the raw block text;
+                // keep it line-by-line — the setext-heading misparse this replaces
+                // collapsed the newlines into one run-on line.
+                Event::Start(Tag::MetadataBlock(_)) => {
+                    i += 1;
+                    let mut raw = String::new();
+                    while i < events.len() {
+                        match &events[i] {
+                            Event::Text(t) => {
+                                raw.push_str(t.as_ref());
+                                i += 1;
+                            }
+                            Event::End(TagEnd::MetadataBlock(_)) => {
+                                i += 1;
+                                break;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    let lines: Vec<StyledLine> = raw
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .map(StyledLine::plain)
+                        .collect();
+                    if !lines.is_empty() {
+                        blocks.push(RenderedBlock::Metadata { lines });
+                    }
+                }
                 Event::Start(Tag::Image {
                     dest_url, title, ..
                 }) => {
@@ -513,5 +541,54 @@ fn heading_level_to_u8(level: pulldown_cmark::HeadingLevel) -> u8 {
         pulldown_cmark::HeadingLevel::H4 => 4,
         pulldown_cmark::HeadingLevel::H5 => 5,
         pulldown_cmark::HeadingLevel::H6 => 6,
+    }
+}
+
+#[cfg(test)]
+mod frontmatter_tests {
+    use super::*;
+
+    /// bug-0014: a document opening with YAML frontmatter must NOT render that
+    /// frontmatter as a giant setext heading. Without
+    /// `ENABLE_YAML_STYLE_METADATA_BLOCKS`, CommonMark reads the closing `---` as a
+    /// setext underline and promotes the whole metadata paragraph to an `<h2>` —
+    /// the screenshot symptom (`name: docs description: … tools: Read, Edit, …`
+    /// rendered enormous and run together).
+    ///
+    /// Negative control: drop the option from `parse::parse` → the first block is
+    /// `HorizontalRule` and the second is `Heading { level: 2 }`, failing both
+    /// asserts.
+    #[test]
+    fn yaml_frontmatter_is_metadata_not_a_heading() {
+        let md = "---\nname: docs\ndescription: Editorial documentation agent\ntools: Read, Edit\n---\n\n# Real Title\n\nBody text.\n";
+        let blocks = render(md, &Theme::default());
+
+        assert!(
+            matches!(blocks.first(), Some(RenderedBlock::Metadata { .. })),
+            "frontmatter renders as its own metadata block; got {:?}",
+            blocks.first()
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| matches!(b, RenderedBlock::Heading { level: 2, content }
+                    if content.text_content().contains("name: docs"))),
+            "frontmatter must never be promoted to a heading; got {blocks:?}"
+        );
+        // The document's REAL heading survives and is the dominant one.
+        assert!(
+            blocks.iter().any(|b| matches!(b, RenderedBlock::Heading { level: 1, content }
+                if content.text_content() == "Real Title")),
+            "the document's own H1 still renders; got {blocks:?}"
+        );
+        // The line breaks the setext-paragraph collapse ate are preserved.
+        let Some(RenderedBlock::Metadata { lines }) = blocks.first() else {
+            unreachable!()
+        };
+        assert_eq!(
+            lines.len(),
+            3,
+            "one styled line per frontmatter source line; got {lines:?}"
+        );
     }
 }

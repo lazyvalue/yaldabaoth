@@ -1493,6 +1493,28 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                 .child(format!("[image: {} <{}>]", alt, url))
                 .into_any_element()
         }
+        // Frontmatter (bug-0014): metadata ABOUT the document, so it reads
+        // de-emphasized — dimmed, monospace, one row per source line, behind a
+        // left rule — and never at heading scale. Before the metadata-block
+        // extension this whole thing rendered as a giant setext `<h2>`.
+        RenderedBlock::Metadata { lines } => {
+            let s = ctx.theme.paragraph;
+            let mut col = div()
+                .flex()
+                .flex_col()
+                .pl_2()
+                .my_1()
+                .border_l_2()
+                .border_color(rgb(0x6272a4))
+                .text_color(fg_or(s, 0x6272a4))
+                .opacity(0.7)
+                .font_family(ctx.code_font.clone())
+                .text_size(px(12.0 * ctx.text_scale));
+            for line in lines.iter() {
+                col = col.child(line.text_content());
+            }
+            col.into_any_element()
+        }
     }
 }
 
@@ -1875,7 +1897,10 @@ pub(crate) fn expand_wiki_links_in_block(block: &mut RenderedBlock, theme: &Them
                 }
             }
         }
-        RenderedBlock::HorizontalRule | RenderedBlock::Image { .. } => {}
+        // Frontmatter is metadata, not prose: no wiki-link expansion (bug-0014).
+        RenderedBlock::HorizontalRule
+        | RenderedBlock::Image { .. }
+        | RenderedBlock::Metadata { .. } => {}
     }
 }
 
@@ -1899,6 +1924,8 @@ pub(crate) fn block_contains_link(block: &RenderedBlock) -> bool {
                 || rows.iter().any(|row| row.iter().any(line_has_link))
         }
         RenderedBlock::HorizontalRule => false,
+        // Frontmatter carries no expanded links (bug-0014).
+        RenderedBlock::Metadata { .. } => false,
         // An image is itself a navigable target (it carries a URL).
         RenderedBlock::Image { .. } => true,
     }
