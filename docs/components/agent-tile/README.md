@@ -52,7 +52,7 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-5 | transcript | No empty turn header | implemented |
 | UXI-AgentTile-6 | transcript | Focusing a subagent swaps the main agent view to its context | implemented |
 | UXI-AgentTile-7 | transcript | A moved transcript fingerprint is ALWAYS rendered (no stale tail) | implemented |
-| UXI-AgentTile-8 | transcript | A tool call never splits an agent text token | implemented |
+| UXI-AgentTile-8 | transcript | A tool call never splits an agent sentence | implemented |
 | UXI-AgentTile-9 | compose | The agent compose always word-wraps | implemented |
 | UXI-AgentTile-10 | compose | Worksheet renders inline-flush; chatbox renders as a pinned box | implemented |
 | UXI-AgentTile-11 | compose | The worksheet is an inline-editable conversation buffer | partial |

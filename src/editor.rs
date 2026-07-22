@@ -1388,6 +1388,11 @@ impl Default for EditorView {
 // Editor (thin wrapper preserving the old surface — 1:1 view per buffer)
 // =============================================================================
 
+/// Closing markup that may trail a sentence terminator (`*…done.*`, `("…here.")`)
+/// — stripped before the terminator test in [`Editor::continuation_rejoin_point`]
+/// so marked-up prose isn't mistaken for an unfinished sentence.
+const SENTENCE_CLOSERS: &str = "*_`~)]}\"'»”’";
+
 impl Editor {
     pub fn new(text: String, file_path: PathBuf) -> Self {
         Self {
@@ -1615,18 +1620,19 @@ impl Editor {
             return;
         }
         let eof = self.core.document().rope().len_chars();
-        // Mid-token tool interruption (interspersed-tool-group bug for AGENT
+        // Mid-SENTENCE tool interruption (interspersed-tool-group bug for AGENT
         // text): if this turn's tail line is still OPEN and a tool call spliced
-        // itself INSIDE a token — the open line's last content char and this
-        // chunk's first char are both non-whitespace — the continuation must
-        // rejoin the open run's end-of-content rather than land on a fresh line
-        // below the tool (where `find_llm_insertion_point` sends it once the
-        // tool closed the line with a '\n'). Otherwise the token is cut in half,
-        // e.g. `mode=max` rendering as "`m" | ToolSearch | "ode=max". A break at
-        // a whitespace/sentence boundary is a LEGITIMATE interleave and is left
-        // alone. Overrides `natural` only in the straddled-token case.
+        // itself into a sentence the model had not finished, the continuation
+        // must rejoin the open run's end-of-content rather than land on a fresh
+        // line below the tool (where `find_llm_insertion_point` sends it once
+        // the tool closed the line with a '\n'). Otherwise the prose is
+        // guillotined — a token cut in half (`mode=max` → "`m" | ToolSearch |
+        // "ode=max") or a clause cut at a space ("…the fix for" | Bash | " it on
+        // my side…", bug-0013). A break AFTER a finished sentence is a
+        // LEGITIMATE interleave and is left alone. Overrides `natural` only in
+        // the unfinished-sentence case.
         let natural = self
-            .midtoken_rejoin_point::<T>(&turn_tag, chunk)
+            .continuation_rejoin_point::<T>(&turn_tag, chunk)
             .unwrap_or_else(|| self.find_llm_insertion_point::<T>(&turn_tag));
         let insertion_char = if floor_char >= eof || natural < floor_char {
             // No draft below the insertion point, or `natural` already lands in
@@ -1763,24 +1769,41 @@ impl Editor {
     }
 
     /// End-of-content char of this turn's OPEN tail line when an incoming
-    /// `chunk` would fuse a WORD across a tool interruption — otherwise `None`.
+    /// `chunk` continues a sentence the model had not finished — otherwise
+    /// `None`.
     ///
-    /// The guard is deliberately narrow: the tail must come from the LIVE cache
-    /// and still be OPEN (`cached_llm_open` — the model has not ended the run),
-    /// AND the join must be mid-word: the open line's last content char and the
-    /// chunk's first char are both **alphanumeric**. That is exactly the streamed
-    /// artifact where a tool call landed between two halves of one word
-    /// (`mode=max` → "`m" | tool | "ode=max"). Any other boundary — whitespace,
-    /// or sentence/word-terminating punctuation like the '.' ending "here." — is
-    /// a legitimate `text → tool → text` interleave and returns `None`, so the
-    /// tool stays between the two statements (UXI-AgentTile-8). Alphanumeric-only is
-    /// conservative on purpose: it fixes the word-cut-in-half case (what reads
-    /// worst) without guessing at ambiguous punctuation splits (a filename like
-    /// "gate.sh" broken on '.' is left to interleave rather than mis-fused).
-    /// `line_len_chars` already excludes the trailing '\n', so this is the
-    /// content end whether or not the tool closed the line with a synthetic
-    /// newline.
-    fn midtoken_rejoin_point<T: Any + Send + Sync + PartialEq>(
+    /// The question is asked of the PRE-tool text alone: **did the model finish a
+    /// sentence before the tool arrived?** If not, the split is a streaming
+    /// artifact (a `ReplyEvent` tool notification delivered between two text
+    /// deltas of one content block) and the continuation rejoins. If it did, the
+    /// break is a legitimate `text → tool → text` interleave and the tool stays
+    /// between the two statements (UXI-AgentTile-8).
+    ///
+    /// Gates, in order:
+    ///
+    /// 1. The tail must come from the LIVE cache and still be OPEN
+    ///    (`cached_llm_open` — the model has not ended the run) and carry this
+    ///    turn's tag.
+    /// 2. A chunk that STARTS with a newline is the model ending the line
+    ///    itself — a real block break, left to interleave.
+    /// 3. The open line's content, trailing whitespace trimmed (so a chunk that
+    ///    ended `". "` still reads as terminated — this is what keeps
+    ///    `floored_tools_and_text_stay_in_order_above_draft` honest) and closing
+    ///    markup stripped (so `*…done.*` reads as terminated too), must not end
+    ///    on `.!?:`.
+    ///
+    /// This supersedes the original mid-WORD rule (`dbe67be`), which required
+    /// the open line's last char AND the chunk's first char to both be
+    /// alphanumeric: that covered `mode=max` → "`m" | tool | "ode=max" but left
+    /// every continuation starting with a space or punctuation split
+    /// ("…the fix for" | Bash | " it on my side…", and a stranded lone "." line —
+    /// bug-0013). The rule here is strictly wider: an alphanumeric last char is
+    /// never one of `.!?:`, so everything the old rule rejoined still rejoins.
+    ///
+    /// `line_len_chars` already excludes the trailing '\n', so the returned
+    /// offset is the content end whether or not the tool closed the line with a
+    /// synthetic newline.
+    fn continuation_rejoin_point<T: Any + Send + Sync + PartialEq>(
         &self,
         turn_tag: &T,
         chunk: &str,
@@ -1793,16 +1816,23 @@ impl Editor {
             .core
             .cached_llm_line()
             .filter(|&l| l < doc.line_count() && self.line_tagged_this_turn::<T>(l, turn_tag))?;
-        let chunk_head = chunk.chars().next()?;
-        if !chunk_head.is_alphanumeric() {
+        // Gate 2: the model ended the line itself.
+        if matches!(chunk.chars().next()?, '\n' | '\r') {
             return None;
         }
         let content_len = doc.line_len_chars(line);
         if content_len == 0 {
             return None;
         }
-        let last_char = doc.line_text(line).chars().nth(content_len - 1)?;
-        if !last_char.is_alphanumeric() {
+        // Gate 3: did the pre-tool text finish a sentence?
+        let content: String = doc.line_text(line).chars().take(content_len).collect();
+        let trimmed = content.trim_end();
+        let last = trimmed
+            .trim_end_matches(|c: char| SENTENCE_CLOSERS.contains(c))
+            .chars()
+            .last()
+            .or_else(|| trimmed.chars().last())?;
+        if matches!(last, '.' | '!' | '?' | ':') {
             return None;
         }
         Some(doc.line_col_to_char(line, content_len))

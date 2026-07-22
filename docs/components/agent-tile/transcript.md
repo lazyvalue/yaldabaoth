@@ -161,24 +161,31 @@ Negative control (observed RED): revert the embed to the fingerprint-independent
 `cached_child(transcript_view)` and the count stays flat — the stale-tail bug
 reproduced.
 
-### UXI-AgentTile-8 — A tool call never splits an agent text token
+### UXI-AgentTile-8 — A tool call never splits an agent sentence
 
-**Statement.** A tool-call row interleaved into an agent turn's streamed prose
-must break the prose only at a **word / sentence boundary**, never inside a word.
-Concretely: when a tool call arrives while the turn's tail line is still OPEN (the
-last streamed chunk did not end the run) and the interruption falls mid-word — the
-open line's last content char AND the next chunk's first char are both
-**alphanumeric** — the continuation **rejoins** the open run's end-of-content, and
-the tool group renders AFTER the completed text. Any other boundary (whitespace,
-or sentence/word-terminating punctuation like the '.' ending "here.") is a
-legitimate `text → tool → text` interleave and is left in place (tool between the
-two statements). This makes the reconstructed transcript read as the model wrote
-it: `` `mode=max` `` is never rendered as `` `m `` | ToolSearch | `ode=max`. The
-alphanumeric-only rule is conservative on purpose — it fixes the word-cut-in-half
-case (what reads worst) without guessing at ambiguous punctuation splits.
+**Statement.** A tool-call row interleaved into an agent turn's streamed prose may
+break it only at a **sentence boundary** — never inside a word, and never mid-clause.
+The test is asked of the PRE-tool text alone: when a tool call arrives while the
+turn's tail line is still OPEN (the last streamed chunk did not end the run) and that
+line does **not** end a sentence — its content, trailing whitespace trimmed and
+closing markup (`` *_`~)]}"'»”’ ``) stripped, does not end on `.!?:` — the
+continuation **rejoins** the open run's end-of-content and the tool group renders
+AFTER the completed text. A break after a finished sentence, or a continuation that
+itself starts with a newline, is a legitimate `text → tool → text` interleave and is
+left in place (tool between the two statements). So the reconstructed transcript
+reads as the model wrote it: `` `mode=max` `` is never `` `m `` | ToolSearch |
+`ode=max`, and `…the fix for` is never cut from ` it on my side…`.
+
+**History.** The original rule (`dbe67be`) required the open line's last char AND the
+chunk's first char to both be **alphanumeric** — mid-*word* only, conservative to
+avoid mis-fusing ambiguous punctuation. That left every continuation starting with a
+space or punctuation split (bug-0013, including a stranded lone `.` line). The rule
+above supersedes it and is a strict superset: an alphanumeric last char is never one
+of `.!?:`.
 
 **Applies to.** `editor.rs` — `Editor::append_llm_chunk_floored` +
-`midtoken_rejoin_point` (the mid-token detector) vs `find_llm_insertion_point`
+`continuation_rejoin_point` (the unfinished-sentence detector, and
+`SENTENCE_CLOSERS`) vs `find_llm_insertion_point`
 (the whitespace-boundary interleave, whose `ends_with('\n')` → different-turn →
 EOF branch is the splitter this guards). Driven from the agent reducer
 (`agent_ui.rs` `apply_reply_events`, the `Chunk` / `ToolCallStarted` arms).
@@ -201,4 +208,10 @@ reducer produces, fully observable without paint).
 renders after the reassembled line; negative control: the buffer becomes
 `` `m\n\node=max ``). `tests.rs`:
 `floored_tools_and_text_stay_in_order_above_draft` pins the complementary
-whitespace-boundary case (chunks ending `". "` stay interleaved with their tools).
+sentence-boundary case (chunks ending `". "` stay interleaved with their tools — the
+trailing-whitespace trim is what keeps this true). AND
+`verify_harness.rs::tool_call_midsentence_does_not_split_agent_sentence` (bug-0013)
+— the same real reducer seam with the two NON-alphanumeric breaks: a continuation
+starting with a SPACE, and one that is a bare `.`. Asserts the sentence is contiguous
+and that no line is left holding only the terminator. Negative control: restore the
+two `is_alphanumeric()` gates → it fails RED while the mid-word test stays green.
