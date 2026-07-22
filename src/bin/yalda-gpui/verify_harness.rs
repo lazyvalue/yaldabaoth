@@ -5722,14 +5722,15 @@ fn free_agent_session_no_server_is_graceful_noop(cx: &mut TestAppContext) {
     });
 }
 
-/// UXI-JumpPanel-3: the SAME create-free action is reachable from the `?` global
-/// menu ("new agent session"), not only the jump-panel row. Drives the REAL menu
-/// path: the entry is present in `global_menu()`, and `dispatch_menu_command`
-/// (the exact call a menu key-selection makes) routes its action id to
-/// `spawn_free_agent_session` — proven by the no-server graceful-noop contract.
+/// UXI-JumpPanel-3 + -4: the SAME create-free action is reachable from the `?`
+/// global menu ("new agent session"), not only the jump-panel row. Drives the REAL
+/// menu path: the entry is present in `global_menu()`, and `dispatch_menu_command`
+/// (the exact call a menu key-selection makes) OPENS the cwd picker overlay
+/// (UXI-JumpPanel-4 — the create flow now asks for a cwd first) targeting
+/// `FreeAgentSessionCwd`.
 ///
 /// Negative controls: drop the `global_menu()` entry → the presence assert fails;
-/// rewire the `"new-free-agent-session"` match arm → the dispatched note vanishes.
+/// rewire the `"new-free-agent-session"` match arm → no overlay opens.
 #[gpui::test]
 fn global_menu_offers_and_dispatches_free_agent_session(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx); // hermetic → session_server is None
@@ -5746,15 +5747,70 @@ fn global_menu_offers_and_dispatches_free_agent_session(cx: &mut TestAppContext)
     });
 
     // Selecting it runs `dispatch_menu_command` with that id — the same call the
-    // key press makes — which reaches `spawn_free_agent_session`.
+    // key press makes — which OPENS the cwd overlay (create flow), spawning
+    // nothing yet.
     view.update(vcx, |v, cx| {
         assert!(v.sessions.is_empty(), "precondition: no sessions");
         v.dispatch_menu_command("new-free-agent-session", cx);
     });
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
-        // No daemon here, so the reached method takes its no-server branch — the
-        // observable proof the ? menu's action id routes to the free-session spawn.
+        assert!(
+            matches!(
+                v.rename_ref().map(|o| o.target),
+                Some(crate::RenameTarget::FreeAgentSessionCwd)
+            ),
+            "the ? menu action opens the free-agent cwd picker"
+        );
+        assert!(v.sessions.is_empty(), "opening the picker creates no session");
+    });
+}
+
+/// UXI-JumpPanel-4: the free-agent create flow opens a cwd path-input overlay
+/// pre-filled with the default cwd (`agent_base_cwd()`), so Enter accepts the
+/// default. Drives the REAL `open_free_agent_session_cwd_overlay`.
+///
+/// Negative control: change the prefill (`text = agent_base_cwd().display()`) to
+/// something else and the default-match assert fails.
+#[gpui::test]
+fn free_agent_cwd_overlay_opens_prefilled_with_default(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    view.update(vcx, |v, cx| v.open_free_agent_session_cwd_overlay(cx));
+    view.update(vcx, |v, _| {
+        let o = v.rename_ref().expect("cwd overlay is open");
+        assert!(
+            matches!(o.target, crate::RenameTarget::FreeAgentSessionCwd),
+            "targets the free-agent cwd variant"
+        );
+        assert_eq!(
+            o.text,
+            v.agent_base_cwd().display().to_string(),
+            "pre-filled with the default cwd so Enter accepts it"
+        );
+    });
+}
+
+/// UXI-JumpPanel-4: committing the cwd overlay ROUTES on the typed path — a valid
+/// path closes the overlay and reaches `spawn_free_agent_session_at` (proven by
+/// its no-server note, since there's no daemon here); an invalid path surfaces an
+/// error and creates nothing. Drives the REAL `commit_rename_overlay`.
+///
+/// Negative control: point the `FreeAgentSessionCwd` commit arm at a no-op → the
+/// valid-path note never appears; drop the `Err(msg)` arm → the invalid path
+/// silently succeeds.
+#[gpui::test]
+fn free_agent_cwd_overlay_commit_routes_or_errors(cx: &mut TestAppContext) {
+    // Valid path → routes to the spawn (no-server note is the observable proof).
+    let (view, vcx) = boot_browser(cx);
+    let valid = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    view.update(vcx, |v, cx| {
+        v.open_free_agent_session_cwd_overlay(cx);
+        v.rename_mut().expect("overlay open").text = valid.display().to_string();
+        v.commit_rename_overlay(cx);
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert!(!v.overlay_is_rename(), "a valid commit closes the overlay");
         let note = v
             .transient_status
             .as_ref()
@@ -5762,9 +5818,38 @@ fn global_menu_offers_and_dispatches_free_agent_session(cx: &mut TestAppContext)
             .unwrap_or_default();
         assert!(
             note.contains("no session server"),
-            "the ? menu action reached spawn_free_agent_session, got: {note:?}"
+            "a valid path reached spawn_free_agent_session_at, got: {note:?}"
         );
-        assert!(v.sessions.is_empty(), "no phantom session created");
+        assert!(v.sessions.is_empty(), "no daemon ⇒ no phantom session");
+    });
+
+    // Invalid path → error surfaced, nothing spawned. Reuse the same view; clear
+    // the prior note so a stale "no session server" can't mask the routing check.
+    view.update(vcx, |v, cx| {
+        v.transient_status = None;
+        v.open_free_agent_session_cwd_overlay(cx);
+        // A path that isn't a real directory fails `resolve_agent_cwd_arg`.
+        v.rename_mut().expect("overlay open").text =
+            "/definitely/not/a/real/dir/xyzzy".to_string();
+        v.commit_rename_overlay(cx);
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert!(!v.overlay_is_rename(), "the commit closes the overlay either way");
+        let note = v
+            .transient_status
+            .as_ref()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(
+            !note.contains("no session server"),
+            "an invalid path must NOT reach the spawn, got: {note:?}"
+        );
+        assert!(
+            note.contains("not a directory"),
+            "the invalid path surfaces the resolve error, got: {note:?}"
+        );
+        assert!(v.sessions.is_empty(), "invalid path creates nothing");
     });
 }
 

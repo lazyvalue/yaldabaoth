@@ -19,9 +19,10 @@ O(workspaces + sessions)), not cached. Primary code home:
 - **Agent sessions** — a **＋ New agent session** create-affordance
   (`UXI-JumpPanel-3`) followed by the universal roster (every server session) ∪
   local-only mid-create sessions (`jump_panel_agent_rows`).
-  - **＋ New agent session** → `spawn_free_agent_session`: creates a session bound
-    to no tile and no workspace; it appears in the rows below as a new unbound
-    (○) row, never auto-bound.
+  - **＋ New agent session** → asks for a cwd (UXI-JumpPanel-4) then
+    `spawn_free_agent_session_at`: creates a session bound to no tile and no
+    workspace; it appears in the rows below as a new unbound (○) row, never
+    auto-bound.
   - **Dot shape** = binding: `●` in-use / `○` free.
   - **Dot color** = per-session status light (INV-UX-10): **working** (reply in
     flight) = warm accent, **waiting for you** (turn finished) = green,
@@ -188,6 +189,66 @@ as an unbound `○` row through the real `jump_panel_agent_rows`, then `jump_to_
 binds it). The `?`-menu entry point is pinned by
 `global_menu_offers_and_dispatches_free_agent_session` (the entry is present in the
 REAL `global_menu()` and `dispatch_menu_command("new-free-agent-session")` — the
-call a menu selection makes — routes to `spawn_free_agent_session`; NC observed
-RED by dropping the entry). The daemon round-trip and the row's paint are the named
-runtime gaps.
+call a menu selection makes — opens the create flow; NC observed RED by dropping
+the entry). The daemon round-trip and the row's paint are the named runtime gaps.
+
+_Note: as of UXI-JumpPanel-4 both entry points open a cwd overlay first; the create
+(`spawn_free_agent_session_at`) runs on the overlay's commit, not on the click/key._
+
+### UXI-JumpPanel-4 — Creating a free agent session lets you choose its CWD
+
+**Statement.** Both free-session entry points (the jump-panel **＋ New agent
+session** row and the `?` menu "new agent session") do NOT spawn immediately.
+They first open a **path-input overlay** ("NEW AGENT SESSION AT…") pre-filled
+with the default cwd (`agent_base_cwd()` — the active workspace's cwd, else the
+process cwd):
+
+1. **Enter accepts the default** — one keystroke keeps the old zero-friction
+   behavior (create at the sensible default).
+2. **Typing/editing a path** roots the new free session there. On commit the path
+   is resolved and validated by `resolve_agent_cwd_arg` (tilde expansion,
+   canonicalize, `.`/`..` collapse — spec-agent-cwd.md §2), then
+   `spawn_free_agent_session_at(resolved)` creates the session at that cwd.
+3. **An invalid path** surfaces a transient status error and creates **nothing**
+   — the overlay closes, no session is spawned.
+4. **An empty input cancels** (the shared `RenameOverlay` "all-whitespace acts
+   like Esc" rule), so hammering Enter on a cleared field never mis-creates.
+
+This is the same overlay machinery as `AgentNewSessionCwd` / `WorkspaceCwd` /
+`AgentChangeCwd`; the free-session create just gains its own
+`RenameTarget::FreeAgentSessionCwd`. The tile-bound "new session at…" flow
+(`AgentNewSessionCwd` → `new_agent_session`) is untouched.
+
+**Applies to.** `main.rs`: `RenameTarget::FreeAgentSessionCwd`,
+`open_free_agent_session_cwd_overlay` (prefill), the `FreeAgentSessionCwd` arm of
+`commit_rename_overlay` (resolve → spawn / error), the overlay header text, and
+the `"new-free-agent-session"` dispatch (now opens the overlay); `jump_panel_view.rs`
+`render_jump_panel` (the ＋ row → `open_free_agent_session_cwd_overlay`);
+`agent_ui.rs` `spawn_free_agent_session_at` (cwd-parameterized core) +
+`spawn_free_agent_session` (default-cwd wrapper).
+
+**Why.** A free agent is "outside a workspace," so it has no workspace cwd to
+inherit — the user must be able to say where it runs (which repo/dir the agent's
+tools operate in). Without this, every free session silently rooted at the active
+workspace's dir, which is often the wrong project for an ad-hoc agent.
+
+**Status.** `implemented`.
+
+**Deviation from plan.** None material. The `?`-menu-opens-overlay assertion was
+folded into the existing `global_menu_offers_and_dispatches_free_agent_session`
+(retargeted to assert the overlay now opens) rather than a separate
+`free_agent_entry_points_open_cwd_overlay` test. `spawn_free_agent_session`'s
+no-server note now includes the chosen cwd (`… at <cwd>…`), which is what makes the
+commit-routing test observable headlessly.
+
+**Enforcement.** `verify_harness.rs`:
+`free_agent_cwd_overlay_opens_prefilled_with_default` (the real
+`open_free_agent_session_cwd_overlay` sets a `Rename` overlay targeting
+`FreeAgentSessionCwd`, text = `agent_base_cwd()`; NC: change the prefill),
+`global_menu_offers_and_dispatches_free_agent_session` (the `?`-menu dispatch opens
+the overlay; NC: no-op the dispatch arm), and
+`free_agent_cwd_overlay_commit_routes_or_errors` (drives the REAL
+`commit_rename_overlay`: a valid path closes the overlay and routes to the spawn —
+proven by the no-server note; an invalid path surfaces `"not a directory"` and
+spawns nothing; NC: no-op both commit arms). The session actually created AT the
+typed cwd needs the daemon (harness gap #2).

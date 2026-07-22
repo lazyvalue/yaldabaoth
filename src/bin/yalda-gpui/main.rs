@@ -1273,6 +1273,12 @@ enum RenameTarget {
     /// rooted at the typed path. Empty input cancels (spec-agent-cwd.md
     /// §2 — bare `:claude-new` already exists and uses the process cwd).
     AgentNewSessionCwd,
+    /// Path-input overlay that, on commit, creates a new FREE (tile-less)
+    /// agent session rooted at the typed path (UXI-JumpPanel-4). A free
+    /// agent has no workspace cwd to inherit, so the create flow asks. Pre-
+    /// filled with `agent_base_cwd()`; empty cancels; commit →
+    /// `spawn_free_agent_session_at`.
+    FreeAgentSessionCwd,
     /// Path-input overlay that, on commit, changes the bound session's
     /// cwd (spec-agent-cwd.md §4). Targeted by stable `SessionId`.
     AgentChangeCwd { id: SessionId },
@@ -4757,10 +4763,11 @@ impl YaldaGpuiView {
                 }
             }
             "new-free-agent-session" => {
-                // Global (`?`) menu: spawn an agent session bound to NO tile and
-                // NO workspace. It lands in the universal roster and shows up in
-                // the jump panel as an unbound, bindable row.
-                self.spawn_free_agent_session(cx);
+                // Global (`?`) menu: create an agent session bound to NO tile and
+                // NO workspace. It first asks for the cwd (UXI-JumpPanel-4) — a
+                // free agent has none to inherit — then spawns; the session lands
+                // in the universal roster as an unbound, bindable row.
+                self.open_free_agent_session_cwd_overlay(cx);
             }
             "new-linear-tile" => {
                 // Split a new tile (focus lands on it), then swap it for a
@@ -5418,6 +5425,24 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// Open a path-input overlay pre-filled with the default cwd
+    /// (`agent_base_cwd()`); on commit, spawn a FREE (tile-less) agent session
+    /// rooted at the typed path (UXI-JumpPanel-4). This is the create flow for the
+    /// jump-panel ＋ row and the `?`-menu "new agent session" — a free agent has no
+    /// workspace cwd to inherit, so it asks. Pre-filling the default means Enter
+    /// keeps the old zero-friction "create at the sensible default" behavior.
+    pub(crate) fn open_free_agent_session_cwd_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.overlay_is_rename() {
+            return;
+        }
+        let text = self.agent_base_cwd().display().to_string();
+        self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
+            text,
+            target: RenameTarget::FreeAgentSessionCwd,
+        }));
+        cx.notify();
+    }
+
     /// Open a path-input overlay pre-filled with the active slot's
     /// current cwd; on commit, respawn the slot at the new path
     /// (spec-agent-cwd.md §4).
@@ -5538,6 +5563,22 @@ impl YaldaGpuiView {
                         if let Some(mut c) = self.agent_mut(cx) {
                             c.status = Some(msg.into());
                         }
+                        cx.notify();
+                    }
+                }
+            }
+            RenameTarget::FreeAgentSessionCwd => {
+                // Resolve per spec-agent-cwd.md §2; on success spawn a FREE
+                // (tile-less) session at that cwd (UXI-JumpPanel-4). A bad path
+                // surfaces a transient error and creates nothing.
+                match resolve_agent_cwd_arg(&new_label) {
+                    Ok(resolved) => {
+                        self.close_rename_overlay();
+                        self.spawn_free_agent_session_at(resolved, cx);
+                    }
+                    Err(msg) => {
+                        self.close_rename_overlay();
+                        self.transient_status = Some(msg.into());
                         cx.notify();
                     }
                 }
@@ -6281,6 +6322,7 @@ impl YaldaGpuiView {
             RenameTarget::AgentSession { .. } => "RENAME SESSION",
             RenameTarget::Tab { .. } => "RENAME WORKSPACE",
             RenameTarget::AgentNewSessionCwd => "NEW SESSION AT…",
+            RenameTarget::FreeAgentSessionCwd => "NEW AGENT SESSION AT…",
             RenameTarget::AgentChangeCwd { .. } => "CHANGE SESSION CWD",
             RenameTarget::WorkspaceCwd { .. } => "SET WORKSPACE CWD",
             RenameTarget::DesktopTileSize => "DESKTOP GRID (COLSxROWS OF TILES)",

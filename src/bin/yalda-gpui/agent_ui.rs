@@ -1179,17 +1179,34 @@ impl YaldaGpuiView {
     /// tile selector). It is server-only: with no session server there is no
     /// roster to host a free session, so this no-ops with a status note.
     pub(crate) fn spawn_free_agent_session(&mut self, cx: &mut Context<Self>) {
+        // Default entry: root the free session at the shared default cwd (the
+        // active workspace's, else the process cwd). The cwd-choosing entry
+        // points (UXI-JumpPanel-4) call `spawn_free_agent_session_at` directly.
+        let cwd = self.agent_base_cwd();
+        self.spawn_free_agent_session_at(cwd, cx);
+    }
+
+    /// As `spawn_free_agent_session`, but roots the new free session at an
+    /// explicit `cwd` (UXI-JumpPanel-4). The cwd-input overlay's commit calls this
+    /// with the resolved path so a free agent — which has no workspace cwd to
+    /// inherit — runs where the user chose.
+    pub(crate) fn spawn_free_agent_session_at(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
         let Some(handle) = self.session_server.as_ref().map(|s| s.handle()) else {
             self.transient_status =
                 Some("no session server — free agent sessions need one".into());
             cx.notify();
             return;
         };
-        // Reuse the same label allocator and cwd resolution as the tile-bound
-        // create paths so a free session is named/rooted identically.
+        // Reuse the same label allocator as the tile-bound create paths so a free
+        // session is named identically; the cwd is the caller's choice.
         let label = self.next_agent_label(cx);
-        let cwd = self.agent_base_cwd();
-        self.transient_status = Some(format!("creating free agent session {label}…").into());
+        self.transient_status = Some(
+            format!(
+                "creating free agent session {label} at {}…",
+                shorten_cwd_for_display(&cwd)
+            )
+            .into(),
+        );
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result: Result<String, String> = cx

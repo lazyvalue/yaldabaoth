@@ -13,6 +13,19 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Free agent session: choose its CWD at create** — `NEEDS-RUNTIME` (built
+  2026-07-22 via `/new-ux`; `UXI-JumpPanel-4`). "When creating a new agent session
+  outside of a workspace, need a way to specify what CWD." Both free-session entry
+  points (jump-panel ＋ row, `?`-menu "new agent session") now open a path-input
+  overlay ("NEW AGENT SESSION AT…") pre-filled with `agent_base_cwd()` (the active
+  workspace's cwd, else process cwd) — Enter accepts the default, or type/edit a
+  path. Commit resolves via `resolve_agent_cwd_arg` (tilde/canonicalize/validate);
+  a bad path surfaces a transient error and creates nothing; a good path routes to
+  `spawn_free_agent_session_at(cwd)`. Reuses the existing `RenameOverlay` machinery
+  (new `RenameTarget::FreeAgentSessionCwd`). Guards: overlay opens pre-filled, both
+  entry points open it, commit routes valid→spawn / invalid→error. The session
+  actually created AT that cwd needs the daemon (harness gap #2).
+
 - **Create a free (tile-less) agent session from the jump panel** — `NEEDS-RUNTIME`
   (built 2026-07-22 via `/new-ux`; `UXI-JumpPanel-3`). "I want to create new agents
   that aren't attached to a tile in a workspace." Capability already existed
