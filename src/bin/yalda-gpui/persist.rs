@@ -9,11 +9,24 @@ use super::*;
 /// next to `debug.log` so all yalda-managed transient state stays in one
 /// place.
 pub(crate) fn acp_session_persist_path() -> Option<PathBuf> {
+    // Fail safe in test builds — NEVER touch the user's real
+    // `~/.yalda/acp_sessions.json` (bug-0016: this is where renamed-session
+    // LABELS live, so a test that clobbered it wiped the user's custom names,
+    // which reverted to `claude-N` on the next launch). `save_agent_ring`
+    // fires from `/clear`, restore, rename, and ~every session mutation, so any
+    // test that boots the real view and triggers one would otherwise overwrite
+    // it. Round-trip tests opt in via `with_acp_persist_path`; every other test
+    // gets `None` → save/load is a no-op. Mirrors `workspace_persist_path` /
+    // `preferences_path`, which already had this guard — this fn was the one
+    // that was missed (it fell through to `yalda_home()` under `cfg(test)`).
     #[cfg(test)]
-    if let Some(p) = ACP_PERSIST_PATH_OVERRIDE.with(|c| c.borrow().clone()) {
-        return Some(p);
+    {
+        return ACP_PERSIST_PATH_OVERRIDE.with(|c| c.borrow().clone());
     }
-    yalda::paths::yalda_home().map(|d| d.join("acp_sessions.json"))
+    #[cfg(not(test))]
+    {
+        yalda::paths::yalda_home().map(|d| d.join("acp_sessions.json"))
+    }
 }
 
 /// Test-only seam: redirect the ACP-session persistence file to a tempdir so a

@@ -11008,6 +11008,192 @@ fn save_agent_ring_persists_session_id_to_workspace_json(cx: &mut TestAppContext
     );
 }
 
+/// bug-0016 (session names lost after exit): the LOAD-BEARING guard. A test that
+/// boots the real view and triggers ANY session save (/clear, restore, rename,
+/// `save_agent_ring`) must NEVER write to the user's real
+/// `~/.yalda/acp_sessions.json` — that file holds the renamed-session LABELS, so
+/// clobbering it reverts the user's custom names to `claude-N` on the next
+/// launch. `acp_session_persist_path()` must therefore be `None` under
+/// `cfg(test)` unless a test explicitly opts into a tempdir via
+/// `with_acp_persist_path` (mirroring `workspace_persist_path` /
+/// `preferences_path`, which already had this guard — this fn was the one that
+/// fell through to the real home).
+///
+/// Negative control (observed RED): restore the `yalda_home()` fall-through in
+/// `acp_session_persist_path` under `cfg(test)` ⇒ the no-override assert returns
+/// `Some(~/.yalda/acp_sessions.json)` and fails.
+#[test]
+fn acp_persist_path_never_hits_real_home_in_tests() {
+    use crate::persist::{acp_session_persist_path, with_acp_persist_path};
+    // With no override set, the path MUST be None — a save is a silent no-op and
+    // the real file is untouched. This is the anti-clobber guarantee.
+    assert_eq!(
+        acp_session_persist_path(),
+        None,
+        "acp_session_persist_path must be None in tests without an override — \
+         otherwise every view-booting test overwrites the user's real \
+         ~/.yalda/acp_sessions.json and wipes their renamed-session labels (bug-0016)"
+    );
+    // And it must still be redirectable for round-trip tests that opt in.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let want = dir.path().join("acp_sessions.json");
+    let got = with_acp_persist_path(want.clone(), acp_session_persist_path);
+    assert_eq!(got, Some(want), "with_acp_persist_path must redirect the path");
+    // The override is scoped: it clears again after the closure.
+    assert_eq!(
+        acp_session_persist_path(),
+        None,
+        "the override must not leak past the closure"
+    );
+}
+
+/// Unit (bug-0016): `is_auto_claude_label` recognizes exactly the auto-generated
+/// names (`claude`, `claude-<n>`) and nothing a user would type as a real name.
+/// This gate decides when the server WAL's label may be adopted, so getting it
+/// wrong either fails to recover a lost name or clobbers a real one.
+#[test]
+fn is_auto_claude_label_matches_only_generated_names() {
+    use crate::agent_ui::is_auto_claude_label;
+    for auto in ["claude", "claude-1", "claude-2", "claude-10", "claude-999", "  claude-3  "] {
+        assert!(is_auto_claude_label(auto), "{auto:?} should be auto");
+    }
+    for custom in ["", "my agent", "claude-", "claude-x", "claude-2b", "reviewer", "Claude-1", "the-claude-1"] {
+        assert!(!is_auto_claude_label(custom), "{custom:?} should NOT be auto");
+    }
+}
+
+/// bug-0016, RECOVERY on the REAL view: the server roster (WAL-backed) is
+/// authoritative for a session's label. An OPENED session that came back with an
+/// auto `claude-N` name (its custom name lost to a clobbered `acp_sessions.json`)
+/// adopts the roster's real name; a session that already carries a real custom
+/// name is LEFT ALONE (never overridden by a momentarily-stale roster). Drives
+/// the real `recover_labels_from_roster` against a seeded roster + store.
+///
+/// Negative control (observed RED): drop the `is_auto_claude_label` gate (adopt
+/// unconditionally) → the "keep custom" assert fails as the real name is
+/// clobbered; OR skip the update entirely → the "recover" assert fails.
+#[gpui::test]
+fn opened_session_recovers_lost_label_from_roster(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState};
+    use yalda::session_proto::SessionInfo;
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    let info = |sid: &str, label: &str| SessionInfo {
+        session_id: sid.into(),
+        acp_session_id: None,
+        label: label.into(),
+        cwd: std::path::PathBuf::from("/proj/x"),
+        turns: 0,
+        connected: true,
+        permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
+    };
+
+    let (lost_id, kept_id) = view.update(vcx, |v, cx| {
+        // The server WAL remembers the real names.
+        v.agent_roster.upsert(info("S-lost", "deploy pipeline"));
+        v.agent_roster.upsert(info("S-kept", "stale-old-name"));
+        // Two opened sessions: one carrying an auto name (its custom name was
+        // clobbered), one carrying a real custom name the user just set locally.
+        let lost = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(None),
+                label: "claude-5".into(),
+                cwd: std::path::PathBuf::from("/proj/x"),
+                resume_id: None,
+            },
+            cx,
+        );
+        v.sessions.bind_sid(lost, "S-lost".into()).unwrap();
+        let kept = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(None),
+                label: "my careful name".into(),
+                cwd: std::path::PathBuf::from("/proj/x"),
+                resume_id: None,
+            },
+            cx,
+        );
+        v.sessions.bind_sid(kept, "S-kept".into()).unwrap();
+        (lost, kept)
+    });
+
+    let changed = view.update(vcx, |v, cx| v.recover_labels_from_roster(cx));
+    assert!(changed, "a lost label was available to recover");
+
+    let label_of = |v: &crate::YaldaGpuiView, cx: &gpui::App, id| {
+        v.session_entity(id).map(|e| e.read(cx).label.clone())
+    };
+    let lost_label = view.update(vcx, |v, cx| label_of(v, cx, lost_id));
+    let kept_label = view.update(vcx, |v, cx| label_of(v, cx, kept_id));
+    assert_eq!(
+        lost_label.as_deref(),
+        Some("deploy pipeline"),
+        "an auto claude-N label must be recovered from the server WAL roster"
+    );
+    assert_eq!(
+        kept_label.as_deref(),
+        Some("my careful name"),
+        "a real custom local label must NEVER be overridden by the roster"
+    );
+
+    // Idempotent: a second pass changes nothing.
+    let again = view.update(vcx, |v, cx| v.recover_labels_from_roster(cx));
+    assert!(!again, "recovery is idempotent once labels match");
+}
+
+/// bug-0016, the behavior the guard protects: a custom (renamed) session label
+/// round-trips through the REAL save + load path unchanged — it is NOT renumbered
+/// to `claude-N`. Proves the persistence logic itself is correct, so the ONLY way
+/// the user's names got lost was the real file being clobbered (fixed by the
+/// path guard above). Uses `with_acp_persist_path` so THIS test writes to a
+/// tempdir, never `~/.yalda`.
+#[test]
+fn renamed_session_label_round_trips_unchanged() {
+    use crate::persist::{
+        SessionSnapshot, load_persisted_acp_sessions, save_persisted_acp_sessions,
+        with_acp_persist_path,
+    };
+    use crate::InputModeKind;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("acp_sessions.json");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let snaps = vec![
+        SessionSnapshot {
+            id: "sid-alpha".into(),
+            label: "my important agent".into(),
+            active: true,
+            mode: InputModeKind::Worksheet,
+            tasklist_open: false,
+            subagents_open: false,
+            sidepanel_hidden: false,
+            cwd: cwd.clone(),
+            compose_draft: None,
+        },
+        SessionSnapshot {
+            id: "sid-beta".into(),
+            label: "reviewer".into(),
+            active: false,
+            mode: InputModeKind::Worksheet,
+            tasklist_open: false,
+            subagents_open: false,
+            sidepanel_hidden: false,
+            cwd: cwd.clone(),
+            compose_draft: None,
+        },
+    ];
+    let loaded = with_acp_persist_path(file.clone(), || {
+        save_persisted_acp_sessions(&cwd, &snaps);
+        load_persisted_acp_sessions(&cwd)
+    });
+    let labels: Vec<String> = loaded.iter().map(|s| s.label.clone()).collect();
+    assert_eq!(
+        labels,
+        vec!["my important agent".to_string(), "reviewer".to_string()],
+        "custom labels must survive save→load verbatim, never revert to claude-N"
+    );
+}
+
 /// UXI-Workspace-9 (click-to-focus): a LEFT press in the BODY of an unfocused
 /// Full-detail tile focuses that tile, and the press is CONSUMED — the tile's
 /// content never sees it. Drives the REAL mouse dispatch (`simulate_mouse_down`

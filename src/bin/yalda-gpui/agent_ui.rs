@@ -131,14 +131,66 @@ impl YaldaGpuiView {
                 .spawn(async move { handle.list_sessions().map_err(|e| e.to_string()) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if let Ok(sessions) = result
-                    && this.agent_roster.replace_all(sessions)
-                {
-                    cx.notify();
+                if let Ok(sessions) = result {
+                    let changed = this.agent_roster.replace_all(sessions);
+                    // bug-0016: the server WAL is authoritative for a session's
+                    // LABEL (renames are persisted there). If a locally-opened
+                    // session is carrying an AUTO-generated name (`claude-N` or
+                    // empty) — e.g. its custom name was lost because a stale
+                    // `acp_sessions.json` fed restore a placeholder label —
+                    // adopt the roster's (WAL-backed) name. Gated to auto names
+                    // so a real custom name set here is NEVER overridden by a
+                    // momentarily-stale roster.
+                    let recovered = this.recover_labels_from_roster(cx);
+                    if changed || recovered {
+                        cx.notify();
+                    }
                 }
             });
         })
         .detach();
+    }
+
+    /// Adopt the server roster's (WAL-backed) label for any OPENED session whose
+    /// local label is auto-generated (`claude-N`) or empty — recovering a custom
+    /// name that was lost to a clobbered `acp_sessions.json` (bug-0016). Returns
+    /// whether any label changed. Never touches a session that already carries a
+    /// real custom name (that name is the local truth until the user renames).
+    pub(crate) fn recover_labels_from_roster(&mut self, cx: &mut Context<Self>) -> bool {
+        // Snapshot (SessionId, roster_label) for sessions that both exist locally
+        // and are known to the roster, WITHOUT holding a borrow across the update.
+        let mut updates: Vec<(SessionId, String)> = Vec::new();
+        for (id, ent) in self.sessions.iter() {
+            let Some(sid) = self.sessions.sid_of(id) else {
+                continue;
+            };
+            let Some(info) = self.agent_roster.get(sid.as_str()) else {
+                continue;
+            };
+            let roster_label = info.label.clone();
+            if roster_label.trim().is_empty() {
+                continue;
+            }
+            let local = ent.read(cx).label.clone();
+            if local != roster_label && (local.trim().is_empty() || is_auto_claude_label(&local)) {
+                updates.push((id, roster_label));
+            }
+        }
+        if updates.is_empty() {
+            return false;
+        }
+        for (id, label) in &updates {
+            if let Some(ent) = self.session_entity(*id) {
+                ent.update(cx, |session, scx| {
+                    session.label = label.clone();
+                    scx.notify();
+                });
+            }
+        }
+        // Persist the recovered names so the next launch reads them from
+        // `acp_sessions.json` directly (belt-and-suspenders alongside the WAL).
+        self.save_agent_ring(cx);
+        true
     }
 
     /// Project the universal roster (universal-agent-list) into a tile
@@ -5101,6 +5153,22 @@ impl YaldaGpuiView {
             );
         }
         cx.notify();
+    }
+}
+
+/// Whether `label` is an AUTO-generated session name — `claude-<n>` for a
+/// positive integer `n`, matching `next_agent_label` / `unique_label`. Used to
+/// decide when the server roster's (WAL-backed) name may be adopted over the
+/// local one without ever clobbering a real custom name (bug-0016). Bare
+/// `claude` (no number) counts as auto too — it's the legacy default.
+pub(crate) fn is_auto_claude_label(label: &str) -> bool {
+    let l = label.trim();
+    if l == "claude" {
+        return true;
+    }
+    match l.strip_prefix("claude-") {
+        Some(n) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
     }
 }
 
