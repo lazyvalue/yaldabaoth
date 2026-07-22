@@ -109,6 +109,58 @@ seeds a frozen fenced code block with a trailing editable blank, records the
 block's four painted band tops, drives the REAL `transcript_mouse_down` inside
 the block, and asserts the band tops are IDENTICAL after — then drags to the
 second code line and asserts the clipboard holds BOTH lines. Non-vacuous (asserts
-≥4 per-line bands painted first). **Negative control (observed RED):** revert
-`protect_line` to the bare `cursor().line` ⇒ the bands shift +25px and the
+the block painted its CONTENT-line bands first — since bug-0017 that is the two
+`let …` lines, not the fence-inclusive four). **Negative control (observed RED):**
+revert `protect_line` to the bare `cursor().line` ⇒ the bands shift +25px and the
 equality assert fires.
+
+### UXI-Selection-3 — Selecting inside a parsed code block is aligned and visible
+
+**Statement.** A mouse drag inside a fenced **code block** in the agent transcript
+MUST (a) hit-test to the raw source line under the pointer — the hit band for each
+rendered code line is that line's OWN painted bounds — and (b) paint the selection
+**highlight** on the selected span, exactly like prose. Selecting code is not
+"model-only": the user sees the highlight and the copied text matches it.
+
+**Why this is load-bearing (bug-0017; the third face of "can't select code",
+after bug-0008 and bug-0015).** A code block renders as a single `FlatItem::Block`,
+not per-line `FlatItem::Line`s, so it bypassed BOTH prose selection mechanisms:
+
+- **No highlight was ever painted.** The block's `RenderCtx` was built with
+  `doc_selection: None`, and nothing else draws a selection background inside a
+  block. The editor selection + copy-on-release worked, so every headless
+  band/clipboard probe passed — while the user saw *nothing move* and reported
+  "cannot select." (This is why bug-0008's hit bands and bug-0015's reflow freeze
+  never changed the experience: both fixed invisible layers.)
+- **The hit bands were misaligned.** They were an EVEN split of the block's full
+  outer height over its raw line range — but that range is **fence-inclusive**
+  while the block paints only the *content* lines plus a `p_2` pad and an optional
+  `[lang]` header. So bands drifted off the glyphs and a click landed a line away.
+
+**Mechanism of the guarantee.** `RenderCtx::block_hits` (`BlockHits { sink,
+raw_base, selection, sel_bg }`) is set only for a transcript code block (`raw_base
+= range.start + 1`, skipping the opening fence). `doc_styled_line_element` then, per
+content line: registers a `TokenHit` from the line's **own painted bounds** into the
+`token_hits` sink (correct alignment, immune to padding/header), and applies the
+selection background to the run range covering the raw-line selection
+(`line_selection_range`). The even-split `register_block_hits_on_paint` path is
+retained only for tables. A companion correctness fix pairs `FlatItem::Block`s
+against **parsed-only** ranges (`resolved_blocks` filtered), so a detected-but-
+unparsed range above a code block can't shift its `raw_base`.
+
+**Bounds.** Tables (the other `FlatItem::Block`) still use the even-split band path
+and paint no in-cell highlight yet — not reported, tracked as follow-up. Nested code
+blocks inside a blockquote/list (`block_hits: None` in the recursion) are also out
+of scope.
+
+**Status.** `implemented` — headless on the REAL paint path.
+
+**Enforcement.** `verify_harness.rs::code_block_selection_is_painted_and_aligned`:
+freezes a fenced ```` ```rust ```` block **with a language header**, asserts the hit
+bands cover the CONTENT lines and NOT the ``` fence lines, then drives the REAL
+`transcript_mouse_down`/`_move` across two code lines and asserts (via the paint tap
+`DocRenderTap.block_selection`) that the selection highlight PAINTED on those lines,
+and that release copies the code. **Two negative controls, each observed RED:** (a)
+`block_hits: None` at the block arm ⇒ the fence lines reappear in the bands; (b)
+disable `apply_selection_bg_to_runs` ⇒ the highlight tap is empty ("no selection
+highlight was painted").

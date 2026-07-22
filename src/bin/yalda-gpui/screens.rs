@@ -100,6 +100,9 @@ impl YaldaGpuiView {
                 block_count: blocks_rc.len(),
                 // Doc view never shows raw markdown markers — agent chat only.
                 show_heading_markers: false,
+                // Doc view uses `doc_selection`/`line_layouts`, not the
+                // transcript code-block hit path.
+                block_hits: None,
             };
             block_element(&ctx, idx, block)
         };

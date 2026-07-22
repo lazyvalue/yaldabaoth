@@ -257,11 +257,21 @@ pub(crate) fn doc_styled_line_element(
     code_font: &SharedString,
     line_idx: usize,
 ) -> AnyElement {
-    // Reuse the plain element when this ctx isn't set up for doc-view selection.
-    let (block_idx, sink) = match (ctx.current_block, ctx.line_layouts.as_ref()) {
-        (Some(b), Some(s)) => (b, s.clone()),
-        _ => return styled_line_element(line, base_style, base_fg, body_font, code_font, None),
-    };
+    // Two selection-capable paths share this builder:
+    //   - doc view: `current_block` + `line_layouts` set → paints selection via
+    //     `doc_selection` and registers a `TextLayout` for `doc_pos_at`.
+    //   - transcript code block (bug-0017): `block_hits` set → paints selection
+    //     via the raw-line `selection` and registers a REAL-bounds `TokenHit`.
+    // With neither, fall back to the plain, selection-less element.
+    let doc_ctx: Option<(usize, std::rc::Rc<RefCell<HashMap<(usize, usize), TextLayout>>>)> =
+        match (ctx.current_block, ctx.line_layouts.as_ref()) {
+            (Some(b), Some(s)) => Some((b, s.clone())),
+            _ => None,
+        };
+    let bh = ctx.block_hits.as_ref();
+    if doc_ctx.is_none() && bh.is_none() {
+        return styled_line_element(line, base_style, base_fg, body_font, code_font, None);
+    }
 
     // Build text + runs, identical to `styled_line_element`. We need the
     // intermediate form so we can patch background_color before sealing the
@@ -347,25 +357,67 @@ pub(crate) fn doc_styled_line_element(
     // Patch selection background on the runs that overlap the projected
     // char range. Convert char range → byte range against `text`, then
     // walk runs and split any that straddle a boundary.
-    if let Some(sel) = ctx.doc_selection {
+    if let Some((block_idx, _)) = &doc_ctx {
+        if let Some(sel) = ctx.doc_selection {
+            let line_chars = styled_line_char_count(line);
+            if let Some((s_char, e_char)) =
+                doc_selection_for_line(&sel, *block_idx, line_idx, line_chars)
+            {
+                let s_byte = char_offset_to_byte_offset(&text, s_char);
+                let e_byte = char_offset_to_byte_offset(&text, e_char);
+                #[cfg(test)]
+                DOC_RENDER_TAP.with(|t| {
+                    t.borrow_mut()
+                        .selection
+                        .push((*block_idx, line_idx, s_byte, e_byte))
+                });
+                runs = apply_selection_bg_to_runs(
+                    runs,
+                    s_byte,
+                    e_byte,
+                    ncolor_to_hsla(SELECTION_BG, BG),
+                );
+            }
+        }
+    } else if let Some(bh) = bh {
+        // Transcript code block (bug-0017): selection is keyed by RAW document
+        // line so the highlight lands on the glyphs, independent of the block's
+        // padding / `[lang]` header. `raw_base` already skips the opening fence.
+        let raw_line = bh.raw_base + line_idx;
         let line_chars = styled_line_char_count(line);
-        if let Some((s_char, e_char)) =
-            doc_selection_for_line(&sel, block_idx, line_idx, line_chars)
+        if let Some((s_char, e_char)) = bh
+            .selection
+            .and_then(|sel| line_selection_range(sel, raw_line, line_chars))
+            .filter(|(s, e)| e > s)
         {
             let s_byte = char_offset_to_byte_offset(&text, s_char);
             let e_byte = char_offset_to_byte_offset(&text, e_char);
             #[cfg(test)]
-            DOC_RENDER_TAP.with(|t| {
-                t.borrow_mut()
-                    .selection
-                    .push((block_idx, line_idx, s_byte, e_byte))
-            });
-            runs =
-                apply_selection_bg_to_runs(runs, s_byte, e_byte, ncolor_to_hsla(SELECTION_BG, BG));
+            DOC_RENDER_TAP
+                .with(|t| t.borrow_mut().block_selection.push((raw_line, s_char, e_char)));
+            runs = apply_selection_bg_to_runs(runs, s_byte, e_byte, bh.sel_bg);
         }
     }
 
     let styled = StyledText::new(text).with_runs(runs);
+
+    // Transcript code block: register a hit token from this line's OWN painted
+    // bounds (not an even split of the padded/headered outer block) so a click
+    // maps to the right raw line. Code content has no wiki links, so return here.
+    if let Some(bh) = bh {
+        let raw_line = bh.raw_base + line_idx;
+        let line_chars = styled_line_char_count(line);
+        return register_token_on_paint(
+            styled.into_any_element(),
+            bh.sink.clone(),
+            raw_line,
+            0,
+            line_chars,
+        );
+    }
+
+    let (block_idx, sink) =
+        doc_ctx.expect("doc_ctx is Some when block_hits is None (guarded above)");
     // Capture the line's TextLayout handle. It is registered into the hit-test
     // sink at PAINT time (via RegisterOnPaint), NOT here at build time: the
     // virtualized `gpui::list` builds/measures lines it never prepaints, and
@@ -520,6 +572,32 @@ pub(crate) struct RenderCtx<'a> {
     /// `false`. Nested ctxes propagate it so headings inside blockquotes/lists
     /// stay consistent.
     pub(crate) show_heading_markers: bool,
+    /// bug-0017: transcript-only. When set, the lines of a parsed code Block
+    /// self-register REAL painted bounds into the token-hit sink AND paint the
+    /// selection background — the two things a `FlatItem::Block` otherwise never
+    /// did (the even-split outer band was offset by the block's padding/`[lang]`
+    /// header + the fence-inclusive raw range, and NOTHING painted a highlight,
+    /// so code-block selection was invisible and grabbed the wrong lines). The
+    /// doc/edit views leave this `None` (they use `doc_selection`/`line_layouts`).
+    pub(crate) block_hits: Option<BlockHits>,
+}
+
+/// bug-0017: side channel that makes a transcript code Block's content lines
+/// selectable *and visible*. Content line `li` maps to raw document line
+/// `raw_base + li` (skipping the opening ``` fence), so the hit band and the
+/// selection highlight land on the real glyphs regardless of the block's
+/// padding / language header.
+#[derive(Clone)]
+pub(crate) struct BlockHits {
+    /// The transcript token-hit sink; each content line pushes one `TokenHit`
+    /// with its REAL painted bounds (not an even split of the outer block).
+    pub(crate) sink: std::rc::Rc<RefCell<Vec<TokenHit>>>,
+    /// Raw document line of this block's first rendered content line.
+    pub(crate) raw_base: usize,
+    /// Active transcript selection in raw `(line, col)` doc coords (focused only).
+    pub(crate) selection: Option<((usize, usize), (usize, usize))>,
+    /// Selection background color.
+    pub(crate) sel_bg: Hsla,
 }
 
 /// A transparent element wrapper that registers a doc line's `TextLayout` into
@@ -1222,6 +1300,8 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
         doc_dir: ctx.doc_dir.clone(),
         block_count: ctx.block_count,
         show_heading_markers: ctx.show_heading_markers,
+        // Nested/doc-view blocks don't use the transcript code-block hit path.
+        block_hits: None,
     };
     let base = block_inner(&inner_ctx, block);
 
@@ -1440,6 +1520,8 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
                         doc_dir: ctx.doc_dir.clone(),
                         block_count: 0,
                         show_heading_markers: ctx.show_heading_markers,
+                        // Nested blocks don't use the transcript code-block hit path.
+                        block_hits: None,
                     },
                     b,
                 ));
@@ -1551,6 +1633,8 @@ pub(crate) fn list_item_element(
                 doc_dir: ctx.doc_dir.clone(),
                 block_count: 0,
                 show_heading_markers: ctx.show_heading_markers,
+                // Nested blocks don't use the transcript code-block hit path.
+                block_hits: None,
             },
             b,
         ));

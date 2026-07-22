@@ -11803,9 +11803,11 @@ fn code_block_does_not_shift_when_clicked(cx: &mut TestAppContext) {
     };
 
     let before = bands(vcx);
-    // Non-vacuity: the block really did paint per-line bands to compare.
+    // Non-vacuity: the block really did paint per-line bands to compare. Since
+    // bug-0017 these are the CONTENT lines only (raw 1 & 2) from their real
+    // painted bounds — the ``` fence lines (0, 3) no longer register bands.
     assert!(
-        before.iter().filter(|(l, _)| *l < 4).count() >= 4,
+        before.iter().filter(|(l, _)| *l == 1 || *l == 2).count() >= 2,
         "the code block painted no per-line bands to compare; got {before:?}"
     );
     let line1 = tv
@@ -11884,4 +11886,141 @@ fn code_block_does_not_shift_when_clicked(cx: &mut TestAppContext) {
     // The freeze is released once the gesture ends.
     let protect = session.read_with(vcx, |s, _| s.state.drag_protect_line);
     assert_eq!(protect, None, "the drag protection must clear on mouse-up");
+}
+
+/// bug-0017 (`UXI-Selection-3`): selecting inside a multiline code block in the
+/// transcript must (a) register hit bands on the CONTENT lines' real painted
+/// bounds — NOT the fence-inclusive even-split that put bands on the ``` lines
+/// and offset them by the block's padding + `[lang]` header — and (b) actually
+/// PAINT the selection highlight (a `FlatItem::Block` used to paint no highlight
+/// at all: `doc_selection: None`, so the model selected + the clipboard copied
+/// while the user saw nothing → "cannot select in code blocks").
+///
+/// Drives the REAL `transcript_mouse_down/move/up` and asserts on the paint tap,
+/// not on model state.
+///
+/// Negative control: at the `FlatItem::Block` arm set `block_hits: None` (revert
+/// the fix) → code lines take the plain path → `block_selection` tap stays empty
+/// AND the fence lines (0 and 4) reappear in the hit bands → both asserts fire.
+#[gpui::test]
+fn code_block_selection_is_painted_and_aligned(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+    use std::collections::HashSet;
+    let (view, vcx, id, session) = boot_with_transcript(cx);
+
+    // A fenced code block WITH a language (so the `[rust]` header offset is
+    // present) + a trailing blank line for the caret. Raw lines:
+    //   0 ```rust   1 fn main() {   2 <indent>let x = 1;   3 }   4 ```   5 (blank)
+    // detect_block_ranges → range (0, 5); content lines 1..=3 (raw_base = 1).
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state
+            .editor
+            .programmatic_insert(0, "```rust\nfn main() {\n    let x = 1;\n}\n```\n");
+        s.state.editor.add_frozen_lines(0, 5);
+        s.state.editor.cursor_mut().line = 5;
+        s.state.editor.cursor_mut().col = 0;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+
+    let tv = view
+        .update(vcx, |v, _| v.transcript_views.get(&id).cloned())
+        .expect("transcript view exists");
+    let hits = |vcx: &mut gpui::VisualTestContext| {
+        tv.update(vcx, |t, _| t.token_hits.borrow().clone())
+    };
+
+    // (a) Hit bands land on the CONTENT lines from their own bounds — not on the
+    // fence lines, and not the 4-band fence-inclusive even-split.
+    let lines_hit: HashSet<usize> = hits(vcx).iter().map(|h| h.line_idx).collect();
+    assert!(
+        lines_hit.contains(&1) && lines_hit.contains(&2) && lines_hit.contains(&3),
+        "code content lines 1..=3 must register hit bands; got {lines_hit:?}"
+    );
+    assert!(
+        !lines_hit.contains(&0) && !lines_hit.contains(&4),
+        "the ``` fence lines (0, 4) must NOT register hit bands (fence-inclusive \
+         even-split bug); got {lines_hit:?}"
+    );
+
+    // Reset the paint tap, then drive a REAL drag from content line 1 → line 3.
+    YaldaGpuiView::test_reset_doc_render_tap();
+    let band = |vcx: &mut gpui::VisualTestContext, line: usize| {
+        hits(vcx)
+            .into_iter()
+            .find(|h| h.line_idx == line)
+            .unwrap_or_else(|| panic!("no hit band for code line {line}"))
+            .bounds
+    };
+    let b1 = band(vcx, 1);
+    let b3 = band(vcx, 3);
+    let mid_y = |b: gpui::Bounds<gpui::Pixels>| b.top() + (b.bottom() - b.top()) / 2.0;
+    // Press at the START of line 1, release at the END of line 3 → whole lines.
+    let start_pos = point(b1.left() + px(1.0), mid_y(b1));
+    let end_pos = point(b3.right() - px(1.0), mid_y(b3));
+    tv.update(vcx, |t, cx| {
+        t.transcript_mouse_down(
+            &gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position: start_pos,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            },
+            cx,
+        );
+        t.transcript_mouse_move(
+            &gpui::MouseMoveEvent {
+                position: end_pos,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            },
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    // (b) The selection highlight was actually PAINTED inside the block, on the
+    // content lines. This is the assert every prior fix lacked.
+    let tap = YaldaGpuiView::test_doc_render_tap();
+    let painted: HashSet<usize> = tap.block_selection.iter().map(|(l, _, _)| *l).collect();
+    assert!(
+        !tap.block_selection.is_empty(),
+        "no selection highlight was painted inside the code block (bug-0017)"
+    );
+    assert!(
+        painted.contains(&1) && painted.contains(&3),
+        "the selection highlight must cover the dragged content lines 1 and 3; \
+         painted {painted:?}"
+    );
+    // Non-vacuity: at least one painted range has real width (e_char > s_char).
+    assert!(
+        tap.block_selection.iter().any(|(_, s, e)| e > s),
+        "every painted selection range was empty; got {:?}",
+        tap.block_selection
+    );
+
+    // And the drag still copies the code text on release.
+    tv.update(vcx, |t, cx| {
+        t.transcript_mouse_up(
+            &gpui::MouseUpEvent {
+                button: MouseButton::Left,
+                position: end_pos,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            },
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    let clip = view
+        .update(vcx, |_, cx| cx.read_from_clipboard())
+        .and_then(|it| it.text())
+        .unwrap_or_default();
+    assert!(
+        clip.contains("fn main() {") && clip.contains("let x = 1;"),
+        "a drag across the code block copies its lines; got {clip:?}"
+    );
 }

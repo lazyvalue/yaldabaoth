@@ -6779,6 +6779,11 @@ pub(crate) struct DocRenderTap {
     pub painted: Vec<(usize, usize)>,
     /// `(block_idx, line_idx, byte_start, byte_end)` for lines given SELECTION_BG.
     pub selection: Vec<(usize, usize, usize, usize)>,
+    /// bug-0017: `(raw_line, char_start, char_end)` for parsed-BLOCK lines
+    /// (transcript code blocks) painted with the selection background. Distinct
+    /// from `selection` (doc-view, block-relative) because transcript blocks key
+    /// selection by RAW document line via `RenderCtx::block_hits`.
+    pub block_selection: Vec<(usize, usize, usize)>,
     /// The block that drew the left cursor bar, if any.
     pub cursor_bar_block: Option<usize>,
 }

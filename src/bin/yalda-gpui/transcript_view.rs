@@ -736,7 +736,18 @@ impl TranscriptView {
                 new_count,
                 edit_seq,
                 block_ranges_active,
-                block_ranges_snap: c.block_ranges.clone(),
+                // bug-0017: pair against PARSED-only ranges, in emit order. A
+                // `FlatItem::Block` is emitted only for a range that parsed
+                // (agent.rs); `c.block_ranges` also holds detected-but-unparsed
+                // ranges (rendered as Lines), so cloning it would shift every
+                // later block's hit range by one — wrong bands, wrong `raw_base`.
+                block_ranges_snap: c
+                    .view_model
+                    .resolved_blocks
+                    .iter()
+                    .filter(|(_, b)| b.is_some())
+                    .map(|(r, _)| *r)
+                    .collect(),
                 follow_tail,
                 pending_reveal_line,
                 you_block_snap,
@@ -1209,6 +1220,30 @@ impl TranscriptView {
                         block.into_any_element()
                     }
                     FlatItem::Block(rendered_block) => {
+                        let range = block_ranges_by_item.get(idx).copied().flatten();
+                        let is_table = matches!(**rendered_block, RenderedBlock::Table { .. });
+                        // bug-0017: a fenced code block (not a source-file view) uses the
+                        // per-line REAL-bounds hit path — each content line self-registers
+                        // a `TokenHit` from its own painted bounds AND paints the selection
+                        // highlight. This fixes both the even-split band misalignment (the
+                        // outer band was offset by the block's `p_2` padding + `[lang]`
+                        // header and split over the FENCE-INCLUSIVE raw range) and the
+                        // total absence of any painted highlight inside a `FlatItem::Block`.
+                        let code_block = matches!(
+                            **rendered_block,
+                            RenderedBlock::CodeBlock { source_file: false, .. }
+                        );
+                        let block_hits = match range {
+                            Some((s, e)) if e > s && code_block => Some(BlockHits {
+                                sink: token_sink_snap.clone(),
+                                // Skip the opening ``` fence: content line `li` → raw `s+1+li`.
+                                raw_base: s + 1,
+                                selection: sel_snap,
+                                sel_bg: nc(at_snap.selection_bg),
+                            }),
+                            _ => None,
+                        };
+                        let uses_line_hits = block_hits.is_some();
                         let ctx = RenderCtx {
                             theme: &theme_snap,
                             body_font: body_font_snap.clone(),
@@ -1224,17 +1259,21 @@ impl TranscriptView {
                             doc_dir: None,
                             block_count: 0,
                             show_heading_markers,
+                            block_hits,
                         };
-                        let is_table = matches!(**rendered_block, RenderedBlock::Table { .. });
                         let inner = block_inner(&ctx, rendered_block);
                         let el = div().mt(px(4.0)).mb(px(4.0)).child(inner).into_any_element();
+                        if uses_line_hits {
+                            // Code-block content lines already self-registered per-line
+                            // hit bands + selection inside `block_inner`.
+                            return el;
+                        }
                         // bug-0008: register hit-test bands so the mouse can select a
-                        // parsed block's content (tables / bullets / code) — otherwise
-                        // a block registers NO tokens and is unselectable. Tables get
-                        // PER-CELL bands (skip the non-rendered `---` separator row so
-                        // vertical bands align to painted rows); other blocks get one
-                        // full-width band per raw line.
-                        match block_ranges_by_item.get(idx).copied().flatten() {
+                        // parsed block's content (tables) — otherwise a block registers
+                        // NO tokens and is unselectable. Tables get PER-CELL bands (skip
+                        // the non-rendered `---` separator row so vertical bands align to
+                        // painted rows); other blocks get one full-width band per raw line.
+                        match range {
                             Some((s, e)) if e > s => {
                                 let rows: Vec<(usize, Vec<(usize, usize)>)> = if is_table {
                                     (s..e)
