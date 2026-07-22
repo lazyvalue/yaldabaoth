@@ -449,6 +449,25 @@ impl YaldaGpuiView {
 
         // ── Agent sessions ─────────────────────────────────────────────────—
         col = col.child(section_heading("Agent sessions", &st).px_3());
+        // A discoverable create-affordance for a FREE (tile-less) session
+        // (UXI-JumpPanel-3): clicking spawns a session bound to no tile/workspace
+        // via `spawn_free_agent_session`. It lands in the roster above as a new
+        // unbound (○) row — never auto-bound — bindable later by selecting it.
+        // Placed here, where free sessions surface, so creating one is a click
+        // away instead of buried in the `?` menu.
+        col = col.child(
+            jump_nav_row(
+                SharedString::from("jump-new-agent"),
+                "New agent session",
+                false,
+                false,
+                Some("＋"),
+                Some(st.accent),
+                &st,
+                sel_bg,
+            )
+            .on_click(cx.listener(|this, _ev, _window, cx| this.spawn_free_agent_session(cx))),
+        );
         if rows.is_empty() {
             col = col.child(
                 div()

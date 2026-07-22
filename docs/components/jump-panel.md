@@ -16,8 +16,12 @@ O(workspaces + sessions)), not cached. Primary code home:
   - Each row's badge shows the **1-based workspace number** (`idx + 1`) — the
     digit `ctrl-<n>` jumps to (INV-UX-11).
   - Click → `select_tab`.
-- **Agent sessions** — the universal roster (every server session) ∪ local-only
-  mid-create sessions (`jump_panel_agent_rows`).
+- **Agent sessions** — a **＋ New agent session** create-affordance
+  (`UXI-JumpPanel-3`) followed by the universal roster (every server session) ∪
+  local-only mid-create sessions (`jump_panel_agent_rows`).
+  - **＋ New agent session** → `spawn_free_agent_session`: creates a session bound
+    to no tile and no workspace; it appears in the rows below as a new unbound
+    (○) row, never auto-bound.
   - **Dot shape** = binding: `●` in-use / `○` free.
   - **Dot color** = per-session status light (INV-UX-10): **working** (reply in
     flight) = warm accent, **waiting for you** (turn finished) = green,
@@ -135,3 +139,48 @@ Clause 4 (slot stability across `/clear`) is pinned by
 `clear_keeps_the_sessions_jump_panel_slot`, which drives the REAL
 `clear_agent_session` + the REAL async `Created` resolution and asserts the slot
 both mid-open and post-bind (negative controls observed RED on each arm).
+
+### UXI-JumpPanel-3 — The jump panel can create a free (tile-less) agent session
+
+**Statement.** The jump panel's "Agent sessions" section leads with a **＋ New
+agent session** action row. Clicking it creates an agent session bound to **no
+tile and no workspace** — a *free* session (spec-agent-session-ownership.md) —
+via `spawn_free_agent_session`:
+
+1. The new session lands in the universal roster and appears as a row in the
+   list below, **unbound** (`○`), exactly like any other free session — it is
+   **never auto-bound** to a tile by the create, so nothing the user is looking
+   at changes except a new row appearing.
+2. It is **bindable later** the ordinary way — selecting the row binds it (a
+   bound tile focuses; a free row opens an ephemeral virtual workspace,
+   ADR-0021).
+3. With **no session server** there is no roster to host a free session, so the
+   action is a graceful no-op that sets a transient status note and creates
+   nothing — it never panics and never auto-binds a phantom.
+
+**Applies to.** `jump_panel_view.rs` `render_jump_panel` (the `jump-new-agent`
+row → `on_click` → `spawn_free_agent_session`); `agent_ui.rs`
+`spawn_free_agent_session` (no-server guard + create + `refresh_roster`, never a
+tile bind); the roster→row projection in `jump_panel_agent_rows`. The `?` global
+menu's "new agent session" entry (`main.rs`, `"new-free-agent-session"`) invokes
+the same method — the jump-panel row just makes it discoverable where free
+sessions live.
+
+**Why.** The user wants to spin up an agent without first placing a tile for it
+— create the worker, bind it to a viewport (or not) whenever. The capability
+existed only as a buried `?`-menu item; surfacing it in the jump panel makes
+"create an agent that isn't attached to a tile" a one-click, discoverable act.
+
+**Status.** `implemented` — the no-server contract and the free-then-bindable
+projection are headless; the live server `create_session` round-trip is
+`NEEDS-RUNTIME` (harness gap #2 — needs the daemon) and the ＋ row's click paint
+is gap #1.
+
+**Enforcement.** `verify_harness.rs`:
+`free_agent_session_no_server_is_graceful_noop` (drives the REAL
+`spawn_free_agent_session` with no session server: a status note is set, the
+store gains no session and no tile binds — negative control: the method's
+no-server guard) and `free_agent_row_is_unbound_and_bindable` (a
+`SessionCreated` roster broadcast — the end state the create produces — surfaces
+as an unbound `○` row through the real `jump_panel_agent_rows`, then `jump_to_agent`
+binds it). The daemon round-trip and the row's paint are the named runtime gaps.

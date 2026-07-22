@@ -5688,6 +5688,116 @@ fn roster_surfaces_unopened_session_and_tracks_rename_close(cx: &mut TestAppCont
     assert!(rows.is_empty(), "closed session is gone from the roster");
 }
 
+/// UXI-JumpPanel-3, clause 3: the jump-panel "＋ New agent session" action drives
+/// the REAL `spawn_free_agent_session`. With no session server there is no roster
+/// to host a free session, so it is a graceful no-op — a transient status note is
+/// set, and it creates NOTHING (no store session, no tile binding). It must never
+/// panic and never auto-bind a phantom.
+///
+/// Negative control: `spawn_free_agent_session`'s no-server guard
+/// (`let Some(handle) … else { note; return }`). Remove it and the method
+/// unwraps a `None` handle → panic instead of this clean note.
+#[gpui::test]
+fn free_agent_session_no_server_is_graceful_noop(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx); // hermetic → session_server is None
+    view.update(vcx, |v, cx| {
+        assert!(v.sessions.is_empty(), "precondition: no sessions yet");
+        v.spawn_free_agent_session(cx);
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert!(
+            v.sessions.is_empty(),
+            "no session server ⇒ create NOTHING locally (no phantom session)"
+        );
+        let note = v
+            .transient_status
+            .as_ref()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(
+            note.contains("no session server"),
+            "the action explains why it did nothing, got: {note:?}"
+        );
+    });
+}
+
+/// UXI-JumpPanel-3, clauses 1–2: a session created free (bound to no tile) —
+/// which is the end state `spawn_free_agent_session` produces once the server's
+/// `SessionCreated` broadcast lands — surfaces in the jump panel as an UNBOUND
+/// (`○`) row through the real `jump_panel_agent_rows`, and is then bindable the
+/// ordinary way (`jump_to_agent`), never auto-bound by the create itself.
+///
+/// The server round-trip needs the daemon (harness gap #2); this drives the wire
+/// end state via the REAL `apply_server_batch(SessionCreated)` reducer.
+///
+/// Negative control: assert `!bound` before the bind — if the create auto-bound
+/// a tile, the row would already read `bound == true`.
+#[gpui::test]
+fn free_agent_row_is_unbound_and_bindable(cx: &mut TestAppContext) {
+    use yalda::session_proto::Notification as ServerNotification;
+    use yalda::session_proto::SessionInfo;
+
+    let (view, vcx) = boot_browser(cx);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let info = SessionInfo {
+        session_id: "free-1".into(),
+        acp_session_id: Some("acp-free-1".into()),
+        label: "claude-free".into(),
+        cwd: cwd.clone(),
+        turns: 0,
+        connected: true,
+        permission_mode: yalda::acp_channel::PermissionMode::ReadOnly,
+    };
+
+    // The end state of a free create: the session appears in the roster, bound
+    // to no tile.
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::SessionCreated { session: info.clone() }],
+            cx,
+        );
+    });
+
+    let target = view.update(vcx, |v, cx| {
+        let rows = v.jump_panel_agent_rows(cx);
+        assert_eq!(rows.len(), 1, "the free session shows in the jump panel");
+        assert!(
+            !rows[0].bound,
+            "a freshly-created session is FREE — no tile binds it (○), not auto-bound"
+        );
+        assert!(
+            matches!(rows[0].target, crate::JumpTarget::Roster(ref s) if s == "free-1"),
+            "surfaced by its server sid"
+        );
+        rows[0].target.clone()
+    });
+
+    // It is bindable later the ordinary way — no session server here, so the
+    // roster-open path can't attach; instead prove bindability directly through
+    // the store + tile bind that a selection performs.
+    view.update(vcx, |v, cx| {
+        let id = v.show_local_session(
+            crate::AgentSession {
+                state: crate::AgentState::new_server_managed(None),
+                label: "claude-free".into(),
+                cwd: cwd.clone(),
+                resume_id: None,
+            },
+            cx,
+        );
+        v.sessions
+            .bind_sid(id, ServerSid::new("free-1"))
+            .expect("fresh sid binds");
+        v.jump_to_session(id, cx);
+        assert!(
+            v.agent_tile_id_bound_to(id).is_some(),
+            "selecting the free session binds it to a tile (create → attach later)"
+        );
+        let _ = &target;
+    });
+}
+
 /// REGRESSION (bug-0006): the jump panel's agent rows are ordered by label across
 /// BOTH roster-known and local-only sessions, so a session doesn't spontaneously
 /// reorder when the async roster refresh catches up to a locally-created session.

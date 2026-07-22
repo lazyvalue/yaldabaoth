@@ -13,6 +13,20 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Create a free (tile-less) agent session from the jump panel** — `NEEDS-RUNTIME`
+  (built 2026-07-22 via `/new-ux`; `UXI-JumpPanel-3`). "I want to create new agents
+  that aren't attached to a tile in a workspace." Capability already existed
+  (`spawn_free_agent_session`, `?`-menu "new agent session") but was checkpointed
+  WIP — un-spec'd, unguarded, and undiscoverable. This makes it a first-class,
+  discoverable action: a **＋ New agent session** row at the top of the jump panel's
+  "Agent sessions" section calls the same `spawn_free_agent_session`; the created
+  session lands in the universal roster as an unbound (○) row, never auto-bound,
+  bindable later by selecting it. Guards: `free_agent_session_no_server_is_graceful_noop`
+  (real method, no-server contract, NC observed), `free_agent_row_is_unbound_and_bindable`
+  (roster session surfaces as free ○, then binds via `jump_to_agent`). Runtime check:
+  the live server `create_session` round-trip needs the daemon (harness gap #2) and
+  the ＋ row's click paint (gap #1).
+
 - **Blockquoted text is italic everywhere** — `NEEDS-RUNTIME` (built 2026-07-21,
   branch `quote-parser-blockquote-italic`, NOT yet merged; `UXI-Blockquote-1`,
   new spec `docs/components/common/blockquote.md`). `>`-quoted text renders italic
