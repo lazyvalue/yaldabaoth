@@ -321,16 +321,23 @@ impl TranscriptView {
     /// Begin a mouse drag-select: focus the transcript, place the cursor at the
     /// hit and drop the selection anchor there. A click on empty space (no token
     /// hit) clears any existing selection. (UXI-Selection-1.)
-    fn transcript_mouse_down(&mut self, ev: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
+    pub(crate) fn transcript_mouse_down(&mut self, ev: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
         let Some((line, col)) = self.transcript_pos_at(cx, ev.position) else {
-            self.session
-                .update(cx, |sp, _| sp.state.editor.clear_selection());
+            self.session.update(cx, |sp, _| {
+                sp.state.editor.clear_selection();
+                sp.state.drag_protect_line = None;
+            });
             self.dragging = false;
             cx.notify();
             return;
         };
         self.session.update(cx, |sp, _| {
             let c = &mut sp.state;
+            // bug-0015: freeze the blank-collapse's protected line at its
+            // PRE-press value for the whole gesture. Moving the cursor below
+            // would otherwise un-protect the old line, drop a flat item and
+            // reflow the transcript ~25px under the pointer mid-drag.
+            c.drag_protect_line = Some(c.editor.cursor().line);
             c.focus = AgentFocus::Transcript;
             c.editor.cursor_mut().line = line;
             c.editor.cursor_mut().col = col;
@@ -341,7 +348,7 @@ impl TranscriptView {
     }
 
     /// Extend the drag-select head to the current point (anchor stays put).
-    fn transcript_mouse_move(&mut self, ev: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+    pub(crate) fn transcript_mouse_move(&mut self, ev: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
         if !self.dragging {
             return;
         }
@@ -364,13 +371,15 @@ impl TranscriptView {
 
     /// Finish the drag: X11-style, a non-empty selection auto-copies to the
     /// system clipboard; an empty one (a bare click) is dropped. (UXI-Selection-1.)
-    fn transcript_mouse_up(&mut self, _ev: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
+    pub(crate) fn transcript_mouse_up(&mut self, _ev: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
         if !self.dragging {
             return;
         }
         self.dragging = false;
         let text = self.session.update(cx, |sp, _| {
             let c = &mut sp.state;
+            // Gesture over: the collapse pass tracks the live cursor again.
+            c.drag_protect_line = None;
             match c.editor.selection_range() {
                 Some((a, b)) if a != b => c.editor.selection_text(),
                 _ => {

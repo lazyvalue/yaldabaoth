@@ -1543,6 +1543,7 @@ impl YaldaGpuiView {
             subagents_open: false,
             sidepanel_hidden: false,
             close_confirm_armed: false,
+            drag_protect_line: None,
             panel_col: PanelColumn::Tasklist,
             panel_sel: 0,
             panel_return_focus: AgentFocus::Compose,

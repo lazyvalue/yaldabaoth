@@ -67,3 +67,48 @@ proportional transcript font would need per-token `index_for_position` instead.
 seeds a sentinel clipboard value, drags across a known line via real mouse
 events, and asserts the clipboard now holds the dragged text (negative control:
 disabling the `write_to_clipboard` leaves the sentinel ⇒ RED).
+
+### UXI-Selection-2 — A drag-selection never moves the content under the pointer
+
+**Statement.** While a mouse drag-selection is in flight over the transcript, the
+painted layout of the content being selected MUST NOT move. Concretely: the
+transcript's flat-item list keeps a **stable item count** for the whole gesture,
+so pressing / dragging inside a multiline block (code fence, list, table) cannot
+reflow the block under the pointer.
+
+**Why this is load-bearing (bug-0015, a repeat offender).** The transcript's
+blank-line collapse is cursor-dependent: it protects the line the caret sits on
+(the Worksheet editable tail). A press moves the caret to the clicked line, which
+*un*-protects the previously-protected blank; that blank collapses away, the list
+loses one item, and the whole block repaints ~25px lower — **mid-drag, under the
+pointer**. 25px > the 20px line height, so every subsequent `hit_test_tokens`
+comes back a line off and the drag selects the wrong lines. To the user this
+reads as "I can't select in a code block" — the text is right there, but the drag
+grabs the wrong span (or leaves the block entirely on a short block).
+
+**Mechanism of the guarantee.** `AgentState.drag_protect_line: Option<usize>` is
+captured at `transcript_mouse_down` to the caret's **pre-press** line and cleared
+at `transcript_mouse_up` (and on a no-hit press). `rebuild_agent_view_model`'s
+collapse protects `drag_protect_line.unwrap_or(cursor.line)`, so for the duration
+of the gesture the protected line — and therefore the item count — is frozen at
+its pre-press value. The field is part of the view-model memo key (a real build
+input).
+
+**Bounds.** This freezes the count only for the drag. A bare click that parks the
+caret inside frozen content still statically reflows the block once after
+mouse-up (the caret legitimately moved); that is a cosmetic post-click shift, not
+a selection failure, and is out of scope here. The durable elimination of the
+whole class (decouple the transcript selection anchor/head from the document
+caret so a press has no layout side effect at all) is recorded as the preferred
+long-term shape in `docs/bugs/bug-0015-*.md` if this ever recurs.
+
+**Status.** `implemented` — headless on the REAL paint path.
+
+**Enforcement.** `verify_harness.rs::code_block_does_not_shift_when_clicked`:
+seeds a frozen fenced code block with a trailing editable blank, records the
+block's four painted band tops, drives the REAL `transcript_mouse_down` inside
+the block, and asserts the band tops are IDENTICAL after — then drags to the
+second code line and asserts the clipboard holds BOTH lines. Non-vacuous (asserts
+≥4 per-line bands painted first). **Negative control (observed RED):** revert
+`protect_line` to the bare `cursor().line` ⇒ the bands shift +25px and the
+equality assert fires.

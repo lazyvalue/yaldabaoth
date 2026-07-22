@@ -2994,8 +2994,15 @@ pub(crate) fn rebuild_agent_view_model(
     // scrolls past where the cursor actually is. Never collapse the
     // line the cursor is on.
     {
+        // bug-0015: while a mouse selection is in flight the protected line is
+        // FROZEN at whatever it was when the drag began. Otherwise the press
+        // itself (which moves the cursor to the clicked line) un-protects the
+        // old line, collapses it away, drops a list item and repaints the
+        // transcript ~25px lower — mid-gesture, under the user's pointer — so
+        // every subsequent hit-test is a line off and dragging inside a code
+        // block selects the wrong lines.
         let protect_line: Option<usize> = (!c.input_surface.is_chatbox())
-            .then(|| c.editor.cursor().line);
+            .then(|| c.drag_protect_line.unwrap_or_else(|| c.editor.cursor().line));
         let is_blank_line = |item: &FlatItem| -> bool {
             matches!(item, FlatItem::Line(idx)
                 if Some(*idx) != protect_line && lines.get(*idx).is_none_or(|s| s.trim().is_empty()))
@@ -3377,6 +3384,13 @@ pub(crate) struct AgentState {
     /// both cases nothing reaches the agent. Deliberately NOT persisted: an
     /// armed confirm is a live, in-the-moment gesture, not session state.
     pub(crate) close_confirm_armed: bool,
+    /// While a transcript mouse-selection is in flight, the blank-line the
+    /// collapse pass must keep protecting — captured at mouse-down BEFORE the
+    /// press moves the cursor (bug-0015). `None` when no drag is in flight, in
+    /// which case the collapse protects the live cursor line as usual. Freezing
+    /// it keeps the flat-item COUNT stable for the whole gesture, so the
+    /// transcript cannot reflow under the pointer mid-drag.
+    pub(crate) drag_protect_line: Option<usize>,
     /// Which bottom-panel column holds the selection while `focus == Panel`
     /// (`h`/`l` switch). Meaningless otherwise.
     pub(crate) panel_col: PanelColumn,
@@ -3616,6 +3630,9 @@ impl AgentState {
         (!self.input_surface.is_chatbox()).hash(&mut h);
         if !self.input_surface.is_chatbox() {
             self.editor.cursor().line.hash(&mut h);
+            // bug-0015: the frozen drag protection overrides the cursor line in
+            // the collapse pass, so it is a genuine build input too.
+            self.drag_protect_line.hash(&mut h);
             // Insert vs Normal flips the PRESENCE-driven "You" divider: it shows
             // while composing (Insert mode with the caret in an editable run),
             // even before any text. Entering/leaving Insert without moving the
@@ -3690,6 +3707,7 @@ impl AgentState {
             subagents_open: true,
             sidepanel_hidden: false,
             close_confirm_armed: false,
+            drag_protect_line: None,
             panel_col: PanelColumn::Tasklist,
             panel_sel: 0,
             panel_return_focus: AgentFocus::Compose,
@@ -3753,6 +3771,7 @@ impl AgentState {
             subagents_open: true,
             sidepanel_hidden: false,
             close_confirm_armed: false,
+            drag_protect_line: None,
             panel_col: PanelColumn::Tasklist,
             panel_sel: 0,
             panel_return_focus: AgentFocus::Compose,
