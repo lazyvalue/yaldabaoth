@@ -37,7 +37,16 @@ Create a task for each; complete in order.
    **Log**: what changed (files/commit), how verified (test + negative control),
    outcome. Move the tried-approach into "Approaches already tried" if it's a partial
    or it later regresses. Update the manifest row (status, times-addressed++).
-7. **If it recurs later** — never rewrite the old log. Append a NEW dated entry at
+7. **Commit the fix (automatic).** Once the suite is green and the negative control
+   was observed RED, commit WITHOUT waiting to be asked — the fix, its guard test,
+   and the bug-file + manifest updates in one commit. Stage only the files for THIS
+   bug (a shared working tree may hold a parallel session's work — never `git add -A`
+   blindly; stage the specific paths and confirm the diff is yours). If not already
+   on a branch and the change is substantial, branch first per `CLAUDE.md`. Message:
+   `fix(<area>): <what> (bug-<NNNN>)`, ending with the `Co-Authored-By` trailer. Do
+   NOT push unless asked. If the guard is RED, the negative control was skipped, or
+   you could not localize on the real path, do NOT commit — report instead.
+8. **If it recurs later** — never rewrite the old log. Append a NEW dated entry at
    the bottom and flip status to `RECURRED`.
 
 ## Constraints
@@ -49,4 +58,9 @@ Create a task for each; complete in order.
 - **The fix must reach the user** — on `main` + rebuilt binary, not stranded on a
   branch (`CLAUDE.md` anti-circling rule 5).
 - Faithful over flattering in the log: record what failed and what's unverified.
-- Don't commit unless asked.
+- **Auto-commit a verified fix** (step 7) — a green suite + an observed-RED negative
+  control is the bar; clearing it means commit without asking. A guess (couldn't
+  localize on the real path, or no negative control) is never committed. Push still
+  needs an explicit ask. This replaces the old "don't commit unless asked" default:
+  leaving verified fixes uncommitted in a shared tree let a parallel session commit
+  the guard test without its fix (HEAD red) and stranded work mid-session.
