@@ -5722,6 +5722,52 @@ fn free_agent_session_no_server_is_graceful_noop(cx: &mut TestAppContext) {
     });
 }
 
+/// UXI-JumpPanel-3: the SAME create-free action is reachable from the `?` global
+/// menu ("new agent session"), not only the jump-panel row. Drives the REAL menu
+/// path: the entry is present in `global_menu()`, and `dispatch_menu_command`
+/// (the exact call a menu key-selection makes) routes its action id to
+/// `spawn_free_agent_session` — proven by the no-server graceful-noop contract.
+///
+/// Negative controls: drop the `global_menu()` entry → the presence assert fails;
+/// rewire the `"new-free-agent-session"` match arm → the dispatched note vanishes.
+#[gpui::test]
+fn global_menu_offers_and_dispatches_free_agent_session(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx); // hermetic → session_server is None
+
+    // The `?` menu offers it, keyed `a`, labeled for the human.
+    view.update(vcx, |v, _| {
+        let entry = v
+            .global_menu()
+            .into_iter()
+            .find(|n| matches!(&n.action,
+                crate::MenuAction::Command(c) if c == "new-free-agent-session"));
+        let entry = entry.expect("the ? global menu offers `new-free-agent-session`");
+        assert_eq!(entry.label, "new agent session", "human-readable label");
+    });
+
+    // Selecting it runs `dispatch_menu_command` with that id — the same call the
+    // key press makes — which reaches `spawn_free_agent_session`.
+    view.update(vcx, |v, cx| {
+        assert!(v.sessions.is_empty(), "precondition: no sessions");
+        v.dispatch_menu_command("new-free-agent-session", cx);
+    });
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        // No daemon here, so the reached method takes its no-server branch — the
+        // observable proof the ? menu's action id routes to the free-session spawn.
+        let note = v
+            .transient_status
+            .as_ref()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(
+            note.contains("no session server"),
+            "the ? menu action reached spawn_free_agent_session, got: {note:?}"
+        );
+        assert!(v.sessions.is_empty(), "no phantom session created");
+    });
+}
+
 /// UXI-JumpPanel-3, clauses 1–2: a session created free (bound to no tile) —
 /// which is the end state `spawn_free_agent_session` produces once the server's
 /// `SessionCreated` broadcast lands — surfaces in the jump panel as an UNBOUND

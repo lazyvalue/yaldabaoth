@@ -161,10 +161,12 @@ via `spawn_free_agent_session`:
 **Applies to.** `jump_panel_view.rs` `render_jump_panel` (the `jump-new-agent`
 row → `on_click` → `spawn_free_agent_session`); `agent_ui.rs`
 `spawn_free_agent_session` (no-server guard + create + `refresh_roster`, never a
-tile bind); the roster→row projection in `jump_panel_agent_rows`. The `?` global
-menu's "new agent session" entry (`main.rs`, `"new-free-agent-session"`) invokes
-the same method — the jump-panel row just makes it discoverable where free
-sessions live.
+tile bind); the roster→row projection in `jump_panel_agent_rows`. **Two entry
+points invoke the same method:** the jump-panel row AND the `?` global menu's
+"new agent session" entry (`main.rs` `global_menu()` → `dispatch_menu_command`
+→ `"new-free-agent-session"`). Neither is privileged — the jump-panel row just
+makes it discoverable where free sessions live; the menu makes it keyboard-
+reachable (`?` then `a`).
 
 **Why.** The user wants to spin up an agent without first placing a tile for it
 — create the worker, bind it to a viewport (or not) whenever. The capability
@@ -183,4 +185,9 @@ store gains no session and no tile binds — negative control: the method's
 no-server guard) and `free_agent_row_is_unbound_and_bindable` (a
 `SessionCreated` roster broadcast — the end state the create produces — surfaces
 as an unbound `○` row through the real `jump_panel_agent_rows`, then `jump_to_agent`
-binds it). The daemon round-trip and the row's paint are the named runtime gaps.
+binds it). The `?`-menu entry point is pinned by
+`global_menu_offers_and_dispatches_free_agent_session` (the entry is present in the
+REAL `global_menu()` and `dispatch_menu_command("new-free-agent-session")` — the
+call a menu selection makes — routes to `spawn_free_agent_session`; NC observed
+RED by dropping the entry). The daemon round-trip and the row's paint are the named
+runtime gaps.
