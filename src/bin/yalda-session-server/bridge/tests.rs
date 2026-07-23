@@ -4,11 +4,13 @@
 //! against a `FakeTransport` + a `FakeDriver`, with no real Manager, socket, or
 //! agent. Router/reconcile logic is covered in `router.rs`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use yalda::acp_channel::PermissionMode;
-use yalda::session_proto::SessionInfo;
+use yalda::acp_channel::{PermissionMode, ToolCall, ToolKind};
+use yalda::agent_event::{AgentEvent, AgentEventKind, ChunkRole, TurnOutcome};
+use yalda::session_proto::{Notification, SessionInfo};
 
 use super::router::TopicRouter;
 use super::transport::{FakeOp, FakeTransport, InboundMsg, ThreadId};
@@ -132,6 +134,8 @@ async fn created_event_opens_and_binds_a_topic() {
     handle_event(
         &t,
         &mut router,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
         BridgeEvent::SessionCreated(info("s1", "Build", PathBuf::from("/w"))),
     )
     .await;
@@ -151,6 +155,8 @@ async fn rename_then_close_target_the_bound_topic() {
     handle_event(
         &t,
         &mut router,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
         BridgeEvent::SessionCreated(info("s1", "Old", PathBuf::from("/w"))),
     )
     .await;
@@ -159,13 +165,22 @@ async fn rename_then_close_target_the_bound_topic() {
     handle_event(
         &t,
         &mut router,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
         BridgeEvent::SessionRenamed {
             session_id: "s1".into(),
             label: "New".into(),
         },
     )
     .await;
-    handle_event(&t, &mut router, BridgeEvent::SessionClosed("s1".into())).await;
+    handle_event(
+        &t,
+        &mut router,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        BridgeEvent::SessionClosed("s1".into()),
+    )
+    .await;
 
     let ops = t.ops();
     assert!(
@@ -185,8 +200,8 @@ async fn duplicate_create_does_not_open_a_second_topic() {
     let t = FakeTransport::new();
     let mut router = TopicRouter::new();
     let ev = || BridgeEvent::SessionCreated(info("s1", "X", PathBuf::from("/w")));
-    handle_event(&t, &mut router, ev()).await;
-    handle_event(&t, &mut router, ev()).await; // idempotent
+    handle_event(&t, &mut router, &mut HashMap::new(), &mut HashMap::new(), ev()).await;
+    handle_event(&t, &mut router, &mut HashMap::new(), &mut HashMap::new(), ev()).await; // idempotent
 
     let opens = t.ops().iter().filter(|o| matches!(o, FakeOp::Open { .. })).count();
     assert_eq!(opens, 1, "second create must not open another topic");
@@ -330,4 +345,133 @@ async fn run_bridge_reconciles_topics_on_startup() {
         .collect();
     assert!(opened.contains(&"Alpha".to_string()), "opened: {opened:?}");
     assert!(opened.contains(&"Beta".to_string()), "opened: {opened:?}");
+}
+
+// ── Outbound event fold (handle_event Transcript arm, T-004) ─────────
+
+/// Wrap an `AgentEventKind` as a Transcript BridgeEvent for session `sid`.
+fn transcript(sid: &str, kind: AgentEventKind) -> BridgeEvent {
+    BridgeEvent::Transcript {
+        session_id: sid.to_string(),
+        note: Box::new(Notification::Agent {
+            event: AgentEvent::new(sid.to_string(), 0, 0, 0, kind),
+        }),
+    }
+}
+
+fn msg_chunk(text: &str) -> AgentEventKind {
+    AgentEventKind::Chunk {
+        text: text.to_string(),
+        role: ChunkRole::Message,
+    }
+}
+
+/// The end-to-end fold through the REAL `handle_event` Transcript arm: a bound
+/// topic receives a Send (running message), then Edit(s) coalescing prose + the
+/// tool line, then no further edit after the turn boundary (Finalize clears the
+/// running id, so the next turn Posts fresh).
+#[tokio::test]
+async fn transcript_agent_events_fold_into_the_bound_topic() {
+    let t = FakeTransport::new();
+    let mut router = TopicRouter::new();
+    router.bind("s1".to_string(), ThreadId(9));
+    let mut folders = HashMap::new();
+    let mut running = HashMap::new();
+
+    handle_event(&t, &mut router, &mut folders, &mut running, transcript("s1", msg_chunk("Hello "))).await;
+    handle_event(&t, &mut router, &mut folders, &mut running, transcript("s1", msg_chunk("world"))).await;
+    let tc: ToolCall = {
+        let mut tc = ToolCall::new("t1", "Read File");
+        tc.kind = ToolKind::Read;
+        tc
+    };
+    handle_event(
+        &t,
+        &mut router,
+        &mut folders,
+        &mut running,
+        transcript("s1", AgentEventKind::ToolCallStarted(tc)),
+    )
+    .await;
+    handle_event(
+        &t,
+        &mut router,
+        &mut folders,
+        &mut running,
+        transcript("s1", AgentEventKind::TurnEnded { outcome: TurnOutcome::Completed }),
+    )
+    .await;
+
+    let ops = t.ops();
+    // First op is a Send on the bound thread (the running message).
+    let (send_thread, send_msg) = match ops.first() {
+        Some(FakeOp::Send { thread, message, .. }) => (*thread, *message),
+        other => panic!("expected first op Send, got {other:?}; ops: {ops:?}"),
+    };
+    assert_eq!(send_thread, ThreadId(9), "posted to the bound topic");
+    // At least one Edit followed, on the SAME thread + message.
+    assert!(
+        ops[1..].iter().any(|o| matches!(
+            o,
+            FakeOp::Edit { thread, message, .. } if *thread == ThreadId(9) && *message == send_msg
+        )),
+        "expected an Edit on the running message; ops: {ops:?}"
+    );
+    // Every op targets the bound thread (nothing leaks elsewhere).
+    assert!(
+        ops.iter().all(|o| matches!(
+            o,
+            FakeOp::Send { thread, .. } | FakeOp::Edit { thread, .. } if *thread == ThreadId(9)
+        )),
+        "all ops on the bound thread; ops: {ops:?}"
+    );
+    // The final rendered text carries BOTH the prose and the tool line.
+    let last_text = ops
+        .iter()
+        .rev()
+        .find_map(|o| match o {
+            FakeOp::Edit { text, .. } | FakeOp::Send { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("some rendered text");
+    assert!(last_text.contains("Hello world"), "prose present: {last_text:?}");
+    assert!(last_text.contains("🔧"), "tool line present: {last_text:?}");
+
+    // Finalize cleared the running message: a NEW turn Posts fresh (not Edit).
+    let before = t.ops().len();
+    handle_event(
+        &t,
+        &mut router,
+        &mut folders,
+        &mut running,
+        transcript("s1", msg_chunk("next turn")),
+    )
+    .await;
+    let after = t.ops();
+    assert!(
+        matches!(&after[before], FakeOp::Send { thread, .. } if *thread == ThreadId(9)),
+        "post-turn message must be a fresh Send, got {:?}",
+        &after[before..]
+    );
+}
+
+/// A transcript event for an UNBOUND session (no topic) folds to nothing — no
+/// transport op at all.
+#[tokio::test]
+async fn transcript_for_unbound_session_is_ignored() {
+    let t = FakeTransport::new();
+    let mut router = TopicRouter::new(); // nothing bound
+    let mut folders = HashMap::new();
+    let mut running = HashMap::new();
+
+    handle_event(
+        &t,
+        &mut router,
+        &mut folders,
+        &mut running,
+        transcript("ghost", msg_chunk("hi")),
+    )
+    .await;
+
+    assert!(t.ops().is_empty(), "unbound session must drive no op: {:?}", t.ops());
 }

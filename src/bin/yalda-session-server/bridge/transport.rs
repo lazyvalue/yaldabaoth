@@ -55,8 +55,7 @@ pub trait ChatTransport: Send + Sync + 'static {
     -> impl Future<Output = TransportResult<MessageId>> + Send;
 
     /// Live-edit a previously-sent message (streaming coalesced prose, §5).
-    // Called by the T-004 event fold; part of the trait contract now.
-    #[allow(dead_code)]
+    /// Driven by the T-004 event fold.
     fn edit(
         &self,
         thread: ThreadId,

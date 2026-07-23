@@ -15,10 +15,12 @@
 //! The bridge is spawned only when configured (a Telegram token is present);
 //! absent config it costs nothing and exposes no surface.
 
+mod fold;
 mod router;
 mod telegram;
 mod transport;
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,8 +30,9 @@ use tokio::sync::{broadcast, mpsc};
 use yalda::acp_channel::PermissionMode;
 use yalda::session_proto::{Notification, ServerSessionId, SessionInfo};
 
+use fold::{ChatOp, EventFolder};
 use router::{TopicAction, TopicMapSnapshot, TopicRouter};
-use transport::ChatTransport;
+use transport::{ChatTransport, MessageId, ThreadId};
 
 #[cfg(test)]
 mod tests;
@@ -276,8 +279,9 @@ pub enum BridgeEvent {
         session_id: ServerSessionId,
         label: String,
     },
-    /// A per-session transcript notification (spec §5 fold). Wired in T-004.
-    #[allow(dead_code)]
+    /// A per-session transcript notification (spec §5 fold), tapped from the
+    /// manager's `push_event` chokepoint (T-004) and folded into the session's
+    /// topic.
     Transcript {
         session_id: ServerSessionId,
         note: Box<Notification>,
@@ -357,11 +361,17 @@ async fn run_bridge<T: ChatTransport + Clone, D: SessionDriver>(
     let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
     tokio::spawn(poll_inbound_loop(transport.clone(), inbound_tx));
 
+    // Outbound fold state (T-004): one `EventFolder` per session, and the running
+    // (live-edited) message id per topic. Owned here so the fold is per-session
+    // stateful across the event stream without a lock.
+    let mut folders: HashMap<ServerSessionId, EventFolder> = HashMap::new();
+    let mut running: HashMap<ThreadId, MessageId> = HashMap::new();
+
     loop {
         tokio::select! {
             maybe_ev = events.recv() => {
                 let Some(ev) = maybe_ev else { return; };
-                handle_event(&transport, &mut router, ev).await;
+                handle_event(&transport, &mut router, &mut folders, &mut running, ev).await;
             }
             maybe_in = inbound_rx.recv() => {
                 let Some(msg) = maybe_in else { continue; };
@@ -394,12 +404,22 @@ async fn poll_inbound_loop<T: ChatTransport>(
     }
 }
 
-/// React to a session-lifecycle event by driving topic ops.
+/// React to a session-lifecycle event by driving topic ops, or fold a
+/// transcript event into the session's topic (T-004).
 async fn handle_event<T: ChatTransport>(
     transport: &T,
     router: &mut TopicRouter,
+    folders: &mut HashMap<ServerSessionId, EventFolder>,
+    running: &mut HashMap<ThreadId, MessageId>,
     ev: BridgeEvent,
 ) {
+    // Transcript events drive no topic-lifecycle op — they fold straight into
+    // the bound topic — so handle them on their own path.
+    if let BridgeEvent::Transcript { session_id, note } = &ev {
+        handle_transcript(transport, router, folders, running, session_id, note).await;
+        return;
+    }
+
     let action = match &ev {
         BridgeEvent::SessionCreated(info) => {
             router.on_session_created(&info.session_id, &info.label)
@@ -408,11 +428,65 @@ async fn handle_event<T: ChatTransport>(
         BridgeEvent::SessionRenamed { session_id, label } => {
             router.on_session_renamed(session_id, label)
         }
-        BridgeEvent::Transcript { .. } => TopicAction::Noop, // T-004
+        BridgeEvent::Transcript { .. } => unreachable!("handled above"),
     };
+
+    // A closed session's fold state must not leak — drop its folder and any
+    // running message (reading the thread BEFORE the close unbinds it).
+    if let BridgeEvent::SessionClosed(sid) = &ev {
+        folders.remove(sid);
+        if let Some(thread) = router.thread_of(sid) {
+            running.remove(&thread);
+        }
+    }
+
     if !matches!(action, TopicAction::Noop) {
         apply_topic_action(transport, router, action).await;
         persist_topic_map(router);
+    }
+}
+
+/// Fold one transcript notification into its session's topic (spec §5). Only
+/// `Notification::Agent` facts drive the fold — the legacy
+/// `ReplyEvent`/`TurnEnded`/`UserPrompt` variants are ignored so a turn is never
+/// double-rendered. Transport errors are logged and swallowed (never panic).
+async fn handle_transcript<T: ChatTransport>(
+    transport: &T,
+    router: &TopicRouter,
+    folders: &mut HashMap<ServerSessionId, EventFolder>,
+    running: &mut HashMap<ThreadId, MessageId>,
+    session_id: &ServerSessionId,
+    note: &Notification,
+) {
+    // Only a bound session has a topic to fold into.
+    let Some(thread) = router.thread_of(session_id) else {
+        return;
+    };
+    // Only the canonical agent stream carries fold facts.
+    let Notification::Agent { event } = note else {
+        return;
+    };
+
+    let folder = folders.entry(session_id.clone()).or_default();
+    for op in folder.on_event(&event.kind) {
+        match op {
+            ChatOp::Post(text) => match transport.send(thread, &text).await {
+                Ok(id) => {
+                    running.insert(thread, id);
+                }
+                Err(e) => tracing::warn!(error = %e, "bridge fold send failed"),
+            },
+            ChatOp::Edit(text) => {
+                if let Some(id) = running.get(&thread).copied() {
+                    if let Err(e) = transport.edit(thread, id, &text).await {
+                        tracing::warn!(error = %e, "bridge fold edit failed");
+                    }
+                }
+            }
+            ChatOp::Finalize => {
+                running.remove(&thread);
+            }
+        }
     }
 }
 
@@ -496,10 +570,16 @@ async fn handle_inbound<T: ChatTransport, D: SessionDriver>(
 /// so it exits only when the server shuts down. A panic in it dies with the task
 /// and leaves the server running (spec §6: a bridge hiccup can't wedge the
 /// daemon). Backoff-restart-on-panic is a deferred hardening.
-pub fn maybe_spawn_bridge(manager: Arc<crate::SessionManager>) {
+pub fn maybe_spawn_bridge(
+    manager: Arc<crate::SessionManager>,
+    transcript_rx: mpsc::UnboundedReceiver<(ServerSessionId, Notification)>,
+) {
     let config = match BridgeConfig::load() {
+        // Disabled — the common case. Dropping `transcript_rx` here makes the
+        // Manager's per-session sends error immediately (no buffering), so the
+        // tap costs nothing when the bridge is off.
+        Ok(None) => return,
         Ok(Some(c)) => c,
-        Ok(None) => return, // disabled — the common case
         Err(e) => {
             tracing::error!(error = %e, "bridge configured but invalid — not starting");
             return;
@@ -511,9 +591,34 @@ pub fn maybe_spawn_bridge(manager: Arc<crate::SessionManager>) {
         "starting Telegram bridge"
     );
 
+    // Both session-list events (manager broadcast) and per-session transcript
+    // events (the `push_event` tap) fan into ONE mpsc so `run_bridge` selects
+    // over a single channel.
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    tokio::spawn(forward_manager_events(manager.subscribe_events(), event_tx));
+    tokio::spawn(forward_manager_events(
+        manager.subscribe_events(),
+        event_tx.clone(),
+    ));
+    tokio::spawn(forward_transcript_events(transcript_rx, event_tx));
 
     let transport = telegram::TelegramTransport::new(config.token.clone(), config.chat_id);
     tokio::spawn(run_bridge(config, transport, manager, event_rx));
+}
+
+/// Map each tapped `(session_id, note)` from the manager's `push_event`
+/// chokepoint into a [`BridgeEvent::Transcript`] on the unified bridge stream.
+/// Its own task so the tap never blocks the manager actor.
+async fn forward_transcript_events(
+    mut rx: mpsc::UnboundedReceiver<(ServerSessionId, Notification)>,
+    tx: mpsc::UnboundedSender<BridgeEvent>,
+) {
+    while let Some((session_id, note)) = rx.recv().await {
+        let ev = BridgeEvent::Transcript {
+            session_id,
+            note: Box::new(note),
+        };
+        if tx.send(ev).is_err() {
+            return; // bridge gone
+        }
+    }
 }

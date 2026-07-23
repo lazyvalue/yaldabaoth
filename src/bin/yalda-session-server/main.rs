@@ -354,7 +354,19 @@ struct ManagedSession {
     /// steady state, once the legacy variants are gone). Reset to 0 on every
     /// channel (re)spawn alongside `channel_generation`.
     agent_seq: u64,
+    /// Outbound tap for the external-chat bridge (T-004, spec §5). Every logged
+    /// notification is forwarded as `(session_id, note)` so the bridge can fold
+    /// it into this session's topic. `None` when no bridge sender is wired
+    /// (e.g. tests); a send whose receiver was dropped (bridge disabled) errors
+    /// and is ignored, so this never buffers unboundedly.
+    bridge_tx: Option<BridgeTx>,
 }
+
+/// Sender for the outbound bridge tap (T-004): the canonical `push_event`
+/// chokepoint forwards each logged `(session_id, note)` to the external-chat
+/// bridge. The `Manager` owns the authoritative sender and hands a clone to
+/// every session (live + recovered) so all of a session's transcript streams.
+type BridgeTx = tokio::sync::mpsc::UnboundedSender<(ServerSessionId, Notification)>;
 
 impl ManagedSession {
     fn info(&self) -> SessionInfo {
@@ -410,6 +422,13 @@ impl ManagedSession {
     /// dropped from the floor, so the trim resumes and growth is bounded.
     fn push_event(&mut self, note: Notification) {
         self.wal_append(&note);
+        // Outbound bridge tap (T-004): forward every logged notification to the
+        // external-chat bridge, keyed by session, at this single chokepoint —
+        // clone BEFORE `note` is moved into the log. A dropped receiver (bridge
+        // disabled) errors and is ignored, so this never buffers.
+        if let Some(tx) = &self.bridge_tx {
+            let _ = tx.send((self.id.clone(), note.clone()));
+        }
         self.event_log.push(note);
         let cap = yalda::event_log::event_log_cap();
         // Low-water mark: ¾ of the cap, leaving a slot for the prepended marker
@@ -726,6 +745,7 @@ fn new_managed_session(
     cwd: PathBuf,
     permission_mode: PermissionMode,
     wal: Option<yalda::session_wal::SessionWal>,
+    bridge_tx: Option<BridgeTx>,
 ) -> ManagedSession {
     let event_log = yalda::event_log::EventLog::new();
     let (log_tx, _) = watch::channel(LogSnapshot {
@@ -749,6 +769,7 @@ fn new_managed_session(
         replay_fence: 0,
         wal,
         agent_seq: 0,
+        bridge_tx,
     }
 }
 
@@ -775,6 +796,10 @@ struct Manager {
     /// substitutes a `FakeAgentSpawner`. The actor itself never spawns — it only
     /// hands this `Arc` to the spawn workers.
     spawner: Arc<dyn AgentSpawner>,
+    /// The canonical outbound bridge sender (T-004). The Manager is the single
+    /// owner; `do_create` clones it into each new session so `push_event` can
+    /// tap the transcript. `None` when the server runs without a bridge sender.
+    bridge_tx: Option<BridgeTx>,
 }
 
 /// The public handle the connection handlers hold. All mutation goes through
@@ -979,7 +1004,9 @@ impl SessionManager {
 /// (moved into `run_manager` before the actor starts) plus the resume jobs whose
 /// workers re-spawn the ACP subprocesses (each posting `PublishChannel` back
 /// into the actor). Runs once at startup before accepting connections.
-fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<ResumeJob>) {
+fn restore_seed_from_disk(
+    bridge_tx: Option<BridgeTx>,
+) -> (HashMap<ServerSessionId, ManagedSession>, Vec<ResumeJob>) {
     let mut sessions = HashMap::new();
     let mut jobs = Vec::new();
     let Some(dir) = session_wal_dir() else {
@@ -1050,6 +1077,10 @@ fn restore_seed_from_disk() -> (HashMap<ServerSessionId, ManagedSession>, Vec<Re
             replay_fence: rs.turns,
             wal,
             agent_seq,
+            // Recovered sessions must stream too (spec §5): hand each the same
+            // canonical bridge sender so a resumed session's transcript folds
+            // into its topic just like a live one.
+            bridge_tx: bridge_tx.clone(),
         };
 
         tracing::info!(
@@ -1135,6 +1166,7 @@ async fn run_manager(
     default_permission_mode: PermissionMode,
     cmd_tx: mpsc::UnboundedSender<Command>,
     spawner: Arc<dyn AgentSpawner>,
+    bridge_tx: Option<BridgeTx>,
 ) {
     let mut mgr = Manager {
         sessions,
@@ -1142,6 +1174,7 @@ async fn run_manager(
         default_permission_mode,
         cmd_tx,
         spawner,
+        bridge_tx,
     };
     // Single-writer actor (ADR-0012): drain the inlet one command at a time;
     // `apply` is the only mutator of the session map.
@@ -1375,7 +1408,14 @@ impl Manager {
         // Open the durable WAL up front so even a crash immediately after create
         // can recover the session's identity.
         let wal = open_session_wal(&id, &label, &cwd, permission_mode);
-        let session = new_managed_session(id.clone(), label, cwd.clone(), permission_mode, wal);
+        let session = new_managed_session(
+            id.clone(),
+            label,
+            cwd.clone(),
+            permission_mode,
+            wal,
+            self.bridge_tx.clone(),
+        );
 
         let info = session.info();
         self.sessions.insert(id.clone(), session);
@@ -2569,11 +2609,19 @@ async fn main() -> io::Result<()> {
         SessionManager::new_with_inlet(default_permission_mode);
     let manager = Arc::new(mgr);
 
+    // Outbound bridge tap (T-004): one channel carries every session's logged
+    // notifications to the bridge. The tx is threaded into the Manager (and each
+    // recovered session) so `push_event` can forward; the rx is handed to
+    // `maybe_spawn_bridge`. If the bridge is disabled, `maybe_spawn_bridge` drops
+    // the rx, so the per-session sends error and are ignored (no buffering).
+    let (bridge_evt_tx, bridge_evt_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(ServerSessionId, Notification)>();
+
     // Recover sessions from a prior run BEFORE the actor starts (recovery must
     // precede the accept loop). The seed map is moved into the actor; the resume
     // jobs spawn workers that re-spawn ACP subprocesses and post `PublishChannel`
     // back into the actor once it's running.
-    let (seed_sessions, resume_jobs) = restore_seed_from_disk();
+    let (seed_sessions, resume_jobs) = restore_seed_from_disk(Some(bridge_evt_tx.clone()));
 
     // Spawn the single-writer manager actor: it OWNS the sessions map and drains
     // the inlet (external requests, spawn-worker publishes, pump-sourced records)
@@ -2590,6 +2638,7 @@ async fn main() -> io::Result<()> {
         default_permission_mode,
         manager.cmd_tx.clone(),
         Arc::clone(&spawner),
+        Some(bridge_evt_tx),
     ));
 
     // Now the actor is running, kick off the resume workers.
@@ -2599,7 +2648,7 @@ async fn main() -> io::Result<()> {
 
     // Start the external chat bridge (Telegram) iff configured. No-op when
     // unconfigured (the common case); spec-external-chat-bridge.md.
-    bridge::maybe_spawn_bridge(Arc::clone(&manager));
+    bridge::maybe_spawn_bridge(Arc::clone(&manager), bridge_evt_rx);
 
     // Handle graceful shutdown — persist sessions before exiting.
     // Listen for both SIGINT (Ctrl-C) and SIGTERM (kill / process manager).
