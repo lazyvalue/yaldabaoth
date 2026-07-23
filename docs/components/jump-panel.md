@@ -12,7 +12,8 @@ O(workspaces + sessions)), not cached. Primary code home:
 `jump_panel_view.rs`. Sections:
 
 - **Pinned** — *placeholder* (pinning mechanics land later).
-- **Workspaces** — one row per non-ephemeral tab, active marked (accent label).
+- **Workspaces** — one row per non-ephemeral tab, active marked (accent label +
+  red active box, `UXI-JumpPanel-5`).
   - Each row's badge shows the **1-based workspace number** (`idx + 1`) — the
     digit `ctrl-<n>` jumps to (INV-UX-11).
   - Click → `select_tab`.
@@ -29,6 +30,8 @@ O(workspaces + sessions)), not cached. Primary code home:
     **neutral/disconnected** = dim. Disconnected also dims the whole row.
   - Click → bound session focuses its tile; **free** session opens in an
     ephemeral virtual workspace (torn down on switch-away).
+  - The row bound to the **focused tile** carries a red active box
+    (`UXI-JumpPanel-5`) — "this is where you are."
 
 ## References
 
@@ -252,3 +255,65 @@ the overlay; NC: no-op the dispatch arm), and
 proven by the no-server note; an invalid path surfaces `"not a directory"` and
 spawns nothing; NC: no-op both commit arms). The session actually created AT the
 typed cwd needs the daemon (harness gap #2).
+
+### UXI-JumpPanel-5 — The active screen element wears a red box in the jump panel
+
+**Statement.** The jump panel draws a **red bounding box** (1px border, rounded,
+`DetailStyle.err` = `0xff6b6b`) around the row(s) representing the **active screen
+UX element** — "this is where you are." Two independent marks, 0/1/2 boxes total:
+
+1. **The active workspace row** — the row whose tab index equals
+   `workspace.active_tab` — is always boxed **when that tab is listed** (i.e. it
+   is non-ephemeral). If the active tab is an **ephemeral virtual workspace** (a
+   free session opened via ADR-0021), it isn't in the Workspaces list, so **no
+   workspace row is boxed**. The box is *additive*: the active workspace keeps its
+   accent label + tinted selection background and gains the border on top.
+2. **The focused bound-session row** — the agent-session row bound to the
+   **focused tile** (`focused_bound_session()`) — is boxed. When the focused tile
+   is a **buffer**, or an **unbound** agent tile (selector, no session), there is
+   **no session box**. A roster-only / unopened session is never the focused bound
+   session, so it is never boxed. A disconnected-but-focused session **still** gets
+   its box (the box means "active," orthogonal to the status-dot color / row dim).
+
+There is a single focused tile, so at most one session box and one workspace box.
+The Pinned section, the "＋ New agent session" affordance, and section headings
+never get a box. The panel renders inline every frame, so the boxes track focus
+changes, workspace switches, and tile close/rebind with no extra plumbing.
+
+Row-activeness is a pure predicate: `jump_target_is_active(target, active_local,
+active_sid)` matches a row's `JumpTarget` against the focused session's local
+`SessionId` (Local rows) or its server sid (Roster rows), where `(active_local,
+active_sid)` come from `YaldaGpuiView::jump_active_session()` (matches the focused
+`App::Agent` tile's `session()` + its `sid_of`). The workspace mark reuses the
+existing per-row `active` (= `idx == active_tab`), which is naturally `false` for
+every listed row when the active tab is ephemeral.
+
+**Applies to.** `jump_panel_view.rs`: `jump_active_session` +
+`jump_target_is_active` (the pure derivation), `jump_nav_row` (new `active_box`
+param → red `border_1`/`rounded_md`), and `render_jump_panel` (workspace rows pass
+`active`; session rows pass `jump_target_is_active(...)`). `focused_bound_session`
+(`main.rs`).
+
+**Why.** With several workspaces and many agent sessions listed, the user loses
+track of which one they're currently looking at. A single unmistakable red box on
+"where you are" — workspace and, when applicable, the specific agent session —
+makes the panel a map with a "you are here" pin.
+
+**Status.** `implemented`.
+
+**Deviation from plan.** `jump_active_session()` does NOT call
+`focused_bound_session()` (which `.expect`s a focused window) — the jump panel can
+render with no focused window (the `workspace_number_skips_ephemeral` path), so it
+matches `workspace.focused_content()` directly and returns `(None, None)` when
+absent, rather than panicking. The red box is a 1px `border_1` (not an inset
+margin): a `w_full` row plus a horizontal margin would overflow the panel, so the
+border is drawn flush within the row bounds instead of inset.
+
+**Enforcement.** `verify_harness.rs`:
+`jump_active_box_marks_focused_workspace_and_session` (drives the REAL view:
+boots a bound agent tile, focuses it, and asserts through the REAL
+`jump_active_session` + `jump_target_is_active` over REAL `jump_panel_agent_rows`
+that exactly the focused session's row is active and its workspace tab is active;
+switching focus to a buffer tile clears the session mark but keeps the workspace
+mark; NC: revert the predicate to `false` and observe RED). The literal red pixels
+are harness gap #1 (human eye).

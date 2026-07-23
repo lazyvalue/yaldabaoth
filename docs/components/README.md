@@ -38,10 +38,10 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 ## Index of components
 
 - [agent-tile/](agent-tile/README.md) — `AgentTile` (decomposed): sidepanel,
-  transcript, compose, recap, model. `UXI-AgentTile-1..16`.
+  transcript, compose, recap, model. `UXI-AgentTile-1..23`.
 - [buffer.md](buffer.md) — `Buffer` (Picking / Viewing / Editing).
 - [linear.md](linear.md) — `Linear`.
-- [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..2`.
+- [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..5`.
 - [workspace.md](workspace.md) — `Workspace` (the infinite-plane model: signed
   all-directions slot grid + pan/semantic-zoom camera + reset-to-origin;
   layout-mode/split surface retired). `UXI-Workspace-1..7`.

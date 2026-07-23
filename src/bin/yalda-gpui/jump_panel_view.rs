@@ -222,6 +222,44 @@ fn jump_target_key(t: &JumpTarget) -> String {
     }
 }
 
+/// Does this row point at the **active** (focused-tile-bound) agent session
+/// (UXI-JumpPanel-5)? `active_local` is the focused tile's local `SessionId`;
+/// `active_sid` its server sid, if it has one. A focused session with a sid
+/// surfaces as a `Roster` row (roster wins the dedup), but before the roster
+/// catches up it can be a `Local` row — so match BOTH so the box never blinks
+/// off across that window. Pure so the "which row is active" derivation is
+/// headlessly testable in isolation.
+pub(crate) fn jump_target_is_active(
+    target: &JumpTarget,
+    active_local: Option<SessionId>,
+    active_sid: Option<&str>,
+) -> bool {
+    match target {
+        JumpTarget::Local(id) => active_local == Some(*id),
+        JumpTarget::Roster(sid) => active_sid == Some(sid.as_str()),
+    }
+}
+
+impl YaldaGpuiView {
+    /// The identity of the active agent session for the jump-panel active box
+    /// (UXI-JumpPanel-5): the session bound to the FOCUSED tile, as `(local id,
+    /// server sid)`. `(None, _)` when the focused tile is a buffer or an unbound
+    /// agent tile. `render_jump_panel` consumes this; exposed for headless
+    /// assertion so the test drives the same derivation the paint does.
+    pub(crate) fn jump_active_session(&self) -> (Option<SessionId>, Option<String>) {
+        // Non-panicking: the jump panel can render before/without a focused
+        // window (e.g. transient ephemeral-only states), so match the focused
+        // content directly rather than `focused_bound_session()` (which
+        // `expect`s a focused window).
+        let local = match self.workspace.focused_content() {
+            Some(App::Agent(tile)) => tile.session(),
+            _ => None,
+        };
+        let sid = local.and_then(|id| self.sessions.sid_of(id).map(|s| s.as_str().to_string()));
+        (local, sid)
+    }
+}
+
 /// Group agent rows by their cwd for the jump panel's per-cwd subheaders
 /// (agent-sessions-by-cwd). Returns groups keyed by the display path
 /// (`shorten_cwd_for_display`), sorted by that label for stable headers; within
@@ -404,6 +442,10 @@ impl YaldaGpuiView {
         // local-only sessions still mid-create. See `jump_panel_agent_rows`.
         let rows = self.jump_panel_agent_rows(cx);
 
+        // The active screen element for the red "you are here" box (UXI-JumpPanel-5):
+        // the session bound to the focused tile (matched against each row below).
+        let (active_local, active_sid) = self.jump_active_session();
+
         let mut col = div()
             .id("jump-panel")
             .flex()
@@ -440,7 +482,9 @@ impl YaldaGpuiView {
             let row_id = SharedString::from(format!("jump-ws-{idx}"));
             let num = format!("{}", idx + 1);
             col = col.child(
-                jump_nav_row(row_id, &label, active, active, Some(&num), None, &st, sel_bg)
+                // Active workspace gets the red "you are here" box (UXI-JumpPanel-5),
+                // additive over the accent label + selection tint.
+                jump_nav_row(row_id, &label, active, active, Some(&num), None, &st, sel_bg, active)
                     .on_click(
                         cx.listener(move |this, _ev, _window, cx| this.select_tab(idx, cx)),
                     ),
@@ -466,6 +510,7 @@ impl YaldaGpuiView {
                 Some(st.accent),
                 &st,
                 sel_bg,
+                false,
             )
             .on_click(
                 cx.listener(|this, _ev, _window, cx| {
@@ -551,6 +596,9 @@ impl YaldaGpuiView {
                 };
                 let row_id = SharedString::from(format!("jump-sess-{i}"));
                 let target = row.target.clone();
+                // Red active box when this row is the focused tile's bound session
+                // (UXI-JumpPanel-5).
+                let active = jump_target_is_active(&row.target, active_local, active_sid.as_deref());
                 let mut r = jump_nav_row(
                     row_id,
                     &row.label,
@@ -560,6 +608,7 @@ impl YaldaGpuiView {
                     Some(badge_color),
                     &st,
                     sel_bg,
+                    active,
                 );
                 if !row.connected {
                     r = r.text_color(st.dim);
@@ -620,7 +669,9 @@ impl YaldaGpuiView {
 /// `hover`/`on_click`); the caller attaches the click listener. `accent_text`
 /// draws the label in the accent color (used to mark the active workspace).
 /// `badge_color` colors the leading badge cell (a status light for agent rows);
-/// `None` falls back to the dim chrome color (workspace numbers).
+/// `None` falls back to the dim chrome color (workspace numbers). `active_box`
+/// wraps the row in the red "you are here" active box (UXI-JumpPanel-5) — the
+/// active workspace and/or the focused bound session; additive over `selected`.
 #[allow(clippy::too_many_arguments)]
 fn jump_nav_row(
     id: impl Into<ElementId>,
@@ -631,6 +682,7 @@ fn jump_nav_row(
     badge_color: Option<Hsla>,
     st: &DetailStyle,
     sel_bg: Hsla,
+    active_box: bool,
 ) -> gpui::Stateful<gpui::Div> {
     let transparent: Hsla = rgba(0x00000000).into();
     let label = if label.trim().is_empty() {
@@ -638,7 +690,7 @@ fn jump_nav_row(
     } else {
         label.to_string()
     };
-    div()
+    let mut row = div()
         .id(id)
         .flex()
         .flex_row()
@@ -651,7 +703,14 @@ fn jump_nav_row(
         .text_size(st.base)
         .font_family(st.mono.clone())
         .bg(if selected { sel_bg } else { transparent })
-        .hover(|s| s.bg(sel_bg))
+        .hover(|s| s.bg(sel_bg));
+    // The red active box marking "this is where you are" (UXI-JumpPanel-5). A
+    // 1px border keeps the row's height/geometry effectively unchanged and reads
+    // as a bounding box over the existing selection tint.
+    if active_box {
+        row = row.border_1().border_color(st.err).rounded_md();
+    }
+    row
         .child(
             div()
                 .w(px(16.0))

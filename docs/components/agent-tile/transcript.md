@@ -1,6 +1,7 @@
 # Agent Tile — Transcript
 
-Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-4..8`.
+Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-4..8`,
+`UXI-AgentTile-23`.
 
 ## Description
 
@@ -23,31 +24,37 @@ highlight, and a thinking indicator while awaiting. Append-only / ordered
 
 ### UXI-AgentTile-4 — Agent text uses the normal tile/desktop background
 
-**Statement.** Agent transcript text sits on the SAME background as the normal
-yalda desktop / tile — there is no per-turn "card" background tint behind agent
-or user turns. Turns are distinguished by the gutter label, the foreground
-author tint, and the left bar — never by a different background color.
+**Statement.** **Agent** transcript text (`TurnId::Llm`) sits on the SAME
+background as the normal yalda desktop / tile — there is no per-turn "card"
+background tint behind agent turns. Agent turns are distinguished by the gutter
+label, the foreground author tint, and the left bar — never by a different
+background color. (Scoped to agent turns by ADR-0027: **user** turns DO carry a
+faint background tint — see `UXI-AgentTile-23`. Tool/system turns are also
+untinted.)
 
-**Applies to.** The agent transcript (`TranscriptView`). The transient
-focused-row highlight (a dim band on the cursor row, shown ONLY while the
-transcript is focused for navigation) is NOT a violation — it's a focus/nav cue,
-not a resting background. Code blocks keep their own background (code styling, not
-a turn card). The compose box keeps its pinned-control affordance.
+**Applies to.** The agent transcript (`TranscriptView`), agent-turn lines. The
+transient focused-row highlight (a dim band on the cursor row, shown ONLY while
+the transcript is focused for navigation) is NOT a violation — it's a focus/nav
+cue, not a resting background. Code blocks keep their own background (code
+styling, not a turn card). The compose box keeps its pinned-control affordance.
 
-**Why.** A tinted card per turn makes the transcript read as a separate surface
-floating on the desktop; the agent's text should blend into the tile like every
-other surface, so the workspace looks like one continuous space.
+**Why.** A tinted card behind the *agent's* prose — the bulk of the transcript —
+makes it read as a separate surface floating on the desktop; the agent's text
+should blend into the tile like every other surface, so the workspace looks like
+one continuous space. (The user's own turns are a small fraction and are
+deliberately picked out — ADR-0027.)
 
-**Status.** `implemented` (runtime-unverified for paint). `transcript_view.rs` sets
-`row_bg` to transparent for every committed turn; the per-turn `claude_turn_bg`/
-`user_turn_bg` (theme `agent_turn_bg`/`user_turn_bg`) tints are no longer applied.
-The cursor-row dim highlight remains, gated on transcript focus
-(`cursor_line == usize::MAX` when composing, so no row matches).
+**Status.** `implemented` (runtime-unverified for paint). `transcript_view.rs`
+leaves `row_bg` transparent for agent/tool/system committed turns; only user turns
+receive the `user_turn_bg` tint (`UXI-AgentTile-23`). The cursor-row dim highlight
+remains, gated on transcript focus (`cursor_line == usize::MAX` when composing, so
+no row matches).
 
-**Enforcement.** Runtime (GPUI paint not headless): open an agent tile and
-confirm agent/user turns show no background tint distinct from the tile; the
-focused row highlights only during transcript (`f`) navigation. (A headless guard
-awaits the element-tree-snapshot harness — `docs/projects/headless-e2e/` #3.2.)
+**Enforcement.** Headless mapping: `verify_harness.rs`
+`user_turn_gets_tint_agent_turn_does_not` asserts the row-background selector
+returns transparent for an `Llm` turn line (and the tint for `User`). The actual
+painted hue is a runtime check (GPUI paint not headless, gap #1): open an agent
+tile and confirm agent turns show no background tint distinct from the tile.
 
 ### UXI-AgentTile-5 — No empty turn header
 
@@ -215,3 +222,49 @@ trailing-whitespace trim is what keeps this true). AND
 starting with a SPACE, and one that is a bare `.`. Asserts the sentence is contiguous
 and that no line is left holding only the terminator. Negative control: restore the
 two `is_alphanumeric()` gates → it fails RED while the mid-word test stays green.
+
+### UXI-AgentTile-23 — The user's own turns carry a faint background tint
+
+**Statement.** In the agent transcript, a **user** turn (`TurnId::User`, the
+frozen `U<n>` blocks — the messages the user sent) renders on a **faint blue
+background band** (`AgentTheme::user_turn_bg`, per-theme), so the user's own
+contributions stand out from the agent's at a glance. Agent turns (`TurnId::Llm`),
+tool turns (`TurnId::Tool`), and system turns stay on the plain tile background
+(`UXI-AgentTile-4`). The tint is *faint* — a low-contrast band, not a floating
+card. This is a deliberate reversal, for user turns only, of the earlier
+"no per-turn background" rule (ADR-0027).
+
+**Precedence.** The transient nav-focus cursor-row highlight (a dim band on the
+cursor row, only while the transcript is focused for navigation) OVERRIDES the
+user tint on that one row, so no row shows two competing fills. Code blocks inside
+a user turn keep their own code background. The live compose box / draft `You`
+block is unaffected (it keeps its accent affordance; the tint is for *committed*
+turns).
+
+**Applies to.** `transcript_view.rs`: the pure `committed_row_bg(tag,
+user_turn_bg)` selector (returns `user_turn_bg` for `TurnId::User`, transparent
+otherwise) and the frozen-line `row_bg` in `TranscriptView::render` that consumes
+it under the cursor-row check. `src/theme.rs`: `AgentTheme::user_turn_bg`
+(retuned to a faint blue in every theme constructor).
+
+**Why.** In a long transcript the user asked to pick out what *they* said versus
+what the agent said. The left bar + `U<n>` gutter label + foreground tint were too
+thin to scan by; a faint background band per user turn is scannable without
+turning the transcript into a wall of cards (the agent turns — the bulk — stay
+card-less, so `UXI-AgentTile-4`'s "one continuous surface" concern holds).
+
+**Status.** `implemented`.
+
+**Deviation from plan.** None material. The tint reuses the pre-existing
+`AgentTheme::user_turn_bg` field (present on all 8 theme constructors, previously
+an unused warm-green from the `UXI-AgentTile-4` removal), retuned in place to a
+faint blue — no new theme field was added. The faint-blue hex per theme is a first
+cut chosen for subtlety on each theme's background; the exact shade is runtime-
+tunable by eye (gap #1).
+
+**Enforcement.** Headless mapping (the paint hue is gap #1, human eye):
+`verify_harness.rs` `user_turn_gets_tint_agent_turn_does_not` — the pure
+`committed_row_bg` returns the passed `user_turn_bg` for a `TurnId::User` tag and
+transparent for `TurnId::Llm` / `TurnId::Tool` / `TurnId::System` / `None`. Negative
+control observed RED: force the `User` arm transparent → "user turn is tinted"
+fails.

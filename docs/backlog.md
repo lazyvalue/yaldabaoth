@@ -13,6 +13,31 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Agent transcript: faint-blue background on the user's own turns** —
+  `NEEDS-RUNTIME` (built 2026-07-22 via `/new-ux`; `UXI-AgentTile-23`, ADR-0027).
+  "I want the background color of my responses in an agent session to be a slightly
+  different color. Possibly a faint blue." User turns (`TurnId::User`) now render on
+  a faint blue band (`AgentTheme::user_turn_bg`, retuned from warm-green to blue in
+  all 8 themes); agent/tool/system turns stay on the plain tile background. Reversed
+  `UXI-AgentTile-4` for user turns only (ADR-0027). Pure selector
+  `committed_row_bg`; nav-focus cursor-row highlight still overrides on its row.
+  Guard: `user_turn_gets_tint_agent_turn_does_not` (NC observed RED). **Runtime
+  check:** the exact blue shade per theme — confirm it reads as "faint/pleasant" on
+  each theme (gap #1, human eye); shades are tunable in `src/theme.rs`.
+
+- **Jump panel: red bounding box on the active screen UX element** —
+  `NEEDS-RUNTIME` (built 2026-07-22 via `/new-ux`; `UXI-JumpPanel-5`). "The active
+  screen UX element (either a workspace or an agent session) should have a red
+  bounding box in the jump panel." A 1px red box (`DetailStyle.err` = `0xff6b6b`,
+  rounded) marks the active-workspace row (additive over its accent label +
+  selection tint) and, when the focused tile is a bound agent, that session's row
+  — 0/1/2 boxes. Ephemeral (free-session) workspaces aren't listed, so only the
+  session boxes in that state; a buffer / unbound-agent tile boxes no session.
+  Pure predicate `jump_target_is_active` over `jump_active_session()`
+  (focused-tile bound session). Guard:
+  `jump_active_box_marks_focused_workspace_and_session` (NC observed RED). The
+  literal red pixels are harness gap #1 — human eye.
+
 - **Free agent session: choose its CWD at create** — `NEEDS-RUNTIME` (built
   2026-07-22 via `/new-ux`; `UXI-JumpPanel-4`). "When creating a new agent session
   outside of a workspace, need a way to specify what CWD." Both free-session entry

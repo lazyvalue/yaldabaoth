@@ -41,6 +41,20 @@ use super::*;
 /// moved — the invalidation GPUI needs to repaint the just-typed text.
 pub(crate) const YOU_BLOCK_SPLICE_LABEL: &str = "you_block_splice";
 
+/// The RESTING row background for a committed transcript line (UXI-AgentTile-4 /
+/// UXI-AgentTile-23, ADR-0027): a **user** turn (`TurnId::User`) gets the faint
+/// `user_turn_bg` tint so the user's own contributions stand out; agent, tool,
+/// and system turns stay on the plain tile background (transparent). The nav-focus
+/// cursor-row highlight is applied by the caller and OVERRIDES this on its row, so
+/// no row shows two competing fills. Pure so the "which turns get a tint" decision
+/// is headlessly testable (the actual painted hue is gap #1).
+pub(crate) fn committed_row_bg(tag: Option<TurnId>, user_turn_bg: Hsla) -> Hsla {
+    match tag {
+        Some(TurnId::User(_)) => user_turn_bg,
+        _ => rgba(0x00000000).into(),
+    }
+}
+
 /// The slice-version watermark the observe filter compares across renders. Each
 /// field is a monotonic (or monotonic-equivalent) counter for one input the
 /// transcript `render()` reads; the observe callback recomputes the live values
@@ -1010,18 +1024,19 @@ impl TranscriptView {
                                 Some(TurnId::System) | None => ("   ".into(), dim_fg),
                             }
                         };
-                        // UXI-AgentTile-4: agent transcript text sits on the normal
-                        // tile/desktop background — no per-turn card tint. The only
-                        // row background is the transient focus highlight on the
-                        // cursor row, which appears ONLY while the transcript is
-                        // focused for navigation (`cursor_line == usize::MAX`
-                        // otherwise, so no row matches during compose).
+                        // Row background: the transient nav-focus highlight on the
+                        // cursor row wins (shown ONLY while the transcript is focused
+                        // for navigation — `cursor_line == usize::MAX` otherwise, so
+                        // no row matches during compose). Off the cursor row, a USER
+                        // turn gets the faint `user_turn_bg` tint (UXI-AgentTile-23,
+                        // ADR-0027) while agent/tool/system turns stay on the plain
+                        // tile background (UXI-AgentTile-4).
                         let row_bg: Hsla = if line_idx == cursor_line {
                             let mut h = nc(at_snap.dim);
                             h.a = 0.2;
                             h
                         } else {
-                            rgba(0x00000000).into()
+                            committed_row_bg(tag, nc(at_snap.user_turn_bg))
                         };
 
                         div()

@@ -1140,7 +1140,7 @@ impl AgentTheme {
             frozen_fg: Color::Rgb(0xb6, 0xc4, 0xd6),  // muted blue-gray
 
             agent_turn_bg: Color::Rgb(0x23, 0x27, 0x36), // subtle cool tint
-            user_turn_bg: Color::Rgb(0x2a, 0x33, 0x28),  // clearly warm green tint
+            user_turn_bg: Color::Rgb(0x28, 0x2e, 0x3a),  // faint blue tint (UXI-AgentTile-23)
 
             turn_header_agent: Color::Rgb(0x8b, 0xe9, 0xfd),
             turn_header_user: Color::Rgb(0x50, 0xfa, 0x7b),
@@ -1185,7 +1185,7 @@ impl AgentTheme {
             frozen_fg: Color::Rgb(0xa0, 0xb4, 0xc8),
 
             agent_turn_bg: Color::Rgb(0x16, 0x1f, 0x2d),
-            user_turn_bg: Color::Rgb(0x1e, 0x2a, 0x22), // clearly warm green tint
+            user_turn_bg: Color::Rgb(0x1c, 0x22, 0x30), // faint blue tint (UXI-AgentTile-23)
 
             turn_header_agent: Color::Rgb(0x63, 0xcd, 0xcf),
             turn_header_user: Color::Rgb(0x81, 0xb2, 0x9a),
@@ -1230,7 +1230,7 @@ impl AgentTheme {
             frozen_fg: Color::Rgb(0x47, 0x60, 0x6e),
 
             agent_turn_bg: Color::Rgb(0xf0, 0xeb, 0xdd), // barely darker than paper
-            user_turn_bg: Color::Rgb(0xe4, 0xed, 0xd8),  // clearly green tint
+            user_turn_bg: Color::Rgb(0xdd, 0xe4, 0xee),  // faint blue tint (UXI-AgentTile-23)
 
             turn_header_agent: Color::Rgb(0x26, 0x8b, 0xd2),
             turn_header_user: Color::Rgb(0x85, 0x99, 0x00),
@@ -1275,7 +1275,7 @@ impl AgentTheme {
             frozen_fg: Color::Rgb(0x78, 0x8e, 0x96),
 
             agent_turn_bg: Color::Rgb(0x02, 0x30, 0x3c),
-            user_turn_bg: Color::Rgb(0x0c, 0x38, 0x28), // clearly warm green tint
+            user_turn_bg: Color::Rgb(0x0a, 0x30, 0x40), // faint blue tint (UXI-AgentTile-23)
 
             turn_header_agent: Color::Rgb(0x26, 0x8b, 0xd2),
             turn_header_user: Color::Rgb(0x85, 0x99, 0x00),
@@ -1320,7 +1320,7 @@ impl AgentTheme {
             frozen_fg: Color::Rgb(0xb0, 0xaa, 0x8e),
 
             agent_turn_bg: Color::Rgb(0x20, 0x24, 0x26),
-            user_turn_bg: Color::Rgb(0x2c, 0x2e, 0x1e), // clearly warm olive tint
+            user_turn_bg: Color::Rgb(0x22, 0x26, 0x2e), // faint blue tint (UXI-AgentTile-23)
 
             turn_header_agent: Color::Rgb(0x83, 0xa5, 0x98),
             turn_header_user: Color::Rgb(0xb8, 0xbb, 0x26),
@@ -1365,7 +1365,7 @@ impl AgentTheme {
             frozen_fg: Color::Rgb(0x44, 0x42, 0x40),
 
             agent_turn_bg: Color::Rgb(0xf8, 0xec, 0xdd),
-            user_turn_bg: Color::Rgb(0xe6, 0xee, 0xd8), // clearly green tint
+            user_turn_bg: Color::Rgb(0xdf, 0xe6, 0xef), // faint blue tint (UXI-AgentTile-23)
 
             turn_header_agent: Color::Rgb(0x0f, 0x54, 0x99),
             turn_header_user: Color::Rgb(0x0d, 0x76, 0x80),
@@ -1410,7 +1410,7 @@ impl AgentTheme {
             frozen_fg: Color::Rgb(0xc0, 0xb4, 0xa8),
 
             agent_turn_bg: Color::Rgb(0x1e, 0x1d, 0x1c),
-            user_turn_bg: Color::Rgb(0x26, 0x2c, 0x22), // clearly warm green tint
+            user_turn_bg: Color::Rgb(0x22, 0x26, 0x30), // faint blue tint (UXI-AgentTile-23)
 
             turn_header_agent: Color::Rgb(0x5e, 0xa7, 0xd9),
             turn_header_user: Color::Rgb(0x34, 0xb0, 0xb8),
@@ -1455,7 +1455,7 @@ impl AgentTheme {
             frozen_fg: Color::Rgb(0x3a, 0x3e, 0x48),
 
             agent_turn_bg: Color::Rgb(0xf2, 0xf0, 0xeb), // barely darker than paper
-            user_turn_bg: Color::Rgb(0xe5, 0xed, 0xe0),  // clearly green tint
+            user_turn_bg: Color::Rgb(0xde, 0xe5, 0xee),  // faint blue tint (UXI-AgentTile-23)
 
             turn_header_agent: Color::Rgb(0x40, 0x5d, 0x72), // steel
             turn_header_user: Color::Rgb(0x49, 0x5f, 0x4e),  // sage

@@ -1104,6 +1104,113 @@ fn agent_dot_status_mapping() {
     assert_eq!(row(false, Some(true)).dot_status(), AgentDotStatus::Neutral);
 }
 
+/// UXI-AgentTile-23 (ADR-0027): the transcript row-background selector gives a
+/// USER turn the theme's faint `user_turn_bg` tint and leaves agent / tool /
+/// system / untagged lines transparent (UXI-AgentTile-4). The painted hue is
+/// gap #1 (human eye); this pins the decision of WHICH turns get a tint.
+///
+/// Negative control: make `committed_row_bg`'s `User` arm return transparent →
+/// the "user turn is tinted" assert fails RED (observed).
+#[test]
+fn user_turn_gets_tint_agent_turn_does_not() {
+    use crate::{committed_row_bg, TurnId};
+    let tint: gpui::Hsla = gpui::rgb(0x283040).into();
+    let transparent: gpui::Hsla = gpui::rgba(0x00000000).into();
+    assert_eq!(
+        committed_row_bg(Some(TurnId::User(1)), tint),
+        tint,
+        "user turn is tinted"
+    );
+    assert_eq!(
+        committed_row_bg(Some(TurnId::Llm(1)), tint),
+        transparent,
+        "agent turn is not tinted"
+    );
+    assert_eq!(
+        committed_row_bg(Some(TurnId::Tool(1)), tint),
+        transparent,
+        "tool turn is not tinted"
+    );
+    assert_eq!(
+        committed_row_bg(Some(TurnId::System), tint),
+        transparent,
+        "system turn is not tinted"
+    );
+    assert_eq!(
+        committed_row_bg(None, tint),
+        transparent,
+        "untagged line is not tinted"
+    );
+}
+
+/// UXI-JumpPanel-5: the active screen UX element wears the red "you are here" box
+/// in the jump panel. Drives the REAL derivation (`jump_active_session` +
+/// `jump_target_is_active` over the REAL `jump_panel_agent_rows`) rather than any
+/// hand-built proxy: the focused tile's bound session is the one active row, an
+/// unfocused session is never active, the active tab is a listed (boxable)
+/// workspace, and unbinding the tile (no focused bound session) clears the
+/// session box. The literal red pixels are harness gap #1 (human eye).
+///
+/// Negative control: make `jump_target_is_active` return `false` unconditionally
+/// → the "exactly one active row" assert fails RED (observed).
+#[gpui::test]
+fn jump_active_box_marks_focused_workspace_and_session(cx: &mut TestAppContext) {
+    use crate::{jump_target_is_active, JumpTarget};
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+    // A second session added straight to the store (NOT via show_local_session,
+    // which would rebind the focused agent tile) so it stays free + unfocused —
+    // it must never be boxed.
+    let other = view.update(vcx, |v, cx| {
+        let ent = cx.new(|_| crate::AgentSession {
+            state: crate::AgentState::new_server_managed(None),
+            label: "claude-2".into(),
+            cwd: PathBuf::from("."),
+            resume_id: None,
+        });
+        v.sessions.create_local(|_| ent)
+    });
+
+    view.read_with(vcx, |v, cx| {
+        // The active workspace is a listed (non-ephemeral) tab, so its row is
+        // boxed (workspace arm; the box reuses the row's existing `active`).
+        assert!(!v.workspace.active_is_ephemeral(), "active tab is listed");
+        assert!(!v.workspace.tabs[v.workspace.active_tab].ephemeral);
+
+        // The focused tile's bound session is the active-session identity.
+        let (active_local, active_sid) = v.jump_active_session();
+        assert_eq!(active_local, Some(id), "focused session is active");
+
+        let rows = v.jump_panel_agent_rows(cx);
+        let active: Vec<_> = rows
+            .iter()
+            .filter(|r| jump_target_is_active(&r.target, active_local, active_sid.as_deref()))
+            .collect();
+        assert_eq!(active.len(), 1, "exactly the focused session's row is active");
+        assert!(active[0].bound, "the boxed row is the bound (focused) session");
+        // The other, unfocused session is present but NOT active.
+        let other_active = rows.iter().any(|r| {
+            matches!(&r.target, JumpTarget::Local(lid) if *lid == other)
+                && jump_target_is_active(&r.target, active_local, active_sid.as_deref())
+        });
+        assert!(!other_active, "an unfocused session is never boxed");
+    });
+
+    // Unbind the focused tile → it becomes the selector (an unbound agent tile),
+    // so there is NO focused bound session: the buffer / unbound-agent arm — no
+    // session row is boxed.
+    view.update(vcx, |v, cx| v.show_selector_on_focused_tile(cx));
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, cx| {
+        let (active_local, active_sid) = v.jump_active_session();
+        assert_eq!(active_local, None, "unbound tile has no active session");
+        let any = v
+            .jump_panel_agent_rows(cx)
+            .iter()
+            .any(|r| jump_target_is_active(&r.target, active_local, active_sid.as_deref()));
+        assert!(!any, "no session boxed when no bound session is focused");
+    });
+}
+
 /// Jump-panel selection of a FREE session opens an ephemeral virtual workspace
 /// (ADR-0021): a new single-tile tab bound to the session, made active. Leaving
 /// it (any workspace switch) tears it down and returns the session to free —
