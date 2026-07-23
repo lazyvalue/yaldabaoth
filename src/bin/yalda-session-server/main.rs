@@ -26,6 +26,7 @@ use yalda::acp_channel::{
 };
 use yalda::session_proto::*;
 
+mod bridge;
 mod launchd;
 
 // ── Forwarder progress + published log snapshot (Bug 1) ─────────────
@@ -2595,6 +2596,10 @@ async fn main() -> io::Result<()> {
     for job in resume_jobs {
         spawn_resume_worker(manager.cmd_tx.clone(), job, Arc::clone(&spawner));
     }
+
+    // Start the external chat bridge (Telegram) iff configured. No-op when
+    // unconfigured (the common case); spec-external-chat-bridge.md.
+    bridge::maybe_spawn_bridge(Arc::clone(&manager));
 
     // Handle graceful shutdown — persist sessions before exiting.
     // Listen for both SIGINT (Ctrl-C) and SIGTERM (kill / process manager).
