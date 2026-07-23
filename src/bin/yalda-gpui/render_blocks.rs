@@ -278,10 +278,11 @@ pub(crate) fn doc_styled_line_element(
     // StyledText.
     let mut text = String::new();
     let mut runs: Vec<TextRun> = Vec::new();
-    // Byte range + target for every wiki link on this line. Populated as
-    // we walk spans below; used to wrap the StyledText in InteractiveText
-    // with on_click handlers.
-    let mut wiki_link_ranges: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    // Byte range + raw target for every link on this line (wiki OR external
+    // URL — bug-0018). Populated as we walk spans below; used to wrap the
+    // StyledText in InteractiveText with on_click handlers that route through
+    // `classify_link`.
+    let mut link_ranges: Vec<(std::ops::Range<usize>, String)> = Vec::new();
 
     if line.spans.is_empty() {
         text.push(' ');
@@ -302,12 +303,12 @@ pub(crate) fn doc_styled_line_element(
             let len = span.text.len();
             let span_start = text.len();
             text.push_str(&span.text);
-            if let Some(link) = span
-                .link
-                .as_deref()
-                .and_then(|l| l.strip_prefix(WIKI_LINK_PREFIX))
-            {
-                wiki_link_ranges.push((span_start..span_start + len, link.to_string()));
+            // Collect EVERY linked span (wiki note OR external URL), keeping the
+            // raw link string; `classify_link` at click time decides the action
+            // (bug-0018). Previously only `wiki:`-prefixed links were collected,
+            // so URL links got no click handler and were inert.
+            if let Some(link) = span.link.as_deref() {
+                link_ranges.push((span_start..span_start + len, link.to_string()));
             }
             let font = if combined.bg.is_some() || combined.fg == Some(NColor::Rgb(241, 250, 140)) {
                 font_for(combined, code_font)
@@ -427,25 +428,26 @@ pub(crate) fn doc_styled_line_element(
     let layout = styled.layout().clone();
     let key = (block_idx, line_idx);
 
-    // Plain text path — no wiki links on this line.
-    if wiki_link_ranges.is_empty() {
+    // Plain text path — no links on this line.
+    if link_ranges.is_empty() {
         return register_line_on_paint(styled.into_any_element(), sink, key, layout);
     }
 
-    // Wrap in InteractiveText so we can attach an on_click handler. Wiki
-    // link clicks navigate the focused tile to the target file via
-    // `open_wiki_link` on the view (resolved through the weak handle
-    // captured in RenderCtx).
+    // Wrap in InteractiveText so we can attach an on_click handler. A click
+    // routes through `classify_link`: an external URL opens in the default
+    // browser (`open_external_link`), a note/local link navigates the focused
+    // tile to the file (`open_wiki_link`). View reached via the weak handle
+    // captured in RenderCtx.
     let weak = match &ctx.weak_view {
         Some(w) => w.clone(),
         None => return styled.into_any_element(),
     };
     let doc_dir = ctx.doc_dir.clone();
     let ranges: Vec<std::ops::Range<usize>> =
-        wiki_link_ranges.iter().map(|(r, _)| r.clone()).collect();
-    let targets: Vec<String> = wiki_link_ranges.into_iter().map(|(_, t)| t).collect();
+        link_ranges.iter().map(|(r, _)| r.clone()).collect();
+    let targets: Vec<String> = link_ranges.into_iter().map(|(_, t)| t).collect();
     let element_id = gpui::ElementId::Name(SharedString::from(format!(
-        "wiki-line-{block_idx}-{line_idx}"
+        "link-line-{block_idx}-{line_idx}"
     )));
     let el = gpui::InteractiveText::new(element_id, styled)
         .on_click(ranges, move |idx, _w, app| {
@@ -454,8 +456,9 @@ pub(crate) fn doc_styled_line_element(
             };
             let target = target.clone();
             let doc_dir = doc_dir.clone();
-            let _ = weak.update(app, |view, cx| {
-                view.open_wiki_link(&target, doc_dir.as_deref(), cx);
+            let _ = weak.update(app, |view, cx| match classify_link(&target) {
+                LinkTarget::External(url) => view.open_external_link(&url, cx),
+                LinkTarget::Wiki(t) => view.open_wiki_link(&t, doc_dir.as_deref(), cx),
             });
         })
         .into_any_element();
@@ -1840,9 +1843,44 @@ pub(crate) fn styled_line_char_count(line: &StyledLine) -> usize {
 
 /// Prefix on `StyledSpan.link` that marks a wiki-style link target
 /// (`[[note]]` in markdown). The doc-view click handler treats spans with
-/// this prefix as file references — anything else is a regular markdown
-/// link and is left alone for now.
+/// this prefix as file references; regular markdown links keep their raw
+/// `dest_url` and are classified by [`classify_link`].
 pub(crate) const WIKI_LINK_PREFIX: &str = "wiki:";
+
+/// What a clicked link should do (bug-0018). Every linked span in a rendered
+/// doc is routed through here so URL links open the browser and note links open
+/// the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LinkTarget {
+    /// An internal note / local-file reference — resolved relative to the doc
+    /// dir and opened in-app by `open_wiki_link`. Covers `wiki:`-prefixed
+    /// `[[note]]` links AND scheme-less / relative markdown links (`./a.md`).
+    Wiki(String),
+    /// An external URL — opened in the OS default handler by
+    /// `open_external_link`. Restricted to `http`/`https`/`mailto` so `open`
+    /// never launches an arbitrary local handler.
+    External(String),
+}
+
+/// Classify a raw link string (a `StyledSpan.link`) into the action it should
+/// trigger (bug-0018). `wiki:`-prefixed → `Wiki` (prefix stripped);
+/// `http://` / `https://` / `mailto:` (case-insensitive) → `External`;
+/// everything else (a relative or scheme-less link) → `Wiki` as a local-file
+/// reference. Pure so the routing decision — the actual fix — is unit-testable.
+pub(crate) fn classify_link(raw: &str) -> LinkTarget {
+    let t = raw.trim();
+    if let Some(rest) = t.strip_prefix(WIKI_LINK_PREFIX) {
+        return LinkTarget::Wiki(rest.to_string());
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:")
+    {
+        return LinkTarget::External(t.to_string());
+    }
+    LinkTarget::Wiki(t.to_string())
+}
 
 /// Map a file extension to a syntect language token. Returns `None` for
 /// markdown and unknown extensions — those are rendered as prose.

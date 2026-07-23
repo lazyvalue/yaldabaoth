@@ -261,6 +261,19 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// Open an external URL in the OS default handler (on macOS `open <url>` →
+    /// the default browser, e.g. Chrome). Only called for links `classify_link`
+    /// deemed `External` (http/https/mailto), so `open` never launches an
+    /// arbitrary local handler. Best-effort: a spawn failure is logged, not
+    /// surfaced. NOTE: the actual browser launch is a live-subprocess side
+    /// effect — verified by a human, not headlessly (harness gap #2); the
+    /// routing decision that fixes bug-0018 is guarded by `classify_link`.
+    pub(crate) fn open_external_link(&mut self, url: &str, _cx: &mut Context<Self>) {
+        if let Err(e) = std::process::Command::new("open").arg(url).spawn() {
+            eprintln!("open external link {url}: {e}");
+        }
+    }
+
     /// Re-read the focused window's file from disk and rebuild its content,
     /// discarding any unsaved buffer state. Doc view: re-renders blocks and
     /// resets scroll/cursor (file may have shifted out from under the user).

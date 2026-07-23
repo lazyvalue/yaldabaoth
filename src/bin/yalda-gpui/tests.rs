@@ -3639,3 +3639,49 @@ fn unknown_detail_zoom_falls_back_to_full() {
         "\"minimap\""
     );
 }
+
+/// bug-0018: a clicked link routes by `classify_link`. External URLs
+/// (http/https/mailto) → `External` (opened in the default browser); `wiki:`
+/// note links and relative/scheme-less links → `Wiki` (opened in-app). This is
+/// the exact routing decision the doc-view `on_click` runs; before the fix, URL
+/// links were never collected/classified and were inert.
+///
+/// Negative control: remove the http/https/mailto branch in `classify_link`
+/// (so it falls through to `Wiki`) → the URL asserts fail RED (a URL would be
+/// mis-routed to `open_wiki_link`, which only resolves LOCAL files — the bug).
+#[test]
+fn classify_link_routes_urls_external_and_notes_wiki() {
+    use crate::{classify_link, LinkTarget};
+
+    // External URLs → open in the browser.
+    assert_eq!(
+        classify_link("https://example.com/x"),
+        LinkTarget::External("https://example.com/x".into()),
+    );
+    assert_eq!(
+        classify_link("http://localhost:3000"),
+        LinkTarget::External("http://localhost:3000".into()),
+    );
+    assert_eq!(
+        classify_link("HTTPS://Example.COM"),
+        LinkTarget::External("HTTPS://Example.COM".into()),
+        "scheme match is case-insensitive; raw target preserved"
+    );
+    assert_eq!(
+        classify_link("mailto:scott@maher.lol"),
+        LinkTarget::External("mailto:scott@maher.lol".into()),
+    );
+    // Surrounding whitespace is trimmed before classifying.
+    assert_eq!(
+        classify_link("  https://trimmed.example  "),
+        LinkTarget::External("https://trimmed.example".into()),
+    );
+
+    // Wiki / local references → open in-app (prefix stripped for wiki:).
+    assert_eq!(classify_link("wiki:my-note"), LinkTarget::Wiki("my-note".into()));
+    assert_eq!(classify_link("./relative.md"), LinkTarget::Wiki("./relative.md".into()));
+    assert_eq!(classify_link("other-note"), LinkTarget::Wiki("other-note".into()));
+    // A non-browser scheme is NOT opened externally (open must not launch an
+    // arbitrary local handler) — treated as a local reference.
+    assert_eq!(classify_link("file:///etc/passwd"), LinkTarget::Wiki("file:///etc/passwd".into()));
+}
