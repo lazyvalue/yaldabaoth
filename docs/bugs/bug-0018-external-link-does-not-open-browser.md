@@ -1,6 +1,6 @@
 # bug-0018: external-link-does-not-open-browser
 
-**Status:** IN-PROGRESS
+**Status:** FIXED
 **First seen:** 2026-07-23
 **Component:** docs/components/buffer (rendered markdown) — link rendering path
 
@@ -57,3 +57,29 @@ app — can't verify a browser actually launched headlessly); flagged, not faked
 Localized: `render_blocks.rs::build_wrapped_line` only wires `wiki:`-prefixed
 spans to a click handler, and `open_wiki_link` has no external-URL branch — so
 URL links are inert. Fix in progress per Planned solution.
+
+### 2026-07-23 15:40 — fixed (commit 12b498d)
+
+**Changed:**
+- `render_blocks.rs`: `LinkTarget` enum + pure `classify_link(raw)` (near
+  `WIKI_LINK_PREFIX`); `build_wrapped_line` now collects EVERY linked span (not
+  just `wiki:`-prefixed) into `link_ranges`, and the `on_click` dispatches via
+  `classify_link` — `External` → `open_external_link`, `Wiki` → `open_wiki_link`.
+- `edit_ui.rs`: `open_external_link(url)` = `open <url>` (macOS default handler
+  → default browser), best-effort.
+- `tests.rs`: `classify_link_routes_urls_external_and_notes_wiki`.
+
+**Verified:** guard test passes; **negative control observed RED** — disabling
+the http/https/mailto branch (`if false && …`) makes `classify_link` return
+`Wiki("https://…")`, failing the External asserts (`left: Wiki`, `right:
+External`), i.e. a URL would be mis-routed to the local-file resolver. Full suite
+412 passed. Committed in isolation (staged only this bug's hunks; a shared tree
+held unrelated paragraph-spacing + jump-panel work — stashed with `--keep-index`,
+confirmed the committed state compiles + the guard passes, then popped).
+
+**Unverified (harness gap #2):** the actual browser launch from `open` is a live
+subprocess side effect — not headlessly testable. The routing decision (the bug)
+IS guarded. Needs a human click on a URL link to confirm Chrome opens.
+
+**Outcome:** FIXED on `main`. Binary rebuild + restart needed for the user to get
+it (they run `main` release).
