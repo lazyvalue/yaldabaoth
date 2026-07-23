@@ -106,7 +106,10 @@ impl YaldaGpuiView {
         {
             let tab = &mut self.workspace.tabs[tab_idx];
             let leaves = tab.layout.leaf_ids();
-            tab.desktop.reconcile(&leaves);
+            // Seed beside the tile the user is on (bug-0012): a brand-new leaf
+            // IS the focused one and has no slot yet, so `reconcile_near` falls
+            // back to `last_reveal` — still the tile focus came from.
+            tab.desktop.reconcile_near(&leaves, Some(focused_id));
             if tab.desktop.last_reveal != Some(focused_id) {
                 if let Some(slot) = tab.desktop.slot_of(focused_id) {
                     let (x, y) = workspace::slot_origin(slot, tile, g);

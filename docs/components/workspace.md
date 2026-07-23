@@ -227,18 +227,25 @@ after the leader). Per CLAUDE.md rule 4, `simulate_keystrokes` is focus-accurate
 not OS-accurate, so the real macOS chord firing is a **human runtime check** (the one
 genuine gap for this UXI).
 
-### UXI-Workspace-6 — Placement is free and origin-seeded; no insert-shift shelf
+### UXI-Workspace-6 — Placement is free and neighbor-seeded; no insert-shift shelf
 
 **Statement.** New tiles seed at the **first free slot on an outward ring-spiral
-from the origin** (skipping occupied rectangles) — new work clusters near origin.
+centered on the tile the user is on** (the focused tile if placed, else the
+last-revealed one, else the origin), skipping occupied rectangles — new work
+appears beside the work it came from. Within a ring the scan is in **preference
+order, not reading order**: nearest row first, and at equal distance below before
+above and right before left. So a new tile opened beside a lone tile lands at
+`(row, col + 1)` — **same height, directly to the right** — never diagonally
+(bug-0012).
 Dragging a tile moves it to the dropped slot iff its whole rectangle lands on
 free slots; an overlapping drop is **rejected** (returns home). There is **no**
 row-major insert-and-shift ripple. Closing a tile leaves a gap; neighbors never
 move. `focus_next`/`focus_prev` traverse `slots` in signed row-major **reading
 order** (top→bottom, left→right); spatial directional focus is unchanged.
 
-**Applies to.** `workspace.rs`: `seed_slot` (ring-spiral, replaces the shelf
-`first_free_slot`); free-placement drop (desktop-mode Behavior 4 gesture, ripple
+**Applies to.** `workspace.rs`: `seed_slot_near` / `seed_slot` (ring-spiral,
+replaces the shelf `first_free_slot`) and `reconcile_near` (resolves the spiral
+center), called from the per-frame plane upkeep in `chrome.rs`; free-placement drop (desktop-mode Behavior 4 gesture, ripple
 removed); edge-resize `clamp_resize` unchanged in spirit (Block rule);
 `sequence_neighbor` retained for traversal only (decoupled from placement).
 
@@ -249,10 +256,15 @@ model for a boundless canvas.
 **Status.** `implemented`.
 
 **Enforcement.** `workspace.rs` desktop_tests: `seed_slot_spiral_deterministic`
-(origin-first, occupied origin ⇒ next lands on the exact reading-order ring slot,
-deterministic) and `free_drop_rejects_overlap_without_moving_neighbors` (overlapping
+(origin-first, occupied origin ⇒ next lands same-row-right, deterministic),
+`seed_slot_near_prefers_same_row_right` (spiral centered on a non-origin tile)
+and `free_drop_rejects_overlap_without_moving_neighbors` (overlapping
 drop leaves every tile's slot unchanged — no ripple). Both negative-control-verified
-RED. Existing signed-adapted desktop_tests cover the type-only reuses.
+RED. On the REAL path: `verify_harness.rs`
+`new_tile_lands_same_row_right_of_the_only_tile` — the sole tile parked off-origin,
+the user's `Ctrl-W v` handler, slot assigned by the real `chrome.rs` reconcile;
+negative-controlled RED twice (origin-centered ⇒ `(0,0)`; row-major ring ⇒
+`(0,-2)`). Existing signed-adapted desktop_tests cover the type-only reuses.
 
 **Deviation from plan.** The dead shelf code was deleted (`Slot::succ`, `first_free`,
 `seed(leaves,w)`, `insert_shift`, `absorbable_run`, `effective_width`); `reconcile`

@@ -789,39 +789,73 @@ impl DesktopState {
         self.slots.sort_by_key(|&(_, s)| s);
     }
 
-    /// The first free slot on an outward ring-spiral from the origin
+    /// The first free slot on an outward ring-spiral centered on `center`
     /// (`spec-infinite-plane-workspace.md` Behavior 4): ring radius `r = 0, 1,
-    /// 2, …`; within each ring, rows `-r..=r` × cols `-r..=r` in reading order,
-    /// skipping the already-scanned interior (`|dr| < r && |dc| < r`) and any
-    /// slot inside an existing tile's rectangle (`occupant`). Deterministic;
-    /// independent of camera. Runs once per new tile, never per frame.
-    pub fn seed_slot(&self) -> Slot {
+    /// 2, …`, skipping the already-scanned interior (`|dr| < r && |dc| < r`) and
+    /// any slot inside an existing tile's rectangle (`occupant`).
+    ///
+    /// Within a ring, candidates are scanned in **preference order, not reading
+    /// order** (bug-0012): nearest row first, and within that, below before
+    /// above and right before left — so the neighbor of a lone tile is
+    /// `(row, col+1)`, i.e. same height, directly to the right, never a
+    /// diagonal. Deterministic; independent of camera. Runs once per new tile,
+    /// never per frame.
+    pub fn seed_slot_near(&self, center: Slot) -> Slot {
+        // Sort key: closest row wins, positive (below / right) before negative
+        // (above / left) at equal distance. `(0,+1)` therefore always leads
+        // ring 1.
+        fn pref(dr: i32, dc: i32) -> (i32, i32, i32, i32) {
+            let sign = |d: i32| if d > 0 { 0 } else { 1 };
+            (dr.abs(), sign(dr), dc.abs(), sign(dc))
+        }
         let mut r: i32 = 0;
         loop {
-            for row in -r..=r {
-                for col in -r..=r {
+            let mut ring: Vec<(i32, i32)> = Vec::new();
+            for dr in -r..=r {
+                for dc in -r..=r {
                     // Interior of this ring was covered by a smaller radius.
-                    if row.abs() < r && col.abs() < r {
+                    if dr.abs() < r && dc.abs() < r {
                         continue;
                     }
-                    let cand = Slot::new(row, col);
-                    if self.occupant(cand).is_none() {
-                        return cand;
-                    }
+                    ring.push((dr, dc));
+                }
+            }
+            ring.sort_by_key(|&(dr, dc)| pref(dr, dc));
+            for (dr, dc) in ring {
+                let cand = Slot::new(center.row + dr, center.col + dc);
+                if self.occupant(cand).is_none() {
+                    return cand;
                 }
             }
             r += 1;
         }
     }
 
+    /// [`seed_slot_near`](Self::seed_slot_near) centered on the origin — the
+    /// placement used when there is no reference tile to sit beside.
+    pub fn seed_slot(&self) -> Slot {
+        self.seed_slot_near(Slot::new(0, 0))
+    }
+
+    /// [`reconcile_near`](Self::reconcile_near) with no reference tile — the
+    /// spiral falls back to `last_reveal`, then the origin.
+    pub fn reconcile(&mut self, leaves: &[WindowId]) -> bool {
+        self.reconcile_near(leaves, None)
+    }
+
     /// Restore the plane invariant (non-overlap + one anchor per live leaf):
     /// drop entries whose window is gone (their slot becomes a gap — neighbors
-    /// never move) and give every slotless leaf a free slot via the origin
-    /// ring-spiral ([`seed_slot`](Self::seed_slot)). Order-free — there is no
+    /// never move) and give every slotless leaf a free slot via the ring-spiral
+    /// ([`seed_slot_near`](Self::seed_slot_near)). Order-free — there is no
     /// sequence, no insert-and-shift ripple (Behavior 4). Returns true if
     /// anything changed. Fast path: a leaf that already has a slot is skipped,
     /// so the spiral runs only for genuinely slotless leaves.
-    pub fn reconcile(&mut self, leaves: &[WindowId]) -> bool {
+    ///
+    /// `near` is the tile the new work should sit BESIDE (bug-0012) — normally
+    /// the focused tile. A brand-new leaf is itself the focused one and has no
+    /// slot yet, so an unplaced `near` falls back to `last_reveal` (the tile the
+    /// user was on before the new one appeared), then to the origin.
+    pub fn reconcile_near(&mut self, leaves: &[WindowId], near: Option<WindowId>) -> bool {
         let mut changed = false;
         let before = self.slots.len();
         self.slots.retain(|(id, _)| leaves.contains(id));
@@ -831,11 +865,19 @@ impl DesktopState {
         self.spans.retain(|id, _| leaves.contains(id));
         changed |= self.spans.len() != spans_before;
 
+        // Where the spiral starts: the reference tile, else the last-revealed
+        // one, else the origin. Resolved BEFORE seeding so every slotless leaf
+        // in this pass clusters around the same tile.
+        let center = near
+            .and_then(|id| self.slot_of(id))
+            .or_else(|| self.last_reveal.and_then(|id| self.slot_of(id)))
+            .unwrap_or(Slot::new(0, 0));
+
         for &leaf in leaves {
             if self.slot_of(leaf).is_some() {
                 continue; // already placed — the spiral never runs for it
             }
-            let slot = self.seed_slot();
+            let slot = self.seed_slot_near(center);
             self.slots.push((leaf, slot));
             self.sort();
             changed = true;
@@ -1907,12 +1949,13 @@ mod desktop_tests {
         // empty via reconcile — origin-first, deterministic.)
         let mut d = DesktopState::default();
         assert!(d.reconcile(&[1, 2, 3, 4, 5]));
-        // Spiral order from origin: (0,0) then ring 1 in reading order.
+        // Spiral order from origin: (0,0) then ring 1 in PREFERENCE order —
+        // same row right, same row left, then the row below (bug-0012).
         assert_eq!(d.slot_of(1), Some(Slot::new(0, 0)));
-        assert_eq!(d.slot_of(2), Some(Slot::new(-1, -1)));
-        assert_eq!(d.slot_of(3), Some(Slot::new(-1, 0)));
-        assert_eq!(d.slot_of(4), Some(Slot::new(-1, 1)));
-        assert_eq!(d.slot_of(5), Some(Slot::new(0, -1)));
+        assert_eq!(d.slot_of(2), Some(Slot::new(0, 1)));
+        assert_eq!(d.slot_of(3), Some(Slot::new(0, -1)));
+        assert_eq!(d.slot_of(4), Some(Slot::new(1, 0)));
+        assert_eq!(d.slot_of(5), Some(Slot::new(1, 1)));
     }
 
     /// A drop onto a free slot is a plain move leaving a gap (Behavior 4).
@@ -2093,8 +2136,9 @@ mod desktop_tests {
         assert!(changed);
         assert_eq!(d.slot_of(2), None);
         // 9 seeds at the first free spiral slot. (0,0),(0,2) occupied; spiral
-        // from origin: (0,0) taken → ring 1 (-1,-1) is free and first.
-        assert_eq!(d.slot_of(9), Some(Slot::new(-1, -1)), "spiral-seeded");
+        // from origin: (0,0) taken → ring 1 leads with the same-row right
+        // neighbor (0,1), which 2's close just freed.
+        assert_eq!(d.slot_of(9), Some(Slot::new(0, 1)), "spiral-seeded");
         assert_eq!(d.slot_of(1), Some(Slot::new(0, 0)), "placed leaf unmoved");
         assert_eq!(d.slot_of(3), Some(Slot::new(0, 2)), "placed leaf unmoved");
         assert!(
@@ -2206,22 +2250,46 @@ mod desktop_tests {
     }
 
     /// Behavior 4: `seed_slot` walks the origin ring-spiral deterministically —
-    /// origin first when free, else the exact next reading-order ring slot.
+    /// origin first when free, else the next slot in PREFERENCE order (same row
+    /// first, right before left, below before above — bug-0012).
     #[test]
     fn seed_slot_spiral_deterministic() {
         let mut d = DesktopState::default();
         // Empty plane: origin is the first free slot.
         assert_eq!(d.seed_slot(), Slot::new(0, 0));
-        // Occupy the origin; the spiral's next reading-order slot is (-1,-1)
-        // (ring 1: rows -1..=1 × cols -1..=1, interior (0,0) skipped later).
+        // Occupy the origin; ring 1 leads with the same-row right neighbor.
         put(&mut d, 1, 0, 0);
         assert_ne!(d.seed_slot(), Slot::new(0, 0));
-        assert_eq!(d.seed_slot(), Slot::new(-1, -1));
-        // Fill the whole of ring 1's leading edge up to (0,-1); next is... the
-        // first still-free ring-1 slot after the occupied ones.
-        put(&mut d, 2, -1, -1);
-        put(&mut d, 3, -1, 0);
-        assert_eq!(d.seed_slot(), Slot::new(-1, 1), "reading order within ring");
+        assert_eq!(d.seed_slot(), Slot::new(0, 1), "same row, to the right");
+        // Then the same-row left neighbor, then the row below.
+        put(&mut d, 2, 0, 1);
+        assert_eq!(d.seed_slot(), Slot::new(0, -1), "same row, to the left");
+        put(&mut d, 3, 0, -1);
+        assert_eq!(d.seed_slot(), Slot::new(1, 0), "then the row below");
+    }
+
+    /// bug-0012: the spiral is centered on the tile the new work sits beside,
+    /// not on the origin — a lone tile parked anywhere still gets its neighbor
+    /// at `(row, col+1)`, and `reconcile_near` uses that center on the real path.
+    #[test]
+    fn seed_slot_near_prefers_same_row_right() {
+        let mut d = DesktopState::default();
+        put(&mut d, 1, 1, -1); // the only tile, NOT at the origin
+        assert_eq!(
+            d.seed_slot_near(Slot::new(1, -1)),
+            Slot::new(1, 0),
+            "same height as the existing tile, one column right"
+        );
+        // The whole-plane reconcile picks the same slot when told which tile to
+        // sit beside (the origin-centered spiral would say (0,0) — up-and-right).
+        assert!(d.reconcile_near(&[1, 2], Some(1)));
+        assert_eq!(d.slot_of(2), Some(Slot::new(1, 0)));
+        // With no hint, `last_reveal` stands in for the focused tile.
+        let mut d2 = DesktopState::default();
+        put(&mut d2, 1, 1, -1);
+        d2.last_reveal = Some(1);
+        assert!(d2.reconcile_near(&[1, 2], None));
+        assert_eq!(d2.slot_of(2), Some(Slot::new(1, 0)));
     }
 
     /// Behavior 4: an overlapping free drop is rejected and moves NOTHING —

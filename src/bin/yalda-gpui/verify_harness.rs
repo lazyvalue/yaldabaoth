@@ -10873,6 +10873,90 @@ fn plane_focused_tile_renders_when_off_viewport(cx: &mut TestAppContext) {
     );
 }
 
+/// bug-0012 (UXI-Workspace-6): in a workspace holding exactly ONE tile, a new
+/// tile lands at the SAME row, one column to the RIGHT of it — never diagonally.
+///
+/// Drives the REAL path per the anti-circling rules: the sole tile is parked at
+/// a non-origin slot `(1,-1)` (the configuration that produced the reported
+/// "up and to the right"), the user's actual `Ctrl-W v` action handler
+/// (`split_v`) creates the leaf, and the REAL per-frame `chrome.rs` upkeep
+/// (`reconcile_near`) is what assigns the slot — the test never seeds one.
+///
+/// NEGATIVE CONTROL (observed RED), each half separately:
+/// - force `center = Slot::new(0,0)` in `reconcile_near` (origin-centered
+///   spiral) ⇒ new tile at `(0,0)`, i.e. up-and-to-the-right of `(1,-1)` — the
+///   reported bug reproduced;
+/// - restore the raw row-major ring scan in `seed_slot_near` ⇒ new tile at
+///   `(0,-2)`. Both restored.
+#[gpui::test]
+fn new_tile_lands_same_row_right_of_the_only_tile(cx: &mut TestAppContext) {
+    use crate::workspace::Slot;
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    // One tile, parked OFF the origin at (1,-1), focus resting on it.
+    let win_a = view.update(vcx, |v, cx| {
+        v.desktop_grid_cols = 2;
+        v.desktop_grid_rows = 2;
+        v.viewport_width_px = 800.0;
+        v.viewport_height_px = 600.0;
+        v.desktop_canvas_bounds.set((0.0, 0.0, 800.0, 600.0));
+        let win_a = v.workspace.focused_window_id().expect("focused tile");
+        let tab = v.workspace.active_tab_mut().unwrap();
+        tab.layout_mode = crate::workspace::LayoutMode::Plane;
+        let leaves = tab.layout.leaf_ids();
+        assert_eq!(leaves.len(), 1, "the fixture must start with ONE tile");
+        tab.desktop.reconcile(&leaves);
+        tab.desktop.set_anchor(win_a, Slot::new(1, -1));
+        tab.focused = win_a;
+        tab.desktop.last_reveal = Some(win_a);
+        tab.desktop.camera.pan = (0.0, 0.0);
+        cx.notify();
+        win_a
+    });
+    vcx.run_until_parked();
+
+    // The REAL `Ctrl-W v` handler — "new tile to the right of the focused one".
+    view.update_in(vcx, |v, w, cx| v.split_v(&crate::SplitV, w, cx));
+    // Let the real render path run its per-frame slot upkeep.
+    for _ in 0..2 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+
+    let (count, a_slot, new_slot) = view.read_with(vcx, |v, _| {
+        let tab = v.workspace.active_tab().expect("active tab");
+        let leaves = tab.layout.leaf_ids();
+        let new_id = leaves
+            .iter()
+            .copied()
+            .find(|id| *id != win_a)
+            .expect("split created a new leaf");
+        (
+            leaves.len(),
+            tab.desktop.slot_of(win_a),
+            tab.desktop.slot_of(new_id),
+        )
+    });
+
+    assert_eq!(count, 2, "split must leave exactly two tiles");
+    assert_eq!(
+        a_slot,
+        Some(Slot::new(1, -1)),
+        "the existing tile must not move"
+    );
+    assert_eq!(
+        new_slot,
+        Some(Slot::new(1, 0)),
+        "new tile must sit at the SAME row, one column right of the only tile \
+         (bug-0012: it was landing diagonally, up-and-to-the-right)"
+    );
+}
+
 /// Perf proxy (spec Verification, optional): panning the plane at Card must NOT
 /// re-render the (non-Full) transcript surfaces — at Card no live transcript is
 /// built at all, so the cached `TranscriptView` render count stays flat across a

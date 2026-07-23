@@ -149,11 +149,15 @@ origin and a wrap width, neither of which survives an all-directions plane.
 Placement on the plane is:
 
 - **Seeding a new tile** (agent open, Cmd+O buffer, any new `Window`): the tile
-  is placed at the **first free slot on an outward ring-spiral from the origin**
-  (origin first, then its 8-neighborhood, then the next ring, …), skipping any
-  slot inside an existing tile's rectangle. Deterministic; independent of
-  camera. This keeps new work clustered near the origin ("where all workspaces
-  start") rather than scattered. Cost: the spiral tests O(ring²) slots, each an
+  is placed at the **first free slot on an outward ring-spiral centered on the
+  tile the user is on** — the focused tile if it already has a slot, else the
+  last-revealed one, else the origin (that centering was bug-0012). Each ring is
+  scanned in **preference order**: nearest row first, then below before above and
+  right before left, so ring 1 leads with `(row, col+1)` — same height, directly
+  to the right — and a new tile is never placed diagonally when a side slot is
+  free. Skips any slot inside an existing tile's rectangle. Deterministic;
+  independent of camera. This keeps new work clustered beside the work it came
+  from rather than scattered. Cost: the spiral tests O(ring²) slots, each an
   O(tiles) `occupant` check, so seeding is worst-case super-linear on a sparse
   far-flung plane — but it runs **once per new tile, never per frame**, and for
   the expected tile counts (< ~50, per desktop-mode Constraint) it is trivial. If
@@ -329,8 +333,11 @@ data, *module-internal* — called by the GPUI view layer):
   `slot_pitch(detail) -> f32` is **infeasible** — pitch is anisotropic and
   changes on window resize; keep `Preferences`' grid config as the single sizing
   source and scale off it. [DRAFT]
-- **`seed_slot(&self) -> Slot`** — first free slot on the origin ring-spiral
-  (Behavior 4). Replaces desktop-mode's `first_free_slot` shelf variant. [DRAFT]
+- **`seed_slot_near(&self, center: Slot) -> Slot`** — first free slot on the
+  preference-ordered ring-spiral around `center` (Behavior 4);
+  **`seed_slot(&self)`** is the origin-centered wrapper. The center is resolved by
+  **`reconcile_near(leaves, near)`** (focused → `last_reveal` → origin). Replaces
+  desktop-mode's `first_free_slot` shelf variant. [DRAFT]
 - Reused **type-only** from desktop mode (logic identical, `Slot` now `i32`):
   `rect_of`, `set_anchor`, `spatial_neighbor`, `span_of`, `sequence_neighbor`
   (still drives `focus_next/prev`, Behavior 5). Reused with **semantic edits**
