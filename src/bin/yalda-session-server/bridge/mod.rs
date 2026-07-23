@@ -15,6 +15,7 @@
 //! The bridge is spawned only when configured (a Telegram token is present);
 //! absent config it costs nothing and exposes no surface.
 
+mod command;
 mod fold;
 mod router;
 mod telegram;
@@ -30,6 +31,7 @@ use tokio::sync::{broadcast, mpsc};
 use yalda::acp_channel::PermissionMode;
 use yalda::session_proto::{Notification, ServerSessionId, SessionInfo};
 
+use command::Command;
 use fold::{ChatOp, EventFolder};
 use router::{TopicAction, TopicMapSnapshot, TopicRouter};
 use transport::{ChatTransport, MessageId, ThreadId};
@@ -225,7 +227,8 @@ fn persist_topic_map(router: &TopicRouter) {
 /// than a direct `Arc<SessionManager>`) so the bridge task is unit-testable
 /// with a fake in-process driver — no real actor, socket, or agent needed.
 pub trait SessionDriver: Send + Sync + 'static {
-    #[allow(dead_code)] // driven by the T-005 `/new` command
+    /// Create a new session (driven by `/new`); its topic auto-opens off the
+    /// resulting `SessionCreated` broadcast.
     fn create(&self, label: String, cwd: PathBuf)
     -> impl Future<Output = SessionInfo> + Send;
     /// Ungated enqueue (ADR-0015 `admin_prompt`): drive a turn without owning
@@ -235,11 +238,10 @@ pub trait SessionDriver: Send + Sync + 'static {
         sid: String,
         text: String,
     ) -> impl Future<Output = Result<(), String>> + Send;
-    // create / cancel / set_permission_mode are driven by the T-005 commands
-    // (`/new`, `/stop`, `/mode`); part of the driver contract now.
-    #[allow(dead_code)]
+    /// Cancel the session's in-flight turn (driven by `/stop`).
     fn cancel(&self, sid: String) -> impl Future<Output = Result<(), String>> + Send;
-    #[allow(dead_code)]
+    /// Set the session's permission mode (driven by `/mode` and the `/new`
+    /// read-only fail-safe).
     fn set_permission_mode(
         &self,
         sid: String,
@@ -517,9 +519,11 @@ async fn apply_topic_action<T: ChatTransport>(
     }
 }
 
-/// Handle one inbound chat message: allowlist gate, then route a plain message
-/// in a session topic to that session as a prompt (spec §6 injection path).
-/// Command parsing (`/new`, `/stop`, …) lands in T-005.
+/// Handle one inbound chat message: allowlist gate FIRST (spec §7), then parse
+/// the slash-command grammar and dispatch it against the locale — the thread it
+/// arrived in *is* the addressing. The General topic (mapped to no session)
+/// takes control commands (`/new`, `/sessions`); a session topic takes the
+/// per-session commands (`/stop`, `/mode`, `/status`) and plain-text injection.
 async fn handle_inbound<T: ChatTransport, D: SessionDriver>(
     config: &BridgeConfig,
     transport: &T,
@@ -528,7 +532,8 @@ async fn handle_inbound<T: ChatTransport, D: SessionDriver>(
     msg: transport::InboundMsg,
 ) {
     // Security boundary (spec §7): a message from a non-allow-listed sender is
-    // dropped silently — no reply, don't confirm the bot exists.
+    // dropped silently — no reply, don't confirm the bot exists. This gate runs
+    // BEFORE any parse/dispatch so a stranger can never reach a command.
     if !config.allowed_user_ids.contains(&msg.from_user) {
         return;
     }
@@ -537,26 +542,136 @@ async fn handle_inbound<T: ChatTransport, D: SessionDriver>(
         return;
     }
 
+    let command = command::parse(text);
     match router.session_of(msg.thread) {
+        // In a session's own topic: per-session commands + plain injection.
         Some(session) => {
             let session = session.clone();
-            if let Err(e) = driver.admin_prompt(session, text.to_string()).await {
-                tracing::warn!(error = %e, "bridge admin_prompt failed");
-                let _ = transport
-                    .send(msg.thread, &format!("⚠️ couldn't send: {e}"))
-                    .await;
+            handle_session_command(transport, driver, msg.thread, &session, command).await;
+        }
+        // The General topic (or any unmapped thread): control commands only.
+        None => handle_general_command(config, transport, driver, router, msg.thread, command).await,
+    }
+}
+
+/// The General topic is the control channel (spec §4): only `/new` and
+/// `/sessions` are meaningful here. Everything else (per-session verbs, plain
+/// text) gets the nudge toward the right gesture.
+async fn handle_general_command<T: ChatTransport, D: SessionDriver>(
+    config: &BridgeConfig,
+    transport: &T,
+    driver: &D,
+    router: &TopicRouter,
+    thread: ThreadId,
+    command: Command,
+) {
+    match command {
+        Command::New { label, cwd } => {
+            let cwd = cwd.unwrap_or_else(|| config.default_cwd.clone());
+            // The topic auto-opens off the SessionCreated broadcast — don't open
+            // one here. New sessions start read-only as a §7 fail-safe.
+            let info = driver.create(label, cwd).await;
+            if let Err(e) = driver
+                .set_permission_mode(info.session_id.clone(), PermissionMode::ReadOnly)
+                .await
+            {
+                tracing::warn!(error = %e, "bridge set_permission_mode(ReadOnly) on /new failed");
             }
         }
-        None => {
-            // General topic (or an unmapped thread): a plain message isn't a
-            // session prompt. Nudge toward the right gesture.
+        Command::Sessions => {
+            let _ = transport.send(thread, &format_sessions(driver, router).await).await;
+        }
+        // Per-session verbs and plain text don't belong in General.
+        _ => {
             let _ = transport
                 .send(
-                    msg.thread,
+                    thread,
                     "Send messages inside a session's topic, or use /new to start one.",
                 )
                 .await;
         }
+    }
+}
+
+/// A session's own topic (spec §4, §6): `/stop`, `/mode`, `/status`, and plain
+/// text injected as a turn. `/new` and `/sessions` here point back to General.
+async fn handle_session_command<T: ChatTransport, D: SessionDriver>(
+    transport: &T,
+    driver: &D,
+    thread: ThreadId,
+    session: &str,
+    command: Command,
+) {
+    match command {
+        Command::Stop => {
+            if let Err(e) = driver.cancel(session.to_string()).await {
+                tracing::warn!(error = %e, "bridge cancel failed");
+                let _ = transport.send(thread, &format!("⚠️ couldn't stop: {e}")).await;
+            }
+        }
+        Command::Mode(mode) => {
+            if let Err(e) = driver.set_permission_mode(session.to_string(), mode).await {
+                tracing::warn!(error = %e, "bridge set_permission_mode failed");
+                let _ = transport
+                    .send(thread, &format!("⚠️ couldn't set mode: {e}"))
+                    .await;
+            }
+        }
+        Command::Status => {
+            let _ = transport.send(thread, &format_status(driver, session).await).await;
+        }
+        Command::Message(text) => {
+            // The §6 injection path: drive an ungated turn on the bound session.
+            if let Err(e) = driver.admin_prompt(session.to_string(), text).await {
+                tracing::warn!(error = %e, "bridge admin_prompt failed");
+                let _ = transport
+                    .send(thread, &format!("⚠️ couldn't send: {e}"))
+                    .await;
+            }
+        }
+        Command::New { .. } | Command::Sessions => {
+            let _ = transport
+                .send(thread, "Use the General topic for /new and /sessions.")
+                .await;
+        }
+        Command::Unknown(cmd) => {
+            let _ = transport
+                .send(thread, &format!("Unknown command: {cmd}"))
+                .await;
+        }
+    }
+}
+
+/// Format the `/sessions` roster: each live session's label + which topic it is
+/// bound to (a recovery aid, spec §4). `router` supplies the topic mapping.
+async fn format_sessions<D: SessionDriver>(driver: &D, router: &TopicRouter) -> String {
+    let list = driver.list().await;
+    if list.is_empty() {
+        return "No active sessions.".to_string();
+    }
+    let mut out = String::from("Sessions:");
+    for info in list {
+        let topic = match router.thread_of(&info.session_id) {
+            Some(t) => format!("topic {}", t.0),
+            None => "no topic".to_string(),
+        };
+        out.push_str(&format!("\n• {} — {}", info.label, topic));
+    }
+    out
+}
+
+/// Format the `/status` line for one session: label, permission mode, turn
+/// count, and whether the agent subprocess is currently connected.
+async fn format_status<D: SessionDriver>(driver: &D, session: &str) -> String {
+    match driver.list().await.into_iter().find(|i| i.session_id == session) {
+        Some(info) => format!(
+            "{} · mode {} · {} turns · {}",
+            info.label,
+            info.permission_mode.short_label(),
+            info.turns,
+            if info.connected { "connected" } else { "idle" },
+        ),
+        None => "Session not found.".to_string(),
     }
 }
 

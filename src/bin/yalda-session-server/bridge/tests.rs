@@ -23,6 +23,9 @@ struct DriverState {
     prompts: Vec<(String, String)>,
     fail_prompt: bool,
     list: Vec<SessionInfo>,
+    created: Vec<(String, PathBuf)>,
+    modes: Vec<(String, PermissionMode)>,
+    cancels: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -39,6 +42,15 @@ impl FakeDriver {
     fn prompts(&self) -> Vec<(String, String)> {
         self.state.lock().unwrap().prompts.clone()
     }
+    fn created(&self) -> Vec<(String, PathBuf)> {
+        self.state.lock().unwrap().created.clone()
+    }
+    fn modes(&self) -> Vec<(String, PermissionMode)> {
+        self.state.lock().unwrap().modes.clone()
+    }
+    fn cancels(&self) -> Vec<String> {
+        self.state.lock().unwrap().cancels.clone()
+    }
     fn set_fail_prompt(&self, v: bool) {
         self.state.lock().unwrap().fail_prompt = v;
     }
@@ -46,6 +58,11 @@ impl FakeDriver {
 
 impl SessionDriver for FakeDriver {
     async fn create(&self, label: String, cwd: PathBuf) -> SessionInfo {
+        self.state
+            .lock()
+            .unwrap()
+            .created
+            .push((label.clone(), cwd.clone()));
         info(&format!("sid-{label}"), &label, cwd)
     }
     async fn admin_prompt(&self, sid: String, text: String) -> Result<(), String> {
@@ -55,10 +72,12 @@ impl SessionDriver for FakeDriver {
         self.state.lock().unwrap().prompts.push((sid, text));
         Ok(())
     }
-    async fn cancel(&self, _sid: String) -> Result<(), String> {
+    async fn cancel(&self, sid: String) -> Result<(), String> {
+        self.state.lock().unwrap().cancels.push(sid);
         Ok(())
     }
-    async fn set_permission_mode(&self, _sid: String, _mode: PermissionMode) -> Result<(), String> {
+    async fn set_permission_mode(&self, sid: String, mode: PermissionMode) -> Result<(), String> {
+        self.state.lock().unwrap().modes.push((sid, mode));
         Ok(())
     }
     async fn list(&self) -> Vec<SessionInfo> {
@@ -313,6 +332,233 @@ async fn failed_prompt_surfaces_a_warning_to_the_topic() {
         "ops: {:?}",
         t.ops()
     );
+}
+
+// ── Command dispatch (handle_inbound parse + locale, T-005) ─────────
+
+#[tokio::test]
+async fn new_in_general_creates_a_read_only_session() {
+    let t = FakeTransport::new();
+    let d = FakeDriver::default();
+    let router = TopicRouter::new(); // General maps to no session
+
+    handle_inbound(
+        &cfg(vec![42]),
+        &t,
+        &d,
+        &router,
+        InboundMsg {
+            thread: ThreadId::GENERAL,
+            from_user: 42,
+            text: "/new Ship it".into(),
+        },
+    )
+    .await;
+
+    // The session was created with the typed label + default cwd…
+    assert_eq!(
+        d.created(),
+        vec![("Ship it".to_string(), PathBuf::from("/tmp"))],
+        "create must be driven with label + config default_cwd"
+    );
+    // …and immediately set read-only (§7 fail-safe). The fake mints "sid-<label>".
+    assert_eq!(
+        d.modes(),
+        vec![("sid-Ship it".to_string(), PermissionMode::ReadOnly)],
+        "new sessions must default to read-only"
+    );
+    // We do NOT open a topic here — that rides the SessionCreated broadcast.
+    assert!(
+        !t.ops().iter().any(|o| matches!(o, FakeOp::Open { .. })),
+        "/new must not open a topic itself: {:?}",
+        t.ops()
+    );
+}
+
+#[tokio::test]
+async fn new_with_trailing_cwd_uses_that_path() {
+    let t = FakeTransport::new();
+    let d = FakeDriver::default();
+    let router = TopicRouter::new();
+
+    handle_inbound(
+        &cfg(vec![42]),
+        &t,
+        &d,
+        &router,
+        InboundMsg {
+            thread: ThreadId::GENERAL,
+            from_user: 42,
+            text: "/new fix bug /srv/app".into(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        d.created(),
+        vec![("fix bug".to_string(), PathBuf::from("/srv/app"))]
+    );
+}
+
+#[tokio::test]
+async fn sessions_in_general_lists_the_roster() {
+    let t = FakeTransport::new();
+    let d = FakeDriver::with_sessions(vec![info("a", "Alpha", PathBuf::from("/w"))]);
+    let mut router = TopicRouter::new();
+    router.bind("a".to_string(), ThreadId(7));
+
+    handle_inbound(
+        &cfg(vec![42]),
+        &t,
+        &d,
+        &router,
+        InboundMsg {
+            thread: ThreadId::GENERAL,
+            from_user: 42,
+            text: "/sessions".into(),
+        },
+    )
+    .await;
+
+    match &t.ops()[..] {
+        [FakeOp::Send { thread, text, .. }] => {
+            assert_eq!(*thread, ThreadId::GENERAL);
+            assert!(text.contains("Alpha"), "roster lists the label: {text:?}");
+            assert!(text.contains("topic 7"), "roster shows the topic: {text:?}");
+        }
+        other => panic!("expected one Send with the roster, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stop_in_bound_topic_cancels_that_session() {
+    let t = FakeTransport::new();
+    let d = FakeDriver::default();
+    let mut router = TopicRouter::new();
+    router.bind("s1".to_string(), ThreadId(5));
+
+    handle_inbound(
+        &cfg(vec![42]),
+        &t,
+        &d,
+        &router,
+        InboundMsg {
+            thread: ThreadId(5),
+            from_user: 42,
+            text: "/stop".into(),
+        },
+    )
+    .await;
+
+    assert_eq!(d.cancels(), vec!["s1".to_string()], "must cancel the topic's session");
+    assert!(d.prompts().is_empty(), "/stop must not inject a prompt");
+}
+
+#[tokio::test]
+async fn mode_yolo_in_bound_topic_sets_permission_mode() {
+    let t = FakeTransport::new();
+    let d = FakeDriver::default();
+    let mut router = TopicRouter::new();
+    router.bind("s1".to_string(), ThreadId(5));
+
+    handle_inbound(
+        &cfg(vec![42]),
+        &t,
+        &d,
+        &router,
+        InboundMsg {
+            thread: ThreadId(5),
+            from_user: 42,
+            text: "/mode yolo".into(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        d.modes(),
+        vec![("s1".to_string(), PermissionMode::Yolo)],
+        "must set the topic's session to Yolo"
+    );
+}
+
+#[tokio::test]
+async fn status_in_bound_topic_reports_the_session() {
+    let t = FakeTransport::new();
+    let d = FakeDriver::with_sessions(vec![info("s1", "Alpha", PathBuf::from("/w"))]);
+    let mut router = TopicRouter::new();
+    router.bind("s1".to_string(), ThreadId(5));
+
+    handle_inbound(
+        &cfg(vec![42]),
+        &t,
+        &d,
+        &router,
+        InboundMsg {
+            thread: ThreadId(5),
+            from_user: 42,
+            text: "/status".into(),
+        },
+    )
+    .await;
+
+    match &t.ops()[..] {
+        [FakeOp::Send { thread, text, .. }] => {
+            assert_eq!(*thread, ThreadId(5));
+            assert!(text.contains("Alpha"), "status names the session: {text:?}");
+            assert!(text.contains("read-only"), "status shows the mode: {text:?}");
+        }
+        other => panic!("expected one status Send, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn plain_message_in_topic_still_injects() {
+    // Regression of T-003: a non-slash message is still an injected prompt.
+    let t = FakeTransport::new();
+    let d = FakeDriver::default();
+    let mut router = TopicRouter::new();
+    router.bind("s1".to_string(), ThreadId(5));
+
+    handle_inbound(
+        &cfg(vec![42]),
+        &t,
+        &d,
+        &router,
+        InboundMsg {
+            thread: ThreadId(5),
+            from_user: 42,
+            text: "keep going".into(),
+        },
+    )
+    .await;
+
+    assert_eq!(d.prompts(), vec![("s1".to_string(), "keep going".to_string())]);
+}
+
+#[tokio::test]
+async fn allowlist_gate_runs_before_command_dispatch() {
+    // A stranger's /stop must be dropped BEFORE parse/dispatch — no cancel, no
+    // op. Guards the ordering of the §7 gate relative to command handling.
+    let t = FakeTransport::new();
+    let d = FakeDriver::default();
+    let mut router = TopicRouter::new();
+    router.bind("s1".to_string(), ThreadId(5));
+
+    handle_inbound(
+        &cfg(vec![42]), // 999 is NOT allowed
+        &t,
+        &d,
+        &router,
+        InboundMsg {
+            thread: ThreadId(5),
+            from_user: 999,
+            text: "/stop".into(),
+        },
+    )
+    .await;
+
+    assert!(d.cancels().is_empty(), "stranger's /stop must not cancel");
+    assert!(t.ops().is_empty(), "stranger must get no reply");
 }
 
 // ── Startup reconcile drives topic ops through the transport ────────
