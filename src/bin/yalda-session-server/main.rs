@@ -2612,16 +2612,22 @@ async fn main() -> io::Result<()> {
     // Outbound bridge tap (T-004): one channel carries every session's logged
     // notifications to the bridge. The tx is threaded into the Manager (and each
     // recovered session) so `push_event` can forward; the rx is handed to
-    // `maybe_spawn_bridge`. If the bridge is disabled, `maybe_spawn_bridge` drops
-    // the rx, so the per-session sends error and are ignored (no buffering).
+    // `maybe_spawn_bridge`.
+    //
+    // Gate the per-session sender on whether the bridge is actually enabled: when
+    // it's disabled (the common case) sessions get `None`, so `push_event` skips
+    // the clone+send entirely rather than cloning every streamed notification into
+    // a dead channel on the hot path.
+    let bridge_enabled = matches!(bridge::BridgeConfig::load(), Ok(Some(_)));
     let (bridge_evt_tx, bridge_evt_rx) =
         tokio::sync::mpsc::unbounded_channel::<(ServerSessionId, Notification)>();
+    let session_bridge_tx = bridge_enabled.then(|| bridge_evt_tx.clone());
 
     // Recover sessions from a prior run BEFORE the actor starts (recovery must
     // precede the accept loop). The seed map is moved into the actor; the resume
     // jobs spawn workers that re-spawn ACP subprocesses and post `PublishChannel`
     // back into the actor once it's running.
-    let (seed_sessions, resume_jobs) = restore_seed_from_disk(Some(bridge_evt_tx.clone()));
+    let (seed_sessions, resume_jobs) = restore_seed_from_disk(session_bridge_tx.clone());
 
     // Spawn the single-writer manager actor: it OWNS the sessions map and drains
     // the inlet (external requests, spawn-worker publishes, pump-sourced records)
@@ -2638,7 +2644,7 @@ async fn main() -> io::Result<()> {
         default_permission_mode,
         manager.cmd_tx.clone(),
         Arc::clone(&spawner),
-        Some(bridge_evt_tx),
+        session_bridge_tx,
     ));
 
     // Now the actor is running, kick off the resume workers.
