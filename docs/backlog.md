@@ -13,6 +13,23 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Command panel (leader menu) aesthetic redesign** — `NEEDS-RUNTIME` (branch
+  `main`, 2026-07-23 via `/new-ux`, autonomous, Fable advising UX + aesthetics +
+  architecture; `UXI-Menu-1..4`, spec `docs/components/common/menu.md`). The old
+  full-width (`.w_full().top_0()`) opaque drop-down bar is replaced by **"The Sigil
+  Card"**: a floating, content-sized card (`[340, 720]px` band) in the workspace
+  region right of the jump panel, horizontally centered, pinned 48px below the top.
+  Each leader wears a scope hue on a 2px left accent bar + a header sigil
+  (`space`→cyan `✦`/`▣`/…, `.`→`overlay.key` `⊞`, `?`→`jump_header` `◉`); the header
+  breadcrumb is the literal **keystroke trail** you typed as key chips; entries are
+  mono key-chip + label rows on a 26px grid; the footer collapses to an `esc` chip.
+  Guards in `verify_harness.rs`: `menu_panel_floats_in_content_region`,
+  `menu_panel_top_stable_across_descent`, `menu_panel_rows_and_sections_paint`; unit
+  `tests.rs::menu_trail_crumbs_tracks_descent`. All four observed RED under reverted
+  negative controls; 445 gpui tests + full suite green. Remaining human check: the
+  exact chip colors / accent-bar hue / glyph legibility on folio + nightfox (the
+  documented pixels-beyond-bounds gap).
+
 - **Jump panel redesign (declutter + context menu + shading)** — `NEEDS-RUNTIME`
   (branch `jump-panel-redesign`, 2026-07-23 via `/new-ux`, autonomous, Fable
   advising UX + color; `UXI-JumpPanel-7`, `-8`). The panel loses its inline

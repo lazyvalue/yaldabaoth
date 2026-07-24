@@ -482,6 +482,45 @@ fn format_menu_key(seq: &[KeyPress]) -> String {
         .join(" ")
 }
 
+// ---- Command panel ("The Sigil Card") layout constants (UXI-Menu-1) ---------
+//
+// The leader menu floats as a content-sized card in the workspace region rather
+// than a full-width drop-down bar. Width tracks content within this band; the top
+// edge is pinned so descent reads as the card breathing, not teleporting.
+pub(crate) const MENU_PANEL_MIN_W: f32 = 340.0;
+pub(crate) const MENU_PANEL_MAX_W: f32 = 720.0;
+pub(crate) const MENU_PANEL_TOP: f32 = 48.0;
+
+/// Build the keystroke trail for the current menu depth (UXI-Menu-3): the leader
+/// glyph followed by each descended submenu key, plus the name of the level you're
+/// now in. Returns `(crumbs, current_label)` where `crumbs[0]` is the leader glyph,
+/// `crumbs[1..]` are the descended submenu keys (formatted for display), and
+/// `current_label` is the scope name at root or the deepest submenu's label.
+///
+/// Pure over `(menu, path, leader_glyph, scope)` — no view state — so it unit-tests
+/// directly (`menu_trail_crumbs_tracks_descent`). Mirrors `MenuState::current_label`'s
+/// walk but also records the key at each step.
+pub(crate) fn menu_trail_crumbs(
+    menu: &[MenuNode],
+    path: &[usize],
+    leader_glyph: &str,
+    scope: &str,
+) -> (Vec<String>, String) {
+    let mut crumbs = vec![leader_glyph.to_string()];
+    let mut nodes = menu;
+    let mut label = scope.to_string();
+    for &idx in path {
+        if let Some(node) = nodes.get(idx) {
+            crumbs.push(format_menu_key(&node.key));
+            label = node.label.clone();
+            if let MenuAction::Submenu(children) = &node.action {
+                nodes = children;
+            }
+        }
+    }
+    (crumbs, label)
+}
+
 // ----------------------------------------------------------------------------
 // Claude (ACP) helpers — port of app::claude splice/lock logic
 // ----------------------------------------------------------------------------
@@ -1215,6 +1254,11 @@ struct MenuOverlay {
     /// Scope tag shown in the overlay header (spec-menu-scopes.md): "MENU"
     /// for the global leader; "DOC"/"EDIT"/"AGENT"/"BROWSE" for the local one.
     header: &'static str,
+    /// The leader key that opened this menu: `' '` (space, tile/app-local), `'.'`
+    /// (workspace), or `'?'` (global). Drives the scope hue + sigil + trail glyph
+    /// (UXI-Menu-3/-4); distinct from `header` since every local content kind shares
+    /// the space leader.
+    leader: char,
     /// Leaf focused when the menu was opened — if focus moves while the menu
     /// is open the overlay dismisses (Behavior 9: no stale dispatch).
     opened_from: workspace::WindowId,
@@ -4267,6 +4311,7 @@ impl YaldaGpuiView {
             state,
             menu: gpui_menu(),
             header: "MENU",
+            leader: '.',
             opened_from,
             disabled: self.global_menu_disabled(),
         }));
@@ -4352,6 +4397,7 @@ impl YaldaGpuiView {
             state,
             menu,
             header,
+            leader: ' ',
             opened_from,
             disabled: HashSet::new(),
         }));
@@ -4422,6 +4468,7 @@ impl YaldaGpuiView {
             state,
             menu,
             header: "GLOBAL",
+            leader: '?',
             opened_from,
             disabled: HashSet::new(),
         }));
@@ -6348,6 +6395,13 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// The command panel — "The Sigil Card" (UXI-Menu-1..4). A floating,
+    /// content-sized card in the workspace region (right of the jump panel),
+    /// horizontally centered and pinned `MENU_PANEL_TOP` below the top chrome —
+    /// NOT the old full-width drop-down bar. Each leader wears a scope hue on a 2px
+    /// left accent bar + a header sigil; the header breadcrumb is the literal
+    /// keystroke trail you typed (UXI-Menu-3). Keyboard-driven (no click-away): the
+    /// `MenuView` capture handler in `render` owns dispatch + Esc.
     fn render_menu_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let m = match self.menu_ref() {
             Some(m) => m,
@@ -6361,30 +6415,116 @@ impl YaldaGpuiView {
         let label_text_fg: Hsla = nc(ov.fg);
         let submenu_fg: Hsla = nc(ov.accent);
         let popup_border: Hsla = nc(ov.border);
+        let mono = self.code_font.clone();
 
-        let nodes = m.state.current_nodes(&m.menu);
-        let breadcrumb = m
-            .state
-            .current_label(&m.menu)
-            .unwrap_or_else(|| "Commands".to_string());
+        // Scope identity (UXI-Menu-4): the leader that opened this menu picks the
+        // accent hue, the header sigil, the display scope name, and the trail's
+        // leading glyph. Three leaders, three colors, glanceable before reading.
+        let scope_hue: Hsla = match m.leader {
+            ' ' => nc(self.theme.agent.frozen_bar),
+            '.' => key_fg,
+            '?' => nc(self.theme.agent.jump_header),
+            _ => key_fg,
+        };
+        let sigil = match m.header {
+            "AGENT" => "✦",
+            "DOC" | "EDIT" => "▣",
+            "BROWSE" => "▤",
+            "LINEAR" => "◈",
+            "KEYBINDINGS" => "⌘",
+            "MENU" => "⊞",   // workspace (`.`)
+            "GLOBAL" => "◉", // global (`?`)
+            _ => "▸",
+        };
+        let scope_name = match m.header {
+            "MENU" => "WORKSPACE",
+            other => other,
+        };
+        let leader_glyph = match m.leader {
+            ' ' => "␣".to_string(),
+            other => other.to_string(),
+        };
+
+        // ---- Keystroke trail (UXI-Menu-3) ----
+        // The literal chord to reach this level, as key chips: leader glyph, then
+        // each descended submenu key, then the current level's name in accent.
+        let (crumbs, level_label) =
+            menu_trail_crumbs(&m.menu, &m.state.path, &leader_glyph, scope_name);
+        let mut trail_bg = label_fg;
+        trail_bg.a = 0.12;
+        let trail_chip = move |text: String| {
+            div()
+                .flex_none()
+                .px(px(5.0))
+                .h(px(16.0))
+                .rounded(px(4.0))
+                .bg(trail_bg)
+                .flex()
+                .items_center()
+                .font_family(mono.clone())
+                .text_size(px(10.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(label_fg)
+                .child(text)
+        };
+        let mut trail = div().flex().flex_row().items_center().gap(px(5.0));
+        for crumb in &crumbs {
+            trail = trail.child(trail_chip(crumb.clone()));
+        }
+        trail = trail
+            .child(div().text_color(label_fg).text_size(px(11.0)).child("›"))
+            .child(
+                div()
+                    .font_family(self.code_font.clone())
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(scope_hue)
+                    .child(level_label.to_uppercase()),
+            );
+
+        // esc hint chip, far right — replaces the old repeated footer line.
+        let mut esc_bg = label_fg;
+        esc_bg.a = 0.10;
+        let esc_chip = div()
+            .flex_none()
+            .px(px(6.0))
+            .h(px(16.0))
+            .rounded(px(4.0))
+            .bg(esc_bg)
+            .flex()
+            .items_center()
+            .font_family(self.code_font.clone())
+            .text_size(px(10.0))
+            .text_color(label_fg)
+            .child(SharedString::new_static("esc"));
 
         let header_row = div()
             .flex()
             .flex_row()
             .items_center()
-            .px_4()
-            .py_1()
-            .h(px(28.0))
-            .text_color(label_fg)
-            .font_weight(FontWeight::BOLD)
-            .child(format!("{} — {}", m.header, breadcrumb.to_uppercase()));
+            .gap(px(8.0))
+            .px(px(14.0))
+            .h(px(30.0))
+            .border_b_1()
+            .border_color(popup_border)
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(scope_hue)
+                    .text_size(px(14.0))
+                    .child(sigil),
+            )
+            .child(trail)
+            .child(div().flex_1())
+            .child(esc_chip);
 
         // ---- Multi-column layout ----
         //
         // Partition the level into sections (separator-delimited groups,
         // each usually starting with a Label), then distribute whole
-        // sections across 1–3 columns so a large menu fits on screen
-        // without scrolling. Sections never split mid-group.
+        // sections across 1–3 columns so a large menu fits the card without
+        // scrolling. Sections never split mid-group.
+        let nodes = m.state.current_nodes(&m.menu);
         let mut sections: Vec<Vec<&MenuNode>> = vec![Vec::new()];
         for node in nodes {
             if node.kind() == MenuNodeKind::Separator {
@@ -6399,9 +6539,9 @@ impl YaldaGpuiView {
             sections.pop();
         }
         let total_rows: usize = sections.iter().map(Vec::len).sum();
-        let n_cols = if total_rows <= 8 {
+        let n_cols = if total_rows <= 10 {
             1
-        } else if total_rows <= 18 {
+        } else if total_rows <= 20 {
             2
         } else {
             3
@@ -6418,48 +6558,81 @@ impl YaldaGpuiView {
             columns.last_mut().unwrap().push(sec);
         }
 
-        let render_node = |node: &MenuNode| -> AnyElement {
+        let body_font = self.body_font.clone();
+        let chip_mono = self.code_font.clone();
+        let disabled = &m.disabled;
+        let render_node = move |node: &MenuNode| -> AnyElement {
             match node.kind() {
                 MenuNodeKind::Separator => unreachable!("separators delimit sections"),
+                // Section heading: a `Label` node reads as an uppercase mono
+                // caption (replacing the old bold-inline label + divider rule).
                 MenuNodeKind::Label => div()
-                    .py_0p5()
-                    .text_color(label_fg)
+                    .pt(px(10.0))
+                    .pb(px(3.0))
+                    .px(px(14.0))
+                    .font_family(chip_mono.clone())
+                    .text_size(px(10.0))
                     .font_weight(FontWeight::BOLD)
-                    .child(node.label.clone())
+                    .text_color(label_fg)
+                    .child(node.label.to_uppercase())
                     .into_any_element(),
                 MenuNodeKind::Command | MenuNodeKind::Submenu => {
                     let key_display = format_menu_key(&node.key);
-                    let trailing = if node.kind() == MenuNodeKind::Submenu {
-                        format!(" {} \u{25b8}", node.label)
-                    } else {
-                        format!(" {}", node.label)
-                    };
-                    // Behavior 10: disabled entries render dimmed (key and
-                    // label both in the label color) and don't dispatch.
+                    let is_submenu = node.kind() == MenuNodeKind::Submenu;
+                    // Behavior 10: disabled entries render dimmed and don't dispatch.
                     let is_disabled = matches!(&node.action,
-                        MenuAction::Command(name) if m.disabled.contains(name));
+                        MenuAction::Command(name) if disabled.contains(name));
                     let label_color = if is_disabled {
                         label_fg
-                    } else if node.kind() == MenuNodeKind::Submenu {
+                    } else if is_submenu {
                         submenu_fg
                     } else {
                         label_text_fg
                     };
-                    let entry_key_fg = if is_disabled { label_fg } else { key_fg };
-                    div()
+                    let chip_fg = if is_disabled { label_fg } else { key_fg };
+                    let mut chip_bg = key_fg;
+                    chip_bg.a = if is_disabled { 0.04 } else { 0.10 };
+                    let mut row = div()
                         .flex()
                         .flex_row()
-                        .items_baseline()
-                        .py_0p5()
+                        .items_center()
+                        .gap(px(10.0))
+                        .h(px(26.0))
+                        .px(px(14.0))
                         .child(
+                            // Key chip: right-aligned in a fixed gutter so labels
+                            // share a left edge and multi-char keys grow leftward.
                             div()
-                                .min_w(px(48.0))
-                                .text_color(entry_key_fg)
+                                .flex_none()
+                                .min_w(px(34.0))
+                                .px(px(6.0))
+                                .h(px(18.0))
+                                .rounded(px(4.0))
+                                .bg(chip_bg)
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .font_family(chip_mono.clone())
+                                .text_size(px(12.0))
                                 .font_weight(FontWeight::BOLD)
+                                .text_color(chip_fg)
                                 .child(key_display),
                         )
-                        .child(div().text_color(label_color).child(trailing))
-                        .into_any_element()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(label_color)
+                                .child(node.label.clone()),
+                        );
+                    if is_submenu {
+                        row = row.child(
+                            div()
+                                .flex_none()
+                                .text_color(submenu_fg)
+                                .child(SharedString::new_static("▸")),
+                        );
+                    }
+                    row.into_any_element()
                 }
             }
         };
@@ -6468,26 +6641,20 @@ impl YaldaGpuiView {
             .flex()
             .flex_row()
             .items_start()
-            .gap_8()
-            .px_4()
-            .py_2()
-            .text_color(label_text_fg)
-            .text_size(px(14.0))
-            .font_family(self.body_font.clone());
+            .gap(px(24.0))
+            .py(px(6.0))
+            .pr(px(10.0))
+            .text_size(px(13.0))
+            .font_family(body_font)
+            .font_weight(FontWeight::MEDIUM);
         for col_sections in columns {
-            let mut col_div = div().flex().flex_col().min_w(px(220.0));
+            let mut col_div = div().flex().flex_col().min_w(px(196.0));
             let mut first = true;
             for sec in col_sections {
                 if !first {
-                    // Inter-section gap inside a column (replaces the old
-                    // full-width separator rule).
-                    col_div = col_div.child(
-                        div()
-                            .h(px(8.0))
-                            .border_b_1()
-                            .border_color(popup_border)
-                            .my_1(),
-                    );
+                    // Inter-section whitespace inside a column (labels + gaps group
+                    // better than a rule inside a small card).
+                    col_div = col_div.child(div().h(px(8.0)));
                 }
                 first = false;
                 for node in sec {
@@ -6497,34 +6664,47 @@ impl YaldaGpuiView {
             entries_col = entries_col.child(col_div);
         }
 
-        let footer = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .px_4()
-            .py_1()
-            .h(px(22.0))
-            .text_color(label_fg)
-            .text_size(px(11.0))
-            .child(SharedString::new_static("press a key · Esc back / close"));
-
-        // Absolute-positioned popup at the top of the window. Width spans
-        // full window width; height is content-sized. Opaque bg + bottom
-        // border so the underlying screen is visible *below* the popup but
-        // hidden behind it.
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .w_full()
-            .bg(menu_bg)
-            .border_b_2()
-            .border_color(popup_border)
+        // The card: accent bar + body column, content-sized within the width band.
+        let accent_bar = div().w(px(2.0)).flex_none().bg(scope_hue);
+        let body_col = div()
             .flex()
             .flex_col()
+            .flex_1()
             .child(header_row)
-            .child(entries_col)
-            .child(footer)
+            .child(probe_bounds("menu-entries", entries_col.into_any_element()));
+        let card = div()
+            .flex()
+            .flex_row()
+            .min_w(px(MENU_PANEL_MIN_W))
+            .max_w(px(MENU_PANEL_MAX_W))
+            .bg(menu_bg)
+            .border_1()
+            .border_color(popup_border)
+            .rounded(px(8.0))
+            .shadow_lg()
+            .overflow_hidden()
+            .child(accent_bar)
+            .child(body_col);
+
+        // Float it: cover the window, inset past the jump panel, center the card
+        // horizontally in the remaining region, pin its top (UXI-Menu-1). No scrim
+        // (these live for ~800ms of muscle memory; a per-chord dim would flash).
+        let mut wrap = div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_row()
+            .items_start()
+            .justify_center()
+            .pt(px(MENU_PANEL_TOP));
+        if self.jump_panel_visible {
+            wrap = wrap.pl(px(JUMP_PANEL_WIDTH));
+        }
+        probe_bounds(
+            "menu-overlay-root",
+            wrap.child(probe_bounds("menu-panel", card.into_any_element()))
+                .into_any_element(),
+        )
     }
 
     /// Render the buffer-list picker as a full-window overlay, mirroring the

@@ -2671,6 +2671,37 @@ fn menu_state_round_trip_picks_command() {
 }
 
 #[test]
+fn menu_trail_crumbs_tracks_descent() {
+    // UXI-Menu-3: the header trail is the literal chord to the current level.
+    // At root it's just [leader] + the scope name; each submenu descent appends
+    // that submenu's key and its label becomes the level name.
+    use crate::menu_trail_crumbs;
+    let menu = doc_local_menu();
+
+    // Root: leader glyph only, scope name is the level label.
+    let mut state = MenuState::new();
+    state.open();
+    let (crumbs, label) = menu_trail_crumbs(&menu, &state.path, "␣", "DOC");
+    assert_eq!(crumbs, vec!["␣".to_string()], "root shows only the leader glyph");
+    assert_eq!(label, "DOC", "root level label is the scope");
+
+    // Descend into the `n` → "navigate" submenu: crumb `n` is appended and the
+    // level label becomes that submenu's name.
+    let after_n = state.process_key(KeyPress::new(Key::Char('n'), KMods::NONE), &menu);
+    assert_eq!(after_n, None, "n opens the navigate submenu");
+    let (crumbs, label) = menu_trail_crumbs(&menu, &state.path, "␣", "DOC");
+    assert_eq!(
+        crumbs,
+        vec!["␣".to_string(), "n".to_string()],
+        "descended key is appended to the trail"
+    );
+    assert_eq!(label, "navigate", "level label is the submenu label after descent");
+    // Negative control: a `current_label`-only breadcrumb would drop the `n`
+    // crumb — asserting the descended key survives is what the trail adds.
+    assert!(crumbs.contains(&"n".to_string()), "trail must carry the descended key");
+}
+
+#[test]
 fn local_menus_have_no_duplicate_keys_per_level() {
     // spec-menu-scopes.md: every local menu must be unambiguous — one
     // key, one entry, at each depth.

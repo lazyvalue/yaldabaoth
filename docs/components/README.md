@@ -51,7 +51,7 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 - [rail.md](rail.md) — `Rail`.
 - [keybindings.md](keybindings.md) — `Keybindings`. `UXI-Keybindings-1`.
 - [common/](common/README.md) — shared behaviors: `TextEditing`, `Selection`,
-  `TextZoom`, `Blockquote`, `ParagraphSpacing`.
+  `TextZoom`, `Blockquote`, `ParagraphSpacing`, `Menu` (leader command panel).
 
 ## Format of a component spec
 

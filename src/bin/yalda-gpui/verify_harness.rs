@@ -9586,6 +9586,155 @@ fn fresh_worksheet_space_opens_the_tile_menu(cx: &mut TestAppContext) {
     );
 }
 
+/// Open the workspace (`.`) leader menu on a nav-resting worksheet and paint one
+/// frame with the layout probe active. Returns `(card_bounds, root_bounds)` where
+/// `card` is the floating panel (`menu-panel`) and `root` is the full-window overlay
+/// wrapper (`menu-overlay-root`). Helper for the UXI-Menu-1/-4 geometry tests.
+fn probe_open_menu(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    leader: &str,
+) -> ((f32, f32, f32, f32), (f32, f32, f32, f32)) {
+    vcx.simulate_keystrokes(leader);
+    vcx.run_until_parked();
+    assert!(
+        view.read_with(vcx, |v, _| v.overlay_is_menu()),
+        "leader `{leader}` should open the menu"
+    );
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let card = crate::layout_probe_get("menu-panel").expect("card painted");
+    let root = crate::layout_probe_get("menu-overlay-root").expect("root painted");
+    crate::layout_probe_end();
+    (card, root)
+}
+
+/// UXI-Menu-1: the command panel floats as a content-sized card in the workspace
+/// region (right of the jump panel), horizontally centered, NOT a full-width bar. On
+/// the 1920px test display the card must be clamped to `MENU_PANEL_MAX_W`, sit right
+/// of `JUMP_PANEL_WIDTH`, and center on the content region.
+///
+/// Negative control: restore `.absolute().top_0().left_0().w_full()` on the panel in
+/// `render_menu_overlay` (drop the centered float) → the card width becomes the full
+/// 1920px window and `x == 0`, so both `width <= MAX` and the centered-x assert fail
+/// RED. Verified by reverting the wrapper locally.
+#[gpui::test]
+fn menu_panel_floats_in_content_region(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_worksheet_nav(cx);
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        assert!(v.jump_panel_visible, "test assumes the jump panel is visible");
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    let (card, root) = probe_open_menu(&view, vcx, ".");
+    let (cx0, _cy, cw, _ch) = card;
+    let (rx0, _ry, rw, _rh) = root;
+
+    // The root wrapper spans the whole window; the card must be materially narrower
+    // (this makes the "not full-width" assertion NON-vacuous — the window is 1920,
+    // far wider than the 720px cap).
+    assert!(
+        rw > crate::MENU_PANEL_MAX_W + 200.0,
+        "test window ({rw}px) must be much wider than the card cap so the float is meaningful"
+    );
+    assert!(
+        cw <= crate::MENU_PANEL_MAX_W + 0.5,
+        "card width {cw} exceeds MENU_PANEL_MAX_W {}",
+        crate::MENU_PANEL_MAX_W
+    );
+    assert!(cw < rw - 100.0, "card ({cw}px) is not content-sized — spans the window ({rw}px)");
+    assert!(
+        cx0 >= rx0 + crate::JUMP_PANEL_WIDTH - 0.5,
+        "card left {cx0} intrudes into the jump-panel region (< {})",
+        rx0 + crate::JUMP_PANEL_WIDTH
+    );
+    // Centered in the content region [JUMP_PANEL_WIDTH, root_right].
+    let content_center = rx0 + (crate::JUMP_PANEL_WIDTH + rw) / 2.0;
+    let card_center = cx0 + cw / 2.0;
+    assert!(
+        (card_center - content_center).abs() < 2.0,
+        "card center {card_center} not centered on content region {content_center}"
+    );
+}
+
+/// UXI-Menu-2: the panel body (key-chip + label rows / section labels) paints
+/// inside the card bounds with height for multiple rows. Structural guard that the
+/// entries actually render within the float (exact chip colors are the pixel gap).
+///
+/// Negative control: drop the `entries_col` child from `body_col` → `menu-entries`
+/// never paints and `.expect(...)` panics RED.
+#[gpui::test]
+fn menu_panel_rows_and_sections_paint(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_worksheet_nav(cx);
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    // Space opens the AGENT local menu — a multi-row, multi-section tree.
+    let (card, _root) = probe_open_menu(&view, vcx, "space");
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let entries = crate::layout_probe_get("menu-entries").expect("entries painted");
+    crate::layout_probe_end();
+
+    let (cx0, cy0, cw, ch) = card;
+    let (ex0, ey0, ew, eh) = entries;
+    // Entries sit inside the card.
+    assert!(ex0 >= cx0 - 0.5 && ey0 >= cy0 - 0.5, "entries escape the card top-left");
+    assert!(ex0 + ew <= cx0 + cw + 0.5, "entries overflow the card right edge");
+    assert!(ey0 + eh <= cy0 + ch + 0.5, "entries overflow the card bottom edge");
+    // The agent menu is many rows tall — height must clear multiple 26px rows.
+    assert!(eh > 26.0 * 3.0, "entries height {eh} too short for a multi-row menu");
+}
+
+/// UXI-Menu-4: descending into a submenu never moves the card's top edge or
+/// horizontal center (only its height/width may change). The static-render descent
+/// reads as the card breathing, not teleporting.
+///
+/// Negative control: pin the panel to `top_0` (drop `MENU_PANEL_TOP`) AND make the
+/// top depend on level (e.g. shift by path depth) → the two probed tops diverge and
+/// the assert fails RED. With the fixed-top float they are identical.
+#[gpui::test]
+fn menu_panel_top_stable_across_descent(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_worksheet_nav(cx);
+    view.update(vcx, |v, cx| {
+        v.splash_until = None;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    // Root of the `.` workspace menu.
+    let (card_root, _root) = probe_open_menu(&view, vcx, ".");
+
+    // Descend into the `n` → "new" submenu (gpui_menu has it) and re-probe.
+    vcx.simulate_keystrokes("n");
+    vcx.run_until_parked();
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let card_sub = crate::layout_probe_get("menu-panel").expect("submenu card painted");
+    crate::layout_probe_end();
+
+    let (rx, ry, rw, _rh) = card_root;
+    let (sx, sy, sw, _sh) = card_sub;
+    assert!((ry - sy).abs() < 0.5, "card top moved on descent: {ry} → {sy}");
+    let root_center = rx + rw / 2.0;
+    let sub_center = sx + sw / 2.0;
+    assert!(
+        (root_center - sub_center).abs() < 0.5,
+        "card horizontal center moved on descent: {root_center} → {sub_center}"
+    );
+}
+
 /// REGRESSION (round-3 restore edge): `settle_input_focus` makes focus/You-block
 /// consistent with the restored placement + draft. A restored chatbox focuses its
 /// box; a restored worksheet draft shows as a tail block (not hidden); an empty

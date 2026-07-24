@@ -26,3 +26,5 @@ them by id.
 - [paragraph-spacing.md](paragraph-spacing.md) — `ParagraphSpacing`: extra vertical
   gap between blocks / paragraphs / list items on the reading surfaces (doc view,
   agent transcript, WP), scaled with zoom.
+- [menu.md](menu.md) — `Menu`: the leader command panel (the floating "Sigil Card"),
+  shared by every tile's `space` / `.` / `?` leaders. `UXI-Menu-1..4`.
