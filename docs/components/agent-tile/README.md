@@ -32,6 +32,8 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
   surface (background, turn headers, subagent swap, render freshness, token splits).
 - [compose.md](compose.md) — `UXI-AgentTile-9..14`, `-21`: the compose input (word-wrap,
   worksheet vs chatbox, paint-on-route, immediate submit, image paste, reply-with-quote).
+- [naming.md](naming.md) — `UXI-AgentTile-27`: one-shot autonaming + summary of a
+  session from its first exchange; an explicit rename latches and wins.
 - [recap.md](recap.md) — `UXI-AgentTile-15`: the pinned, isolated session recap.
 - [model.md](model.md) — `UXI-AgentTile-16`: the per-session model selector.
 - [session-binding.md](session-binding.md) — `UXI-AgentTile-18..19`, `-22..23`: durable
@@ -68,3 +70,4 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-21 | compose | `[N]r` over agent text opens a reply You-block seeded with a quotation | implemented |
 | UXI-AgentTile-22 | session-binding | Closing a session requires a typed `yes` confirmation | implemented (rule 1 amended by `-23`) |
 | UXI-AgentTile-23 | session-binding | Arming the close confirm drops you into insert, unless a draft is at risk | implemented |
+| UXI-AgentTile-27 | naming | A session names + summarizes itself once; an explicit rename wins forever | implemented |

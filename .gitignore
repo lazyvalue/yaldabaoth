@@ -8,6 +8,9 @@
 # insta snapshot pending-review artifacts
 *.snap.new
 
+# local secrets (ANTHROPIC_API_KEY for session autonaming, …)
+.env
+
 # brainstorm scratch (superpowers tool)
 .superpowers/
 

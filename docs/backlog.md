@@ -27,6 +27,54 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   `docs/components/README.md` § Terminology, cross-referenced from the jump-panel
   and session-binding specs.
 
+- **Cmd-P fuzzy jump palette (workspaces + agent sessions)** — `NEEDS-DECISION`
+  (2026-07-24 via `/new-ux`; component `JumpPanel` or a new `JumpPalette`, UXI
+  TBD). Captured verbatim: *"I want a Cmd-P jump command. When I hit Cmd-P a
+  dialog appears that I can type into. It is doing a fuzzy match on both
+  workspace names and agent session names. It shows a list of possible matches
+  below. I can use arrow keys to select one directly. Or if I hit `<enter>` it
+  jumps to the current top match."* Prior art to reuse rather than reinvent: the
+  always-visible jump panel (`jump_panel_view.rs`, `UXI-JumpPanel-1..8`) already
+  owns the merged workspaces ∪ universal-`AgentRoster` list and the jump/bind
+  semantics (free session → ephemeral virtual workspace); the buffer switcher
+  already has a fuzzy filter (`filtered_buffer_indices` + `fuzzy_match_gpui`,
+  `main.rs:6283`); overlays already exist as `ActiveOverlay` with per-overlay key
+  dispatch. No existing `cmd-p` binding. Open questions under interrogation:
+  which surfaces it opens from, exactly what a "name" is on each side, ranking vs
+  filtering, arrow-key + Enter semantics with an empty/no-match query, and
+  whether it supersedes or complements the sidebar panel.
+
+- **Autonaming of agent sessions + jump-panel summary** — `NEEDS-RUNTIME`
+  (branch `session-autonaming`, merged to `main` 2026-07-24 via `/new-ux`;
+  `UXI-AgentTile-27`, spec `docs/components/agent-tile/naming.md`). Captured
+  verbatim: *"I want autonaming of sessions based on the first couple of
+  interactions. Possibly via Haiku. Should be a couple of words. When I use the
+  rename command it should override."* plus, mid-build, *"also having a short
+  summary (2 sentences) would be great"* and *"we could put the summary
+  underneath in tiny italics on the jump panel."* When a session's FIRST agent
+  turn completes, the opening exchange goes to `claude-haiku-4-5` over one plain
+  HTTP `/v1/messages` call (no SDK exists for Rust; built on the `ureq` client
+  Linear + Telegram already use) and comes back as a 2–3 word name plus a
+  two-sentence summary. The name replaces `claude-N` everywhere; the summary
+  renders under it in small italics in the jump panel and persists in
+  `acp_sessions.json`. One shot per session, ever — restored sessions are never
+  retro-named. An explicit rename latches a typed `NameOrigin::User`, which
+  permanently blocks autonaming and drops an in-flight result rather than
+  applying it; this replaces the `is_auto_claude_label` string sniff, which
+  cannot tell an autoname from a name the user typed. Shape is enforced
+  client-side (28-char name cap, 2-sentence summary cap, tolerant JSON/fence/
+  bare-text parser), and every failure mode is silent — no key, no network, a
+  refusal, or junk leaves the session as `claude-N`. `.env` is now gitignored and
+  loaded at startup for `ANTHROPIC_API_KEY` (real env vars win). Guards:
+  `autoname_fires_once_on_first_turn_completion`,
+  `autoname_result_renames_the_session`,
+  `rename_latches_origin_and_blocks_autoname`,
+  `late_autoname_result_never_clobbers_a_user_rename`, plus unit coverage for the
+  sanitizers / reply parser / `.env` parser; **four negative controls observed
+  RED**; 457 gpui tests + full suite green. Remaining human check: the live Haiku
+  round-trip end-to-end (harness gap #2 — the worker is `cfg(test)`-suppressed),
+  and the italic summary line's exact size/color under folio + nightfox (gap #1).
+
 - **Contextual "New Agent" + one-gesture close in the bare agent view** —
   `NEEDS-RUNTIME` (branch `contextual-new-agent`, 2026-07-24 via `/new-ux`;
   `UXI-Workspace-8`, `UXI-Workspace-9`, `UXI-AgentTile-23`). Two user
