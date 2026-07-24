@@ -9611,14 +9611,15 @@ fn probe_open_menu(
 }
 
 /// UXI-Menu-1: the command panel floats as a content-sized card in the workspace
-/// region (right of the jump panel), horizontally centered, NOT a full-width bar. On
-/// the 1920px test display the card must be clamped to `MENU_PANEL_MAX_W`, sit right
-/// of `JUMP_PANEL_WIDTH`, and center on the content region.
+/// region, LEFT-ANCHORED just past the jump panel (about where the first workspace
+/// tile renders) with a small gutter — NOT a full-width bar, NOT centered. On the
+/// 1920px test display the card must be clamped to `MENU_PANEL_MAX_W`, narrower than
+/// the window, and sit at `JUMP_PANEL_WIDTH + MENU_PANEL_LEFT_PAD` from the left.
 ///
 /// Negative control: restore `.absolute().top_0().left_0().w_full()` on the panel in
-/// `render_menu_overlay` (drop the centered float) → the card width becomes the full
-/// 1920px window and `x == 0`, so both `width <= MAX` and the centered-x assert fail
-/// RED. Verified by reverting the wrapper locally.
+/// `render_menu_overlay` (drop the left-anchored float) → the card width becomes the
+/// full 1920px window and `x == 0`, so both `width <= MAX` and the left-edge assert
+/// fail RED. Verified by reverting the wrapper locally.
 #[gpui::test]
 fn menu_panel_floats_in_content_region(cx: &mut TestAppContext) {
     cx.update(crate::register_keymap);
@@ -9647,17 +9648,11 @@ fn menu_panel_floats_in_content_region(cx: &mut TestAppContext) {
         crate::MENU_PANEL_MAX_W
     );
     assert!(cw < rw - 100.0, "card ({cw}px) is not content-sized — spans the window ({rw}px)");
+    // Left-anchored just past the jump panel + gutter (where the first tile renders).
+    let expected_left = rx0 + crate::JUMP_PANEL_WIDTH + crate::MENU_PANEL_LEFT_PAD;
     assert!(
-        cx0 >= rx0 + crate::JUMP_PANEL_WIDTH - 0.5,
-        "card left {cx0} intrudes into the jump-panel region (< {})",
-        rx0 + crate::JUMP_PANEL_WIDTH
-    );
-    // Centered in the content region [JUMP_PANEL_WIDTH, root_right].
-    let content_center = rx0 + (crate::JUMP_PANEL_WIDTH + rw) / 2.0;
-    let card_center = cx0 + cw / 2.0;
-    assert!(
-        (card_center - content_center).abs() < 2.0,
-        "card center {card_center} not centered on content region {content_center}"
+        (cx0 - expected_left).abs() < 2.0,
+        "card left {cx0} not anchored past the jump panel + gutter ({expected_left})"
     );
 }
 
@@ -9695,13 +9690,13 @@ fn menu_panel_rows_and_sections_paint(cx: &mut TestAppContext) {
     assert!(eh > 26.0 * 3.0, "entries height {eh} too short for a multi-row menu");
 }
 
-/// UXI-Menu-4: descending into a submenu never moves the card's top edge or
-/// horizontal center (only its height/width may change). The static-render descent
-/// reads as the card breathing, not teleporting.
+/// UXI-Menu-4: descending into a submenu never moves the card's top edge or LEFT
+/// edge (only its height/width may change, growing down/right from the anchor). The
+/// static-render descent reads as the card breathing, not teleporting.
 ///
-/// Negative control: pin the panel to `top_0` (drop `MENU_PANEL_TOP`) AND make the
-/// top depend on level (e.g. shift by path depth) → the two probed tops diverge and
-/// the assert fails RED. With the fixed-top float they are identical.
+/// Negative control: make the top depend on level (e.g. shift by path depth) → the
+/// two probed tops diverge and the assert fails RED. With the fixed-top left-anchored
+/// float they are identical.
 #[gpui::test]
 fn menu_panel_top_stable_across_descent(cx: &mut TestAppContext) {
     cx.update(crate::register_keymap);
@@ -9724,14 +9719,12 @@ fn menu_panel_top_stable_across_descent(cx: &mut TestAppContext) {
     let card_sub = crate::layout_probe_get("menu-panel").expect("submenu card painted");
     crate::layout_probe_end();
 
-    let (rx, ry, rw, _rh) = card_root;
-    let (sx, sy, sw, _sh) = card_sub;
+    let (rx, ry, _rw, _rh) = card_root;
+    let (sx, sy, _sw, _sh) = card_sub;
     assert!((ry - sy).abs() < 0.5, "card top moved on descent: {ry} → {sy}");
-    let root_center = rx + rw / 2.0;
-    let sub_center = sx + sw / 2.0;
     assert!(
-        (root_center - sub_center).abs() < 0.5,
-        "card horizontal center moved on descent: {root_center} → {sub_center}"
+        (rx - sx).abs() < 0.5,
+        "card left edge moved on descent: {rx} → {sx}"
     );
 }
 

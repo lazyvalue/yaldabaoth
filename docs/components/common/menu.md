@@ -57,14 +57,16 @@ level — a menu whose goal is its own obsolescence.
 **Statement.** When a leader menu is open the panel is an absolutely-positioned,
 **content-sized floating card** — NOT a full-window-width bar. Its width is clamped
 to `[MENU_PANEL_MIN_W (340px), MENU_PANEL_MAX_W (720px)]` and is strictly less than
-the window width on any monitor wider than `MENU_PANEL_MAX_W`. It is horizontally
-centered within the content region to the right of the jump panel (its left edge is
-`≥ JUMP_PANEL_WIDTH` when the panel is visible) and pinned a fixed
-`MENU_PANEL_TOP (48px)` below the top of the window.
+the window width on any monitor wider than `MENU_PANEL_MAX_W`. It is **left-anchored**
+just past the jump panel — its left edge sits at
+`JUMP_PANEL_WIDTH + MENU_PANEL_LEFT_PAD (16px)` when the panel is visible (else
+`MENU_PANEL_LEFT_PAD`), about where the first workspace tile renders — and pinned a
+fixed `MENU_PANEL_TOP (48px)` below the top of the window. It grows down/right from
+that anchor; it is not centered.
 
 **Applies to.** `render_menu_overlay` (`main.rs`); the wrapper that composites it
 over `screen_view` at the end of `render`. Constants `MENU_PANEL_MIN_W`,
-`MENU_PANEL_MAX_W`, `MENU_PANEL_TOP`.
+`MENU_PANEL_MAX_W`, `MENU_PANEL_TOP`, `MENU_PANEL_LEFT_PAD`.
 
 **Why.** The old `.w_full().top_0()` bar wasted the entire right half of a wide
 monitor and read as an intrusive drop-down rather than a deliberate command surface.
@@ -125,9 +127,9 @@ appends that submenu's key and its label. Negative control: return only
 
 **Statement.** The card carries a 2px full-height **left accent bar** in the leader's
 scope hue (`space`→`agent.frozen_bar`, `.`→`overlay.key`, `?`→`agent.jump_header`),
-and the card's **top edge is invariant across submenu descent** — descending into or
-escaping out of a submenu never moves the card's top or horizontal center (only its
-height/width may change, symmetrically about center).
+and the card's **top edge and left edge are invariant across submenu descent** —
+descending into or escaping out of a submenu never moves the card's top or left
+anchor (only its height/width may change, growing down/right).
 
 **Applies to.** `render_menu_overlay` (accent bar element `menu-accent-bar`; the
 fixed `top`/centered wrapper).
@@ -161,7 +163,10 @@ What shipped vs. what was designed in step 4, and why:
   current level name in the **scope hue** (not a separate accent token) — one hue per
   scope, reinforcing the accent bar. Scope display name maps `.`→"WORKSPACE",
   `?`→"GLOBAL"; the stored `header` string is unchanged (other code/tests read it).
-- **Everything else as briefed:** top-center float right of the jump panel, fixed 48px
+- **Placement refined post-review:** Fable briefed a top-*center* float; shipped
+  **left-anchored** just past the jump panel + a 16px gutter (`MENU_PANEL_LEFT_PAD`),
+  about where the first workspace tile renders — reads more intentional than centered.
+- **Everything else as briefed:** float right of the jump panel, fixed 48px
   top, `[340, 720]px` width band, 2px scope-hued left accent bar, sigil vocabulary
   (`✦ ▣ ▤ ◈ ⌘ ⊞ ◉`), key chips (mono, right-aligned in a 34px gutter, `overlay.key`
   tint), retuned column thresholds (`≤10→1, ≤20→2, else 3`), esc chip replacing the

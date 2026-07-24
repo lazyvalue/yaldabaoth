@@ -490,6 +490,9 @@ fn format_menu_key(seq: &[KeyPress]) -> String {
 pub(crate) const MENU_PANEL_MIN_W: f32 = 340.0;
 pub(crate) const MENU_PANEL_MAX_W: f32 = 720.0;
 pub(crate) const MENU_PANEL_TOP: f32 = 48.0;
+/// Left gutter between the jump panel and the card, so the card sits about where
+/// the first workspace tile would render rather than glued to the panel edge.
+pub(crate) const MENU_PANEL_LEFT_PAD: f32 = 16.0;
 
 /// Build the keystroke trail for the current menu depth (UXI-Menu-3): the leader
 /// glyph followed by each descended submenu key, plus the name of the level you're
@@ -6686,20 +6689,24 @@ impl YaldaGpuiView {
             .child(accent_bar)
             .child(body_col);
 
-        // Float it: cover the window, inset past the jump panel, center the card
-        // horizontally in the remaining region, pin its top (UXI-Menu-1). No scrim
-        // (these live for ~800ms of muscle memory; a per-chord dim would flash).
-        let mut wrap = div()
+        // Float it: cover the window, left-anchor the card just past the jump panel
+        // (about where the first workspace tile renders) with a small gutter, pin its
+        // top (UXI-Menu-1). No scrim (these live for ~800ms of muscle memory; a
+        // per-chord dim would flash).
+        let left = if self.jump_panel_visible {
+            JUMP_PANEL_WIDTH + MENU_PANEL_LEFT_PAD
+        } else {
+            MENU_PANEL_LEFT_PAD
+        };
+        let wrap = div()
             .absolute()
             .inset_0()
             .flex()
             .flex_row()
             .items_start()
-            .justify_center()
-            .pt(px(MENU_PANEL_TOP));
-        if self.jump_panel_visible {
-            wrap = wrap.pl(px(JUMP_PANEL_WIDTH));
-        }
+            .justify_start()
+            .pt(px(MENU_PANEL_TOP))
+            .pl(px(left));
         probe_bounds(
             "menu-overlay-root",
             wrap.child(probe_bounds("menu-panel", card.into_any_element()))
