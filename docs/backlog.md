@@ -13,6 +13,14 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Abandon-reply gesture in the worksheet You-block** — DONE (2026-07-23 via
+  `/new-ux`, `UXI-AgentTile-24`). `<esc>u` in an open worksheet You-block backs
+  the reply out undo-style: normal undo of any typing, then `u` pops the block
+  (clear draft + close active block, parked untouched) → transcript Normal nav.
+  In the common `r → Esc → u` case (`r`-seed is a committed baseline) the first
+  `u` pops. Guard `worksheet_esc_u_backs_out_reply_block` (real keystrokes; NC
+  observed RED). Headless — no runtime gap beyond painted glyphs (#1).
+
 - **Agent transcript: faint-blue background on the user's own turns** —
   `NEEDS-RUNTIME` (built 2026-07-22 via `/new-ux`; `UXI-AgentTile-23`, ADR-0027).
   "I want the background color of my responses in an agent session to be a slightly

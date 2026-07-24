@@ -8522,6 +8522,123 @@ fn worksheet_r_seeds_reply_quote_from_agent_line(cx: &mut TestAppContext) {
     });
 }
 
+/// UXI-AgentTile-24: `u` in an open worksheet You-block backs the reply out,
+/// undo-style. Common flow `r → Esc → u` pops the block on the FIRST `u` (the
+/// seeded quote is a committed baseline with no undo history). The layered case
+/// (`i`, type, `Esc`, `u` undoes the typing and the block stays; a further `u`
+/// pops it) is asserted too. Drives the REAL keystroke dispatch (handle_claude_key).
+///
+/// Negative control (observed RED): make the `u` branch always `editor.undo()`
+/// (drop the pop) → after `r → Esc → u` the block is STILL open (the
+/// `!you_block_open` assert fails).
+#[gpui::test]
+fn worksheet_esc_u_backs_out_reply_block(cx: &mut TestAppContext) {
+    use yalda::acp_channel::ReplyEvent;
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx, _id, _session) = boot_with_transcript(cx); // worksheet nav
+    let ev = |e: ReplyEvent| ServerNotification::ReplyEvent {
+        session_id: "S1".into(),
+        event: e,
+    };
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![
+                ev(ReplyEvent::Chunk("First sentence. Second sentence.\n".into())),
+                ev(ReplyEvent::TurnEnded { count: 1 }),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    let park_on_agent_line = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
+        view.update(vcx, |v, cx| {
+            let mut c = v.agent_mut(cx).expect("agent");
+            let (s, _e) = c.latest_agent_turn_range().unwrap_or((0, 0));
+            c.editor.cursor_mut().line = s;
+        });
+    };
+
+    // ── Common flow: r → Esc → u pops on the FIRST u ────────────────────────
+    park_on_agent_line(&view, vcx);
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(c.you_block_open, "r opened the block");
+        assert_eq!(
+            c.input_surface.compose().mode,
+            crate::EditMode::Insert,
+            "seeded reply is in Insert"
+        );
+    });
+    // 1st Esc: compose → Normal, still in the block.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(c.you_block_open, "still in the block after 1st Esc");
+        assert_eq!(
+            c.input_surface.compose().mode,
+            crate::EditMode::Normal,
+            "1st Esc dropped the compose to Normal (in place)"
+        );
+    });
+    // u: nothing to undo (committed baseline) → pop the block.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("u"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(!c.you_block_open, "u popped the You-block");
+        assert!(
+            c.input_surface.compose().text().trim().is_empty(),
+            "the reply text is gone"
+        );
+        assert_eq!(
+            c.focus,
+            crate::AgentFocus::Transcript,
+            "back in transcript Normal navigation"
+        );
+    });
+
+    // ── Layered case: undo the typing first, THEN pop ───────────────────────
+    park_on_agent_line(&view, vcx);
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("r"), w, cx));
+    vcx.run_until_parked();
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    vcx.run_until_parked();
+    // Re-enter Insert and type a character.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("i"), w, cx));
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("x"), w, cx));
+    vcx.run_until_parked();
+    let typed = view.update(vcx, |v, cx| {
+        v.agent_mut(cx).unwrap().input_surface.compose().text()
+    });
+    assert!(typed.contains('x'), "typed x is in the draft: {typed:?}");
+    // Esc → Normal, then u: undoes the typing, block STAYS open.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("escape"), w, cx));
+    vcx.run_until_parked();
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("u"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(c.you_block_open, "1st u undid the typing; the block stays open");
+        assert!(
+            !c.input_surface.compose().text().contains('x'),
+            "the typed x was undone"
+        );
+    });
+    // 2nd u: nothing left to undo → pop.
+    view.update_in(vcx, |v, w, cx| v.handle_claude_key(&ws_bare_key("u"), w, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        assert!(!c.you_block_open, "2nd u popped the block");
+        assert_eq!(c.focus, crate::AgentFocus::Transcript, "back to transcript nav");
+    });
+}
+
 /// UXI-AgentTile-21: a vim count prefix quotes that many sentences — `3r` quotes
 /// the first three, joined on one `>` line. Exercises the shared `pending_count`
 /// path end-to-end (`3` accumulates, `r` consumes via `take_count`).

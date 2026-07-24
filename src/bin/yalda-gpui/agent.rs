@@ -2070,6 +2070,16 @@ impl InputSurface {
             mode,
         }
     }
+
+    /// Like [`with_draft`], but the draft is the compose's committed baseline
+    /// (no undo history) — see [`Compose::seeded_committed`]. Used for the
+    /// `r`-seeded reply quotation so `u` can back the block out (UXI-AgentTile-24).
+    pub(crate) fn with_committed_draft(mode: InputModeKind, draft: &str) -> Self {
+        Self {
+            compose: Compose::seeded_committed(draft),
+            mode,
+        }
+    }
     pub(crate) fn is_chatbox(&self) -> bool {
         self.mode == InputModeKind::Chatbox
     }
@@ -2367,6 +2377,22 @@ impl Compose {
         for ch in text.chars() {
             c.editor.insert_char(ch);
         }
+        c
+    }
+
+    /// Like [`seeded`], but the seed is the compose's **committed baseline** — it
+    /// carries NO undo history (built as the editor's initial content, not as a
+    /// sequence of edits). So `editor.undo()` on an untouched seeded compose is a
+    /// no-op, which is what lets `u` pop a `r`-seeded You-block on the first press
+    /// once the user's own typing (if any) has been undone (UXI-AgentTile-24).
+    /// Cursor rests at the end of the seed (like `seeded`).
+    pub(crate) fn seeded_committed(text: &str) -> Self {
+        let mut c = Self::new();
+        c.editor = Editor::new(text.to_string(), std::path::PathBuf::from("*compose*"));
+        let last = c.editor.document().line_count().saturating_sub(1);
+        let col = c.editor.document().line_len_chars(last);
+        c.editor.cursor_mut().line = last;
+        c.editor.cursor_mut().col = col;
         c
     }
 }
@@ -4288,8 +4314,11 @@ impl AgentState {
         // the open discards only a draft parked AT THIS slot (a reply reseeds
         // fresh by intent); every other parked block is preserved by the open.
         self.open_you_block_at_cursor();
+        // Seed as a COMMITTED baseline (no undo history) so `u` can back the block
+        // out (UXI-AgentTile-24): an untouched seeded reply has nothing to undo,
+        // so the first `u` pops the block rather than erasing the quotation.
         self.input_surface =
-            InputSurface::with_draft(InputModeKind::Worksheet, &format!("re\n> {quote}\n"));
+            InputSurface::with_committed_draft(InputModeKind::Worksheet, &format!("re\n> {quote}\n"));
         self.input_surface.compose_mut().mode = EditMode::Insert;
         self.focus = AgentFocus::Compose;
         self.pending_reveal_cursor = true;

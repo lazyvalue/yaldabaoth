@@ -5081,6 +5081,49 @@ impl YaldaGpuiView {
             return;
         }
 
+        // UXI-AgentTile-24: `u` in an OPEN worksheet You-block (compose focused,
+        // Normal mode) is "back out the reply, undo-style": first an ordinary
+        // compose undo; when there is nothing left to undo, it POPS the block —
+        // clear the draft, close the ACTIVE block (parked insertion points
+        // untouched), and return to transcript Normal navigation. In the common
+        // `r → Esc → u` flow the seeded quote is a committed baseline (no undo
+        // history), so the first `u` pops. `u` is unchanged everywhere else.
+        let ws_block_u = self
+            .agent_read(cx, |c| {
+                !c.input_surface.is_chatbox()
+                    && c.focus == AgentFocus::Compose
+                    && c.you_block_open
+                    && c.input_surface.compose().mode == EditMode::Normal
+                    && press.key == Key::Char('u')
+                    && press.modifiers.is_empty()
+            })
+            .unwrap_or(false);
+        if ws_block_u {
+            self.with_session(focused_id, cx, |c| {
+                // The worksheet's 1st-Esc drops the compose to Normal by flipping
+                // the mode flag WITHOUT `end_insert()`, so any typing since the
+                // last commit is still in an open, un-undoable group. Commit it
+                // first so `undo()` actually unwinds the user's typing (else the
+                // committed stack looks empty and we'd wrongly pop immediately).
+                c.input_surface.compose_mut().editor.end_insert();
+                let before = c.input_surface.compose().text();
+                c.input_surface.compose_mut().editor.undo();
+                let after = c.input_surface.compose().text();
+                if before == after {
+                    // Nothing left to undo → pop the active reply block. Reset the
+                    // compose but DO NOT `close_you_block()` (that clears parked
+                    // blocks); only the active block is backed out.
+                    c.input_surface = InputSurface::new(InputModeKind::Worksheet);
+                    c.you_block_open = false;
+                    c.you_block_anchor = None;
+                    c.focus = AgentFocus::Transcript;
+                }
+                c.pending_reveal_cursor = true;
+            });
+            cx.notify();
+            return;
+        }
+
         // Model C: keystrokes route to the COMPOSE buffer in both placements —
         // the transcript is read-only (INV-1) and worksheet no longer edits it
         // in place. `compose_mut()` is total, so there is no per-placement branch.

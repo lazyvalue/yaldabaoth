@@ -1,6 +1,6 @@
 # Agent Tile — Compose
 
-Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-9..14`, `-21`.
+Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-9..14`, `-21`, `-24`.
 
 ## Description
 
@@ -517,3 +517,81 @@ asserts RED (`left: ""`); disabling the closing-markup run turns the bold case R
 with `left: "*this sentence is bold.* Next one."` — the exact reported symptom.
 The seeded `> ` quote renders italic per
 [UXI-Blockquote-1](../common/blockquote.md).
+
+### UXI-AgentTile-24 — `u` in an open worksheet You-block backs out the reply (undo pops the block)
+
+**Statement.** While a **worksheet You-block** is open and focused (the compose is
+an inline editable reply attached to the transcript — `focus == Compose`,
+`you_block_open`, NOT chatbox) and the compose is in **Normal** mode, pressing
+`u` is an **undo that pops the reply off the action stack**:
+
+1. **First, normal undo.** If the reply draft has undoable typing, `u` undoes it
+   — ordinary per-edit undo of the compose buffer. You stay in the block.
+2. **When there is nothing left to undo, `u` pops the block.** The reply is
+   abandoned: the draft is cleared, the **active** You-block is closed
+   (`you_block_open = false`, anchor cleared), and focus returns to **transcript
+   Normal navigation** (the worksheet's resting state).
+
+Because a `r`-seeded reply's quotation is the block's **baseline** (it carries no
+undo history), the common flow `r → Esc → u` pops the block on the **first** `u`
+— open the reply, decide against it, back out, one keystroke. Having typed a real
+reply, `u` unwinds the typing first and only then pops the block — "undo works
+normally; it just pops a stack," where opening the block is the entry beneath the
+typing.
+
+Scope / edges:
+
+- **Any open You-block**, not only `r`-seeded ones — `o`/`i`/`a`-opened blocks
+  (which start with an empty draft, hence an empty undo stack) pop on the first
+  `u` when untyped, or after their typing is undone.
+- **Active block only.** Parked insertion points (rule 6, `parked_you_blocks`)
+  are **left intact** — `u` backs out the reply you're in, not the whole
+  worksheet. (Full cross-block unwinding would be a separate global-undo feature;
+  out of scope here.)
+- **`u` is unchanged everywhere else.** It only means "back out the reply" while
+  an open worksheet You-block's compose is focused + Normal. In transcript nav,
+  the chatbox, mid-turn, or compose **Insert** mode, `u` behaves as before (`u`
+  types a literal `u` in Insert; Normal-mode `u` elsewhere is ordinary undo /
+  read-only nav). The `<esc>` in `<esc>u` is just the existing first-Esc that
+  drops the compose from Insert to Normal ([UXI-AgentTile-11](#uxi-agenttile-11--the-worksheet-is-an-inline-editable-conversation-buffer-chatbox-is-mid-turn-only)).
+
+**Applies to.** `agent_ui.rs` — a new `u` branch in `handle_claude_key`'s
+worksheet compose dispatch, gated on `(focus==Compose, you_block_open, !chatbox,
+compose.mode==Normal, key==u, no mods)`: it undoes the compose editor and, if the
+undo changed nothing, resets the active block (`InputSurface::new` +
+`you_block_open=false`/anchor cleared + `focus=Transcript`) **without** touching
+`parked_you_blocks`. `agent.rs` — `reply_quote_at_cursor` seeds the compose as a
+committed **baseline** (`Compose::seeded_committed` / `InputSurface::with_committed_draft`,
+built via `Editor::new(seed)` so the quotation carries no undo history) instead of
+the char-by-char `with_draft`. Builds on
+[UXI-AgentTile-11](#uxi-agenttile-11--the-worksheet-is-an-inline-editable-conversation-buffer-chatbox-is-mid-turn-only)
+and [UXI-AgentTile-21](#uxi-agenttile-21--nr-over-agent-text-opens-a-reply-you-block-seeded-with-a-quotation).
+
+**Why.** Today a non-empty You-block **persists** on the second Esc (rule 4) —
+correct for "keep this, submit later," but there was **no** one-gesture way to
+say "never mind this reply" short of manually deleting all its text so the empty
+Esc discards it. `u` makes backing out a reply as cheap as opening it, and does
+it through the undo mental model the user already has (`r` pushed the reply; `u`
+pops it).
+
+**Status.** `implemented`.
+
+**Deviation from plan.** The `u` handler must `end_insert()` on the compose
+editor **before** undoing. The worksheet's first Esc drops the compose to Normal
+by flipping the mode flag *without* calling `end_insert()` (unlike
+`dispatch_insert_core`'s Esc), so any typing since the last commit sits in an
+**open, un-committed undo group** — `undo()` would see an empty committed stack
+and wrongly pop on the first `u` even though the user had typed. Committing the
+group first makes "undo the typing, then pop" correct. (This surfaced as the
+layered-case test RED before the `end_insert()` was added.)
+
+**Enforcement.** Headless `verify_harness.rs` (real keystrokes through the actual
+keymap + `handle_claude_key`): `worksheet_esc_u_backs_out_reply_block` — boot an
+idle worksheet with an agent line, focus the transcript with the caret on it,
+`simulate_keystrokes("r")` (block opens, seeded, Insert), `"escape"` (compose →
+Normal in block), `"u"` (pops) → assert `you_block_open == false`, the compose
+draft is empty, and `focus == Transcript`. Negative control: skip the pop branch
+(always `editor.undo()`) → the block stays open on `u`, RED. A second assertion
+exercises the layered case (`i`, type, `escape`, `u` undoes the typing and the
+block stays open; a further `u` pops it), guarding "undo first, then pop." Painted
+glyphs remain harness gap #1.
