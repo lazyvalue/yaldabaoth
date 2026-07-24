@@ -282,6 +282,86 @@ impl YaldaGpuiView {
     }
 }
 
+/// One rendered project section in the jump panel (UXI-Project-3): a project's
+/// name + cwd, the workspaces that belong to it (each carrying its GLOBAL tab
+/// index so the `ctrl-<n>` badge stays sequential across projects), and the
+/// agent sessions rooted at its cwd. Pure view-model so the section structure is
+/// headlessly assertable — the render just walks it.
+pub(crate) struct JumpProjectSection {
+    pub(crate) id: ProjectId,
+    pub(crate) name: String,
+    pub(crate) cwd_display: String,
+    /// `(global tab idx, label, is-active)` — idx+1 is the `ctrl-<n>` number.
+    pub(crate) workspaces: Vec<(usize, String, bool)>,
+    /// `(flat row index, row)` — the flat index is the stable listener key.
+    pub(crate) sessions: Vec<(usize, AgentRow)>,
+}
+
+impl YaldaGpuiView {
+    /// Build the jump panel's per-project sections plus the trailing UNFILED
+    /// groups (sessions whose cwd no project roots), for `render_jump_panel`
+    /// (UXI-Project-3). Every project renders (so an EMPTY project still shows
+    /// its header + create rows); its sessions are the cwd-groups that resolve to
+    /// it (cwd is unique per project, so each group maps to at most one project),
+    /// and its workspaces are the non-ephemeral tabs whose `tab.project()` is it.
+    /// Sections are ordered by the user's `jump_cwd_order` drag order (keyed on
+    /// the project's cwd display — the same key `CwdDrag` carries), stable so
+    /// undragged projects stay in id order. Pure (no listeners) so it is
+    /// testable in isolation.
+    pub(crate) fn jump_panel_sections(
+        &self,
+        cx: &gpui::App,
+    ) -> (Vec<JumpProjectSection>, Vec<(String, Vec<(usize, AgentRow)>)>) {
+        let rows = self.jump_panel_agent_rows(cx);
+        let grouped = order_grouped_rows(
+            group_agent_rows_by_cwd(rows),
+            &self.jump_cwd_order,
+            &self.jump_session_order,
+        );
+        // Bucket each cwd-group under the project that roots its cwd; a group with
+        // no owning project is Unfiled.
+        let mut by_project: std::collections::BTreeMap<ProjectId, Vec<(usize, AgentRow)>> =
+            std::collections::BTreeMap::new();
+        let mut unfiled: Vec<(String, Vec<(usize, AgentRow)>)> = Vec::new();
+        for (cwd_label, group) in grouped {
+            let pid = group.first().and_then(|(_, r)| self.projects.by_cwd(&r.cwd));
+            match pid {
+                Some(id) => by_project.entry(id).or_default().extend(group),
+                None => unfiled.push((cwd_label, group)),
+            }
+        }
+        let mut sections: Vec<JumpProjectSection> = Vec::new();
+        for (id, p) in self.projects.iter() {
+            let workspaces: Vec<(usize, String, bool)> = self
+                .workspace
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| !t.ephemeral && t.project() == id)
+                .map(|(idx, t)| {
+                    (idx, t.display_label().to_string(), idx == self.workspace.active_tab)
+                })
+                .collect();
+            let sessions = by_project.remove(&id).unwrap_or_default();
+            sections.push(JumpProjectSection {
+                id,
+                name: p.name.clone(),
+                cwd_display: shorten_cwd_for_display(&p.cwd),
+                workspaces,
+                sessions,
+            });
+        }
+        let cwd_rank = |key: &str| {
+            self.jump_cwd_order
+                .iter()
+                .position(|k| k.as_str() == key)
+                .unwrap_or(usize::MAX)
+        };
+        sections.sort_by_key(|s| cwd_rank(&s.cwd_display));
+        (sections, unfiled)
+    }
+}
+
 /// Group agent rows by their cwd for the jump panel's per-cwd subheaders
 /// (agent-sessions-by-cwd). Returns groups keyed by the display path
 /// (`shorten_cwd_for_display`), sorted by that label for stable headers; within
@@ -463,22 +543,6 @@ impl YaldaGpuiView {
         // distinct from the warm gold `warm_accent` and legible on every theme.
         let working_orange: Hsla = rgb(0xff9e64).into();
 
-        // Snapshot the rows up-front (releases the session-entity reads before we
-        // wire listeners). Workspaces: non-ephemeral tabs, active marked.
-        let workspaces: Vec<(usize, String, bool)> = self
-            .workspace
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| !t.ephemeral)
-            .map(|(idx, t)| (idx, t.display_label().to_string(), idx == self.workspace.active_tab))
-            .collect();
-
-        // Agent sessions: the UNIVERSAL roster (universal-agent-list) — every
-        // session the server knows about, opened here or not — unioned with any
-        // local-only sessions still mid-create. See `jump_panel_agent_rows`.
-        let rows = self.jump_panel_agent_rows(cx);
-
         // The active screen element for the red "you are here" box (UXI-JumpPanel-5):
         // the session bound to the focused tile (matched against each row below).
         let (active_local, active_sid) = self.jump_active_session();
@@ -509,117 +573,86 @@ impl YaldaGpuiView {
                 .child(SharedString::from("Nothing pinned yet.")),
         );
 
-        // ── Workspaces ───────────────────────────────────────────────────────
-        // The badge shows the 1-based workspace number — the same digit that
-        // `ctrl-<n>` switches to (`goto_workspace_number`). Non-ephemeral tabs
-        // occupy indices `0..N` contiguously (ephemeral virtual workspaces sort
-        // last; see the goto-workspace menu), so `idx + 1` is a stable number.
-        col = col.child(section_heading("Workspaces", &st).px_3().text_color(st.err));
-        for (idx, label, active) in workspaces {
-            let row_id = SharedString::from(format!("jump-ws-{idx}"));
-            let num = format!("{}", idx + 1);
-            col = col.child(
-                // Active workspace wears the "you are here" mark (UXI-JumpPanel-5):
-                // a left accent bar + accent label + selection tint.
-                jump_nav_row(
-                    row_id,
-                    &label,
-                    Some(&num),
-                    None,
-                    &st,
-                    sel_bg,
-                    active.then_some(active_accent),
-                )
-                    .on_click(
-                        cx.listener(move |this, _ev, _window, cx| this.select_tab(idx, cx)),
-                    ),
-            );
-        }
-
-        // ── Agent sessions ─────────────────────────────────────────────────—
-        col = col.child(section_heading("Agent sessions", &st).px_3().text_color(st.err));
-        // A discoverable create-affordance for a FREE (tile-less) session
-        // (UXI-JumpPanel-3): clicking opens the cwd picker (UXI-JumpPanel-4), then
-        // spawns a session bound to no tile/workspace via
-        // `spawn_free_agent_session_at`. It lands in the roster above as a new
-        // unbound (○) row — never auto-bound — bindable later by selecting it.
-        // Placed here, where free sessions surface, so creating one is a click
-        // away instead of buried in the `?` menu.
+        // ── New project ─ top-level create affordance (UXI-Project-4).
         col = col.child(
             jump_nav_row(
-                SharedString::from("jump-new-agent"),
-                "New agent session",
+                SharedString::from("jump-new-project"),
+                "New project",
                 Some("＋"),
                 Some(active_accent),
                 &st,
                 sel_bg,
                 None,
             )
-            .on_click(
-                cx.listener(|this, _ev, _window, cx| {
-                    this.open_free_agent_session_cwd_overlay(cx)
-                }),
-            ),
+            .on_click(cx.listener(|this, _ev, _window, cx| this.open_new_project_overlay(cx))),
         );
-        if rows.is_empty() {
-            col = col.child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .text_color(st.dim)
-                    .font_family(st.mono.clone())
-                    .text_size(px(st.pt * 0.9))
-                    .child(SharedString::from("No sessions.")),
-            );
-        }
-        // Group the session rows by cwd, then apply the user's drag-reordered
-        // order (jump-reorder): `order_grouped_rows` reorders the cwd groups by
-        // `jump_cwd_order` and the sessions within each group by
-        // `jump_session_order`. Both default to alphabetical / by-label until the
-        // user drags. The enumerate index `i` from the pre-group flat order is
-        // retained as the row id / listener key so ids stay stable regardless of
-        // grouping OR reorder. A cwd header can be dragged to reorder groups; a
-        // session can be dragged to reorder within its group — never across
-        // groups (the `can_drop` cwd gate).
-        let grouped = order_grouped_rows(
-            group_agent_rows_by_cwd(rows),
-            &self.jump_cwd_order,
-            &self.jump_session_order,
-        );
-        // Chip colors for the floating drag image (captured per-drag below).
+
+        // ── Per-project sections (UXI-Project-3): one section per project, each
+        // owning its WORKSPACES sublist (workspaces whose tab.project() == this
+        // project; the badge keeps the GLOBAL idx+1 = ctrl-<n> number) and its
+        // AGENT SESSIONS, plus inline ＋create rows. Individual tiles are NOT
+        // listed. Unfiled sessions (a cwd no project roots) trail under path
+        // headers. See `jump_panel_sections`.
+        let (sections, unfiled) = self.jump_panel_sections(cx);
         let drag_fg = st.fg;
         let drag_font = st.mono.clone();
-        for (cwd_label, group) in grouped {
-            let cwd_key = cwd_label.clone();
-            // Display the PROJECT NAME as the group header (UXI-Project-3),
-            // resolved from a row's cwd; the drag machinery below still keys on
-            // the cwd label. Falls back to the shortened path for unfiled sessions.
-            let header_text = group
-                .first()
-                .map(|(_, r)| self.jump_group_header(&r.cwd))
-                .unwrap_or_else(|| cwd_label.clone());
-            // The cwd subheader is itself a drag SOURCE (reorder groups) and a
-            // drop TARGET for other headers. It's a plain heading turned into a
-            // stateful div (needs an id for drag/drop + a drop-highlight).
-            let header_id = SharedString::from(format!("jump-cwd-{cwd_label}"));
-            // A cwd subheader is a SECONDARY grouping label — electric blue, real
-            // path casing (not the bold red uppercased top-level `section_heading`),
-            // so the two header tiers read as a clear hierarchy. No italic (italic
-            // is reserved for the "waiting on you" session state).
+
+        for section in sections {
+            let pid = section.id;
+            let cwd_key = section.cwd_display.clone();
+            // Project header: name (red) + dim cwd subtext, with a ✕ delete
+            // affordance (UXI-Project-5). The header is also a CwdDrag source /
+            // target so sections reorder (keyed on the cwd display, the same key
+            // the session drag rejects across).
             let header = div()
-                .id(header_id)
+                .id(SharedString::from(format!("jump-proj-{}", pid.0)))
+                .flex()
+                .flex_row()
+                .items_center()
                 .w_full()
+                .px_3()
                 .pt_2()
                 .pb_1()
-                .pl(px(20.0))
-                .pr_3()
-                .text_color(electric)
-                .font_family(st.mono.clone())
-                .text_size(px(st.pt * 0.85))
+                .border_b_1()
+                .border_color(border)
                 .cursor_pointer()
-                .child(SharedString::from(header_text.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_color(st.err)
+                                .font_family(st.mono.clone())
+                                .font_weight(FontWeight::BOLD)
+                                .text_size(px(st.pt * 0.95))
+                                .child(SharedString::from(section.name.to_uppercase())),
+                        )
+                        .child(
+                            div()
+                                .text_color(st.dim)
+                                .font_family(st.mono.clone())
+                                .text_size(px(st.pt * 0.8))
+                                .child(SharedString::from(section.cwd_display.clone())),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("jump-proj-del-{}", pid.0)))
+                        .flex_none()
+                        .px_1()
+                        .cursor_pointer()
+                        .text_color(st.dim)
+                        .hover(|s| s.text_color(st.err))
+                        .child(SharedString::new_static("✕"))
+                        .on_click(cx.listener(move |this, _ev, _window, cx| {
+                            this.request_delete_project(pid, cx)
+                        })),
+                )
                 .on_drag(CwdDrag { cwd_key: cwd_key.clone() }, {
-                    let label: SharedString = cwd_label.clone().into();
+                    let label: SharedString = section.name.clone().into();
                     let (fg, bg, font) = (drag_fg, sel_bg, drag_font.clone());
                     move |_payload, _pos, _window, cx| {
                         cx.new(|_| JumpDragPreview {
@@ -638,88 +671,193 @@ impl YaldaGpuiView {
                     }
                 }));
             col = col.child(header);
-            for (i, row) in group {
-                // The status dot encodes what the AGENT is doing (not binding):
-                //   • working  (reply in flight)                 → ● orange
-                //   • waiting on you (idle + unread output)       → ● green + italic
-                //   • idle+read / disconnected / unknown phase    → ○ dim
-                let status = row.dot_status();
-                let (badge, badge_color) = match status {
-                    AgentDotStatus::Working => ("●", working_orange),
-                    AgentDotStatus::WaitingForYou => ("●", ready),
-                    AgentDotStatus::Neutral => ("○", st.dim),
-                };
-                let row_id = SharedString::from(format!("jump-sess-{i}"));
-                let target = row.target.clone();
-                // Left accent bar when this row is the focused tile's bound session
-                // (UXI-JumpPanel-5).
-                let active = jump_target_is_active(&row.target, active_local, active_sid.as_deref());
-                let mut r = jump_nav_row(
-                    row_id,
-                    &row.label,
-                    Some(badge),
-                    Some(badge_color),
+
+            // WORKSPACES sublist — the badge stays the GLOBAL idx+1 (ctrl-<n>).
+            for (idx, label, active) in section.workspaces {
+                let row_id = SharedString::from(format!("jump-ws-{idx}"));
+                let num = format!("{}", idx + 1);
+                col = col.child(
+                    jump_nav_row(
+                        row_id,
+                        &label,
+                        Some(&num),
+                        None,
+                        &st,
+                        sel_bg,
+                        active.then_some(active_accent),
+                    )
+                    .on_click(cx.listener(move |this, _ev, _window, cx| this.select_tab(idx, cx))),
+                );
+            }
+            col = col.child(
+                jump_nav_row(
+                    SharedString::from(format!("jump-new-ws-{}", pid.0)),
+                    "New workspace",
+                    Some("＋"),
+                    Some(active_accent),
                     &st,
                     sel_bg,
-                    active.then_some(active_accent),
-                );
-                if !row.connected {
-                    r = r.text_color(st.dim);
+                    None,
+                )
+                .on_click(cx.listener(move |this, _ev, _window, cx| this.new_workspace_in(pid, cx))),
+            );
+
+            // AGENT SESSIONS sublist (status dots + accent marks preserved).
+            for (i, row) in section.sessions {
+                let active =
+                    jump_target_is_active(&row.target, active_local, active_sid.as_deref());
+                col = col.child(jump_session_row_el(
+                    i,
+                    &row,
+                    &st,
+                    sel_bg,
+                    active_accent,
+                    ready,
+                    working_orange,
+                    active,
+                    drag_fg,
+                    drag_font.clone(),
+                    cx,
+                ));
+            }
+            col = col.child(
+                jump_nav_row(
+                    SharedString::from(format!("jump-new-agent-{}", pid.0)),
+                    "New agent session",
+                    Some("＋"),
+                    Some(active_accent),
+                    &st,
+                    sel_bg,
+                    None,
+                )
+                .on_click(
+                    cx.listener(move |this, _ev, _window, cx| this.new_agent_session_in(pid, cx)),
+                ),
+            );
+        }
+
+        // ── Unfiled sessions (no project roots their cwd) ─ path headers.
+        if !unfiled.is_empty() {
+            col = col.child(section_heading("Unfiled", &st).px_3().text_color(st.err));
+            for (cwd_label, group) in unfiled {
+                let header = div()
+                    .w_full()
+                    .pt_2()
+                    .pb_1()
+                    .pl(px(20.0))
+                    .pr_3()
+                    .text_color(electric)
+                    .font_family(st.mono.clone())
+                    .text_size(px(st.pt * 0.85))
+                    .child(SharedString::from(cwd_label.clone()));
+                col = col.child(header);
+                for (i, row) in group {
+                    let active =
+                        jump_target_is_active(&row.target, active_local, active_sid.as_deref());
+                    col = col.child(jump_session_row_el(
+                        i,
+                        &row,
+                        &st,
+                        sel_bg,
+                        active_accent,
+                        ready,
+                        working_orange,
+                        active,
+                        drag_fg,
+                        drag_font.clone(),
+                        cx,
+                    ));
                 }
-                // Italic == "waiting on you" (idle with unread output). The one
-                // meaning italic carries in the panel.
-                if status == AgentDotStatus::WaitingForYou {
-                    r = r.italic();
-                }
-                r = r.on_click(cx.listener({
-                    let target = target.clone();
-                    move |this, _ev, _window, cx| this.jump_to_agent(target.clone(), cx)
-                }));
-                // Only roster-backed sessions (with a stable sid) participate in
-                // drag-reorder; local-only mid-create placeholders don't.
-                if let JumpTarget::Roster(sid) = &row.target {
-                    let sid = sid.clone();
-                    let cwd_key = cwd_key.clone();
-                    let label: SharedString = row.label.clone().into();
-                    let (fg, font) = (drag_fg, drag_font.clone());
-                    r = r
-                        .on_drag(
-                            SessionDrag { sid: sid.clone(), cwd_key: cwd_key.clone() },
-                            move |_payload, _pos, _window, cx| {
-                                cx.new(|_| JumpDragPreview {
-                                    label: label.clone(),
-                                    fg,
-                                    bg: sel_bg,
-                                    font: font.clone(),
-                                })
-                            },
-                        )
-                        // Gate: only accept a session drag from the SAME cwd group
-                        // — this is what makes "a session can't be dragged into a
-                        // cwd it doesn't belong in" a hard rule at the gesture.
-                        .can_drop({
-                            let cwd_key = cwd_key.clone();
-                            move |dragged, _window, _cx| {
-                                dragged
-                                    .downcast_ref::<SessionDrag>()
-                                    .is_some_and(|d| d.cwd_key == cwd_key)
-                            }
-                        })
-                        .drag_over::<SessionDrag>(move |s, _, _, _| s.bg(sel_bg))
-                        .on_drop(cx.listener({
-                            let target_sid = sid.clone();
-                            move |this, dragged: &SessionDrag, _window, cx| {
-                                this.reorder_session(&dragged.sid, &target_sid, cx)
-                            }
-                        }));
-                }
-                col = col.child(r);
             }
         }
 
         col.into_any_element()
     }
 
+}
+
+/// Build one agent-session row (status dot + accent mark + drag) shared by the
+/// per-project sections and the trailing Unfiled groups (UXI-Project-3), so the
+/// dot/italic/active/drag semantics stay identical in both. `active` is the
+/// precomputed "this row is the focused tile's bound session" mark
+/// (UXI-JumpPanel-5). Only roster-backed rows (stable sid) participate in the
+/// session drag-reorder.
+#[allow(clippy::too_many_arguments)]
+fn jump_session_row_el(
+    i: usize,
+    row: &AgentRow,
+    st: &DetailStyle,
+    sel_bg: Hsla,
+    active_accent: Hsla,
+    ready: Hsla,
+    working_orange: Hsla,
+    active: bool,
+    drag_fg: Hsla,
+    drag_font: SharedString,
+    cx: &mut Context<YaldaGpuiView>,
+) -> gpui::Stateful<gpui::Div> {
+    // • working (reply in flight) → ● orange; • waiting on you (idle + unread)
+    // → ● green + italic; • idle+read / disconnected / unknown → ○ dim.
+    let status = row.dot_status();
+    let (badge, badge_color) = match status {
+        AgentDotStatus::Working => ("●", working_orange),
+        AgentDotStatus::WaitingForYou => ("●", ready),
+        AgentDotStatus::Neutral => ("○", st.dim),
+    };
+    let row_id = SharedString::from(format!("jump-sess-{i}"));
+    let target = row.target.clone();
+    let mut r = jump_nav_row(
+        row_id,
+        &row.label,
+        Some(badge),
+        Some(badge_color),
+        st,
+        sel_bg,
+        active.then_some(active_accent),
+    );
+    if !row.connected {
+        r = r.text_color(st.dim);
+    }
+    if status == AgentDotStatus::WaitingForYou {
+        r = r.italic();
+    }
+    r = r.on_click(cx.listener({
+        let target = target.clone();
+        move |this, _ev, _window, cx| this.jump_to_agent(target.clone(), cx)
+    }));
+    if let JumpTarget::Roster(sid) = &row.target {
+        let sid = sid.clone();
+        let cwd_key = shorten_cwd_for_display(&row.cwd);
+        let label: SharedString = row.label.clone().into();
+        r = r
+            .on_drag(
+                SessionDrag { sid: sid.clone(), cwd_key: cwd_key.clone() },
+                move |_payload, _pos, _window, cx| {
+                    cx.new(|_| JumpDragPreview {
+                        label: label.clone(),
+                        fg: drag_fg,
+                        bg: sel_bg,
+                        font: drag_font.clone(),
+                    })
+                },
+            )
+            .can_drop({
+                let cwd_key = cwd_key.clone();
+                move |dragged, _window, _cx| {
+                    dragged
+                        .downcast_ref::<SessionDrag>()
+                        .is_some_and(|d| d.cwd_key == cwd_key)
+                }
+            })
+            .drag_over::<SessionDrag>(move |s, _, _, _| s.bg(sel_bg))
+            .on_drop(cx.listener({
+                let target_sid = sid.clone();
+                move |this, dragged: &SessionDrag, _window, cx| {
+                    this.reorder_session(&dragged.sid, &target_sid, cx)
+                }
+            }));
+    }
+    r
 }
 
 /// One selectable row: optional leading badge glyph + label. Returns a

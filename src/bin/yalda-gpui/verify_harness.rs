@@ -5902,134 +5902,217 @@ fn free_agent_session_no_server_is_graceful_noop(cx: &mut TestAppContext) {
     });
 }
 
-/// UXI-JumpPanel-3 + -4: the SAME create-free action is reachable from the `?`
-/// global menu ("new agent session"), not only the jump-panel row. Drives the REAL
-/// menu path: the entry is present in `global_menu()`, and `dispatch_menu_command`
-/// (the exact call a menu key-selection makes) OPENS the cwd picker overlay
-/// (UXI-JumpPanel-4 — the create flow now asks for a cwd first) targeting
-/// `FreeAgentSessionCwd`.
+/// UXI-Project-7 (removal half): the retired global "new agent session" cwd flow
+/// is gone. The `?` menu no longer offers `new-free-agent-session`, and
+/// dispatching that command (the exact call a menu key-selection made) opens NO
+/// overlay — sessions are created only inside a project now (per-project ＋ row).
 ///
-/// Negative controls: drop the `global_menu()` entry → the presence assert fails;
-/// rewire the `"new-free-agent-session"` match arm → no overlay opens.
+/// Negative control: re-add the `?`-menu entry (`gpui_menu` / the workspace `?`
+/// menu builder) → the presence assert fails; re-add the dispatch arm calling
+/// `open_free_agent_session_cwd_overlay` → the "opens no overlay" assert fails.
 #[gpui::test]
-fn global_menu_offers_and_dispatches_free_agent_session(cx: &mut TestAppContext) {
-    let (view, vcx) = boot_browser(cx); // hermetic → session_server is None
-
-    // The `?` menu offers it, keyed `a`, labeled for the human.
-    view.update(vcx, |v, _| {
-        let entry = v
-            .global_menu()
-            .into_iter()
-            .find(|n| matches!(&n.action,
-                crate::MenuAction::Command(c) if c == "new-free-agent-session"));
-        let entry = entry.expect("the ? global menu offers `new-free-agent-session`");
-        assert_eq!(entry.label, "new agent session", "human-readable label");
-    });
-
-    // Selecting it runs `dispatch_menu_command` with that id — the same call the
-    // key press makes — which OPENS the cwd overlay (create flow), spawning
-    // nothing yet.
+fn global_cwd_session_overlay_is_gone(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
     view.update(vcx, |v, cx| {
-        assert!(v.sessions.is_empty(), "precondition: no sessions");
+        let has = v.global_menu().into_iter().any(|n| {
+            matches!(&n.action, crate::MenuAction::Command(c) if c == "new-free-agent-session")
+        });
+        assert!(
+            !has,
+            "the ? menu no longer offers the global 'new agent session' cwd flow"
+        );
         v.dispatch_menu_command("new-free-agent-session", cx);
-    });
-    vcx.run_until_parked();
-    view.update(vcx, |v, _| {
-        assert!(
-            matches!(
-                v.rename_ref().map(|o| o.target),
-                Some(crate::RenameTarget::FreeAgentSessionCwd)
-            ),
-            "the ? menu action opens the free-agent cwd picker"
-        );
-        assert!(v.sessions.is_empty(), "opening the picker creates no session");
+        assert!(!v.has_overlay(), "the retired command opens no overlay");
     });
 }
 
-/// UXI-JumpPanel-4: the free-agent create flow opens a cwd path-input overlay
-/// pre-filled with the default cwd (`agent_base_cwd()`), so Enter accepts the
-/// default. Drives the REAL `open_free_agent_session_cwd_overlay`.
+/// UXI-Project-3 (T004-tail): `jump_panel_sections` — the pure model the jump
+/// panel walks — groups WORKSPACES and AGENT SESSIONS under their owning project,
+/// each section listing ONLY its own (workspaces filtered by `tab.project()`,
+/// sessions by cwd→project). Workspace badges keep the GLOBAL tab index (idx+1 =
+/// ctrl-<n>), so two projects' workspaces carry distinct global numbers. Empty
+/// projects still render a section. Individual tiles are never listed (the model
+/// has no tile axis).
 ///
-/// Negative control: change the prefill (`text = agent_base_cwd().display()`) to
-/// something else and the default-match assert fails.
+/// Negative control: drop the `t.project() == id` filter in `jump_panel_sections`
+/// (`.filter(|(_, t)| !t.ephemeral)`) → every section lists every workspace, so
+/// A's section contains B's workspace index and the exclusion assert fails.
 #[gpui::test]
-fn free_agent_cwd_overlay_opens_prefilled_with_default(cx: &mut TestAppContext) {
+fn jump_panel_renders_per_project_sections(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState};
     let (view, vcx) = boot_browser(cx);
-    view.update(vcx, |v, cx| v.open_free_agent_session_cwd_overlay(cx));
-    view.update(vcx, |v, _| {
-        let o = v.rename_ref().expect("cwd overlay is open");
-        assert!(
-            matches!(o.target, crate::RenameTarget::FreeAgentSessionCwd),
-            "targets the free-agent cwd variant"
-        );
+    let pa = PathBuf::from("/tmp/yalda-sec-a");
+    let pb = PathBuf::from("/tmp/yalda-sec-b");
+    let (a_pid, b_pid) = view.update(vcx, |v, _| {
+        let a = v.projects.create("Alpha".into(), pa.clone()).expect("A");
+        let b = v.projects.create("Beta".into(), pb.clone()).expect("B");
+        (a, b)
+    });
+    // A workspace in each project; capture their GLOBAL indices.
+    let a_idx = view.update(vcx, |v, cx| {
+        v.new_workspace_in(a_pid, cx);
+        v.workspace.active_tab
+    });
+    let b_idx = view.update(vcx, |v, cx| {
+        v.new_workspace_in(b_pid, cx);
+        v.workspace.active_tab
+    });
+    assert_ne!(a_idx, b_idx, "badges (idx+1) are distinct global workspace numbers");
+    // A free session rooted at A's cwd → groups under A.
+    view.update(vcx, |v, cx| {
+        let s = AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: "sess-a".into(),
+            cwd: pa.clone(),
+            resume_id: None,
+        };
+        v.show_local_session(s, cx);
+    });
+    vcx.run_until_parked();
+
+    let (sections, _unfiled) = view.update(vcx, |v, cx| v.jump_panel_sections(cx));
+    let sec_a = sections.iter().find(|s| s.id == a_pid).expect("section A present");
+    let sec_b = sections.iter().find(|s| s.id == b_pid).expect("section B present (even if empty)");
+
+    assert!(
+        sec_a.workspaces.iter().any(|(i, _, _)| *i == a_idx),
+        "A lists its own workspace (global idx {a_idx})"
+    );
+    assert!(
+        !sec_a.workspaces.iter().any(|(i, _, _)| *i == b_idx),
+        "A must NOT list B's workspace — the per-project filter"
+    );
+    assert!(
+        sec_b.workspaces.iter().any(|(i, _, _)| *i == b_idx),
+        "B lists its own workspace (global idx {b_idx})"
+    );
+    assert!(
+        sec_a.sessions.iter().any(|(_, r)| r.label == "sess-a"),
+        "A groups the session rooted at its cwd"
+    );
+    assert!(sec_b.sessions.is_empty(), "B (no sessions) still renders an empty section");
+}
+
+/// UXI-Project-4: the "New project" overlay creates an EMPTY project via the REAL
+/// path (`open_new_project_overlay` → edit fields → `commit_new_project_overlay`),
+/// and a duplicate NAME is refused with a transient error, creating nothing.
+///
+/// Negative control: remove the `by_name` duplicate guard in `Projects::create`
+/// (`project.rs`) → the dup name is accepted, `projects.len()` grows, and the
+/// "creates nothing" assert fails.
+#[gpui::test]
+fn new_project_overlay_creates_empty_project_and_rejects_dup(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    // Two distinct REAL directories (resolve_agent_cwd_arg validates existence).
+    let dir1 = std::env::temp_dir();
+    let dir2 = std::env::temp_dir().join(format!("yalda-np-{}", std::process::id()));
+    std::fs::create_dir_all(&dir2).expect("mk dir2");
+
+    let before = view.read_with(vcx, |v, _| v.projects.len());
+    view.update(vcx, |v, cx| {
+        v.open_new_project_overlay(cx);
+        {
+            let o = v.new_project_mut().expect("new-project overlay open");
+            o.name = "Zephyr".into();
+            o.cwd = dir1.display().to_string();
+        }
+        v.commit_new_project_overlay(cx);
+    });
+    let zid = view.read_with(vcx, |v, _| {
+        let zid = v.projects.by_name("Zephyr").expect("project created");
+        assert_eq!(v.projects.len(), before + 1, "exactly one new project");
+        zid
+    });
+    // The new project starts EMPTY — no workspaces, no sessions.
+    view.read_with(vcx, |v, _| {
         assert_eq!(
-            o.text,
-            v.agent_base_cwd().display().to_string(),
-            "pre-filled with the default cwd so Enter accepts it"
+            v.workspace.tabs.iter().filter(|t| t.project() == zid).count(),
+            0,
+            "new project owns zero workspaces"
         );
+    });
+
+    // A second create with the SAME name is refused; nothing added.
+    let after = view.read_with(vcx, |v, _| v.projects.len());
+    view.update(vcx, |v, cx| {
+        v.open_new_project_overlay(cx);
+        {
+            let o = v.new_project_mut().expect("overlay open");
+            o.name = "Zephyr".into();
+            o.cwd = dir2.display().to_string();
+        }
+        v.commit_new_project_overlay(cx);
+    });
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.projects.len(), after, "a duplicate name creates NOTHING");
+        let note = v.transient_status.as_ref().map(|s| s.to_string()).unwrap_or_default();
+        assert!(note.contains("already exists"), "dup name surfaces an error, got: {note:?}");
     });
 }
 
-/// UXI-JumpPanel-4: committing the cwd overlay ROUTES on the typed path — a valid
-/// path closes the overlay and reaches `spawn_free_agent_session_at` (proven by
-/// its no-server note, since there's no daemon here); an invalid path surfaces an
-/// error and creates nothing. Drives the REAL `commit_rename_overlay`.
+/// UXI-Project-5: deleting a NON-empty project first confirms, then cascades. The
+/// REAL `request_delete_project` arms the confirm overlay (removing nothing yet);
+/// `perform_delete_project` then closes the project's workspaces, kills its
+/// sessions (via `AgentSessions::close`), and drops the project — never leaving
+/// zero workspaces. An EMPTY project deletes directly with no confirm.
 ///
-/// Negative control: point the `FreeAgentSessionCwd` commit arm at a no-op → the
-/// valid-path note never appears; drop the `Err(msg)` arm → the invalid path
-/// silently succeeds.
+/// Negative control: comment out the session-kill loop in
+/// `perform_delete_project` (`for id in local_kill { … self.sessions.close(id) }`)
+/// → the orphaned session survives in `self.sessions` and the kill assert fails.
 #[gpui::test]
-fn free_agent_cwd_overlay_commit_routes_or_errors(cx: &mut TestAppContext) {
-    // Valid path → routes to the spawn (no-server note is the observable proof).
+fn delete_nonempty_project_confirms_then_cascades(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState};
     let (view, vcx) = boot_browser(cx);
-    let valid = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    view.update(vcx, |v, cx| {
-        v.open_free_agent_session_cwd_overlay(cx);
-        v.rename_mut().expect("overlay open").text = valid.display().to_string();
-        v.commit_rename_overlay(cx);
-    });
-    vcx.run_until_parked();
-    view.update(vcx, |v, _| {
-        assert!(!v.overlay_is_rename(), "a valid commit closes the overlay");
-        let note = v
-            .transient_status
-            .as_ref()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        assert!(
-            note.contains("no session server"),
-            "a valid path reached spawn_free_agent_session_at, got: {note:?}"
-        );
-        assert!(v.sessions.is_empty(), "no daemon ⇒ no phantom session");
+    let pa = PathBuf::from("/tmp/yalda-del-a");
+    let (pid, ws_idx, sid) = view.update(vcx, |v, cx| {
+        let pid = v.projects.create("Doomed".into(), pa.clone()).expect("create");
+        v.new_workspace_in(pid, cx);
+        let ws_idx = v.workspace.active_tab;
+        let s = AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: "doomed-s".into(),
+            cwd: pa.clone(),
+            resume_id: None,
+        };
+        let sid = v.show_local_session(s, cx);
+        (pid, ws_idx, sid)
     });
 
-    // Invalid path → error surfaced, nothing spawned. Reuse the same view; clear
-    // the prior note so a stale "no session server" can't mask the routing check.
-    view.update(vcx, |v, cx| {
-        v.transient_status = None;
-        v.open_free_agent_session_cwd_overlay(cx);
-        // A path that isn't a real directory fails `resolve_agent_cwd_arg`.
-        v.rename_mut().expect("overlay open").text =
-            "/definitely/not/a/real/dir/xyzzy".to_string();
-        v.commit_rename_overlay(cx);
+    // Non-empty → arms the confirm overlay, removes NOTHING yet.
+    view.update(vcx, |v, cx| v.request_delete_project(pid, cx));
+    view.read_with(vcx, |v, _| {
+        assert!(matches!(v.confirm_delete_ref(), Some(p) if p == pid), "confirm overlay armed");
+        assert!(v.projects.contains(pid), "project still present pre-confirm");
+        assert_eq!(
+            v.workspace.tabs.get(ws_idx).map(|t| t.project()),
+            Some(pid),
+            "workspace intact pre-confirm"
+        );
+        assert!(v.sessions.contains(sid), "session intact pre-confirm");
     });
-    vcx.run_until_parked();
-    view.update(vcx, |v, _| {
-        assert!(!v.overlay_is_rename(), "the commit closes the overlay either way");
-        let note = v
-            .transient_status
-            .as_ref()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+
+    // Confirm → cascade.
+    view.update(vcx, |v, cx| v.perform_delete_project(pid, cx));
+    view.read_with(vcx, |v, _| {
+        assert!(!v.projects.contains(pid), "project removed");
+        assert!(!v.sessions.contains(sid), "session killed by the cascade");
+        assert!(!v.transcript_views.contains_key(&sid), "transcript view dropped");
         assert!(
-            !note.contains("no session server"),
-            "an invalid path must NOT reach the spawn, got: {note:?}"
+            !v.workspace.tabs.iter().any(|t| t.project() == pid),
+            "the project's workspaces are closed"
         );
-        assert!(
-            note.contains("not a directory"),
-            "the invalid path surfaces the resolve error, got: {note:?}"
-        );
-        assert!(v.sessions.is_empty(), "invalid path creates nothing");
+        assert!(!v.workspace.tabs.is_empty(), "≥1 workspace always survives (Behavior 2)");
+        assert!(!v.overlay_is_confirm_delete(), "the overlay clears after cascade");
+    });
+
+    // An EMPTY project deletes directly — no confirm overlay.
+    let empty = view.update(vcx, |v, _| {
+        v.projects.create("Empty".into(), PathBuf::from("/tmp/yalda-del-empty")).expect("create")
+    });
+    view.update(vcx, |v, cx| v.request_delete_project(empty, cx));
+    view.read_with(vcx, |v, _| {
+        assert!(!v.overlay_is_confirm_delete(), "an empty project needs no confirmation");
+        assert!(!v.projects.contains(empty), "the empty project deleted directly");
     });
 }
 

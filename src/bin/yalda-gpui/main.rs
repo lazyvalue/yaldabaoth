@@ -1271,16 +1271,6 @@ enum RenameTarget {
     /// captures key dispatch (no structural mutations possible mid-
     /// rename), so positional addressing is safe here.
     Tab { index: usize },
-    /// Path-input overlay that, on commit, creates a new agent session
-    /// rooted at the typed path. Empty input cancels (spec-agent-cwd.md
-    /// §2 — bare `:claude-new` already exists and uses the process cwd).
-    AgentNewSessionCwd,
-    /// Path-input overlay that, on commit, creates a new FREE (tile-less)
-    /// agent session rooted at the typed path (UXI-JumpPanel-4). A free
-    /// agent has no workspace cwd to inherit, so the create flow asks. Pre-
-    /// filled with `agent_base_cwd()`; empty cancels; commit →
-    /// `spawn_free_agent_session_at`.
-    FreeAgentSessionCwd,
     /// Path-input overlay that, on commit, changes the bound session's
     /// cwd (spec-agent-cwd.md §4). Targeted by stable `SessionId`.
     AgentChangeCwd { id: SessionId },
@@ -1294,6 +1284,24 @@ enum RenameTarget {
     /// (spec-desktop-mode.md Behavior 6). Clamped to [20, 400] × [5, 200];
     /// unparseable input cancels with a footer hint.
     DesktopTileSize,
+}
+
+/// Which field the [`NewProjectOverlay`] edits (Tab toggles). A new project
+/// needs BOTH a name and a cwd at birth (UXI-Project-4), so this is a two-field
+/// input rather than the single-field [`RenameOverlay`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NpField {
+    Name,
+    Cwd,
+}
+
+/// "New project" overlay (UXI-Project-4): prompts for a unique name + a cwd,
+/// then `Projects::create`. A duplicate name/cwd is refused with a transient
+/// error (nothing created); an empty name cancels.
+struct NewProjectOverlay {
+    name: String,
+    cwd: String,
+    field: NpField,
 }
 
 /// The single, mutually-exclusive overlay layered over the screen body — at
@@ -1319,6 +1327,11 @@ enum ActiveOverlay {
     WorkspacePicker(WorkspacePicker),
     Rename(RenameOverlay),
     TagInput(TagInputOverlay),
+    /// "New project" name+cwd input (UXI-Project-4).
+    NewProject(NewProjectOverlay),
+    /// "Delete project?" confirmation for a non-empty project (UXI-Project-5);
+    /// carries the target so confirm cascades exactly it.
+    ConfirmProjectDelete(ProjectId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4094,6 +4107,33 @@ impl YaldaGpuiView {
     fn overlay_is_tag_input(&self) -> bool {
         matches!(self.active_overlay, ActiveOverlay::TagInput(_))
     }
+    fn overlay_is_new_project(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::NewProject(_))
+    }
+    fn overlay_is_confirm_delete(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::ConfirmProjectDelete(_))
+    }
+    fn new_project_ref(&self) -> Option<&NewProjectOverlay> {
+        if let ActiveOverlay::NewProject(o) = &self.active_overlay {
+            Some(o)
+        } else {
+            None
+        }
+    }
+    fn new_project_mut(&mut self) -> Option<&mut NewProjectOverlay> {
+        if let ActiveOverlay::NewProject(o) = &mut self.active_overlay {
+            Some(o)
+        } else {
+            None
+        }
+    }
+    fn confirm_delete_ref(&self) -> Option<ProjectId> {
+        if let ActiveOverlay::ConfirmProjectDelete(id) = &self.active_overlay {
+            Some(*id)
+        } else {
+            None
+        }
+    }
 
     fn menu_ref(&self) -> Option<&MenuOverlay> {
         if let ActiveOverlay::Menu(m) = &self.active_overlay {
@@ -4324,9 +4364,8 @@ impl YaldaGpuiView {
         items.push(MenuNode::separator());
         items.push(MenuNode::entry("n", "name workspace", "rename-tab"));
         items.push(MenuNode::entry("c", "new workspace", "new-tab"));
-        // Spawn a free agent session (bound to no tile/workspace) — it lands in
-        // the roster and shows up in the jump panel for later binding.
-        items.push(MenuNode::entry("a", "new agent session", "new-free-agent-session"));
+        // (Agent sessions are now created only inside a project — the jump panel's
+        // per-project ＋ row, not a global cwd overlay; UXI-Project-7.)
         let jp_label = if self.jump_panel_visible {
             "hide jump panel"
         } else {
@@ -4557,7 +4596,6 @@ impl YaldaGpuiView {
             "claude-mode-cycle" => self.cycle_claude_permission_mode(cx),
             "claude-clear" => self.clear_agent_session(cx),
             "claude-rename" => self.open_rename_overlay(cx),
-            "claude-new-here" => self.open_new_agent_session_cwd_overlay(cx),
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
             "dev-restart-gui" => self.dev_rebuild_restart_gui(cx),
             "dev-restart-all" => self.dev_rebuild_restart_all(cx),
@@ -4787,13 +4825,6 @@ impl YaldaGpuiView {
                     self.save_workspace_state();
                     cx.notify();
                 }
-            }
-            "new-free-agent-session" => {
-                // Global (`?`) menu: create an agent session bound to NO tile and
-                // NO workspace. It first asks for the cwd (UXI-JumpPanel-4) — a
-                // free agent has none to inherit — then spawns; the session lands
-                // in the universal roster as an unbound, bindable row.
-                self.open_free_agent_session_cwd_overlay(cx);
             }
             "new-linear-tile" => {
                 // Split a new tile (focus lands on it), then swap it for a
@@ -5434,39 +5465,265 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Open a path-input overlay; on commit, spawn a new agent session
-    /// rooted at the typed path (spec-agent-cwd.md §2). Empty input
-    /// cancels — the bare `claude-new` already exists for the
-    /// "process cwd" case.
-    fn open_new_agent_session_cwd_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.overlay_is_rename() {
+    // ---- Project lifecycle (UXI-Project-4 / -5) ----------------------------
+
+    /// Open the "New project" overlay (UXI-Project-4): a name + cwd input. The
+    /// cwd pre-fills with the active project's cwd so the common "a project near
+    /// this one" case is one keystroke. No-op if any overlay is already open.
+    pub(crate) fn open_new_project_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.has_overlay() {
             return;
         }
-        // Don't gate by "claude is focused" — this command can transition
-        // the user into the agent screen at the chosen cwd in one step.
-        self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
-            text: String::new(),
-            target: RenameTarget::AgentNewSessionCwd,
+        let cwd = self.agent_base_cwd().display().to_string();
+        self.open_overlay(ActiveOverlay::NewProject(NewProjectOverlay {
+            name: String::new(),
+            cwd,
+            field: NpField::Name,
         }));
         cx.notify();
     }
 
-    /// Open a path-input overlay pre-filled with the default cwd
-    /// (`agent_base_cwd()`); on commit, spawn a FREE (tile-less) agent session
-    /// rooted at the typed path (UXI-JumpPanel-4). This is the create flow for the
-    /// jump-panel ＋ row and the `?`-menu "new agent session" — a free agent has no
-    /// workspace cwd to inherit, so it asks. Pre-filling the default means Enter
-    /// keeps the old zero-friction "create at the sensible default" behavior.
-    pub(crate) fn open_free_agent_session_cwd_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.overlay_is_rename() {
+    /// Commit the "New project" overlay (UXI-Project-4): create an EMPTY project
+    /// and persist it. An empty name cancels; a bad cwd, a duplicate name, or a
+    /// duplicate cwd each surface a transient error and create NOTHING.
+    fn commit_new_project_overlay(&mut self, cx: &mut Context<Self>) {
+        let (name, cwd) = match self.new_project_ref() {
+            Some(o) => (o.name.trim().to_string(), o.cwd.trim().to_string()),
+            None => return,
+        };
+        if name.is_empty() {
+            self.clear_overlay();
+            cx.notify();
             return;
         }
-        let text = self.agent_base_cwd().display().to_string();
-        self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
-            text,
-            target: RenameTarget::FreeAgentSessionCwd,
-        }));
+        match resolve_agent_cwd_arg(&cwd) {
+            Ok(resolved) => match self.projects.create(name.clone(), resolved) {
+                Ok(_) => {
+                    save_persisted_projects(&self.projects);
+                    self.clear_overlay();
+                    self.transient_status = Some(format!("project {name} created").into());
+                }
+                Err(CreateError::DuplicateName) => {
+                    self.clear_overlay();
+                    self.transient_status =
+                        Some(format!("a project named {name} already exists").into());
+                }
+                Err(CreateError::DuplicateCwd(_)) => {
+                    self.clear_overlay();
+                    self.transient_status =
+                        Some("another project already roots that directory".into());
+                }
+            },
+            Err(msg) => {
+                self.clear_overlay();
+                self.transient_status = Some(msg.into());
+            }
+        }
         cx.notify();
+    }
+
+    fn handle_new_project_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        match press.key {
+            Key::Esc => {
+                self.clear_overlay();
+                cx.notify();
+            }
+            Key::Enter => self.commit_new_project_overlay(cx),
+            Key::Tab | Key::BackTab | Key::Down | Key::Up => {
+                if let Some(o) = self.new_project_mut() {
+                    o.field = match o.field {
+                        NpField::Name => NpField::Cwd,
+                        NpField::Cwd => NpField::Name,
+                    };
+                }
+                cx.notify();
+            }
+            Key::Backspace => {
+                if let Some(o) = self.new_project_mut() {
+                    match o.field {
+                        NpField::Name => {
+                            o.name.pop();
+                        }
+                        NpField::Cwd => {
+                            o.cwd.pop();
+                        }
+                    }
+                }
+                cx.notify();
+            }
+            Key::Char(c) => {
+                if let Some(o) = self.new_project_mut() {
+                    match o.field {
+                        NpField::Name => o.name.push(c),
+                        NpField::Cwd => o.cwd.push(c),
+                    }
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// Create a new workspace belonging to `pid`, rooted at its cwd (UXI-Project-4:
+    /// the per-project ＋ New workspace row). No cwd prompt — the cwd is the
+    /// project's. Becomes the active workspace.
+    pub(crate) fn new_workspace_in(&mut self, pid: ProjectId, cx: &mut Context<Self>) {
+        let Some(cwd) = self.projects.cwd_of(pid).map(|p| p.to_path_buf()) else {
+            return;
+        };
+        self.workspace.push_initial_tab(
+            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
+            pid,
+        );
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    /// Create a new FREE agent session rooted at `pid`'s cwd (UXI-Project-4: the
+    /// per-project ＋ New agent session row). No cwd prompt; it lands unbound in
+    /// the roster under this project's section.
+    pub(crate) fn new_agent_session_in(&mut self, pid: ProjectId, cx: &mut Context<Self>) {
+        let Some(cwd) = self.projects.cwd_of(pid).map(|p| p.to_path_buf()) else {
+            return;
+        };
+        self.spawn_free_agent_session_at(cwd, cx);
+    }
+
+    /// Request deletion of `pid` (UXI-Project-5). If it still holds workspaces or
+    /// sessions (live or roster-only), arm a confirmation overlay; an EMPTY
+    /// project deletes directly. No-op if any overlay is already open.
+    pub(crate) fn request_delete_project(&mut self, pid: ProjectId, cx: &mut Context<Self>) {
+        if self.has_overlay() {
+            return;
+        }
+        let mut nonempty = self.workspace.tabs.iter().any(|t| t.project() == pid);
+        if !nonempty {
+            for (_, ent) in self.sessions.iter() {
+                if self.projects.by_cwd(&ent.read(cx).cwd) == Some(pid) {
+                    nonempty = true;
+                    break;
+                }
+            }
+        }
+        if !nonempty {
+            for info in self.agent_roster.entries_by_label() {
+                if self.projects.by_cwd(&info.cwd) == Some(pid) {
+                    nonempty = true;
+                    break;
+                }
+            }
+        }
+        if nonempty {
+            self.open_overlay(ActiveOverlay::ConfirmProjectDelete(pid));
+            cx.notify();
+        } else {
+            self.perform_delete_project(pid, cx);
+        }
+    }
+
+    /// Cascade-delete `pid` (UXI-Project-5): kill every session rooted in it
+    /// (local + roster-only), close its workspaces, then drop the project +
+    /// persist. Never leaves zero workspaces (spec Behavior 2) — a placeholder is
+    /// seeded under a surviving project. Empty projects are otherwise NOT
+    /// auto-deleted (only this explicit path removes a project).
+    pub(crate) fn perform_delete_project(&mut self, pid: ProjectId, cx: &mut Context<Self>) {
+        // 1. Sessions: local sessions rooted here, and roster-only sids rooted
+        // here (not already represented locally).
+        let mut local_kill: Vec<SessionId> = Vec::new();
+        let mut local_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (id, ent) in self.sessions.iter() {
+            if let Some(sid) = self.sessions.sid_of(id) {
+                local_sids.insert(sid.as_str().to_string());
+            }
+            if self.projects.by_cwd(&ent.read(cx).cwd) == Some(pid) {
+                local_kill.push(id);
+            }
+        }
+        let mut roster_kill: Vec<String> = Vec::new();
+        for info in self.agent_roster.entries_by_label() {
+            if self.projects.by_cwd(&info.cwd) == Some(pid)
+                && !local_sids.contains(&info.session_id)
+            {
+                roster_kill.push(info.session_id.clone());
+            }
+        }
+        for id in local_kill {
+            if let Some(sid) = self.sessions.sid_of(id).map(|s| s.to_string()) {
+                self.spawn_close_session(sid, cx);
+            }
+            self.transcript_views.remove(&id);
+            self.sessions.close(id);
+        }
+        for sid in roster_kill {
+            self.agent_roster.remove(&sid);
+            self.spawn_close_session(sid, cx);
+        }
+        // 2. Workspaces: close this project's tabs (descending so indices stay
+        // valid), then guarantee ≥1 workspace survives under a surviving project.
+        let mut idxs: Vec<usize> = self
+            .workspace
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.project() == pid)
+            .map(|(i, _)| i)
+            .collect();
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        for i in idxs {
+            self.workspace.close_tab(i);
+        }
+        if self.workspace.tabs.is_empty() {
+            let survivor = self.projects.ids().find(|&x| x != pid).unwrap_or(pid);
+            let name = workspace::auto_tab_name(self.workspace.next_tab_index);
+            self.workspace.next_tab_index += 1;
+            self.workspace.tabs.push(workspace::Tab::with_layout(
+                name,
+                workspace::Layout::Empty,
+                0,
+                survivor,
+            ));
+            self.workspace.active_tab = 0;
+        }
+        // 3. Drop the project + persist.
+        self.projects.close(pid);
+        save_persisted_projects(&self.projects);
+        self.save_workspace_state();
+        self.clear_overlay();
+        // A focused agent tile whose session we just killed falls back to its
+        // live selector (never a dangling bound id).
+        let dangling = match self.workspace.focused_content() {
+            Some(App::Agent(tile)) => tile.session().filter(|id| !self.sessions.contains(*id)),
+            _ => None,
+        };
+        if dangling.is_some() {
+            self.show_selector_on_focused_tile(cx);
+        }
+        cx.notify();
+    }
+
+    fn handle_confirm_delete_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        let Some(pid) = self.confirm_delete_ref() else {
+            return;
+        };
+        match press.key {
+            Key::Char('y') | Key::Enter => self.perform_delete_project(pid, cx),
+            _ => {
+                self.clear_overlay();
+                cx.notify();
+            }
+        }
     }
 
     /// Open a path-input overlay pre-filled with the active slot's
@@ -5578,40 +5835,6 @@ impl YaldaGpuiView {
                 self.close_rename_overlay();
                 self.save_workspace_state();
                 cx.notify();
-            }
-            RenameTarget::AgentNewSessionCwd => {
-                // Resolve per spec-agent-cwd.md §2 (tilde, canonicalize,
-                // validate). Failure surfaces via the active agent's
-                // footer hint and leaves the overlay closed.
-                match resolve_agent_cwd_arg(&new_label) {
-                    Ok(resolved) => {
-                        self.close_rename_overlay();
-                        self.new_agent_session(Some(resolved), cx);
-                    }
-                    Err(msg) => {
-                        self.close_rename_overlay();
-                        if let Some(mut c) = self.agent_mut(cx) {
-                            c.status = Some(msg.into());
-                        }
-                        cx.notify();
-                    }
-                }
-            }
-            RenameTarget::FreeAgentSessionCwd => {
-                // Resolve per spec-agent-cwd.md §2; on success spawn a FREE
-                // (tile-less) session at that cwd (UXI-JumpPanel-4). A bad path
-                // surfaces a transient error and creates nothing.
-                match resolve_agent_cwd_arg(&new_label) {
-                    Ok(resolved) => {
-                        self.close_rename_overlay();
-                        self.spawn_free_agent_session_at(resolved, cx);
-                    }
-                    Err(msg) => {
-                        self.close_rename_overlay();
-                        self.transient_status = Some(msg.into());
-                        cx.notify();
-                    }
-                }
             }
             RenameTarget::AgentChangeCwd { id } => match resolve_agent_cwd_arg(&new_label) {
                 Ok(resolved) => {
@@ -6367,8 +6590,6 @@ impl YaldaGpuiView {
         let header_label = match o.target {
             RenameTarget::AgentSession { .. } => "RENAME SESSION",
             RenameTarget::Tab { .. } => "RENAME WORKSPACE",
-            RenameTarget::AgentNewSessionCwd => "NEW SESSION AT…",
-            RenameTarget::FreeAgentSessionCwd => "NEW AGENT SESSION AT…",
             RenameTarget::AgentChangeCwd { .. } => "CHANGE SESSION CWD",
             RenameTarget::WorkspaceCwd { .. } => "SET WORKSPACE CWD",
             RenameTarget::DesktopTileSize => "DESKTOP GRID (COLSxROWS OF TILES)",
@@ -6415,6 +6636,140 @@ impl YaldaGpuiView {
                     .flex_col()
                     .child(header)
                     .child(input_row)
+                    .child(footer),
+            )
+    }
+
+    /// The "New project" overlay (UXI-Project-4): two input rows (name / cwd)
+    /// with a block cursor on the focused field, modeled on `render_rename_overlay`.
+    fn render_new_project_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let o = match self.new_project_ref() {
+            Some(o) => o,
+            None => unreachable!(),
+        };
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let popup_border: Hsla = nc(ov.border);
+        let label_fg: Hsla = nc(ov.label);
+        let input_fg: Hsla = nc(ov.input);
+        let cursor = |on: bool| if on { "\u{2588}" } else { "" };
+
+        let header = div()
+            .px_4()
+            .py_1()
+            .text_color(label_fg)
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::new_static("NEW PROJECT"));
+        let name_row = div()
+            .px_4()
+            .pt_2()
+            .text_color(input_fg)
+            .text_size(px(14.0))
+            .font_family(self.code_font.clone())
+            .child(SharedString::from(format!(
+                "name: {}{}",
+                o.name,
+                cursor(o.field == NpField::Name)
+            )));
+        let cwd_row = div()
+            .px_4()
+            .pb_2()
+            .text_color(input_fg)
+            .text_size(px(14.0))
+            .font_family(self.code_font.clone())
+            .child(SharedString::from(format!(
+                "cwd:  {}{}",
+                o.cwd,
+                cursor(o.field == NpField::Cwd)
+            )));
+        let footer = div()
+            .px_4()
+            .py_1()
+            .text_color(label_fg)
+            .text_size(px(11.0))
+            .child(SharedString::new_static("tab:switch field  enter:create  esc:cancel"));
+
+        div()
+            .absolute()
+            .top(px(80.0))
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_row()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(420.0))
+                    .bg(menu_bg)
+                    .border_2()
+                    .border_color(popup_border)
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .child(name_row)
+                    .child(cwd_row)
+                    .child(footer),
+            )
+    }
+
+    /// The "Delete project?" confirmation (UXI-Project-5): names the project and
+    /// how many workspaces/sessions the cascade will close, `y`/enter confirms.
+    fn render_confirm_delete_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let pid = self.confirm_delete_ref().expect("confirm overlay open");
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let popup_border: Hsla = nc(ov.border);
+        let label_fg: Hsla = nc(ov.label);
+        let input_fg: Hsla = nc(ov.input);
+        let name = self.projects.name_of(pid).to_string();
+        let n_ws = self.workspace.tabs.iter().filter(|t| t.project() == pid).count();
+        let mut n_sess = 0usize;
+        for (_, ent) in self.sessions.iter() {
+            if self.projects.by_cwd(&ent.read(cx).cwd) == Some(pid) {
+                n_sess += 1;
+            }
+        }
+
+        let header = div()
+            .px_4()
+            .py_1()
+            .text_color(label_fg)
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::from(format!("DELETE PROJECT {name}?")));
+        let body = div()
+            .px_4()
+            .py_2()
+            .text_color(input_fg)
+            .text_size(px(14.0))
+            .font_family(self.code_font.clone())
+            .child(SharedString::from(format!(
+                "closes {n_ws} workspace(s), kills {n_sess} session(s)"
+            )));
+        let footer = div()
+            .px_4()
+            .py_1()
+            .text_color(label_fg)
+            .text_size(px(11.0))
+            .child(SharedString::new_static("y / enter: confirm    esc: cancel"));
+
+        div()
+            .absolute()
+            .top(px(80.0))
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_row()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(420.0))
+                    .bg(menu_bg)
+                    .border_2()
+                    .border_color(popup_border)
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .child(body)
                     .child(footer),
             )
     }
@@ -6724,6 +7079,36 @@ impl Render for YaldaGpuiView {
         // shifted chars could shadow distinct overlay entries (e.g. `w` vs
         // `W`). The capture handler short-circuits the entire rest of the
         // pipeline.
+        if self.overlay_is_new_project() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("NewProjectView")
+                .size_full()
+                .bg(editor_bg)
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_new_project_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_new_project_overlay(cx))
+                .into_any_element();
+        }
+
+        if self.overlay_is_confirm_delete() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("ConfirmDeleteView")
+                .size_full()
+                .bg(editor_bg)
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_confirm_delete_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_confirm_delete_overlay(cx))
+                .into_any_element();
+        }
+
         if self.overlay_is_rename() {
             return div()
                 .track_focus(&self.focus_handle)
