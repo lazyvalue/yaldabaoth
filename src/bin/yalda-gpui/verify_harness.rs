@@ -13577,3 +13577,143 @@ fn arming_close_drops_into_insert_unless_a_draft_is_at_risk(cx: &mut TestAppCont
         });
     }
 }
+
+/// `add_free_session`, but rooted at an explicit cwd so the session belongs to a
+/// specific project (`Projects::membership_for_cwd`).
+#[cfg(test)]
+fn add_free_session_at(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    label: &str,
+    cwd: PathBuf,
+) -> crate::SessionId {
+    use crate::{AgentSession, AgentState};
+    let label = label.to_string();
+    view.update(vcx, |v, cx| {
+        let id = v.show_local_session(
+            AgentSession {
+                state: AgentState::new_server_managed(None),
+                label,
+                cwd,
+                resume_id: None,
+            },
+            cx,
+        );
+        cx.notify();
+        id
+    })
+}
+
+/// Arm + confirm a close through the REAL paths (`dispatch_menu_command("claude-close")`
+/// then a `yes` submit), the way the user does it.
+#[cfg(test)]
+fn real_close_confirmed(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) {
+    view.update(vcx, |v, cx| v.dispatch_menu_command("claude-close", cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let id = v.focused_bound_session().expect("a bound session to close");
+        v.with_session(id, cx, |c| {
+            for ch in "yes".chars() {
+                c.input_surface.compose_mut().editor.insert_char(ch);
+            }
+        });
+    });
+    view.update(vcx, |v, cx| v.submit_agent(cx));
+    vcx.run_until_parked();
+}
+
+/// UXI-Workspace-9 clause 2: dismissing a bare agent view lands in the CLOSED
+/// SESSION'S project — never a foreign one. Jumping to a free session in project B
+/// from a project-A workspace and closing it must NOT drop you back into A (the
+/// reported bug: "when I close a free agent session it drops me in a different
+/// project sometimes").
+///
+/// Both arms of the rule:
+///  1. B has a workspace → land on it, not on the project-A origin.
+///  2. The project has NO workspace → land on ANOTHER SESSION in it (a fresh bare
+///     agent view), rather than a foreign project's workspace.
+///
+/// Drives the REAL close path (`dispatch_menu_command("claude-close")` → real `yes`
+/// submit → `close_active_agent_session`).
+///
+/// Negative controls: drop the `same_project` preference in
+/// `dismiss_ephemeral_workspace` → arm 1 lands on the project-A origin, RED; drop
+/// the `session_fallback` in `close_active_agent_session` → arm 2 lands on a
+/// workspace instead of the sibling session, RED.
+#[gpui::test]
+fn closing_a_free_session_lands_in_the_same_project(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let pa = PathBuf::from("/tmp/yalda-fcsp-a");
+    let pb = PathBuf::from("/tmp/yalda-fcsp-b");
+    let pc = PathBuf::from("/tmp/yalda-fcsp-c");
+
+    // Workspace 0 → project A (where the user is sitting). Workspace 1 → project B.
+    // Project C gets NO workspace at all.
+    let (b_ws, b_pid) = view.update(vcx, |v, cx| {
+        let a = v.projects.create("Aproj".into(), pa.clone()).expect("A");
+        let b = v.projects.create("Bproj".into(), pb.clone()).expect("B");
+        let c = v.projects.create("Cproj".into(), pc.clone()).expect("C");
+        if let Some(w) = v.workspace.active_workspace_mut() {
+            w.set_project(a);
+        }
+        v.new_workspace_in(b, cx);
+        let b_ws = v.workspace.active_workspace;
+        v.workspace.set_active_workspace(0); // sit in project A
+        cx.notify();
+        let _ = c; // project C exists but deliberately has NO workspace (arm 2)
+        (b_ws, b)
+    });
+    assert_ne!(b_ws, 0, "project B's workspace is a different workspace than A's");
+
+    // ── Arm 1: the session's project HAS a workspace. ──────────────────────
+    let sb = add_free_session_at(&view, vcx, "claude-b", pb.clone());
+    view.update(vcx, |v, cx| v.jump_to_session(sb, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert!(v.workspace.active_is_ephemeral(), "jumped into a bare agent view");
+        assert_eq!(
+            v.workspace.active_workspace().map(|w| w.project()),
+            Some(b_pid),
+            "UXI-Project-6: the bare agent view sits under the SESSION's project"
+        );
+    });
+
+    real_close_confirmed(&view, vcx);
+
+    view.update(vcx, |v, _| {
+        assert!(!v.workspace.active_is_ephemeral(), "the bare agent view is dismissed");
+        assert_eq!(
+            v.workspace.active_workspace, b_ws,
+            "closing a project-B session lands on project B's workspace — NOT the \
+             project-A workspace we jumped from (the reported bug)"
+        );
+    });
+
+    // ── Arm 2: the session's project has NO workspace → another session. ───
+    view.update(vcx, |v, cx| {
+        v.workspace.set_active_workspace(0); // back to project A
+        cx.notify();
+    });
+    let c1 = add_free_session_at(&view, vcx, "claude-c1", pc.clone());
+    let c2 = add_free_session_at(&view, vcx, "claude-c2", pc.clone());
+    view.update(vcx, |v, cx| v.jump_to_session(c1, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert_eq!(v.focused_bound_session(), Some(c1), "showing C's first session");
+    });
+
+    real_close_confirmed(&view, vcx);
+
+    view.update(vcx, |v, _| {
+        assert_eq!(
+            v.focused_bound_session(),
+            Some(c2),
+            "a project with no workspace falls back to ANOTHER SESSION in it, not a \
+             foreign project's workspace"
+        );
+        assert!(
+            v.workspace.active_is_ephemeral(),
+            "…shown in its own bare agent view"
+        );
+    });
+}

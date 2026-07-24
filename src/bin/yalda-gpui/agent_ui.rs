@@ -1557,7 +1557,7 @@ impl YaldaGpuiView {
         // Fire the server close off the paint thread (it parks on a 30s
         // recv_timeout). The SessionClosed broadcast reconciles the rest.
         let server_sid = self.sessions.sid_of(id).map(|s| s.to_string());
-        if let Some(sid) = server_sid {
+        if let Some(sid) = server_sid.clone() {
             self.spawn_close_session(sid, cx);
         }
         // Drop the session from the store (its channel/pump cancel on drop) and
@@ -1569,8 +1569,20 @@ impl YaldaGpuiView {
         // solely to show THIS session — with it closed there is nothing left to
         // show, so dismiss the view instead of stranding a selector the user has to
         // close a second time. A real workspace's tile keeps the selector (clause 1).
-        if self.workspace.active_is_ephemeral() {
+        if let Some(project) = self.workspace.active_ephemeral_project() {
+            // Clause 2: stay in the CLOSED SESSION'S project. The frame lands on a
+            // same-project workspace when one exists; when the project has NONE,
+            // prefer another agent session in it over a foreign project's workspace
+            // — resolve that target BEFORE the dismissal moves the active workspace.
+            let session_fallback = (self.workspace.same_project_landing(project).is_none())
+                .then(|| self.same_project_session_target(project, id, server_sid.as_deref(), cx))
+                .flatten();
             self.workspace.dismiss_ephemeral_workspace();
+            if let Some(target) = session_fallback {
+                // The same call a jump-panel click makes — it opens the session's
+                // own ephemeral view, under its (== this) project.
+                self.jump_to_agent(target, cx);
+            }
         }
         // Wipe the cwd entry so reboot doesn't resurrect the closed session.
         if let Ok(cwd) = std::env::current_dir() {
@@ -1579,6 +1591,38 @@ impl YaldaGpuiView {
         self.save_agent_ring(cx);
         cx.notify();
         // No early `back_to_doc` — the tile stays Agent (unbound → selector).
+    }
+
+    /// Another agent session belonging to `project` to land on when a bare agent
+    /// view is dismissed and that project has NO workspace to fall back to
+    /// (`UXI-Workspace-9` clause 2). Projected from the SAME list the jump panel
+    /// shows (`jump_panel_agent_rows`), so "another session" means what the user
+    /// sees, in the order they see it — local and roster-only sessions alike.
+    ///
+    /// The session being closed is excluded by both keys: its local `SessionId`
+    /// (already dropped from the store by the time we're called) and its server sid
+    /// — the roster still lists that sid until the async `SessionDeleted` broadcast
+    /// lands, and landing back on the session we just killed would be absurd.
+    /// `None` when the project has no other session; the caller then keeps the
+    /// frame's workspace landing.
+    pub(crate) fn same_project_session_target(
+        &self,
+        project: ProjectId,
+        closed: SessionId,
+        closed_sid: Option<&str>,
+        cx: &gpui::App,
+    ) -> Option<JumpTarget> {
+        self.jump_panel_agent_rows(cx)
+            .into_iter()
+            .find(|row| {
+                let same_project = self.projects.membership_for_cwd(&row.cwd).project() == Some(project);
+                let is_the_closed_one = match &row.target {
+                    JumpTarget::Local(id) => *id == closed,
+                    JumpTarget::Roster(sid) => Some(sid.as_str()) == closed_sid,
+                };
+                same_project && !is_the_closed_one
+            })
+            .map(|row| row.target)
     }
 
     /// Fire a `close_session` off the paint thread (S4). The local slot has
