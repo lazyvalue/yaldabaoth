@@ -27,22 +27,27 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   `docs/components/README.md` § Terminology, cross-referenced from the jump-panel
   and session-binding specs.
 
-- **Cmd-P fuzzy jump palette (workspaces + agent sessions)** — `NEEDS-DECISION`
-  (2026-07-24 via `/new-ux`; component `JumpPanel` or a new `JumpPalette`, UXI
-  TBD). Captured verbatim: *"I want a Cmd-P jump command. When I hit Cmd-P a
-  dialog appears that I can type into. It is doing a fuzzy match on both
-  workspace names and agent session names. It shows a list of possible matches
-  below. I can use arrow keys to select one directly. Or if I hit `<enter>` it
-  jumps to the current top match."* Prior art to reuse rather than reinvent: the
-  always-visible jump panel (`jump_panel_view.rs`, `UXI-JumpPanel-1..8`) already
-  owns the merged workspaces ∪ universal-`AgentRoster` list and the jump/bind
-  semantics (free session → ephemeral virtual workspace); the buffer switcher
-  already has a fuzzy filter (`filtered_buffer_indices` + `fuzzy_match_gpui`,
-  `main.rs:6283`); overlays already exist as `ActiveOverlay` with per-overlay key
-  dispatch. No existing `cmd-p` binding. Open questions under interrogation:
-  which surfaces it opens from, exactly what a "name" is on each side, ranking vs
-  filtering, arrow-key + Enter semantics with an empty/no-match query, and
-  whether it supersedes or complements the sidebar panel.
+- **Cmd-P fuzzy jump palette (workspaces + agent sessions)** — `NEEDS-RUNTIME`
+  (branch `cmd-p-jump-palette`, 2026-07-24 via `/new-ux`; `UXI-JumpPanel-9`).
+  Captured verbatim: *"I want a Cmd-P jump command. When I hit Cmd-P a dialog
+  appears that I can type into. It is doing a fuzzy match on both workspace names
+  and agent session names. It shows a list of possible matches below. I can use
+  arrow keys to select one directly. Or if I hit `<enter>` it jumps to the current
+  top match."* **Built.** `Cmd-P` opens a centered palette over every non-ephemeral
+  workspace + every agent session (`Local` ∪ `Roster`), projects excluded (a
+  container, not a view target). Empty query = the full list in panel order; typing
+  filters by subsequence and orders by score (exact > prefix > word-start >
+  contiguous, shorter wins ties, panel order as tiebreak); arrows move the highlight
+  without navigating; `Enter` activates the highlight (= the top match unless you
+  moved); no-match `Enter` is a no-op that stays open; `Esc` closes; a second `Cmd-P`
+  (or `Cmd-P` over another overlay) is a no-op. Candidates come from
+  `jump_panel_sections` and activation goes through `select_workspace` /
+  `jump_to_agent`, so the palette can't drift from the sidebar or grow its own jump
+  semantics. New `jump_palette.rs`; 9 headless guards, each observed RED under a
+  reverted-fix mutation; full suite green (466 + 157). **Remaining:** a human look
+  at the popup's glyphs/colors/placement (harness gap #1) — the geometry is pinned
+  by a layout probe, the pixels aren't.
+
 
 - **Autonaming of agent sessions + jump-panel summary** — `NEEDS-RUNTIME`
   (branch `session-autonaming`, merged to `main` 2026-07-24 via `/new-ux`;
