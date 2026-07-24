@@ -70,7 +70,7 @@ fn constructs_and_renders_real_view(cx: &mut TestAppContext) {
 }
 
 /// Workspace → agent CWD inheritance (untitled.md Workspace + Agent TODOs;
-/// ADR-0023). The cwd is a required, typed field on every `Tab`
+/// ADR-0023). The cwd is a required, typed field on every `Workspace`
 /// ([`WorkspaceCwd`]) — "no cwd" is unrepresentable — so `agent_base_cwd` is
 /// total and always surfaces the active workspace's dir. Includes the
 /// regression that motivated the type: an **ephemeral** virtual workspace
@@ -78,7 +78,6 @@ fn constructs_and_renders_real_view(cx: &mut TestAppContext) {
 /// falling back to the process dir.
 #[gpui::test]
 fn workspace_cwd_inheritance(cx: &mut TestAppContext) {
-    use crate::workspace::WorkspaceCwd;
     let start = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (view, vcx) = cx.add_window_view({
         let start = start.clone();
@@ -96,10 +95,7 @@ fn workspace_cwd_inheritance(cx: &mut TestAppContext) {
 
     // Set CWD → both the surfaced cwd and what a new agent inherits move.
     view.update(vcx, |v, _cx| {
-        v.workspace
-            .active_tab_mut()
-            .expect("active tab")
-            .set_cwd(WorkspaceCwd::new(PathBuf::from("/Users/scott/ws/fulcrum")));
+        v.test_set_active_workspace_cwd(PathBuf::from("/Users/scott/ws/fulcrum"));
     });
     let base = view.read_with(vcx, |v, _| v.agent_base_cwd());
     assert_eq!(
@@ -110,11 +106,11 @@ fn workspace_cwd_inheritance(cx: &mut TestAppContext) {
 
     // The regression (ADR-0023): opening an ephemeral virtual workspace (what a
     // jump-panel free-session click does) must inherit the spawning workspace's
-    // cwd — NOT reset to the process dir. With the old empty-`kv` ephemeral tab,
+    // cwd — NOT reset to the process dir. With the old empty-`kv` ephemeral workspace,
     // `agent_base_cwd` here returned the launch dir.
     view.update(vcx, |v, _cx| {
         v.workspace
-            .open_ephemeral_tab(crate::App::Agent(crate::AgentTile::new()));
+            .open_ephemeral_workspace(crate::App::Agent(crate::AgentTile::new()));
     });
     let in_ephemeral = view.read_with(vcx, |v, _| v.agent_base_cwd());
     assert_eq!(
@@ -157,10 +153,7 @@ fn browser_start_dir_resolution(cx: &mut TestAppContext) {
     // (2) Workspace cwd set, still no file-backed buffer → the workspace cwd.
     let ws_dir = std::env::temp_dir();
     view.update(vcx, |v, _cx| {
-        v.workspace
-            .active_tab_mut()
-            .expect("active tab")
-            .set_cwd(crate::workspace::WorkspaceCwd::new(ws_dir.clone()));
+        v.test_set_active_workspace_cwd(ws_dir.clone());
     });
     let from_ws = view.read_with(vcx, |v, _| v.browser_start_dir());
     assert_eq!(from_ws, ws_dir, "workspace cwd wins over process dir");
@@ -991,26 +984,24 @@ fn jump_panel_renders_with_sessions(cx: &mut TestAppContext) {
 /// past the last workspace is a no-op (no panic, no spurious switch).
 #[gpui::test]
 fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
-    use crate::workspace::WorkspaceCwd;
     use crate::{App, BrowserWindow, BufferApp};
     cx.update(crate::register_keymap);
     let (view, vcx) = boot_browser(cx);
 
-    // Build four real (non-ephemeral) workspaces: the boot tab + three more
-    // INHABITED browser tabs (an empty-layout workspace renders a bare div with
+    // Build four real (non-ephemeral) workspaces: the boot workspace + three more
+    // INHABITED browser workspaces (an empty-layout workspace renders a bare div with
     // no action handlers, so its root couldn't dispatch the global jump — a
     // separate edge state; here we want real, switchable workspaces).
     view.update(vcx, |v, _| {
         let cwd = PathBuf::from(".");
         for _ in 0..3 {
-            v.workspace.push_initial_tab(
+            v.workspace.push_workspace_inheriting(
                 App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
-                WorkspaceCwd::new(cwd.clone()),
             );
         }
-        assert_eq!(v.workspace.tabs.len(), 4);
-        v.workspace.set_active_tab(0); // start the keystroke run on workspace 1
-        assert_eq!(v.workspace.active_tab, 0);
+        assert_eq!(v.workspace.workspaces.len(), 4);
+        v.workspace.set_active_workspace(0); // start the keystroke run on workspace 1
+        assert_eq!(v.workspace.active_workspace, 0);
     });
     vcx.run_until_parked();
 
@@ -1018,14 +1009,14 @@ fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("ctrl-3");
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.active_tab, 2, "ctrl-3 selects the 3rd workspace");
+        assert_eq!(v.workspace.active_workspace, 2, "ctrl-3 selects the 3rd workspace");
     });
 
     // ctrl-1 → back to the first.
     vcx.simulate_keystrokes("ctrl-1");
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.active_tab, 0, "ctrl-1 selects the 1st workspace");
+        assert_eq!(v.workspace.active_workspace, 0, "ctrl-1 selects the 1st workspace");
     });
 
     // ctrl-9 with only four workspaces is a no-op (stays put).
@@ -1033,7 +1024,7 @@ fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
         assert_eq!(
-            v.workspace.active_tab, 0,
+            v.workspace.active_workspace, 0,
             "a digit past the last workspace does nothing"
         );
     });
@@ -1042,12 +1033,11 @@ fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
 /// bug-0011 REGRESSION: an UNBOUND agent tile (the session selector/picker,
 /// `render_agent_picker`) was the one screen root missing `.workspace_nav(cx)`, so
 /// while the picker was focused `ctrl-<n>` (GotoWorkspace) and `cmd-shift-[]`
-/// (Next/PrevTab) dispatched into a dead chain — the picker "ate" workspace-switch
+/// (Next/PrevWorkspace) dispatched into a dead chain — the picker "ate" workspace-switch
 /// keys. Drives the REAL keymap over a focused picker tile. RED before the fix
-/// (the picker root wires workspace_nav): `active_tab` stays 0.
+/// (the picker root wires workspace_nav): `active_workspace` stays 0.
 #[gpui::test]
 fn agent_picker_does_not_eat_workspace_switch_keys(cx: &mut TestAppContext) {
-    use crate::workspace::WorkspaceCwd;
     use crate::{App, BrowserWindow, BufferApp};
     cx.update(crate::register_keymap);
     let (view, vcx) = boot_browser(cx);
@@ -1056,12 +1046,11 @@ fn agent_picker_does_not_eat_workspace_switch_keys(cx: &mut TestAppContext) {
     view.update(vcx, |v, _| {
         let cwd = PathBuf::from(".");
         for _ in 0..3 {
-            v.workspace.push_initial_tab(
+            v.workspace.push_workspace_inheriting(
                 App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
-                WorkspaceCwd::new(cwd.clone()),
             );
         }
-        v.workspace.set_active_tab(0);
+        v.workspace.set_active_workspace(0);
     });
     // Replace workspace 1's tile with an UNBOUND agent tile → the selector/picker
     // is now the focused screen root. Force a repaint so the picker actually
@@ -1074,7 +1063,7 @@ fn agent_picker_does_not_eat_workspace_switch_keys(cx: &mut TestAppContext) {
     view.read_with(vcx, |v, _| {
         let tile = v.agent_tile().expect("agent tile on workspace 1");
         assert!(tile.session().is_none(), "tile is unbound → picker is showing");
-        assert_eq!(v.workspace.active_tab, 0);
+        assert_eq!(v.workspace.active_workspace, 0);
     });
 
     // ctrl-3 FROM THE PICKER → third workspace. This is the bug: RED without
@@ -1083,48 +1072,46 @@ fn agent_picker_does_not_eat_workspace_switch_keys(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         assert_eq!(
-            v.workspace.active_tab, 2,
+            v.workspace.active_workspace, 2,
             "ctrl-3 must switch workspace even while the session picker is focused"
         );
     });
 
-    // And cycling (Next/PrevTab) must reach the picker too — go back to it, then
+    // And cycling (Next/PrevWorkspace) must reach the picker too — go back to it, then
     // cmd-shift-] forward.
-    view.update(vcx, |v, _| v.workspace.set_active_tab(0));
+    view.update(vcx, |v, _| v.workspace.set_active_workspace(0));
     vcx.run_until_parked();
     vcx.simulate_keystrokes("cmd-shift-]");
     vcx.run_until_parked();
     view.read_with(vcx, |v, _| {
         assert_eq!(
-            v.workspace.active_tab, 1,
-            "cmd-shift-] must advance the workspace from the picker (Next/PrevTab wiring)"
+            v.workspace.active_workspace, 1,
+            "cmd-shift-] must advance the workspace from the picker (Next/PrevWorkspace wiring)"
         );
     });
 }
 
-/// REGRESSION ("ctrl-tab does nothing"): tab-cycling (NextTab/PrevTab) was wired ONLY
+/// REGRESSION ("ctrl-tab does nothing"): tab-cycling (NextWorkspace/PrevWorkspace) was wired ONLY
 /// on the doc screen, so it was DEAD whenever an agent/worksheet tile was focused
 /// (where the user actually was). It's now in `workspace_nav`, wired on every screen.
 /// This drives the AGENT screen (not the browser) and switches with the reliable
 /// `cmd-shift-[`/`]` binding (Ctrl-Tab is OS-mangled on macOS — a 4th genuine gap;
 /// this test is focus-accurate, proving the WIRING, not the OS delivery). RED before
-/// folding next_tab/prev_tab into `workspace_nav`.
+/// folding next_workspace/prev_workspace into `workspace_nav`.
 #[gpui::test]
 fn workspace_cycle_works_from_the_agent_screen(cx: &mut TestAppContext) {
-    use crate::workspace::WorkspaceCwd;
     use crate::{App, BrowserWindow, BufferApp};
     cx.update(crate::register_keymap);
     let (view, vcx) = boot_worksheet_nav(cx); // FOCUSED on an agent/worksheet tile
     view.update(vcx, |v, _| {
         let cwd = PathBuf::from(".");
         for _ in 0..2 {
-            v.workspace.push_initial_tab(
+            v.workspace.push_workspace_inheriting(
                 App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
-                WorkspaceCwd::new(cwd.clone()),
             );
         }
-        assert_eq!(v.workspace.tabs.len(), 3, "agent workspace + 2 more");
-        v.workspace.set_active_tab(0); // start on the agent workspace
+        assert_eq!(v.workspace.workspaces.len(), 3, "agent workspace + 2 more");
+        v.workspace.set_active_workspace(0); // start on the agent workspace
     });
     vcx.run_until_parked();
 
@@ -1132,7 +1119,7 @@ fn workspace_cycle_works_from_the_agent_screen(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
         assert_eq!(
-            v.workspace.active_tab, 1,
+            v.workspace.active_workspace, 1,
             "cmd-shift-] advances the workspace FROM THE AGENT SCREEN (the dead-wiring bug)"
         );
     });
@@ -1140,7 +1127,7 @@ fn workspace_cycle_works_from_the_agent_screen(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("cmd-shift-[");
     vcx.run_until_parked();
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.active_tab, 0, "cmd-shift-[ goes back");
+        assert_eq!(v.workspace.active_workspace, 0, "cmd-shift-[ goes back");
     });
 }
 
@@ -1155,13 +1142,13 @@ fn workspace_number_skips_ephemeral(cx: &mut TestAppContext) {
     // Open the free session → an ephemeral workspace is appended (sorts last).
     view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.tabs.len(), 3, "two real + one ephemeral");
+        assert_eq!(v.workspace.workspaces.len(), 3, "two real + one ephemeral");
         assert!(v.workspace.active_is_ephemeral());
     });
     // ctrl-2 must land on the 2nd REAL workspace (index 1), not the ephemeral.
     view.update(vcx, |v, cx| v.goto_workspace_number(2, cx));
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.active_tab, 1, "number 2 = 2nd non-ephemeral tab");
+        assert_eq!(v.workspace.active_workspace, 1, "number 2 = 2nd non-ephemeral workspace");
         assert!(!v.workspace.active_is_ephemeral());
     });
 }
@@ -1367,7 +1354,7 @@ fn user_turn_gets_tint_agent_turn_does_not() {
 /// in the jump panel. Drives the REAL derivation (`jump_active_session` +
 /// `jump_target_is_active` over the REAL `jump_panel_agent_rows`) rather than any
 /// hand-built proxy: the focused tile's bound session is the one active row, an
-/// unfocused session is never active, the active tab is a listed (boxable)
+/// unfocused session is never active, the active workspace is a listed (boxable)
 /// workspace, and unbinding the tile (no focused bound session) clears the
 /// session box. The literal red pixels are harness gap #1 (human eye).
 ///
@@ -1391,10 +1378,10 @@ fn jump_active_box_marks_focused_workspace_and_session(cx: &mut TestAppContext) 
     });
 
     view.read_with(vcx, |v, cx| {
-        // The active workspace is a listed (non-ephemeral) tab, so its row is
+        // The active workspace is a listed (non-ephemeral) wsp, so its row is
         // boxed (workspace arm; the box reuses the row's existing `active`).
-        assert!(!v.workspace.active_is_ephemeral(), "active tab is listed");
-        assert!(!v.workspace.tabs[v.workspace.active_tab].ephemeral);
+        assert!(!v.workspace.active_is_ephemeral(), "active workspace is listed");
+        assert!(!v.workspace.workspaces[v.workspace.active_workspace].ephemeral);
 
         // The focused tile's bound session is the active-session identity.
         let (active_local, active_sid) = v.jump_active_session();
@@ -1432,7 +1419,7 @@ fn jump_active_box_marks_focused_workspace_and_session(cx: &mut TestAppContext) 
 }
 
 /// Jump-panel selection of a FREE session opens an ephemeral virtual workspace
-/// (ADR-0021): a new single-tile tab bound to the session, made active. Leaving
+/// (ADR-0021): a new single-tile workspace bound to the session, made active. Leaving
 /// it (any workspace switch) tears it down and returns the session to free —
 /// the session itself survives in the store the whole time.
 #[gpui::test]
@@ -1440,9 +1427,9 @@ fn jump_to_free_session_opens_then_tears_down_ephemeral(cx: &mut TestAppContext)
     let (view, vcx) = boot_browser(cx);
     let sid = add_free_session(&view, vcx, "claude-1");
 
-    // Precondition: one real tab, session is free.
+    // Precondition: one real wsp, session is free.
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.tabs.len(), 1, "starts with one workspace");
+        assert_eq!(v.workspace.workspaces.len(), 1, "starts with one workspace");
         assert!(
             v.agent_tile_id_bound_to(sid).is_none(),
             "session starts free"
@@ -1452,7 +1439,7 @@ fn jump_to_free_session_opens_then_tears_down_ephemeral(cx: &mut TestAppContext)
     // Jump to the free session → ephemeral virtual workspace.
     view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.tabs.len(), 2, "ephemeral workspace added");
+        assert_eq!(v.workspace.workspaces.len(), 2, "ephemeral workspace added");
         assert!(
             v.workspace.active_is_ephemeral(),
             "the ephemeral workspace is active"
@@ -1464,9 +1451,9 @@ fn jump_to_free_session_opens_then_tears_down_ephemeral(cx: &mut TestAppContext)
     });
 
     // Jump away (back to the real workspace 0) → ephemeral torn down, free again.
-    view.update(vcx, |v, cx| v.select_tab(0, cx));
+    view.update(vcx, |v, cx| v.select_workspace(0, cx));
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.tabs.len(), 1, "ephemeral workspace torn down");
+        assert_eq!(v.workspace.workspaces.len(), 1, "ephemeral workspace torn down");
         assert!(
             !v.workspace.active_is_ephemeral(),
             "no ephemeral workspace remains"
@@ -1480,7 +1467,7 @@ fn jump_to_free_session_opens_then_tears_down_ephemeral(cx: &mut TestAppContext)
 }
 
 /// Selecting a *different* free session while a virtual workspace is open
-/// REPLACES it (we never accumulate more than one ephemeral tab), and the first
+/// REPLACES it (we never accumulate more than one ephemeral workspace), and the first
 /// session returns to free.
 #[gpui::test]
 fn jump_to_second_free_session_replaces_ephemeral(cx: &mut TestAppContext) {
@@ -1491,7 +1478,7 @@ fn jump_to_second_free_session_replaces_ephemeral(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.jump_to_session(a, cx));
     view.update(vcx, |v, cx| v.jump_to_session(b, cx));
     view.update(vcx, |v, _| {
-        assert_eq!(v.workspace.tabs.len(), 2, "still exactly one ephemeral tab");
+        assert_eq!(v.workspace.workspaces.len(), 2, "still exactly one ephemeral workspace");
         assert!(
             v.agent_tile_id_bound_to(b).is_some(),
             "the second session is now shown"
@@ -1512,31 +1499,30 @@ fn jump_to_bound_session_focuses_existing_tile(cx: &mut TestAppContext) {
     let (view, vcx) = boot_browser(cx);
     // Workspace 0: an agent tile bound to S1.
     install_agent_slot(&view, vcx, Some("S1"));
-    let (sid, owner_tab, owner_wid) = view.update(vcx, |v, _| {
+    let (sid, owner_workspace, owner_wid) = view.update(vcx, |v, _| {
         let sid = v.sessions.locate(&ServerSid::new("S1")).expect("S1 bound");
         let wid = v.agent_tile_id_bound_to(sid).expect("S1 has a tile");
-        let tab = v.workspace.tab_containing(wid).expect("tile in a tab");
-        (sid, tab, wid)
+        let wsp = v.workspace.workspace_containing(wid).expect("tile in a workspace");
+        (sid, wsp, wid)
     });
     // Add a second workspace and switch to it, so jumping must cross back.
     view.update(vcx, |v, cx| {
-        v.workspace.push_initial_tab(
+        v.workspace.push_workspace_inheriting(
             App::Buffer(BufferApp::Picking(BrowserWindow::standalone(PathBuf::from(".")))),
-            crate::workspace::WorkspaceCwd::new(PathBuf::from(".")),
         );
         cx.notify();
     });
-    let tabs_before = view.update(vcx, |v, _| v.workspace.tabs.len());
+    let workspaces_before = view.update(vcx, |v, _| v.workspace.workspaces.len());
 
     view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
     view.update(vcx, |v, _| {
         assert_eq!(
-            v.workspace.tabs.len(),
-            tabs_before,
+            v.workspace.workspaces.len(),
+            workspaces_before,
             "no new tile/workspace created for a bound session"
         );
         assert_eq!(
-            v.workspace.active_tab, owner_tab,
+            v.workspace.active_workspace, owner_workspace,
             "focus moved to the owner's workspace"
         );
         assert_eq!(
@@ -1571,9 +1557,8 @@ fn agent_session_binds_at_most_one_tile(cx: &mut TestAppContext) {
 
     // Workspace 1: a fresh agent tile, now focused.
     view.update(vcx, |v, _cx| {
-        v.workspace.push_initial_tab(
+        v.workspace.push_workspace_inheriting(
             App::Agent(AgentTile::new()),
-            crate::workspace::WorkspaceCwd::new(PathBuf::from(".")),
         );
     });
 
@@ -1582,8 +1567,8 @@ fn agent_session_binds_at_most_one_tile(cx: &mut TestAppContext) {
 
     let (bound_tiles, active) = view.update(vcx, |v, _| {
         let mut n = 0;
-        for tab in v.workspace.tabs.iter() {
-            tab.layout.for_each_leaf(&mut |w| {
+        for wsp in v.workspace.workspaces.iter() {
+            wsp.layout.for_each_leaf(&mut |w| {
                 if let App::Agent(t) = &w.content
                     && t.session() == Some(owner)
                 {
@@ -1591,7 +1576,7 @@ fn agent_session_binds_at_most_one_tile(cx: &mut TestAppContext) {
                 }
             });
         }
-        (n, v.workspace.active_tab)
+        (n, v.workspace.active_workspace)
     });
     assert_eq!(bound_tiles, 1, "a session binds at most one tile");
     assert_eq!(active, 0, "focus navigated to the owning workspace");
@@ -2005,7 +1990,7 @@ fn agent_seam_routes_reply_only_after_session_is_bound(cx: &mut TestAppContext) 
 // screen's `on_action` wiring headlessly.
 
 /// `cmd-b` (`ToggleFileBrowserRail`, a global binding) opens a file-browser
-/// rail on the active tab, and a second `cmd-b` closes it. This only works if
+/// rail on the active wsp, and a second `cmd-b` closes it. This only works if
 /// `register_keymap` installed the binding AND the focused screen's root wired
 /// `on_action(toggle_file_browser_rail)` — i.e. the whole dispatch chain.
 #[gpui::test]
@@ -2025,12 +2010,12 @@ fn cmd_b_toggles_file_browser_rail(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
 
-    // Read the rail kind on the active tab: None = no rail, Some(true) = a
+    // Read the rail kind on the active workspace: None = no rail, Some(true) = a
     // file-browser rail, Some(false) = some other rail kind.
     let rail_kind = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         view.update(vcx, |v, cx| {
             v.workspace
-                .active_tab()
+                .active_workspace()
                 .and_then(|t| t.rail.as_ref())
                 .map(|r| r.content.is_file_browser())
         })
@@ -2361,7 +2346,7 @@ fn active_overlay_open_replaces_and_clears(cx: &mut TestAppContext) {
         );
 
         // open REPLACES, never stacks: opening a different overlay drops the
-        // previous one (the tab-double-click-behind-menu case can't strand).
+        // previous one (the workspace-double-click-behind-menu case can't strand).
         v.open_overlay(ActiveOverlay::WorkspacePicker(WorkspacePicker {
             mode: WorkspacePickerMode::Move,
             selected: 0,
@@ -3772,12 +3757,11 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
 
 /// The workspace cwd (`Set CWD`) is PERSISTED: it survives a save→restore
 /// (process restart). Hermetic — the workspace file is redirected to a tempdir
-/// (no touch to `~/.yalda`). Save writes `PersistedTab.cwd`; restore reads it
-/// back into the typed `Tab.cwd` (ADR-0023).
+/// (no touch to `~/.yalda`). Save writes `PersistedWorkspace.cwd`; restore reads it
+/// back into the typed `Workspace.cwd` (ADR-0023).
 #[gpui::test]
 fn workspace_cwd_persists_across_restart(cx: &mut TestAppContext) {
     use crate::persist::with_workspace_path;
-    use crate::workspace::WorkspaceCwd;
     let dir = tempfile::tempdir().expect("tempdir");
     let file = dir.path().join("workspace.json");
     let set = std::env::temp_dir().join("yalda-persisted-cwd");
@@ -3787,10 +3771,7 @@ fn workspace_cwd_persists_across_restart(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     with_workspace_path(file.clone(), || {
         view.update(vcx, |v, _cx| {
-            v.workspace
-                .active_tab_mut()
-                .expect("active tab")
-                .set_cwd(WorkspaceCwd::new(set.clone()));
+            v.test_set_active_workspace_cwd(set.clone());
             v.save_workspace_state();
         });
     });
@@ -3819,7 +3800,6 @@ fn workspace_cwd_persists_across_restart(cx: &mut TestAppContext) {
 /// `Start a new session` reads `agent_base_cwd` live.
 #[gpui::test]
 fn new_agent_uses_live_workspace_cwd_after_set_cwd(cx: &mut TestAppContext) {
-    use crate::workspace::WorkspaceCwd;
     use crate::{AgentTile, App, SessionPicker};
     let (view, vcx) = cx.add_window_view(hermetic_browser_view);
     vcx.run_until_parked();
@@ -3834,10 +3814,7 @@ fn new_agent_uses_live_workspace_cwd_after_set_cwd(cx: &mut TestAppContext) {
     // Now Set CWD on the active workspace — AFTER the selector is already open.
     let target = PathBuf::from("/tmp/yalda-live-cwd-test");
     view.update(vcx, |v, _cx| {
-        v.workspace
-            .active_tab_mut()
-            .expect("active tab")
-            .set_cwd(WorkspaceCwd::new(target.clone()));
+        v.test_set_active_workspace_cwd(target.clone());
     });
 
     // Activate row 0 ("Start a new session"). Hermetic: the create round-trip is
@@ -3911,8 +3888,8 @@ fn session_close_shows_selector_on_bound_tile_not_focused(cx: &mut TestAppContex
     vcx.run_until_parked();
 
     let tile_state = |v: &YaldaGpuiView, id: crate::workspace::WindowId| {
-        for tab in v.workspace.tabs.iter() {
-            if let Some(w) = tab.layout.find_leaf(id)
+        for wsp in v.workspace.workspaces.iter() {
+            if let Some(w) = wsp.layout.find_leaf(id)
                 && let App::Agent(t) = &w.content
             {
                 return Some((t.session().is_some(), t.picker().is_some()));
@@ -5904,11 +5881,10 @@ fn global_menu_lists_and_switches_workspaces(cx: &mut TestAppContext) {
 
     // Add two more workspaces (3 total). A bare Linear tile needs no args.
     view.update(vcx, |v, _cx| {
-        let cwd = crate::workspace::WorkspaceCwd::new(PathBuf::from("."));
         v.workspace
-            .push_initial_tab(crate::App::Linear(crate::LinearTile::new()), cwd.clone());
+            .push_workspace_inheriting(crate::App::Linear(crate::LinearTile::new()));
         v.workspace
-            .push_initial_tab(crate::App::Linear(crate::LinearTile::new()), cwd);
+            .push_workspace_inheriting(crate::App::Linear(crate::LinearTile::new()));
     });
 
     // The menu enumerates each workspace + the name/new commands.
@@ -5925,19 +5901,19 @@ fn global_menu_lists_and_switches_workspaces(cx: &mut TestAppContext) {
         "goto-workspace-0",
         "goto-workspace-1",
         "goto-workspace-2",
-        "rename-tab",
-        "new-tab",
+        "rename-workspace",
+        "new-workspace",
     ] {
         assert!(cmds.contains(&expect.to_string()), "global menu missing {expect}: {cmds:?}");
     }
 
     // Dispatching a goto command switches the active workspace.
     view.update(vcx, |v, cx| v.dispatch_menu_command("goto-workspace-2", cx));
-    let active = view.update(vcx, |v, _| v.workspace.active_tab);
+    let active = view.update(vcx, |v, _| v.workspace.active_workspace);
     assert_eq!(active, 2, "goto-workspace-2 activated the third workspace");
 
     view.update(vcx, |v, cx| v.dispatch_menu_command("goto-workspace-0", cx));
-    let active = view.update(vcx, |v, _| v.workspace.active_tab);
+    let active = view.update(vcx, |v, _| v.workspace.active_workspace);
     assert_eq!(active, 0, "goto-workspace-0 activated the first workspace");
 }
 
@@ -6049,134 +6025,217 @@ fn free_agent_session_no_server_is_graceful_noop(cx: &mut TestAppContext) {
     });
 }
 
-/// UXI-JumpPanel-3 + -4: the SAME create-free action is reachable from the `?`
-/// global menu ("new agent session"), not only the jump-panel row. Drives the REAL
-/// menu path: the entry is present in `global_menu()`, and `dispatch_menu_command`
-/// (the exact call a menu key-selection makes) OPENS the cwd picker overlay
-/// (UXI-JumpPanel-4 — the create flow now asks for a cwd first) targeting
-/// `FreeAgentSessionCwd`.
+/// UXI-Project-7 (removal half): the retired global "new agent session" cwd flow
+/// is gone. The `?` menu no longer offers `new-free-agent-session`, and
+/// dispatching that command (the exact call a menu key-selection made) opens NO
+/// overlay — sessions are created only inside a project now (per-project ＋ row).
 ///
-/// Negative controls: drop the `global_menu()` entry → the presence assert fails;
-/// rewire the `"new-free-agent-session"` match arm → no overlay opens.
+/// Negative control: re-add the `?`-menu entry (`gpui_menu` / the workspace `?`
+/// menu builder) → the presence assert fails; re-add the dispatch arm calling
+/// `open_free_agent_session_cwd_overlay` → the "opens no overlay" assert fails.
 #[gpui::test]
-fn global_menu_offers_and_dispatches_free_agent_session(cx: &mut TestAppContext) {
-    let (view, vcx) = boot_browser(cx); // hermetic → session_server is None
-
-    // The `?` menu offers it, keyed `a`, labeled for the human.
-    view.update(vcx, |v, _| {
-        let entry = v
-            .global_menu()
-            .into_iter()
-            .find(|n| matches!(&n.action,
-                crate::MenuAction::Command(c) if c == "new-free-agent-session"));
-        let entry = entry.expect("the ? global menu offers `new-free-agent-session`");
-        assert_eq!(entry.label, "new agent session", "human-readable label");
-    });
-
-    // Selecting it runs `dispatch_menu_command` with that id — the same call the
-    // key press makes — which OPENS the cwd overlay (create flow), spawning
-    // nothing yet.
+fn global_cwd_session_overlay_is_gone(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
     view.update(vcx, |v, cx| {
-        assert!(v.sessions.is_empty(), "precondition: no sessions");
+        let has = v.global_menu().into_iter().any(|n| {
+            matches!(&n.action, crate::MenuAction::Command(c) if c == "new-free-agent-session")
+        });
+        assert!(
+            !has,
+            "the ? menu no longer offers the global 'new agent session' cwd flow"
+        );
         v.dispatch_menu_command("new-free-agent-session", cx);
-    });
-    vcx.run_until_parked();
-    view.update(vcx, |v, _| {
-        assert!(
-            matches!(
-                v.rename_ref().map(|o| o.target),
-                Some(crate::RenameTarget::FreeAgentSessionCwd)
-            ),
-            "the ? menu action opens the free-agent cwd picker"
-        );
-        assert!(v.sessions.is_empty(), "opening the picker creates no session");
+        assert!(!v.has_overlay(), "the retired command opens no overlay");
     });
 }
 
-/// UXI-JumpPanel-4: the free-agent create flow opens a cwd path-input overlay
-/// pre-filled with the default cwd (`agent_base_cwd()`), so Enter accepts the
-/// default. Drives the REAL `open_free_agent_session_cwd_overlay`.
+/// UXI-Project-3 (T004-tail): `jump_panel_sections` — the pure model the jump
+/// panel walks — groups WORKSPACES and AGENT SESSIONS under their owning project,
+/// each section listing ONLY its own (workspaces filtered by `wsp.project()`,
+/// sessions by cwd→project). Workspace badges keep the GLOBAL workspace index (idx+1 =
+/// ctrl-<n>), so two projects' workspaces carry distinct global numbers. Empty
+/// projects still render a section. Individual tiles are never listed (the model
+/// has no tile axis).
 ///
-/// Negative control: change the prefill (`text = agent_base_cwd().display()`) to
-/// something else and the default-match assert fails.
+/// Negative control: drop the `t.project() == id` filter in `jump_panel_sections`
+/// (`.filter(|(_, t)| !t.ephemeral)`) → every section lists every workspace, so
+/// A's section contains B's workspace index and the exclusion assert fails.
 #[gpui::test]
-fn free_agent_cwd_overlay_opens_prefilled_with_default(cx: &mut TestAppContext) {
+fn jump_panel_renders_per_project_sections(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState};
     let (view, vcx) = boot_browser(cx);
-    view.update(vcx, |v, cx| v.open_free_agent_session_cwd_overlay(cx));
-    view.update(vcx, |v, _| {
-        let o = v.rename_ref().expect("cwd overlay is open");
-        assert!(
-            matches!(o.target, crate::RenameTarget::FreeAgentSessionCwd),
-            "targets the free-agent cwd variant"
-        );
+    let pa = PathBuf::from("/tmp/yalda-sec-a");
+    let pb = PathBuf::from("/tmp/yalda-sec-b");
+    let (a_pid, b_pid) = view.update(vcx, |v, _| {
+        let a = v.projects.create("Alpha".into(), pa.clone()).expect("A");
+        let b = v.projects.create("Beta".into(), pb.clone()).expect("B");
+        (a, b)
+    });
+    // A workspace in each project; capture their GLOBAL indices.
+    let a_idx = view.update(vcx, |v, cx| {
+        v.new_workspace_in(a_pid, cx);
+        v.workspace.active_workspace
+    });
+    let b_idx = view.update(vcx, |v, cx| {
+        v.new_workspace_in(b_pid, cx);
+        v.workspace.active_workspace
+    });
+    assert_ne!(a_idx, b_idx, "badges (idx+1) are distinct global workspace numbers");
+    // A free session rooted at A's cwd → groups under A.
+    view.update(vcx, |v, cx| {
+        let s = AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: "sess-a".into(),
+            cwd: pa.clone(),
+            resume_id: None,
+        };
+        v.show_local_session(s, cx);
+    });
+    vcx.run_until_parked();
+
+    let (sections, _unfiled) = view.update(vcx, |v, cx| v.jump_panel_sections(cx));
+    let sec_a = sections.iter().find(|s| s.id == a_pid).expect("section A present");
+    let sec_b = sections.iter().find(|s| s.id == b_pid).expect("section B present (even if empty)");
+
+    assert!(
+        sec_a.workspaces.iter().any(|(i, _, _)| *i == a_idx),
+        "A lists its own workspace (global idx {a_idx})"
+    );
+    assert!(
+        !sec_a.workspaces.iter().any(|(i, _, _)| *i == b_idx),
+        "A must NOT list B's workspace — the per-project filter"
+    );
+    assert!(
+        sec_b.workspaces.iter().any(|(i, _, _)| *i == b_idx),
+        "B lists its own workspace (global idx {b_idx})"
+    );
+    assert!(
+        sec_a.sessions.iter().any(|(_, r)| r.label == "sess-a"),
+        "A groups the session rooted at its cwd"
+    );
+    assert!(sec_b.sessions.is_empty(), "B (no sessions) still renders an empty section");
+}
+
+/// UXI-Project-4: the "New project" overlay creates an EMPTY project via the REAL
+/// path (`open_new_project_overlay` → edit fields → `commit_new_project_overlay`),
+/// and a duplicate NAME is refused with a transient error, creating nothing.
+///
+/// Negative control: remove the `by_name` duplicate guard in `Projects::create`
+/// (`project.rs`) → the dup name is accepted, `projects.len()` grows, and the
+/// "creates nothing" assert fails.
+#[gpui::test]
+fn new_project_overlay_creates_empty_project_and_rejects_dup(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    // Two distinct REAL directories (resolve_agent_cwd_arg validates existence).
+    let dir1 = std::env::temp_dir();
+    let dir2 = std::env::temp_dir().join(format!("yalda-np-{}", std::process::id()));
+    std::fs::create_dir_all(&dir2).expect("mk dir2");
+
+    let before = view.read_with(vcx, |v, _| v.projects.len());
+    view.update(vcx, |v, cx| {
+        v.open_new_project_overlay(cx);
+        {
+            let o = v.new_project_mut().expect("new-project overlay open");
+            o.name = "Zephyr".into();
+            o.cwd = dir1.display().to_string();
+        }
+        v.commit_new_project_overlay(cx);
+    });
+    let zid = view.read_with(vcx, |v, _| {
+        let zid = v.projects.by_name("Zephyr").expect("project created");
+        assert_eq!(v.projects.len(), before + 1, "exactly one new project");
+        zid
+    });
+    // The new project starts EMPTY — no workspaces, no sessions.
+    view.read_with(vcx, |v, _| {
         assert_eq!(
-            o.text,
-            v.agent_base_cwd().display().to_string(),
-            "pre-filled with the default cwd so Enter accepts it"
+            v.workspace.workspaces.iter().filter(|t| t.project() == zid).count(),
+            0,
+            "new project owns zero workspaces"
         );
+    });
+
+    // A second create with the SAME name is refused; nothing added.
+    let after = view.read_with(vcx, |v, _| v.projects.len());
+    view.update(vcx, |v, cx| {
+        v.open_new_project_overlay(cx);
+        {
+            let o = v.new_project_mut().expect("overlay open");
+            o.name = "Zephyr".into();
+            o.cwd = dir2.display().to_string();
+        }
+        v.commit_new_project_overlay(cx);
+    });
+    view.read_with(vcx, |v, _| {
+        assert_eq!(v.projects.len(), after, "a duplicate name creates NOTHING");
+        let note = v.transient_status.as_ref().map(|s| s.to_string()).unwrap_or_default();
+        assert!(note.contains("already exists"), "dup name surfaces an error, got: {note:?}");
     });
 }
 
-/// UXI-JumpPanel-4: committing the cwd overlay ROUTES on the typed path — a valid
-/// path closes the overlay and reaches `spawn_free_agent_session_at` (proven by
-/// its no-server note, since there's no daemon here); an invalid path surfaces an
-/// error and creates nothing. Drives the REAL `commit_rename_overlay`.
+/// UXI-Project-5: deleting a NON-empty project first confirms, then cascades. The
+/// REAL `request_delete_project` arms the confirm overlay (removing nothing yet);
+/// `perform_delete_project` then closes the project's workspaces, kills its
+/// sessions (via `AgentSessions::close`), and drops the project — never leaving
+/// zero workspaces. An EMPTY project deletes directly with no confirm.
 ///
-/// Negative control: point the `FreeAgentSessionCwd` commit arm at a no-op → the
-/// valid-path note never appears; drop the `Err(msg)` arm → the invalid path
-/// silently succeeds.
+/// Negative control: comment out the session-kill loop in
+/// `perform_delete_project` (`for id in local_kill { … self.sessions.close(id) }`)
+/// → the orphaned session survives in `self.sessions` and the kill assert fails.
 #[gpui::test]
-fn free_agent_cwd_overlay_commit_routes_or_errors(cx: &mut TestAppContext) {
-    // Valid path → routes to the spawn (no-server note is the observable proof).
+fn delete_nonempty_project_confirms_then_cascades(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState};
     let (view, vcx) = boot_browser(cx);
-    let valid = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    view.update(vcx, |v, cx| {
-        v.open_free_agent_session_cwd_overlay(cx);
-        v.rename_mut().expect("overlay open").text = valid.display().to_string();
-        v.commit_rename_overlay(cx);
-    });
-    vcx.run_until_parked();
-    view.update(vcx, |v, _| {
-        assert!(!v.overlay_is_rename(), "a valid commit closes the overlay");
-        let note = v
-            .transient_status
-            .as_ref()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        assert!(
-            note.contains("no session server"),
-            "a valid path reached spawn_free_agent_session_at, got: {note:?}"
-        );
-        assert!(v.sessions.is_empty(), "no daemon ⇒ no phantom session");
+    let pa = PathBuf::from("/tmp/yalda-del-a");
+    let (pid, ws_idx, sid) = view.update(vcx, |v, cx| {
+        let pid = v.projects.create("Doomed".into(), pa.clone()).expect("create");
+        v.new_workspace_in(pid, cx);
+        let ws_idx = v.workspace.active_workspace;
+        let s = AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: "doomed-s".into(),
+            cwd: pa.clone(),
+            resume_id: None,
+        };
+        let sid = v.show_local_session(s, cx);
+        (pid, ws_idx, sid)
     });
 
-    // Invalid path → error surfaced, nothing spawned. Reuse the same view; clear
-    // the prior note so a stale "no session server" can't mask the routing check.
-    view.update(vcx, |v, cx| {
-        v.transient_status = None;
-        v.open_free_agent_session_cwd_overlay(cx);
-        // A path that isn't a real directory fails `resolve_agent_cwd_arg`.
-        v.rename_mut().expect("overlay open").text =
-            "/definitely/not/a/real/dir/xyzzy".to_string();
-        v.commit_rename_overlay(cx);
+    // Non-empty → arms the confirm overlay, removes NOTHING yet.
+    view.update(vcx, |v, cx| v.request_delete_project(pid, cx));
+    view.read_with(vcx, |v, _| {
+        assert!(matches!(v.confirm_delete_ref(), Some(p) if p == pid), "confirm overlay armed");
+        assert!(v.projects.contains(pid), "project still present pre-confirm");
+        assert_eq!(
+            v.workspace.workspaces.get(ws_idx).map(|t| t.project()),
+            Some(pid),
+            "workspace intact pre-confirm"
+        );
+        assert!(v.sessions.contains(sid), "session intact pre-confirm");
     });
-    vcx.run_until_parked();
-    view.update(vcx, |v, _| {
-        assert!(!v.overlay_is_rename(), "the commit closes the overlay either way");
-        let note = v
-            .transient_status
-            .as_ref()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+
+    // Confirm → cascade.
+    view.update(vcx, |v, cx| v.perform_delete_project(pid, cx));
+    view.read_with(vcx, |v, _| {
+        assert!(!v.projects.contains(pid), "project removed");
+        assert!(!v.sessions.contains(sid), "session killed by the cascade");
+        assert!(!v.transcript_views.contains_key(&sid), "transcript view dropped");
         assert!(
-            !note.contains("no session server"),
-            "an invalid path must NOT reach the spawn, got: {note:?}"
+            !v.workspace.workspaces.iter().any(|t| t.project() == pid),
+            "the project's workspaces are closed"
         );
-        assert!(
-            note.contains("not a directory"),
-            "the invalid path surfaces the resolve error, got: {note:?}"
-        );
-        assert!(v.sessions.is_empty(), "invalid path creates nothing");
+        assert!(!v.workspace.workspaces.is_empty(), "≥1 workspace always survives (Behavior 2)");
+        assert!(!v.overlay_is_confirm_delete(), "the overlay clears after cascade");
+    });
+
+    // An EMPTY project deletes directly — no confirm overlay.
+    let empty = view.update(vcx, |v, _| {
+        v.projects.create("Empty".into(), PathBuf::from("/tmp/yalda-del-empty")).expect("create")
+    });
+    view.update(vcx, |v, cx| v.request_delete_project(empty, cx));
+    view.read_with(vcx, |v, _| {
+        assert!(!v.overlay_is_confirm_delete(), "an empty project needs no confirmation");
+        assert!(!v.projects.contains(empty), "the empty project deleted directly");
     });
 }
 
@@ -10983,8 +11042,8 @@ fn unresumable_session_shows_inline_notice_not_picker(cx: &mut TestAppContext) {
 
     // State: unavailable, NOT the picker; identity kept for a later re-attempt.
     view.read_with(vcx, |v, _cx| {
-        for tab in v.workspace.tabs.iter() {
-            if let Some(w) = tab.layout.find_leaf(win)
+        for wsp in v.workspace.workspaces.iter() {
+            if let Some(w) = wsp.layout.find_leaf(win)
                 && let App::Agent(t) = &w.content
             {
                 assert!(t.session().is_none(), "tile is unbound after the session went away");
@@ -11094,18 +11153,18 @@ fn boot_desktop_two_tiles<'a>(
         v.viewport_height_px = 600.0;
         v.desktop_canvas_bounds.set((0.0, 0.0, 800.0, 600.0));
 
-        // Every tab is a plane now (infinite-plane, Stage D); place the tiles.
-        let tab = v.workspace.active_tab_mut().unwrap();
-        tab.layout_mode = crate::workspace::LayoutMode::Plane;
-        let leaves = tab.layout.leaf_ids();
-        tab.desktop.reconcile(&leaves);
-        tab.desktop.set_anchor(win_a, crate::workspace::Slot::new(0, 0));
-        tab.desktop.set_anchor(win_b, crate::workspace::Slot::new(0, 100));
+        // Every workspace is a plane now (infinite-plane, Stage D); place the tiles.
+        let wsp = v.workspace.active_workspace_mut().unwrap();
+        wsp.layout_mode = crate::workspace::LayoutMode::Plane;
+        let leaves = wsp.layout.leaf_ids();
+        wsp.desktop.reconcile(&leaves);
+        wsp.desktop.set_anchor(win_a, crate::workspace::Slot::new(0, 0));
+        wsp.desktop.set_anchor(win_b, crate::workspace::Slot::new(0, 100));
         // Focus A (the origin tile) and pin the reveal so auto-pan won't drag
         // the camera to wherever focus is — the camera rests at (0,0).
-        tab.focused = win_a;
-        tab.desktop.last_reveal = Some(win_a);
-        tab.desktop.camera.pan = (0.0, 0.0);
+        wsp.focused = win_a;
+        wsp.desktop.last_reveal = Some(win_a);
+        wsp.desktop.camera.pan = (0.0, 0.0);
         cx.notify();
         (win_a, win_b)
     });
@@ -11128,8 +11187,8 @@ fn plane_card_zoom_paints_placeholders_not_live_content(cx: &mut TestAppContext)
 
     // Zoom to Card.
     view.update(vcx, |v, cx| {
-        let tab = v.workspace.active_tab_mut().unwrap();
-        tab.desktop.camera.zoom = crate::workspace::Detail::Card;
+        let wsp = v.workspace.active_workspace_mut().unwrap();
+        wsp.desktop.camera.zoom = crate::workspace::Detail::Card;
         cx.notify();
     });
     for _ in 0..2 {
@@ -11177,9 +11236,9 @@ fn plane_focused_tile_renders_when_off_viewport(cx: &mut TestAppContext) {
     // 800×600 viewport: A (origin, col 0) is now far LEFT of view; B (col 100)
     // is still far right. Neither slot intersects the viewport.
     view.update(vcx, |v, cx| {
-        let tab = v.workspace.active_tab_mut().unwrap();
-        tab.desktop.camera.pan = (50.0, 0.0); // 50 slots right — origin is off-left
-        tab.desktop.last_reveal = Some(focused_id); // keep auto-pan from re-revealing
+        let wsp = v.workspace.active_workspace_mut().unwrap();
+        wsp.desktop.camera.pan = (50.0, 0.0); // 50 slots right — origin is off-left
+        wsp.desktop.last_reveal = Some(focused_id); // keep auto-pan from re-revealing
         cx.notify();
     });
     for _ in 0..2 {
@@ -11245,15 +11304,15 @@ fn new_tile_lands_same_row_right_of_the_only_tile(cx: &mut TestAppContext) {
         v.viewport_height_px = 600.0;
         v.desktop_canvas_bounds.set((0.0, 0.0, 800.0, 600.0));
         let win_a = v.workspace.focused_window_id().expect("focused tile");
-        let tab = v.workspace.active_tab_mut().unwrap();
-        tab.layout_mode = crate::workspace::LayoutMode::Plane;
-        let leaves = tab.layout.leaf_ids();
+        let wsp = v.workspace.active_workspace_mut().unwrap();
+        wsp.layout_mode = crate::workspace::LayoutMode::Plane;
+        let leaves = wsp.layout.leaf_ids();
         assert_eq!(leaves.len(), 1, "the fixture must start with ONE tile");
-        tab.desktop.reconcile(&leaves);
-        tab.desktop.set_anchor(win_a, Slot::new(1, -1));
-        tab.focused = win_a;
-        tab.desktop.last_reveal = Some(win_a);
-        tab.desktop.camera.pan = (0.0, 0.0);
+        wsp.desktop.reconcile(&leaves);
+        wsp.desktop.set_anchor(win_a, Slot::new(1, -1));
+        wsp.focused = win_a;
+        wsp.desktop.last_reveal = Some(win_a);
+        wsp.desktop.camera.pan = (0.0, 0.0);
         cx.notify();
         win_a
     });
@@ -11268,8 +11327,8 @@ fn new_tile_lands_same_row_right_of_the_only_tile(cx: &mut TestAppContext) {
     }
 
     let (count, a_slot, new_slot) = view.read_with(vcx, |v, _| {
-        let tab = v.workspace.active_tab().expect("active tab");
-        let leaves = tab.layout.leaf_ids();
+        let wsp = v.workspace.active_workspace().expect("active workspace");
+        let leaves = wsp.layout.leaf_ids();
         let new_id = leaves
             .iter()
             .copied()
@@ -11277,8 +11336,8 @@ fn new_tile_lands_same_row_right_of_the_only_tile(cx: &mut TestAppContext) {
             .expect("split created a new leaf");
         (
             leaves.len(),
-            tab.desktop.slot_of(win_a),
-            tab.desktop.slot_of(new_id),
+            wsp.desktop.slot_of(win_a),
+            wsp.desktop.slot_of(new_id),
         )
     });
 
@@ -11306,7 +11365,7 @@ fn plane_pan_at_card_leaves_transcript_render_flat(cx: &mut TestAppContext) {
     let (view, vcx, _focused, _other) = boot_desktop_two_tiles(cx);
     // Zoom to Card and settle.
     view.update(vcx, |v, cx| {
-        v.workspace.active_tab_mut().unwrap().desktop.camera.zoom =
+        v.workspace.active_workspace_mut().unwrap().desktop.camera.zoom =
             crate::workspace::Detail::Card;
         cx.notify();
     });
@@ -11319,7 +11378,7 @@ fn plane_pan_at_card_leaves_transcript_render_flat(cx: &mut TestAppContext) {
     // Pan the plane several times in slot units (the bare-scroll path).
     for _ in 0..5 {
         view.update(vcx, |v, cx| {
-            v.workspace.active_tab_mut().unwrap().desktop.pan_by(0.5, 0.0);
+            v.workspace.active_workspace_mut().unwrap().desktop.pan_by(0.5, 0.0);
             cx.notify();
         });
         vcx.run_until_parked();
@@ -11354,7 +11413,7 @@ fn ctrl_w_reset_returns_camera_to_origin(cx: &mut TestAppContext) {
 
     // Snapshot the tile placement so we can prove the reset is view-only.
     let slots_before = view.update(vcx, |v, _| {
-        v.workspace.active_tab().unwrap().desktop.slots.clone()
+        v.workspace.active_workspace().unwrap().desktop.slots.clone()
     });
 
     // Pan AND zoom the camera AWAY from the origin — reset must undo BOTH. Zoom
@@ -11362,13 +11421,13 @@ fn ctrl_w_reset_returns_camera_to_origin(cx: &mut TestAppContext) {
     // (chrome.rs), which renders at every Detail, so the chord must still fire
     // when the focused tile is a Minimap placeholder (the C5 path).
     view.update(vcx, |v, cx| {
-        let d = &mut v.workspace.active_tab_mut().unwrap().desktop;
+        let d = &mut v.workspace.active_workspace_mut().unwrap().desktop;
         d.pan_by(7.0, -4.0);
         d.camera.zoom = crate::workspace::Detail::Minimap;
         cx.notify();
     });
     vcx.run_until_parked();
-    let moved = view.update(vcx, |v, _| v.workspace.active_tab().unwrap().desktop.camera);
+    let moved = view.update(vcx, |v, _| v.workspace.active_workspace().unwrap().desktop.camera);
     assert_ne!(
         moved,
         crate::workspace::Camera::default(),
@@ -11380,7 +11439,7 @@ fn ctrl_w_reset_returns_camera_to_origin(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let (camera, slots_after) = view.update(vcx, |v, _| {
-        let d = &v.workspace.active_tab().unwrap().desktop;
+        let d = &v.workspace.active_workspace().unwrap().desktop;
         (d.camera, d.slots.clone())
     });
     assert_eq!(
@@ -11411,7 +11470,7 @@ fn ctrl_w_zoom_steps_detail(cx: &mut TestAppContext) {
 
     let zoom = |view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext| {
         view.update(vcx, |v, _| {
-            v.workspace.active_tab().unwrap().desktop.camera.zoom
+            v.workspace.active_workspace().unwrap().desktop.camera.zoom
         })
     };
 
@@ -11460,7 +11519,7 @@ fn cmd_shift_drag_pans_the_plane(cx: &mut TestAppContext) {
     let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
 
     let slots_before = view.read_with(vcx, |v, _| {
-        let d = &v.workspace.active_tab().unwrap().desktop;
+        let d = &v.workspace.active_workspace().unwrap().desktop;
         (d.slot_of(win_a), d.slot_of(win_b))
     });
 
@@ -11482,7 +11541,7 @@ fn cmd_shift_drag_pans_the_plane(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let (pan, slots_after) = view.read_with(vcx, |v, _| {
-        let d = &v.workspace.active_tab().unwrap().desktop;
+        let d = &v.workspace.active_workspace().unwrap().desktop;
         (d.camera.pan, (d.slot_of(win_a), d.slot_of(win_b)))
     });
     // Pointer moved left+up; content follows the cursor, so the camera pan
@@ -11518,7 +11577,7 @@ fn cmd_only_drag_does_not_pan_the_plane(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let pan = view.read_with(vcx, |v, _| {
-        v.workspace.active_tab().unwrap().desktop.camera.pan
+        v.workspace.active_workspace().unwrap().desktop.camera.pan
     });
     assert_eq!(pan, (0.0, 0.0), "Cmd WITHOUT Shift must not pan the plane");
 }
@@ -11540,7 +11599,7 @@ fn cmd_shift_pan_rests_view_cell_aligned(cx: &mut TestAppContext) {
     let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
 
     let slots_before = view.read_with(vcx, |v, _| {
-        let d = &v.workspace.active_tab().unwrap().desktop;
+        let d = &v.workspace.active_workspace().unwrap().desktop;
         (d.slot_of(win_a), d.slot_of(win_b))
     });
 
@@ -11560,7 +11619,7 @@ fn cmd_shift_pan_rests_view_cell_aligned(cx: &mut TestAppContext) {
     // Precondition: mid-gesture the pan is fractional (proves the snap has real
     // work to do — the release isn't landing on an already-integral pan).
     let pan_mid = view.read_with(vcx, |v, _| {
-        v.workspace.active_tab().unwrap().desktop.camera.pan
+        v.workspace.active_workspace().unwrap().desktop.camera.pan
     });
     assert!(
         pan_mid.0.fract() != 0.0 || pan_mid.1.fract() != 0.0,
@@ -11571,7 +11630,7 @@ fn cmd_shift_pan_rests_view_cell_aligned(cx: &mut TestAppContext) {
     vcx.run_until_parked();
 
     let (pan_after, slots_after) = view.read_with(vcx, |v, _| {
-        let d = &v.workspace.active_tab().unwrap().desktop;
+        let d = &v.workspace.active_workspace().unwrap().desktop;
         (d.camera.pan, (d.slot_of(win_a), d.slot_of(win_b)))
     });
     assert_eq!(pan_after.0.fract(), 0.0, "pan.0 rests on a whole slot (got {pan_after:?})");
@@ -11596,7 +11655,7 @@ fn tile_drag_rests_view_cell_aligned(cx: &mut TestAppContext) {
     let (view, vcx, win_a, win_b) = boot_desktop_two_tiles(cx);
 
     let slot_b_before = view.read_with(vcx, |v, _| {
-        v.workspace.active_tab().unwrap().desktop.slot_of(win_b)
+        v.workspace.active_workspace().unwrap().desktop.slot_of(win_b)
     });
 
     // Use the REAL painted canvas rect (boot's final paint sets it; a set here
@@ -11620,7 +11679,7 @@ fn tile_drag_rests_view_cell_aligned(cx: &mut TestAppContext) {
     // The pan is now fractional (proving the auto-pan ran) — the exact condition
     // the drop must clean up.
     let pan_before = view.read_with(vcx, |v, _| {
-        v.workspace.active_tab().unwrap().desktop.camera.pan
+        v.workspace.active_workspace().unwrap().desktop.camera.pan
     });
     assert!(
         pan_before.0.fract() != 0.0 || pan_before.1.fract() != 0.0,
@@ -11630,7 +11689,7 @@ fn tile_drag_rests_view_cell_aligned(cx: &mut TestAppContext) {
     view.update(vcx, |v, cx| v.desktop_drop(cx));
 
     let (pan_after, slot_b_after) = view.read_with(vcx, |v, _| {
-        let d = &v.workspace.active_tab().unwrap().desktop;
+        let d = &v.workspace.active_workspace().unwrap().desktop;
         (d.camera.pan, d.slot_of(win_b))
     });
     assert_eq!(pan_after.0.fract(), 0.0, "pan.0 rests on a whole slot (got {pan_after:?})");
@@ -11682,8 +11741,8 @@ fn created_server_session_persists_its_id_for_restore(cx: &mut TestAppContext) {
     });
 
     view.read_with(vcx, |v, _cx| {
-        for tab in v.workspace.tabs.iter() {
-            if let Some(w) = tab.layout.find_leaf(win)
+        for wsp in v.workspace.workspaces.iter() {
+            if let Some(w) = wsp.layout.find_leaf(win)
                 && let App::Agent(t) = &w.content
             {
                 // The layout snapshot resolves the Bound tile's id from the store
@@ -11767,7 +11826,7 @@ fn save_agent_ring_persists_session_id_to_workspace_json(cx: &mut TestAppContext
             }
         }
         let mut ids = Vec::new();
-        for t in &ws.tabs {
+        for t in &ws.workspaces {
             collect(&t.layout, &mut ids);
         }
         ids
@@ -11987,19 +12046,19 @@ fn click_in_unfocused_tile_body_focuses_and_is_consumed(cx: &mut TestAppContext)
     // exercise culling. Bring it next to A so it actually renders LIVE content —
     // a culled tile builds no transcript and there'd be nothing to click.
     view.update(vcx, |v, cx| {
-        let tab = v.workspace.active_tab_mut().unwrap();
-        tab.desktop
+        let wsp = v.workspace.active_workspace_mut().unwrap();
+        wsp.desktop
             .set_anchor(win_b, crate::workspace::Slot::new(0, 1));
-        tab.desktop.camera.pan = (0.0, 0.0);
-        tab.desktop.last_reveal = Some(win_a);
+        wsp.desktop.camera.pan = (0.0, 0.0);
+        wsp.desktop.last_reveal = Some(win_a);
         cx.notify();
     });
     vcx.run_until_parked();
 
     // Session bound to tile B (the tile we'll click into).
     let id_b = view.update(vcx, |v, _| {
-        let ti = v.workspace.active_tab;
-        match &v.workspace.tabs[ti]
+        let ti = v.workspace.active_workspace;
+        match &v.workspace.workspaces[ti]
             .layout
             .find_leaf_mut(win_b)
             .expect("tile B leaf")
@@ -12028,8 +12087,8 @@ fn click_in_unfocused_tile_body_focuses_and_is_consumed(cx: &mut TestAppContext)
 
     // Focus tile A ⇒ tile B is the UNFOCUSED tile under test.
     view.update(vcx, |v, cx| {
-        let ti = v.workspace.active_tab;
-        v.workspace.tabs[ti].focused = win_a;
+        let ti = v.workspace.active_workspace;
+        v.workspace.workspaces[ti].focused = win_a;
         cx.notify();
     });
     vcx.run_until_parked();
@@ -12099,12 +12158,12 @@ fn title_bar_press_on_unfocused_tile_still_focuses_and_arms_drag(cx: &mut TestAp
 
     // Put B next to A so its card is on-screen and hit-testable.
     view.update(vcx, |v, cx| {
-        let tab = v.workspace.active_tab_mut().unwrap();
-        tab.desktop
+        let wsp = v.workspace.active_workspace_mut().unwrap();
+        wsp.desktop
             .set_anchor(win_b, crate::workspace::Slot::new(0, 1));
-        tab.desktop.camera.pan = (0.0, 0.0);
-        tab.desktop.last_reveal = Some(win_a);
-        tab.focused = win_a;
+        wsp.desktop.camera.pan = (0.0, 0.0);
+        wsp.desktop.last_reveal = Some(win_a);
+        wsp.focused = win_a;
         cx.notify();
     });
     vcx.run_until_parked();
@@ -12131,9 +12190,9 @@ fn title_bar_press_on_unfocused_tile_still_focuses_and_arms_drag(cx: &mut TestAp
             Some(win_b),
             "title-bar press focuses the tile"
         );
-        let ti = v.workspace.active_tab;
+        let ti = v.workspace.active_workspace;
         assert!(
-            v.workspace.tabs[ti].desktop.drag.is_some(),
+            v.workspace.workspaces[ti].desktop.drag.is_some(),
             "title-bar press ALSO arms the drag in the same gesture (carve-out 1)"
         );
     });
@@ -12553,4 +12612,262 @@ fn code_block_selection_is_painted_and_aligned(cx: &mut TestAppContext) {
         clip.contains("fn main() {") && clip.contains("let x = 1;"),
         "a drag across the code block copies its lines; got {clip:?}"
     );
+}
+
+#[cfg(test)]
+impl YaldaGpuiView {
+    /// Test helper (ADR-0028): point the active workspace at a project rooted at
+    /// `cwd`, creating that project if absent, so `active_workspace_cwd()` /
+    /// `agent_base_cwd()` resolve to `cwd`. Mirrors the production "assign the
+    /// workspace's project" — the FK replacement for the old `Workspace::set_cwd`.
+    pub(crate) fn test_set_active_workspace_cwd(&mut self, cwd: std::path::PathBuf) {
+        let pid = self
+            .projects
+            .ensure_at_cwd(cwd.clone(), &crate::persist::project_name_for_cwd(&cwd));
+        if let Some(t) = self.workspace.active_workspace_mut() {
+            t.set_project(pid);
+        }
+    }
+}
+
+/// UXI-Project-2 — a workspace's cwd is DERIVED from its project (a `ProjectId`
+/// foreign key), resolved live at the point of use and never cached. Repointing
+/// the project's cwd moves what the workspace (and a new agent) inherits, with
+/// nothing to keep in sync.
+///
+/// Negative control: comment out `p.cwd = cwd;` in `Projects::set_cwd`
+/// (`project.rs`) → the repoint doesn't take, `agent_base_cwd()` stays at A, and
+/// the second assert fails — proving the value is read live from the project.
+#[gpui::test]
+fn workspace_and_session_cwd_derive_from_project(cx: &mut TestAppContext) {
+    let a = PathBuf::from("/tmp/yalda-proj-a");
+    let b = PathBuf::from("/tmp/yalda-proj-b");
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    // Point the active workspace at a project rooted at A; it inherits A.
+    view.update(vcx, |v, _| v.test_set_active_workspace_cwd(a.clone()));
+    let at_a = view.read_with(vcx, |v, _| v.agent_base_cwd());
+    assert_eq!(at_a, a, "workspace inherits its project's cwd");
+
+    // Repoint THAT project's cwd to B — the workspace's cwd follows LIVE, because
+    // it is derived from the project (no cwd cached on the workspace).
+    view.update(vcx, |v, _| {
+        let pid = v.workspace.active_workspace().expect("active workspace").project();
+        v.projects.set_cwd(pid, b.clone()).expect("repoint");
+    });
+    let at_b = view.read_with(vcx, |v, _| v.agent_base_cwd());
+    assert_eq!(
+        at_b, b,
+        "repointing the project moves the workspace's cwd — derived, not cached"
+    );
+}
+
+
+/// UXI-Project-6 — a session↔tile bind is intra-project only. A free ROSTER
+/// session rooted in project B is NOT offered by an A-tile's selector
+/// (`picker_projection`, the Part-3 project filter), and a direct cross-project
+/// attach (A tile ← B session) is REFUSED by `picker_attach_existing` (the Part-4
+/// hard gate) — no placeholder is bound and a transient note is set. The SAME
+/// session binds successfully once the tile's workspace is project B.
+///
+/// Drives the REAL paths (`picker_projection`, `picker_attach_existing` — the
+/// shared attach choke both the picker and the roster-jump funnel through), not a
+/// hand-built proxy state.
+///
+/// Negative control: comment out the Part-4 guard in `picker_attach_existing`
+/// (`agent_ui.rs`, the `if let (Some(sp), Some(tp)) … sp != tp { … return }`
+/// block) → the cross-project attach binds the A tile to the B session, so the
+/// `tile.session().is_none()` refusal assert fails (observed RED). The Part-3
+/// filter revert (restore the `cwd_match_key` gate in `picker_projection`) makes
+/// the selector-omits assert fail.
+#[gpui::test]
+fn bind_refused_across_projects_allowed_within(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App};
+    use yalda::session_proto::SessionInfo;
+    let (view, vcx) = boot_browser(cx);
+    let pa = PathBuf::from("/tmp/yalda-bind-a");
+    let pb = PathBuf::from("/tmp/yalda-bind-b");
+    let (a_pid, b_pid) = view.update(vcx, |v, _| {
+        let a = v.projects.create("Aproj".into(), pa.clone()).expect("A");
+        let b = v.projects.create("Bproj".into(), pb.clone()).expect("B");
+        (a, b)
+    });
+    // A FREE roster session rooted at B's cwd → it belongs to project B.
+    view.update(vcx, |v, _| {
+        v.agent_roster.upsert(SessionInfo {
+            session_id: "SB".into(),
+            acp_session_id: None,
+            label: "claude-b".into(),
+            cwd: pb.clone(),
+            turns: 0,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        });
+    });
+    // The active workspace is project A, showing an unbound agent tile (selector).
+    view.update(vcx, |v, _| {
+        if let Some(t) = v.workspace.active_workspace_mut() {
+            t.set_project(a_pid);
+        }
+        let mut tile = AgentTile::new();
+        tile.show_picker();
+        v.set_screen(App::Agent(tile));
+    });
+
+    // Part 3: A's selector must NOT list B's cross-project free session.
+    view.read_with(vcx, |v, _| {
+        let (free, _bound) = v.picker_projection(&v.agent_base_cwd());
+        assert!(
+            !free.iter().any(|s| s.sid == "SB"),
+            "A's selector must not offer B's cross-project free session"
+        );
+    });
+
+    // Part 4: a direct cross-project attach (A tile ← B session) is refused —
+    // nothing binds, a transient note is set.
+    view.update(vcx, |v, cx| {
+        v.transient_status = None;
+        v.picker_attach_existing(
+            pb.clone(),
+            "SB".into(),
+            None,
+            "claude-b".into(),
+            true,
+            yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let tile = v.agent_tile().expect("agent tile");
+        assert!(
+            tile.session().is_none(),
+            "cross-project bind refused: the A tile stays unbound"
+        );
+        assert!(
+            v.transient_status.is_some(),
+            "the refusal surfaces a transient note"
+        );
+    });
+
+    // Allowed within: point the active workspace at project B and attach the SAME
+    // session — now intra-project, so it binds.
+    view.update(vcx, |v, cx| {
+        if let Some(t) = v.workspace.active_workspace_mut() {
+            t.set_project(b_pid);
+        }
+        let mut tile = AgentTile::new();
+        tile.show_picker();
+        v.set_screen(App::Agent(tile));
+        v.picker_attach_existing(
+            pb.clone(),
+            "SB".into(),
+            None,
+            "claude-b".into(),
+            true,
+            yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let tile = v.agent_tile().expect("agent tile");
+        let bound = tile.session().expect("same-project bind succeeds");
+        assert_eq!(
+            v.sessions.sid_of(bound).map(|s| s.as_str()),
+            Some("SB"),
+            "the B tile is bound to the B session"
+        );
+    });
+}
+
+/// UXI-Project-7 — the active project is DERIVED from focus, never stored: the
+/// focused workspace's project, else the focused session's, else the first. Point
+/// the active workspace at A → `active_project()` is A; jump a FREE session rooted
+/// in B (its ephemeral workspace lands under B via UXI-Project-6) and focus it →
+/// `active_project()` follows to B.
+///
+/// Drives the REAL paths (`active_project`, `jump_to_session`), not hand-built
+/// state.
+///
+/// Negative control: replace `active_project`'s body with `self.projects.first()`
+/// (`agent_ui.rs`) → after the jump it still reports A (the first project), so the
+/// `Some(b_pid)` assert fails (observed RED).
+#[gpui::test]
+fn active_project_derives_from_focus(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState};
+    let (view, vcx) = boot_browser(cx);
+    let pa = PathBuf::from("/tmp/yalda-active-a");
+    let pb = PathBuf::from("/tmp/yalda-active-b");
+    let (a_pid, b_pid) = view.update(vcx, |v, _| {
+        let a = v.projects.create("Aproj".into(), pa.clone()).expect("A");
+        let b = v.projects.create("Bproj".into(), pb.clone()).expect("B");
+        (a, b)
+    });
+    // A FREE local session rooted in B's cwd (the focused tile is a browser, so
+    // `show_local_session` binds nothing — it stays free/re-bindable).
+    let sid = view.update(vcx, |v, cx| {
+        let s = AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: "sess-b".into(),
+            cwd: pb.clone(),
+            resume_id: None,
+        };
+        v.show_local_session(s, cx)
+    });
+
+    // Focus a project-A workspace → active project A.
+    view.update(vcx, |v, _| {
+        if let Some(t) = v.workspace.active_workspace_mut() {
+            t.set_project(a_pid);
+        }
+    });
+    let at_a = view.read_with(vcx, |v, cx| v.active_project(cx));
+    assert_eq!(at_a, Some(a_pid), "active project = focused workspace's project (A)");
+
+    // Jump the free B-session: its ephemeral workspace opens under project B, so
+    // the derived active project follows focus to B.
+    view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
+    let at_b = view.read_with(vcx, |v, cx| v.active_project(cx));
+    assert_eq!(
+        at_b,
+        Some(b_pid),
+        "focusing the B session moves the derived active project to B"
+    );
+    // Distinct ids so the NC (hardcode `first()`) is non-vacuous.
+    assert_ne!(a_pid, b_pid);
+}
+
+/// Deleting the LAST project must not orphan the surviving workspace (review-caught
+/// bug): `perform_delete_project` closes the project first, then mints a fresh
+/// default when none survive, and seeds the replacement workspace under THAT — so
+/// the store is never empty and no workspace points at a dead project id.
+///
+/// Negative control: restore the old `ids().find(|x| x != pid).unwrap_or(pid)`
+/// survivor (computed before `close(pid)`) → the seeded workspace points at the
+/// deleted id and `projects.contains(w.project())` fails.
+#[gpui::test]
+fn delete_last_project_mints_a_fresh_default(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+    let only = view.read_with(vcx, |v, _| {
+        assert_eq!(v.projects.len(), 1, "boot has exactly one project");
+        v.projects.first().expect("the boot project")
+    });
+    view.update(vcx, |v, cx| v.perform_delete_project(only, cx));
+    view.read_with(vcx, |v, cx| {
+        assert!(v.projects.len() >= 1, "a fresh default project was minted");
+        assert!(!v.workspace.workspaces.is_empty(), "a workspace survives");
+        for w in &v.workspace.workspaces {
+            assert!(
+                v.projects.contains(w.project()),
+                "no surviving workspace points at a deleted project id"
+            );
+        }
+        assert!(
+            v.active_project(cx).is_some_and(|p| v.projects.contains(p)),
+            "the active project resolves to a live project"
+        );
+    });
 }

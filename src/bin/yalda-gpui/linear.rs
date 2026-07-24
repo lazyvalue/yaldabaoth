@@ -308,13 +308,13 @@ pub(crate) enum LinearMode {
 
 /// A Linear viewport. Lives in the workspace layout tree as `App::Linear`.
 /// Holds the cheap, frequently-edited bits (the input line, the request id, a
-/// denormalized title for the tab strip) inline; the EXPENSIVE part — the
+/// denormalized title for the workspace strip) inline; the EXPENSIVE part — the
 /// loaded issue/project body — lives in a cached [`LinearView`] entity
 /// (`linear_view.rs`) so a keystroke in the input doesn't re-render the body.
 ///
 /// `view` is lazily created on first render (`restore_content` has no `cx`).
 /// `req` is a monotonic guard so a slow response can't overwrite a newer query.
-/// `title` mirrors the loaded entity's identifier/name so the tab strip /
+/// `title` mirrors the loaded entity's identifier/name so the workspace strip /
 /// window title can read it without a `cx` (the body's payload needs one).
 pub(crate) struct LinearTile {
     pub(crate) input: String,

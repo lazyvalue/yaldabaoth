@@ -417,19 +417,19 @@ impl YaldaGpuiView {
         if mode == EditMode::Normal {
             match press.key {
                 Key::Tab => {
-                    if self.workspace.tabs.len() > 1 {
-                        let next = (self.workspace.active_tab + 1) % self.workspace.tabs.len();
+                    if self.workspace.workspaces.len() > 1 {
+                        let next = (self.workspace.active_workspace + 1) % self.workspace.workspaces.len();
                         self.switch_to_buffer(next);
                         cx.notify();
                     }
                     return;
                 }
                 Key::BackTab => {
-                    if self.workspace.tabs.len() > 1 {
-                        let prev = if self.workspace.active_tab == 0 {
-                            self.workspace.tabs.len() - 1
+                    if self.workspace.workspaces.len() > 1 {
+                        let prev = if self.workspace.active_workspace == 0 {
+                            self.workspace.workspaces.len() - 1
                         } else {
-                            self.workspace.active_tab - 1
+                            self.workspace.active_workspace - 1
                         };
                         self.switch_to_buffer(prev);
                         cx.notify();

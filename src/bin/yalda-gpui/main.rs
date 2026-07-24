@@ -84,6 +84,7 @@ mod linear;
 mod linear_ui;
 mod linear_view;
 mod persist;
+mod project;
 mod render_blocks;
 mod screens;
 mod tool_body;
@@ -103,6 +104,7 @@ pub(crate) use keymap_view::*;
 pub(crate) use linear::*;
 pub(crate) use linear_view::*;
 pub(crate) use persist::*;
+pub(crate) use project::*;
 pub(crate) use render_blocks::*;
 pub(crate) use tool_body::*;
 pub(crate) use transcript_view::*;
@@ -205,11 +207,11 @@ actions!(
         // Buffer cycling
         NextBuffer,
         PrevBuffer,
-        // Tab cycling (workspace-level — independent of buffer list)
-        NextTab,
-        PrevTab,
-        NewTab,
-        CloseTab,
+        // Workspace cycling (frame-level — independent of buffer list)
+        NextWorkspace,
+        PrevWorkspace,
+        NewWorkspace,
+        CloseWorkspace,
         // Move the focused tile to another workspace (Ctrl-W m). Opens the
         // workspace picker; selecting a target relocates the focused leaf
         // (content travels with it). See spec-workspaces-tagging.md Phase 1.
@@ -219,12 +221,12 @@ actions!(
         // creates a second view onto the same file there, leaving the
         // original in place. Agent/Browser tiles are single-home (rejected).
         AlsoShowTile,
-        // Splits (Ctrl-W chord prefix per spec-tabs-and-splits.md §12)
+        // Splits (Ctrl-W chord prefix per spec-workspaces-and-splits.md §12)
         SplitH,
         SplitV,
         CloseWindow,
         OnlyWindow,
-        // Focus motion within the active tab's split tree
+        // Focus motion within the active workspace's split tree
         FocusLeft,
         FocusRight,
         FocusUp,
@@ -254,8 +256,8 @@ actions!(
         CopyDocSelection,
         // Paste from system clipboard into active editor
         PasteFromClipboard,
-        // Open the rename input overlay for the active tab.
-        RenameTab,
+        // Open the rename input overlay for the active workspace.
+        RenameWorkspace,
         // Agent window: send the current draft. Worksheet sweep (§12) or
         // Chatbox submit (§18) depending on `AgentState::input_mode`.
         SubmitAgent,
@@ -334,13 +336,13 @@ pub(crate) trait WorkspaceNavExt: Sized {
 impl<E: InteractiveElement> WorkspaceNavExt for E {
     fn workspace_nav(self, cx: &mut Context<YaldaGpuiView>) -> Self {
         self
-            // Tab CYCLING must be wired on EVERY screen root (it was only on the doc
+            // Workspace CYCLING must be wired on EVERY screen root (it was only on the doc
             // view — so Ctrl-Tab was dead whenever an agent/edit/browser tile was
             // focused, the reported "ctrl-tab does nothing" bug). Folded into
             // `workspace_nav` so it can never again be present on some screens and not
             // others. (Bindings: reliable `cmd-shift-[`/`]` + legacy ctrl-tab.)
-            .on_action(cx.listener(YaldaGpuiView::next_tab))
-            .on_action(cx.listener(YaldaGpuiView::prev_tab))
+            .on_action(cx.listener(YaldaGpuiView::next_workspace))
+            .on_action(cx.listener(YaldaGpuiView::prev_workspace))
             .on_action(cx.listener(|t, _: &GotoWorkspace1, _w, cx| t.goto_workspace_number(1, cx)))
             .on_action(cx.listener(|t, _: &GotoWorkspace2, _w, cx| t.goto_workspace_number(2, cx)))
             .on_action(cx.listener(|t, _: &GotoWorkspace3, _w, cx| t.goto_workspace_number(3, cx)))
@@ -746,7 +748,7 @@ enum EditView {
 /// close so refcounting can drop clean, unreferenced buffers.
 struct SharedEditor {
     /// Pool key for this file's core. Liveness is tracked via `Rc` strong
-    /// count (see `Workspace::gc_buffers`), so this id isn't needed for
+    /// count (see `Frame::gc_buffers`), so this id isn't needed for
     /// refcounting; it's kept as the stable handle for future explicit pool
     /// ops (save-to-pool, `:buffers`).
     #[allow(dead_code)]
@@ -984,7 +986,7 @@ trait EditOps: EditAccess {
 impl EditOps for Editor {}
 impl EditOps for SharedEditor {}
 
-// Build the trimmed, tab-expanded per-line text for an Edit tile's body,
+// Build the trimmed, wsp-expanded per-line text for an Edit tile's body,
 // reading the pooled core's rope once. Mirrors the prior per-line
 // `document().line_text(i)` loop but takes a single `RefCell` borrow.
 
@@ -1248,13 +1250,13 @@ enum WorkspacePickerMode {
 /// (you can't move a tile to where it already lives).
 struct WorkspacePicker {
     mode: WorkspacePickerMode,
-    /// Index into the entry list: `0..tabs.len()` are existing workspaces,
-    /// `tabs.len()` is the "+ new workspace" entry.
+    /// Index into the entry list: `0..workspaces.len()` are existing workspaces,
+    /// `workspaces.len()` is the "+ new workspace" entry.
     selected: usize,
 }
 
 /// Single-line input overlay used by both Claude-session rename and
-/// tab rename. Pre-filled with the current label; Enter commits, Esc
+/// workspace rename. Pre-filled with the current label; Enter commits, Esc
 /// cancels, empty input cancels.
 struct RenameOverlay {
     text: String,
@@ -1266,34 +1268,42 @@ enum RenameTarget {
     /// Claude session — targeted by its stable `SessionId` so a concurrent
     /// close on another tile can't rename the wrong one.
     AgentSession { id: SessionId },
-    /// Workspace tab — targeted by current tab position. Tab indices
+    /// Workspace — targeted by current workspace position. Workspace indices
     /// don't shift during the rename's lifetime since the overlay
     /// captures key dispatch (no structural mutations possible mid-
     /// rename), so positional addressing is safe here.
-    Tab { index: usize },
-    /// Path-input overlay that, on commit, creates a new agent session
-    /// rooted at the typed path. Empty input cancels (spec-agent-cwd.md
-    /// §2 — bare `:claude-new` already exists and uses the process cwd).
-    AgentNewSessionCwd,
-    /// Path-input overlay that, on commit, creates a new FREE (tile-less)
-    /// agent session rooted at the typed path (UXI-JumpPanel-4). A free
-    /// agent has no workspace cwd to inherit, so the create flow asks. Pre-
-    /// filled with `agent_base_cwd()`; empty cancels; commit →
-    /// `spawn_free_agent_session_at`.
-    FreeAgentSessionCwd,
+    Workspace { index: usize },
     /// Path-input overlay that, on commit, changes the bound session's
     /// cwd (spec-agent-cwd.md §4). Targeted by stable `SessionId`.
     AgentChangeCwd { id: SessionId },
     /// Path-input overlay that, on commit, writes the active workspace's
     /// registry `"cwd"` (untitled.md "Set CWD … implemented as a kv"). Agent
     /// sessions created in this workspace then inherit it. Targeted by current
-    /// tab position (safe: the overlay captures key dispatch, so no structural
-    /// mutation can shift indices mid-edit, same as `Tab`).
+    /// workspace position (safe: the overlay captures key dispatch, so no structural
+    /// mutation can shift indices mid-edit, same as `Workspace`).
     WorkspaceCwd { index: usize },
     /// `{cols}x{rows}` input that sets the global desktop-mode tile size
     /// (spec-desktop-mode.md Behavior 6). Clamped to [20, 400] × [5, 200];
     /// unparseable input cancels with a footer hint.
     DesktopTileSize,
+}
+
+/// Which field the [`NewProjectOverlay`] edits (Tab toggles). A new project
+/// needs BOTH a name and a cwd at birth (UXI-Project-4), so this is a two-field
+/// input rather than the single-field [`RenameOverlay`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NpField {
+    Name,
+    Cwd,
+}
+
+/// "New project" overlay (UXI-Project-4): prompts for a unique name + a cwd,
+/// then `Projects::create`. A duplicate name/cwd is refused with a transient
+/// error (nothing created); an empty name cancels.
+struct NewProjectOverlay {
+    name: String,
+    cwd: String,
+    field: NpField,
 }
 
 /// The single, mutually-exclusive overlay layered over the screen body — at
@@ -1319,6 +1329,11 @@ enum ActiveOverlay {
     WorkspacePicker(WorkspacePicker),
     Rename(RenameOverlay),
     TagInput(TagInputOverlay),
+    /// "New project" name+cwd input (UXI-Project-4).
+    NewProject(NewProjectOverlay),
+    /// "Delete project?" confirmation for a non-empty project (UXI-Project-5);
+    /// carries the target so confirm cascades exactly it.
+    ConfirmProjectDelete(ProjectId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1499,7 +1514,7 @@ struct YaldaGpuiView {
     body_font: SharedString,
     code_font: SharedString,
     /// Multiplier applied to document body / heading font sizes (Cmd+= / Cmd+-
-    /// / Cmd+0). Chrome (status bar, tabs, file browser) stays fixed. 1.0 is
+    /// / Cmd+0). Chrome (status bar, workspaces, file browser) stays fixed. 1.0 is
     /// the unzoomed default; clamped to [MIN_TEXT_SCALE, MAX_TEXT_SCALE] on
     /// every adjustment.
     text_scale: f32,
@@ -1516,7 +1531,7 @@ struct YaldaGpuiView {
     /// when the user rebinds a key.
     keymap_registry: KeymapRegistry,
     /// Desktop-mode tile size in mono cells (spec-desktop-mode.md
-    /// Behavior 6) — one global setting for all tiles in all tabs,
+    /// Behavior 6) — one global setting for all tiles in all workspaces,
     /// persisted in `Preferences`, clamped to [20, 400] × [5, 200].
     desktop_grid_cols: u32,
     desktop_grid_rows: u32,
@@ -1550,9 +1565,15 @@ struct YaldaGpuiView {
     /// cleared on the next overlay dismissal. Display-only. NOT part of
     /// `active_overlay` — a toast can coexist with (and outlive) an overlay.
     transient_status: Option<SharedString>,
-    /// Tabs + n-ary split tree (spec-tabs-and-splits.md). The focused
+    /// Tabs + n-ary split tree (spec-workspaces-and-splits.md). The focused
     /// window's content is the authoritative live state for the workspace.
-    workspace: workspace::Workspace<App>,
+    workspace: workspace::Frame<App>,
+    /// The top-level **Project** registry (ADR-0028, `docs/components/project.md`).
+    /// Owns every project's name + cwd + params; workspaces hold a `ProjectId`
+    /// foreign key into this and resolve their cwd here at the point of use.
+    /// Built before the workspace at boot (loaded from `projects.json`, else
+    /// migrated from existing cwds) so a real `ProjectId` is always available.
+    projects: Projects,
     /// Active mouse-driven text selection in the doc view. Spans block/line/char.
     /// `None` when nothing is selected. Cleared on Esc, on a fresh MouseDown
     /// without modifier, and when entering edit mode.
@@ -1658,6 +1679,10 @@ impl YaldaGpuiView {
         let label: SharedString = file_label.into();
         let initial =
             App::Buffer(BufferApp::Viewing(DocState::viewing(blocks, label.clone(), None)));
+        // ADR-0028: build the Project registry before the workspace so the root
+        // workspace has a real `ProjectId` to belong to.
+        let cwd = process_cwd();
+        let (projects, seed_project) = boot_projects(&cwd, [cwd.clone()]);
         Self {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
@@ -1674,10 +1699,8 @@ impl YaldaGpuiView {
             focus_handle,
             active_overlay: ActiveOverlay::None,
             transient_status: None,
-            workspace: workspace::Workspace::with_initial(
-                initial,
-                workspace::WorkspaceCwd::new(process_cwd()),
-            ),
+            workspace: workspace::Frame::with_initial(initial, seed_project),
+            projects,
             doc_selection: None,
             line_layouts: Rc::new(RefCell::new(HashMap::new())),
             session_server: connect_session_server(),
@@ -1701,8 +1724,9 @@ impl YaldaGpuiView {
     fn new_browser(start_dir: PathBuf, theme: Theme, focus_handle: FocusHandle) -> Self {
         let syntect_hl =
             Rc::new(yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme()));
-        let cwd = workspace::WorkspaceCwd::new(start_dir.clone());
-        let initial = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(start_dir)));
+        let initial = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(start_dir.clone())));
+        // ADR-0028: projects before workspace.
+        let (projects, seed_project) = boot_projects(&start_dir, [start_dir.clone()]);
         Self {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
@@ -1719,7 +1743,8 @@ impl YaldaGpuiView {
             focus_handle,
             active_overlay: ActiveOverlay::None,
             transient_status: None,
-            workspace: workspace::Workspace::with_initial(initial, cwd),
+            workspace: workspace::Frame::with_initial(initial, seed_project),
+            projects,
             doc_selection: None,
             line_layouts: Rc::new(RefCell::new(HashMap::new())),
             session_server: connect_session_server(),
@@ -1746,7 +1771,7 @@ impl YaldaGpuiView {
     }
 
     /// Persist the current workspace snapshot for the active cwd. Called
-    /// after every structural mutation (tab add/remove, split, close,
+    /// after every structural mutation (workspace add/remove, split, close,
     /// focus change, etc.). Best-effort — failures are silent so a
     /// read-only cache_dir or full disk doesn't break the editor.
     pub(crate) fn save_workspace_state(&mut self) {
@@ -1762,7 +1787,7 @@ impl YaldaGpuiView {
         // `&self.workspace` snapshot borrow).
         let sessions = &self.sessions;
         let resolve = |id| sessions.sid_of(id).cloned();
-        save_persisted_workspace(&cwd, &self.workspace, &resolve);
+        save_persisted_workspace(&cwd, &self.workspace, &self.projects, &resolve);
     }
 
     /// Replace `self.workspace` with one rebuilt from the persisted snapshot
@@ -1775,47 +1800,57 @@ impl YaldaGpuiView {
         let Some(snap) = load_persisted_workspace(&cwd) else {
             return false;
         };
-        let mut ws: workspace::Workspace<App> = workspace::Workspace::new();
+        // Rebuild onto the already-migrated project registry; each restored
+        // workspace re-points at the project rooting its persisted cwd
+        // (ADR-0028 §7 self-healing load). `default_project` is the first project
+        // (migration guarantees ≥1 exists).
+        let default_project = self.projects.first().unwrap_or(ProjectId(0));
+        let mut ws: workspace::Frame<App> = workspace::Frame::new(default_project);
         // Each agent leaf carries its persisted session id (identity), so restore
         // rebinds it to ITS OWN session (UXI-AgentTile-18), not by index.
         let mut agent_leaf_ids: Vec<(workspace::WindowId, Option<ServerSid>)> = Vec::new();
-        for ptab in snap.tabs {
-            let (layout, max_id, agents) = restore_layout(&mut ws, &self.theme, ptab.layout);
+        for pws in snap.workspaces {
+            let (layout, max_id, agents) = restore_layout(&mut ws, &self.theme, pws.layout);
             ws.next_window_id = ws.next_window_id.max(max_id + 1);
             agent_leaf_ids.extend(agents);
-            // Working directory: typed field if present, else migrate from the
-            // legacy `kv["cwd"]`, else the process dir (ADR-0023).
-            let cwd = workspace::WorkspaceCwd::new(
-                ptab.cwd
-                    .map(PathBuf::from)
-                    .or_else(|| ptab.legacy_kv.get("cwd").map(PathBuf::from))
-                    .unwrap_or_else(process_cwd),
-            );
-            let mut tab = workspace::Tab::with_layout(
-                ptab.auto_name,
+            // Working directory → project: resolve the persisted cwd (typed field
+            // if present, else the legacy `kv["cwd"]`, else the process dir) to a
+            // project in the registry, creating one if the migration hasn't
+            // (ADR-0028 §7 self-heal — the cwd the record carries is always
+            // enough to recover membership).
+            let workspace_cwd = pws
+                .cwd
+                .map(PathBuf::from)
+                .or_else(|| pws.legacy_kv.get("cwd").map(PathBuf::from))
+                .unwrap_or_else(process_cwd);
+            let project = self
+                .projects
+                .ensure_at_cwd(workspace_cwd.clone(), &project_name_for_cwd(&workspace_cwd));
+            let mut wsp = workspace::Workspace::with_layout(
+                pws.auto_name,
                 layout,
-                ptab.focused_window,
-                cwd,
+                pws.focused_window,
+                project,
             );
-            tab.display_name = ptab.display_name;
-            tab.rail = ptab.rail.map(|r| restore_rail(r, ptab.focused_window));
+            wsp.display_name = pws.display_name;
+            wsp.rail = pws.rail.map(|r| restore_rail(r, pws.focused_window));
             // IGNORE the persisted layout mode (spec-infinite-plane-workspace.md
-            // Behavior 7): every workspace is a Plane now. `ptab.layout_mode`
+            // Behavior 7): every workspace is a Plane now. `pws.layout_mode`
             // deserializes any old mode string to `Plane` already; force it here
             // so the intent is explicit and a retired-mode snapshot can never
             // resurrect a mode. Content (tree leaves) is preserved; geometry
             // reflows once via the first render's seed/reconcile below.
-            tab.layout_mode = workspace::LayoutMode::Plane;
-            tab.master_ratio = ptab.master_ratio;
-            tab.master_count = ptab.master_count;
-            tab.tag_view = ptab.tag_view;
-            tab.desktop = workspace::DesktopState {
+            wsp.layout_mode = workspace::LayoutMode::Plane;
+            wsp.master_ratio = pws.master_ratio;
+            wsp.master_count = pws.master_count;
+            wsp.tag_view = pws.tag_view;
+            wsp.desktop = workspace::DesktopState {
                 // Restored leaves keep their persisted WindowIds, so the
                 // id-keyed slots round-trip with no mapping. Stale ids (or an
                 // absent field) are handled by the first desktop render's
                 // reconcile/seed (spec Behavior 7).
                 slots: {
-                    let mut v: Vec<(workspace::WindowId, workspace::Slot)> = ptab
+                    let mut v: Vec<(workspace::WindowId, workspace::Slot)> = pws
                         .desktop_slots
                         .into_iter()
                         // Slots are signed on the plane (D4). Old snapshots
@@ -1826,14 +1861,14 @@ impl YaldaGpuiView {
                     v.sort_by_key(|&(_, s)| s);
                     v
                 },
-                spans: ptab
+                spans: pws
                     .desktop_spans
                     .into_iter()
                     .map(|(id, rows, cols)| (id, workspace::Span::new(rows, cols)))
                     .collect(),
                 // Restore the plane's saved camera (D4 / Behavior 7); an absent
                 // field (old snapshot) falls back to the origin at Full.
-                camera: ptab
+                camera: pws
                     .camera
                     .map(|c| workspace::Camera {
                         pan: c.pan,
@@ -1845,13 +1880,13 @@ impl YaldaGpuiView {
                 pan_drag: None,
                 last_reveal: None,
             };
-            ws.tabs.push(tab);
-            ws.next_tab_index += 1;
+            ws.workspaces.push(wsp);
+            ws.next_workspace_index += 1;
         }
-        if !ws.tabs.is_empty() {
-            ws.active_tab = snap.active_tab.min(ws.tabs.len() - 1);
+        if !ws.workspaces.is_empty() {
+            ws.active_workspace = snap.active_workspace.min(ws.workspaces.len() - 1);
         }
-        if ws.tabs.is_empty() {
+        if ws.workspaces.is_empty() {
             return false;
         }
         // Restore marks — load from snapshot, then GC stale window ids.
@@ -1870,10 +1905,10 @@ impl YaldaGpuiView {
                 buf.tags = tags.iter().cloned().collect();
             }
         }
-        // No retile-on-restore (infinite-plane, Stage D): every tab is a Plane
+        // No retile-on-restore (infinite-plane, Stage D): every workspace is a Plane
         // (Behavior 1/7). The `Layout<C>` tree restored above is the CONTENT
         // owner verbatim; geometry comes from the restored `desktop` slot map (a
-        // tab with `desktop_slots` round-trips its arrangement) or, for a
+        // workspace with `desktop_slots` round-trips its arrangement) or, for a
         // retired-mode snapshot that has none, from the first desktop render's
         // seed/reconcile — which bulk-seeds every tree leaf onto the plane by
         // origin ring-spiral (chrome.rs `render_desktop` → `reconcile`). Content
@@ -2097,10 +2132,10 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Replace the content at `leaf_id` (any tab) with `tile`.
+    /// Replace the content at `leaf_id` (any workspace) with `tile`.
     fn install_agent_tile(&mut self, leaf_id: workspace::WindowId, tile: AgentTile) {
-        for tab in &mut self.workspace.tabs {
-            if let Some(win) = tab.layout.find_leaf_mut(leaf_id) {
+        for wsp in &mut self.workspace.workspaces {
+            if let Some(win) = wsp.layout.find_leaf_mut(leaf_id) {
                 win.content = App::Agent(tile);
                 return;
             }
@@ -2110,10 +2145,10 @@ impl YaldaGpuiView {
     /// Point the workspace focus at `leaf_id` so the bind-choke methods (which
     /// act on the FOCUSED tile) target the leaf being restored.
     fn focus_window_for_restore(&mut self, leaf_id: workspace::WindowId) {
-        for (i, tab) in self.workspace.tabs.iter_mut().enumerate() {
-            if tab.layout.find_leaf(leaf_id).is_some() {
-                tab.focused = leaf_id;
-                self.workspace.active_tab = i;
+        for (i, wsp) in self.workspace.workspaces.iter_mut().enumerate() {
+            if wsp.layout.find_leaf(leaf_id).is_some() {
+                wsp.focused = leaf_id;
+                self.workspace.active_workspace = i;
                 return;
             }
         }
@@ -2344,8 +2379,8 @@ impl YaldaGpuiView {
         id
     }
 
-    /// Open `path` as a doc. If it's already in a tab, switch to that tab.
-    /// Otherwise push a new tab containing the doc. Returns false on read error.
+    /// Open `path` as a doc. If it's already in a wsp, switch to that workspace.
+    /// Otherwise push a new workspace containing the doc. Returns false on read error.
     /// Build a Doc `App` for `path`, bound to the shared buffer
     /// pool (5c: dedup by canonical path so Edit views of the same file
     /// share the exact same rope + undo and edits show live in this Doc).
@@ -2382,10 +2417,10 @@ impl YaldaGpuiView {
             .display()
             .to_string();
 
-        // Already open? Switch to that tab.
-        if let Some(idx) = self.find_tab_by_doc_label(&canon) {
-            if idx != self.workspace.active_tab {
-                self.workspace.set_active_tab(idx);
+        // Already open? Switch to that workspace.
+        if let Some(idx) = self.find_workspace_by_doc_label(&canon) {
+            if idx != self.workspace.active_workspace {
+                self.workspace.set_active_workspace(idx);
             }
             return true;
         }
@@ -2394,9 +2429,9 @@ impl YaldaGpuiView {
             return false;
         };
 
-        // If the current tab is a transient Browser, replace its content
+        // If the current workspace is a transient Browser, replace its content
         // (matches today's "browser disappears when you pick a file"). For
-        // Doc/Edit/Claude, push a new tab so the existing work isn't lost.
+        // Doc/Edit/Claude, push a new workspace so the existing work isn't lost.
         let replace_in_place = matches!(
             self.workspace.focused_content(),
             Some(App::Buffer(BufferApp::Picking(_)))
@@ -2404,18 +2439,18 @@ impl YaldaGpuiView {
         if replace_in_place {
             self.set_screen(new_content);
         } else {
-            let cwd = self.workspace.inherited_cwd();
-            self.workspace.push_initial_tab(new_content, cwd);
+            let project = self.workspace.inherited_project();
+            self.workspace.push_initial_workspace(new_content, project);
         }
         self.save_workspace_state();
         true
     }
 
-    /// Find a tab whose focused content is a Doc/Edit with the given file
-    /// label. Returns the tab index, or None.
-    fn find_tab_by_doc_label(&self, label: &str) -> Option<usize> {
-        for (i, tab) in self.workspace.tabs.iter().enumerate() {
-            if let workspace::Layout::Leaf(w) = &tab.layout {
+    /// Find a workspace whose focused content is a Doc/Edit with the given file
+    /// label. Returns the workspace index, or None.
+    fn find_workspace_by_doc_label(&self, label: &str) -> Option<usize> {
+        for (i, wsp) in self.workspace.workspaces.iter().enumerate() {
+            if let workspace::Layout::Leaf(w) = &wsp.layout {
                 match &w.content {
                     App::Buffer(BufferApp::Viewing(d)) if d.file_label.as_ref() == label => {
                         return Some(i);
@@ -2430,34 +2465,34 @@ impl YaldaGpuiView {
         None
     }
 
-    /// Switch the workspace to the tab at `idx`. Used by the buffer-list
+    /// Switch the workspace to the workspace at `idx`. Used by the buffer-list
     /// picker. No-op if idx is out of range.
     fn switch_to_buffer(&mut self, idx: usize) {
-        if idx >= self.workspace.tabs.len() || idx == self.workspace.active_tab {
+        if idx >= self.workspace.workspaces.len() || idx == self.workspace.active_workspace {
             return;
         }
-        self.workspace.set_active_tab(idx);
+        self.workspace.set_active_workspace(idx);
     }
 
-    /// Close the tab at `idx`. Returns false if the tab's content has unsaved
-    /// modifications (refusing to close). If it's the last tab, quits.
+    /// Close the workspace at `idx`. Returns false if the workspace's content has unsaved
+    /// modifications (refusing to close). If it's the last wsp, quits.
     fn close_buffer_at(&mut self, idx: usize, cx: &mut Context<Self>) -> bool {
-        if idx >= self.workspace.tabs.len() {
+        if idx >= self.workspace.workspaces.len() {
             return true;
         }
-        // Check if the tab's focused content is modified.
-        let is_modified = match &self.workspace.tabs[idx].layout {
+        // Check if the workspace's focused content is modified.
+        let is_modified = match &self.workspace.workspaces[idx].layout {
             workspace::Layout::Leaf(w) => screen_is_modified(&w.content),
             _ => false,
         };
         if is_modified {
             return false;
         }
-        if self.workspace.tabs.len() <= 1 {
+        if self.workspace.workspaces.len() <= 1 {
             cx.quit();
             return true;
         }
-        self.workspace.close_tab(idx);
+        self.workspace.close_workspace(idx);
         true
     }
 
@@ -2608,8 +2643,8 @@ impl YaldaGpuiView {
         // mode on `BrowserWindow.underlying` so Esc/q restores it (B4). Picking
         // a file discards the underlying and replaces the picker with the picked
         // file in this same tile (see `open_file`'s `replace_in_place` branch).
-        // This keeps the picker tile-scoped instead of tab-scoped so
-        // splits/tabs aren't disrupted by file picking.
+        // This keeps the picker tile-scoped instead of workspace-scoped so
+        // splits/workspaces aren't disrupted by file picking.
         let placeholder = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(dir.clone())));
         let prior = self
             .workspace
@@ -2935,8 +2970,8 @@ impl YaldaGpuiView {
     /// their tile), so collect handles in an immutable walk, then update each.
     fn notify_linear_views(&mut self, reason: MissReason, cx: &mut Context<Self>) {
         let mut views: Vec<Entity<LinearView>> = Vec::new();
-        for tab in self.workspace.tabs.iter() {
-            tab.layout.for_each_leaf(&mut |w| {
+        for wsp in self.workspace.workspaces.iter() {
+            wsp.layout.for_each_leaf(&mut |w| {
                 if let App::Linear(tile) = &w.content
                     && let Some(v) = &tile.view
                 {
@@ -2956,8 +2991,8 @@ impl YaldaGpuiView {
     /// off the root, so a theme/zoom change must bust it directly).
     fn notify_keymap_views(&mut self, reason: MissReason, cx: &mut Context<Self>) {
         let mut views: Vec<Entity<KeymapView>> = Vec::new();
-        for tab in self.workspace.tabs.iter() {
-            tab.layout.for_each_leaf(&mut |w| {
+        for wsp in self.workspace.workspaces.iter() {
+            wsp.layout.for_each_leaf(&mut |w| {
                 if let App::Keymap(tile) = &w.content
                     && let Some(v) = &tile.view
                 {
@@ -3072,8 +3107,8 @@ impl YaldaGpuiView {
         self.syntect_hl = Rc::new(yalda::highlight::Highlighter::with_syntect_theme(
             self.theme.name.syntect_theme(),
         ));
-        for tab in self.workspace.tabs.iter_mut() {
-            re_render_layout_docs(&mut tab.layout, &self.theme);
+        for wsp in self.workspace.workspaces.iter_mut() {
+            re_render_layout_docs(&mut wsp.layout, &self.theme);
         }
         // Agent transcripts cache parsed code/table blocks with their span
         // colors baked in at the old theme (keyed by content, not theme), so
@@ -3382,48 +3417,48 @@ impl YaldaGpuiView {
     }
 
     fn next_buffer(&mut self, _: &NextBuffer, _w: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.tabs.len() > 1 {
-            let next = (self.workspace.active_tab + 1) % self.workspace.tabs.len();
+        if self.workspace.workspaces.len() > 1 {
+            let next = (self.workspace.active_workspace + 1) % self.workspace.workspaces.len();
             self.switch_to_buffer(next);
             cx.notify();
         }
     }
 
     fn prev_buffer(&mut self, _: &PrevBuffer, _w: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.tabs.len() > 1 {
-            let prev = if self.workspace.active_tab == 0 {
-                self.workspace.tabs.len() - 1
+        if self.workspace.workspaces.len() > 1 {
+            let prev = if self.workspace.active_workspace == 0 {
+                self.workspace.workspaces.len() - 1
             } else {
-                self.workspace.active_tab - 1
+                self.workspace.active_workspace - 1
             };
             self.switch_to_buffer(prev);
             cx.notify();
         }
     }
 
-    fn next_tab(&mut self, _: &NextTab, _w: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.tabs.len() > 1 {
-            self.workspace.next_tab();
+    fn next_workspace(&mut self, _: &NextWorkspace, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.workspaces.len() > 1 {
+            self.workspace.next_workspace();
             self.save_workspace_state();
             cx.notify();
         }
     }
 
-    /// Activate the tab at `idx`. Mouse-click entry point from the tab
+    /// Activate the workspace at `idx`. Mouse-click entry point from the workspace
     /// strip — no-ops if the index is out of range or already active.
-    fn select_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
-        if idx >= self.workspace.tabs.len() || idx == self.workspace.active_tab {
+    fn select_workspace(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.workspace.workspaces.len() || idx == self.workspace.active_workspace {
             return;
         }
-        self.workspace.set_active_tab(idx);
+        self.workspace.set_active_workspace(idx);
         self.save_workspace_state();
         cx.notify();
     }
 
     /// Jump to the `n`-th (1-based) workspace as numbered in the jump panel /
-    /// goto-workspace menu — i.e. the `n`-th non-ephemeral tab. `ctrl-<n>`
+    /// goto-workspace menu — i.e. the `n`-th non-ephemeral workspace. `ctrl-<n>`
     /// entry point. No-ops if there is no such workspace (e.g. `ctrl-7` with
-    /// four tabs). Ephemeral virtual workspaces (ADR-0021) are skipped so the
+    /// four workspaces). Ephemeral virtual workspaces (ADR-0021) are skipped so the
     /// numbering matches what the panel shows.
     fn goto_workspace_number(&mut self, n: usize, cx: &mut Context<Self>) {
         if n == 0 {
@@ -3431,54 +3466,55 @@ impl YaldaGpuiView {
         }
         if let Some((idx, _)) = self
             .workspace
-            .tabs
+            .workspaces
             .iter()
             .enumerate()
             .filter(|(_, t)| !t.ephemeral)
             .nth(n - 1)
         {
-            self.select_tab(idx, cx);
+            self.select_workspace(idx, cx);
         }
     }
 
-    fn prev_tab(&mut self, _: &PrevTab, _w: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.tabs.len() > 1 {
-            self.workspace.prev_tab();
+    fn prev_workspace(&mut self, _: &PrevWorkspace, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.workspaces.len() > 1 {
+            self.workspace.prev_workspace();
             self.save_workspace_state();
             cx.notify();
         }
     }
 
-    /// Open a new tab containing a Browser rooted at cwd. Spec Behavior 3:
+    /// Open a new workspace containing a Browser rooted at cwd. Spec Behavior 3:
     /// no-arg `:tabnew` / `Cmd-T` creates a browser tab so the user can pick
     /// what to load.
-    fn new_tab(&mut self, _: &NewTab, _w: &mut Window, cx: &mut Context<Self>) {
+    fn new_workspace(&mut self, _: &NewWorkspace, _w: &mut Window, cx: &mut Context<Self>) {
+        let project = self.workspace.inherited_project();
         let cwd = self.active_workspace_cwd().unwrap_or_else(process_cwd);
-        self.workspace.push_initial_tab(
-            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
-            workspace::WorkspaceCwd::new(cwd),
+        self.workspace.push_initial_workspace(
+            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
+            project,
         );
         self.save_workspace_state();
         cx.notify();
     }
 
-    /// Close the active tab. Spec Behavior 5: ClaudeWindows drop their ACP
-    /// channels (subprocess killed via kill_on_drop). When the last tab is
-    /// closed, quit the app for now (placeholder-tab Behavior 2 is a
+    /// Close the active workspace. Spec Behavior 5: ClaudeWindows drop their ACP
+    /// channels (subprocess killed via kill_on_drop). When the last workspace is
+    /// closed, quit the app for now (placeholder-workspace Behavior 2 is a
     /// follow-up).
-    fn close_tab(&mut self, _: &CloseTab, _w: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace.tabs.len() <= 1 {
+    fn close_workspace(&mut self, _: &CloseWorkspace, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.workspaces.len() <= 1 {
             cx.quit();
             return;
         }
-        let idx = self.workspace.active_tab;
-        self.workspace.close_tab(idx);
+        let idx = self.workspace.active_workspace;
+        self.workspace.close_workspace(idx);
         self.save_workspace_state();
         cx.notify();
     }
 
-    fn rename_tab(&mut self, _: &RenameTab, _w: &mut Window, cx: &mut Context<Self>) {
-        self.open_rename_active_tab_overlay(cx);
+    fn rename_workspace(&mut self, _: &RenameWorkspace, _w: &mut Window, cx: &mut Context<Self>) {
+        self.open_rename_active_workspace_overlay(cx);
     }
 
     /// `Ctrl-W m` — open the workspace picker to MOVE the focused tile.
@@ -3575,7 +3611,7 @@ impl YaldaGpuiView {
     }
 
     /// `Ctrl-W c` — close the focused window. If it was the only window in
-    /// the tab, close the tab instead.
+    /// the wsp, close the workspace instead.
     fn close_window(&mut self, _: &CloseWindow, _w: &mut Window, cx: &mut Context<Self>) {
         match self.workspace.close_focused() {
             Ok(Some(_new_focus)) => {
@@ -3584,15 +3620,15 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             Ok(None) => {
-                // Focused leaf is the only one in its tab. Close the tab
-                // if there are other tabs; otherwise no-op — closing the
+                // Focused leaf is the only one in its workspace. Close the workspace
+                // if there are other workspaces; otherwise no-op — closing the
                 // absolute last tile would leave the app with nothing to
                 // render. Cmd-Q is the only quit path now.
-                if self.workspace.tabs.len() <= 1 {
+                if self.workspace.workspaces.len() <= 1 {
                     return;
                 }
-                let idx = self.workspace.active_tab;
-                self.workspace.close_tab(idx);
+                let idx = self.workspace.active_workspace;
+                self.workspace.close_workspace(idx);
                 self.save_workspace_state();
                 cx.notify();
             }
@@ -3651,10 +3687,10 @@ impl YaldaGpuiView {
     /// (spec-infinite-plane-workspace.md Behavior 3): the focused tile's slot,
     /// or the viewport-center slot when nothing is focused / the focused tile has
     /// no slot. Mirrors the pixel-context setup `desktop_scroll` builds for
-    /// `desktop_zoom_anchor`, but sourced from the active tab + captured canvas
+    /// `desktop_zoom_anchor`, but sourced from the active workspace + captured canvas
     /// bounds (there's no pointer event here).
     fn plane_keyboard_zoom_anchor(&self) -> workspace::Slot {
-        let tab_idx = self.workspace.active_tab;
+        let workspace_idx = self.workspace.active_workspace;
         let full_tile = self.desktop_tile_px();
         let (_, _, mut cw, mut ch) = self.desktop_canvas_bounds.get();
         if cw <= 0.0 {
@@ -3663,14 +3699,14 @@ impl YaldaGpuiView {
         if ch <= 0.0 {
             ch = self.viewport_height_px.max(1.0);
         }
-        let cam = self.workspace.tabs[tab_idx].desktop.camera;
+        let cam = self.workspace.workspaces[workspace_idx].desktop.camera;
         let scale = workspace::detail_scale(cam.zoom);
         let tile = (full_tile.0 * scale, full_tile.1 * scale);
         let g = 12.0 * scale; // DESKTOP_GUTTER (chrome.rs); pitch-independent.
         let pitch = (tile.0 + g, tile.1 + g);
         let pan = (cam.pan.0 * pitch.0, cam.pan.1 * pitch.1);
-        let focused_id = self.workspace.tabs[tab_idx].focused;
-        self.desktop_zoom_anchor(tab_idx, focused_id, tile, g, pan, cw, ch)
+        let focused_id = self.workspace.workspaces[workspace_idx].focused;
+        self.desktop_zoom_anchor(workspace_idx, focused_id, tile, g, pan, cw, ch)
     }
 
     /// `Ctrl-W -` — step the active plane's semantic zoom one level OUT
@@ -3684,8 +3720,8 @@ impl YaldaGpuiView {
         cx: &mut Context<Self>,
     ) {
         let anchor = self.plane_keyboard_zoom_anchor();
-        let tab_idx = self.workspace.active_tab;
-        self.workspace.tabs[tab_idx].desktop.zoom_out(anchor);
+        let workspace_idx = self.workspace.active_workspace;
+        self.workspace.workspaces[workspace_idx].desktop.zoom_out(anchor);
         self.save_workspace_state();
         cx.notify();
     }
@@ -3694,8 +3730,8 @@ impl YaldaGpuiView {
     /// (`Minimap → Card → Full`, clamped). Reclaimed from the retired `Equalize`.
     fn zoom_in_workspace(&mut self, _: &ZoomInWorkspace, _w: &mut Window, cx: &mut Context<Self>) {
         let anchor = self.plane_keyboard_zoom_anchor();
-        let tab_idx = self.workspace.active_tab;
-        self.workspace.tabs[tab_idx].desktop.zoom_in(anchor);
+        let workspace_idx = self.workspace.active_workspace;
+        self.workspace.workspaces[workspace_idx].desktop.zoom_in(anchor);
         self.save_workspace_state();
         cx.notify();
     }
@@ -3709,8 +3745,8 @@ impl YaldaGpuiView {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tab_idx = self.workspace.active_tab;
-        self.workspace.tabs[tab_idx].desktop.reset_view();
+        let workspace_idx = self.workspace.active_workspace;
+        self.workspace.workspaces[workspace_idx].desktop.reset_view();
         self.save_workspace_state();
         cx.notify();
     }
@@ -3810,9 +3846,9 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Jump focus to a specific window (cross-tab). Updates `prev_jump`.
+    /// Jump focus to a specific window (cross-workspace). Updates `prev_jump`.
     fn jump_to_window(&mut self, target_id: workspace::WindowId) {
-        let Some(tab_idx) = self.workspace.tab_containing(target_id) else {
+        let Some(workspace_idx) = self.workspace.workspace_containing(target_id) else {
             // Stale mark — GC
             let live = self.workspace.all_window_ids();
             self.workspace.marks.gc(&live);
@@ -3821,20 +3857,20 @@ impl YaldaGpuiView {
         };
 
         let current_wid = self.workspace.focused_window_id();
-        let cross_tab = tab_idx != self.workspace.active_tab;
+        let cross_workspace = workspace_idx != self.workspace.active_workspace;
 
-        if cross_tab {
+        if cross_workspace {
             if let Some(wid) = current_wid {
                 self.workspace.marks.prev_jump = Some(wid);
             }
             // Route through the switch chokepoint so a departing virtual
             // workspace is torn down (ADR-0021); the index math inside accounts
-            // for the removal so `active_tab` still lands on `target_id`'s tab.
-            self.workspace.set_active_tab(tab_idx);
+            // for the removal so `active_workspace` still lands on `target_id`'s workspace.
+            self.workspace.set_active_workspace(workspace_idx);
         }
 
-        if let Some(tab) = self.workspace.active_tab_mut() {
-            tab.focused = target_id;
+        if let Some(wsp) = self.workspace.active_workspace_mut() {
+            wsp.focused = target_id;
         }
     }
 
@@ -3851,8 +3887,8 @@ impl YaldaGpuiView {
     }
 
     fn clear_tag_view(&mut self, _: &ClearTagView, _w: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.workspace.active_tab_mut() {
-            tab.tag_view.clear();
+        if let Some(wsp) = self.workspace.active_workspace_mut() {
+            wsp.tag_view.clear();
         }
         self.transient_status = Some("tag filter cleared".into());
         self.save_workspace_state();
@@ -3878,20 +3914,20 @@ impl YaldaGpuiView {
         match chord_type {
             't' => {
                 // View tag (replace)
-                if let Some(tab) = self.workspace.active_tab_mut() {
-                    tab.tag_view.clear();
-                    tab.tag_view.insert(tag_name.clone());
+                if let Some(wsp) = self.workspace.active_workspace_mut() {
+                    wsp.tag_view.clear();
+                    wsp.tag_view.insert(tag_name.clone());
                 }
                 self.adjust_focus_for_tag_view();
                 self.transient_status = Some(format!("viewing tag: {tag_name}").into());
             }
             'T' => {
                 // Toggle tag in view
-                if let Some(tab) = self.workspace.active_tab_mut() {
-                    if tab.tag_view.contains(&tag_name) {
-                        tab.tag_view.remove(&tag_name);
+                if let Some(wsp) = self.workspace.active_workspace_mut() {
+                    if wsp.tag_view.contains(&tag_name) {
+                        wsp.tag_view.remove(&tag_name);
                     } else {
-                        tab.tag_view.insert(tag_name.clone());
+                        wsp.tag_view.insert(tag_name.clone());
                     }
                 }
                 self.adjust_focus_for_tag_view();
@@ -3947,7 +3983,7 @@ impl YaldaGpuiView {
         tags
     }
 
-    /// Check if a window should be visible given the active tab's tag_view.
+    /// Check if a window should be visible given the active workspace's tag_view.
     fn window_visible_for_tag_view(
         content: &App,
         tag_view: &workspace::TagSet,
@@ -3971,7 +4007,7 @@ impl YaldaGpuiView {
     /// If the focused window is hidden by the tag filter, move focus to the
     /// first visible window.
     fn adjust_focus_for_tag_view(&mut self) {
-        let tag_view = match self.workspace.active_tab() {
+        let tag_view = match self.workspace.active_workspace() {
             Some(t) => t.tag_view.clone(),
             None => return,
         };
@@ -3987,7 +4023,7 @@ impl YaldaGpuiView {
 
         let focused_visible = self
             .workspace
-            .active_tab()
+            .active_workspace()
             .and_then(|t| t.layout.find_leaf(focused))
             .map(|w| {
                 Self::window_visible_for_tag_view(
@@ -4005,14 +4041,14 @@ impl YaldaGpuiView {
         // Find first visible window.
         let ids = self
             .workspace
-            .active_tab()
+            .active_workspace()
             .map(|t| t.layout.leaf_ids())
             .unwrap_or_default();
 
         for id in ids {
             let visible = self
                 .workspace
-                .active_tab()
+                .active_workspace()
                 .and_then(|t| t.layout.find_leaf(id))
                 .map(|w| {
                     Self::window_visible_for_tag_view(
@@ -4023,8 +4059,8 @@ impl YaldaGpuiView {
                 })
                 .unwrap_or(false);
             if visible {
-                if let Some(tab) = self.workspace.active_tab_mut() {
-                    tab.focused = id;
+                if let Some(wsp) = self.workspace.active_workspace_mut() {
+                    wsp.focused = id;
                 }
                 return;
             }
@@ -4072,6 +4108,33 @@ impl YaldaGpuiView {
     }
     fn overlay_is_tag_input(&self) -> bool {
         matches!(self.active_overlay, ActiveOverlay::TagInput(_))
+    }
+    fn overlay_is_new_project(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::NewProject(_))
+    }
+    fn overlay_is_confirm_delete(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::ConfirmProjectDelete(_))
+    }
+    fn new_project_ref(&self) -> Option<&NewProjectOverlay> {
+        if let ActiveOverlay::NewProject(o) = &self.active_overlay {
+            Some(o)
+        } else {
+            None
+        }
+    }
+    fn new_project_mut(&mut self) -> Option<&mut NewProjectOverlay> {
+        if let ActiveOverlay::NewProject(o) = &mut self.active_overlay {
+            Some(o)
+        } else {
+            None
+        }
+    }
+    fn confirm_delete_ref(&self) -> Option<ProjectId> {
+        if let ActiveOverlay::ConfirmProjectDelete(id) = &self.active_overlay {
+            Some(*id)
+        } else {
+            None
+        }
     }
 
     fn menu_ref(&self) -> Option<&MenuOverlay> {
@@ -4283,29 +4346,28 @@ impl YaldaGpuiView {
         // holds ≥1 tile (so it's "inhabited"); a named-but-empty one would show
         // too. The active workspace is marked. Ephemeral virtual workspaces
         // (ADR-0021) are excluded — they're transient and always last, so the
-        // surviving `i` values stay contiguous and match the real tab indices.
-        for (i, tab) in self
+        // surviving `i` values stay contiguous and match the real workspace indices.
+        for (i, wsp) in self
             .workspace
-            .tabs
+            .workspaces
             .iter()
             .enumerate()
             .filter(|(_, t)| !t.ephemeral)
             .take(10)
         {
             let digit = if i == 9 { '0' } else { (b'1' + i as u8) as char };
-            let marker = if i == self.workspace.active_tab { "● " } else { "  " };
+            let marker = if i == self.workspace.active_workspace { "● " } else { "  " };
             items.push(MenuNode::entry(
                 &digit.to_string(),
-                &format!("{marker}{}: {}", i + 1, tab.display_label()),
+                &format!("{marker}{}: {}", i + 1, wsp.display_label()),
                 &format!("goto-workspace-{i}"),
             ));
         }
         items.push(MenuNode::separator());
-        items.push(MenuNode::entry("n", "name workspace", "rename-tab"));
-        items.push(MenuNode::entry("c", "new workspace", "new-tab"));
-        // Spawn a free agent session (bound to no tile/workspace) — it lands in
-        // the roster and shows up in the jump panel for later binding.
-        items.push(MenuNode::entry("a", "new agent session", "new-free-agent-session"));
+        items.push(MenuNode::entry("n", "name workspace", "rename-workspace"));
+        items.push(MenuNode::entry("c", "new workspace", "new-workspace"));
+        // (Agent sessions are now created only inside a project — the jump panel's
+        // per-project ＋ row, not a global cwd overlay; UXI-Project-7.)
         let jp_label = if self.jump_panel_visible {
             "hide jump panel"
         } else {
@@ -4536,7 +4598,6 @@ impl YaldaGpuiView {
             "claude-mode-cycle" => self.cycle_claude_permission_mode(cx),
             "claude-clear" => self.clear_agent_session(cx),
             "claude-rename" => self.open_rename_overlay(cx),
-            "claude-new-here" => self.open_new_agent_session_cwd_overlay(cx),
             "claude-cd" => self.open_change_agent_cwd_overlay(cx),
             "dev-restart-gui" => self.dev_rebuild_restart_gui(cx),
             "dev-restart-all" => self.dev_rebuild_restart_all(cx),
@@ -4564,7 +4625,7 @@ impl YaldaGpuiView {
             "keymap-reset-all" => self.keymap_menu_reset_all(cx),
             "back-to-doc" => self.back_to_doc(cx),
             "reload-file" => self.reload_focused_from_disk(cx),
-            "rename-tab" => self.open_rename_active_tab_overlay(cx),
+            "rename-workspace" => self.open_rename_active_workspace_overlay(cx),
             "toggle-jump-panel" => self.toggle_jump_panel_impl(cx),
             "workspace-set-cwd" => self.open_set_workspace_cwd_overlay(cx),
             "theme-dracula" => self.set_theme(ThemeName::Dracula, cx),
@@ -4596,11 +4657,11 @@ impl YaldaGpuiView {
                     }
                     Ok(None) => {
                         // Same no-quit-on-last rule as the keyboard action.
-                        if self.workspace.tabs.len() <= 1 {
+                        if self.workspace.workspaces.len() <= 1 {
                             return;
                         }
-                        let idx = self.workspace.active_tab;
-                        self.workspace.close_tab(idx);
+                        let idx = self.workspace.active_workspace;
+                        self.workspace.close_workspace(idx);
                         self.save_workspace_state();
                         cx.notify();
                     }
@@ -4642,35 +4703,38 @@ impl YaldaGpuiView {
                 self.save_workspace_state();
                 cx.notify();
             }
-            "new-tab" => {
-                let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                self.workspace.push_initial_tab(
-                    App::Buffer(BufferApp::Picking(BrowserWindow::standalone(dir.clone()))),
-                    workspace::WorkspaceCwd::new(dir),
+            "new-workspace" => {
+                let project = self.workspace.inherited_project();
+                let dir = self
+                    .active_workspace_cwd()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                self.workspace.push_initial_workspace(
+                    App::Buffer(BufferApp::Picking(BrowserWindow::standalone(dir))),
+                    project,
                 );
                 self.save_workspace_state();
                 cx.notify();
             }
-            "close-tab" => {
-                if self.workspace.tabs.len() <= 1 {
+            "close-workspace" => {
+                if self.workspace.workspaces.len() <= 1 {
                     cx.quit();
                     return;
                 }
-                let idx = self.workspace.active_tab;
-                self.workspace.close_tab(idx);
+                let idx = self.workspace.active_workspace;
+                self.workspace.close_workspace(idx);
                 self.save_workspace_state();
                 cx.notify();
             }
-            "next-tab" => {
-                if self.workspace.tabs.len() > 1 {
-                    self.workspace.next_tab();
+            "next-workspace" => {
+                if self.workspace.workspaces.len() > 1 {
+                    self.workspace.next_workspace();
                     self.save_workspace_state();
                     cx.notify();
                 }
             }
-            "prev-tab" => {
-                if self.workspace.tabs.len() > 1 {
-                    self.workspace.prev_tab();
+            "prev-workspace" => {
+                if self.workspace.workspaces.len() > 1 {
+                    self.workspace.prev_workspace();
                     self.save_workspace_state();
                     cx.notify();
                 }
@@ -4681,21 +4745,21 @@ impl YaldaGpuiView {
             // same camera ops as the `Ctrl-W -/=/0` bindings.
             "plane-zoom-in" => {
                 let anchor = self.plane_keyboard_zoom_anchor();
-                let tab_idx = self.workspace.active_tab;
-                self.workspace.tabs[tab_idx].desktop.zoom_in(anchor);
+                let workspace_idx = self.workspace.active_workspace;
+                self.workspace.workspaces[workspace_idx].desktop.zoom_in(anchor);
                 self.save_workspace_state();
                 cx.notify();
             }
             "plane-zoom-out" => {
                 let anchor = self.plane_keyboard_zoom_anchor();
-                let tab_idx = self.workspace.active_tab;
-                self.workspace.tabs[tab_idx].desktop.zoom_out(anchor);
+                let workspace_idx = self.workspace.active_workspace;
+                self.workspace.workspaces[workspace_idx].desktop.zoom_out(anchor);
                 self.save_workspace_state();
                 cx.notify();
             }
             "plane-reset-view" => {
-                let tab_idx = self.workspace.active_tab;
-                self.workspace.tabs[tab_idx].desktop.reset_view();
+                let workspace_idx = self.workspace.active_workspace;
+                self.workspace.workspaces[workspace_idx].desktop.reset_view();
                 self.save_workspace_state();
                 cx.notify();
             }
@@ -4763,13 +4827,6 @@ impl YaldaGpuiView {
                     self.save_workspace_state();
                     cx.notify();
                 }
-            }
-            "new-free-agent-session" => {
-                // Global (`?`) menu: create an agent session bound to NO tile and
-                // NO workspace. It first asks for the cwd (UXI-JumpPanel-4) — a
-                // free agent has none to inherit — then spawns; the session lands
-                // in the universal roster as an unbound, bindable row.
-                self.open_free_agent_session_cwd_overlay(cx);
             }
             "new-linear-tile" => {
                 // Split a new tile (focus lands on it), then swap it for a
@@ -4870,8 +4927,8 @@ impl YaldaGpuiView {
                 match sel {
                     Some((path, false)) => {
                         if let Some(content) = self.make_doc_content(&path) {
-                            let cwd = self.workspace.inherited_cwd();
-                            self.workspace.push_initial_tab(content, cwd);
+                            let project = self.workspace.inherited_project();
+                            self.workspace.push_initial_workspace(content, project);
                             self.save_workspace_state();
                             cx.notify();
                         }
@@ -4930,7 +4987,7 @@ impl YaldaGpuiView {
             // Global menu: jump to workspace N (the index is encoded in the name).
             name if name.starts_with("goto-workspace-") => {
                 if let Ok(idx) = name["goto-workspace-".len()..].parse::<usize>() {
-                    self.select_tab(idx, cx);
+                    self.select_workspace(idx, cx);
                 }
             }
             _ => {
@@ -4944,11 +5001,11 @@ impl YaldaGpuiView {
     // ---- Buffer switcher ---------------------------------------------------
 
     fn open_buffer_switcher(&mut self, cx: &mut Context<Self>) {
-        if self.overlay_is_buffer() || self.workspace.tabs.is_empty() {
+        if self.overlay_is_buffer() || self.workspace.workspaces.is_empty() {
             return;
         }
         self.open_overlay(ActiveOverlay::BufferSwitcher(BufferSwitcher {
-            selected: self.workspace.active_tab,
+            selected: self.workspace.active_workspace,
             filter_mode: false,
             filter_text: String::new(),
         }));
@@ -4963,7 +5020,7 @@ impl YaldaGpuiView {
 
     /// Count how many distinct **workspaces** show a view of `label` (the
     /// file path backing a Doc/Edit tile). File path is the canonical buffer-
-    /// pool key (`Workspace::canonical_key`), so counting by path is the exact
+    /// pool key (`Frame::canonical_key`), so counting by path is the exact
     /// equivalent of counting by `FileBufferId` for pooled Edit tiles — and it
     /// additionally captures Doc tiles, which render disk snapshots and aren't
     /// pooled. Hence path, not id, is the right unifying membership key
@@ -4974,11 +5031,11 @@ impl YaldaGpuiView {
     /// not "appears N times here".
     fn workspaces_showing_file(&self, label: &str) -> usize {
         self.workspace
-            .tabs
+            .workspaces
             .iter()
-            .filter(|tab| {
+            .filter(|wsp| {
                 let mut found = false;
-                tab.layout.for_each_leaf(&mut |w| {
+                wsp.layout.for_each_leaf(&mut |w| {
                     if let Some(l) = screen_file_label(&w.content)
                         && l.as_ref() == label
                     {
@@ -5033,10 +5090,10 @@ impl YaldaGpuiView {
         // Pre-select the first workspace that isn't the active one (you can't
         // move/also-show into the workspace the tile already lives in); fall
         // back to the "+ new workspace" entry when there's only one.
-        let active = self.workspace.active_tab;
-        let selected = (0..self.workspace.tabs.len())
+        let active = self.workspace.active_workspace;
+        let selected = (0..self.workspace.workspaces.len())
             .find(|&i| i != active)
-            .unwrap_or(self.workspace.tabs.len());
+            .unwrap_or(self.workspace.workspaces.len());
         self.open_overlay(ActiveOverlay::WorkspacePicker(WorkspacePicker {
             mode,
             selected,
@@ -5051,7 +5108,7 @@ impl YaldaGpuiView {
     /// Number of selectable entries in the picker: every workspace plus the
     /// trailing "+ new workspace" entry.
     fn workspace_picker_entry_count(&self) -> usize {
-        self.workspace.tabs.len() + 1
+        self.workspace.workspaces.len() + 1
     }
 
     fn handle_workspace_picker_key(
@@ -5109,22 +5166,22 @@ impl YaldaGpuiView {
     }
 
     /// Apply the picker selection. `entry` is the chosen index into the entry
-    /// list (`tabs.len()` means "+ new workspace").
+    /// list (`workspaces.len()` means "+ new workspace").
     fn commit_workspace_picker(&mut self, entry: usize, cx: &mut Context<Self>) {
         let mode = match self.workspace_picker_ref() {
             Some(p) => p.mode,
             None => return,
         };
-        let n_tabs = self.workspace.tabs.len();
-        let active = self.workspace.active_tab;
+        let n_workspaces = self.workspace.workspaces.len();
+        let active = self.workspace.active_workspace;
 
-        // Resolve the target tab index, creating a new workspace if "+ new"
+        // Resolve the target workspace index, creating a new workspace if "+ new"
         // was chosen. A new workspace starts Empty; the relocated/also-shown
         // leaf becomes its first tile.
-        let make_new = entry >= n_tabs;
+        let make_new = entry >= n_workspaces;
         let target = if make_new {
             self.push_empty_workspace();
-            self.workspace.tabs.len() - 1
+            self.workspace.workspaces.len() - 1
         } else {
             entry
         };
@@ -5149,19 +5206,19 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Append a new empty workspace (today's `Tab`) with an auto-name and an
+    /// Append a new empty workspace with an auto-name and an
     /// `Empty` layout. Does NOT change the active workspace — the caller picks
     /// what to do next (relocate a leaf into it, etc.).
     fn push_empty_workspace(&mut self) {
-        let name = workspace::auto_tab_name(self.workspace.next_tab_index);
-        self.workspace.next_tab_index += 1;
-        // A new workspace inherits the current one's cwd (ADR-0023).
-        let cwd = self.workspace.inherited_cwd();
-        self.workspace.tabs.push(workspace::Tab::with_layout(
+        let name = workspace::auto_workspace_name(self.workspace.next_workspace_index);
+        self.workspace.next_workspace_index += 1;
+        // A new workspace inherits the current one's project (ADR-0028 §3).
+        let project = self.workspace.inherited_project();
+        self.workspace.workspaces.push(workspace::Workspace::with_layout(
             name,
             workspace::Layout::Empty,
             0,
-            cwd,
+            project,
         ));
     }
 
@@ -5175,27 +5232,27 @@ impl YaldaGpuiView {
             Err(()) => return,
         };
         // `detach_focused` may shift nothing, but if it removed the active
-        // tab's only tile the target index could still be valid (target was
-        // resolved before detach and detach never removes tabs). Insert first,
+        // workspace's only tile the target index could still be valid (target was
+        // resolved before detach and detach never removes workspaces). Insert first,
         // then prune the empty source so indices stay stable during insert.
-        let _ = self.workspace.insert_leaf_into_tab(target, window);
+        let _ = self.workspace.insert_leaf_into_workspace(target, window);
 
-        let source = self.workspace.active_tab;
+        let source = self.workspace.active_workspace;
         if source_empty {
-            if self.workspace.tabs.len() > 1 {
+            if self.workspace.workspaces.len() > 1 {
                 // Removing the source shifts indices; recompute the target's
                 // position so we can land focus there.
                 let target_after = if target > source { target - 1 } else { target };
-                self.workspace.close_tab(source);
-                self.workspace.active_tab = target_after.min(self.workspace.tabs.len() - 1);
+                self.workspace.close_workspace(source);
+                self.workspace.active_workspace = target_after.min(self.workspace.workspaces.len() - 1);
             } else {
                 // Only workspace: leave it empty and stay on it (matches the
-                // existing single-tab close behavior — we don't quit here).
-                self.workspace.active_tab = target.min(self.workspace.tabs.len() - 1);
+                // existing single-workspace close behavior — we don't quit here).
+                self.workspace.active_workspace = target.min(self.workspace.workspaces.len() - 1);
             }
         } else {
             // Source still has tiles; follow the moved tile to the target.
-            self.workspace.active_tab = target.min(self.workspace.tabs.len() - 1);
+            self.workspace.active_workspace = target.min(self.workspace.workspaces.len() - 1);
         }
     }
 
@@ -5214,8 +5271,8 @@ impl YaldaGpuiView {
         let content = self.clone_focused_for_split(&cwd);
         let id = self.workspace.alloc_window_id();
         let window = workspace::Window { id, content };
-        let _ = self.workspace.insert_leaf_into_tab(target, window);
-        self.workspace.active_tab = target.min(self.workspace.tabs.len() - 1);
+        let _ = self.workspace.insert_leaf_into_workspace(target, window);
+        self.workspace.active_workspace = target.min(self.workspace.workspaces.len() - 1);
     }
 
     // ---- Session switcher overlay -----------------------------------------
@@ -5279,14 +5336,14 @@ impl YaldaGpuiView {
             .text_size(px(14.0))
             .font_family(self.code_font.clone());
 
-        let active = self.workspace.active_tab;
-        let n_tabs = self.workspace.tabs.len();
-        for (i, tab) in self.workspace.tabs.iter().enumerate() {
+        let active = self.workspace.active_workspace;
+        let n_workspaces = self.workspace.workspaces.len();
+        for (i, wsp) in self.workspace.workspaces.iter().enumerate() {
             let is_selected = i == picker.selected;
             let is_active = i == active;
             let marker = if is_selected { "\u{25b8} " } else { "  " };
             let here = if is_active { " (here)" } else { "" };
-            let label_text = format!("{}{}", tab_strip_label(tab), here);
+            let label_text = format!("{}{}", workspace_strip_label(wsp), here);
             let name_color = if is_active { label_fg } else { normal_fg };
 
             let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
@@ -5312,7 +5369,7 @@ impl YaldaGpuiView {
 
         // "+ new workspace" entry.
         {
-            let is_selected = picker.selected == n_tabs;
+            let is_selected = picker.selected == n_workspaces;
             let marker = if is_selected { "\u{25b8} " } else { "  " };
             let mut row = div().flex().flex_row().items_center().px_2().py_0p5();
             if is_selected {
@@ -5410,39 +5467,274 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Open a path-input overlay; on commit, spawn a new agent session
-    /// rooted at the typed path (spec-agent-cwd.md §2). Empty input
-    /// cancels — the bare `claude-new` already exists for the
-    /// "process cwd" case.
-    fn open_new_agent_session_cwd_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.overlay_is_rename() {
+    // ---- Project lifecycle (UXI-Project-4 / -5) ----------------------------
+
+    /// Open the "New project" overlay (UXI-Project-4): a name + cwd input. The
+    /// cwd pre-fills with the active project's cwd so the common "a project near
+    /// this one" case is one keystroke. No-op if any overlay is already open.
+    pub(crate) fn open_new_project_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.has_overlay() {
             return;
         }
-        // Don't gate by "claude is focused" — this command can transition
-        // the user into the agent screen at the chosen cwd in one step.
-        self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
-            text: String::new(),
-            target: RenameTarget::AgentNewSessionCwd,
+        let cwd = self.agent_base_cwd().display().to_string();
+        self.open_overlay(ActiveOverlay::NewProject(NewProjectOverlay {
+            name: String::new(),
+            cwd,
+            field: NpField::Name,
         }));
         cx.notify();
     }
 
-    /// Open a path-input overlay pre-filled with the default cwd
-    /// (`agent_base_cwd()`); on commit, spawn a FREE (tile-less) agent session
-    /// rooted at the typed path (UXI-JumpPanel-4). This is the create flow for the
-    /// jump-panel ＋ row and the `?`-menu "new agent session" — a free agent has no
-    /// workspace cwd to inherit, so it asks. Pre-filling the default means Enter
-    /// keeps the old zero-friction "create at the sensible default" behavior.
-    pub(crate) fn open_free_agent_session_cwd_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.overlay_is_rename() {
+    /// Commit the "New project" overlay (UXI-Project-4): create an EMPTY project
+    /// and persist it. An empty name cancels; a bad cwd, a duplicate name, or a
+    /// duplicate cwd each surface a transient error and create NOTHING.
+    fn commit_new_project_overlay(&mut self, cx: &mut Context<Self>) {
+        let (name, cwd) = match self.new_project_ref() {
+            Some(o) => (o.name.trim().to_string(), o.cwd.trim().to_string()),
+            None => return,
+        };
+        if name.is_empty() {
+            self.clear_overlay();
+            cx.notify();
             return;
         }
-        let text = self.agent_base_cwd().display().to_string();
-        self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
-            text,
-            target: RenameTarget::FreeAgentSessionCwd,
-        }));
+        match resolve_agent_cwd_arg(&cwd) {
+            Ok(resolved) => match self.projects.create(name.clone(), resolved) {
+                Ok(_) => {
+                    save_persisted_projects(&self.projects);
+                    self.clear_overlay();
+                    self.transient_status = Some(format!("project {name} created").into());
+                }
+                Err(CreateError::DuplicateName) => {
+                    self.clear_overlay();
+                    self.transient_status =
+                        Some(format!("a project named {name} already exists").into());
+                }
+                Err(CreateError::DuplicateCwd(_)) => {
+                    self.clear_overlay();
+                    self.transient_status =
+                        Some("another project already roots that directory".into());
+                }
+            },
+            Err(msg) => {
+                self.clear_overlay();
+                self.transient_status = Some(msg.into());
+            }
+        }
         cx.notify();
+    }
+
+    fn handle_new_project_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        match press.key {
+            Key::Esc => {
+                self.clear_overlay();
+                cx.notify();
+            }
+            Key::Enter => self.commit_new_project_overlay(cx),
+            Key::Tab | Key::BackTab | Key::Down | Key::Up => {
+                if let Some(o) = self.new_project_mut() {
+                    o.field = match o.field {
+                        NpField::Name => NpField::Cwd,
+                        NpField::Cwd => NpField::Name,
+                    };
+                }
+                cx.notify();
+            }
+            Key::Backspace => {
+                if let Some(o) = self.new_project_mut() {
+                    match o.field {
+                        NpField::Name => {
+                            o.name.pop();
+                        }
+                        NpField::Cwd => {
+                            o.cwd.pop();
+                        }
+                    }
+                }
+                cx.notify();
+            }
+            Key::Char(c) => {
+                if let Some(o) = self.new_project_mut() {
+                    match o.field {
+                        NpField::Name => o.name.push(c),
+                        NpField::Cwd => o.cwd.push(c),
+                    }
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// Create a new workspace belonging to `pid`, rooted at its cwd (UXI-Project-4:
+    /// the per-project ＋ New workspace row). No cwd prompt — the cwd is the
+    /// project's. Becomes the active workspace.
+    pub(crate) fn new_workspace_in(&mut self, pid: ProjectId, cx: &mut Context<Self>) {
+        let Some(cwd) = self.projects.cwd_of(pid).map(|p| p.to_path_buf()) else {
+            return;
+        };
+        self.workspace.push_initial_workspace(
+            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
+            pid,
+        );
+        self.save_workspace_state();
+        cx.notify();
+    }
+
+    /// Create a new FREE agent session rooted at `pid`'s cwd (UXI-Project-4: the
+    /// per-project ＋ New agent session row). No cwd prompt; it lands unbound in
+    /// the roster under this project's section.
+    pub(crate) fn new_agent_session_in(&mut self, pid: ProjectId, cx: &mut Context<Self>) {
+        let Some(cwd) = self.projects.cwd_of(pid).map(|p| p.to_path_buf()) else {
+            return;
+        };
+        self.spawn_free_agent_session_at(cwd, cx);
+    }
+
+    /// Request deletion of `pid` (UXI-Project-5). If it still holds workspaces or
+    /// sessions (live or roster-only), arm a confirmation overlay; an EMPTY
+    /// project deletes directly. No-op if any overlay is already open.
+    pub(crate) fn request_delete_project(&mut self, pid: ProjectId, cx: &mut Context<Self>) {
+        if self.has_overlay() {
+            return;
+        }
+        let mut nonempty = self.workspace.workspaces.iter().any(|t| t.project() == pid);
+        if !nonempty {
+            for (_, ent) in self.sessions.iter() {
+                if self.projects.by_cwd(&ent.read(cx).cwd) == Some(pid) {
+                    nonempty = true;
+                    break;
+                }
+            }
+        }
+        if !nonempty {
+            for info in self.agent_roster.entries_by_label() {
+                if self.projects.by_cwd(&info.cwd) == Some(pid) {
+                    nonempty = true;
+                    break;
+                }
+            }
+        }
+        if nonempty {
+            self.open_overlay(ActiveOverlay::ConfirmProjectDelete(pid));
+            cx.notify();
+        } else {
+            self.perform_delete_project(pid, cx);
+        }
+    }
+
+    /// Cascade-delete `pid` (UXI-Project-5): kill every session rooted in it
+    /// (local + roster-only), close its workspaces, then drop the project +
+    /// persist. Never leaves zero workspaces (spec Behavior 2) — a placeholder is
+    /// seeded under a surviving project. Empty projects are otherwise NOT
+    /// auto-deleted (only this explicit path removes a project).
+    pub(crate) fn perform_delete_project(&mut self, pid: ProjectId, cx: &mut Context<Self>) {
+        // 1. Sessions: local sessions rooted here, and roster-only sids rooted
+        // here (not already represented locally).
+        let mut local_kill: Vec<SessionId> = Vec::new();
+        let mut local_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (id, ent) in self.sessions.iter() {
+            if let Some(sid) = self.sessions.sid_of(id) {
+                local_sids.insert(sid.as_str().to_string());
+            }
+            if self.projects.by_cwd(&ent.read(cx).cwd) == Some(pid) {
+                local_kill.push(id);
+            }
+        }
+        let mut roster_kill: Vec<String> = Vec::new();
+        for info in self.agent_roster.entries_by_label() {
+            if self.projects.by_cwd(&info.cwd) == Some(pid)
+                && !local_sids.contains(&info.session_id)
+            {
+                roster_kill.push(info.session_id.clone());
+            }
+        }
+        for id in local_kill {
+            if let Some(sid) = self.sessions.sid_of(id).map(|s| s.to_string()) {
+                self.spawn_close_session(sid, cx);
+            }
+            self.transcript_views.remove(&id);
+            self.sessions.close(id);
+        }
+        for sid in roster_kill {
+            self.agent_roster.remove(&sid);
+            self.spawn_close_session(sid, cx);
+        }
+        // 2. Workspaces: close this project's workspaces (descending so indices stay
+        // valid), then guarantee ≥1 workspace survives under a surviving project.
+        let mut idxs: Vec<usize> = self
+            .workspace
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.project() == pid)
+            .map(|(i, _)| i)
+            .collect();
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        for i in idxs {
+            self.workspace.close_workspace(i);
+        }
+        // 3. Drop the project FIRST, so the survivor is derived from what REMAINS
+        // (deleting the last project must not seed a workspace under the id we're
+        // about to remove — bug caught in review).
+        self.projects.close(pid);
+        // Guarantee ≥1 workspace AND ≥1 project survive. If that was the last
+        // project, mint a fresh default rooted at the process dir — the "never
+        // zero projects" twin of "never zero workspaces", so the app can never
+        // enter a projectless / orphaned-workspace state.
+        if self.workspace.workspaces.is_empty() {
+            let survivor = self.projects.first().unwrap_or_else(|| {
+                let cwd = process_cwd();
+                self.projects.ensure_at_cwd(cwd.clone(), &project_name_for_cwd(&cwd))
+            });
+            let name = workspace::auto_workspace_name(self.workspace.next_workspace_index);
+            self.workspace.next_workspace_index += 1;
+            self.workspace.workspaces.push(workspace::Workspace::with_layout(
+                name,
+                workspace::Layout::Empty,
+                0,
+                survivor,
+            ));
+            self.workspace.active_workspace = 0;
+        }
+        save_persisted_projects(&self.projects);
+        self.save_workspace_state();
+        self.clear_overlay();
+        // A focused agent tile whose session we just killed falls back to its
+        // live selector (never a dangling bound id).
+        let dangling = match self.workspace.focused_content() {
+            Some(App::Agent(tile)) => tile.session().filter(|id| !self.sessions.contains(*id)),
+            _ => None,
+        };
+        if dangling.is_some() {
+            self.show_selector_on_focused_tile(cx);
+        }
+        cx.notify();
+    }
+
+    fn handle_confirm_delete_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let press = keystroke_to_keypress(&ev.keystroke);
+        let Some(pid) = self.confirm_delete_ref() else {
+            return;
+        };
+        match press.key {
+            Key::Char('y') | Key::Enter => self.perform_delete_project(pid, cx),
+            _ => {
+                self.clear_overlay();
+                cx.notify();
+            }
+        }
     }
 
     /// Open a path-input overlay pre-filled with the active slot's
@@ -5470,17 +5762,21 @@ impl YaldaGpuiView {
     /// `"cwd"` (untitled.md "Set CWD"). Pre-fills with the current workspace
     /// cwd if set, otherwise the process cwd, so Enter confirms a sensible
     /// default. On commit the path is resolved + validated (same rules as
-    /// `:claude-new <path>`) and written to the tab's kv; new agent sessions
+    /// `:claude-new <path>`) and written to the workspace's kv; new agent sessions
     /// in this workspace inherit it.
     fn open_set_workspace_cwd_overlay(&mut self, cx: &mut Context<Self>) {
         if self.overlay_is_rename() {
             return;
         }
-        let idx = self.workspace.active_tab;
-        let Some(tab) = self.workspace.tabs.get(idx) else {
+        let idx = self.workspace.active_workspace;
+        let Some(wsp) = self.workspace.workspaces.get(idx) else {
             return;
         };
-        let text = tab.cwd().path().display().to_string();
+        let text = self
+            .projects
+            .cwd_of(wsp.project())
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
             text,
             target: RenameTarget::WorkspaceCwd { index: idx },
@@ -5488,21 +5784,21 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
-    /// Open the rename overlay targeting the active workspace tab. The
-    /// input pre-fills with the tab's current display label (display_name
+    /// Open the rename overlay targeting the active workspace workspace. The
+    /// input pre-fills with the workspace's current display label (display_name
     /// if set, else auto_name).
-    fn open_rename_active_tab_overlay(&mut self, cx: &mut Context<Self>) {
+    fn open_rename_active_workspace_overlay(&mut self, cx: &mut Context<Self>) {
         if self.overlay_is_rename() {
             return;
         }
-        let idx = self.workspace.active_tab;
-        let Some(tab) = self.workspace.tabs.get(idx) else {
+        let idx = self.workspace.active_workspace;
+        let Some(wsp) = self.workspace.workspaces.get(idx) else {
             return;
         };
-        let text = tab.display_label().to_string();
+        let text = wsp.display_label().to_string();
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
             text,
-            target: RenameTarget::Tab { index: idx },
+            target: RenameTarget::Workspace { index: idx },
         }));
         cx.notify();
     }
@@ -5511,7 +5807,7 @@ impl YaldaGpuiView {
         self.clear_overlay();
     }
 
-    /// Apply the overlay's text to the targeted slot/tab, then close.
+    /// Apply the overlay's text to the targeted slot/wsp, then close.
     /// Trims whitespace; an all-whitespace input cancels (acts like Esc) so
     /// the user can't accidentally erase the label by hammering Enter.
     fn commit_rename_overlay(&mut self, cx: &mut Context<Self>) {
@@ -5543,47 +5839,13 @@ impl YaldaGpuiView {
                 self.save_agent_ring(cx);
                 cx.notify();
             }
-            RenameTarget::Tab { index } => {
-                if let Some(tab) = self.workspace.tabs.get_mut(index) {
-                    tab.display_name = Some(new_label);
+            RenameTarget::Workspace { index } => {
+                if let Some(wsp) = self.workspace.workspaces.get_mut(index) {
+                    wsp.display_name = Some(new_label);
                 }
                 self.close_rename_overlay();
                 self.save_workspace_state();
                 cx.notify();
-            }
-            RenameTarget::AgentNewSessionCwd => {
-                // Resolve per spec-agent-cwd.md §2 (tilde, canonicalize,
-                // validate). Failure surfaces via the active agent's
-                // footer hint and leaves the overlay closed.
-                match resolve_agent_cwd_arg(&new_label) {
-                    Ok(resolved) => {
-                        self.close_rename_overlay();
-                        self.new_agent_session(Some(resolved), cx);
-                    }
-                    Err(msg) => {
-                        self.close_rename_overlay();
-                        if let Some(mut c) = self.agent_mut(cx) {
-                            c.status = Some(msg.into());
-                        }
-                        cx.notify();
-                    }
-                }
-            }
-            RenameTarget::FreeAgentSessionCwd => {
-                // Resolve per spec-agent-cwd.md §2; on success spawn a FREE
-                // (tile-less) session at that cwd (UXI-JumpPanel-4). A bad path
-                // surfaces a transient error and creates nothing.
-                match resolve_agent_cwd_arg(&new_label) {
-                    Ok(resolved) => {
-                        self.close_rename_overlay();
-                        self.spawn_free_agent_session_at(resolved, cx);
-                    }
-                    Err(msg) => {
-                        self.close_rename_overlay();
-                        self.transient_status = Some(msg.into());
-                        cx.notify();
-                    }
-                }
             }
             RenameTarget::AgentChangeCwd { id } => match resolve_agent_cwd_arg(&new_label) {
                 Ok(resolved) => {
@@ -5602,10 +5864,26 @@ impl YaldaGpuiView {
                 Ok(resolved) => {
                     self.close_rename_overlay();
                     let path = resolved.display().to_string();
-                    if let Some(tab) = self.workspace.tabs.get_mut(index) {
-                        tab.set_cwd(workspace::WorkspaceCwd::new(resolved));
+                    // "Set workspace cwd" now repoints the workspace's PROJECT cwd
+                    // (ADR-0028 §3 — cwd lives on the project). Refused if another
+                    // project already roots there.
+                    let outcome = self
+                        .workspace
+                        .workspaces
+                        .get(index)
+                        .map(|t| t.project())
+                        .map(|pid| self.projects.set_cwd(pid, resolved));
+                    match outcome {
+                        Some(Ok(())) => {
+                            save_persisted_projects(&self.projects);
+                            self.transient_status = Some(format!("project cwd → {path}").into());
+                        }
+                        Some(Err(_)) => {
+                            self.transient_status =
+                                Some("another project already roots that directory".into());
+                        }
+                        None => {}
                     }
-                    self.transient_status = Some(format!("workspace cwd → {path}").into());
                     self.save_workspace_state();
                     cx.notify();
                 }
@@ -5720,13 +5998,13 @@ impl YaldaGpuiView {
                 }
             }
             TagInputMode::ViewTag => {
-                if let Some(tab) = self.workspace.active_tab_mut() {
+                if let Some(wsp) = self.workspace.active_workspace_mut() {
                     if tag.is_empty() {
-                        tab.tag_view.clear();
+                        wsp.tag_view.clear();
                         self.transient_status = Some("tag filter cleared".into());
                     } else {
-                        tab.tag_view.clear();
-                        tab.tag_view.insert(tag.clone());
+                        wsp.tag_view.clear();
+                        wsp.tag_view.insert(tag.clone());
                         self.transient_status = Some(format!("viewing tag '{tag}'").into());
                     }
                 }
@@ -5734,9 +6012,9 @@ impl YaldaGpuiView {
             }
             TagInputMode::SendTag => {
                 self.tag_focused(tag.clone());
-                if let Some(tab) = self.workspace.active_tab_mut() {
-                    tab.tag_view.clear();
-                    tab.tag_view.insert(tag.clone());
+                if let Some(wsp) = self.workspace.active_workspace_mut() {
+                    wsp.tag_view.clear();
+                    wsp.tag_view.insert(tag.clone());
                 }
                 self.adjust_focus_for_tag_view();
                 self.transient_status = Some(format!("tagged + viewing '{tag}'").into());
@@ -5839,15 +6117,15 @@ impl YaldaGpuiView {
     fn filtered_buffer_indices(&self) -> Vec<usize> {
         let bs = match self.buffer_ref() {
             Some(bs) => bs,
-            None => return (0..self.workspace.tabs.len()).collect(),
+            None => return (0..self.workspace.workspaces.len()).collect(),
         };
         if bs.filter_text.is_empty() {
-            return (0..self.workspace.tabs.len()).collect();
+            return (0..self.workspace.workspaces.len()).collect();
         }
         let query = bs.filter_text.to_lowercase();
-        (0..self.workspace.tabs.len())
+        (0..self.workspace.workspaces.len())
             .filter(|&i| {
-                let label = tab_doc_label(&self.workspace.tabs[i])
+                let label = workspace_doc_label(&self.workspace.workspaces[i])
                     .map(|s| s.to_lowercase())
                     .unwrap_or_default();
                 fuzzy_match_gpui(&label, &query)
@@ -6174,7 +6452,7 @@ impl YaldaGpuiView {
         let filter_fg: Hsla = nc(ov.input);
 
         let filtered = self.filtered_buffer_indices();
-        let total = self.workspace.tabs.len();
+        let total = self.workspace.workspaces.len();
         let visible = filtered.len();
 
         // Header
@@ -6204,10 +6482,10 @@ impl YaldaGpuiView {
             .font_family(self.code_font.clone());
 
         for (vis_idx, &buf_idx) in filtered.iter().enumerate() {
-            let tab = &self.workspace.tabs[buf_idx];
+            let wsp = &self.workspace.workspaces[buf_idx];
             let is_selected = vis_idx == bs.selected;
-            let is_active = buf_idx == self.workspace.active_tab;
-            let is_modified = match &tab.layout {
+            let is_active = buf_idx == self.workspace.active_workspace;
+            let is_modified = match &wsp.layout {
                 workspace::Layout::Leaf(w) => screen_is_modified(&w.content),
                 _ => false,
             };
@@ -6217,7 +6495,7 @@ impl YaldaGpuiView {
             let modified_mark = if is_modified { " [+]" } else { "" };
 
             // Shorten the path for display
-            let label_owned = tab_doc_label(tab).unwrap_or_else(|| tab.display_label().to_string());
+            let label_owned = workspace_doc_label(wsp).unwrap_or_else(|| wsp.display_label().to_string());
             let display_path = shorten_path(&label_owned);
 
             let name_color = if is_active { active_fg } else { normal_fg };
@@ -6322,9 +6600,7 @@ impl YaldaGpuiView {
 
         let header_label = match o.target {
             RenameTarget::AgentSession { .. } => "RENAME SESSION",
-            RenameTarget::Tab { .. } => "RENAME WORKSPACE",
-            RenameTarget::AgentNewSessionCwd => "NEW SESSION AT…",
-            RenameTarget::FreeAgentSessionCwd => "NEW AGENT SESSION AT…",
+            RenameTarget::Workspace { .. } => "RENAME WORKSPACE",
             RenameTarget::AgentChangeCwd { .. } => "CHANGE SESSION CWD",
             RenameTarget::WorkspaceCwd { .. } => "SET WORKSPACE CWD",
             RenameTarget::DesktopTileSize => "DESKTOP GRID (COLSxROWS OF TILES)",
@@ -6371,6 +6647,140 @@ impl YaldaGpuiView {
                     .flex_col()
                     .child(header)
                     .child(input_row)
+                    .child(footer),
+            )
+    }
+
+    /// The "New project" overlay (UXI-Project-4): two input rows (name / cwd)
+    /// with a block cursor on the focused field, modeled on `render_rename_overlay`.
+    fn render_new_project_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let o = match self.new_project_ref() {
+            Some(o) => o,
+            None => unreachable!(),
+        };
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let popup_border: Hsla = nc(ov.border);
+        let label_fg: Hsla = nc(ov.label);
+        let input_fg: Hsla = nc(ov.input);
+        let cursor = |on: bool| if on { "\u{2588}" } else { "" };
+
+        let header = div()
+            .px_4()
+            .py_1()
+            .text_color(label_fg)
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::new_static("NEW PROJECT"));
+        let name_row = div()
+            .px_4()
+            .pt_2()
+            .text_color(input_fg)
+            .text_size(px(14.0))
+            .font_family(self.code_font.clone())
+            .child(SharedString::from(format!(
+                "name: {}{}",
+                o.name,
+                cursor(o.field == NpField::Name)
+            )));
+        let cwd_row = div()
+            .px_4()
+            .pb_2()
+            .text_color(input_fg)
+            .text_size(px(14.0))
+            .font_family(self.code_font.clone())
+            .child(SharedString::from(format!(
+                "cwd:  {}{}",
+                o.cwd,
+                cursor(o.field == NpField::Cwd)
+            )));
+        let footer = div()
+            .px_4()
+            .py_1()
+            .text_color(label_fg)
+            .text_size(px(11.0))
+            .child(SharedString::new_static("workspace:switch field  enter:create  esc:cancel"));
+
+        div()
+            .absolute()
+            .top(px(80.0))
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_row()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(420.0))
+                    .bg(menu_bg)
+                    .border_2()
+                    .border_color(popup_border)
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .child(name_row)
+                    .child(cwd_row)
+                    .child(footer),
+            )
+    }
+
+    /// The "Delete project?" confirmation (UXI-Project-5): names the project and
+    /// how many workspaces/sessions the cascade will close, `y`/enter confirms.
+    fn render_confirm_delete_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let pid = self.confirm_delete_ref().expect("confirm overlay open");
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let popup_border: Hsla = nc(ov.border);
+        let label_fg: Hsla = nc(ov.label);
+        let input_fg: Hsla = nc(ov.input);
+        let name = self.projects.name_of(pid).to_string();
+        let n_ws = self.workspace.workspaces.iter().filter(|t| t.project() == pid).count();
+        let mut n_sess = 0usize;
+        for (_, ent) in self.sessions.iter() {
+            if self.projects.by_cwd(&ent.read(cx).cwd) == Some(pid) {
+                n_sess += 1;
+            }
+        }
+
+        let header = div()
+            .px_4()
+            .py_1()
+            .text_color(label_fg)
+            .font_weight(FontWeight::BOLD)
+            .child(SharedString::from(format!("DELETE PROJECT {name}?")));
+        let body = div()
+            .px_4()
+            .py_2()
+            .text_color(input_fg)
+            .text_size(px(14.0))
+            .font_family(self.code_font.clone())
+            .child(SharedString::from(format!(
+                "closes {n_ws} workspace(s), kills {n_sess} session(s)"
+            )));
+        let footer = div()
+            .px_4()
+            .py_1()
+            .text_color(label_fg)
+            .text_size(px(11.0))
+            .child(SharedString::new_static("y / enter: confirm    esc: cancel"));
+
+        div()
+            .absolute()
+            .top(px(80.0))
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_row()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(420.0))
+                    .bg(menu_bg)
+                    .border_2()
+                    .border_color(popup_border)
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .child(body)
                     .child(footer),
             )
     }
@@ -6495,8 +6905,8 @@ impl Render for YaldaGpuiView {
         // unchanged and read-only on the core, so this is cheap and panic-safe.
         {
             let theme = &self.theme;
-            for tab in self.workspace.tabs.iter_mut() {
-                tab.layout.for_each_leaf_content_mut(&mut |content| {
+            for wsp in self.workspace.workspaces.iter_mut() {
+                wsp.layout.for_each_leaf_content_mut(&mut |content| {
                     if let App::Buffer(BufferApp::Viewing(d)) = content {
                         d.refresh_blocks(theme);
                     }
@@ -6550,7 +6960,7 @@ impl Render for YaldaGpuiView {
         let screen_view: AnyElement =
             self.render_focused_window(screen_root, leaf_attach_focus, !has_overlay, cx);
 
-        // (The side workspace/tab strip was removed — workspaces are switched
+        // (The side workspace/workspace strip was removed — workspaces are switched
         // from the `?` global menu now.)
 
         // Tag bar: thin strip above content showing tag labels when any
@@ -6680,6 +7090,36 @@ impl Render for YaldaGpuiView {
         // shifted chars could shadow distinct overlay entries (e.g. `w` vs
         // `W`). The capture handler short-circuits the entire rest of the
         // pipeline.
+        if self.overlay_is_new_project() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("NewProjectView")
+                .size_full()
+                .bg(editor_bg)
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_new_project_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_new_project_overlay(cx))
+                .into_any_element();
+        }
+
+        if self.overlay_is_confirm_delete() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("ConfirmDeleteView")
+                .size_full()
+                .bg(editor_bg)
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_confirm_delete_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_confirm_delete_overlay(cx))
+                .into_any_element();
+        }
+
         if self.overlay_is_rename() {
             return div()
                 .track_focus(&self.focus_handle)
@@ -7008,22 +7448,22 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 // Buffer helpers
 // ----------------------------------------------------------------------------
 
-/// Short display label for the tab strip. Doc/Edit tabs show the file's
+/// Short display label for the workspace strip. Doc/Edit workspaces show the file's
 /// basename (`E ` prefix for Edit); Browser/Claude show their kind.
-fn tab_strip_label(tab: &workspace::Tab<App>) -> String {
-    if let workspace::Layout::Leaf(w) = &tab.layout {
+fn workspace_strip_label(wsp: &workspace::Workspace<App>) -> String {
+    if let workspace::Layout::Leaf(w) = &wsp.layout {
         match &w.content {
             App::Buffer(BufferApp::Viewing(d)) => basename_or_full(d.file_label.as_ref()),
             App::Buffer(BufferApp::Editing(e)) => {
                 format!("E {}", basename_or_full(e.file_label.as_ref()))
             }
-            App::Buffer(BufferApp::Picking(_)) => format!("Browser ({})", tab.display_label()),
-            App::Agent(_) => format!("Claude ({})", tab.display_label()),
+            App::Buffer(BufferApp::Picking(_)) => format!("Browser ({})", wsp.display_label()),
+            App::Agent(_) => format!("Claude ({})", wsp.display_label()),
             App::Linear(tile) => tile.title(),
             App::Keymap(_) => "Keybindings".to_string(),
         }
     } else {
-        tab.display_label().to_string()
+        wsp.display_label().to_string()
     }
 }
 
@@ -7034,10 +7474,10 @@ fn basename_or_full(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// Extract the file label of a tab's focused window, if Doc or Edit.
-/// Returns `None` for Browser/Claude tabs or non-leaf layouts.
-fn tab_doc_label(tab: &workspace::Tab<App>) -> Option<String> {
-    if let workspace::Layout::Leaf(w) = &tab.layout {
+/// Extract the file label of a workspace's focused window, if Doc or Edit.
+/// Returns `None` for Browser/Claude workspaces or non-leaf layouts.
+fn workspace_doc_label(wsp: &workspace::Workspace<App>) -> Option<String> {
+    if let workspace::Layout::Leaf(w) = &wsp.layout {
         match &w.content {
             App::Buffer(BufferApp::Viewing(d)) => Some(d.file_label.to_string()),
             App::Buffer(BufferApp::Editing(e)) => Some(e.file_label.to_string()),

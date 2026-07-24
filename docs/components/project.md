@@ -154,9 +154,11 @@ prior behavior for free roster sessions in dir-less projects.
 (two projects each with a workspace + one session at A's cwd → A's section lists
 its own workspace by GLOBAL index and NOT B's, B renders an empty section, the
 session groups under A, badges are distinct global numbers; NC: drop the
-`t.project() == id` workspace filter → A lists B's workspace, observed RED). Plus
-the pre-existing `jump_panel_groups_sessions_by_project` (header resolves to the
-project name; NC: force the path fallback → RED).
+`t.project() == id` workspace filter → A lists B's workspace, observed RED). The
+sections key on `ProjectId`, so the per-project header IS the project name by
+construction. (The earlier stand-alone `jump_group_header` helper + its
+`jump_panel_groups_sessions_by_project` test were removed once T005's
+`jump_panel_sections` became the sole render path — single-sourced.)
 
 ### UXI-Project-4 — Creating a project asks for a name + cwd and starts empty
 

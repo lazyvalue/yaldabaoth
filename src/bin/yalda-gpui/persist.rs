@@ -1,5 +1,5 @@
 //! Durable on-disk state: yalda-home paths, client id, preferences,
-//! workspace snapshot/restore (tabs/splits/rails), persisted ACP session
+//! workspace snapshot/restore (workspaces/splits/rails), persisted ACP session
 //! slots, and session-server launch/attach helpers. Extracted verbatim
 //! from main.rs (split-gpui-main).
 
@@ -207,7 +207,7 @@ pub(crate) fn resolve_agent_cwd_arg(arg: &str) -> Result<PathBuf, String> {
     };
 
     // 2) Canonicalize when possible, else fall back to cwd-relative with
-    //    `.`/`..` collapsed (same pattern as `Workspace::canonical_key`).
+    //    `.`/`..` collapsed (same pattern as `Frame::canonical_key`).
     let resolved = match std::fs::canonicalize(&expanded) {
         Ok(c) => c,
         Err(_) => {
@@ -281,14 +281,14 @@ pub(crate) fn shorten_cwd_for_display(cwd: &std::path::Path) -> String {
     }
 }
 
-/// Path to the JSON file that maps cwd → workspace snapshot (tabs + layout
+/// Path to the JSON file that maps cwd → workspace snapshot (workspaces + layout
 /// tree). Companion to acp_sessions.json; cleared by clearing cache_dir.
 pub(crate) fn workspace_persist_path() -> Option<PathBuf> {
     // Fail safe in test builds (same rationale as `preferences_path`): NEVER
     // touch the user's real `~/.yalda/workspace.json`. `save_workspace_state`
     // fires from ~75 action handlers (open / split / close / focus), so any
     // test that dispatches one of those actions would otherwise overwrite the
-    // user's real tab/split layout. Round-trip tests opt in via
+    // user's real workspace/split layout. Round-trip tests opt in via
     // `with_workspace_path`; everything else gets `None` → save is a no-op.
     #[cfg(test)]
     {
@@ -457,6 +457,171 @@ pub(crate) fn save_preferences(prefs: &Preferences) {
     }
 }
 
+// ── Projects (ADR-0028, docs/components/project.md, UXI-Project-8) ───────────
+
+/// Path to the JSON file holding the Project registry (ADR-0028). **Global**,
+/// not cwd-keyed — projects are the top of the hierarchy, so one file holds them
+/// all. Same fail-safe seam as [`preferences_path`]: under `cfg(test)` returns
+/// `None` unless a test opts in via [`with_projects_path`], so a headless test
+/// never touches the user's real `~/.yalda/projects.json`.
+pub(crate) fn projects_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        return PROJECTS_PATH_OVERRIDE.with(|c| c.borrow().clone());
+    }
+    #[cfg(not(test))]
+    {
+        yalda::paths::yalda_home().map(|d| d.join("projects.json"))
+    }
+}
+
+/// Test-only seam mirroring [`PREFS_PATH_OVERRIDE`] for the projects file.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PROJECTS_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn with_projects_path<R>(path: PathBuf, f: impl FnOnce() -> R) -> R {
+    PROJECTS_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+    let r = f();
+    PROJECTS_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    r
+}
+
+/// On-disk shadow of one [`Project`]. `params` defaults empty so a file written
+/// before a future key existed loads cleanly; serde ignores unknown fields, so a
+/// *newer* file never resets the store (the migration discipline of
+/// `UXI-Workspace-7`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PersistedProject {
+    pub(crate) name: String,
+    pub(crate) cwd: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) params: std::collections::BTreeMap<String, String>,
+}
+
+/// The `projects.json` root.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PersistedProjects {
+    #[serde(default)]
+    pub(crate) projects: Vec<PersistedProject>,
+}
+
+/// Load the persisted project registry, or `None` when the file is absent — the
+/// signal that triggers a one-time cwd→project migration ([`migrate_cwds_to_projects`]).
+pub(crate) fn load_persisted_projects() -> Option<PersistedProjects> {
+    let path = projects_path()?;
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Best-effort write of the live [`Projects`] store. No-ops on any failure.
+pub(crate) fn save_persisted_projects(projects: &Projects) {
+    let Some(path) = projects_path() else {
+        return;
+    };
+    let doc = PersistedProjects {
+        projects: projects
+            .iter()
+            .map(|(_, p)| PersistedProject {
+                name: p.name.clone(),
+                cwd: p.cwd.display().to_string(),
+                params: p.params.clone(),
+            })
+            .collect(),
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(&doc) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+/// Rebuild a live [`Projects`] store from a persisted doc. Tolerant of a
+/// malformed/hand-edited file: a duplicate **name** folds to the existing
+/// project, a duplicate **cwd** folds to whatever roots there — the loader never
+/// panics and never drops a record's params.
+pub(crate) fn projects_from_persisted(doc: &PersistedProjects) -> Projects {
+    let mut ps = Projects::new();
+    for pp in &doc.projects {
+        let cwd = PathBuf::from(&pp.cwd);
+        let id = match ps.create(pp.name.clone(), cwd.clone()) {
+            Ok(id) => id,
+            // Fold a corrupt duplicate onto the existing project rather than fail.
+            Err(CreateError::DuplicateName) => match ps.by_name(&pp.name) {
+                Some(id) => id,
+                None => continue,
+            },
+            Err(CreateError::DuplicateCwd(id)) => id,
+        };
+        if let Some(p) = ps.get_mut(id) {
+            p.params = pp.params.clone();
+        }
+    }
+    ps
+}
+
+/// The project name a cwd migrates to (ADR-0028 §7, `UXI-Project-8`): the last
+/// path component with its first letter capitalized. Basename `yaldabaoth` →
+/// `Yaldabaoth`, `fulcrum` → `Fulcrum` — the user's two named projects fall out
+/// of this general rule, and any other cwd gets its own basename-derived name.
+/// Total: an empty/rootless path falls back to `"Project"`.
+pub(crate) fn project_name_for_cwd(cwd: &std::path::Path) -> String {
+    let base = cwd
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Project".to_string());
+    let mut chars = base.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "Project".to_string(),
+    }
+}
+
+/// Migrate the cwds found across persisted workspaces + sessions into a named
+/// [`Projects`] store (ADR-0028 §7). Each **distinct canonical** cwd becomes a
+/// project named by [`project_name_for_cwd`]; a name clash folds via
+/// `get_or_create` (a documented limitation — two distinct dirs sharing a
+/// basename share a project; not expected in practice, where live state is under
+/// the two known cwds). **Total + panic-proof**: every cwd yields a project and
+/// nothing is dropped, so an old snapshot with no `projects.json` never loses
+/// data.
+/// Build the Project registry at boot (ADR-0028 "projects before workspace"):
+/// load `projects.json` if present, else migrate from `seed_cwds` (the cwds found
+/// across persisted workspaces + sessions). Then ensure a project exists at
+/// `primary` (the root workspace's cwd) and return the store plus that project's
+/// id, persisting the (possibly newly-migrated) store. Under `cfg(test)` the
+/// load/save no-op (path seam), so a boot migrates purely in memory.
+pub(crate) fn boot_projects(
+    primary: &std::path::Path,
+    seed_cwds: impl IntoIterator<Item = PathBuf>,
+) -> (Projects, ProjectId) {
+    let mut projects = match load_persisted_projects() {
+        Some(doc) if !doc.projects.is_empty() => projects_from_persisted(&doc),
+        _ => migrate_cwds_to_projects(seed_cwds),
+    };
+    let pid = projects.ensure_at_cwd(primary.to_path_buf(), &project_name_for_cwd(primary));
+    save_persisted_projects(&projects);
+    (projects, pid)
+}
+
+pub(crate) fn migrate_cwds_to_projects(cwds: impl IntoIterator<Item = PathBuf>) -> Projects {
+    let mut ps = Projects::new();
+    for cwd in cwds {
+        // `ensure_at_cwd` dedups on the canonical key (so `/tmp` vs `/private/tmp`
+        // don't split) and uniquifies the basename-derived name on a clash, so
+        // both uniqueness invariants stay total.
+        let name = project_name_for_cwd(&cwd);
+        ps.ensure_at_cwd(cwd, &name);
+    }
+    ps
+}
+
 /// Serializable shadow of `App` for spec-tiles-and-apps.md (ADR-0019).
 ///
 /// The tag set is `{buffer{mode}, agent}` (was `{doc, edit, browser, claude}`).
@@ -531,7 +696,7 @@ pub(crate) enum PersistedRailKind {
     Outline,
 }
 
-/// Persisted per-tab rail (spec-rail.md §14). Optional on `PersistedTab` so
+/// Persisted per-workspace rail (spec-rail.md §14). Optional on `PersistedWorkspace` so
 /// snapshots written before rails existed still load (serde default → `None`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PersistedRail {
@@ -545,7 +710,7 @@ pub(crate) struct PersistedRail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cwd: Option<PathBuf>,
     /// Leaf the rail is pinned to. Defaults to 0 for old snapshots (will be
-    /// overridden by the tab's focused_window on restore).
+    /// overridden by the workspace's focused_window on restore).
     #[serde(default)]
     pub(crate) pinned_to: workspace::WindowId,
 }
@@ -570,7 +735,7 @@ pub(crate) struct PersistedCamera {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PersistedTab {
+pub(crate) struct PersistedWorkspace {
     pub(crate) auto_name: String,
     pub(crate) display_name: Option<String>,
     pub(crate) focused_window: workspace::WindowId,
@@ -578,7 +743,7 @@ pub(crate) struct PersistedTab {
     /// Optional rail (spec-rail.md §14). Absent in old snapshots → no rail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rail: Option<PersistedRail>,
-    // Layout patterns: per-tab layout mode + master-stack params
+    // Layout patterns: per-workspace layout mode + master-stack params
     #[serde(default)]
     pub(crate) layout_mode: workspace::LayoutMode,
     #[serde(default = "default_master_ratio")]
@@ -631,9 +796,14 @@ pub(crate) fn default_master_count() -> usize {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PersistedWorkspace {
-    pub(crate) tabs: Vec<PersistedTab>,
-    pub(crate) active_tab: usize,
+pub(crate) struct PersistedFrame {
+    // On-disk keys stay `tabs`/`active_tab` (pre-T007 format) so existing
+    // `workspace.json` files keep loading after the Tab→Workspace rename. The
+    // Rust field names are the new vocabulary; serde bridges to the old keys.
+    #[serde(rename = "tabs")]
+    pub(crate) workspaces: Vec<PersistedWorkspace>,
+    #[serde(rename = "active_tab")]
+    pub(crate) active_workspace: usize,
     // Layout patterns: workspace-global marks
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) marks: HashMap<char, workspace::WindowId>,
@@ -774,7 +944,7 @@ pub(crate) fn restore_rail(
 /// persisted session id (`Option<String>`) so restore rebinds each tile to its
 /// OWN session by identity (UXI-AgentTile-18), not by index.
 pub(crate) fn restore_layout(
-    ws: &mut workspace::Workspace<App>,
+    ws: &mut workspace::Frame<App>,
     theme: &Theme,
     layout: PersistedLayout,
 ) -> (
@@ -825,7 +995,7 @@ pub(crate) fn restore_layout(
 }
 
 pub(crate) fn restore_content(
-    ws: &mut workspace::Workspace<App>,
+    ws: &mut workspace::Frame<App>,
     theme: &Theme,
     kind: PersistedKind,
 ) -> App {
@@ -884,7 +1054,7 @@ pub(crate) fn restore_content(
         PersistedKind::Agent { .. } => {
             // Claude restore is its own subsystem (acp_sessions.json +
             // open_agent_inner). Replace with a Browser stub here so the
-            // tab survives; user can re-attach via the existing Claude
+            // workspace survives; user can re-attach via the existing Claude
             // commands.
             App::Buffer(BufferApp::Picking(BrowserWindow::standalone(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -897,20 +1067,21 @@ pub(crate) fn restore_content(
 
 /// Snapshot a live workspace into a fully serializable shape.
 pub(crate) fn snapshot_workspace(
-    ws: &workspace::Workspace<App>,
+    ws: &workspace::Frame<App>,
+    projects: &Projects,
     resolve: SidResolver,
-) -> PersistedWorkspace {
+) -> PersistedFrame {
     // Ephemeral virtual workspaces (ADR-0021) are transient and never persisted;
-    // they're always the last tab, so filtering them keeps the remaining indices
-    // contiguous. `active_tab` is clamped into the surviving range so a restore
+    // they're always the last wsp, so filtering them keeps the remaining indices
+    // contiguous. `active_workspace` is clamped into the surviving range so a restore
     // never points past the saved list.
-    let non_ephemeral = ws.tabs.iter().filter(|t| !t.ephemeral).count();
-    PersistedWorkspace {
-        tabs: ws
-            .tabs
+    let non_ephemeral = ws.workspaces.iter().filter(|t| !t.ephemeral).count();
+    PersistedFrame {
+        workspaces: ws
+            .workspaces
             .iter()
             .filter(|t| !t.ephemeral)
-            .map(|t| PersistedTab {
+            .map(|t| PersistedWorkspace {
                 auto_name: t.auto_name.clone(),
                 display_name: t.display_name.clone(),
                 focused_window: t.focused,
@@ -940,11 +1111,15 @@ pub(crate) fn snapshot_workspace(
                     pan: t.desktop.camera.pan,
                     zoom: t.desktop.camera.zoom,
                 }),
-                cwd: Some(t.cwd().path().display().to_string()),
+                // Persist the workspace's PROJECT cwd (ADR-0028): the cwd lives on
+                // the project now, so we resolve `t.project()` through the store.
+                // Restore re-points the workspace at whatever project roots this
+                // cwd (self-heal); project *names* survive via `projects.json`.
+                cwd: projects.cwd_of(t.project()).map(|p| p.display().to_string()),
                 legacy_kv: HashMap::new(),
             })
             .collect(),
-        active_tab: ws.active_tab.min(non_ephemeral.saturating_sub(1)),
+        active_workspace: ws.active_workspace.min(non_ephemeral.saturating_sub(1)),
         marks: ws.marks.all_marks().into_iter().collect(),
         tag_shortcuts: ws.tag_shortcuts.clone(),
         buffer_tags: {
@@ -966,7 +1141,8 @@ pub(crate) fn snapshot_workspace(
 /// on any I/O / serialization failure (Behavior 23: best-effort + silent).
 pub(crate) fn save_persisted_workspace(
     cwd: &std::path::Path,
-    ws: &workspace::Workspace<App>,
+    ws: &workspace::Frame<App>,
+    projects: &Projects,
     resolve: SidResolver,
 ) {
     let Some(path) = workspace_persist_path() else {
@@ -982,7 +1158,7 @@ pub(crate) fn save_persisted_workspace(
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
-    let snap = snapshot_workspace(ws, resolve);
+    let snap = snapshot_workspace(ws, projects, resolve);
     if let Ok(v) = serde_json::to_value(&snap) {
         // Drop any entry saved under the old raw spelling so the file doesn't
         // accumulate a canonical + raw duplicate for the same dir (ADR-0010:
@@ -998,7 +1174,7 @@ pub(crate) fn save_persisted_workspace(
 /// Read the persisted workspace for `cwd`. Returns `None` if no file, no
 /// entry, or unparseable — the caller treats these as "no saved state,
 /// bootstrap fresh" (Behavior 24).
-pub(crate) fn load_persisted_workspace(cwd: &std::path::Path) -> Option<PersistedWorkspace> {
+pub(crate) fn load_persisted_workspace(cwd: &std::path::Path) -> Option<PersistedFrame> {
     let path = workspace_persist_path()?;
     let bytes = std::fs::read(&path).ok()?;
     let map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
@@ -1211,7 +1387,7 @@ pub(crate) fn forget_persisted_acp_sessions(cwd: &std::path::Path) {
 /// EVERY cwd key (the file is `{ cwd_key: [ {id, ...}, ... ] }`). Used when an
 /// attach reports a session the server no longer has: re-saving the live rings
 /// can't be relied on to drop the id (a single-slot ring that empties no longer
-/// holds an Agent ring to re-save, and a stale id in a non-active tab is never
+/// holds an Agent ring to re-save, and a stale id in a non-active workspace is never
 /// walked), so we scrub by id here. A cwd whose array becomes empty has its key
 /// removed. Best-effort.
 pub(crate) fn forget_persisted_acp_session_ids(ids: &[String]) {

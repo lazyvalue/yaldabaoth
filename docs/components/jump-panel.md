@@ -162,6 +162,17 @@ both mid-open and post-bind (negative controls observed RED on each arm).
 
 ### UXI-JumpPanel-3 — The jump panel can create a free (tile-less) agent session
 
+> **SUPERSEDED by `UXI-Project-3/4/7` (T005).** The global, tile-less "＋ New
+> agent session" that asked for a cwd is gone: sessions are now created only
+> **inside a project** via the jump panel's per-project ＋New agent session row
+> (`new_agent_session_in`, cwd = the project's, no prompt). The `?`-menu entry and
+> its cwd overlay were removed. The free-then-bindable *projection* below still
+> holds; only the create *entry point* moved into a project. The removed guards
+> `global_menu_offers_and_dispatches_free_agent_session` /
+> `free_agent_cwd_overlay_*` are replaced by `global_cwd_session_overlay_is_gone`
+> (entry point removed) and `jump_panel_renders_per_project_sections` (per-project
+> ＋ rows).
+
 **Statement.** The jump panel's "Agent sessions" section leads with a **＋ New
 agent session** action row. Clicking it creates an agent session bound to **no
 tile and no workspace** — a *free* session (spec-agent-session-ownership.md) —
@@ -215,6 +226,13 @@ _Note: as of UXI-JumpPanel-4 both entry points open a cwd overlay first; the cre
 (`spawn_free_agent_session_at`) runs on the overlay's commit, not on the click/key._
 
 ### UXI-JumpPanel-4 — Creating a free agent session lets you choose its CWD
+
+> **SUPERSEDED by `UXI-Project-4` (T005).** There is no longer a cwd to choose at
+> session-create time — a session inherits its **project's** cwd. The
+> "NEW AGENT SESSION AT…" / "NEW SESSION AT…" path-input overlays
+> (`RenameTarget::FreeAgentSessionCwd` / `AgentNewSessionCwd`) and their commit
+> arms are deleted. The cwd is chosen once, when the **project** is created
+> (`UXI-Project-4`'s NEW PROJECT overlay).
 
 **Statement.** Both free-session entry points (the jump-panel **＋ New agent
 session** row and the `?` menu "new agent session") do NOT spawn immediately.

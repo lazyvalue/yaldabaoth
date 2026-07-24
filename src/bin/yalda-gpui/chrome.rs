@@ -1,4 +1,4 @@
-//! Window chrome on YaldaGpuiView: focused-window/layout render, tab
+//! Window chrome on YaldaGpuiView: focused-window/layout render, wsp
 //! strip, tag bar, rails (render + outline derivation). Extracted
 //! verbatim from main.rs (split-gpui-main, stage 2).
 
@@ -19,7 +19,7 @@ impl YaldaGpuiView {
     /// and a footer hint. Has *no* key handlers — the wrapper in
     /// `Render::render` handles input via `capture_key_down` so the
     /// underlying screen never sees keystrokes while the menu is open.
-    /// Render the active tab's layout tree. Leaves dispatch to per-kind
+    /// Render the active workspace's layout tree. Leaves dispatch to per-kind
     /// render methods; splits become flex containers (row for V splits,
     /// col for H splits) with weighted children.
     pub(crate) fn render_focused_window(
@@ -29,24 +29,24 @@ impl YaldaGpuiView {
         rail_focusable: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let tab_idx = self.workspace.active_tab;
-        let focused_id = self.workspace.tabs[tab_idx].focused;
+        let workspace_idx = self.workspace.active_workspace;
+        let focused_id = self.workspace.workspaces[workspace_idx].focused;
         // Re-derive the outline rail (if any) once before rendering the tree,
         // so the focused leaf can render it inline without a second pass.
         self.refresh_outline_rail();
         let layout_ptr: *mut workspace::Layout<App> =
-            &mut self.workspace.tabs[tab_idx].layout as *mut _;
-        // SAFETY: `layout_ptr` is valid for as long as the active tab's
+            &mut self.workspace.workspaces[workspace_idx].layout as *mut _;
+        // SAFETY: `layout_ptr` is valid for as long as the active workspace's
         // `layout` field isn't structurally mutated (no splits/closes/etc.).
         // The render pipeline only reads self's other fields (theme/fonts)
         // and the layout subtree via this pointer; structural mutations
         // happen in action handlers, never inside render. This sidesteps a
         // Rust borrowck limitation where the compiler can't prove that
-        // &mut Layout<App> (a field inside self.workspace.tabs)
+        // &mut Layout<App> (a field inside self.workspace.workspaces)
         // is disjoint from &self.render_X's other field accesses.
         let layout = unsafe { &mut *layout_ptr };
         // The plane is the ONLY workspace interior (infinite-plane, Stage D): a
-        // workspace IS a Plane (Behavior 1), so the tab always renders as the
+        // workspace IS a Plane (Behavior 1), so the workspace always renders as the
         // desktop/plane canvas. The old split-tree branch (`render_layout`) is
         // retired along with the mode surface.
         self.render_desktop(root, layout, focused_id, attach_focus, rail_focusable, cx)
@@ -54,7 +54,7 @@ impl YaldaGpuiView {
 
     /// Desktop mode (spec-desktop-mode.md): fixed-size tiles at slot
     /// positions on a pannable canvas. The layout tree is the CONTENT owner
-    /// (leaves render exactly as in tiling); geometry comes from the tab's
+    /// (leaves render exactly as in tiling); geometry comes from the workspace's
     /// `DesktopState`. Only viewport-intersecting tiles render, except the
     /// focused tile — it carries the focus handle and the per-screen action
     /// wiring, and culling it would strand the keyboard (spec Behavior 3).
@@ -67,7 +67,7 @@ impl YaldaGpuiView {
         rail_focusable: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let tab_idx = self.workspace.active_tab;
+        let workspace_idx = self.workspace.active_workspace;
         let full_tile = self.desktop_tile_px();
         let (_, _, mut canvas_w, mut canvas_h) = self.desktop_canvas_bounds.get();
         // First frame: bounds not captured yet — approximate with the window
@@ -86,7 +86,7 @@ impl YaldaGpuiView {
         // geometry (`slot_origin`/`tile_rect`/`slot_at`, dot grid, drag, reveal)
         // runs against them, so zooming out shrinks the whole plane uniformly
         // without touching a single slot/span.
-        let zoom = self.workspace.tabs[tab_idx].desktop.camera.zoom;
+        let zoom = self.workspace.workspaces[workspace_idx].desktop.camera.zoom;
         let scale = workspace::detail_scale(zoom);
         let tile = (full_tile.0 * scale, full_tile.1 * scale);
         let g = DESKTOP_GUTTER * scale;
@@ -104,19 +104,19 @@ impl YaldaGpuiView {
         // is UNCLAMPED now — the plane is infinite in all directions
         // (Behavior 5). ──
         {
-            let tab = &mut self.workspace.tabs[tab_idx];
-            let leaves = tab.layout.leaf_ids();
+            let wsp = &mut self.workspace.workspaces[workspace_idx];
+            let leaves = wsp.layout.leaf_ids();
             // Seed beside the tile the user is on (bug-0012): a brand-new leaf
             // IS the focused one and has no slot yet, so `reconcile_near` falls
             // back to `last_reveal` — still the tile focus came from.
-            tab.desktop.reconcile_near(&leaves, Some(focused_id));
-            if tab.desktop.last_reveal != Some(focused_id) {
-                if let Some(slot) = tab.desktop.slot_of(focused_id) {
+            wsp.desktop.reconcile_near(&leaves, Some(focused_id));
+            if wsp.desktop.last_reveal != Some(focused_id) {
+                if let Some(slot) = wsp.desktop.slot_of(focused_id) {
                     let (x, y) = workspace::slot_origin(slot, tile, g);
                     // Reveal in pixel space, then store the pan back in slot units.
                     let mut pan_px = (
-                        tab.desktop.camera.pan.0 * pitch.0,
-                        tab.desktop.camera.pan.1 * pitch.1,
+                        wsp.desktop.camera.pan.0 * pitch.0,
+                        wsp.desktop.camera.pan.1 * pitch.1,
                     );
                     // Whether we actually had to pan to reveal the tile — a focus
                     // change to an already-fully-visible tile must NOT move the view
@@ -137,28 +137,28 @@ impl YaldaGpuiView {
                         revealed = true;
                     }
                     if revealed {
-                        tab.desktop.camera.pan = (pan_px.0 / pitch.0, pan_px.1 / pitch.1);
+                        wsp.desktop.camera.pan = (pan_px.0 / pitch.0, pan_px.1 / pitch.1);
                         // Rest the view cell-aligned like the tile (UXI-Workspace-8).
-                        tab.desktop.snap_camera_to_slots();
+                        wsp.desktop.snap_camera_to_slots();
                     }
                 }
-                tab.desktop.last_reveal = Some(focused_id);
+                wsp.desktop.last_reveal = Some(focused_id);
             }
         }
 
-        let tab = &self.workspace.tabs[tab_idx];
+        let wsp = &self.workspace.workspaces[workspace_idx];
         // Derived pixel pan for the rest of this render (all existing pixel math
         // reads `pan`).
         let pan = (
-            tab.desktop.camera.pan.0 * pitch.0,
-            tab.desktop.camera.pan.1 * pitch.1,
+            wsp.desktop.camera.pan.0 * pitch.0,
+            wsp.desktop.camera.pan.1 * pitch.1,
         );
-        let drag = tab.desktop.drag;
-        let slot_list: Vec<(workspace::WindowId, workspace::Slot, workspace::Span)> = tab
+        let drag = wsp.desktop.drag;
+        let slot_list: Vec<(workspace::WindowId, workspace::Slot, workspace::Span)> = wsp
             .desktop
             .slots
             .iter()
-            .map(|&(id, s)| (id, s, tab.desktop.span_of(id)))
+            .map(|&(id, s)| (id, s, wsp.desktop.span_of(id)))
             .collect();
         // A lone tile fills the canvas — a desktop with one window shouldn't
         // strand it in a single grid quadrant (the jump-panel virtual
@@ -171,7 +171,7 @@ impl YaldaGpuiView {
         // Live edge-resize preview (spec Behavior 4b): the clamped anchor +
         // span the resized tile renders at this frame, which is also what
         // commits. West/North move the anchor, so the preview carries it.
-        let resize_preview: Option<(workspace::WindowId, workspace::Slot, workspace::Span)> = tab
+        let resize_preview: Option<(workspace::WindowId, workspace::Slot, workspace::Span)> = wsp
             .desktop
             .resize
             .map(|r| {
@@ -762,7 +762,7 @@ impl YaldaGpuiView {
     /// per-axis pitch; `pan` is the derived pixel pan.
     pub(crate) fn desktop_zoom_anchor(
         &self,
-        tab_idx: usize,
+        workspace_idx: usize,
         focused_id: workspace::WindowId,
         tile: (f32, f32),
         g: f32,
@@ -770,8 +770,8 @@ impl YaldaGpuiView {
         canvas_w: f32,
         canvas_h: f32,
     ) -> workspace::Slot {
-        let tab = &self.workspace.tabs[tab_idx];
-        if let Some(s) = tab.desktop.slot_of(focused_id) {
+        let wsp = &self.workspace.workspaces[workspace_idx];
+        if let Some(s) = wsp.desktop.slot_of(focused_id) {
             return s;
         }
         // Viewport center in desktop (pre-pan) pixels → slot.
@@ -801,14 +801,14 @@ impl YaldaGpuiView {
         if ch <= 0.0 {
             ch = self.viewport_height_px.max(1.0);
         }
-        let tab_idx = self.workspace.active_tab;
-        let zoom = self.workspace.tabs[tab_idx].desktop.camera.zoom;
+        let workspace_idx = self.workspace.active_workspace;
+        let zoom = self.workspace.workspaces[workspace_idx].desktop.camera.zoom;
         let scale = workspace::detail_scale(zoom);
         let tile = (full_tile.0 * scale, full_tile.1 * scale);
         let g = DESKTOP_GUTTER * scale;
         let pitch = (tile.0 + g, tile.1 + g);
         let pan = {
-            let cam = self.workspace.tabs[tab_idx].desktop.camera;
+            let cam = self.workspace.workspaces[workspace_idx].desktop.camera;
             (cam.pan.0 * pitch.0, cam.pan.1 * pitch.1)
         };
 
@@ -819,13 +819,13 @@ impl YaldaGpuiView {
         // Zoom: `Cmd`/`Ctrl`+scroll steps Detail (secondary() is Cmd on macOS,
         // the platform key; also accept raw control for portability).
         if ev.modifiers.secondary() || ev.modifiers.control {
-            let focused_id = self.workspace.tabs[tab_idx].focused;
-            let anchor = self.desktop_zoom_anchor(tab_idx, focused_id, tile, g, pan, cw, ch);
-            let tab = &mut self.workspace.tabs[tab_idx];
+            let focused_id = self.workspace.workspaces[workspace_idx].focused;
+            let anchor = self.desktop_zoom_anchor(workspace_idx, focused_id, tile, g, pan, cw, ch);
+            let wsp = &mut self.workspace.workspaces[workspace_idx];
             if dy > 0.0 {
-                tab.desktop.zoom_in(anchor);
+                wsp.desktop.zoom_in(anchor);
             } else if dy < 0.0 {
-                tab.desktop.zoom_out(anchor);
+                wsp.desktop.zoom_out(anchor);
             } else {
                 return;
             }
@@ -855,9 +855,9 @@ impl YaldaGpuiView {
         if !(modifiers.secondary() && modifiers.shift) {
             return;
         }
-        let tab_idx = self.workspace.active_tab;
-        let start_pan = self.workspace.tabs[tab_idx].desktop.camera.pan;
-        self.workspace.tabs[tab_idx].desktop.pan_drag = Some(workspace::DesktopPan {
+        let workspace_idx = self.workspace.active_workspace;
+        let start_pan = self.workspace.workspaces[workspace_idx].desktop.camera.pan;
+        self.workspace.workspaces[workspace_idx].desktop.pan_drag = Some(workspace::DesktopPan {
             start_pointer: window_pos,
             start_pan,
         });
@@ -876,21 +876,21 @@ impl YaldaGpuiView {
     ) {
         let (cx0, cy0, _, _) = self.desktop_canvas_bounds.get();
         let tile = self.desktop_tile_px();
-        let tab_idx = self.workspace.active_tab;
-        let tab = &mut self.workspace.tabs[tab_idx];
-        tab.focused = id;
-        let Some(slot) = tab.desktop.slot_of(id) else {
+        let workspace_idx = self.workspace.active_workspace;
+        let wsp = &mut self.workspace.workspaces[workspace_idx];
+        wsp.focused = id;
+        let Some(slot) = wsp.desktop.slot_of(id) else {
             cx.notify();
             return;
         };
         let pitch = (tile.0 + DESKTOP_GUTTER, tile.1 + DESKTOP_GUTTER);
         let pan = (
-            tab.desktop.camera.pan.0 * pitch.0,
-            tab.desktop.camera.pan.1 * pitch.1,
+            wsp.desktop.camera.pan.0 * pitch.0,
+            wsp.desktop.camera.pan.1 * pitch.1,
         );
         let desktop_pos = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
         let (ox, oy) = workspace::slot_origin(slot, tile, DESKTOP_GUTTER);
-        tab.desktop.drag = Some(workspace::DesktopDrag {
+        wsp.desktop.drag = Some(workspace::DesktopDrag {
             id,
             grab: (desktop_pos.0 - ox, desktop_pos.1 - oy),
             pointer: desktop_pos,
@@ -911,8 +911,8 @@ impl YaldaGpuiView {
         id: workspace::WindowId,
         cx: &mut Context<Self>,
     ) {
-        let tab_idx = self.workspace.active_tab;
-        self.workspace.tabs[tab_idx].focused = id;
+        let workspace_idx = self.workspace.active_workspace;
+        self.workspace.workspaces[workspace_idx].focused = id;
         self.save_workspace_state();
         cx.notify();
     }
@@ -929,16 +929,16 @@ impl YaldaGpuiView {
     ) {
         let (cx0, cy0, _, _) = self.desktop_canvas_bounds.get();
         let tile = self.desktop_tile_px();
-        let tab_idx = self.workspace.active_tab;
-        let tab = &mut self.workspace.tabs[tab_idx];
-        tab.focused = id;
+        let workspace_idx = self.workspace.active_workspace;
+        let wsp = &mut self.workspace.workspaces[workspace_idx];
+        wsp.focused = id;
         let pitch = (tile.0 + DESKTOP_GUTTER, tile.1 + DESKTOP_GUTTER);
         let pan = (
-            tab.desktop.camera.pan.0 * pitch.0,
-            tab.desktop.camera.pan.1 * pitch.1,
+            wsp.desktop.camera.pan.0 * pitch.0,
+            wsp.desktop.camera.pan.1 * pitch.1,
         );
         let desktop_pos = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
-        tab.desktop.resize = Some(workspace::DesktopResize {
+        wsp.desktop.resize = Some(workspace::DesktopResize {
             id,
             edge,
             pointer: desktop_pos,
@@ -954,11 +954,11 @@ impl YaldaGpuiView {
     fn desktop_resize_target(&self, r: workspace::DesktopResize) -> (workspace::Slot, workspace::Span) {
         let tile = self.desktop_tile_px();
         let g = DESKTOP_GUTTER;
-        let tab = &self.workspace.tabs[self.workspace.active_tab];
-        let Some(anchor) = tab.desktop.slot_of(r.id) else {
-            return (workspace::Slot::new(0, 0), tab.desktop.span_of(r.id));
+        let wsp = &self.workspace.workspaces[self.workspace.active_workspace];
+        let Some(anchor) = wsp.desktop.slot_of(r.id) else {
+            return (workspace::Slot::new(0, 0), wsp.desktop.span_of(r.id));
         };
-        let span = tab.desktop.span_of(r.id);
+        let span = wsp.desktop.span_of(r.id);
         let (ox, oy) = workspace::slot_origin(anchor, tile, g);
         let desired = match r.edge {
             // Far edge from the anchor: n cells end at origin + n*(tile+g) - g,
@@ -980,7 +980,7 @@ impl YaldaGpuiView {
                 (anchor.row + span.rows as i32 - near).max(1) as u32
             }
         };
-        tab.desktop.clamp_resize(r.id, r.edge, desired)
+        wsp.desktop.clamp_resize(r.id, r.edge, desired)
     }
 
     /// Canvas mouse-move: advance the drag (threshold, pointer, drop target,
@@ -989,13 +989,13 @@ impl YaldaGpuiView {
         let (cx0, cy0, cw, ch) = self.desktop_canvas_bounds.get();
         let tile = self.desktop_tile_px();
         let pitch = (tile.0 + DESKTOP_GUTTER, tile.1 + DESKTOP_GUTTER);
-        let tab_idx = self.workspace.active_tab;
+        let workspace_idx = self.workspace.active_workspace;
 
         // A `Cmd+Shift` canvas pan takes precedence over any tile drag/resize:
         // move the camera relative to the grab, converting the pixel delta to
         // slot units at the CURRENT zoom pitch (pan is pitch-independent).
-        if let Some(p) = self.workspace.tabs[tab_idx].desktop.pan_drag {
-            let scale = workspace::detail_scale(self.workspace.tabs[tab_idx].desktop.camera.zoom);
+        if let Some(p) = self.workspace.workspaces[workspace_idx].desktop.pan_drag {
+            let scale = workspace::detail_scale(self.workspace.workspaces[workspace_idx].desktop.camera.zoom);
             let zpitch = (
                 (tile.0 * scale) + DESKTOP_GUTTER * scale,
                 (tile.1 * scale) + DESKTOP_GUTTER * scale,
@@ -1004,7 +1004,7 @@ impl YaldaGpuiView {
             let dy = window_pos.1 - p.start_pointer.1;
             // Grab-and-drag: content follows the cursor, so the camera pan moves
             // opposite the pointer.
-            self.workspace.tabs[tab_idx].desktop.camera.pan =
+            self.workspace.workspaces[workspace_idx].desktop.camera.pan =
                 (p.start_pan.0 - dx / zpitch.0, p.start_pan.1 - dy / zpitch.1);
             cx.notify();
             return;
@@ -1013,14 +1013,14 @@ impl YaldaGpuiView {
         // A live resize takes precedence over (and is mutually exclusive with)
         // a drag: just track the pointer; the render pass clamps the span.
         {
-            let tab = &mut self.workspace.tabs[tab_idx];
-            if let Some(mut r) = tab.desktop.resize {
+            let wsp = &mut self.workspace.workspaces[workspace_idx];
+            if let Some(mut r) = wsp.desktop.resize {
                 let pan = (
-                    tab.desktop.camera.pan.0 * pitch.0,
-                    tab.desktop.camera.pan.1 * pitch.1,
+                    wsp.desktop.camera.pan.0 * pitch.0,
+                    wsp.desktop.camera.pan.1 * pitch.1,
                 );
                 r.pointer = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
-                tab.desktop.resize = Some(r);
+                wsp.desktop.resize = Some(r);
                 cx.notify();
                 return;
             }
@@ -1029,8 +1029,8 @@ impl YaldaGpuiView {
         // Edge auto-pan first (uses window-relative position within canvas).
         let mut pan_delta = (0.0f32, 0.0f32);
         let rel = (window_pos.0 - cx0, window_pos.1 - cy0);
-        let tab = &mut self.workspace.tabs[tab_idx];
-        let Some(mut d) = tab.desktop.drag else {
+        let wsp = &mut self.workspace.workspaces[workspace_idx];
+        let Some(mut d) = wsp.desktop.drag else {
             return;
         };
         if d.active {
@@ -1046,12 +1046,12 @@ impl YaldaGpuiView {
             }
             // Edge auto-pan is a pixel delta; convert to slot units. Unclamped
             // — the plane is infinite in all directions (Behavior 5).
-            tab.desktop
+            wsp.desktop
                 .pan_by(pan_delta.0 / pitch.0, pan_delta.1 / pitch.1);
         }
         let pan = (
-            tab.desktop.camera.pan.0 * pitch.0,
-            tab.desktop.camera.pan.1 * pitch.1,
+            wsp.desktop.camera.pan.0 * pitch.0,
+            wsp.desktop.camera.pan.1 * pitch.1,
         );
         let desktop_pos = (window_pos.0 - cx0 + pan.0, window_pos.1 - cy0 + pan.1);
 
@@ -1071,21 +1071,21 @@ impl YaldaGpuiView {
             d.pointer.1 - d.grab.1 + tile.1 / 2.0,
         );
         d.target = Some(workspace::slot_at(center, tile, DESKTOP_GUTTER));
-        tab.desktop.drag = Some(d);
+        wsp.desktop.drag = Some(d);
         cx.notify();
     }
 
     /// Canvas mouse-up: commit the drop (insert-and-shift) or treat as a
     /// click when the threshold was never crossed.
     pub(crate) fn desktop_drop(&mut self, cx: &mut Context<Self>) {
-        let tab_idx = self.workspace.active_tab;
+        let workspace_idx = self.workspace.active_workspace;
 
         // End a `Cmd+Shift` canvas pan (Behavior 5) — the gesture is continuous
         // while dragging but rests the view cell-aligned on release, the same
         // contract as a tile drag/edge-resize (UXI-Workspace-8 / bug-0009); then
         // persist the final view.
-        if self.workspace.tabs[tab_idx].desktop.pan_drag.take().is_some() {
-            self.workspace.tabs[tab_idx].desktop.snap_camera_to_slots();
+        if self.workspace.workspaces[workspace_idx].desktop.pan_drag.take().is_some() {
+            self.workspace.workspaces[workspace_idx].desktop.snap_camera_to_slots();
             self.save_workspace_state();
             cx.notify();
             return;
@@ -1094,9 +1094,9 @@ impl YaldaGpuiView {
         // Commit a live edge resize (spec Behavior 4b) — the clamped anchor +
         // span the preview showed become the stored placement. West/North move
         // the anchor; East/South leave it unchanged.
-        if let Some(r) = self.workspace.tabs[tab_idx].desktop.resize.take() {
+        if let Some(r) = self.workspace.workspaces[workspace_idx].desktop.resize.take() {
             let (slot, span) = self.desktop_resize_target(r);
-            let d = &mut self.workspace.tabs[tab_idx].desktop;
+            let d = &mut self.workspace.workspaces[workspace_idx].desktop;
             d.set_anchor(r.id, slot);
             d.set_span(r.id, span);
             // Rest the view cell-aligned like the resized tile (UXI-Workspace-8).
@@ -1106,18 +1106,18 @@ impl YaldaGpuiView {
             return;
         }
 
-        let tab = &mut self.workspace.tabs[tab_idx];
-        let Some(d) = tab.desktop.drag.take() else {
+        let wsp = &mut self.workspace.workspaces[workspace_idx];
+        let Some(d) = wsp.desktop.drag.take() else {
             return;
         };
         if d.active {
             let committed = if let Some(target) = d.target
-                && tab.desktop.slot_of(d.id) != Some(target)
+                && wsp.desktop.slot_of(d.id) != Some(target)
             {
                 // Free placement (Behavior 4): commit iff the whole rectangle
                 // lands on free slots; an overlapping drop is rejected (returns
                 // home, no ripple).
-                tab.desktop.free_drop(d.id, target);
+                wsp.desktop.free_drop(d.id, target);
                 true
             } else {
                 false
@@ -1125,7 +1125,7 @@ impl YaldaGpuiView {
             // Any active drag may have edge-auto-panned the view to a fractional
             // slot; rest it cell-aligned like the tile (UXI-Workspace-8) even when
             // the drop itself was rejected/no-op.
-            tab.desktop.snap_camera_to_slots();
+            wsp.desktop.snap_camera_to_slots();
             if committed {
                 self.save_workspace_state();
             }
@@ -1135,18 +1135,18 @@ impl YaldaGpuiView {
 
     /// Cancel an in-flight drag or resize (right-click; Esc is a follow-up).
     pub(crate) fn desktop_cancel_drag(&mut self, cx: &mut Context<Self>) {
-        let tab_idx = self.workspace.active_tab;
-        let d = &mut self.workspace.tabs[tab_idx].desktop;
+        let workspace_idx = self.workspace.active_workspace;
+        let d = &mut self.workspace.workspaces[workspace_idx].desktop;
         if d.drag.take().is_some() || d.resize.take().is_some() {
             cx.notify();
         }
     }
 
-    /// If the workspace has more than one tab, stack a thin horizontal tab
-    /// strip above the screen view. Single-tab workspaces render the screen
+    /// If the workspace has more than one wsp, stack a thin horizontal workspace
+    /// strip above the screen view. Single-workspace workspaces render the screen
     /// alone (no strip).
     /// Render a thin tag bar above the content when any buffers in the workspace
-    /// have tags. Tags in the active tab's tag_view get accent background.
+    /// have tags. Tags in the active workspace's tag_view get accent background.
     pub(crate) fn wrap_with_tag_bar(&self, screen_view: AnyElement) -> AnyElement {
         let all_tags = self.all_tags();
         if all_tags.is_empty() {
@@ -1154,7 +1154,7 @@ impl YaldaGpuiView {
         }
         let tag_view = self
             .workspace
-            .active_tab()
+            .active_workspace()
             .map(|t| &t.tag_view)
             .cloned()
             .unwrap_or_default();
@@ -1198,7 +1198,7 @@ impl YaldaGpuiView {
             .into_any_element()
     }
 
-    /// Inject the active tab's rail beside the **focused leaf's** content
+    /// Inject the active workspace's rail beside the **focused leaf's** content
     /// (spec-rail.md §8, adjusted: the rail is chrome local to the focused
     /// tile, not the whole window — so in a split it sits against the focused
     /// content, not at the window edge). `content_el` is the already-rendered
@@ -1216,7 +1216,7 @@ impl YaldaGpuiView {
     ) -> AnyElement {
         if self
             .workspace
-            .active_tab()
+            .active_workspace()
             .map(|t| t.rail.is_none())
             .unwrap_or(true)
         {
@@ -1226,7 +1226,7 @@ impl YaldaGpuiView {
         let (side, focused) = {
             let r = self
                 .workspace
-                .active_tab()
+                .active_workspace()
                 .and_then(|t| t.rail.as_ref())
                 .expect("rail present");
             (r.side, r.focused && rail_focusable)
@@ -1254,8 +1254,8 @@ impl YaldaGpuiView {
     pub(crate) fn outline_change_key(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        if let Some(tab) = self.workspace.active_tab() {
-            tab.focused.hash(&mut h); // focus change → re-derive
+        if let Some(wsp) = self.workspace.active_workspace() {
+            wsp.focused.hash(&mut h); // focus change → re-derive
         }
         match self.workspace.focused_content() {
             // Edit: edit_seq is the exact monotonic content version.
@@ -1273,7 +1273,7 @@ impl YaldaGpuiView {
     pub(crate) fn refresh_outline_rail(&mut self) {
         let is_outline = self
             .workspace
-            .active_tab()
+            .active_workspace()
             .and_then(|t| t.rail.as_ref())
             .map(|r| r.content.is_outline())
             .unwrap_or(false);
@@ -1286,7 +1286,7 @@ impl YaldaGpuiView {
         let key = self.outline_change_key();
         let unchanged = self
             .workspace
-            .active_tab()
+            .active_workspace()
             .and_then(|t| t.rail.as_ref())
             .and_then(|r| match &r.content {
                 workspace::RailContent::Outline(o) => o.last_key,
@@ -1336,12 +1336,12 @@ impl YaldaGpuiView {
         }
     }
 
-    /// Render the rail column for the active tab (spec §9, §11–§13). Chrome
+    /// Render the rail column for the active workspace (spec §9, §11–§13). Chrome
     /// styling — text is fixed at 12px and does NOT scale with `text_scale`.
     pub(crate) fn render_rail(&self, focused: bool, cx: &mut Context<Self>) -> gpui::Div {
         let rail = self
             .workspace
-            .active_tab()
+            .active_workspace()
             .and_then(|t| t.rail.as_ref())
             .expect("rail present");
 
@@ -1413,7 +1413,7 @@ impl YaldaGpuiView {
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_from_clipboard))
-            .on_action(cx.listener(Self::rename_tab))
+            .on_action(cx.listener(Self::rename_workspace))
             .on_action(cx.listener(Self::move_tile))
             .on_action(cx.listener(Self::also_show_tile))
             .on_action(cx.listener(Self::toggle_file_browser_rail))
