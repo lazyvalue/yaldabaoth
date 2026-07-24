@@ -104,7 +104,12 @@ impl YaldaGpuiView {
                 // transcript code-block hit path.
                 block_hits: None,
             };
-            block_element(&ctx, idx, block)
+            let el = block_element(&ctx, idx, block);
+            // UXI-ParagraphSpacing-1 test seam: expose each doc block's painted
+            // bounds so `verify_harness` can measure the inter-block gap.
+            #[cfg(test)]
+            let el = probe_bounds_dyn(format!("doc-block-{idx}"), el);
+            el
         };
 
         // View-mode mouse selection: anchor on left MouseDown, update head on
@@ -579,6 +584,11 @@ impl YaldaGpuiView {
                 WpLineKind::Heading(_) => (14.0, FontWeight::BOLD, 4.0),
                 WpLineKind::CodeFence | WpLineKind::CodeContent => (13.0, FontWeight::NORMAL, 0.0),
                 WpLineKind::TableRow => (13.0, FontWeight::NORMAL, 0.0),
+                // UXI-ParagraphSpacing-1: list items get a readability gap above
+                // each one so bullets break apart (mirrors the Doc view's list gap).
+                WpLineKind::BulletItem | WpLineKind::OrderedItem => {
+                    (14.0, FontWeight::NORMAL, PARAGRAPH_GAP_PX)
+                }
                 _ => (14.0, FontWeight::NORMAL, 0.0),
             };
             let text_size_px = raw_size_px * text_scale;
@@ -617,7 +627,7 @@ impl YaldaGpuiView {
                     .flex_row()
                     .text_size(px(text_size_px))
                     .font_weight(font_weight)
-                    .pt(px(top_pad))
+                    .pt(px(top_pad * text_scale))
                     .italic()
                     .text_color(rgb(0xbfbfbf))
                     .child(div().w(px(3.0)).bg(rgb(0xffb86c)).mr_2())
@@ -635,14 +645,16 @@ impl YaldaGpuiView {
                     .flex()
                     .flex_row()
                     .text_size(px(text_size_px))
-                    .h(px(18.0))
+                    // UXI-ParagraphSpacing-1: the blank paragraph-break line carries
+                    // the readability gap on top of the base 18px blank row; scaled.
+                    .h(px(18.0 * text_scale) + paragraph_gap(text_scale))
                     .child(content),
                 _ => div()
                     .flex()
                     .flex_row()
                     .text_size(px(text_size_px))
                     .font_weight(font_weight)
-                    .pt(px(top_pad))
+                    .pt(px(top_pad * text_scale))
                     .child(content),
             };
 

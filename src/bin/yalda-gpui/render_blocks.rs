@@ -28,6 +28,19 @@ pub(crate) const TEXT_SCALE_STEP: f32 = 1.1;
 pub(crate) const MIN_TEXT_SCALE: f32 = 0.5;
 pub(crate) const MAX_TEXT_SCALE: f32 = 3.0;
 
+/// UXI-ParagraphSpacing-1. Extra vertical space inserted BETWEEN stacked blocks /
+/// paragraphs / list items on the reading surfaces (Doc view, agent transcript,
+/// WP edit) so paragraphs read as distinct chunks — the "break up paragraphs"
+/// readability gap. It is added on top of each surface's existing base gap and
+/// multiplied by `text_scale` (see `paragraph_gap`) so it scales with zoom.
+/// Within-paragraph wrapped lines and all chrome are unaffected. Tune here.
+pub(crate) const PARAGRAPH_GAP_PX: f32 = 6.0;
+
+/// The readability paragraph gap in pixels at the given document zoom.
+pub(crate) fn paragraph_gap(text_scale: f32) -> gpui::Pixels {
+    px(PARAGRAPH_GAP_PX * text_scale)
+}
+
 /// Convert a `NColor` to `Hsla`, using a hardcoded white fallback for
 /// `Reset` / `Indexed` variants. Suitable for agent theme colors which
 /// are always `Color::Rgb` and never need a real fallback.
@@ -1321,20 +1334,34 @@ pub(crate) fn block_element(ctx: &RenderCtx<'_>, idx: usize, block: &RenderedBlo
     // Wrap with a left "cursor bar" indicator when this is the focused block.
     let mut row = div().flex().flex_row().items_start().w_full();
     if !is_source_line {
-        row = row.mb_2();
+        // UXI-ParagraphSpacing-1: readability gap below each block so paragraphs
+        // read as distinct chunks, scaled with zoom. PADDING, not margin: the doc
+        // stacks blocks in a `gpui::list`, which IGNORES item margins (the old
+        // `mb_2` produced no visible gap) — padding is part of the box the list
+        // measures and stacks by. Source-file lines are exempt (one block/line).
+        row = row.pb(px(8.0 * ctx.text_scale) + paragraph_gap(ctx.text_scale));
     }
     // Source-file lines: add a full-row background tint so the focused line
     // is unmistakable (the 3px bar alone is too subtle in a wall of code).
     if is_source_line && highlighted {
         row = row.bg(rgb(CURSOR_LINE_BG));
     }
-    row.child(div().w(px(3.0)).flex_none().h_full().bg(if highlighted {
+    let bar = div().w(px(3.0)).flex_none().h_full().bg(if highlighted {
         rgb(CURSOR_BAR_COLOR)
     } else {
         rgba(0x00000000)
-    }))
-    .child(div().pl_3().flex_1().min_w_0().child(base))
-    .into_any_element()
+    });
+    // Content column. Its painted bounds EXCLUDE the row's bottom margin, so a test
+    // can recover the applied paragraph gap as (row-slot height − content height).
+    let content_col = div()
+        .pl_3()
+        .flex_1()
+        .min_w_0()
+        .child(base)
+        .into_any_element();
+    #[cfg(test)]
+    let content_col = probe_bounds_dyn(format!("doc-block-inner-{idx}"), content_col);
+    row.child(bar).child(content_col).into_any_element()
 }
 
 /// Prepend the literal markdown heading markers (`## ` for h2, `### ` for h3,
@@ -1543,7 +1570,14 @@ pub(crate) fn block_inner(ctx: &RenderCtx<'_>, block: &RenderedBlock) -> AnyElem
             items,
         } => {
             let marker_style = ctx.theme.list_marker;
-            let mut col = div().flex().flex_col();
+            // UXI-ParagraphSpacing-1: air between bullet / ordered items (scaled
+            // with zoom) so a list reads item-by-item. Within an item, wrapped
+            // lines stay tight (one `build_wrapped_line` per line). Shared by the
+            // Doc view and the transcript (both reach this via `block_inner`).
+            let mut col = div()
+                .flex()
+                .flex_col()
+                .gap(paragraph_gap(ctx.text_scale));
             let mut counter = start.unwrap_or(1);
             for item in items {
                 col = col.child(list_item_element(

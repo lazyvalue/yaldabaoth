@@ -21,6 +21,24 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   `u` pops. Guard `worksheet_esc_u_backs_out_reply_block` (real keystrokes; NC
   observed RED). Headless — no runtime gap beyond painted glyphs (#1).
 
+- **Extra vertical spacing between paragraphs / blocks / bullets in text tiles** —
+  `NEEDS-RUNTIME` (built 2026-07-23 via `/new-ux`; `UXI-ParagraphSpacing-1`). User:
+  "a few extra pixels between every newline … to break up paragraphs" + "space
+  between bullet points." Resolved to option **B** (gap *between* blocks/paragraphs
+  and *between* list items; within-paragraph leading unchanged), on Doc view + agent
+  transcript + WP edit (Code/RAW + compose + chrome excluded), scaled with zoom.
+  Shared `PARAGRAPH_GAP_PX`/`paragraph_gap` in `render_blocks.rs`; applied as
+  **padding** (a `gpui::list` ignores item margins — the old `mb_2`/`mt/mb` were dead
+  spacing) on Doc blocks + transcript blocks, flex `gap` on list items, scaled
+  `top_pad`/blank-row height in WP. **Transcript PROSE paragraphs** also covered
+  (added after a user screenshot showed them tight): the blank-collapse pass drops
+  the blank `FlatItem::Line`, so paragraphs render adjacent — fixed by paragraph-start
+  top-padding detected over `lines_snap` (frozen-only, so draft/compose excluded).
+  Guards: `paragraph_gap_between_doc_blocks_exceeds_within_paragraph_leading` +
+  `transcript_paragraph_start_row_is_taller_than_within_paragraph_row` (both NC
+  observed RED at 0px delta). **Runtime check:** exact feel per surface (WP +
+  transcript pixels are gap #1, human eye) — `PARAGRAPH_GAP_PX` tunable.
+
 - **Agent transcript: faint-blue background on the user's own turns** —
   `NEEDS-RUNTIME` (built 2026-07-22 via `/new-ux`; `UXI-AgentTile-23`, ADR-0027).
   "I want the background color of my responses in an agent session to be a slightly

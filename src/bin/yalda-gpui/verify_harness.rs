@@ -500,6 +500,129 @@ fn doc_view_render_is_o_visible(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-ParagraphSpacing-1: a Doc-view block (paragraph) carries a readability gap
+/// below it — measurably larger than the pre-change 8px base (and than the ~0
+/// leading between soft-wrapped lines *within* one block, which carry no inter-line
+/// margin). In a virtualized `gpui::list` each item's bottom margin is absorbed
+/// into its slot height, so the gap is recovered as (block-row slot height −
+/// block-content height): the two `doc-block-{idx}` / `doc-block-inner-{idx}`
+/// probes bracket exactly the applied `.mb(...)`.
+///
+/// Negative control (observed RED): restore `block_element`'s `mb_2` (8px) in
+/// `render_blocks.rs` → the recovered gap drops to 8px and the `>= 12.0` assert
+/// fails.
+#[gpui::test]
+fn paragraph_gap_between_doc_blocks_exceeds_within_paragraph_leading(cx: &mut TestAppContext) {
+    let (view, vcx) = cx.add_window_view(|window, cx| {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+        let mut v = YaldaGpuiView::new_browser(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            Theme::default(),
+            focus_handle,
+        );
+        // Two paragraphs → two top-level `RenderedBlock`s (doc-block-0/-1).
+        v.test_open_doc("First paragraph, block zero.\n\nSecond paragraph, block one.\n");
+        v
+    });
+    // Pin zoom at 1x so the gap is the unscaled `8 + PARAGRAPH_GAP_PX` = 14px.
+    view.update(vcx, |v, cx| v.set_text_scale(1.0, cx));
+    for _ in 0..3 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let slot = crate::layout_probe_get("doc-block-0");
+    let content = crate::layout_probe_get("doc-block-inner-0");
+    crate::layout_probe_end();
+
+    let (_, _, _, slot_h) = slot.expect("doc block 0 row did not paint");
+    let (_, _, _, content_h) = content.expect("doc block 0 content did not paint");
+    // The list slot includes the bottom margin; the content box does not.
+    let gap = slot_h - content_h;
+    assert!(
+        gap >= 12.0,
+        "block paragraph gap must exceed the pre-change 8px base \
+         (UXI-ParagraphSpacing-1); recovered {gap}px (slot {slot_h} − content {content_h})"
+    );
+    assert!(
+        gap <= 24.0,
+        "block paragraph gap unexpectedly large ({gap}px) — double-count or regression"
+    );
+}
+
+/// UXI-ParagraphSpacing-1 (agent transcript prose): a COMMITTED prose line that
+/// STARTS a new paragraph (its previous source line is blank) carries the readability
+/// gap as top padding, so its painted row is taller than a within-paragraph prose row
+/// (a soft break, previous line non-blank). The blank line itself is dropped by the
+/// blank-collapse pass, so paragraphs would otherwise render adjacent — this proves
+/// the gap survives the collapse by reading `lines_snap`.
+///
+/// Negative control (observed RED): drop the `is_paragraph_break` `.pt(...)` in
+/// `transcript_view.rs` → the two rows are the same height and the delta assert fails.
+#[gpui::test]
+fn transcript_paragraph_start_row_is_taller_than_within_paragraph_row(cx: &mut TestAppContext) {
+    let (view, vcx, _id, session) = boot_with_transcript(cx);
+
+    // Paragraph α has TWO lines (a soft break between 0 and 1); a blank line (2)
+    // separates it from paragraph β (line 3). So: line 1 = within-paragraph (no gap),
+    // line 3 = paragraph start (gap). All committed/frozen.
+    session.update(vcx, |s, cx: &mut gpui::Context<crate::AgentSession>| {
+        s.state.editor.programmatic_insert(
+            0,
+            "Alpha line one.\nAlpha line two.\n\nBeta paragraph line.\n",
+        );
+        s.state.editor.add_frozen_lines(0, 4);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let mut c = v.agent_mut(cx).expect("agent");
+        assert!(
+            !c.editor.document().line_text(1).trim().is_empty(),
+            "line 1 is a within-paragraph soft break (non-blank, prev non-blank)"
+        );
+        assert!(c.editor.document().line_text(2).trim().is_empty(), "line 2 blank");
+        assert!(
+            c.editor.document().line_text(3).starts_with("Beta"),
+            "line 3 starts paragraph β (prev source line 2 is blank)"
+        );
+        assert!(c.editor.is_frozen_line(3), "paragraph-start line must be frozen");
+        c.focus = crate::AgentFocus::Transcript;
+    });
+    view.update(vcx, |v, cx| v.set_text_scale(1.0, cx));
+    for _ in 0..4 {
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+
+    crate::layout_probe_begin();
+    view.update(vcx, |v, cx| {
+        if let Some(mut c) = v.agent_mut(cx) {
+            c.pending_reveal_cursor = true;
+        }
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let within = crate::layout_probe_get("transcript-row-1");
+    let para_start = crate::layout_probe_get("transcript-row-3");
+    crate::layout_probe_end();
+
+    let (_, _, _, h_within) = within.expect("within-paragraph row 1 did not paint");
+    let (_, _, _, h_start) = para_start.expect("paragraph-start row 3 did not paint");
+    // The paragraph-start row is a bare line PLUS the top-padding gap; a within-
+    // paragraph row is the bare line. So it exceeds the within row by ~PARAGRAPH_GAP_PX.
+    assert!(
+        h_start > h_within + 4.0,
+        "a paragraph-start row must be taller than a within-paragraph row by ~the gap \
+         (UXI-ParagraphSpacing-1); got start {h_start}px vs within {h_within}px"
+    );
+}
+
 /// Regression gate for the `TextLayout::bounds()` panic (runtime-only class the
 /// other gates missed). `doc_pos_at` (mouse hit-testing) iterates **every**
 /// entry in `line_layouts` and calls `.bounds()`, which panics on a layout that

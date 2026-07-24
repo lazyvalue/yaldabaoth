@@ -19,6 +19,8 @@ highlight, and a thinking indicator while awaiting. Append-only / ordered
 - INV-UX-3, INV-UX-4, INV-UX-15, INV-UX-19, INV-UX-23 in
   `docs/ux-invariants.md` → migrated here.
 - `docs/components/agent-tile/README.md` — parent component.
+- `docs/components/common/paragraph-spacing.md` — the transcript's markdown
+  blocks + list items obey `ParagraphSpacing` (`UXI-ParagraphSpacing-1`).
 
 ## UX invariants
 

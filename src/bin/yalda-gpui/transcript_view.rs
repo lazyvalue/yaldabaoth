@@ -1039,7 +1039,23 @@ impl TranscriptView {
                             committed_row_bg(tag, nc(at_snap.user_turn_bg))
                         };
 
-                        div()
+                        // UXI-ParagraphSpacing-1: a COMMITTED (frozen) prose line that
+                        // STARTS a new paragraph gets the readability gap as top padding,
+                        // so agent/user prose paragraphs break apart — mirroring the block
+                        // gap and WP's blank row. A paragraph start is a non-blank line
+                        // whose previous SOURCE line is blank (`lines_snap` keeps that
+                        // blank even though the blank-collapse pass drops its FlatItem, so
+                        // the two paragraphs would otherwise render adjacent). Within-
+                        // paragraph soft breaks (previous line non-blank) are untouched,
+                        // and the live draft/compose (unfrozen) is excluded — option B.
+                        let prev_source_blank = line_idx > 0
+                            && lines_snap
+                                .get(line_idx - 1)
+                                .map(|l| l.trim().is_empty())
+                                .unwrap_or(false);
+                        let is_paragraph_break =
+                            is_frozen && !line_str.trim().is_empty() && prev_source_blank;
+                        let mut row = div()
                             .flex()
                             .flex_row()
                             .items_start()
@@ -1072,8 +1088,19 @@ impl TranscriptView {
                                 crate::probe_bounds("transcript-line0", content)
                             } else {
                                 content
-                            })
-                            .into_any_element()
+                            });
+                        if is_paragraph_break {
+                            // Add the gap ON TOP of the row's base 2px top padding
+                            // (`.pt` replaces, not adds), so the net increase over a
+                            // within-paragraph row is the full paragraph gap.
+                            row = row.pt(px(2.0) + crate::paragraph_gap(text_scale));
+                        }
+                        let row = row.into_any_element();
+                        // Per-row bounds probe so the harness can measure the
+                        // paragraph-break row's extra height (UXI-ParagraphSpacing-1).
+                        #[cfg(test)]
+                        let row = crate::probe_bounds_dyn(format!("transcript-row-{line_idx}"), row);
+                        row
                     }
                     FlatItem::ToolGroup { anchor_line, ids } => {
                         let anchor = *anchor_line;
@@ -1277,7 +1304,19 @@ impl TranscriptView {
                             block_hits,
                         };
                         let inner = block_inner(&ctx, rendered_block);
-                        let el = div().mt(px(4.0)).mb(px(4.0)).child(inner).into_any_element();
+                        // UXI-ParagraphSpacing-1: base 4px plus HALF the readability
+                        // paragraph gap on each side (scaled with zoom), so two adjacent
+                        // transcript blocks total the same `8*scale + gap` the Doc view
+                        // uses between blocks. PADDING, not margin: transcript items are
+                        // `gpui::list` rows, which ignore item margins (the old mt/mb 4
+                        // produced no gap) — padding is part of the measured box. Prose
+                        // paragraphs are untouched (they carry a blank `FlatItem::Line`).
+                        let half = px(crate::PARAGRAPH_GAP_PX / 2.0 * text_scale);
+                        let el = div()
+                            .pt(px(4.0 * text_scale) + half)
+                            .pb(px(4.0 * text_scale) + half)
+                            .child(inner)
+                            .into_any_element();
                         if uses_line_hits {
                             // Code-block content lines already self-registered per-line
                             // hit bands + selection inside `block_inner`.

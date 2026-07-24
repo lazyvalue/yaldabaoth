@@ -30,6 +30,8 @@ versa. Primary code home: `screens.rs::render_doc` / `render_edit` /
 - `docs/specs/spec-tiles-and-apps.md` — `App::Buffer` and the tile/app model (ADR-0019).
 - `docs/components/common/text-editing.md` — the Edit view obeys `TextEditing`.
 - `docs/components/common/text-zoom.md` — the Doc/Edit views obey `TextZoom`.
+- `docs/components/common/paragraph-spacing.md` — the Doc view + WP obey
+  `ParagraphSpacing` (`UXI-ParagraphSpacing-1`).
 
 ## UX invariants
 

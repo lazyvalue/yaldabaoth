@@ -23,3 +23,6 @@ them by id.
   doc/edit views + the agent transcript.
 - [blockquote.md](blockquote.md) — `Blockquote`: `>`-quoted text renders italic on
   every surface (doc view, transcript, both edit views, compose / You-block).
+- [paragraph-spacing.md](paragraph-spacing.md) — `ParagraphSpacing`: extra vertical
+  gap between blocks / paragraphs / list items on the reading surfaces (doc view,
+  agent transcript, WP), scaled with zoom.
