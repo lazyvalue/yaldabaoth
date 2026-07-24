@@ -546,3 +546,104 @@ removing the header ✕ (`UXI-JumpPanel-7`) doesn't strand the delete capability
 the per-project menu is its natural, precise home. Placement is stored as a clamped
 `(x, y)` computed from `viewport_{width,height}_px` at open time (no live `Window`
 needed in the render).
+
+### UXI-JumpPanel-9 — `Cmd-P` opens a fuzzy jump palette over the same list the panel shows
+
+**Statement.** `Cmd-P` opens a centered **jump palette** — a type-to-filter dialog
+over the *same* navigable set the sidebar projects: every **non-ephemeral
+workspace** and every **agent session** (`Local` ∪ `Roster`). It is a pure
+alternate *input* onto that list — it introduces **no new jump semantics**; every
+activation runs the panel's existing dispatchers (`select_workspace` for a
+workspace, `jump_to_agent` for a session), so 1:1 binding, ephemeral-workspace
+teardown, and read-marking stay owned where they already are.
+
+**Projects are not candidates** — a project is a container, not a view target
+(clicking one opens a menu, `UXI-JumpPanel-8`). **Ephemeral workspaces are not
+candidates** — one is created on demand by `jump_to_session` and torn down on
+navigate-away, so it is never a thing you name and type.
+
+Behavior:
+
+1. **Empty query** ⇒ the **full list in panel order** (each project section's
+   workspaces then its sessions, then the unfiled session groups), so
+   `Cmd-P` → arrows → `Enter` is a keyboard navigator with no typing.
+2. **Typing** ⇒ candidates are **filtered by subsequence match and ordered by
+   match score**, best first. Score rewards contiguous runs, word-start hits, a
+   whole-prefix hit and an exact hit, and prefers shorter labels on a tie; panel
+   order is the final tiebreak (stable). The **top row is the best match**, not
+   merely the first list member that matched.
+3. **Selection** — exactly one row is highlighted, defaulting to the top match
+   and **reset to the top on every query edit**. `Up`/`Down` move the highlight
+   (wrapping); moving the highlight does **not** navigate.
+4. **`Enter`** activates the **highlighted** row (which is the top match unless
+   you moved), closes the palette, then jumps.
+5. **No matches** ⇒ a dim "No matches" line; `Enter` is a **no-op** and the
+   palette stays open.
+6. **`Esc`** closes with no navigation.
+7. **`Cmd-P` while the palette (or any other overlay) is open is a no-op** — it
+   does not toggle, re-open, or clobber a sibling overlay, and the chord never
+   leaks through as a typed `p`.
+8. **Query is cleared on every open** — no sticky state.
+9. **Mouse** — clicking a row activates it; hovering moves the highlight.
+10. The **sidebar panel is unchanged** by all of this (`UXI-JumpPanel-1..8` hold);
+    the palette works whether the panel is visible or hidden.
+
+**Applies to.** Every screen (`YaldaView` / `EditView` / `BrowserView` /
+`AgentView` / rail), including while typing in the agent compose or edit insert
+mode — it is a global `Cmd` chord (`None` context), wired on every screen root
+alongside `toggle_jump_panel`.
+
+**Why.** The sidebar is a *browsing* navigator: it scales with the number of
+workspaces and sessions, and reaching a specific one means finding it by eye and
+clicking. A keystroke-addressable palette makes the same set reachable in O(a few
+characters) without leaving the keyboard, and — because it projects from the same
+source and dispatches through the same activators — it cannot drift from the panel
+or grow a second, divergent notion of "jump".
+
+**Status.** `implemented` — code home `jump_palette.rs` (`PaletteItem` /
+`PaletteTarget` / `JumpPaletteOverlay`, the pure `fuzzy_score` +
+`rank_palette_items`, `jump_palette_items`, `open_jump_palette_impl`,
+`handle_jump_palette_key`, `activate_jump_palette_selection`,
+`render_jump_palette`); `main.rs` holds `ActiveOverlay::JumpPalette`, the
+`OpenJumpPalette` action + `overlay_is_jump_palette` render/capture branch;
+`keymap_registry.rs` binds `cmd-p` (GLOBAL); `screens.rs`/`chrome.rs` wire
+`open_jump_palette` on all 8 screen roots beside `toggle_jump_panel`. Exact
+glyphs/colors are harness gap #1.
+
+**Enforcement.** `verify_harness.rs`, all nine green, each observed RED under its
+own reverted-fix mutation:
+
+- `jump_palette_cmd_p_opens_over_any_screen` — real keymap + `simulate_keystrokes("cmd-p")`;
+  also pins that a second `Cmd-P` neither toggles nor types a `p`.
+  (NC: drop the modifier guard in the `Key::Char` arm → query becomes `"p"`.)
+- `jump_palette_lists_workspaces_and_sessions_in_panel_order` — both kinds present,
+  workspaces before sessions within a section.
+- `jump_palette_ranks_best_match_first` — exact > prefix > scattered, non-matches
+  dropped, empty query = panel order, word-start beats mid-word.
+  (NC: remove the `sort_by` → order stays as listed.)
+- `jump_palette_enter_jumps_to_top_match` — types `gam`, `Enter`, lands on `gamma`.
+- `jump_palette_arrows_select_and_enter_activates_the_selection` — `Down` moves the
+  highlight and navigates nowhere; `Enter` activates the highlighted row.
+  (NC: activate `ranked[0]` instead of `ranked[selected]` → lands on `alpha`.)
+- `jump_palette_no_match_enter_is_noop` — palette stays open, no navigation;
+  backspacing back to a match re-ranks and re-highlights the top.
+  (NC: close the overlay in the no-selection branch → palette gone.)
+- `jump_palette_escape_closes_without_navigating`.
+- `jump_palette_does_not_open_over_another_overlay`.
+  (NC: drop the `has_overlay()` guard → the palette steals the slot.)
+- `jump_palette_paints_over_the_screen` — layout probe `"jump-palette"`: absent while
+  closed, non-zero box while open. (NC: render an empty `div()` in the branch →
+  "the open palette did not paint".)
+
+**Deviation from plan.** Three, all small:
+
+1. **`detail` is not matched against.** The plan said "match against label only" and
+   that shipped — but each row also *renders* a dim `detail` (owning project name, or
+   the cwd for an unfiled session) purely to disambiguate same-named rows. You read
+   it; you can't type against it.
+2. **The ranked list is windowed to 12 rows** (`PALETTE_VISIBLE_ROWS`), scrolled to
+   keep the highlight visible, rather than rendering an unbounded list. Wrapping
+   `Up`/`Down` still traverses the whole ranked set.
+3. **`JumpTarget` gained `Debug, PartialEq, Eq` derives** (`jump_panel_view.rs`) so
+   `PaletteTarget` could be compared and printed in test failures — the only edit
+   outside the palette's own files and the wiring.

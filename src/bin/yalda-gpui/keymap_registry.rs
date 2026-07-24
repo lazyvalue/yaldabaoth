@@ -149,6 +149,7 @@ const DEFAULT_BINDINGS: &[DefaultBinding] = &[
     b!("cmd-shift-o",       "ToggleOutlineRail", GLOBAL, "Rails", "Toggle outline rail"),
     b!("cmd-shift-b",       "FlipRailSide",    GLOBAL, "Rails", "Flip rail to other side"),
     b!("cmd-j",             "ToggleJumpPanel", GLOBAL, "Workspaces", "Toggle jump panel"),
+    b!("cmd-p",             "OpenJumpPalette", GLOBAL, "Workspaces", "Jump palette (fuzzy)"),
 
     // ── File browser (BrowserView) ───────────────────────────────────────────
     b!("j",       "BrowserDown",      BV, "File browser", "Move down"),

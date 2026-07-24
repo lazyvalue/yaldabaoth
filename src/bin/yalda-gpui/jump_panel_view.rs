@@ -31,7 +31,7 @@ pub(crate) const JUMP_PANEL_WIDTH: f32 = 220.0;
 /// be opened here (`Local`, keyed by store `SessionId`) or known only to the
 /// server via the roster (`Roster`, keyed by server sid) — running but never
 /// opened in this GUI.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum JumpTarget {
     Local(SessionId),
     Roster(String),

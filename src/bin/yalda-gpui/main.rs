@@ -76,6 +76,7 @@ mod browser_ui;
 mod chrome;
 mod edit_ui;
 mod highlight_cache;
+mod jump_palette;
 mod jump_panel_view;
 mod keymap_registry;
 mod keymap_tile;
@@ -99,6 +100,7 @@ pub(crate) use agent::*;
 pub(crate) use agent_naming::*;
 pub(crate) use agent_roster::*;
 pub(crate) use agent_sessions::*;
+pub(crate) use jump_palette::*;
 pub(crate) use jump_panel_view::*;
 pub(crate) use keymap_registry::*;
 pub(crate) use keymap_tile::*;
@@ -288,6 +290,9 @@ actions!(
         FlipRailSide,
         // Jump panel (jump-panel; spec-jump-panel.md). Global, `None` context.
         ToggleJumpPanel,
+        // Jump palette (UXI-JumpPanel-9): Cmd-P fuzzy jump over workspaces +
+        // agent sessions. Global, `None` context.
+        OpenJumpPalette,
         // Rail-focused navigation (`RailView` context):
         RailDown,
         RailUp,
@@ -1408,6 +1413,10 @@ enum ActiveOverlay {
     /// "Delete project?" confirmation for a non-empty project (UXI-Project-5);
     /// carries the target so confirm cascades exactly it.
     ConfirmProjectDelete(ProjectId),
+    /// The `Cmd-P` jump palette (UXI-JumpPanel-9): a fuzzy type-to-filter dialog
+    /// over every non-ephemeral workspace + every agent session. Carries the
+    /// query and the highlighted RANKED-list index.
+    JumpPalette(JumpPaletteOverlay),
     /// Project context menu (UXI-JumpPanel-8): a small popup anchored at the
     /// click position, offering the project-scoped create/delete actions. Carries
     /// the target project + the window-space anchor point (already clamped to the
@@ -4224,6 +4233,23 @@ impl YaldaGpuiView {
     fn confirm_delete_ref(&self) -> Option<ProjectId> {
         if let ActiveOverlay::ConfirmProjectDelete(id) = &self.active_overlay {
             Some(*id)
+        } else {
+            None
+        }
+    }
+    pub(crate) fn overlay_is_jump_palette(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::JumpPalette(_))
+    }
+    pub(crate) fn jump_palette_ref(&self) -> Option<&JumpPaletteOverlay> {
+        if let ActiveOverlay::JumpPalette(p) = &self.active_overlay {
+            Some(p)
+        } else {
+            None
+        }
+    }
+    pub(crate) fn jump_palette_mut(&mut self) -> Option<&mut JumpPaletteOverlay> {
+        if let ActiveOverlay::JumpPalette(p) = &mut self.active_overlay {
+            Some(p)
         } else {
             None
         }
@@ -7605,6 +7631,24 @@ impl Render for YaldaGpuiView {
                 }))
                 .child(screen_view)
                 .child(self.render_workspace_picker(cx))
+                .into_any_element();
+        }
+
+        // Jump palette (UXI-JumpPanel-9). Layered over the still-visible screen
+        // (no opaque body swap) so you keep your bearings while jumping; the
+        // capture handler owns every key, so the Cmd-P chord can't re-enter and
+        // no global binding leaks through.
+        if self.overlay_is_jump_palette() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("JumpPaletteView")
+                .size_full()
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_jump_palette_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_jump_palette(cx))
                 .into_any_element();
         }
 

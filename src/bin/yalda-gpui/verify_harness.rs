@@ -13975,3 +13975,325 @@ fn late_autoname_result_never_clobbers_a_user_rename(cx: &mut TestAppContext) {
         "…and it must not sneak its summary in either"
     );
 }
+
+// ---- UXI-JumpPanel-9: the Cmd-P jump palette ------------------------------
+//
+// The palette is a pure alternate INPUT onto the jump panel's list, so these
+// drive the real chord (`register_keymap` + `simulate_keystrokes`), the real
+// item projection (`jump_palette_items`, built from `jump_panel_sections`), and
+// the real activators (`select_workspace` / `jump_to_agent`). The ranking is a
+// pure function, so "the top row is the best match" is asserted directly rather
+// than inferred from paint.
+
+/// Give the boot workspace a typeable name and add `n` more named workspaces.
+/// Returns nothing — tests address workspaces by their labels, the way the user
+/// does.
+#[cfg(test)]
+fn name_workspaces(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    names: &[&str],
+) {
+    use crate::{App, BrowserWindow, BufferApp};
+    let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+    view.update(vcx, |v, _| {
+        let cwd = PathBuf::from(".");
+        while v.workspace.workspaces.len() < names.len() {
+            v.workspace.push_workspace_inheriting(App::Buffer(BufferApp::Picking(
+                BrowserWindow::standalone(cwd.clone()),
+            )));
+        }
+        for (i, n) in names.iter().enumerate() {
+            v.workspace.workspaces[i].display_name = Some(n.clone());
+        }
+        v.workspace.set_active_workspace(0);
+    });
+    vcx.run_until_parked();
+}
+
+/// UXI-JumpPanel-9 (1): `Cmd-P` opens the palette through the REAL keymap, and a
+/// second `Cmd-P` is a no-op — it neither closes it nor leaks a typed `p` into
+/// the query (the overlay captures keys before action dispatch, so the chord has
+/// to die in `handle_jump_palette_key`).
+#[gpui::test]
+fn jump_palette_cmd_p_opens_over_any_screen(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    name_workspaces(&view, vcx, &["alpha", "beta"]);
+
+    view.update(vcx, |v, _| {
+        assert!(!v.overlay_is_jump_palette(), "palette starts closed");
+    });
+
+    vcx.simulate_keystrokes("cmd-p");
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert!(
+            v.overlay_is_jump_palette(),
+            "cmd-p must open the jump palette on the focused screen"
+        );
+        assert_eq!(v.jump_palette_ref().unwrap().query, "", "opens with an empty query");
+    });
+
+    // Re-pressing the chord: still open, still empty — not a toggle, not a `p`.
+    vcx.simulate_keystrokes("cmd-p");
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert!(v.overlay_is_jump_palette(), "cmd-p while open is a no-op, not a toggle");
+        assert_eq!(
+            v.jump_palette_ref().unwrap().query,
+            "",
+            "the cmd-p chord must never type its bare letter into the query"
+        );
+    });
+}
+
+/// UXI-JumpPanel-9 (candidate set): the palette lists every non-ephemeral
+/// workspace AND every agent session, in panel order — and lists no project.
+#[gpui::test]
+fn jump_palette_lists_workspaces_and_sessions_in_panel_order(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    name_workspaces(&view, vcx, &["alpha", "beta"]);
+    add_free_session(&view, vcx, "gamma-session");
+
+    let (labels, agents) = view.update(vcx, |v, cx| {
+        let items = v.jump_palette_items(cx);
+        (
+            items.iter().map(|i| i.label.clone()).collect::<Vec<_>>(),
+            items.iter().map(|i| i.is_agent).collect::<Vec<_>>(),
+        )
+    });
+
+    assert!(labels.contains(&"alpha".to_string()), "workspaces are candidates: {labels:?}");
+    assert!(labels.contains(&"beta".to_string()), "every workspace is a candidate: {labels:?}");
+    assert!(
+        labels.contains(&"gamma-session".to_string()),
+        "agent sessions are candidates: {labels:?}"
+    );
+    // Panel order: a section's workspaces precede its sessions.
+    let first_agent = agents.iter().position(|a| *a).expect("at least one session row");
+    assert!(
+        agents[..first_agent].iter().all(|a| !*a),
+        "panel order puts a section's workspaces before its sessions: {agents:?}"
+    );
+}
+
+/// UXI-JumpPanel-9 (2): ranking, not mere filtering. A prefix hit outranks a
+/// late/scattered hit, and an exact hit outranks everything — so the TOP row is
+/// the best match rather than the first list member that happened to match.
+#[gpui::test]
+fn jump_palette_ranks_best_match_first(_cx: &mut TestAppContext) {
+    use crate::{fuzzy_score, rank_palette_items, PaletteItem, PaletteTarget};
+    let item = |label: &str, i: usize| PaletteItem {
+        target: PaletteTarget::Workspace(i),
+        label: label.to_string(),
+        detail: String::new(),
+        is_agent: false,
+        status: None,
+        active: false,
+    };
+    // Deliberately listed worst-first, so a "filter in panel order" impl fails.
+    let items = vec![
+        item("the yalda archive", 0), // scattered, late
+        item("yalda-gpui", 1),        // prefix
+        item("yal", 2),               // exact
+    ];
+    let ranked = rank_palette_items(&items, "yal");
+    assert_eq!(
+        ranked.iter().map(|&i| items[i].label.as_str()).collect::<Vec<_>>(),
+        vec!["yal", "yalda-gpui", "the yalda archive"],
+        "candidates must be ordered by match quality, best first"
+    );
+
+    // Non-matches are dropped entirely.
+    assert_eq!(rank_palette_items(&items, "zzz"), Vec::<usize>::new());
+    // An empty query keeps panel order.
+    assert_eq!(rank_palette_items(&items, ""), vec![0, 1, 2]);
+    // Word-start hits beat mid-word ones at equal length.
+    assert!(
+        fuzzy_score("my-agent-run", "mar").unwrap() > fuzzy_score("mmmagentrun", "mar").unwrap(),
+        "characters landing at word starts must score higher"
+    );
+}
+
+/// UXI-JumpPanel-9 (4): typing then `Enter` jumps to the top match, through the
+/// REAL keystroke path and the REAL activator (`select_workspace`).
+#[gpui::test]
+fn jump_palette_enter_jumps_to_top_match(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    name_workspaces(&view, vcx, &["alpha", "beta", "gamma"]);
+
+    vcx.simulate_keystrokes("cmd-p");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("g a m");
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        assert_eq!(v.jump_palette_ref().unwrap().query, "gam");
+        let (items, ranked) = v.jump_palette_ranked(cx);
+        assert_eq!(items[ranked[0]].label, "gamma", "top match is the typed workspace");
+    });
+
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert!(!v.overlay_is_jump_palette(), "enter closes the palette");
+        assert_eq!(
+            v.workspace.active_workspace, 2,
+            "enter jumps to the top match's workspace"
+        );
+    });
+}
+
+/// UXI-JumpPanel-9 (3)(4): arrows move the highlight WITHOUT navigating, and
+/// `Enter` activates the highlighted row — not the top match.
+#[gpui::test]
+fn jump_palette_arrows_select_and_enter_activates_the_selection(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    name_workspaces(&view, vcx, &["alpha", "beta", "gamma"]);
+
+    vcx.simulate_keystrokes("cmd-p");
+    vcx.run_until_parked();
+
+    // Empty query ⇒ full list in panel order; remember what row 1 points at.
+    let (second_label, started_on) = view.update(vcx, |v, cx| {
+        let (items, ranked) = v.jump_palette_ranked(cx);
+        assert!(ranked.len() >= 3, "empty query lists everything");
+        (items[ranked[1]].label.clone(), v.workspace.active_workspace)
+    });
+
+    vcx.simulate_keystrokes("down");
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert_eq!(v.jump_palette_ref().unwrap().selected, 1, "down moves the highlight");
+        assert_eq!(
+            v.workspace.active_workspace, started_on,
+            "moving the highlight must NOT navigate"
+        );
+    });
+
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    let landed = view.update(vcx, |v, _| {
+        assert!(!v.overlay_is_jump_palette());
+        v.workspace.workspaces[v.workspace.active_workspace].display_label().to_string()
+    });
+    assert_eq!(
+        landed, second_label,
+        "enter activates the HIGHLIGHTED row, not the top match"
+    );
+}
+
+/// UXI-JumpPanel-9 (5): a query nothing matches ⇒ `Enter` is a no-op and the
+/// palette stays open (a typo must not jump you somewhere arbitrary).
+#[gpui::test]
+fn jump_palette_no_match_enter_is_noop(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    name_workspaces(&view, vcx, &["alpha", "beta", "gamma"]);
+
+    vcx.simulate_keystrokes("cmd-p");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("z q x");
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        assert_eq!(v.jump_palette_ref().unwrap().query, "zqx");
+        assert!(v.jump_palette_ranked(cx).1.is_empty(), "nothing matches 'zqx'");
+    });
+
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert!(
+            v.overlay_is_jump_palette(),
+            "enter with no matches must leave the palette open"
+        );
+        assert_eq!(v.workspace.active_workspace, 0, "…and must not navigate");
+    });
+
+    // Backspacing back to a matching query re-ranks and re-highlights the top.
+    vcx.simulate_keystrokes("backspace backspace backspace b");
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        let (items, ranked) = v.jump_palette_ranked(cx);
+        assert_eq!(items[ranked[0]].label, "beta");
+        assert_eq!(v.jump_palette_ref().unwrap().selected, 0, "editing resets the highlight");
+    });
+}
+
+/// UXI-JumpPanel-9 (6): `Esc` closes with no navigation.
+#[gpui::test]
+fn jump_palette_escape_closes_without_navigating(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    name_workspaces(&view, vcx, &["alpha", "beta", "gamma"]);
+
+    vcx.simulate_keystrokes("cmd-p");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("g a m");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, _| {
+        assert!(!v.overlay_is_jump_palette(), "escape closes the palette");
+        assert_eq!(v.workspace.active_workspace, 0, "escape navigates nowhere");
+    });
+}
+
+/// UXI-JumpPanel-9 (7): the palette never clobbers a sibling overlay — the
+/// single `ActiveOverlay` slot is guarded, so `Cmd-P` over the rename/tag input
+/// (both text-entry surfaces) is a no-op.
+#[gpui::test]
+fn jump_palette_does_not_open_over_another_overlay(cx: &mut TestAppContext) {
+    use crate::{ActiveOverlay, WorkspacePicker, WorkspacePickerMode};
+    let (view, vcx) = boot_browser(cx);
+    name_workspaces(&view, vcx, &["alpha", "beta"]);
+
+    view.update(vcx, |v, cx| {
+        v.open_overlay(ActiveOverlay::WorkspacePicker(WorkspacePicker {
+            mode: WorkspacePickerMode::Move,
+            selected: 0,
+        }));
+        v.open_jump_palette_impl(cx);
+        assert!(
+            !v.overlay_is_jump_palette(),
+            "cmd-p must not steal the overlay slot from another overlay"
+        );
+        assert!(v.overlay_is_workspace(), "…and must leave that overlay intact");
+    });
+}
+
+/// UXI-JumpPanel-9: the palette actually PAINTS over the screen (a state-only
+/// assert can't catch a collapsed or unmounted overlay). Layout probe, per the
+/// anti-circling rule "assert on paint, not just state".
+#[gpui::test]
+fn jump_palette_paints_over_the_screen(cx: &mut TestAppContext) {
+    cx.update(crate::register_keymap);
+    let (view, vcx) = boot_browser(cx);
+    name_workspaces(&view, vcx, &["alpha", "beta", "gamma"]);
+
+    // Closed: nothing paints.
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let closed = crate::layout_probe_get("jump-palette");
+    crate::layout_probe_end();
+    assert!(closed.is_none(), "the palette must not paint while closed");
+
+    vcx.simulate_keystrokes("cmd-p");
+    vcx.run_until_parked();
+
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let open = crate::layout_probe_get("jump-palette");
+    crate::layout_probe_end();
+
+    let (_, _, w, h) = open.expect("the open palette did not paint");
+    assert!(
+        w > 0.0 && h > 0.0,
+        "the palette painted a collapsed box ({w}x{h}) — the rows/input never reached the screen"
+    );
+}
