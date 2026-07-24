@@ -1,6 +1,6 @@
 # Component: Project
 
-**Status:** draft
+**Status:** living
 **Component token:** `Project` (⇒ invariants are `UXI-Project-N`)
 
 ## Description
@@ -47,34 +47,45 @@ rename (the `tab` vocabulary is eradicated).
 ### UXI-Project-1 — A Project is a first-class, name-keyed object owning one cwd + a params bag
 
 **Statement.** A `Project { name, cwd, params }` exists as a real, persisted
-object. Its **name is unique** — the `Projects` store refuses a second project
-with an existing name — and it owns **exactly one cwd** and an extensible
-(empty-for-now) `params` map. The store's `by_name` index is private; creation is
-the only path to a project, so two projects sharing a name is unrepresentable.
+object. **Both its name and its cwd are unique** — the `Projects` store refuses a
+second project with an existing name *or* cwd — and it owns an extensible
+(empty-for-now) `params` map. The store's `by_name`/`by_cwd` indices are private;
+creation is the only path to a project, so two projects sharing a name — or a cwd
+— is unrepresentable. cwd-uniqueness makes `by_cwd` **total-or-none** (no
+ambiguous "first match"), which is what lets a project-agnostic server session
+infer its project (`UXI-Project-2`).
 
 **Applies to.** `project.rs` (new): `ProjectId`, `Project`, `Projects`
-(`create(name, cwd) -> Result<ProjectId, DuplicateName>`, `get`, `by_name`,
-`by_cwd`, `rename`, `iter`, `close`). Persisted via `persist.rs`
-(`~/.yalda/projects.json`).
+(`create(name, cwd) -> Result<ProjectId, CreateError>` where `CreateError =
+DuplicateName | DuplicateCwd(ProjectId)`; `ensure_at_cwd`, `get`, `by_name`,
+`by_cwd`, `membership_for_cwd`, `rename`, `set_cwd`, `close`, `first`, `iter`).
+Persisted via `persist.rs` (`~/.yalda/projects.json`).
 
 **Why.** The cwd was a display string, never an identity, so nothing could carry
 per-project configuration; objectifying it is what makes per-project settings
 possible.
 
-**Status.** `not implemented`.
+**Status.** `implemented` (T001, commit `e786c23`).
 
-**Enforcement.** `tests.rs`: `projects_store_enforces_unique_name` (create twice
-with one name → the second is refused; `by_cwd` resolves a path) — pure unit test,
-negative-control by removing the `by_name` check.
+**Enforcement.** `project.rs::projects_store_enforces_unique_name` (create twice
+with one name → refused; a second with an existing cwd → `DuplicateCwd`; `by_cwd`
+resolves) — pure unit test; NC observed RED by removing the `by_name` check.
+Plus `ensure_at_cwd_dedups_cwd_and_uniquifies_name`,
+`rename_and_repoint_preserve_uniqueness`, `membership_infers_or_unfiles_by_cwd`.
 
 ### UXI-Project-2 — Every workspace and session belongs to exactly one project; cwd is derived
 
-**Statement.** A `Workspace` carries `project: ProjectId` (not its own cwd); an
-`AgentSession` carries a project (locally-created sessions store the `ProjectId`;
-roster-only sessions resolve theirs by `Projects::by_cwd(session.cwd)`). The cwd
-used anywhere — the workspace's inherited cwd, the cwd spawned into an agent
-subprocess — is read **from the project**, never from a cwd field on the
-workspace/session. There is one source of truth for a project's directory.
+**Statement.** A `Workspace` carries a required, private `project: ProjectId`
+**foreign key** (not its own cwd — the ADR-0023 pattern, type swapped). An
+`AgentSession` likewise holds a `ProjectId` when locally created. The cwd used
+anywhere — the workspace's inherited cwd, the cwd spawned into an agent
+subprocess, the persistence/grouping key — is resolved **from the project at the
+point of use** (`projects.cwd_of(id)`), **never cached** on the workspace/session,
+so there is one source of truth and nothing to drift. A project-agnostic
+roster/server session (no stored assignment) has its project **inferred** from
+cwd via the three-valued `Membership::{Assigned | Inferred | Unfiled}` resolved at
+the roster boundary — an inference is recomputed every render, never persisted as
+authority.
 
 **Applies to.** `workspace.rs` (`Workspace::cwd` reads through the store),
 `agent.rs`/`agent_ui.rs` (`AgentSession.project`; `agent_base_cwd` resolves via
@@ -85,12 +96,22 @@ source of truth (ADR-0023 lifted to the project).
 **Why.** Two independent cwd fields (`WorkspaceCwd`, `AgentSession.cwd`) linked
 only at creation time is exactly the drift the project object removes.
 
-**Status.** `not implemented`.
+**Status.** `implemented` (T003, commit `da833be`).
 
-**Enforcement.** `verify_harness.rs`: `workspace_and_session_cwd_derive_from_project`
-(change a project's cwd → the workspace's inherited cwd and a session's spawn cwd
-both follow; NC: revert the derivation to a stored field → the change doesn't
-propagate).
+**Deviation from plan.** Only the **workspace** dropped its cwd for the FK.
+`AgentSession` **keeps** its `cwd: PathBuf`, reframed as the **immutable spawn
+directory** (server-side ground truth) — deriving a *running* agent's cwd from
+its project would be wrong the instant the project repoints (the agent is still
+in the old dir). The session's *project membership* is derived (`Membership`),
+not its cwd. So T003 changed no `AgentSession` field; ADR-0028 §3 was corrected to
+match.
+
+**Enforcement.** `verify_harness.rs::workspace_and_session_cwd_derive_from_project`
+(point the active workspace at a project rooted at A → `agent_base_cwd()` == A;
+repoint the project's cwd to B → it follows live, proving derived-not-cached; NC:
+disable `p.cwd = cwd` in `Projects::set_cwd` → stays A, observed RED). The FK swap
+is additionally covered by the pre-existing `workspace_cwd_inheritance` /
+`workspace_cwd_persists_across_restart` passing on the new path.
 
 ### UXI-Project-3 — The jump panel renders the project hierarchy
 
@@ -113,12 +134,29 @@ workspaces-per-project sublist; the workspace-number badge stays global.
 **Why.** The user wants to see the whole hierarchy — which workspaces and agents
 belong to which project — at a glance, and to create either scoped to a project.
 
-**Status.** `not implemented`.
+**Status.** `implemented` (T004 core `caadfc9`; T004-tail T005). The jump panel
+now renders one section per project (`jump_panel_sections` → `render_jump_panel`):
+project header (name + dim cwd) + a WORKSPACES sublist (filtered by
+`tab.project()`, global `idx+1` badge) + AGENT SESSIONS + inline ＋New workspace /
+＋New agent session rows, plus a top-level ＋New project row. Empty projects still
+render a section; individual tiles are not listed.
 
-**Enforcement.** `verify_harness.rs`: `jump_panel_groups_workspaces_and_sessions_by_project`
-(two projects each with a workspace + a session → the real `render_jump_panel`
-row model shows two project sections, each listing its own workspace and session,
-tiles absent; NC: collapse to a flat list → the section structure disappears).
+**Deviation from plan.** (1) Section ORDER reuses the existing `jump_cwd_order`
+drag order keyed on the project's cwd display (the project header stays a
+`CwdDrag` source/target), falling back to project-id order — the `order_grouped_rows`
+"cwd order → project order" reframe was kept as a cwd-keyed order rather than a
+new project-id order list, so empty projects can't yet be drag-reordered (they
+sort by id). (2) Unfiled sessions (a cwd no project roots) still render under
+electric-blue path headers in a trailing **Unfiled** section, preserving the
+prior behavior for free roster sessions in dir-less projects.
+
+**Enforcement.** `verify_harness.rs::jump_panel_renders_per_project_sections`
+(two projects each with a workspace + one session at A's cwd → A's section lists
+its own workspace by GLOBAL index and NOT B's, B renders an empty section, the
+session groups under A, badges are distinct global numbers; NC: drop the
+`t.project() == id` workspace filter → A lists B's workspace, observed RED). Plus
+the pre-existing `jump_panel_groups_sessions_by_project` (header resolves to the
+project name; NC: force the path fallback → RED).
 
 ### UXI-Project-4 — Creating a project asks for a name + cwd and starts empty
 
@@ -137,11 +175,18 @@ cwd), its open + commit routing → `Projects::create`; `jump_panel_view.rs` the
 **Why.** A project is the create scope; making name+cwd explicit at birth is what
 lets everything below inherit the cwd.
 
-**Status.** `not implemented`.
+**Status.** `implemented` (T005). `ActiveOverlay::NewProject` (a two-field
+name+cwd overlay, Tab toggles the field) → `commit_new_project_overlay` →
+`Projects::create`; a duplicate name/cwd or a bad cwd surfaces a transient error
+and creates nothing; an empty name cancels. The jump panel's per-project ＋New
+workspace / ＋New agent session rows call `new_workspace_in(pid)` /
+`new_agent_session_in(pid)` (cwd = the project's, no prompt).
 
-**Enforcement.** `verify_harness.rs`: `new_project_overlay_creates_empty_project_and_rejects_dup`
-(commit with a name+cwd → store gains an empty project; commit a dup name → error
-note, no new project; NC: no-op the dup guard → a second project appears).
+**Enforcement.** `verify_harness.rs::new_project_overlay_creates_empty_project_and_rejects_dup`
+(drives `open_new_project_overlay` → edit fields → `commit_new_project_overlay`:
+the store gains ONE empty project; a second commit with the same name adds nothing
+and sets an "already exists" note; NC: remove the `by_name` guard in
+`Projects::create` → the dup is accepted and `len` grows, observed RED).
 
 ### UXI-Project-5 — Deleting a project confirms when non-empty, then cascades
 
@@ -161,12 +206,39 @@ affordance). Persistence drops the project from `projects.json`.
 workspaces/sessions pointing at a dead project; persisting empty projects lets a
 project be a durable place you set up before filling.
 
-**Status.** `not implemented`.
+**Status.** `implemented` (T005). The jump-panel project header carries a ✕
+affordance → `request_delete_project`: a non-empty project arms
+`ActiveOverlay::ConfirmProjectDelete(pid)`, an empty one deletes directly.
+`perform_delete_project` kills the project's sessions (local via
+`AgentSessions::close` + off-thread `spawn_close_session`; roster-only sids
+dropped + server-closed), closes its workspaces descending, seeds a placeholder
+under a surviving project if that would empty the frame (Behavior 2), then
+`Projects::close` + `save_persisted_projects`. A focused agent tile whose session
+was killed falls back to its selector.
 
-**Enforcement.** `verify_harness.rs`: `delete_nonempty_project_confirms_then_cascades`
-(delete a project with a workspace + session → confirm required → on confirm both
-are gone and the project is removed; an empty project deletes without a workspace/
-session left behind; NC: skip the cascade → an orphaned session survives).
+**Never zero projects.** Deleting the **last** project mints a fresh default
+(rooted at the process dir, named from it) and seeds the replacement workspace
+under THAT — the "never zero projects" twin of "never zero workspaces". The
+delete closes the project *first*, then derives the survivor from what remains, so
+a workspace can never point at a deleted project id (adversarial-review-caught bug,
+commit `e25a43b`).
+
+**Deviation from plan.** The cascade lives in `main.rs::perform_delete_project`
+(not split into `agent_ui.rs`) since it orchestrates workspaces + projects +
+sessions together. The live-server `close_session` round-trip is off-thread
+against the daemon (harness gap #2); the headless guard asserts the store /
+overlay / workspace state transitions (the reducer side), not the subprocess.
+
+**Enforcement.** `verify_harness.rs::delete_nonempty_project_confirms_then_cascades`
+(a project with a workspace + a session: `request_delete_project` arms the confirm
+and removes NOTHING; `perform_delete_project` then drops the project, kills the
+session (`sessions.close`), closes the workspace, and leaves ≥1 workspace; an
+empty project deletes with no confirm; NC: skip the session-kill loop → the
+orphaned session survives, observed RED). Plus
+`delete_last_project_mints_a_fresh_default` (deleting the sole project leaves a
+non-empty store + a workspace pointing at a LIVE project + a resolvable
+`active_project`; NC: restore the `unwrap_or(pid)` survivor computed before close →
+orphaned workspace, observed RED).
 
 ### UXI-Project-6 — Session↔tile binding is intra-project only
 
@@ -186,12 +258,32 @@ project predicate.
 workspace (different cwd) would misrepresent where the agent runs — the same
 honesty rule as the jump-panel cwd-gate (`UXI-JumpPanel-2`).
 
-**Status.** `not implemented`.
+**Status.** `implemented` (T006). Three layers enforce intra-project binding:
+(1) `picker_projection` (`agent_ui.rs`) filters the selector/free-session list on
+the tile's project (`projects.by_cwd(cwd)`), not a raw cwd; (2) `jump_to_session`
+(free branch) and `jump_to_roster_session` open the ephemeral virtual workspace
+via `Workspace::open_ephemeral_tab_in(content, project)` pinned to the SESSION's
+own project (resolved from its spawn cwd), so the subsequent bind is intra-project
+by construction; (3) `picker_attach_existing` — the shared attach choke both the
+picker and the roster-jump funnel through — carries a hard cross-project guard
+(session project via `projects.by_cwd(session.cwd)` vs the active project) that
+aborts before minting a placeholder and sets a transient note.
 
-**Enforcement.** `verify_harness.rs`: `bind_refused_across_projects_allowed_within`
-(a free session of project A binds to a tile in an A-workspace; the same bind into
-a B-workspace tile is refused and the selector doesn't list it; NC: drop the
-project predicate → the cross-project bind succeeds).
+**Deviation from plan.** The bind gate lives at `picker_attach_existing`
+(upstream of `bind_session_sid`/`apply_open_agent_resolution`, which lack
+tile/project context), not in `agent_sessions.rs` — those stay the store-side 1:1
+choke. Because (1) filters the selector and (2) redirects the free-session jump to
+the session's own project, no normal UI path reaches the (3) hard refusal with a
+cross-project session; it is defense-in-depth. The `OpenResolution::Created`
+(brand-new session) path is same-project by construction (created at
+`agent_base_cwd`) and is not gated.
+
+**Enforcement.** `verify_harness.rs::bind_refused_across_projects_allowed_within`
+(a free ROSTER session of project B is omitted from an A-tile's selector; a direct
+`picker_attach_existing(A tile ← B session)` is refused — nothing binds, a
+transient note is set; pointing the workspace at B and attaching the same session
+succeeds). NCs observed RED: disabling the Part-4 guard → the A tile binds the B
+session; removing the Part-3 filter → B's session lists in A's selector.
 
 ### UXI-Project-7 — The active project is derived; create entry points scope to it
 
@@ -210,13 +302,28 @@ project's cwd), `jump_panel_view.rs` (the removed global ＋ row).
 **Why.** With cwd on the project, there is no free-floating cwd to prompt for;
 the create scope is always a project, so the active project is a pure derivation.
 
-**Status.** `not implemented`.
+**Status.** `implemented` (removal half in T005; derivation in T006). Both global
+cwd overlays are gone: `RenameTarget::FreeAgentSessionCwd` + `AgentNewSessionCwd`
+and their open / commit / render arms are deleted, the `?`-menu "new agent
+session" entry and its `new-free-agent-session` dispatch arm are removed, and
+`claude-new-here` is retired — a session is created only via a project's ＋ row.
+The `active_project()` derivation now exists (`agent_ui.rs`): focused workspace's
+project → focused (bound) session's project → `projects.first()`. `agent_base_cwd`
+was already the active project's cwd via `active_workspace_cwd` (T003), so it is
+the cwd twin of `active_project` and needed no change.
 
-**Enforcement.** `verify_harness.rs`: `active_project_derives_from_focus`
-(focus an A-workspace → active project A; focus a B-session tile → B; NC: hardcode
-the first project → focus changes don't move it) and
-`global_cwd_session_overlay_is_gone` (the removed entry point no longer opens a
-cwd overlay).
+**Deviation from plan.** In practice the workspace branch of `active_project`
+dominates — an active tab always carries a project, so the session + `first()`
+fallbacks are only reachable in the transient no-tab state; they are implemented
+for spec fidelity and totality. The derivation lives in `agent_ui.rs` (beside
+`agent_base_cwd`), not `main.rs`.
+
+**Enforcement.** `verify_harness.rs::active_project_derives_from_focus`
+(point the active workspace at project A → `active_project()` == A; jump a free
+B-session — its ephemeral workspace opens under B per UXI-Project-6 — → it follows
+to B; NC: hardcode `active_project` to `projects.first()` → focus changes don't
+move it, observed RED) plus `global_cwd_session_overlay_is_gone` (the removed
+entry point no longer opens a cwd overlay).
 
 ### UXI-Project-8 — Migration maps existing cwds to named projects, losslessly
 
@@ -237,10 +344,19 @@ absent, then bind workspaces/sessions to projects). Uses `cwd_match_key`
 **Why.** Existing live state must land in named projects with zero loss on the
 first run of the new model; the two known cwds get the user's chosen names.
 
-**Status.** `not implemented`.
+**Status.** `implemented` (T002, commit `e786c23`; wired into boot in T003 via
+`boot_projects`). The store-level migration + naming + self-heal are done; the
+persisted round-trip is guarded. The two named cwds fall out of the general
+basename rule (`ws/yaldabaoth`→Yaldabaoth, `ws/fulcrum`→Fulcrum).
+
+**Deviation from plan.** Realized as `migrate_cwds_to_projects` +
+`project_name_for_cwd` (basename, first-letter-capitalized) + `ensure_at_cwd`
+(dedups by canonical cwd, uniquifies a clashing name). Boot resolves via
+`boot_projects` (`persist.rs`): load `projects.json` if present, else migrate.
 
 **Enforcement.** `tests.rs` (pure serde + migration, no `~/.yalda`):
-`migration_maps_known_cwds_and_basename_fallback` (a synthetic snapshot with the
-two known cwds + one other → three projects with the right names, every workspace/
-session re-pointed, nothing dropped; NC: drop the fallback → the third cwd's items
-are orphaned/lost, observed RED).
+`migration_maps_known_cwds_and_basename_fallback` (two known cwds + one other →
+three named projects, dup folded, nothing dropped; NC: replace the naming
+derivation with a constant → all fold to one, observed RED),
+`project_name_for_cwd_capitalizes_basename`, `projects_persist_round_trips_via_disk`
+(names + cwds + params round-trip through the `cfg(test)` path seam).

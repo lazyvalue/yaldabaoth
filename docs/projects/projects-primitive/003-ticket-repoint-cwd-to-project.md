@@ -1,9 +1,22 @@
 # 003 — Re-point workspaces + sessions at `ProjectId`; cwd derived
 
 **Goal.** Make the project the single source of a directory: a workspace and a
-session reference a `ProjectId`; every cwd read resolves through the store.
-(`UXI-Project-2`.) This is the largest mechanical step (mirrors the
-agent-model-refactor's ownership move).
+session hold a `ProjectId` **foreign key** and the cwd is resolved at each point
+of use — **never cached** on the workspace/session (ADR-0028 §3, the locked
+model). Delete `WorkspaceCwd` / `Tab::cwd` / `default_cwd` outright. This is the
+largest mechanical step (mirrors the agent-model-refactor's ownership move).
+
+**Boot ordering (new constraint from the FK model):** the `Projects` store must
+be built *before* the `Workspace`, because `Tab::with_layout` now takes a
+`ProjectId` (not a cwd). Boot: load `projects.json` (`projects_from_persisted`)
+else `migrate_cwds_to_projects(existing workspace+session cwds)` → then build the
+workspace passing project ids. The store lives on `YaldaGpuiView` (`projects:
+Projects`).
+
+**Session membership:** locally-created sessions store `ProjectId`
+(`Membership::Assigned`); roster/server sessions resolve `Membership::Inferred`
+via `projects.by_cwd(session.cwd)` at the roster boundary — never persisted as an
+assignment.
 
 ## Subtasks
 

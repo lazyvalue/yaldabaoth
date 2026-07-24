@@ -13,6 +13,30 @@ workspaces + sessions + a shared cwd + configuration," so per-project
 configuration is impossible and the two cwd fields can drift. The user wants a
 first-class **Project** at the top of a named hierarchy.
 
+## Status (2026-07-23) — architecture landed green (branch `projects-primitive`, 421 tests)
+
+**Done + verified (4 commits on the branch):**
+- **T001** — `project.rs` `Projects` store: name+cwd both unique, `Membership`,
+  `ensure_at_cwd`. (`e786c23`)
+- **T002** — `projects.json` persistence + `migrate_cwds_to_projects` +
+  `boot_projects`. (`e786c23`)
+- **T003** — the FK swap: workspaces hold a required-private `ProjectId`; cwd
+  **derived** at the point of use, never cached; boot builds projects before the
+  workspace; `AgentSession` keeps its immutable spawn cwd (corrected §3). (`da833be`)
+- **T004 core** — jump-panel session group headers show the owning **project
+  name** (`jump_group_header`). (`caadfc9`)
+
+**Model locked** (ADR-0028, after a Fable architecture review): `ProjectId`
+**foreign key**, cwd resolved live (**never cached** — the denormalized cache is
+rejected by name in the ADR), both `name` and `cwd` unique, three-valued
+`Membership` for project-agnostic server sessions.
+
+**Remaining:** T004 tail (per-project WORKSPACES sublist + per-project ＋New rows +
+top-level ＋New project), T005 (create/delete-project overlays + cascade; remove the
+global cwd overlay), T006 (intra-project bind gate + `active_project()` from focus),
+T007 (the `tab`→`workspace` / `Workspace`→`Frame` eradication — one mechanical sweep,
+last). Each still owes its `UXI-Project-N` guard + NC.
+
 ## The model (see ADR-0028 for full rationale)
 
 - **Project** = `{ name (unique key), cwd (one), params (empty bag) }`, owned by a
@@ -52,11 +76,11 @@ first-class **Project** at the top of a named hierarchy.
 |---|--------|------|--------|
 | 001 | `project` module: `Project`/`ProjectId`/`Projects` store + unit tests | — | DONE |
 | 002 | Persistence + migration (`projects.json`, cwd→named-project) | 001 | DONE |
-| 003 | Re-point workspaces + sessions at `ProjectId`; cwd derived | 001,002 | READY |
-| 004 | Jump panel renders the project hierarchy | 003 | READY |
-| 005 | Create/delete project + per-project create; remove global cwd overlay | 003,004 | READY |
-| 006 | Intra-project binding + active-project derivation | 003 | READY |
-| 007 | `tab`→`workspace` / `Workspace`→`Frame` rename; eradicate `tab`; supersede ADR-0002 | — (last) | READY |
+| 003 | Re-point workspaces at `ProjectId`; cwd derived (FK) | 001,002 | DONE |
+| 004 | Jump panel renders the project hierarchy | 003 | DONE |
+| 005 | Create/delete project + per-project create; remove global cwd overlay | 003,004 | DONE |
+| 006 | Intra-project binding + active-project derivation | 003 | DONE |
+| 007 | Eradicate `tab`: Tab→Workspace, Workspace→Frame rename | (last) | DONE |
 
 Sequencing: 001→002→003 are the load-bearing spine (types → persistence/migration
 → model re-point). 004/005/006 are the UX surface on top of 003 and can overlap.

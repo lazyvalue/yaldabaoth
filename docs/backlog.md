@@ -34,8 +34,29 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   `u` pops. Guard `worksheet_esc_u_backs_out_reply_block` (real keystrokes; NC
   observed RED). Headless — no runtime gap beyond painted glyphs (#1).
 
-- **Projects as the top-level organizational primitive** — `NEEDS-DECISION`
-  (captured 2026-07-23 via `/new-ux`; interrogation in progress). User: "Change our
+- **Projects as the top-level organizational primitive** — `NEEDS-RUNTIME`
+  (branch `projects-primitive`, **all 7 tickets landed + green**, 2026-07-23 via
+  `/new-ux` + a Fable-advised workflow; **not yet merged to `main`**). All of
+  `UXI-Project-1..8` implemented; 426 tests green; adversarial review caught one
+  last-project-delete bug, fixed + guarded (`e25a43b`). Runtime-unverified in the
+  live GUI (the daemon session-close/create round-trips + pixels are harness
+  gaps #1/#2). **Next step: merge to `main` + a human launch.** Model + tickets:
+  ADR-0028 + `docs/components/project.md` (`UXI-Project-1..8`) + `/plan`
+  `docs/projects/projects-primitive/`.
+  **Landed + verified (branch `projects-primitive`, 421 tests green, 4 commits):**
+  T001 `Projects` store (name+cwd unique, `Membership`, `ensure_at_cwd`); T002
+  `projects.json` persistence + migration + `boot_projects`; **T003** the FK swap —
+  the workspace holds a required-private `ProjectId`, cwd is **derived** at the
+  point of use and **never cached** (`workspace_and_session_cwd_derive_from_project`,
+  NC RED); T004 core — jump-panel session headers show the owning **project name**.
+  Fable-advised durable model: `ProjectId` foreign key (denormalized cache rejected
+  by name in the ADR); `AgentSession` keeps its immutable spawn cwd (corrected §3).
+  **Remaining (well-scoped, each owes a UXI guard):** T004 tail (per-project
+  workspaces sublist + per-project ＋New rows + top-level ＋New project); T005
+  create/delete-project overlays + cascade + remove the global cwd overlay; T006
+  intra-project bind gate + `active_project()`; T007 the `tab`→`workspace` /
+  `Workspace`→`Frame` eradication (supersedes ADR-0002's deferral). Not yet merged
+  to `main`. Original ask: "Change our
   organizational primitive vocabulary and hierarchy. Projects are at the top.
   Projects have a CWD, and a map of other parameters. Workspaces belong to projects;
   Tiles are in workspaces. Agent sessions belong to projects; they can also be bound

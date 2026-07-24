@@ -42,9 +42,12 @@ struct Project {
 }
 ```
 
-- **Name is the unique key.** One `Project` per name. cwd is a *property*, not
-  the key (in practice one project per cwd, but that is not enforced — the user
-  chose name-uniqueness).
+- **Name AND cwd are both unique.** Name is the human key (renameable, the
+  persistence reference); cwd is *additionally* enforced unique so `by_cwd` is
+  **total-or-none** — one project per directory, no ambiguous "first match."
+  (The user wants name-uniqueness and "not more than one project per cwd";
+  enforcing both now is free — you can *relax* a uniqueness constraint later with
+  zero migration, but you cannot *add* one once duplicates exist. Fable advisory.)
 - **cwd lives ONLY on the project.** Workspaces and sessions no longer carry
   their own cwd; they reference a project and read the cwd *from* it. This
   enforces mechanically what `spec-agent-cwd.md` always intended ("a workspace is
@@ -69,17 +72,47 @@ agent-session 1:1 bugs (`spec-agent-session-ownership.md`). Creation
 (`create(name, cwd)`) rejects a duplicate name; `by_cwd(path)` resolves a cwd to
 a project (first match — the practical-1:1 case is unambiguous).
 
-### 3. Workspaces and sessions reference a project by id; cwd is derived
+### 3. Workspaces and sessions hold a `ProjectId` foreign key; cwd is NEVER stored on them
 
-- `Workspace` (renamed `Tab`, see §5) replaces `cwd: WorkspaceCwd` with
-  `project: ProjectId`. Its cwd is `projects.get(project).cwd`.
-- `AgentSession` replaces `cwd: PathBuf` with `project: ProjectId`. The cwd
-  spawned into the subprocess is read from the project.
+The cwd **leaves the layout tree and the session entirely** — it is normalized
+onto the project and resolved at each point of use. This is not "thread the store
+everywhere": `workspace.rs` is a generic layout container (`Workspace<C>`) that
+never actually *consumes* a cwd; every real consumer (agent-subprocess spawn,
+jump-panel grouping, persistence key, new-workspace inheritance) already sits at
+the view layer holding the `Projects` store. So the cwd read moves **up** to the
+consumers; nothing is pushed **down** into the layout tree.
+
+- `Workspace` (renamed `Tab`, §5) drops `cwd: WorkspaceCwd` and holds
+  `project: ProjectId` — a **required, private** field, exactly the ADR-0023
+  pattern with the type swapped (a workspace without a project is
+  unrepresentable). `WorkspaceCwd`, `Tab::cwd`, `default_cwd`/`inherited_cwd`'s
+  cwd form are deleted; the new-workspace inheritance copies the active
+  workspace's `ProjectId`.
+- `AgentSession` **keeps** its `cwd: PathBuf` — but reframed: this is the
+  **immutable spawn directory** the subprocess actually runs in (server-side
+  ground truth), NOT a cached copy of the project's cwd. It is legitimately owned
+  by the session (deriving it from the project would be *wrong* the instant the
+  project repoints — the running agent is still in the old dir). The session's
+  **project membership** is what's derived, via `Membership` (below): `Inferred`
+  from `projects.by_cwd(session.cwd)` today, upgradeable to a stored `Assigned`
+  `ProjectId` when the server-metadata endgame lands. So T003 changes **no
+  `AgentSession` field**; only the workspace loses its cwd.
 - **Server/roster sessions are project-agnostic** (the session server knows
-  nothing about projects). A roster-only session is mapped to a project by
-  `Projects::by_cwd(session.cwd)` at render time — exactly how the jump panel
-  groups by cwd today, but resolving to a stable `ProjectId` instead of a display
-  string. Locally-created sessions carry their `ProjectId` directly.
+  nothing about projects — a self-imposed constraint, see Consequences). Their
+  membership is *inferred* from cwd, never stored as authority. This is modeled
+  as a three-valued `Membership` resolved at the roster boundary:
+  - `Assigned(ProjectId)` — the stored foreign key (authoritative).
+  - `Inferred(ProjectId)` — `Projects::by_cwd(session.cwd)` for a foreign
+    session with no assignment (recomputed every render, **never persisted** as
+    an assignment — persisting a guess turns it into fake authority that
+    survives a rename/repoint).
+  - `Unfiled(cwd)` — the honest "no project roots this cwd" state (rendered by
+    shortened path); creation is deliberate, so a jump never auto-creates.
+
+There is **no cached cwd anywhere**, so there is nothing to keep in sync. A
+project cwd repoint therefore affects **new** spawns/pickers/grouping only; an
+already-running agent subprocess keeps its original spawn cwd (server-side,
+immutable) — see Consequences.
 
 ### 4. Binding is intra-project only
 
@@ -137,6 +170,24 @@ drops data (same discipline as `UXI-Workspace-7`).
 
 ## Alternatives rejected
 
+- **Denormalized cwd cache + single-writer resync** (workspace/session keep a
+  cached `cwd` refreshed by a `resync_project_cwds` walk on every project-cwd
+  change). **Rejected by name** — it reintroduces the cached-derivable-data /
+  drift bug class this entire effort exists to eliminate (the same class the
+  typed `WorkspaceCwd` field was created to kill). A foreign key on a row is
+  normalization; caching the joined column is not. (Fable advisory: "Option B
+  should be rejected in the ADR by name.")
+- **Thread `cwd(&projects)` through `workspace.rs`** (pure derivation, store
+  pushed down). Rejected as a *false premise*: `workspace.rs` never consumes a
+  cwd, so there is nothing to thread — §3's "read at the consumer" achieves pure
+  derivation without touching a single layout-tree signature.
+- **A view-side `TabId → ProjectId` side map** instead of a field on the tab.
+  Rejected — it makes "a workspace without a project" representable again (the
+  exact failure ADR-0023 fixed) and must be hand-maintained at every
+  workspace-creation path; someone forgets one. The FK belongs *on* the tab.
+- **cwd as the project key** (a project *is* its directory). Rejected by the user
+  in favor of a renameable name key; cwd is enforced as a unique *attribute*
+  (§1), which gives deterministic `by_cwd` without making cwd the identity.
 - **Nest `Vec<Project>` inside the frame, each owning `Vec<Workspace>`.** Rejected
   — it would re-thread focus/active-workspace/persistence through a second
   container level and fight the flat `Vec<Workspace>` the code already has. The
@@ -166,6 +217,29 @@ drops data (same discipline as `UXI-Workspace-7`).
   The change-cwd flow (`AgentChangeCwd`) is reframed as "move session to another
   project" (or retired) — resolved in the component spec.
 - **Per-project configuration becomes possible** — the point of the whole change.
+  `params` is the stringly-bag reborn (ADR-0023's lesson): promote each param to
+  a typed field the moment it gains a consumer; the map is for opaque passthrough
+  only.
+- **Persisted references use the project NAME, not the runtime `ProjectId`** (a
+  memory-only counter). Load order is `projects.json` → `workspace.json` /
+  `acp_sessions.json`, and load is **self-healing**: an unresolved name resolves
+  via `ensure_at_cwd(cwd, name)` using the cwd the record already carries (the
+  server needs a session cwd regardless, so it is kept in `acp_sessions.json`), so
+  nothing dangles on a partial write or hand-edit.
+- **A project cwd repoint affects new spawns only.** Everything resolves live, so
+  new agents/pickers/grouping follow immediately; an already-running agent
+  subprocess keeps its original (server-side, immutable) spawn cwd. This is the
+  bug class the FK model prevents and the rejected cache would have created.
+- **Delete = confirm-then-cascade** (the user's choice): a project with
+  workspaces or live sessions prompts, then on confirm closes its workspaces and
+  kills its sessions. The confirm makes the session kills a *deliberate user
+  gesture*, not a silent cascade (reconciles with the "never silently touch
+  server sessions" principle). An empty project deletes directly.
+- **Server-side session→project metadata is the durable endgame** (a follow-up
+  ticket): `yalda-session-server` is ours, so a future opaque per-session
+  metadata bag (`project=<name>` written at create) lets any client recover
+  `Assigned` membership with no cwd inference — demoting `by_cwd` to a
+  migration-era fallback. Not blocking this pass.
 - Behavior is UX-visible; ships behind the `UXI-Project-N` invariants in
   `docs/components/project.md` with headless guards, and the pixel/gesture bits
   flagged `NEEDS-RUNTIME`.

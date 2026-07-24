@@ -45,6 +45,9 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 - [workspace.md](workspace.md) — `Workspace` (the infinite-plane model: signed
   all-directions slot grid + pan/semantic-zoom camera + reset-to-origin;
   layout-mode/split surface retired). `UXI-Workspace-1..7`.
+- [project.md](project.md) — `Project` (top-level org primitive: name+cwd-keyed
+  store, workspaces/sessions hold a `ProjectId` FK, `Frame → Project → Workspace →
+  Window`). `UXI-Project-1..8` — all implemented (ADR-0028).
 - [rail.md](rail.md) — `Rail`.
 - [keybindings.md](keybindings.md) — `Keybindings`. `UXI-Keybindings-1`.
 - [common/](common/README.md) — shared behaviors: `TextEditing`, `Selection`,
