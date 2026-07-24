@@ -44,7 +44,7 @@ Both worktrees under `.claude/worktrees/`; removed after merge.
 - **Command rename** — `new-browser-tile` → `new-buffer-tile`,
   `inplace-browser-tile` → `inplace-buffer-pick`. Any external keybind/doc refs
   should be re-checked.
-- **`spec-tabs-and-splits.md`** is still referenced (code + ADR-0019) but does
+- **`spec-workspaces-and-splits.md`** is still referenced (code + ADR-0019) but does
   not exist — the workspace tree was never given its own spec.
 - **Buffer pool still unwired** (`workspace.rs` `buffer_retain`/`FileBufferId`)
   — the App restructure did not touch it; shared-doc multi-membership remains
@@ -62,5 +62,5 @@ Both worktrees under `.claude/worktrees/`; removed after merge.
 
 ## Next
 - `cargo insta accept` to clear the two stale snapshots (separate, pre-existing).
-- Optionally write `spec-tabs-and-splits.md` to retire the dangling reference.
+- Optionally write `spec-workspaces-and-splits.md` to retire the dangling reference.
 - Re-check any keybindings/docs for the renamed `*-tile` / `*-buffer-pick` commands.

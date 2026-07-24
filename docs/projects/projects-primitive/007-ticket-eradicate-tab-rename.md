@@ -20,7 +20,7 @@ LAST** — one mechanical sweep after the earlier tickets stop churning call-sit
 - [ ] User strings: keymap label `"Tabs & workspaces"`→`"Workspaces"`; descs
       "New/Close/Rename tab"→"…workspace"; test literal `"tab-1"`→`"workspace-1"`.
 - [ ] Comments (~200) + docs (~250, incl. renaming/retiring
-      `spec-tabs-and-splits.md` prose) — workspace-concept only.
+      `spec-workspaces-and-splits.md` prose) — workspace-concept only.
 - [ ] **DO NOT TOUCH:** physical Tab key (`Key::Tab`, `ctrl-tab` keystroke,
       `NextBuffer`/`PrevBuffer` on `tab`), tab-character/indentation, markdown
       `Table*` types.

@@ -14,7 +14,7 @@ persisted layout leaf, so restore rebinds each tile to its OWN session.
 
 - ADR-0025 — identity-based binding + auto-resume (the decision).
 - `spec-agent-session-ownership.md` — the live 1:1 store invariant.
-- `spec-tabs-and-splits.md` Behavior 23–24 — workspace persistence.
+- `spec-workspaces-and-splits.md` Behavior 23–24 — workspace persistence.
 - Code: `agent.rs::AgentTile.resume_sid`, `agent_ui.rs::save_agent_ring`,
   `persist.rs::{snapshot_content, restore_layout, PersistedKind::Agent}`,
   `main.rs::restore_agent_leaves`.

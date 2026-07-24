@@ -2,7 +2,7 @@
 
 **Status:** DRAFT
 **Last updated:** 2026-06-06
-**Builds on:** `spec-tabs-and-splits.md` (workspace / tab / layout tree), `spec-workspaces-tagging.md` (research — Option C adopted here), `spec-rail.md` (per-tab chrome)
+**Builds on:** `spec-workspaces-and-splits.md` (workspace / tab / layout tree), `spec-workspaces-tagging.md` (research — Option C adopted here), `spec-rail.md` (per-tab chrome)
 
 ## Overview
 
@@ -253,7 +253,7 @@ with `Ctrl-W s/v/c/o` and the tree persists as-is. Layout algorithms
 do not touch the tree. All existing workspace operations
 (`split_focused`, `close_focused`, `resize_focused`, `equalize_focused`,
 `focus_motion`, `only`) work exactly as specified in
-`spec-tabs-and-splits.md`.
+`spec-workspaces-and-splits.md`.
 
 #### 15 · Automatic mode constraints [DRAFT]
 

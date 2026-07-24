@@ -5,7 +5,7 @@ later **completed** by ADR-0028 §5 (project T007): `Tab<C>`→`Workspace<C>`, t
 container `Workspace<C>`→`Frame<C>`. The "strings-only, type stays `Tab`" stance here
 is superseded.
 **Date:** 2026-06-02
-**Related:** spec-workspaces-tagging.md, spec-tabs-and-splits.md, ADR-0005
+**Related:** spec-workspaces-tagging.md, spec-workspaces-and-splits.md, ADR-0005
 
 ## Context
 

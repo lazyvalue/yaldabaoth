@@ -29,7 +29,7 @@ Shared vocabulary for the GUI's containment hierarchy:
 
 The code-level struct is still called `Window`, but in discussion we say **tile**
 to avoid confusion with the OS-level frame. See
-`docs/specs/spec-tabs-and-splits.md` (tabs/splits) and
+`docs/specs/spec-workspaces-and-splits.md` (tabs/splits) and
 `docs/specs/spec-tiles-and-apps.md` + ADR-0019 (one App per tile).
 
 ---

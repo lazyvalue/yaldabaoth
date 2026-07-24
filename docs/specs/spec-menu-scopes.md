@@ -2,7 +2,7 @@
 
 **Status:** DRAFT
 **Last updated:** 2026-06-06
-**Builds on:** `spec-tabs-and-splits.md` (workspace / screens), `spec-layout-patterns.md` (tags, marks, layouts), `spec-rail.md` (per-tab chrome)
+**Builds on:** `spec-workspaces-and-splits.md` (workspace / screens), `spec-layout-patterns.md` (tags, marks, layouts), `spec-rail.md` (per-tab chrome)
 
 ## Overview
 

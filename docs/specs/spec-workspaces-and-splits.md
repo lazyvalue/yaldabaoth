@@ -1,15 +1,21 @@
-# Tabs and Splits — the workspace layout tree
+# Workspaces and Splits — the workspace layout tree
 
-**Status:** describes SHIPPED behavior (retroactive spec). The whole tabs /
+**Status:** describes SHIPPED behavior (retroactive spec). The whole workspaces /
 splits / persistence model documented here is implemented in
 `src/bin/yalda-gpui/workspace.rs` and wired into the live view. The single
 exception is **§10 (cross-view edit broadcast), which is DRAFT / unshipped** —
 it is documented as a design target, not a description of running code.
 
-**Last updated:** 2026-07-12
+**Last updated:** 2026-07-24 (ADR-0028: the `tab`→`workspace` / container→`frame`
+rename, and the workspace's cwd lifted to its `Project`).
+**Vocabulary:** what the user calls a **workspace** is the code type `Workspace<C>`
+(formerly `Tab<C>`); the container that owns the workspace list, one per OS
+**frame**, is `Frame<C>` (formerly `Workspace<C>`). The `tab` vocabulary is retired
+(ADR-0028 §5 / T007); only the physical **Ctrl-Tab** keystroke keeps the word.
 **Builds on:** ADR-0002 (workspaces model), ADR-0005 (shared content pool),
 ADR-0007 (doc/edit shared rope), ADR-0021 (ephemeral virtual workspaces),
-ADR-0023 (typed workspace cwd)
+ADR-0023 (typed workspace cwd — now lifted to the project),
+ADR-0028 (Projects as the top-level primitive; the workspace's `ProjectId` FK)
 **Related:** `docs/decisions/0019-tiles-contain-apps.md` +
 `docs/specs/spec-tiles-and-apps.md` (what a leaf *holds* — one App),
 `docs/specs/spec-layout-patterns.md` (marks, automatic layouts, tags),
@@ -22,12 +28,12 @@ one window-kind; partially inlines §10's editor substrate).
 ## Overview
 
 This spec covers the **structure** the GPUI frontend arranges its content in —
-tabs, the n-ary split tree beneath each tab, focus, the pooled shared-rope file
+workspaces, the n-ary split tree beneath each workspace, focus, the pooled shared-rope file
 buffers, persistence — and NOT what a leaf holds. What a leaf holds is one
 **App** (`App::{Buffer, Agent, Linear}`); that content model is
 `spec-tiles-and-apps.md` + ADR-0019 and is linked, not re-derived, here. The
-tree code is deliberately **generic over the content type** (`Workspace<C>`,
-`Tab<C>`, `Layout<C>`, `Window<C>`): it gained no App-kind knowledge when
+tree code is deliberately **generic over the content type** (`Frame<C>`,
+`Workspace<C>`, `Layout<C>`, `Window<C>`): it gained no App-kind knowledge when
 `WindowContent{Doc,Edit,Browser,Agent}` collapsed into `App{Buffer,Agent}` —
 only the type parameter changed (ADR-0019 Consequences; Constraint §1).
 
@@ -36,17 +42,17 @@ The containment hierarchy (see `docs/UX.md` for the reader-facing table):
 | Term | Code type | Meaning |
 |---|---|---|
 | **Frame** | GPUI `Window` | The OS desktop window (one per process today). |
-| **Workspace** | `Workspace<C>` | The tab-strip + file-buffer pool + active-tab pointer. |
-| **Tab** (user-facing: *"workspace"*) | `Tab<C>` | One tab-strip entry: its own layout tree, focus pointer, rail, layout mode, and cwd. |
+| **Frame** | `Frame<C>` | The workspace-strip + file-buffer pool + active-workspace pointer. |
+| **Workspace** (user-facing: *"workspace"*) | `Workspace<C>` | One workspace-strip entry: its own layout tree, focus pointer, rail, layout mode, and a required `ProjectId` FK (its cwd comes from the project — ADR-0028). |
 | **Split** | `Layout::Split` | Interior node: a `SplitDir` + weighted children (`≥ 2`). |
 | **Tile** | `Window<C>` (code name `Window`) | A leaf: a stable `WindowId` + one App. |
 
-> Naming note. The code type that owns the tab list is `Workspace<C>`, but the
-> product presents each **`Tab`** as a named "workspace." This is an accepted
-> internal name collision (`Tab::auto_name`/`display_name` render as the
+> Naming note. The code type that owns the workspace list is `Frame<C>`, but the
+> product presents each **`Workspace`** as a named "workspace." This is an accepted
+> internal name collision (`Workspace::auto_name`/`display_name` render as the
 > workspace label). The leaf type is `Window<C>` but we say **tile** in prose to
 > avoid confusion with the OS frame. There is no `FocusedWindow` type; focus is
-> the `WindowId` in `Tab::focused`, read via `Workspace::focused_content{,_mut}`
+> the `WindowId` in `Workspace::focused`, read via `Frame::focused_content{,_mut}`
 > / `focused_window_id`.
 
 Substrate: `src/bin/yalda-gpui/workspace.rs`. Split render (H = stacked column,
@@ -74,7 +80,7 @@ struct Window<C> { id: WindowId, content: C }    // WindowId = u64, workspace-un
   (`renormalize`).
 - `Empty` is a `std::mem::take` placeholder used *inside* mutation methods only.
   **It must never appear in a tree at rest** — every mutator restores a
-  non-`Empty` root before returning. (`insert_leaf_into_tab` treats an `Empty`
+  non-`Empty` root before returning. (`insert_leaf_into_workspace` treats an `Empty`
   target as "adopt the arriving leaf as root," the one place it is observed
   externally, and only transiently.)
 - The tree is walked/queried by a family of pure methods: `find_leaf{,_mut}`,
@@ -82,25 +88,28 @@ struct Window<C> { id: WindowId, content: C }    // WindowId = u64, workspace-un
   `leaf_ids`, `leaf_count`, `swap_leaf_contents`, `skeleton` (shape without
   content, for saving a manual tree across a layout-mode switch).
 
-### The tab — `Tab<C>`
+### The workspace — `Workspace<C>`
 
-Each `Tab` owns: `auto_name` + optional `display_name` (the label), `layout`
+Each `Workspace` owns: `auto_name` + optional `display_name` (the label), `layout`
 (its `Layout<C>` root), `focused: WindowId`, an optional `rail`
 (`spec-rail.md`), the `ephemeral` flag (ADR-0021 virtual workspaces),
 layout-pattern state (`layout_mode`, `saved_manual_layout`, `master_ratio`,
 `master_count`, `tag_view`, `desktop`; `spec-layout-patterns.md` /
-`spec-desktop-mode.md`), and a **private, required** `cwd: WorkspaceCwd`
-(ADR-0023 — a cwd-less workspace is unrepresentable; built only via
-`Tab::with_layout`, read via `cwd()`, changed via `set_cwd()`).
+`spec-desktop-mode.md`), and a **private, required** `project: ProjectId`
+foreign key (ADR-0028 — a project-less workspace is unrepresentable; built only
+via `Workspace::with_layout`, read via `project()`, reassigned via
+`set_project()`). Its **cwd is the project's**, resolved at the point of use and
+never cached (ADR-0028 §3, `UXI-Project-2`; this replaced the per-workspace
+`WorkspaceCwd` of ADR-0023, now lifted to the project).
 
-### The workspace — `Workspace<C>`
+### The frame (container) — `Frame<C>`
 
-Owns `tabs: Vec<Tab<C>>`, `active_tab: usize`, the file-buffer pool
+Owns `workspaces: Vec<Workspace<C>>`, `active_workspace: usize`, the file-buffer pool
 (`file_buffers`, `path_index`), id counters (`next_window_id`,
-`next_buffer_id`, `next_tab_index`), the workspace-global `marks`
-(`spec-layout-patterns.md` Phase 1), `tag_shortcuts`, and a `default_cwd`
-fallback for the root tab. Constructed via `Workspace::with_initial(content,
-cwd)` (root tab holding one leaf) or `new()` + restore.
+`next_buffer_id`, `next_workspace_index`), the workspace-global `marks`
+(`spec-layout-patterns.md` Phase 1), `tag_shortcuts`, and a `default_project`
+fallback for the root workspace. Constructed via `Frame::with_initial(content,
+project)` (root workspace holding one leaf) or `new(default_project)` + restore.
 
 ### The file-buffer pool — `FileBuffer` / `SharedCore`
 
@@ -119,44 +128,44 @@ the count; a tile drops its `Rc` on close; `gc_buffers()` reaps any buffer whose
 Numbered; external docs cite specific numbers (notably **12–13** for splits and
 **23–24** for persistence). Numbers are stable — extend, don't renumber.
 
-### Tabs / workspaces
+### Workspaces / workspaces
 
-1. **A workspace is a non-empty set of tabs.** The root tab is created with
-   content + a cwd (`with_initial` / `push_initial_tab`). `active_tab` always
-   indexes a real tab; closing tabs clamps it into range (`close_tab`).
+1. **A frame is a non-empty set of workspaces.** The root workspace is created with
+   content + a project (`with_initial` / `push_initial_workspace`). `active_workspace`
+   always indexes a real workspace; closing workspaces clamps it into range (`close_workspace`).
 
-2. **Sole-tile / sole-tab floor.** The workspace is never left with zero usable
-   surfaces. Closing the only tile in the only tab is a no-op at the callsite
+2. **Sole-tile / sole-workspace floor.** The workspace is never left with zero usable
+   surfaces. Closing the only tile in the only workspace is a no-op at the callsite
    (it does not quit the app); `close_focused` returning `Ok(None)` signals the
    caller to substitute a placeholder rather than vanish. (See
    `spec-tiles-and-apps.md` B4 for the Buffer-side realization.)
 
-3. **New tab.** `push_initial_tab(content, cwd)` appends a tab holding one leaf
-   and makes it active, auto-named `workspace-N` from `next_tab_index`. The new
-   tab **inherits** the active tab's cwd (`inherited_cwd`), never silently the
-   process dir (ADR-0023). Bound to **Cmd-T** (`NewTab`).
+3. **New workspace.** `push_initial_workspace(content, cwd)` appends a workspace holding one leaf
+   and makes it active, auto-named `workspace-N` from `next_workspace_index`. The new
+   workspace **inherits** the active workspace's cwd (`inherited_cwd`), never silently the
+   process dir (ADR-0023). Bound to **Cmd-T** (`NewWorkspace`).
 
-4. **Close tab.** `close_tab(idx)` removes a tab and re-clamps `active_tab`.
-   Closing a tab **frees, does not kill**, any Agent session its tiles showed —
+4. **Close workspace.** `close_workspace(idx)` removes a workspace and re-clamps `active_workspace`.
+   Closing a workspace **frees, does not kill**, any Agent session its tiles showed —
    an Agent tile holds only a `SessionId` key; the session lives in the
    `AgentSessions` store and stays running, re-bindable elsewhere
    (`spec-agent-session-ownership.md`). Only `claude-close` kills a session.
-   Bound to **Cmd-Shift-W** (`CloseTab`).
+   Bound to **Cmd-Shift-W** (`CloseWorkspace`).
 
-5. **Tab cycling + direct jump.** `next_tab` / `prev_tab` wrap and route through
-   `set_active_tab` (Behavior 6). Bound to **Ctrl-Tab / Ctrl-Shift-Tab** and
+5. **Workspace cycling + direct jump.** `next_workspace` / `prev_workspace` wrap and route through
+   `set_active_workspace` (Behavior 6). Bound to **Ctrl-Tab / Ctrl-Shift-Tab** and
    **Cmd-Shift-] / Cmd-Shift-[** (and arrow variants). **Ctrl-1..9,0** jump
    straight to the Nth non-ephemeral workspace (`GotoWorkspace1..10`; `0` = 10th)
    — see the macOS caveat in §12.
 
-6. **Workspace-switch chokepoint (`set_active_tab`).** Every activation flows
-   through this one method (ADR-0021): if the *departing* tab is an **ephemeral
+6. **Workspace-switch chokepoint (`set_active_workspace`).** Every activation flows
+   through this one method (ADR-0021): if the *departing* workspace is an **ephemeral
    virtual workspace** it is torn down on the way out (its single Agent tile
    drops, returning the session to *free*), and `idx` is index-corrected for the
-   removal. Renames go through the label; the tab strip renders `display_label`.
+   removal. Renames go through the label; the workspace strip renders `display_label`.
 
-7. **Ephemeral virtual workspaces (ADR-0021).** `open_ephemeral_tab(content)`
-   opens a transient single-tile tab (`ephemeral = true`), inheriting the
+7. **Ephemeral virtual workspaces (ADR-0021).** `open_ephemeral_workspace(content)`
+   opens a transient single-tile workspace (`ephemeral = true`), inheriting the
    spawning workspace's cwd *before* any teardown. At most one exists at a time
    (a second replaces the first); it is invisible to the jump panel's Workspaces
    section, the `?` menu, and persistence, and is destroyed the instant focus
@@ -165,8 +174,8 @@ Numbered; external docs cite specific numbers (notably **12–13** for splits an
 
 ### Focus
 
-8. **Focus is a single `WindowId` per tab (`Tab::focused`).** It must always
-   name a live leaf in that tab's tree. `focused_content{,_mut}` /
+8. **Focus is a single `WindowId` per workspace (`Workspace::focused`).** It must always
+   name a live leaf in that workspace's tree. `focused_content{,_mut}` /
    `replace_focused_content` / `focused_window_id` read/mutate through it. After
    any structural mutation the mutator re-points `focused` at a surviving leaf.
 
@@ -188,7 +197,7 @@ Numbered; external docs cite specific numbers (notably **12–13** for splits an
 11. *(reserved — see Constraint §11.)*
 
 12. **Create a split (`split_focused(dir, content)`).** Inserts a new leaf
-    adjacent to the focused leaf in the active tab, and focuses it. Placement
+    adjacent to the focused leaf in the active workspace, and focuses it. Placement
     (this is the "Behavior 12–13" `workspace.rs:1531` implements):
     - **Focused leaf is the root** → wrap it in a fresh 2-child `Split(dir)`
       `[(0.5, old_root), (0.5, new_leaf)]`.
@@ -205,8 +214,8 @@ Numbered; external docs cite specific numbers (notably **12–13** for splits an
     - **`close_focused()`** (**Ctrl-W c**) — remove the focused leaf; re-focus a
       sibling (previous index, else first remaining); **collapse** a
       now-single-child split into that child (Behavior 14); renormalize.
-      Returns `Ok(None)` when the leaf was the tab root (Behavior 2 floor).
-    - **`only()`** (**Ctrl-W o**) — make the focused leaf the tab's whole tree,
+      Returns `Ok(None)` when the leaf was the workspace root (Behavior 2 floor).
+    - **`only()`** (**Ctrl-W o**) — make the focused leaf the workspace's whole tree,
       closing every other tile.
     - **`resize_focused(delta)`** (**Ctrl-W < / -** shrink, **Ctrl-W > / +**
       grow) — shift weight between the focused leaf and its next sibling, each
@@ -227,12 +236,12 @@ Numbered; external docs cite specific numbers (notably **12–13** for splits an
 
 16. **Detach (`detach_focused`).** Removes the focused leaf and returns the owned
     `Window<C>` (content travels with it — no clone), pruning the source split
-    exactly like `close_focused`. Reports whether the source tab is now empty
+    exactly like `close_focused`. Reports whether the source workspace is now empty
     (focused leaf was the root → source `layout` left `Empty` for the caller to
     remove).
 
-17. **Insert into a target tab (`insert_leaf_into_tab`).** Adopts a detached
-    leaf into another tab, focusing it there: `Empty` → adopt as root; single
+17. **Insert into a target workspace (`insert_leaf_into_workspace`).** Adopts a detached
+    leaf into another workspace, focusing it there: `Empty` → adopt as root; single
     `Leaf` → wrap both in a `Split(V)`; `Split` → append as a new child +
     renormalize. Window ids are workspace-unique, so the leaf keeps its id.
 
@@ -246,7 +255,7 @@ Numbered; external docs cite specific numbers (notably **12–13** for splits an
 
 ### Layout modes
 
-20. **Per-tab layout mode (`LayoutMode`).** `Desktop` (default; free tile
+20. **Per-workspace layout mode (`LayoutMode`).** `Desktop` (default; free tile
     placement, `spec-desktop-mode.md`), `Manual` (the hand-built tree IS the
     layout), and the automatic modes `MasterStack` / `Monocle` / `Columns`
     (`spec-layout-patterns.md` Phase 2). **Ctrl-W space** cycles
@@ -270,10 +279,10 @@ Numbered; external docs cite specific numbers (notably **12–13** for splits an
 
 ### Persistence — Behaviors 23–24 (cited by `spec-agent-cwd.md`)
 
-23. **The tree, tabs, and per-tab state persist to `workspace.json`; leaves store
-    session ids only.** On change the whole `Workspace` is snapshotted to
-    `PersistedWorkspace { tabs, active_tab, marks, tag_shortcuts, buffer_tags }`
-    (`persist.rs`). Each `PersistedTab` carries `auto_name`, `display_name`,
+23. **The tree, workspaces, and per-workspace state persist to `workspace.json`; leaves store
+    session ids only.** On change the whole `Frame` is snapshotted to
+    `PersistedFrame { workspaces, active_workspace, marks, tag_shortcuts, buffer_tags }`
+    (`persist.rs`). Each `PersistedWorkspace` carries `auto_name`, `display_name`,
     `focused_window` (the stable `WindowId`), the `PersistedLayout` tree
     (`Leaf | Split{dir, children:(weight, …)}`), the optional rail
     (`spec-rail.md` §14), the layout-pattern fields (`layout_mode`,
@@ -321,12 +330,12 @@ Numbered; external docs cite specific numbers (notably **12–13** for splits an
 
 3. **`Empty` never rests in a tree.** It is a `mem::take` placeholder inside
    mutators only; every mutator restores a non-`Empty` root (or, for
-   `detach_focused`, hands `Empty` to a caller that immediately removes the tab).
+   `detach_focused`, hands `Empty` to a caller that immediately removes the workspace).
 
 4. **Splits have `≥ 2` children; weights sum to 1.0.** Enforced by the
    collapse-on-prune (Behavior 14) and `renormalize` (Behavior 15) discipline.
 
-5. **Focus always names a live leaf.** `Tab::focused` is re-pointed to a
+5. **Focus always names a live leaf.** `Workspace::focused` is re-pointed to a
    survivor by every structural mutator; `marks.gc` / desktop `reconcile` drop
    references to dead windows.
 
@@ -335,21 +344,21 @@ Numbered; external docs cite specific numbers (notably **12–13** for splits an
    `focused_window`, marks, desktop slots, and rail `pinned_to` can all key
    through them across a restore.
 
-7. **Every real workspace has a cwd.** `Tab.cwd: WorkspaceCwd` is private +
+7. **Every real workspace has a cwd.** `Workspace.cwd: WorkspaceCwd` is private +
    required (ADR-0023); no construction path — real or ephemeral — can omit it.
 
 8. **Persistence stores structure + ids, not session content.** Agent leaves
    carry `session_id` only (Behavior 23); conversation state is owned elsewhere.
 
 9. **The rail is not a leaf** (`spec-rail.md`): it cannot be split, focused via
-   `focus_motion`, or resized with `resize_focused`. It is per-tab chrome pinned
+   `focus_motion`, or resized with `resize_focused`. It is per-workspace chrome pinned
    to a leaf.
 
 ### §11 — Path canonicalization (cited by `spec-agent-cwd.md`)
 
 The canonical key for the buffer pool (and reused by any consumer that needs a
 stable path identity, e.g. per-slot agent cwds) is computed by
-`Workspace::canonical_key(path)`:
+`Frame::canonical_key(path)`:
 
 > If `std::fs::canonicalize(path)` succeeds (the target exists on disk), use its
 > result. **Otherwise** (a path that does not exist yet — a new file, a
@@ -423,21 +432,21 @@ on every screen. The full surface:
 | `Ctrl-W i` / `Ctrl-W d` | Increase / decrease master count | `spec-layout-patterns.md` |
 | `Ctrl-W t` / `Ctrl-W Ctrl-T` / `Ctrl-W Shift-T` | Tag view / toggle / clear | `spec-layout-patterns.md` Phase 3 |
 
-Tab / workspace switching lives on separate global chords (Behavior 5): **Cmd-T**
+Workspace / workspace switching lives on separate global chords (Behavior 5): **Cmd-T**
 new, **Cmd-Shift-W** close, **Ctrl-Tab / Ctrl-Shift-Tab** and
 **Cmd-Shift-] / [** cycle, **Ctrl-1..9,0** direct jump, **Cmd-J** jump panel.
 
 > **macOS keystroke caveat.** `Ctrl`+digit and `Ctrl-Tab` are unreliable on
 > macOS (the OS eats them), and `simulate_keystrokes` cannot catch that (it
 > fabricates the ideal chord — the 4th verification gap in root `CLAUDE.md`).
-> The `Cmd`-based tab bindings are the reliable path; the `Ctrl-W` split chord is
+> The `Cmd`-based workspace bindings are the reliable path; the `Ctrl-W` split chord is
 > delivered reliably as a prefix but the `Ctrl-<digit>` GotoWorkspace bindings
 > carry this caveat.
 
 ## Verification
 
 The split/close/focus/resize/detach/persist operations are pure functions on
-`Layout<C>` / `Workspace<C>` and are unit-tested in `workspace.rs` tests +
+`Layout<C>` / `Frame<C>` and are unit-tested in `workspace.rs` tests +
 `verify_harness.rs` (real view, real `Ctrl-W` bindings via
 `register_keymap` + `simulate_keystrokes`, real persistence round-trips with the
 `*_PATH_OVERRIDE` / `None`-under-`cfg(test)` seam so no test touches
@@ -445,7 +454,7 @@ The split/close/focus/resize/detach/persist operations are pure functions on
 
 ## Revision history
 
-- 2026-07-12 — Initial write. Retroactive spec for the already-shipped tabs /
+- 2026-07-12 — Initial write. Retroactive spec for the already-shipped workspaces /
   splits / pool / persistence model in `workspace.rs`, authored to resolve the
   ~15 dangling references to this file. Anchors fixed as a contract: Behaviors
   12–13 = splits, 23–24 = persistence; Constraint §11 = path canonicalization;

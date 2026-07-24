@@ -37,8 +37,8 @@ The full hierarchy: **`Frame` → `Project`s → `Workspace`s → `Window` tiles
   belongs to; the `ProjectId` FK + derived-cwd contract (`UXI-Project-2`).
 - ADR-0028 — Projects as the top-level primitive + the `Tab`→`Workspace`,
   container→`Frame` rename (§5) this Description now reflects.
-- `docs/specs/spec-tabs-and-splits.md` — the n-ary split/layout tree (its "tab"
-  prose predates the rename; read "tab" as "workspace", the container as "frame").
+- `docs/specs/spec-workspaces-and-splits.md` — the n-ary split/layout tree +
+  persistence (retroactive spec of shipped behavior; workspace/frame vocabulary).
 - `docs/specs/spec-layout-patterns.md` — tile tags + automatic layout modes.
 - `docs/specs/spec-desktop-mode.md` — desktop tile sizing / master layout; the
   tile/slot geometry engine (`Slot`, `Span`, `DesktopState`, occupancy,

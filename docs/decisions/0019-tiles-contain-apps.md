@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-06-10
 **Related:** ADR-0002 (workspaces model), ADR-0005 (shared content pool),
-ADR-0007 (doc/edit shared rope), `spec-tabs-and-splits.md`,
+ADR-0007 (doc/edit shared rope), `spec-workspaces-and-splits.md`,
 `spec-desktop-mode.md`, `spec-menu-scopes.md`, `docs/UX.md`
 
 ## Context

@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-07-13
 **Related:** ADR-0019 (Tiles contain Apps), `spec-agent-session-ownership.md`,
-`spec-tabs-and-splits.md` (Behavior 23–24, workspace persistence),
+`spec-workspaces-and-splits.md` (Behavior 23–24, workspace persistence),
 `docs/components/agent-tile/session-binding.md` (UXI-AgentTile-18/19)
 
 ## Context

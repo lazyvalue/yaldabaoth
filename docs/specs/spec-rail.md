@@ -2,7 +2,7 @@
 
 **Status:** DRAFT
 **Last updated:** 2026-06-01
-**Builds on:** `spec-tabs-and-splits.md` (workspace / layout tree)
+**Builds on:** `spec-workspaces-and-splits.md` (workspace / layout tree)
 
 ## Overview
 
