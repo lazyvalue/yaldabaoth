@@ -19,6 +19,16 @@ cyan `frozen_bar` (UXI-JumpPanel-5). **Italic carries exactly one meaning** — 
 "waiting on you" session state (UXI-JumpPanel-6); nothing else in the panel is
 italic.
 
+> **Current chrome (`UXI-JumpPanel-7/-8`).** The Sections list below predates the
+> declutter: the inline **＋ create rows**, the **✕** close glyph, and the **cwd
+> subtext** are GONE. Create/delete now live in menus (global "new project"; a
+> per-project **context menu** on the name). Rows carry **icons** (`⊞`
+> workspaces / status-colored `✦` agent sessions — the ●/○ dot is folded into the
+> star's color), the workspace `ctrl-<n>` number is a **dim right-edge hint**,
+> labels are **SEMIBOLD**, sections are split by a **hairline rule above** each
+> header, and the panel background is a **recessed shade** of the editor bg
+> (`jump_panel_bg`). Read UXI-JumpPanel-7/-8 for the authoritative behavior.
+
 Sections:
 
 - **Pinned** — *placeholder* (pinning mechanics land later).
@@ -399,3 +409,124 @@ focused session; asserts through REAL `jump_panel_agent_rows` + `dot_status` tha
 the backgrounded one is `WaitingForYou` and the focused one is `Neutral`; NC:
 remove `self.unread = true` in `finalize_agent_turn_idem` → the backgrounded row
 reads `Neutral`, observed RED). The green/italic pixels are harness gap #1.
+
+_Note (UXI-JumpPanel-7): the status glyph is now a **`✦`** whose COLOR carries the
+state (orange working / green waiting / dim neutral), not a separate ●/○ dot. The
+`dot_status` mapping and its enforcement are unchanged — only the rendered glyph._
+
+### UXI-JumpPanel-7 — The jump panel is a decluttered navigator; create/delete live in menus, and it wears a recessed shade
+
+**Statement.** The jump panel is a **pure navigator** — it carries no inline
+create/delete chrome and no per-project cwd subtext. Specifically, all of the
+following are **gone** from the panel body:
+
+1. the **cwd subtext line** under each project header (the project name stands
+   alone);
+2. the top-level **＋ New project** row — project creation moved to the **GLOBAL
+   menu** (`?` → "new project", command `new-project` → `open_new_project_overlay`);
+3. the per-project **＋ New workspace** and **＋ New agent session** rows — these
+   moved into the project **context menu** (`UXI-JumpPanel-8`);
+4. the **✕ close-project** glyph on the header — delete also moved into the
+   context menu.
+
+The panel's **look** is:
+
+- **Inter-section rule.** A thin inset **hairline above each project header**
+  (`jump_divider`, 1px, the dim border color at α 0.4, inset `mx_3`, 14px above /
+  6px below) separates sections — replacing the old under-name underline. Pinned
+  always precedes the first project, so every project section gets a top rule.
+- **Icons.** A leading **`⊞`** marks a workspace row (dim); a leading **`✦`** marks
+  an agent-session row, colored by status (`UXI-JumpPanel-1`). The workspace's
+  `ctrl-<n>` number moves from the leading badge to a **dim right-edge hint**.
+- **Weight.** Row labels render at **`SEMIBOLD`** (they read too thin at normal
+  weight; still a step under the `BOLD` uppercase project headers, so the header >
+  row hierarchy holds). The project-name red is softened to α 0.9.
+- **Recessed background.** The panel background is `jump_panel_bg(editor_bg())` — a
+  touch darker in **lightness** than the editor at the **same hue + saturation**
+  (dropping saturation is what muddies a tinted bg), with a **lighten-flip** on
+  near-black themes so the seam never vanishes. A fixed ΔL (−0.035 dark / −0.045
+  light / +0.04 near-black), not a multiply or black-composite (those vanish at
+  low L and overshoot at high L). The darker shade also makes the cyan selection
+  tint pop.
+
+The navigation/marks/status behavior (`UXI-JumpPanel-1/-2/-5/-6`, `UXI-Project-3`)
+is otherwise unchanged; the section view-model (`jump_panel_sections`) is
+untouched — only `render_jump_panel` and `jump_nav_row` changed.
+
+**Applies to.** `jump_panel_view.rs`: `render_jump_panel` (removed rows, header
+without cwd/✕, per-section `jump_divider`, `⊞` workspace badge + right-edge number
+hint, `✦` session badge via `jump_session_row_el`, `jump_panel_bg` background),
+`jump_nav_row` (new `hint` param + `SEMIBOLD` label), `jump_panel_bg` +
+`jump_divider` (new free fns). `main.rs`: `global_menu` (+ "new project" entry) and
+`dispatch_menu_command` (+ `"new-project"` arm).
+
+**Why.** With projects, workspaces, and sessions all listed, the panel had grown a
+thicket of ＋/✕ affordances and cwd lines that competed with the navigation it
+exists for. Moving create/delete into menus and giving the panel a clean, shaded,
+iconified look makes it scannable — a map, not a control panel.
+
+**Status.** `implemented` — the panel-background derivation and the create
+relocation are headless-guarded; the literal glyphs (`⊞`/`✦`), the SEMIBOLD/red
+weights, the hairline, and the recessed shade as *pixels* are harness gap #1
+(human eye).
+
+**Enforcement.** `verify_harness.rs`:
+`jump_panel_bg_shades_by_theme_and_preserves_hue` (the pure `jump_panel_bg`:
+dark → darker, near-black → lighter, light → darker, hue+sat+alpha preserved; NC:
+return `editor` unchanged → the dark/near-black asserts fail) and
+`new_project_relocated_to_global_menu` (the global menu offers "new project" and
+`dispatch_menu_command("new-project")` opens the REAL New Project overlay; NC:
+drop the `"new-project"` dispatch arm → the overlay never opens). The removed rows'
+absence + the visual treatment are gap #1.
+
+### UXI-JumpPanel-8 — Clicking a project name opens a context menu of project-scoped actions
+
+**Statement.** Clicking a project's **name** in the jump panel opens a small
+**context menu** anchored at the cursor, offering the project-scoped actions:
+
+1. **⊞ New workspace** → `new_workspace_in(pid)` (a workspace in that project, cwd
+   = the project's, no prompt).
+2. **✦ New agent session** → `new_agent_session_in(pid)` (a free session rooted at
+   the project's cwd).
+3. **✕ Delete project** → `request_delete_project(pid)` (confirm-then-cascade for a
+   non-empty project, direct delete for an empty one — `UXI-Project-5`).
+
+The menu is a lightweight popup layered over the still-visible panel (not an opaque
+body swap): a transparent full-window **click-away backdrop** under a positioned
+popup, so a click on the popup hits an item and a click anywhere else dismisses.
+**Esc** closes; single-key accelerators (`w`/`a`/`d`) fire the items. Choosing an
+item **dismisses the menu first**, then runs the action (so each action's
+`has_overlay()` guard passes). The menu opens at the click position, nudged a hair
+down-right and clamped to the viewport (flipping above the anchor near the bottom
+edge). The header stays a `CwdDrag` source, so a **click** opens the menu while a
+**drag** still reorders the section (`UXI-JumpPanel-2`).
+
+**Applies to.** `jump_panel_view.rs` `render_jump_panel` (the header `on_click` →
+`open_project_menu`, coexisting with `on_drag`). `main.rs`:
+`ActiveOverlay::ProjectMenu { pid, x, y }`, `open_project_menu` (anchor + clamp),
+`project_menu_action` (dismiss-then-act), `handle_project_menu_key` (Esc + `w`/`a`/
+`d`), `render_project_menu` (backdrop + positioned popup, overlay-styled with cyan
+α 0.15 inset hover pills), and the `overlay_is_project_menu` render branch.
+
+**Why.** The per-project ＋ rows and the ✕ glyph cluttered the panel and scaled
+badly (three affordances per project). A single click-to-open menu on the name is
+discoverable, precise (scoped to the clicked project), and keeps the panel body
+clean (`UXI-JumpPanel-7`).
+
+**Status.** `implemented` — the open + action-dispatch are headless; the popup's
+placement/hover pixels and the mouse click-away GESTURE are harness gap #1/#2
+(the layout probe could pin placement later; the action wiring is what's guarded).
+
+**Enforcement.** `verify_harness.rs::project_menu_opens_on_name_click_and_actions_dispatch`
+(drives the REAL `open_project_menu` → the overlay is `ProjectMenu` for that pid →
+`project_menu_action(NewWorkspace)` creates a workspace in the project and closes
+the menu → re-open + `DeleteProject` arms the confirm overlay; NCs: skip
+`open_overlay(ProjectMenu…)` → menu never opens; no-op `new_workspace_in` in the
+action → count assert fails).
+
+**Deviation from plan.** The requested menu named only "New workspace / New agent
+session"; **Delete project** was added as a third item (separated by a rule) so
+removing the header ✕ (`UXI-JumpPanel-7`) doesn't strand the delete capability —
+the per-project menu is its natural, precise home. Placement is stored as a clamped
+`(x, y)` computed from `viewport_{width,height}_px` at open time (no live `Window`
+needed in the render).

@@ -517,8 +517,21 @@ impl YaldaGpuiView {
         let active_accent = nc(self.theme.agent.frozen_bar);
         let mut sel_bg = active_accent;
         sel_bg.a = 0.15;
-        let panel_bg = self.editor_bg();
+        // The panel is a recessed room: same hue + saturation as the editor, a
+        // touch darker in lightness (a lighten-flip on near-black themes so the
+        // seam never vanishes) — `jump_panel_bg`. Untouched s keeps it from
+        // muddying (dropping saturation is what browns a blue-tinted bg).
+        let panel_bg = jump_panel_bg(self.editor_bg());
         let border = st.dim;
+        // Inter-section hairline (a rule ABOVE each project header): the dim
+        // border color at low alpha, so internal structure stays quieter than
+        // the panel's outer right border.
+        let mut divider_color = st.dim;
+        divider_color.a = 0.4;
+        // Project-name header red, softened a hair (it repeats per section, so
+        // full-strength `err` reads as an alarm for nav chrome).
+        let mut header_red = st.err;
+        header_red.a = 0.9;
         // "Waiting for you" status-dot color (turn finished, your move). The
         // tool-completed green reads as ready/done across both themes.
         let ready = nc(self.theme.agent.tool_completed);
@@ -561,26 +574,16 @@ impl YaldaGpuiView {
                 .child(SharedString::from("Nothing pinned yet.")),
         );
 
-        // ── New project ─ top-level create affordance (UXI-Project-4).
-        col = col.child(
-            jump_nav_row(
-                SharedString::from("jump-new-project"),
-                "New project",
-                Some("＋"),
-                Some(active_accent),
-                &st,
-                sel_bg,
-                None,
-            )
-            .on_click(cx.listener(|this, _ev, _window, cx| this.open_new_project_overlay(cx))),
-        );
-
-        // ── Per-project sections (UXI-Project-3): one section per project, each
-        // owning its WORKSPACES sublist (workspaces whose wsp.project() == this
-        // project; the badge keeps the GLOBAL idx+1 = ctrl-<n> number) and its
-        // AGENT SESSIONS, plus inline ＋create rows. Individual tiles are NOT
-        // listed. Unfiled sessions (a cwd no project roots) trail under path
-        // headers. See `jump_panel_sections`.
+        // ── Per-project sections (UXI-Project-3, UXI-JumpPanel-7): one section
+        // per project. A **hairline rule** separates sections (drawn ABOVE each
+        // header); the header is the project NAME only (bold uppercase) — its cwd
+        // subtext, the ✕ delete affordance, and the inline ＋create rows are gone.
+        // Clicking the name opens a **context menu** (New workspace / New agent
+        // session / Delete project; UXI-JumpPanel-8). Each section owns its
+        // WORKSPACES sublist (workspaces whose `wsp.project()` is it; the ctrl-<n>
+        // number moves to a dim right-edge hint) and its AGENT SESSIONS. Individual
+        // tiles are NOT listed. Unfiled sessions (a cwd no project roots) trail
+        // under path headers. See `jump_panel_sections`.
         let (sections, unfiled) = self.jump_panel_sections(cx);
         let drag_fg = st.fg;
         let drag_font = st.mono.clone();
@@ -588,10 +591,13 @@ impl YaldaGpuiView {
         for section in sections {
             let pid = section.id;
             let cwd_key = section.cwd_display.clone();
-            // Project header: name (red) + dim cwd subtext, with a ✕ delete
-            // affordance (UXI-Project-5). The header is also a CwdDrag source /
-            // target so sections reorder (keyed on the cwd display, the same key
-            // the session drag rejects across).
+            // Inter-section rule, above the header (Pinned always precedes the
+            // first project, so every project section gets a top rule).
+            col = col.child(jump_divider(divider_color));
+            // Project header: NAME only. Clicking it opens the project context
+            // menu at the cursor. The header is still a CwdDrag source / target so
+            // sections reorder (keyed on the cwd display, the same key the session
+            // drag rejects across) — a click opens the menu, a drag reorders.
             let header = div()
                 .id(SharedString::from(format!("jump-proj-{}", pid.0)))
                 .flex()
@@ -599,46 +605,22 @@ impl YaldaGpuiView {
                 .items_center()
                 .w_full()
                 .px_3()
-                .pt_2()
-                .pb_1()
-                .border_b_1()
-                .border_color(border)
+                .pb(px(4.0))
                 .cursor_pointer()
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .text_color(st.err)
-                                .font_family(st.mono.clone())
-                                .font_weight(FontWeight::BOLD)
-                                .text_size(px(st.pt * 0.95))
-                                .child(SharedString::from(section.name.to_uppercase())),
-                        )
-                        .child(
-                            div()
-                                .text_color(st.dim)
-                                .font_family(st.mono.clone())
-                                .text_size(px(st.pt * 0.8))
-                                .child(SharedString::from(section.cwd_display.clone())),
-                        ),
+                        .text_color(header_red)
+                        .font_family(st.mono.clone())
+                        .font_weight(FontWeight::BOLD)
+                        .text_size(px(st.pt * 0.95))
+                        .child(SharedString::from(section.name.to_uppercase())),
                 )
-                .child(
-                    div()
-                        .id(SharedString::from(format!("jump-proj-del-{}", pid.0)))
-                        .flex_none()
-                        .px_1()
-                        .cursor_pointer()
-                        .text_color(st.dim)
-                        .hover(|s| s.text_color(st.err))
-                        .child(SharedString::new_static("✕"))
-                        .on_click(cx.listener(move |this, _ev, _window, cx| {
-                            this.request_delete_project(pid, cx)
-                        })),
-                )
+                .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _window, cx| {
+                    let p = ev.position();
+                    this.open_project_menu(pid, (f32::from(p.x), f32::from(p.y)), cx);
+                }))
                 .on_drag(CwdDrag { cwd_key: cwd_key.clone() }, {
                     let label: SharedString = section.name.clone().into();
                     let (fg, bg, font) = (drag_fg, sel_bg, drag_font.clone());
@@ -660,7 +642,8 @@ impl YaldaGpuiView {
                 }));
             col = col.child(header);
 
-            // WORKSPACES sublist — the badge stays the GLOBAL idx+1 (ctrl-<n>).
+            // WORKSPACES sublist — a `⊞` icon leads; the GLOBAL idx+1 (ctrl-<n>)
+            // becomes a dim right-edge shortcut hint.
             for (idx, label, active) in section.workspaces {
                 let row_id = SharedString::from(format!("jump-ws-{idx}"));
                 let num = format!("{}", idx + 1);
@@ -668,8 +651,9 @@ impl YaldaGpuiView {
                     jump_nav_row(
                         row_id,
                         &label,
-                        Some(&num),
+                        Some("⊞"),
                         None,
+                        Some(&num),
                         &st,
                         sel_bg,
                         active.then_some(active_accent),
@@ -677,20 +661,8 @@ impl YaldaGpuiView {
                     .on_click(cx.listener(move |this, _ev, _window, cx| this.select_workspace(idx, cx))),
                 );
             }
-            col = col.child(
-                jump_nav_row(
-                    SharedString::from(format!("jump-new-ws-{}", pid.0)),
-                    "New workspace",
-                    Some("＋"),
-                    Some(active_accent),
-                    &st,
-                    sel_bg,
-                    None,
-                )
-                .on_click(cx.listener(move |this, _ev, _window, cx| this.new_workspace_in(pid, cx))),
-            );
 
-            // AGENT SESSIONS sublist (status dots + accent marks preserved).
+            // AGENT SESSIONS sublist (status-colored `✦` + accent marks preserved).
             for (i, row) in section.sessions {
                 let active =
                     jump_target_is_active(&row.target, active_local, active_sid.as_deref());
@@ -708,20 +680,6 @@ impl YaldaGpuiView {
                     cx,
                 ));
             }
-            col = col.child(
-                jump_nav_row(
-                    SharedString::from(format!("jump-new-agent-{}", pid.0)),
-                    "New agent session",
-                    Some("＋"),
-                    Some(active_accent),
-                    &st,
-                    sel_bg,
-                    None,
-                )
-                .on_click(
-                    cx.listener(move |this, _ev, _window, cx| this.new_agent_session_in(pid, cx)),
-                ),
-            );
         }
 
         // ── Unfiled sessions (no project roots their cwd) ─ path headers.
@@ -784,21 +742,24 @@ fn jump_session_row_el(
     drag_font: SharedString,
     cx: &mut Context<YaldaGpuiView>,
 ) -> gpui::Stateful<gpui::Div> {
-    // • working (reply in flight) → ● orange; • waiting on you (idle + unread)
-    // → ● green + italic; • idle+read / disconnected / unknown → ○ dim.
+    // The agent-session icon is a `✦` whose COLOR carries the status (one glyph =
+    // "this is an agent" + what it's doing): working (reply in flight) → orange;
+    // waiting on you (idle + unread) → green + italic label; idle+read /
+    // disconnected / unknown → dim.
     let status = row.dot_status();
-    let (badge, badge_color) = match status {
-        AgentDotStatus::Working => ("●", working_orange),
-        AgentDotStatus::WaitingForYou => ("●", ready),
-        AgentDotStatus::Neutral => ("○", st.dim),
+    let badge_color = match status {
+        AgentDotStatus::Working => working_orange,
+        AgentDotStatus::WaitingForYou => ready,
+        AgentDotStatus::Neutral => st.dim,
     };
     let row_id = SharedString::from(format!("jump-sess-{i}"));
     let target = row.target.clone();
     let mut r = jump_nav_row(
         row_id,
         &row.label,
-        Some(badge),
+        Some("✦"),
         Some(badge_color),
+        None,
         st,
         sel_bg,
         active.then_some(active_accent),
@@ -848,20 +809,26 @@ fn jump_session_row_el(
     r
 }
 
-/// One selectable row: optional leading badge glyph + label. Returns a
-/// `Stateful<Div>` (has an `id`, so it supports `hover`/`on_click`); the caller
-/// attaches the click listener. `badge_color` colors the leading badge cell (a
-/// status light for agent rows); `None` falls back to the dim chrome color
-/// (workspace numbers). `active` marks "this is where you are" (UXI-JumpPanel-5):
-/// `Some(accent)` draws a left accent bar in that hue, tints the row background,
-/// and colors the label with the accent; `None` is a plain row (hover still
-/// tints). Every row reserves the 2px left-bar gutter (transparent when inactive)
-/// so the mark never shifts row geometry.
+/// One selectable row: optional leading badge glyph + label + optional trailing
+/// dim hint. Returns a `Stateful<Div>` (has an `id`, so it supports
+/// `hover`/`on_click`); the caller attaches the click listener. `badge_color`
+/// colors the leading badge cell (a status light for agent rows, the dim icon for
+/// workspaces); `None` falls back to the dim chrome color. `hint` is a right-edge
+/// dim accelerator (the workspace's `ctrl-<n>` digit), rendered small and quiet.
+/// Row labels sit at `SEMIBOLD` (they read too thin at normal weight, and this
+/// stays a step under the `BOLD` project headers so the hierarchy holds).
+/// `active` marks "this is where you are" (UXI-JumpPanel-5): `Some(accent)` draws
+/// a left accent bar in that hue, tints the row background, and colors the label
+/// with the accent; `None` is a plain row (hover still tints). Every row reserves
+/// the 2px left-bar gutter (transparent when inactive) so the mark never shifts
+/// row geometry.
+#[allow(clippy::too_many_arguments)]
 fn jump_nav_row(
     id: impl Into<ElementId>,
     label: &str,
     badge: Option<&str>,
     badge_color: Option<Hsla>,
+    hint: Option<&str>,
     st: &DetailStyle,
     sel_bg: Hsla,
     active: Option<Hsla>,
@@ -872,7 +839,7 @@ fn jump_nav_row(
     } else {
         label.to_string()
     };
-    div()
+    let mut row = div()
         .id(id)
         .flex()
         .flex_row()
@@ -901,7 +868,40 @@ fn jump_nav_row(
             div()
                 .flex_1()
                 .min_w_0()
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(active.unwrap_or(st.fg))
                 .child(SharedString::from(label)),
-        )
+        );
+    if let Some(hint) = hint {
+        row = row.child(
+            div()
+                .flex_none()
+                .text_color(st.dim)
+                .text_size(px(st.pt * 0.85))
+                .child(SharedString::from(hint.to_string())),
+        );
+    }
+    row
+}
+
+/// Panel background: the editor background, a touch darker in lightness (with a
+/// lighten-flip on near-black themes so the seam never disappears) at the SAME
+/// hue + saturation (dropping saturation is what muddies a tinted background).
+/// A fixed ΔL — not a multiply/black-composite, which vanish at low L and
+/// overshoot at high L. The recessed shade also makes the cyan selection tint pop.
+pub(crate) fn jump_panel_bg(editor: Hsla) -> Hsla {
+    let l = if editor.l >= 0.5 {
+        editor.l - 0.045 // light themes: darken (paper needs the bigger step)
+    } else if editor.l - 0.035 >= 0.055 {
+        editor.l - 0.035 // dark themes: darken
+    } else {
+        (editor.l + 0.04).min(1.0) // near-black: darker is invisible → lighten
+    };
+    Hsla { l, ..editor }
+}
+
+/// The inter-section hairline drawn above each project header (inset both sides
+/// to read as content grouping, not hard chrome).
+fn jump_divider(color: Hsla) -> gpui::Div {
+    div().mx_3().mt(px(14.0)).mb(px(6.0)).h(px(1.0)).bg(color)
 }

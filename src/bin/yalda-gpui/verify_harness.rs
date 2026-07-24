@@ -6239,6 +6239,112 @@ fn delete_nonempty_project_confirms_then_cascades(cx: &mut TestAppContext) {
     });
 }
 
+/// UXI-JumpPanel-7 (panel background): the jump panel sits a touch darker than
+/// the editor on dark/light themes, and LIGHTENS on near-black themes so the seam
+/// never vanishes — always at the same hue + saturation (no muddying). Pure fn.
+///
+/// Negative control: make `jump_panel_bg` return `editor` unchanged → the
+/// dark-darker and near-black-lighter asserts fail.
+#[test]
+fn jump_panel_bg_shades_by_theme_and_preserves_hue() {
+    use crate::jump_panel_bg;
+    use gpui::Hsla;
+    // Dark theme (Dracula editor_bg L≈0.184): panel is darker.
+    let dark = Hsla { h: 0.63, s: 0.11, l: 0.184, a: 1.0 };
+    let d = jump_panel_bg(dark);
+    assert!(d.l < dark.l - 0.02, "dark bg → darker panel (got L {} vs {})", d.l, dark.l);
+    assert!(
+        (d.h - dark.h).abs() < 1e-6 && (d.s - dark.s).abs() < 1e-6 && d.a == dark.a,
+        "hue + saturation + alpha preserved (no muddying)"
+    );
+    // Near-black (OLED): darker would be invisible → LIGHTEN.
+    let black = Hsla { h: 0.0, s: 0.0, l: 0.02, a: 1.0 };
+    let b = jump_panel_bg(black);
+    assert!(b.l > black.l, "near-black bg → lighter panel (seam stays visible), got L {}", b.l);
+    // Light theme (paper L≈0.94): darker.
+    let light = Hsla { h: 0.12, s: 0.5, l: 0.94, a: 1.0 };
+    let l = jump_panel_bg(light);
+    assert!(l.l < light.l - 0.02, "light bg → darker panel, got L {}", l.l);
+}
+
+/// UXI-JumpPanel-8: clicking a project name opens a context menu (the REAL entry
+/// point `open_project_menu`), and choosing an item runs the project-scoped action
+/// and dismisses the menu. New workspace creates a workspace in THAT project;
+/// Delete arms the confirm overlay. This drives the exact methods the menu items'
+/// `on_click` handlers call.
+///
+/// Negative control: make `open_project_menu` skip `open_overlay(ProjectMenu…)` →
+/// `project_menu_ref()` is `None` and the first assert fails; or make
+/// `project_menu_action` not call `new_workspace_in` → the workspace-count assert
+/// fails.
+#[gpui::test]
+fn project_menu_opens_on_name_click_and_actions_dispatch(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let pa = PathBuf::from("/tmp/yalda-projmenu-a");
+    let pid = view.update(vcx, |v, _cx| v.projects.create("Menu".into(), pa.clone()).expect("create"));
+
+    // Click the name → menu opens anchored, targeting this project.
+    view.update(vcx, |v, cx| v.open_project_menu(pid, (40.0, 30.0), cx));
+    view.read_with(vcx, |v, _| {
+        assert!(
+            matches!(v.project_menu_ref(), Some((p, _, _)) if p == pid),
+            "the project context menu is open for the clicked project"
+        );
+    });
+
+    // "New workspace" → creates a workspace in this project, closes the menu.
+    let before = view
+        .read_with(vcx, |v, _| v.workspace.workspaces.iter().filter(|t| t.project() == pid).count());
+    view.update(vcx, |v, cx| {
+        v.project_menu_action(pid, crate::ProjectMenuAction::NewWorkspace, cx)
+    });
+    view.read_with(vcx, |v, _| {
+        assert!(!v.overlay_is_project_menu(), "menu dismissed after the action fires");
+        assert_eq!(
+            v.workspace.workspaces.iter().filter(|t| t.project() == pid).count(),
+            before + 1,
+            "New workspace created a workspace scoped to this project"
+        );
+    });
+
+    // Re-open, then "Delete project" → arms the confirm overlay (the project is
+    // non-empty now), menu dismissed. project_menu_action clears the menu FIRST so
+    // request_delete_project's has_overlay guard passes.
+    view.update(vcx, |v, cx| v.open_project_menu(pid, (40.0, 30.0), cx));
+    view.update(vcx, |v, cx| {
+        v.project_menu_action(pid, crate::ProjectMenuAction::DeleteProject, cx)
+    });
+    view.read_with(vcx, |v, _| {
+        assert!(!v.overlay_is_project_menu(), "menu dismissed");
+        assert!(
+            matches!(v.confirm_delete_ref(), Some(p) if p == pid),
+            "Delete project armed the confirm overlay for this project"
+        );
+    });
+}
+
+/// UXI-JumpPanel-7 (create relocation): the jump panel no longer carries a
+/// top-level ＋ New project row — project creation moved to the GLOBAL menu. The
+/// menu offers a "new project" entry, and dispatching `new-project` opens the REAL
+/// New Project overlay.
+///
+/// Negative control: remove the `"new-project" => …` arm in
+/// `dispatch_menu_command` → the overlay never opens and the last assert fails.
+#[gpui::test]
+fn new_project_relocated_to_global_menu(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    view.read_with(vcx, |v, _| {
+        assert!(
+            v.global_menu().iter().any(|n| n.label == "new project"),
+            "the global menu offers a New project entry"
+        );
+    });
+    view.update(vcx, |v, cx| v.dispatch_menu_command("new-project", cx));
+    view.read_with(vcx, |v, _| {
+        assert!(v.overlay_is_new_project(), "dispatching new-project opens the New Project overlay");
+    });
+}
+
 /// UXI-JumpPanel-3, clauses 1–2: a session created free (bound to no tile) —
 /// which is the end state `spawn_free_agent_session` produces once the server's
 /// `SessionCreated` broadcast lands — surfaces in the jump panel as an UNBOUND

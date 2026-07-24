@@ -1320,6 +1320,16 @@ struct NewProjectOverlay {
 /// split-borrow (`m.state` + `&m.menu`) still type-checks. Do not add a
 /// per-field `&mut state` accessor. Non-exclusive chrome (`transient_status`
 /// toast, `splash_until`) is deliberately NOT folded in here.
+/// The project-scoped actions offered by the jump-panel project context menu
+/// (UXI-JumpPanel-8). Each maps to an existing project method; the menu is just a
+/// discoverable, cursor-anchored entry point.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectMenuAction {
+    NewWorkspace,
+    NewAgentSession,
+    DeleteProject,
+}
+
 #[derive(Default)]
 enum ActiveOverlay {
     #[default]
@@ -1334,6 +1344,11 @@ enum ActiveOverlay {
     /// "Delete project?" confirmation for a non-empty project (UXI-Project-5);
     /// carries the target so confirm cascades exactly it.
     ConfirmProjectDelete(ProjectId),
+    /// Project context menu (UXI-JumpPanel-8): a small popup anchored at the
+    /// click position, offering the project-scoped create/delete actions. Carries
+    /// the target project + the window-space anchor point (already clamped to the
+    /// viewport at open time).
+    ProjectMenu { pid: ProjectId, x: f32, y: f32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4136,6 +4151,17 @@ impl YaldaGpuiView {
             None
         }
     }
+    fn overlay_is_project_menu(&self) -> bool {
+        matches!(self.active_overlay, ActiveOverlay::ProjectMenu { .. })
+    }
+    /// The open project context menu's `(project, anchor x, anchor y)`, if any.
+    fn project_menu_ref(&self) -> Option<(ProjectId, f32, f32)> {
+        if let ActiveOverlay::ProjectMenu { pid, x, y } = &self.active_overlay {
+            Some((*pid, *x, *y))
+        } else {
+            None
+        }
+    }
 
     fn menu_ref(&self) -> Option<&MenuOverlay> {
         if let ActiveOverlay::Menu(m) = &self.active_overlay {
@@ -4366,8 +4392,12 @@ impl YaldaGpuiView {
         items.push(MenuNode::separator());
         items.push(MenuNode::entry("n", "name workspace", "rename-workspace"));
         items.push(MenuNode::entry("c", "new workspace", "new-workspace"));
+        // New project lives here now that the jump panel dropped its top-level
+        // ＋ row (UXI-JumpPanel-7); the per-project create/delete actions moved to
+        // the project name's context menu (UXI-JumpPanel-8).
+        items.push(MenuNode::entry("p", "new project", "new-project"));
         // (Agent sessions are now created only inside a project — the jump panel's
-        // per-project ＋ row, not a global cwd overlay; UXI-Project-7.)
+        // per-project context menu, not a global cwd overlay; UXI-Project-7.)
         let jp_label = if self.jump_panel_visible {
             "hide jump panel"
         } else {
@@ -4702,6 +4732,9 @@ impl YaldaGpuiView {
                 let _ = self.workspace.focus_prev();
                 self.save_workspace_state();
                 cx.notify();
+            }
+            "new-project" => {
+                self.open_new_project_overlay(cx);
             }
             "new-workspace" => {
                 let project = self.workspace.inherited_project();
@@ -5468,6 +5501,67 @@ impl YaldaGpuiView {
     }
 
     // ---- Project lifecycle (UXI-Project-4 / -5) ----------------------------
+
+    /// Open the project context menu (UXI-JumpPanel-8) anchored at the click
+    /// position `pos` (window space). Offers the project-scoped actions (New
+    /// workspace / New agent session / Delete project). Nudged a hair down-right
+    /// so the cursor doesn't land pre-hovered on the first item, and clamped to
+    /// the viewport (flipping above the anchor when near the bottom edge). No-op
+    /// if any overlay is already open.
+    pub(crate) fn open_project_menu(
+        &mut self,
+        pid: ProjectId,
+        pos: (f32, f32),
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_overlay() {
+            return;
+        }
+        const MENU_W: f32 = 200.0;
+        const MENU_H: f32 = 118.0;
+        let (vw, vh) = (self.viewport_width_px, self.viewport_height_px);
+        let mut x = pos.0 + 2.0;
+        let mut y = pos.1 + 4.0;
+        if vw > 0.0 && x + MENU_W > vw {
+            x = (vw - MENU_W).max(0.0);
+        }
+        if vh > 0.0 && y + MENU_H > vh {
+            y = (pos.1 - MENU_H).max(0.0);
+        }
+        self.open_overlay(ActiveOverlay::ProjectMenu { pid, x, y });
+        cx.notify();
+    }
+
+    /// A project context-menu item was chosen (UXI-JumpPanel-8): dismiss the menu
+    /// FIRST (so the per-action `has_overlay()` guards pass), then run the action
+    /// scoped to `pid`.
+    fn project_menu_action(&mut self, pid: ProjectId, action: ProjectMenuAction, cx: &mut Context<Self>) {
+        self.clear_overlay();
+        match action {
+            ProjectMenuAction::NewWorkspace => self.new_workspace_in(pid, cx),
+            ProjectMenuAction::NewAgentSession => self.new_agent_session_in(pid, cx),
+            ProjectMenuAction::DeleteProject => self.request_delete_project(pid, cx),
+        }
+    }
+
+    /// Key dispatch while the project context menu is open (UXI-JumpPanel-8): Esc
+    /// closes; single-key accelerators fire the items (`w`/`a`/`d`).
+    fn handle_project_menu_key(&mut self, ev: &KeyDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        let Some((pid, _, _)) = self.project_menu_ref() else {
+            return;
+        };
+        let press = keystroke_to_keypress(&ev.keystroke);
+        match press.key {
+            Key::Esc => {
+                self.clear_overlay();
+                cx.notify();
+            }
+            Key::Char('w') => self.project_menu_action(pid, ProjectMenuAction::NewWorkspace, cx),
+            Key::Char('a') => self.project_menu_action(pid, ProjectMenuAction::NewAgentSession, cx),
+            Key::Char('d') => self.project_menu_action(pid, ProjectMenuAction::DeleteProject, cx),
+            _ => {}
+        }
+    }
 
     /// Open the "New project" overlay (UXI-Project-4): a name + cwd input. The
     /// cwd pre-fills with the active project's cwd so the common "a project near
@@ -6785,6 +6879,103 @@ impl YaldaGpuiView {
             )
     }
 
+    /// The project context menu (UXI-JumpPanel-8): a small popup anchored at the
+    /// stored click point, offering the project-scoped actions. Rendered as two
+    /// siblings — a full-window transparent click-away backdrop UNDER a
+    /// positioned popup (a click on the popup hits it, not the backdrop; a click
+    /// anywhere else hits the backdrop and dismisses). Item glyphs match the panel
+    /// row icons (`⊞`/`✦`) so the menu teaches the icon vocabulary.
+    fn render_project_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (pid, x, y) = self.project_menu_ref().expect("project menu open");
+        let ov = &self.theme.overlay;
+        let menu_bg: Hsla = nc(ov.bg);
+        let popup_border: Hsla = nc(ov.border);
+        let item_fg: Hsla = nc(ov.fg);
+        let dim: Hsla = nc(self.theme.agent.dim);
+        // One interaction hue across the whole panel + menu: the cyan selection
+        // tint at low alpha, as an inset hover pill.
+        let mut hover_bg: Hsla = nc(self.theme.agent.frozen_bar);
+        hover_bg.a = 0.15;
+        let err: Hsla = rgb(0xff6b6b).into();
+        let mono = self.code_font.clone();
+
+        let item = |id: &str,
+                    glyph: &str,
+                    glyph_color: Hsla,
+                    label: &str,
+                    label_color: Hsla,
+                    action: ProjectMenuAction| {
+            div()
+                .id(SharedString::from(id.to_string()))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .mx(px(4.0))
+                .px_3()
+                .py(px(6.0))
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .font_family(mono.clone())
+                .text_size(px(13.0))
+                .font_weight(FontWeight::MEDIUM)
+                .hover(|s| s.bg(hover_bg))
+                .child(
+                    div()
+                        .w(px(16.0))
+                        .flex_none()
+                        .text_color(glyph_color)
+                        .child(SharedString::from(glyph.to_string())),
+                )
+                .child(div().flex_1().text_color(label_color).child(SharedString::from(label.to_string())))
+                .on_click(cx.listener(move |this, _ev, _w, cx| {
+                    this.project_menu_action(pid, action, cx)
+                }))
+        };
+
+        let popup = div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .min_w(px(184.0))
+            .bg(menu_bg)
+            .border_1()
+            .border_color(popup_border)
+            .rounded(px(6.0))
+            .shadow_md()
+            .py(px(4.0))
+            .flex()
+            .flex_col()
+            .child(item("proj-menu-new-ws", "⊞", dim, "New workspace", item_fg, ProjectMenuAction::NewWorkspace))
+            .child(item(
+                "proj-menu-new-agent",
+                "✦",
+                dim,
+                "New agent session",
+                item_fg,
+                ProjectMenuAction::NewAgentSession,
+            ))
+            .child(div().mx(px(4.0)).my(px(4.0)).h(px(1.0)).bg(popup_border))
+            .child(item("proj-menu-delete", "✕", err, "Delete project", err, ProjectMenuAction::DeleteProject));
+
+        // Full-window transparent backdrop (click-away). Sibling BEFORE the popup
+        // so the popup paints on top; a click on the popup hits the popup, a click
+        // elsewhere hits the backdrop and dismisses.
+        let backdrop = div()
+            .id("proj-menu-backdrop")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseDownEvent, _w, cx| {
+                    this.clear_overlay();
+                    cx.notify();
+                }),
+            );
+
+        div().absolute().inset_0().child(backdrop).child(popup)
+    }
+
     /// Best-effort copy via macOS `pbcopy`. Failures are silent — yank is
     /// a convenience, and we don't want to surface system errors per keystroke.
     /// (TUI uses the same approach.)
@@ -7090,6 +7281,24 @@ impl Render for YaldaGpuiView {
         // shifted chars could shadow distinct overlay entries (e.g. `w` vs
         // `W`). The capture handler short-circuits the entire rest of the
         // pipeline.
+        // Project context menu (UXI-JumpPanel-8): a lightweight popup layered over
+        // the (still visible) screen + jump panel — NOT an opaque body swap. A
+        // transparent backdrop inside `render_project_menu` handles click-away;
+        // capture_key_down handles Esc + the `w`/`a`/`d` accelerators.
+        if self.overlay_is_project_menu() {
+            return div()
+                .track_focus(&self.focus_handle)
+                .key_context("ProjectMenuView")
+                .size_full()
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    this.handle_project_menu_key(ev, w, cx);
+                    cx.stop_propagation();
+                }))
+                .child(screen_view)
+                .child(self.render_project_menu(cx))
+                .into_any_element();
+        }
+
         if self.overlay_is_new_project() {
             return div()
                 .track_focus(&self.focus_handle)
