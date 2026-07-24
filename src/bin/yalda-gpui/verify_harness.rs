@@ -12456,3 +12456,32 @@ fn workspace_and_session_cwd_derive_from_project(cx: &mut TestAppContext) {
         "repointing the project moves the workspace's cwd — derived, not cached"
     );
 }
+
+/// UXI-Project-3 — the jump panel groups agent sessions under their PROJECT name
+/// (resolved from the session cwd through the store), not a bare cwd string; an
+/// unfiled cwd (no project roots it) falls back to the shortened path.
+///
+/// Negative control: make `jump_group_header` always return
+/// `shorten_cwd_for_display(cwd)` → the project-name assert fails.
+#[gpui::test]
+fn jump_panel_groups_sessions_by_project(cx: &mut TestAppContext) {
+    let proj_cwd = PathBuf::from("/tmp/yalda-proj-yalda");
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        v.projects
+            .create("Yaldabaoth".into(), proj_cwd.clone())
+            .expect("create project");
+    });
+    // A session rooted at the project's cwd groups under the project NAME.
+    let header = view.read_with(vcx, |v, _| v.jump_group_header(&proj_cwd));
+    assert_eq!(
+        header, "Yaldabaoth",
+        "sessions in the project's cwd group under the project name"
+    );
+    // A cwd with no project falls back to the shortened path (Unfiled).
+    let unfiled =
+        view.read_with(vcx, |v, _| v.jump_group_header(&PathBuf::from("/tmp/yalda-unfiled")));
+    assert_ne!(unfiled, "Yaldabaoth");
+    assert!(!unfiled.is_empty(), "unfiled falls back to the shortened path");
+}

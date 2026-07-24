@@ -152,6 +152,18 @@ impl YaldaGpuiView {
     /// roster (every server session) unioned with local-only sessions not yet
     /// represented in the roster (mid-create placeholders). Sessions opened here
     /// prefer their live store label; binding status comes from the tiles.
+    /// The jump-panel group header for a session cwd (ADR-0028, `UXI-Project-3`):
+    /// the **project name** when a project roots that cwd (`Membership::Inferred`
+    /// / `Assigned`), else the shortened path for an `Unfiled` session. This is
+    /// what turns the "sessions grouped by cwd string" list into "sessions
+    /// grouped under their project," representing the hierarchy.
+    pub(crate) fn jump_group_header(&self, cwd: &std::path::Path) -> String {
+        self.projects
+            .by_cwd(cwd)
+            .map(|id| self.projects.name_of(id).to_string())
+            .unwrap_or_else(|| shorten_cwd_for_display(cwd))
+    }
+
     pub(crate) fn jump_panel_agent_rows(&self, cx: &gpui::App) -> Vec<AgentRow> {
         let bound_sids = self.bound_sid_set();
         let mut rows: Vec<AgentRow> = Vec::new();
@@ -579,6 +591,13 @@ impl YaldaGpuiView {
         let drag_font = st.mono.clone();
         for (cwd_label, group) in grouped {
             let cwd_key = cwd_label.clone();
+            // Display the PROJECT NAME as the group header (UXI-Project-3),
+            // resolved from a row's cwd; the drag machinery below still keys on
+            // the cwd label. Falls back to the shortened path for unfiled sessions.
+            let header_text = group
+                .first()
+                .map(|(_, r)| self.jump_group_header(&r.cwd))
+                .unwrap_or_else(|| cwd_label.clone());
             // The cwd subheader is itself a drag SOURCE (reorder groups) and a
             // drop TARGET for other headers. It's a plain heading turned into a
             // stateful div (needs an id for drag/drop + a drop-highlight).
@@ -598,7 +617,7 @@ impl YaldaGpuiView {
                 .font_family(st.mono.clone())
                 .text_size(px(st.pt * 0.85))
                 .cursor_pointer()
-                .child(SharedString::from(cwd_label.clone()))
+                .child(SharedString::from(header_text.clone()))
                 .on_drag(CwdDrag { cwd_key: cwd_key.clone() }, {
                     let label: SharedString = cwd_label.clone().into();
                     let (fg, bg, font) = (drag_fg, sel_bg, drag_font.clone());
