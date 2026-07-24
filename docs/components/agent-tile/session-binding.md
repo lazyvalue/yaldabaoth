@@ -109,6 +109,9 @@ it was. Rules pinned by the user:
    clear. A pre-existing draft stays put; if the user submits it while armed it is
    *not* sent (it cancels) and it stays in the buffer. Reaching a place where `yes`
    can be typed (e.g. `o` in worksheet nav) is the user's job.
+   **→ AMENDED by `UXI-AgentTile-23`:** the focus half now holds only when a draft is
+   present. With an **empty** compose, arming also drops the user into insert. The
+   no-clear half stands unconditionally.
 2. **Only `yes` clears** — a trimmed exact match. `y`, `Yes`, `yes please` cancel.
 3. **The prompt line stays.** Answered either way, the appended line remains in the
    transcript as a permanent record; a second `x` appends a second line and re-arms.
@@ -150,3 +153,58 @@ step 4 types into the compose directly instead of reusing `worksheet_real_submit
 because that helper presses `i` first and mid-turn (a turn is in flight from step 3)
 the `i` is literal text — it produced the answer `iyes`. That is a harness artifact,
 not a product behavior; the mid-turn chatbox path is what a real user hits there.
+
+### UXI-AgentTile-23 — Arming the close confirm drops you into insert, unless a draft is at risk
+
+**Statement.** `x` ("close session") arms the confirm (`UXI-AgentTile-22`) and, when
+the compose is **empty**, also puts the user where `yes` can be typed — so the whole
+gesture is `<space>` `x` `yes` `⏎`. The move is exactly the one the app already
+makes for text entry, per surface:
+
+1. **Chatbox** — focus moves to the compose and it enters **Insert**.
+2. **Worksheet, idle** — a You-block opens at the caret
+   (`open_you_block_at_cursor`, which focuses the compose in Insert and reveals it).
+3. **Worksheet, mid-turn** — the compose enters **Insert** but focus stays on the
+   **transcript**: mid-turn the worksheet routes input to the bottom chatbox
+   (`UXI-AgentTile-11` rule 7), and `focus = Compose` there is the state that strands
+   focus over a vanished box when the turn ends (the fuzzer-found edge B1).
+4. **A non-empty draft suppresses all of the above** — with text already in the
+   compose, arming behaves exactly as it did before (no focus move, no You-block, no
+   clear). This is deliberate: typing `yes` after a draft would not trim to exactly
+   `yes`, so the close would silently **cancel**, and clearing the draft to make room
+   would destroy the user's work. A draft means the user finishes the job by hand.
+
+This **amends `UXI-AgentTile-22` rule 1** ("arming changes nothing else… reaching a
+place where `yes` can be typed is the user's job"), which is now true only of the
+draft case (clause 4). The rest of rule 1 stands: no compose clear, ever, on either
+path. It applies on every surface — a workspace tile and the bare agent view alike.
+
+**Applies to.** `agent_ui.rs::arm_close_confirm`; `agent.rs`
+(`AgentState::open_you_block_at_cursor`, `InputSurface::is_chatbox`,
+`TurnPhase::is_awaiting`).
+
+**Why.** Closing a session was five steps (`<space>` `x`, then reach a typeable
+place, `yes`, submit) for what the user reads as one decision. The compose-empty
+condition is what makes the shortcut safe: it fires only when there is nothing to
+lose and nothing to corrupt the `yes` with.
+
+**Status.** `implemented` (headless, end-to-end on the real close path).
+
+**Enforcement.** `verify_harness.rs::arming_close_drops_into_insert_unless_a_draft_is_at_risk`
+— drives the REAL `dispatch_menu_command("claude-close")` twice. **Part A** (empty
+compose, idle worksheet resting in nav): after arming, `focus == Compose`, the compose
+is in `Insert`, and `you_block_open` is true; then `yes` is typed and submitted with
+**no focus/insert call of the test's own**, and the session really closes — so the
+assert chain proves the gesture, not a simulated state. **Part B** (draft "half a
+thought", stepped back to transcript nav): focus, mode, and draft text are all
+unchanged by the arm.
+*Negative controls (both observed RED):* delete the auto-insert block → part A's
+"arming with an empty compose focuses it" fires (`Transcript` vs `Compose`); make it
+unconditional → part B's "must NOT move focus" fires (`Compose` vs `Transcript`).
+
+**Deviation from plan.** None behaviorally. One test-side consequence worth
+recording: the pre-existing `close_session_requires_typed_yes_confirmation` used the
+`worksheet_real_submit` helper, which presses `i` before typing — now that arming
+already enters Insert, that `i` became literal text (`inope`). The test was updated to
+type directly, which is also what a real user now does. That failure is itself
+evidence the auto-insert lands on the real path.

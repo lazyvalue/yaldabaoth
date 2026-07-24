@@ -4908,6 +4908,13 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             "new-agent-tile" => {
+                // UXI-Workspace-8: contextual placement. In a BARE AGENT VIEW (an
+                // ephemeral virtual workspace) there is nothing to split beside —
+                // swap that single tile in place for a fresh picker instead.
+                if self.workspace.active_is_ephemeral() {
+                    self.open_new_agent_selector_in_place(cx);
+                    return;
+                }
                 // Split with a placeholder browser (focus lands on the new
                 // tile), then let `open_agent_inner` swap the focused tile
                 // for the agent ring — reusing all the session machinery.

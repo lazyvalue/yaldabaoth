@@ -1119,6 +1119,31 @@ impl YaldaGpuiView {
         cx.notify();
     }
 
+    /// Swap the focused tile for a FRESH unbound agent tile showing the session
+    /// picker, **in place** — no split, no new tile (`UXI-Workspace-8` clause 2).
+    /// This is what "new agent" means in a bare agent view (an ephemeral virtual
+    /// workspace): that view is one agent fullscreen, so a second tile there is a
+    /// cramped layout the user never asked for and that evaporates on the next
+    /// switch.
+    ///
+    /// The session the tile was showing is NOT killed — dropping the tile's binding
+    /// returns it to *free* in the store (the tile holds only a `SessionId` key), so
+    /// it stays running as an unbound row in the jump panel and is re-pickable from
+    /// the very picker this opens (clause 3). Only `claude-close` kills a session.
+    pub(crate) fn open_new_agent_selector_in_place(&mut self, cx: &mut Context<Self>) {
+        // A fresh `AgentTile::new()` is already `Selecting`, so replacing the
+        // content IS opening the picker.
+        self.set_screen(App::Agent(AgentTile::new()));
+        if self.session_server.is_some() {
+            // The picker projects the free sessions out of the universal roster;
+            // make sure the pump is up and the roster isn't stale.
+            self.start_server_pump(cx);
+            self.refresh_roster(cx);
+        }
+        self.save_workspace_state();
+        cx.notify();
+    }
+
     /// Bootstrap the Agent screen from a non-Agent screen AND create a
     /// brand-new session — never re-attach an existing per-cwd one. This is
     /// the always-fresh counterpart to `open_agent_inner`: `open_agent_inner`
@@ -1477,6 +1502,29 @@ impl YaldaGpuiView {
         self.with_session(id, cx, |claude| {
             Self::append_system_line(claude, Self::CLOSE_CONFIRM_PROMPT);
             claude.close_confirm_armed = true;
+            // UXI-AgentTile-23: with an EMPTY compose there is no draft to protect,
+            // so also put the user where `yes` can be typed — the whole gesture
+            // becomes <space> x yes ⏎. A non-empty draft suppresses this entirely
+            // (UXI-AgentTile-22 rule 1 still governs that case): typing after a draft
+            // would not trim to exactly `yes` and would silently cancel, and clearing
+            // it to make room would destroy the user's work.
+            if claude.input_surface.compose().text().trim().is_empty() {
+                if claude.input_surface.is_chatbox() {
+                    claude.input_surface.compose_mut().mode = EditMode::Insert;
+                    claude.focus = AgentFocus::Compose;
+                } else if claude.turn_phase.is_awaiting() {
+                    // Mid-turn worksheet: input already routes to the bottom chatbox
+                    // (UXI-AgentTile-11 rule 7), so only the mode needs flipping.
+                    // Focus must STAY on the transcript — `focus = Compose` here is
+                    // the state that strands focus over a vanished box when the turn
+                    // ends (the fuzzer-found edge B1).
+                    claude.input_surface.compose_mut().mode = EditMode::Insert;
+                } else {
+                    // Idle worksheet: the typeable surface is an inline You-block.
+                    // This focuses the compose in Insert and reveals it.
+                    claude.open_you_block_at_cursor();
+                }
+            }
         });
         cx.notify();
     }
@@ -1517,6 +1565,13 @@ impl YaldaGpuiView {
         self.transcript_views.remove(&id);
         self.sessions.close(id);
         self.show_selector_on_focused_tile(cx);
+        // UXI-Workspace-9: a bare agent view (ephemeral virtual workspace) exists
+        // solely to show THIS session — with it closed there is nothing left to
+        // show, so dismiss the view instead of stranding a selector the user has to
+        // close a second time. A real workspace's tile keeps the selector (clause 1).
+        if self.workspace.active_is_ephemeral() {
+            self.workspace.dismiss_ephemeral_workspace();
+        }
         // Wipe the cwd entry so reboot doesn't resurrect the closed session.
         if let Ok(cwd) = std::env::current_dir() {
             forget_persisted_acp_sessions(&cwd);

@@ -465,3 +465,108 @@ directly), so they actually exercise `capture_any_mouse_down` + `stop_propagatio
 **Not covered (deliberate).** Card/Minimap placeholders (carve-out 2) remain
 unimplemented — clicking a card/pip still does nothing. If that is wanted, it belongs
 with the plane-zoom work, not here.
+
+### UXI-Workspace-8 — "New agent" is contextual: a new tile in a workspace, in place in the bare agent view
+
+**Statement.** The workspace `.` menu's **new → agent** (command `new-agent-tile`)
+places the new agent tile according to what you are looking at. Both branches land
+on the **same in-tile session picker** — only the placement differs:
+
+1. **In a real workspace** (the active workspace is NOT ephemeral) — unchanged:
+   a new tile is added to the plane and opens on the picker. Your existing tiles
+   stay put.
+2. **In the bare agent view** (the active workspace IS an ephemeral virtual
+   workspace, ADR-0021 — where a free session you jumped to from the jump panel is
+   shown fullscreen) — **no new tile is created**. The single tile swaps **in
+   place** to a fresh unbound agent tile showing the picker. The bare agent view
+   stays exactly one tile; it never splits.
+3. **The session you were looking at is not killed.** Swapping the ephemeral view
+   unbinds it, so it returns to being a *free* session (still running, an unbound
+   `✦` row in the jump panel) — and it is re-pickable from the very picker the
+   swap just opened. Closing a session is `claude-close` and nothing else
+   (`UXI-AgentTile-22`).
+4. The ephemeral workspace stays ephemeral: it is still torn down on switch-away,
+   and the picker's cwd is still its project's (`UXI-Project-2/-6`).
+
+**Applies to.** `main.rs` `dispatch_menu_command`'s `"new-agent-tile"` arm (the
+`workspace.active_is_ephemeral()` branch); `agent_ui.rs`
+`open_new_agent_selector_in_place` (the in-place swap: fresh `AgentTile::new()` via
+`set_screen`, `start_server_pump` + `refresh_roster`); `workspace.rs`
+`Frame::active_is_ephemeral`.
+
+**Why.** The bare agent view is "one agent, fullscreen" — splitting a second tile
+into it produces a cramped two-pane layout the user never asked for and that
+evaporates on the next workspace switch. "New agent" there means "show me a
+different agent," not "tile another one beside this one."
+
+**Status.** `implemented` (headless, on the real dispatch path).
+
+**Enforcement.** `verify_harness.rs::new_agent_splits_in_a_workspace_and_swaps_in_place_in_a_bare_agent_view`
+— drives the REAL `dispatch_menu_command("new-agent-tile")` (the exact command string
+the `.`→`n`→`a` entry carries) in both contexts: in a real workspace the active
+workspace's tile count grows by one and the focused tile is an `App::Agent`; in an
+ephemeral workspace the tile count stays **1**, the workspace count is unchanged, the
+workspace is still ephemeral, the focused tile is an **unbound** `App::Agent`, and the
+previously-bound session is still in the store (`sessions.contains`) bound by no tile.
+*Negative control (observed RED):* disable the `active_is_ephemeral()` arm → "must NOT
+split" fires with `left: 2, right: 1`.
+
+**Deviation from plan.** The real-workspace arm asserts the new tile is an
+`App::Agent`, not specifically an *unbound* one. That branch's picker-vs-bound
+outcome is decided inside the pre-existing `open_agent_inner`: with a session server
+(production) it opens the picker; the harness has no daemon, so it takes the legacy
+direct-spawn branch and binds. The **placement** — the thing this invariant changes —
+is what the guard pins. The ephemeral branch is unconditional (`AgentTile::new()` is
+always `Selecting`), so its unbound-picker assert is exact.
+
+### UXI-Workspace-9 — Closing the session in a bare agent view dismisses the view
+
+**Statement.** When the confirmed close (`UXI-AgentTile-22`'s typed `yes`) kills the
+session shown by an **ephemeral virtual workspace**, the workspace itself is torn
+down and the user lands back on the workspace they jumped from — no leftover
+selector tile to dismiss with a second `.` `x`.
+
+1. **Only in the ephemeral case.** In a real workspace, closing a session is
+   unchanged: the tile stays an agent tile and becomes a live unbound **selector**
+   (an agent tile never vanishes and never becomes a buffer).
+2. **Return to origin.** The frame records the workspace the ephemeral was opened
+   FROM (`Frame::ephemeral_origin`, the origin workspace's focused `WindowId` — a
+   stable key, unlike an index) and reactivates exactly that workspace. If the
+   origin is gone (closed while the ephemeral was up), the last remaining workspace
+   is used. There is always ≥1 real workspace, so the fallback is total.
+3. **Replacing one ephemeral with another keeps the ORIGINAL origin** — the
+   ephemeral is the thing you return *from*, never the thing you return *to*.
+4. Switch-away teardown (ADR-0021, `set_active_workspace`) is unchanged; it just
+   clears the recorded origin.
+
+**Applies to.** `workspace.rs`: `Frame::ephemeral_origin`,
+`Frame::dismiss_ephemeral_workspace`, `Frame::workspace_index_of_window`, the origin
+capture in `open_ephemeral_workspace_in`, the clear in `set_active_workspace`.
+`agent_ui.rs`: the tail of `close_active_agent_session`.
+
+**Why.** The bare agent view exists *to show that one session*. Once the session is
+closed the view has nothing to show, so leaving a selector behind makes the user
+close the same thing twice (`<space> x … yes`, then `.` `x`) — the friction this
+invariant removes.
+
+**Status.** `implemented` (headless, end-to-end on the real close path).
+
+**Enforcement.** `verify_harness.rs::closing_the_session_in_a_bare_agent_view_dismisses_it`
+— drives the REAL `dispatch_menu_command("claude-close")` then a REAL `yes` submit
+through `submit_agent` → `consume_close_confirm` → `close_active_agent_session`, on a
+session jumped to from workspace **0** of two. Asserts the workspace count is back to
+pre-jump, the active workspace is no longer ephemeral, and it is workspace 0 with the
+very `WindowId` we left. **The origin assert is non-vacuous by construction:** the
+origin (0) is deliberately NOT the last workspace, so a "land on the last one"
+fallback would give 1. Clause 1 (a real workspace keeps its tile + workspace) is
+asserted at the tail of
+`arming_close_drops_into_insert_unless_a_draft_is_at_risk` part A, which closes a
+session on a properly-bound tile in a real workspace.
+*Negative controls (both observed RED):* skip the `dismiss_ephemeral_workspace` call
+→ "the ephemeral view is gone" fires (`3` vs `2`); force the origin lookup to `None`
+→ "we land back on the ORIGIN workspace" fires (`1` vs `0`).
+
+**Deviation from plan.** The clause-1 contrast lives in the `UXI-AgentTile-23` test
+rather than this one: binding a second free session into a *real* workspace mid-test
+needs a bound-tile boot (`boot_worksheet_channel`), which that test already has —
+`focus_existing_session` on a free session opens another ephemeral view instead.

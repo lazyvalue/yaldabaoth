@@ -34,9 +34,9 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
   worksheet vs chatbox, paint-on-route, immediate submit, image paste, reply-with-quote).
 - [recap.md](recap.md) — `UXI-AgentTile-15`: the pinned, isolated session recap.
 - [model.md](model.md) — `UXI-AgentTile-16`: the per-session model selector.
-- [session-binding.md](session-binding.md) — `UXI-AgentTile-18..19`, `-22`: durable
+- [session-binding.md](session-binding.md) — `UXI-AgentTile-18..19`, `-22..23`: durable
   tile↔session identity + auto-resume on restart (the unresumable-session notice,
-  and the typed-`yes` close confirmation).
+  and the typed-`yes` close confirmation + its auto-insert).
 
 <!-- Add facets as more of the agent tile's behavior is migrated in:
      status-strip.md, … -->
@@ -66,4 +66,5 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-19 | session-binding | An unresumable session shows an inline "start fresh" notice, never a picker | implemented |
 | UXI-AgentTile-20 | sidepanel | `Cmd-B` force-hides the whole sidepanel; `Cmd-0` un-hides; persists per session | implemented |
 | UXI-AgentTile-21 | compose | `[N]r` over agent text opens a reply You-block seeded with a quotation | implemented |
-| UXI-AgentTile-22 | session-binding | Closing a session requires a typed `yes` confirmation | implemented |
+| UXI-AgentTile-22 | session-binding | Closing a session requires a typed `yes` confirmation | implemented (rule 1 amended by `-23`) |
+| UXI-AgentTile-23 | session-binding | Arming the close confirm drops you into insert, unless a draft is at risk | implemented |

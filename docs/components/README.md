@@ -44,7 +44,8 @@ holds the detail for a slice. The UXI ids stay owned by the component, not the f
 - [jump-panel.md](jump-panel.md) — `JumpPanel`. `UXI-JumpPanel-1..5`.
 - [workspace.md](workspace.md) — `Workspace` (the infinite-plane model: signed
   all-directions slot grid + pan/semantic-zoom camera + reset-to-origin;
-  layout-mode/split surface retired). `UXI-Workspace-1..7`.
+  layout-mode/split surface retired; contextual new-agent placement + ephemeral
+  dismissal on close). `UXI-Workspace-1..9`.
 - [project.md](project.md) — `Project` (top-level org primitive: name+cwd-keyed
   store, workspaces/sessions hold a `ProjectId` FK, `Frame → Project → Workspace →
   Window`). `UXI-Project-1..8` — all implemented (ADR-0028).

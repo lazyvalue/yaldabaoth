@@ -1223,6 +1223,14 @@ pub struct Frame<C> {
     /// migration guarantees at least one project exists at boot, so a real id is
     /// always available (ADR-0028 §3).
     default_project: ProjectId,
+    /// The workspace an **ephemeral** virtual workspace was opened FROM
+    /// (`UXI-Workspace-9`) — keyed by that workspace's focused [`WindowId`], which
+    /// is stable across the index shifting a workspace add/remove causes. `Some`
+    /// only while an ephemeral workspace is up. Read by
+    /// [`Frame::dismiss_ephemeral_workspace`] so closing the session a bare agent
+    /// view exists to show returns the user where they jumped from — not merely to
+    /// the last workspace in the list.
+    ephemeral_origin: Option<WindowId>,
 }
 
 impl<C> Frame<C> {
@@ -1244,6 +1252,7 @@ impl<C> Frame<C> {
             marks: MarkTable::new(),
             tag_shortcuts: HashMap::new(),
             default_project,
+            ephemeral_origin: None,
         }
     }
 
@@ -1371,6 +1380,10 @@ impl<C> Frame<C> {
         let cur = self.active_workspace;
         if cur != idx && self.is_ephemeral(cur) {
             self.workspaces.remove(cur);
+            // The user chose where to go, so the recorded origin is spent
+            // (`UXI-Workspace-9` clause 4) — never let it leak into a later
+            // dismissal.
+            self.ephemeral_origin = None;
             // The ephemeral workspace is gone; shift `idx` down if it sat after it.
             let target = if idx > cur { idx - 1 } else { idx };
             self.active_workspace = target.min(self.workspaces.len().saturating_sub(1));
@@ -1401,6 +1414,13 @@ impl<C> Frame<C> {
         if self.active_is_ephemeral() {
             let cur = self.active_workspace;
             self.workspaces.remove(cur);
+            // Keep the ORIGINAL origin (`UXI-Workspace-9` clause 3): an ephemeral
+            // workspace is what you return FROM, never what you return TO.
+        } else {
+            // Record where we came from so a close-triggered dismissal can land
+            // back here (`UXI-Workspace-9` clause 2). Keyed by the origin's focused
+            // WindowId — stable across the index shift the push below causes.
+            self.ephemeral_origin = self.focused_window_id();
         }
         let id = self.alloc_window_id();
         let name = auto_workspace_name(self.next_workspace_index);
@@ -1410,6 +1430,44 @@ impl<C> Frame<C> {
         self.workspaces.push(wsp);
         self.active_workspace = self.workspaces.len() - 1;
         id
+    }
+
+    /// The index of the workspace whose layout contains `id`. `None` if no workspace
+    /// holds that window. Window ids are frame-wide unique, so this is the stable
+    /// way to name a workspace across an add/remove that shifts every index.
+    pub fn workspace_index_of_window(&self, id: WindowId) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .position(|w| w.layout.find_leaf(id).is_some())
+    }
+
+    /// Tear down the active **ephemeral** virtual workspace and return to the
+    /// workspace it was opened from (`UXI-Workspace-9`). Called when the session a
+    /// bare agent view exists to show is closed — the view has nothing left to show,
+    /// so it should not linger as a selector the user must dismiss again.
+    ///
+    /// No-op when the active workspace is not ephemeral (a real workspace's tile
+    /// stays put and becomes a selector — clause 1). The origin is resolved BEFORE
+    /// the removal (indices shift) and falls back to the last remaining workspace if
+    /// it is gone, so the landing is total. Does NOT notify — callers do.
+    pub fn dismiss_ephemeral_workspace(&mut self) {
+        if !self.active_is_ephemeral() {
+            return;
+        }
+        let cur = self.active_workspace;
+        let origin = self
+            .ephemeral_origin
+            .take()
+            .and_then(|w| self.workspace_index_of_window(w));
+        self.workspaces.remove(cur);
+        let last = self.workspaces.len().saturating_sub(1);
+        self.active_workspace = match origin {
+            // The ephemeral workspace is always pushed last, so a live origin sits
+            // before it; the `>` arm is defensive, not reachable today.
+            Some(i) if i > cur => (i - 1).min(last),
+            Some(i) => i.min(last),
+            None => last,
+        };
     }
 
     /// Cycle to the next workspace (wraps). Routes through [`set_active_workspace`] so a

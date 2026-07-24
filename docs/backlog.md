@@ -13,6 +13,35 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Contextual "New Agent" + one-gesture close in the bare agent view** —
+  `NEEDS-RUNTIME` (branch `contextual-new-agent`, 2026-07-24 via `/new-ux`;
+  `UXI-Workspace-8`, `UXI-Workspace-9`, `UXI-AgentTile-23`). Two user
+  requirements, both scoped to the **ephemeral virtual workspace** (what the user
+  calls the "just agent view"):
+  1. *"New Agent command should be contextual based on whether I have a workspace
+     open. If workspace — open a new tile. If not, just open a new agent
+     session."* → `.` → `n` → `a` still adds a tile in a real workspace, but in a
+     bare agent view it swaps that single tile **in place** (no split) to the
+     picker. The session it was showing is **freed, not killed** — still running,
+     re-pickable from the picker that just opened. Both branches land on the same
+     picker (the user reversed an earlier "immediately fresh" choice for
+     consistency).
+  2. *"closing an agent session is a pain in the ass … `<space>` `x` insert-mode
+     `yes` … then `.` `x`."* → arming the close confirm now also drops you into
+     insert **when the compose is empty** (a draft suppresses it entirely: `yes`
+     appended to a draft would silently cancel, and clearing it would destroy the
+     user's work), and answering `yes` in a bare agent view **dismisses the view**,
+     returning to the origin workspace. Real workspaces are unchanged (tile stays,
+     becomes the unbound selector).
+  This **amends `UXI-AgentTile-22` rule 1** — its "no focus move" half now applies
+  only to the draft case. Guards:
+  `new_agent_splits_in_a_workspace_and_swaps_in_place_in_a_bare_agent_view`,
+  `closing_the_session_in_a_bare_agent_view_dismisses_it`,
+  `arming_close_drops_into_insert_unless_a_draft_is_at_risk`; **four negative
+  controls observed RED**; 455 gpui tests + full suite green. Remaining human
+  check: the live feel of the in-place swap and the dismissal, and the picker's
+  server round-trip (harness gaps #1/#2 — needs the daemon).
+
 - **Command panel (leader menu) aesthetic redesign** — `NEEDS-RUNTIME` (branch
   `main`, 2026-07-23 via `/new-ux`, autonomous, Fable advising UX + aesthetics +
   architecture; `UXI-Menu-1..5`, spec `docs/components/common/menu.md`, rationale
