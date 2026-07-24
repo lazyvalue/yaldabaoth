@@ -1981,18 +1981,28 @@ impl YaldaGpuiView {
                                         .font_weight(FontWeight::NORMAL)
                                         .child(SharedString::from(format!("· {label}"))),
                                 );
+                            // UXI-AgentTile-25: render the subagent's context as
+                            // beautiful sections (markdown prompt/report, code,
+                            // diffs, chips) — NOT raw JSON. No `font_family(mono)`
+                            // on the container: each section sets its own font.
                             let mut content = div()
                                 .flex()
                                 .flex_col()
                                 .text_size(px(13.0))
-                                .text_color(compose_fg)
-                                .font_family(self.code_font.clone());
-                            content = append_tool_body(
+                                .text_color(compose_fg);
+                            let tb_ctx = ToolBodyCtx {
+                                theme: &self.theme,
+                                body_font: self.body_font.clone(),
+                                code_font: self.code_font.clone(),
+                                text_scale: self.text_scale,
+                                // Focused subagent view: show the whole report.
+                                markdown_block_cap: None,
+                            };
+                            content = append_tool_body_rich(
                                 content,
                                 tc,
                                 ToolRenderPolicy::Full,
-                                &self.code_font,
-                                at,
+                                &tb_ctx,
                             );
                             let body = div()
                                 .id("subagent-body")

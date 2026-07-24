@@ -13,6 +13,19 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Beautiful subagent / tool-call content rendering** — `NEEDS-RUNTIME` (built
+  2026-07-23 via `/new-ux`, autonomous, Fable advising; `UXI-AgentTile-25`). Tool
+  inputs/outputs now render as typed semantic sections instead of raw JSON: a
+  subagent's prompt + report as **markdown**, Bash as a **command code** block,
+  edits as **diffs**, params as **chips**; terminal output stays monospace;
+  content/output dedup; JSON only for unknown shapes; theme-driven + zoom-aware.
+  New `tool_body.rs` (pure `plan_tool_sections` + render layer) replaces
+  `append_tool_body`/`tool_body_free`; wired into the subagent view (`screens.rs`)
+  and both transcript tool paths (`transcript_view.rs`). Guards: 6 pure tests in
+  `tests.rs` (NC observed RED). **Runtime check:** the actual rendered
+  fonts/colors/markdown layout is gap #1 (human eye); a `sample` on a huge report
+  would confirm no jank (the parse cache was deferred — see the deviation note).
+
 - **Abandon-reply gesture in the worksheet You-block** — DONE (2026-07-23 via
   `/new-ux`, `UXI-AgentTile-24`). `<esc>u` in an open worksheet You-block backs
   the reply out undo-style: normal undo of any typing, then `u` pops the block

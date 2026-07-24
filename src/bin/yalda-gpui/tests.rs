@@ -3685,3 +3685,160 @@ fn classify_link_routes_urls_external_and_notes_wiki() {
     // arbitrary local handler) — treated as a local reference.
     assert_eq!(classify_link("file:///etc/passwd"), LinkTarget::Wiki("file:///etc/passwd".into()));
 }
+
+// ── UXI-AgentTile-25: beautiful tool-body section planning (pure) ──────────
+
+#[cfg(test)]
+fn mk_tc(
+    title: &str,
+    kind: yalda::acp_channel::ToolKind,
+    input: Option<serde_json::Value>,
+    output: Option<serde_json::Value>,
+    content: Vec<yalda::acp_channel::ToolCallContent>,
+) -> yalda::acp_channel::ToolCall {
+    let id: yalda::acp_channel::ToolCallId = "t".into();
+    let mut tc = yalda::acp_channel::ToolCall::new(id, title.to_string());
+    tc.kind = kind;
+    tc.raw_input = input;
+    tc.raw_output = output;
+    tc.content = content;
+    tc
+}
+
+/// `extract_output_text` pulls markdown text out of the shapes ACP tools return,
+/// and returns None when there's no clean text (JSON fallback).
+#[test]
+fn extract_output_text_pulls_text_from_common_shapes() {
+    use crate::extract_output_text;
+    use serde_json::json;
+    assert_eq!(extract_output_text(&json!("hello")).as_deref(), Some("hello"));
+    assert_eq!(
+        extract_output_text(&json!({"content":[{"type":"text","text":"# Title"},{"type":"text","text":"body"}]}))
+            .as_deref(),
+        Some("# Title\n\nbody")
+    );
+    assert_eq!(extract_output_text(&json!({"output":"ran ok"})).as_deref(), Some("ran ok"));
+    assert_eq!(extract_output_text(&json!({"result":"done"})).as_deref(), Some("done"));
+    // No clean text → None (caller falls back to JSON).
+    assert_eq!(extract_output_text(&json!({"count": 3, "ok": true})), None);
+    assert_eq!(extract_output_text(&json!(null)), None);
+}
+
+/// A subagent renders its prompt and its report as MARKDOWN sections (not JSON),
+/// with agent-type + description surfaced separately. This is the showcase.
+///
+/// Negative control (observed RED): make the report/output branch always emit
+/// `SectionBody::Json` → the "report is Markdown" assert fails.
+#[test]
+fn plan_tool_sections_subagent_prompt_and_report_are_markdown() {
+    use crate::{plan_tool_sections, SectionBody, SectionRole, ToolRenderPolicy};
+    use serde_json::json;
+    let tc = mk_tc(
+        "Explore the repo",
+        yalda::acp_channel::ToolKind::Think,
+        Some(json!({"subagent_type":"Explore","description":"map the code","prompt":"# Task\nFind all the **things**."})),
+        Some(json!({"content":[{"type":"text","text":"## Report\n- found it\n- done"}]})),
+        vec![],
+    );
+    let sections = plan_tool_sections(&tc, ToolRenderPolicy::Full);
+    // agent chip
+    assert!(sections.iter().any(|s| s.label == "agent"
+        && matches!(&s.body, SectionBody::Chips(c) if c.iter().any(|(k,v)| k=="agent" && v=="Explore"))));
+    // description as prose
+    assert!(sections.iter().any(|s| s.label == "task" && matches!(s.body, SectionBody::Prose(_))));
+    // prompt as MARKDOWN (input side)
+    assert!(sections.iter().any(|s| s.label == "prompt"
+        && s.role == SectionRole::Input
+        && matches!(s.body, SectionBody::Markdown{..})));
+    // report as MARKDOWN, emphasized (output side) — the star.
+    let report = sections.iter().find(|s| s.label == "report").expect("a report section");
+    assert_eq!(report.role, SectionRole::Output);
+    assert!(matches!(report.body, SectionBody::Markdown{..}), "report renders as markdown, not json");
+    assert!(report.emphasis, "the subagent report is emphasized");
+}
+
+/// A Bash command renders as a code section (not JSON); terminal output stays
+/// monospace (a leading `#` must not become an H1).
+#[test]
+fn plan_tool_sections_bash_is_code_not_markdown() {
+    use crate::{plan_tool_sections, SectionBody, ToolRenderPolicy};
+    use serde_json::json;
+    let tc = mk_tc(
+        "Bash",
+        yalda::acp_channel::ToolKind::Execute,
+        Some(json!({"command":"grep -rn foo .","description":"search"})),
+        Some(json!("# not a heading\nresults")),
+        vec![],
+    );
+    let sections = plan_tool_sections(&tc, ToolRenderPolicy::Full);
+    assert!(sections.iter().any(|s| s.label == "command" && matches!(s.body, SectionBody::Code{..})));
+    // terminal output is Code, never Markdown.
+    assert!(sections.iter().any(|s| s.label == "output" && matches!(s.body, SectionBody::Code{..})));
+    assert!(!sections.iter().any(|s| matches!(s.body, SectionBody::Markdown{..})),
+        "bash output must not be markdown-rendered");
+}
+
+/// An Edit synthesizes a diff from old/new when `content` carries none, and does
+/// NOT dump old_string/new_string as JSON.
+#[test]
+fn plan_tool_sections_edit_synthesizes_diff() {
+    use crate::{plan_tool_sections, SectionBody, ToolRenderPolicy};
+    use serde_json::json;
+    let tc = mk_tc(
+        "Edit",
+        yalda::acp_channel::ToolKind::Edit,
+        Some(json!({"file_path":"/a/b.rs","old_string":"let x = 1;","new_string":"let x = 2;"})),
+        None,
+        vec![],
+    );
+    let sections = plan_tool_sections(&tc, ToolRenderPolicy::Full);
+    let diff = sections.iter().find(|s| matches!(s.body, SectionBody::Diff{..})).expect("a diff section");
+    let SectionBody::Diff { text, .. } = &diff.body else { unreachable!() };
+    assert!(text.contains("- let x = 1;") && text.contains("+ let x = 2;"), "synthesized +/- diff");
+    // path is a chip, not raw json; no Json section for the edit input.
+    assert!(sections.iter().any(|s| s.label == "path" && matches!(s.body, SectionBody::Chips(_))));
+    assert!(!sections.iter().any(|s| matches!(s.body, SectionBody::Json(_))));
+}
+
+/// When `content` and `raw_output` carry the SAME text (Claude Code mirrors
+/// output into content), only ONE section is emitted — not the doubled text the
+/// old UI showed (content + JSON-escaped output).
+#[test]
+fn plan_tool_sections_dedups_content_and_output() {
+    use crate::{plan_tool_sections, SectionBody, ToolRenderPolicy};
+    use serde_json::json;
+    let tc = mk_tc(
+        "Task",
+        yalda::acp_channel::ToolKind::Think,
+        Some(json!({"prompt":"do it","subagent_type":"general"})),
+        Some(json!({"content":[{"type":"text","text":"the one and only report"}]})),
+        vec![yalda::acp_channel::ToolCallContent::from("the one and only report".to_string())],
+    );
+    let sections = plan_tool_sections(&tc, ToolRenderPolicy::Full);
+    let report_like = sections
+        .iter()
+        .filter(|s| matches!(s.body, SectionBody::Markdown{ref text} if text.contains("one and only")))
+        .count();
+    assert_eq!(report_like, 1, "content/output dedup: the shared report is shown once, not twice");
+}
+
+/// An unknown tool with a long multiline string field renders it as a readable
+/// code section (real newlines), not a `\n`-riddled JSON blob.
+#[test]
+fn plan_tool_sections_unknown_multiline_is_code() {
+    use crate::{plan_tool_sections, SectionBody, ToolRenderPolicy};
+    use serde_json::json;
+    let big = "line one\nline two\nline three\nline four which is here";
+    let tc = mk_tc(
+        "mystery",
+        yalda::acp_channel::ToolKind::Other,
+        Some(json!({"blob": big, "n": 5})),
+        None,
+        vec![],
+    );
+    let sections = plan_tool_sections(&tc, ToolRenderPolicy::Full);
+    assert!(sections.iter().any(|s| matches!(&s.body, SectionBody::Code{text,..} if text.contains("line two"))),
+        "multiline string becomes a code section");
+    // the scalar `n` is a chip.
+    assert!(sections.iter().any(|s| matches!(&s.body, SectionBody::Chips(c) if c.iter().any(|(k,_)| k=="n"))));
+}

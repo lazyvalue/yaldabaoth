@@ -1,7 +1,7 @@
 # Agent Tile — Transcript
 
 Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-4..8`,
-`UXI-AgentTile-23`.
+`UXI-AgentTile-23`, `UXI-AgentTile-25`.
 
 ## Description
 
@@ -91,7 +91,8 @@ the test fails.
 by clicking its row, or highlighting it in the Subagents panel per INV-UX-12), the
 agent tile's **main area is replaced** by that subagent's **context**: a `← Back`
 header (label of the subagent) over a scrollable view of its prompt + content +
-output (`append_tool_body`, the same body the expanded tool card shows). The cached
+output (`append_tool_body_rich`, the same beautiful sections the expanded tool card
+shows — markdown/code/diff/chips, UXI-AgentTile-25). The cached
 main `TranscriptView` is **not rendered** while swapped. Returning to the main agent
 is easy and always available: click **`← Back`**, or press **`Esc`** (`Esc` with a
 focused subagent calls `unfocus_subagent`, ahead of its per-mode meaning). Switching
@@ -100,7 +101,7 @@ main transcript. The swap is a pure render-time branch on `focused_subagent`; no
 transcript state is touched, so Back is lossless.
 
 **Applies to.** `screens.rs::render_agent`: the `focused_subagent` match that builds
-the `subagent-view` (Back header + `append_tool_body`) OR the transcript body.
+the `subagent-view` (Back header + `append_tool_body_rich`) OR the transcript body.
 `agent_ui.rs`: `focus_subagent` / `unfocus_subagent` (set/clear), the `Esc`-returns
 branch in `handle_claude_key`, and `reveal_panel_selection` (panel highlight → swap).
 `agent.rs`: `focused_subagent: Option<ToolCallKey>`, `classify_subagent` (label).
@@ -270,3 +271,70 @@ tunable by eye (gap #1).
 transparent for `TurnId::Llm` / `TurnId::Tool` / `TurnId::System` / `None`. Negative
 control observed RED: force the `User` arm transparent → "user turn is tinted"
 fails.
+
+### UXI-AgentTile-25 — Tool-call inputs/outputs render as beautiful sections, not raw JSON
+
+**Statement.** An expanded tool call's body — everywhere it appears (the inline
+transcript tool groups AND the focused-subagent context view, UXI-AgentTile-6) —
+renders as **typed, semantically-labeled sections**, never as
+`serde_json::to_string_pretty` monospace blobs:
+
+- **Markdown text renders as markdown.** A subagent's **prompt** (input) and its
+  **report** (output), and any prose tool output, are parsed with the doc markdown
+  renderer (`render_with_wiki` + `block_inner`) — headings, lists, code fences,
+  bold, tables — in the proportional body font, code in the code font. The report
+  gets an emphasized (warm-accent) tile; it's the star.
+- **Per-tool structured input.** Bash → a `command` **code** section; Read/Search/
+  Move → **chips** (`path`, `pattern`, `glob`, …) in the code font; Edit → the
+  **diff** (from `content`, or synthesized from `old_string`/`new_string`), with
+  `old_string`/`new_string` never dumped as JSON; Write → a `content` code section;
+  Task → `agent` chip + `task` prose + `prompt` markdown.
+- **Terminal output stays monospace.** Execute/Bash output renders as **code**, not
+  markdown (a leading `#` is a shell comment, not an H1).
+- **Content/output dedup.** When `content` and `raw_output` carry the same text
+  (Claude Code mirrors output into content), it is shown **once**, not doubled.
+- **JSON only as a last resort.** Genuinely unknown shapes fall back to
+  pretty-printed JSON; a long/multiline string field of an unknown tool becomes its
+  own readable **code** section (real newlines), not a `\n`-riddled one-liner.
+- All colors/fonts are **theme-driven** (`AgentTheme` tiles: input = neutral
+  `tool_card_border`/`tool_body_bg`, output = `agent_tint`/`tool_output_bg`, report
+  = `warm_accent`), and every size multiplies by `text_scale` (zoom applies, which
+  the old JSON tiles ignored). Payloads are byte-capped before parse; the inline
+  transcript caps markdown blocks (a "+N more blocks" footer) while the focused
+  subagent view shows the whole report.
+
+**Applies to.** New module `tool_body.rs`: the **pure** planner
+`plan_tool_sections(tc, policy) -> Vec<ToolSection>` (`SectionBody::{Chips, Prose,
+Code, Markdown, Diff, Json}`) + `extract_output_text` (`agent.rs`), and the render
+layer `render_tool_section` / `append_tool_body_rich` over a `ToolBodyCtx` (theme,
+fonts, `text_scale`, markdown cap). `render_blocks.rs::render_markdown_column`
+(read-only `block_inner` column). Call sites: `screens.rs` focused-subagent view
+(drops its old `font_family(mono)` container) and `transcript_view.rs`
+single-/multi-tool paths (`build_tool_block_with_weak` now takes a `ToolBodyCtx`).
+Replaces `agent.rs::append_tool_body`/`tool_body_free` (removed).
+
+**Why.** The subagent view and tool cards showed inputs/outputs as raw
+pretty-printed JSON — hard to read, no formatting, markdown reports mangled into
+escaped one-liners. The user asked to "make this beautiful": markdown reads as
+markdown, code as code, edits as diffs, params as chips.
+
+**Status.** `implemented` (headless for the section *planning* — the exact painted
+glyphs/colors/markdown layout are gap #1, human eye).
+
+**Enforcement.** `tests.rs` (pure, no gpui):
+`plan_tool_sections_subagent_prompt_and_report_are_markdown` (subagent prompt +
+report are `Markdown`, report emphasized; NC observed RED by forcing the output
+branch to `Json`), `plan_tool_sections_bash_is_code_not_markdown`,
+`plan_tool_sections_edit_synthesizes_diff`, `plan_tool_sections_dedups_content_and_output`,
+`plan_tool_sections_unknown_multiline_is_code`, and
+`extract_output_text_pulls_text_from_common_shapes`. The rendered pixels
+(fonts/colors/markdown block layout) are the runtime check (gap #1).
+
+**Deviation from plan.** Fable's proposed per-view markdown **parse cache**
+(`tool_md_cache`) is **not** implemented in this pass: the inline transcript is
+already seq-gated + list-virtualized (parse runs only when the row's cache busts),
+payloads are byte-capped (96 KB) and block-capped (40 inline), and the
+focused-subagent view is a transient surface — so per-frame reparse is bounded.
+The cache is a clean follow-up if a wall-clock `sample` shows jank on a huge report
+(gap #3). `Todos`/`Terminal` rich variants were also left out of scope (TodoWrite is
+`HeaderOnly`; terminals render as a placeholder as before).

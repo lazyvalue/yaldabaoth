@@ -1235,14 +1235,21 @@ impl TranscriptView {
                             .child(header_row);
 
                         if group_expanded && expandable {
+                            // UXI-AgentTile-25: rich per-section tool body (markdown
+                            // output, code, diffs, chips) instead of raw JSON.
+                            let tb_ctx = tool_body_ctx_inline(
+                                &theme_snap,
+                                body_font_snap.clone(),
+                                code_font_snap.clone(),
+                                text_scale,
+                            );
                             if count == 1 {
                                 let tc = calls[0];
-                                block = append_tool_body(
+                                block = append_tool_body_rich(
                                     block,
                                     tc,
                                     single_policy.unwrap_or(ToolRenderPolicy::Full),
-                                    &code_font_snap,
-                                    &at_snap,
+                                    &tb_ctx,
                                 );
                             } else {
                                 for tc in &calls {
@@ -1251,9 +1258,8 @@ impl TranscriptView {
                                     block = block.child(build_tool_block_with_weak(
                                         tc,
                                         expanded_detail,
-                                        &code_font_snap,
                                         weak_self.clone(),
-                                        &at_snap,
+                                        &tb_ctx,
                                     ));
                                 }
                             }

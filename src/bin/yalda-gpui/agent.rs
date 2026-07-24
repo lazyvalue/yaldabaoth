@@ -259,11 +259,11 @@ pub(crate) fn user_turn_item_indices(flat_items: &[FlatItem]) -> Vec<usize> {
 pub(crate) fn build_tool_block_with_weak(
     tc: &yalda::acp_channel::ToolCall,
     expanded: bool,
-    code_font: &SharedString,
     weak_view: gpui::WeakEntity<YaldaGpuiView>,
-    at: &yalda::theme::AgentTheme,
+    ctx: &ToolBodyCtx<'_>,
 ) -> AnyElement {
     use yalda::acp_channel::ToolCallStatus;
+    let at = &ctx.theme.agent;
     let (status_glyph, status_color): (&str, Hsla) = match tc.status {
         ToolCallStatus::Pending => ("○", nc(at.tool_pending)),
         ToolCallStatus::InProgress => ("◐", nc(at.tool_in_progress)),
@@ -330,124 +330,12 @@ pub(crate) fn build_tool_block_with_weak(
         .child(summary_row);
 
     if expanded && has_body {
-        let max_lines = match policy {
-            ToolRenderPolicy::Truncated { max_lines } => Some(max_lines),
-            _ => None,
-        };
-        let body_bg = nc(at.tool_body_bg);
-        let output_bg = nc(at.tool_output_bg);
-        let body_fg = nc(at.tool_body_fg);
-        let diff_add = nc(at.diff_add);
-        let diff_remove = nc(at.diff_remove);
-        let diff_header = nc(at.diff_header);
-        if let Some(input) = &tc.raw_input {
-            let pretty = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
-            block = block.child(tool_body_free(
-                "input",
-                &pretty,
-                None,
-                body_bg,
-                body_fg,
-                code_font,
-                diff_add,
-                diff_remove,
-                diff_header,
-            ));
-        }
-        let content_text = render_tool_content_blocks(&tc.content);
-        if !content_text.trim().is_empty() {
-            block = block.child(tool_body_free(
-                "content",
-                &content_text,
-                max_lines,
-                body_bg,
-                body_fg,
-                code_font,
-                diff_add,
-                diff_remove,
-                diff_header,
-            ));
-        }
-        if let Some(output) = &tc.raw_output {
-            let pretty =
-                serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
-            block = block.child(tool_body_free(
-                "output",
-                &pretty,
-                max_lines,
-                output_bg,
-                body_fg,
-                code_font,
-                diff_add,
-                diff_remove,
-                diff_header,
-            ));
-        }
+        // UXI-AgentTile-25: rich per-section rendering (markdown/code/diff/chips)
+        // instead of the old pretty-JSON tiles.
+        block = append_tool_body_rich(block, tc, policy, ctx);
     }
 
     block.into_any_element()
-}
-
-/// Free-function form of [`YaldaGpuiView::tool_body`] for the
-/// virtualised render path. Same content layout, accepts a borrowed
-/// `code_font` instead of reaching through `&self`.
-// builder/render fn — arg count is inherent, splitting would obscure
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn tool_body_free(
-    label: &str,
-    body: &str,
-    max_lines: Option<usize>,
-    bg: Hsla,
-    fg: Hsla,
-    code_font: &SharedString,
-    diff_add: Hsla,
-    diff_remove: Hsla,
-    diff_header: Hsla,
-) -> gpui::Div {
-    let display = match max_lines {
-        Some(n) => truncate_lines(body, n),
-        None => body.to_string(),
-    };
-
-    // Build diff-highlighted lines: color +/- lines and diff headers.
-    let mut container = div()
-        .mt_1()
-        .mx_2()
-        .px_2()
-        .py_1()
-        .rounded_sm()
-        .bg(bg)
-        .text_size(px(11.0))
-        .text_color(fg)
-        .font_family(code_font.clone());
-
-    // Label
-    container = container.child(
-        div()
-            .text_size(px(10.0))
-            .pb(px(2.0))
-            .child(SharedString::from(format!("{}:", label))),
-    );
-
-    // Diff-highlighted body lines.
-    for line in display.lines() {
-        let color = if line.starts_with("+ ") || line.starts_with("+\t") || line == "+" {
-            diff_add
-        } else if line.starts_with("- ") || line.starts_with("-\t") || line == "-" {
-            diff_remove
-        } else if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("@@ ") {
-            diff_header
-        } else {
-            fg
-        };
-        container = container.child(
-            div()
-                .text_color(color)
-                .child(SharedString::from(line.to_string())),
-        );
-    }
-
-    container
 }
 
 /// How much of a tool call's body to render when expanded. Mirrors the
@@ -584,70 +472,6 @@ pub(crate) fn tool_kind_label(kind: &yalda::acp_channel::ToolKind) -> String {
     .to_string()
 }
 
-/// Append a tool call's body tiles directly to a container div.
-/// Used for single-tool groups where we skip the nested sub-header.
-pub(crate) fn append_tool_body(
-    mut block: gpui::Div,
-    tc: &yalda::acp_channel::ToolCall,
-    policy: ToolRenderPolicy,
-    code_font: &SharedString,
-    at: &yalda::theme::AgentTheme,
-) -> gpui::Div {
-    let max_lines = match policy {
-        ToolRenderPolicy::Truncated { max_lines } => Some(max_lines),
-        _ => None,
-    };
-    let body_bg = nc(at.tool_body_bg);
-    let output_bg = nc(at.tool_output_bg);
-    let body_fg = nc(at.tool_body_fg);
-    let diff_add = nc(at.diff_add);
-    let diff_remove = nc(at.diff_remove);
-    let diff_header = nc(at.diff_header);
-    if let Some(input) = &tc.raw_input {
-        let pretty = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
-        block = block.child(tool_body_free(
-            "input",
-            &pretty,
-            None,
-            body_bg,
-            body_fg,
-            code_font,
-            diff_add,
-            diff_remove,
-            diff_header,
-        ));
-    }
-    let content_text = render_tool_content_blocks(&tc.content);
-    if !content_text.trim().is_empty() {
-        block = block.child(tool_body_free(
-            "content",
-            &content_text,
-            max_lines,
-            body_bg,
-            body_fg,
-            code_font,
-            diff_add,
-            diff_remove,
-            diff_header,
-        ));
-    }
-    if let Some(output) = &tc.raw_output {
-        let pretty = serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string());
-        block = block.child(tool_body_free(
-            "output",
-            &pretty,
-            max_lines,
-            output_bg,
-            body_fg,
-            code_font,
-            diff_add,
-            diff_remove,
-            diff_header,
-        ));
-    }
-    block
-}
-
 /// Flatten a tool call's `Vec<ToolCallContent>` into a single human-
 /// readable string. Splits diffs into a labelled `--- path` header plus
 /// old/new bodies; treats terminal embeds as a one-line placeholder.
@@ -694,6 +518,54 @@ pub(crate) fn render_tool_content_blocks(
         }
     }
     buf
+}
+
+/// Pull human-readable (usually markdown) TEXT out of a tool's `raw_output`
+/// JSON so it can be rendered as markdown instead of dumped as raw JSON
+/// (UXI-AgentTile-25). Handles the shapes ACP tools actually return:
+///   • a bare string                      → that string
+///   • `{ "content": [ {text}, … ] }`     → the text blocks joined
+///   • `{ "content": "…" }`               → that string
+///   • a single obvious text field        → `text` / `output` / `result` /
+///     `stdout` / `message` when it's the only meaningful string
+/// Returns `None` when there's no clean text payload (the caller then falls
+/// back to pretty-printed JSON). Pure so the extraction is unit-testable.
+pub(crate) fn extract_output_text(v: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    fn clean(s: &str) -> Option<String> {
+        let t = s.trim_matches(['\n', '\r']);
+        (!t.trim().is_empty()).then(|| t.to_string())
+    }
+    match v {
+        Value::String(s) => clean(s),
+        Value::Object(map) => {
+            // ACP content-block array: `{ content: [ {type:"text", text:"…"}, … ] }`.
+            if let Some(Value::Array(items)) = map.get("content") {
+                let joined = items
+                    .iter()
+                    .filter_map(|it| {
+                        it.get("text")
+                            .and_then(Value::as_str)
+                            .or_else(|| it.as_str())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if let Some(c) = clean(&joined) {
+                    return Some(c);
+                }
+            }
+            // `{ content: "…" }` or a single obvious text field.
+            for key in ["content", "text", "output", "result", "stdout", "message"] {
+                if let Some(Value::String(s)) = map.get(key)
+                    && let Some(c) = clean(s)
+                {
+                    return Some(c);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Trim `body` to its first `max_lines` lines. If anything was dropped,

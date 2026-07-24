@@ -86,6 +86,7 @@ mod linear_view;
 mod persist;
 mod render_blocks;
 mod screens;
+mod tool_body;
 mod transcript_view;
 #[cfg(test)]
 mod verify_harness;
@@ -103,6 +104,7 @@ pub(crate) use linear::*;
 pub(crate) use linear_view::*;
 pub(crate) use persist::*;
 pub(crate) use render_blocks::*;
+pub(crate) use tool_body::*;
 pub(crate) use transcript_view::*;
 pub(crate) use yux::*;
 mod workspace;

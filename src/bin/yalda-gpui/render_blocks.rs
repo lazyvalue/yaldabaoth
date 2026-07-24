@@ -1969,6 +1969,56 @@ pub(crate) fn lang_for_path(path: &std::path::Path) -> Option<&'static str> {
     }
 }
 
+/// Render pre-parsed markdown `blocks` into a read-only column element, reusing
+/// the doc block renderer via `block_inner` (no cursor / selection / wiki-nav
+/// plumbing — a self-contained read-only surface). For embedded markdown: tool
+/// output, subagent reports, prompts. Prose in the body font, fenced code in the
+/// code font, headings/lists/tables/blockquotes styled by the theme. `max_blocks`
+/// caps huge payloads (a dim "+N more blocks" footer is appended when clipped);
+/// `None` renders all. Per-block vertical gap follows `ParagraphSpacing`
+/// (`paragraph_gap`). Blocks are pre-parsed so the caller can cache the parse.
+/// (UXI-AgentTile-25.)
+pub(crate) fn render_markdown_column(
+    blocks: &[RenderedBlock],
+    max_blocks: Option<usize>,
+    theme: &Theme,
+    body_font: &SharedString,
+    code_font: &SharedString,
+    text_scale: f32,
+) -> AnyElement {
+    let ctx = RenderCtx {
+        theme,
+        body_font: body_font.clone(),
+        code_font: code_font.clone(),
+        text_scale,
+        cursor_block: None,
+        doc_selection: None,
+        line_layouts: None,
+        current_block: None,
+        weak_view: None,
+        doc_dir: None,
+        block_count: blocks.len(),
+        show_heading_markers: false,
+        block_hits: None,
+    };
+    let cap = max_blocks.unwrap_or(blocks.len());
+    let gap = paragraph_gap(text_scale);
+    let mut col = div().flex().flex_col().min_w_0();
+    for b in blocks.iter().take(cap) {
+        col = col.child(div().pt(gap).child(block_inner(&ctx, b)));
+    }
+    if blocks.len() > cap {
+        col = col.child(
+            div()
+                .pt(gap)
+                .text_size(px(11.0 * text_scale))
+                .text_color(nc(theme.agent.dim))
+                .child(SharedString::from(format!("… +{} more blocks", blocks.len() - cap))),
+        );
+    }
+    col.into_any_element()
+}
+
 /// Render markdown to blocks + post-process `[[name]]` / `[[name|display]]`
 /// patterns into link-bearing spans. pulldown-cmark doesn't understand
 /// wiki links, so they arrive as plain text and we rewrite them after
