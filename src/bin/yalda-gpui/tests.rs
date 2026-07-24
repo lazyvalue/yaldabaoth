@@ -3287,6 +3287,7 @@ fn compose_draft_persist_roundtrip() {
                 sidepanel_hidden: false,
                 cwd: cwd.to_path_buf(),
                 compose_draft: Some("persisted draft".into()),
+                summary: None,
             },
             persist::SessionSnapshot {
                 id: "S-empty".into(),
@@ -3298,6 +3299,7 @@ fn compose_draft_persist_roundtrip() {
                 sidepanel_hidden: false,
                 cwd: cwd.to_path_buf(),
                 compose_draft: None,
+                summary: None,
             },
         ];
         persist::save_persisted_acp_sessions(cwd, &snaps);
@@ -4091,4 +4093,107 @@ fn projects_persist_round_trips_via_disk() {
         "params round-trip"
     );
     assert!(restored.by_name("Fulcrum").is_some());
+}
+
+// ── UXI-AgentTile-27: the naming sanitizers/parser ───────────────────────────
+// These are where the real risk lives: the model can return anything, and
+// property 2's shape guarantee is enforced CLIENT-side. Every case below is a
+// reply shape a model has a plausible reason to produce.
+
+#[test]
+fn sanitize_name_enforces_shape_and_cap() {
+    use crate::agent_naming::{sanitize_name, MAX_NAME_CHARS};
+
+    // The happy path passes through, lowercased.
+    assert_eq!(sanitize_name("Payments Refactor").as_deref(), Some("payments refactor"));
+    // Quotes, trailing punctuation, and stray markdown are stripped.
+    assert_eq!(sanitize_name("\"flaky test hunt\".").as_deref(), Some("flaky test hunt"));
+    // At most three words — a model that writes a sentence gets truncated, not
+    // installed verbatim.
+    assert_eq!(
+        sanitize_name("rewrite the payments adapter for the new gateway").as_deref(),
+        Some("rewrite the payments")
+    );
+    // The cap holds even when three words would blow past it (words are dropped
+    // from the end rather than cut mid-word).
+    let long = sanitize_name("supercalifragilistic expialidocious pipeline").unwrap();
+    assert!(long.chars().count() <= MAX_NAME_CHARS, "got {long:?}");
+    // A single over-long word is hard-truncated rather than dropped entirely.
+    let one = sanitize_name("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    assert_eq!(one.chars().count(), MAX_NAME_CHARS);
+    // Nothing usable → no name at all (rather than an empty label).
+    assert_eq!(sanitize_name("   "), None);
+    assert_eq!(sanitize_name("!!! ???"), None);
+}
+
+#[test]
+fn sanitize_summary_keeps_two_sentences_and_flattens() {
+    use crate::agent_naming::{sanitize_summary, MAX_SUMMARY_CHARS};
+
+    // Newlines collapse — the jump panel renders one small italic line.
+    assert_eq!(
+        sanitize_summary("First sentence.\n  Second one.").as_deref(),
+        Some("First sentence. Second one.")
+    );
+    // A third sentence is dropped.
+    assert_eq!(
+        sanitize_summary("One. Two. Three. Four.").as_deref(),
+        Some("One. Two.")
+    );
+    // A rambling single "sentence" is capped on a word boundary with an ellipsis.
+    let long = "word ".repeat(200);
+    let capped = sanitize_summary(&long).unwrap();
+    assert!(capped.chars().count() <= MAX_SUMMARY_CHARS + 1, "got {} chars", capped.chars().count());
+    assert!(capped.ends_with('…'), "a truncated summary is marked: {capped:?}");
+    assert_eq!(sanitize_summary("   "), None);
+}
+
+#[test]
+fn parse_naming_reply_tolerates_real_model_output() {
+    use crate::agent_naming::parse_naming_reply;
+
+    // The contract shape.
+    let clean = parse_naming_reply(r#"{"name": "payments refactor", "summary": "Ripping out the adapter."}"#);
+    assert_eq!(clean.name.as_deref(), Some("payments refactor"));
+    assert_eq!(clean.summary.as_deref(), Some("Ripping out the adapter."));
+
+    // Wrapped in a code fence (a very common deviation).
+    let fenced = parse_naming_reply("```json\n{\"name\": \"flaky tests\", \"summary\": \"Hunting a flake.\"}\n```");
+    assert_eq!(fenced.name.as_deref(), Some("flaky tests"));
+
+    // With a preamble the instruction told it not to write.
+    let chatty = parse_naming_reply("Sure! Here you go:\n{\"name\": \"jump panel\", \"summary\": \"Panel work.\"}");
+    assert_eq!(chatty.name.as_deref(), Some("jump panel"));
+
+    // No JSON at all: the first line is salvaged as the name.
+    let bare = parse_naming_reply("payments refactor\nWe are ripping out the adapter.");
+    assert_eq!(bare.name.as_deref(), Some("payments refactor"));
+    assert_eq!(bare.summary.as_deref(), Some("We are ripping out the adapter."));
+
+    // Total garbage yields nothing installable, so the caller keeps `claude-N`.
+    assert!(parse_naming_reply("   ").is_empty());
+}
+
+#[test]
+fn parse_dotenv_reads_keys_and_ignores_noise() {
+    use crate::persist::parse_dotenv;
+
+    let parsed = parse_dotenv(
+        "# a comment\n\
+         \n\
+         ANTHROPIC_API_KEY=sk-ant-123\n\
+         export QUOTED=\"with spaces\"\n\
+         SINGLE='single quoted'\n\
+         not a key value line\n\
+         EMPTY=\n",
+    );
+    assert_eq!(
+        parsed,
+        vec![
+            ("ANTHROPIC_API_KEY".to_string(), "sk-ant-123".to_string()),
+            ("QUOTED".to_string(), "with spaces".to_string()),
+            ("SINGLE".to_string(), "single quoted".to_string()),
+            ("EMPTY".to_string(), String::new()),
+        ]
+    );
 }

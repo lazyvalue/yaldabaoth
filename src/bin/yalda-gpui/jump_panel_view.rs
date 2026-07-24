@@ -61,6 +61,12 @@ pub(crate) struct AgentRow {
     /// ("waiting on you") — `AgentState.unread`. `false` for roster-only sessions
     /// not opened in this GUI (unknown). Drives the ● green + italic row.
     pub(crate) unread: bool,
+    /// The autonamer's two-sentence summary of the session (`UXI-AgentTile-27`),
+    /// when this GUI has the session open. Rendered as a small italic second
+    /// line under the label. `None` for roster-only sessions (never opened here,
+    /// so we have no local state to read it from) and for sessions that were
+    /// never named.
+    pub(crate) summary: Option<String>,
     /// The sid this row occupies in the user's drag order (`jump_session_order`).
     /// For a roster row that is its own sid. For a local-only placeholder it is
     /// its PREDECESSOR's sid when the placeholder continues a killed session
@@ -174,9 +180,11 @@ impl YaldaGpuiView {
                 .unwrap_or_else(|| info.label.clone());
             let awaiting = opened.map(|e| e.read(cx).state.turn_phase.is_awaiting());
             let unread = opened.map(|e| e.read(cx).state.unread).unwrap_or(false);
+            let summary = opened.and_then(|e| e.read(cx).state.summary.clone());
             rows.push(AgentRow {
                 target: JumpTarget::Roster(info.session_id.clone()),
                 label,
+                summary,
                 cwd: info.cwd.clone(),
                 bound,
                 connected: info.connected,
@@ -197,6 +205,7 @@ impl YaldaGpuiView {
             rows.push(AgentRow {
                 target: JumpTarget::Local(id),
                 label: ent.read(cx).label.clone(),
+                summary: ent.read(cx).state.summary.clone(),
                 cwd: ent.read(cx).cwd.clone(),
                 bound: self.agent_tile_id_bound_to(id).is_some(),
                 connected: true,
@@ -746,7 +755,7 @@ fn jump_session_row_el(
     drag_fg: Hsla,
     drag_font: SharedString,
     cx: &mut Context<YaldaGpuiView>,
-) -> gpui::Stateful<gpui::Div> {
+) -> gpui::AnyElement {
     // The agent-session icon is a `✦` whose COLOR carries the status (one glyph =
     // "this is an agent" + what it's doing): working (reply in flight) → orange;
     // waiting on you (idle + unread) → green + italic label; idle+read /
@@ -811,7 +820,34 @@ fn jump_session_row_el(
                 }
             }));
     }
-    r
+    // UXI-AgentTile-27: the autoname summary sits UNDER the label as a small
+    // italic dim line. Chrome-class (fixed size, unaffected by document zoom),
+    // single-line-height text indented to the label's x so it reads as a
+    // subtitle of the row rather than a row of its own. A session with no
+    // summary renders exactly as before — no reserved space, no layout shift.
+    let Some(summary) = row.summary.as_ref().filter(|s| !s.trim().is_empty()) else {
+        return r.into_any_element();
+    };
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .child(r)
+        .child(
+            div()
+                // 2px accent gutter + px_3 padding + 16px badge + gap_2 — line the
+                // summary up with the label above it.
+                .pl(px(38.0))
+                .pr_3()
+                .pb_1()
+                .w_full()
+                .min_w_0()
+                .italic()
+                .text_size(px(st.pt * 0.8))
+                .text_color(st.dim)
+                .child(SharedString::from(summary.clone())),
+        )
+        .into_any_element()
 }
 
 /// One selectable row: optional leading badge glyph + label + optional trailing

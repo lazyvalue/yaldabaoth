@@ -71,7 +71,7 @@ impl YaldaGpuiView {
         let id = match chosen {
             None => {
                 let label = self.next_agent_label(cx);
-                let state = self.create_agent_session(None, base_cwd.clone(), cx);
+                let state = self.create_agent_session(None, base_cwd.clone(), cx).armed_for_autoname();
                 self.show_local_session(
                     AgentSession {
                         state,
@@ -361,9 +361,12 @@ impl YaldaGpuiView {
         }
         self.show_local_session(
             AgentSession {
+                // UXI-AgentTile-27: "start a new session" from the picker is a
+                // genuinely-fresh session, so arm it for one-shot autonaming.
                 state: AgentState::new_server_managed(Some(
                     "connecting to session server…".into(),
-                )),
+                ))
+                .armed_for_autoname(),
                 label: label.clone(),
                 cwd: cwd.clone(),
                 resume_id: None,
@@ -1085,9 +1088,12 @@ impl YaldaGpuiView {
             let open_token = alloc_open_token();
             self.show_local_session(
                 AgentSession {
+                    // UXI-AgentTile-27: a brand-new session is armed for
+                    // one-shot autonaming; attach/restore paths are not.
                     state: AgentState::new_server_managed(Some(
                         "connecting to session server…".into(),
-                    )),
+                    ))
+                    .armed_for_autoname(),
                     label: label.clone(),
                     cwd: slot_cwd.clone(),
                     resume_id: None,
@@ -1100,7 +1106,7 @@ impl YaldaGpuiView {
             self.spawn_create_agent_session(open_token, label, slot_cwd, None, cx);
         } else {
             // Direct-spawn path.
-            let state = self.create_agent_session(None, slot_cwd.clone(), cx);
+            let state = self.create_agent_session(None, slot_cwd.clone(), cx).armed_for_autoname();
             let id = self.show_local_session(
                 AgentSession {
                     state,
@@ -1173,9 +1179,12 @@ impl YaldaGpuiView {
             let open_token = alloc_open_token();
             self.show_local_session(
                 AgentSession {
+                    // UXI-AgentTile-27: a brand-new session is armed for
+                    // one-shot autonaming; attach/restore paths are not.
                     state: AgentState::new_server_managed(Some(
                         "connecting to session server…".into(),
-                    )),
+                    ))
+                    .armed_for_autoname(),
                     label: label.clone(),
                     cwd: slot_cwd.clone(),
                     resume_id: None,
@@ -1193,7 +1202,7 @@ impl YaldaGpuiView {
             self.spawn_create_agent_session(open_token, label, slot_cwd, None, cx);
         } else {
             // Direct-spawn path: a fresh session has no resume_id.
-            let state = self.create_agent_session(None, slot_cwd.clone(), cx);
+            let state = self.create_agent_session(None, slot_cwd.clone(), cx).armed_for_autoname();
             let id = self.show_local_session(
                 AgentSession {
                     state,
@@ -1712,6 +1721,7 @@ impl YaldaGpuiView {
                             sidepanel_hidden: session.state.sidepanel_hidden,
                             cwd: session.cwd.clone(),
                             compose_draft: (!draft.trim().is_empty()).then_some(draft),
+                            summary: session.state.summary.clone(),
                         });
                     }
                 }
@@ -1808,6 +1818,14 @@ impl YaldaGpuiView {
             agent_stream_authoritative: false,
             unread: false,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
+            name_origin: NameOrigin::Auto,
+            summary: None,
+            // Autoname is OPT-IN: a session must be explicitly armed at a
+            // genuinely-fresh creation point (`armed_for_autoname`). Defaulting
+            // to `Done` means an attach/restore path can never autoname a
+            // session that already carries a real name.
+            autoname: AutonameState::Done,
+            autoname_due: false,
             _pump: None,
         };
         // The follow-output scroll handler is wired by the owning
@@ -2613,6 +2631,10 @@ impl YaldaGpuiView {
         if let Some(focused) = self.jump_active_session().0 {
             self.mark_session_read(focused, cx);
         }
+        // UXI-AgentTile-27: a turn that finalized in this batch may have armed a
+        // session for autonaming. `finalize_agent_turn_idem` only raises a flag
+        // (it has no `cx`); this is where the flag becomes a request.
+        self.drain_autoname_requests(cx);
         if did_work {
             cx.notify();
         }
@@ -2789,6 +2811,10 @@ impl YaldaGpuiView {
         if attached_with_id {
             self.save_agent_ring(cx);
         }
+
+        // UXI-AgentTile-27: same drain as the server path — a direct-spawn
+        // session's first turn finalizes here, not in `apply_server_batch`.
+        self.drain_autoname_requests(cx);
 
         if has_events {
             cx.notify();
@@ -4639,6 +4665,142 @@ impl YaldaGpuiView {
         if self.recaps.remove(&id).is_some() {
             cx.notify();
         }
+    }
+
+    /// Drain any sessions whose first turn just completed while armed for
+    /// autonaming (`UXI-AgentTile-27`), and kick off one Haiku call each.
+    ///
+    /// Called from the reducer/pump paths after a batch settles — the flag is
+    /// raised inside `finalize_agent_turn_idem` (which has no `cx` and cannot
+    /// spawn), so this is the layer that turns it into work. Flipping
+    /// `Pending → Requested` here is what makes the call one-shot: a second
+    /// turn finishing before the first result lands finds `Requested`, not
+    /// `Pending`, and re-arms nothing.
+    pub(crate) fn drain_autoname_requests(&mut self, cx: &mut Context<Self>) {
+        let due: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, ent)| {
+                let s = ent.read(cx);
+                s.autoname_due && s.autoname == AutonameState::Pending
+            })
+            .map(|(id, _)| id)
+            .collect();
+        for id in due {
+            let Some(ent) = self.sessions.get(id).cloned() else {
+                continue;
+            };
+            let transcript = ent.update(cx, |s, scx| {
+                s.autoname_due = false;
+                if s.autoname != AutonameState::Pending {
+                    return None;
+                }
+                // UXI-AgentTile-27 property 3, the EARLY half of the latch: the
+                // user renamed before the first turn finished, so there is
+                // nothing to derive — settle terminally and never call out.
+                // (`finish_autoname` is the late half, for a result that lands
+                // after a rename.)
+                if s.name_origin == NameOrigin::User {
+                    s.autoname = AutonameState::Done;
+                    return None;
+                }
+                s.autoname = AutonameState::Requested;
+                scx.notify();
+                Some(s.state.editor.document().full_text())
+            });
+            let Some(transcript) = transcript else {
+                continue;
+            };
+            if transcript.trim().is_empty() {
+                // Nothing to name from — settle terminally rather than retrying
+                // on the next turn (property 1: one shot, ever).
+                self.finish_autoname(id, None, cx);
+                continue;
+            }
+            self.spawn_autoname_worker(id, transcript, cx);
+        }
+    }
+
+    /// Spawn the one-shot naming call on the background executor.
+    ///
+    /// Mirrors `spawn_recap_worker`'s `cfg(test)` suppression: the live HTTP
+    /// call is dev-system verification gap 2, so headless tests never make a
+    /// network request — they leave the session `Requested` and drive
+    /// `apply_autoname_result` directly, exactly as the worker would.
+    fn spawn_autoname_worker(&self, id: SessionId, transcript: String, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let Some(key) = naming_api_key() else {
+            // No key configured: fail silently (property 4) and settle so we
+            // never retry on a later turn.
+            eprintln!("[yalda-gpui] autoname skipped: ANTHROPIC_API_KEY not set");
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { request_session_name(&key, &transcript) })
+                .await;
+            let naming = match result {
+                Ok(naming) => Some(naming),
+                Err(e) => {
+                    eprintln!("[yalda-gpui] autoname failed: {e}");
+                    None
+                }
+            };
+            let _ = this.update(cx, |this, cx| this.finish_autoname(id, naming, cx));
+        })
+        .detach();
+    }
+
+    /// Settle a session's autoname: install the name/summary if one came back
+    /// and the user hasn't renamed in the meantime, and mark the one-shot done
+    /// either way.
+    ///
+    /// The `NameOrigin::User` check is `UXI-AgentTile-27` property 3's teeth: a
+    /// result that lands AFTER the user renamed is dropped on the floor, never
+    /// applied. Without it a slow call could silently overwrite a name the user
+    /// typed seconds earlier (the bug-0016 class of "names keep getting
+    /// forgotten").
+    pub(crate) fn finish_autoname(
+        &mut self,
+        id: SessionId,
+        naming: Option<SessionNaming>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ent) = self.sessions.get(id).cloned() else {
+            return;
+        };
+        let new_label = ent.update(cx, |s, scx| {
+            s.autoname = AutonameState::Done;
+            s.autoname_due = false;
+            let renamed_by_user = s.name_origin == NameOrigin::User;
+            let mut installed = None;
+            if let Some(naming) = naming
+                && !renamed_by_user
+            {
+                if let Some(name) = naming.name {
+                    s.label = name.clone();
+                    installed = Some(name);
+                }
+                if naming.summary.is_some() {
+                    s.summary = naming.summary;
+                }
+            }
+            scx.notify();
+            installed
+        });
+        // Push the derived name to the session server so it survives a restart,
+        // exactly as a manual rename does (the WAL is the durable home).
+        if let Some(label) = new_label {
+            let server_sid = self.sessions.sid_of(id).map(|s| s.to_string());
+            if let (Some(server), Some(sid)) = (&self.session_server, server_sid) {
+                let _ = server.rename_session(&sid, &label);
+            }
+        }
+        self.save_agent_ring(cx);
+        cx.notify();
     }
 
     /// Build the recap prompt: a tail-trimmed transcript wrapped with a terse
