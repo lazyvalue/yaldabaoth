@@ -34,4 +34,4 @@ one per decision.
 - One decision per ADR; keep it to ~a screen.
 - ADRs are append-only history: don't rewrite an accepted one — supersede it with
   a new ADR and set the old one's Status to "Superseded by ADR-XXXX".
-- Don't commit unless asked.
+- Commit when done — no need to ask (push still needs an explicit ask).

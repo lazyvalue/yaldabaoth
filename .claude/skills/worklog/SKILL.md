@@ -30,5 +30,5 @@ without re-deriving state from git. Worklog = the *past* (what happened);
 
 - Faithful over flattering: record what failed, what was skipped, what's
   unverified. A worklog that only lists wins is useless for recovery.
-- Don't commit unless asked; just write the files.
+- Commit the files when done — no need to ask (push still needs an explicit ask).
 - Keep it scannable — statuses, commit shas, one-liners. Not prose walls.

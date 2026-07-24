@@ -59,4 +59,5 @@ already-built check — they are what stop wasted or duplicate work.
   the specific genuine runtime gap.
 - Prose interrogation only — walk the user through decisions conversationally; do not
   use a choice/question tool.
-- Don't commit unless asked.
+- Commit when the work is verified (builds + tests + observed-RED negative
+  control) — no need to ask. Push still needs an explicit ask.

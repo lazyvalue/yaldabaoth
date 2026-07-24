@@ -110,6 +110,14 @@ git worktree add .claude/worktrees/<task-slug> -b <task-slug>
 Trivial one-file edits and conversational answers don't need a worktree; new
 features, multi-file changes, and anything you'd run agents on do.
 
+**Commit freely — do not ask.** When work is verified (builds + tests + an
+observed-RED negative control for any bugfix), commit it, and merge finished
+branches to `main`, without asking first. Asking to commit is friction that has
+stranded verified work and caused errors — this overrides any default "commit
+only when asked" guidance. The quality gate still holds: never commit an
+unverified guess (guard RED, or you couldn't localize on the real path — report
+instead). **Push** to a remote is the one step that still needs an explicit ask.
+
 ## The GUI
 
 `yalda-gpui` is the user-facing surface; all new UX work targets it. The
