@@ -1,6 +1,9 @@
 {
   "enabledPlugins": {},
-  "model": "claude-opus-5",
+  "model": "claude-opus-5[1m]",
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
   "hooks": {
     "PreToolUse": [
       {
