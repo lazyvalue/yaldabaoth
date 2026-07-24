@@ -9955,6 +9955,65 @@ fn subagent_focus_swaps_the_painted_view(cx: &mut TestAppContext) {
     );
 }
 
+/// UXI-AgentTile-25 (MAIN transcript integration): a Task tool call built through
+/// the real `tools.register` path renders its prompt + report as MARKDOWN
+/// sections, not raw JSON. Drives the exact `plan_tool_sections` call the
+/// transcript render makes over the STORED tool call, after a real transcript
+/// paint (`run_until_parked`, no panic). The render layer's paint of the expanded
+/// body is covered by `subagent_focus_swaps_the_painted_view`, which now goes
+/// through the same `append_tool_body_rich`.
+///
+/// Negative control (shared with the pure guards, observed RED): forcing the
+/// report branch in `plan_tool_sections` to `SectionBody::Json` fails the
+/// "report is Markdown" assert.
+#[gpui::test]
+fn transcript_tool_body_renders_markdown_not_json(cx: &mut TestAppContext) {
+    use crate::{plan_tool_sections, SectionBody, SectionRole, ToolRenderPolicy};
+    let (view, vcx, _id, _session) = boot_with_transcript(cx);
+    view.update(vcx, |v, cx| {
+        use yalda::acp_channel::{ToolCall, ToolCallId, ToolKind};
+        let mut c = v.agent_mut(cx).expect("agent");
+        let tid: ToolCallId = "sub-md".into();
+        let mut tc = ToolCall::new(tid.clone(), "Explore repo".to_string());
+        tc.kind = ToolKind::Think;
+        tc.raw_input = Some(serde_json::json!({
+            "subagent_type": "Explore",
+            "description": "map the code",
+            "prompt": "# Task\nFind the **things**."
+        }));
+        tc.raw_output = Some(serde_json::json!({
+            "content": [{"type": "text", "text": "## Report\n- found it\n- done"}]
+        }));
+        let anchor = c.editor.anchor_for_line(0);
+        c.tools.register(crate::ToolCallKey::from_id(&tid), tc, anchor);
+    });
+    vcx.run_until_parked(); // renders the main transcript with the tool group (no panic)
+
+    // The exact call the transcript render makes, over the STORED tool call.
+    view.update(vcx, |v, cx| {
+        let c = v.agent_mut(cx).expect("agent");
+        let k = crate::ToolCallKey::from_id(&yalda::acp_channel::ToolCallId::from("sub-md"));
+        let tc = c.tools.calls.get(&k).expect("the registered tool call");
+        let sections = plan_tool_sections(tc, ToolRenderPolicy::Full);
+        assert!(
+            sections.iter().any(|s| s.label == "prompt"
+                && s.role == SectionRole::Input
+                && matches!(s.body, SectionBody::Markdown { .. })),
+            "the prompt renders as markdown in the main transcript"
+        );
+        let report = sections.iter().find(|s| s.label == "report").expect("a report section");
+        assert!(
+            matches!(report.body, SectionBody::Markdown { .. }),
+            "the report renders as markdown, not raw JSON, in the main transcript"
+        );
+        assert!(report.emphasis, "the report tile is emphasized");
+        assert!(
+            !sections.iter().any(|s| matches!(s.body, SectionBody::Json(_))),
+            "no raw-JSON section for a well-formed subagent tool call"
+        );
+    });
+}
+
 /// Enter on a panel row activates it: reveals it in the transcript AND leaves
 /// panel focus so the revealed content is readable. Drives the real
 /// `panel_activate_selection`.

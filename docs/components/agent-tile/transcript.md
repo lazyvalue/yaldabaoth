@@ -327,8 +327,14 @@ report are `Markdown`, report emphasized; NC observed RED by forcing the output
 branch to `Json`), `plan_tool_sections_bash_is_code_not_markdown`,
 `plan_tool_sections_edit_synthesizes_diff`, `plan_tool_sections_dedups_content_and_output`,
 `plan_tool_sections_unknown_multiline_is_code`, and
-`extract_output_text_pulls_text_from_common_shapes`. The rendered pixels
-(fonts/colors/markdown block layout) are the runtime check (gap #1).
+`extract_output_text_pulls_text_from_common_shapes`. **Main-transcript
+integration** (`verify_harness.rs`):
+`transcript_tool_body_renders_markdown_not_json` registers a real `Task` tool
+call, paints the transcript (`run_until_parked`, no panic), and asserts through
+`plan_tool_sections` over the STORED tool call that the prompt + report are
+`Markdown` (not JSON) — the exact call the transcript render makes; NC observed
+RED (report → `Json`). The rendered pixels (fonts/colors/markdown block layout)
+are the runtime check (gap #1).
 
 **Deviation from plan.** Fable's proposed per-view markdown **parse cache**
 (`tool_md_cache`) is **not** implemented in this pass: the inline transcript is
