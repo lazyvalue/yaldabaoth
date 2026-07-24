@@ -12568,3 +12568,178 @@ fn jump_panel_groups_sessions_by_project(cx: &mut TestAppContext) {
     assert_ne!(unfiled, "Yaldabaoth");
     assert!(!unfiled.is_empty(), "unfiled falls back to the shortened path");
 }
+
+/// UXI-Project-6 — a session↔tile bind is intra-project only. A free ROSTER
+/// session rooted in project B is NOT offered by an A-tile's selector
+/// (`picker_projection`, the Part-3 project filter), and a direct cross-project
+/// attach (A tile ← B session) is REFUSED by `picker_attach_existing` (the Part-4
+/// hard gate) — no placeholder is bound and a transient note is set. The SAME
+/// session binds successfully once the tile's workspace is project B.
+///
+/// Drives the REAL paths (`picker_projection`, `picker_attach_existing` — the
+/// shared attach choke both the picker and the roster-jump funnel through), not a
+/// hand-built proxy state.
+///
+/// Negative control: comment out the Part-4 guard in `picker_attach_existing`
+/// (`agent_ui.rs`, the `if let (Some(sp), Some(tp)) … sp != tp { … return }`
+/// block) → the cross-project attach binds the A tile to the B session, so the
+/// `tile.session().is_none()` refusal assert fails (observed RED). The Part-3
+/// filter revert (restore the `cwd_match_key` gate in `picker_projection`) makes
+/// the selector-omits assert fail.
+#[gpui::test]
+fn bind_refused_across_projects_allowed_within(cx: &mut TestAppContext) {
+    use crate::{AgentTile, App};
+    use yalda::session_proto::SessionInfo;
+    let (view, vcx) = boot_browser(cx);
+    let pa = PathBuf::from("/tmp/yalda-bind-a");
+    let pb = PathBuf::from("/tmp/yalda-bind-b");
+    let (a_pid, b_pid) = view.update(vcx, |v, _| {
+        let a = v.projects.create("Aproj".into(), pa.clone()).expect("A");
+        let b = v.projects.create("Bproj".into(), pb.clone()).expect("B");
+        (a, b)
+    });
+    // A FREE roster session rooted at B's cwd → it belongs to project B.
+    view.update(vcx, |v, _| {
+        v.agent_roster.upsert(SessionInfo {
+            session_id: "SB".into(),
+            acp_session_id: None,
+            label: "claude-b".into(),
+            cwd: pb.clone(),
+            turns: 0,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        });
+    });
+    // The active workspace is project A, showing an unbound agent tile (selector).
+    view.update(vcx, |v, _| {
+        if let Some(t) = v.workspace.active_tab_mut() {
+            t.set_project(a_pid);
+        }
+        let mut tile = AgentTile::new();
+        tile.show_picker();
+        v.set_screen(App::Agent(tile));
+    });
+
+    // Part 3: A's selector must NOT list B's cross-project free session.
+    view.read_with(vcx, |v, _| {
+        let (free, _bound) = v.picker_projection(&v.agent_base_cwd());
+        assert!(
+            !free.iter().any(|s| s.sid == "SB"),
+            "A's selector must not offer B's cross-project free session"
+        );
+    });
+
+    // Part 4: a direct cross-project attach (A tile ← B session) is refused —
+    // nothing binds, a transient note is set.
+    view.update(vcx, |v, cx| {
+        v.transient_status = None;
+        v.picker_attach_existing(
+            pb.clone(),
+            "SB".into(),
+            None,
+            "claude-b".into(),
+            true,
+            yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let tile = v.agent_tile().expect("agent tile");
+        assert!(
+            tile.session().is_none(),
+            "cross-project bind refused: the A tile stays unbound"
+        );
+        assert!(
+            v.transient_status.is_some(),
+            "the refusal surfaces a transient note"
+        );
+    });
+
+    // Allowed within: point the active workspace at project B and attach the SAME
+    // session — now intra-project, so it binds.
+    view.update(vcx, |v, cx| {
+        if let Some(t) = v.workspace.active_tab_mut() {
+            t.set_project(b_pid);
+        }
+        let mut tile = AgentTile::new();
+        tile.show_picker();
+        v.set_screen(App::Agent(tile));
+        v.picker_attach_existing(
+            pb.clone(),
+            "SB".into(),
+            None,
+            "claude-b".into(),
+            true,
+            yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        let tile = v.agent_tile().expect("agent tile");
+        let bound = tile.session().expect("same-project bind succeeds");
+        assert_eq!(
+            v.sessions.sid_of(bound).map(|s| s.as_str()),
+            Some("SB"),
+            "the B tile is bound to the B session"
+        );
+    });
+}
+
+/// UXI-Project-7 — the active project is DERIVED from focus, never stored: the
+/// focused workspace's project, else the focused session's, else the first. Point
+/// the active workspace at A → `active_project()` is A; jump a FREE session rooted
+/// in B (its ephemeral workspace lands under B via UXI-Project-6) and focus it →
+/// `active_project()` follows to B.
+///
+/// Drives the REAL paths (`active_project`, `jump_to_session`), not hand-built
+/// state.
+///
+/// Negative control: replace `active_project`'s body with `self.projects.first()`
+/// (`agent_ui.rs`) → after the jump it still reports A (the first project), so the
+/// `Some(b_pid)` assert fails (observed RED).
+#[gpui::test]
+fn active_project_derives_from_focus(cx: &mut TestAppContext) {
+    use crate::{AgentSession, AgentState};
+    let (view, vcx) = boot_browser(cx);
+    let pa = PathBuf::from("/tmp/yalda-active-a");
+    let pb = PathBuf::from("/tmp/yalda-active-b");
+    let (a_pid, b_pid) = view.update(vcx, |v, _| {
+        let a = v.projects.create("Aproj".into(), pa.clone()).expect("A");
+        let b = v.projects.create("Bproj".into(), pb.clone()).expect("B");
+        (a, b)
+    });
+    // A FREE local session rooted in B's cwd (the focused tile is a browser, so
+    // `show_local_session` binds nothing — it stays free/re-bindable).
+    let sid = view.update(vcx, |v, cx| {
+        let s = AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: "sess-b".into(),
+            cwd: pb.clone(),
+            resume_id: None,
+        };
+        v.show_local_session(s, cx)
+    });
+
+    // Focus a project-A workspace → active project A.
+    view.update(vcx, |v, _| {
+        if let Some(t) = v.workspace.active_tab_mut() {
+            t.set_project(a_pid);
+        }
+    });
+    let at_a = view.read_with(vcx, |v, cx| v.active_project(cx));
+    assert_eq!(at_a, Some(a_pid), "active project = focused workspace's project (A)");
+
+    // Jump the free B-session: its ephemeral workspace opens under project B, so
+    // the derived active project follows focus to B.
+    view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
+    let at_b = view.read_with(vcx, |v, cx| v.active_project(cx));
+    assert_eq!(
+        at_b,
+        Some(b_pid),
+        "focusing the B session moves the derived active project to B"
+    );
+    // Distinct ids so the NC (hardcode `first()`) is non-vacuous.
+    assert_ne!(a_pid, b_pid);
+}

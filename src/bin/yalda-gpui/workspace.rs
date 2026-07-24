@@ -1391,6 +1391,14 @@ impl<C> Workspace<C> {
         // workspace you jumped from — not the process dir (the regression this
         // typed cwd makes impossible; ADR-0023).
         let project = self.inherited_project();
+        self.open_ephemeral_tab_in(content, project)
+    }
+
+    /// Like [`Workspace::open_ephemeral_tab`] but pins the virtual workspace to an
+    /// explicit `project` (UXI-Project-6): a free-session jump opens its ephemeral
+    /// workspace under the SESSION's own project, not the spawning workspace's, so
+    /// the subsequent bind is intra-project by construction.
+    pub fn open_ephemeral_tab_in(&mut self, content: C, project: ProjectId) -> WindowId {
         // Replace any existing virtual workspace rather than stacking.
         if self.active_is_ephemeral() {
             let cur = self.active_tab;

@@ -206,10 +206,15 @@ impl YaldaGpuiView {
         cwd: &std::path::Path,
     ) -> (Vec<PickerSession>, Vec<PickerSession>) {
         let open_sids = self.bound_sid_set();
-        let cwd_key = cwd_match_key(cwd);
+        // UXI-Project-6: a tile's selector offers only free sessions of the tile's
+        // OWN project. The tile's project is the one rooted at its cwd
+        // (`agent_base_cwd` = the active project's cwd); a session's project is the
+        // one rooted at its spawn cwd. Comparing project ids (not raw cwds) is the
+        // honest, spec-aligned predicate — and the one the NC toggles.
+        let tile_project = self.projects.by_cwd(cwd);
         let (mut free, mut bound) = (Vec::new(), Vec::new());
         for info in self.agent_roster.entries_by_label() {
-            if cwd_match_key(&info.cwd) != cwd_key {
+            if self.projects.by_cwd(&info.cwd) != tile_project {
                 continue;
             }
             let ps = PickerSession {
@@ -395,7 +400,7 @@ impl YaldaGpuiView {
     /// open token, then synchronously run `apply_open_agent_resolution`, which
     /// binds the sid and kicks off `spawn_attach_sessions`.
     #[allow(clippy::too_many_arguments)]
-    fn picker_attach_existing(
+    pub(crate) fn picker_attach_existing(
         &mut self,
         cwd: PathBuf,
         sid: String,
@@ -405,6 +410,27 @@ impl YaldaGpuiView {
         permission_mode: yalda::acp_channel::PermissionMode,
         cx: &mut Context<Self>,
     ) {
+        // UXI-Project-6: refuse a cross-project bind. The session's project comes
+        // from its real (roster) spawn cwd — not the placeholder `cwd` argument —
+        // and the tile's project is the active project. On a mismatch abort BEFORE
+        // any placeholder session is minted, surfacing a transient note. This is
+        // the hard predicate the NC toggles; normal flows never reach it (the
+        // selector is already project-filtered and the free-session jump lands its
+        // ephemeral workspace under the session's own project), so it is
+        // defense-in-depth against a cross-project attach.
+        let session_cwd = self
+            .agent_roster
+            .get(&sid)
+            .map(|i| i.cwd.clone())
+            .unwrap_or_else(|| cwd.clone());
+        let session_proj = self.projects.by_cwd(&session_cwd);
+        let tile_proj = self.active_project(cx);
+        if let (Some(sp), Some(tp)) = (session_proj, tile_proj)
+            && sp != tp
+        {
+            self.transient_status = Some("session belongs to another project".into());
+            return;
+        }
         let open_token = alloc_open_token();
         if self.agent_tile_mut().is_none() {
             return;
@@ -659,7 +685,16 @@ impl YaldaGpuiView {
         } else {
             let mut tile = AgentTile::new();
             tile.bind(sid);
-            self.workspace.open_ephemeral_tab(App::Agent(tile));
+            // UXI-Project-6: the ephemeral workspace lands under the SESSION's own
+            // project (resolved from its spawn cwd), so this bind is intra-project.
+            let proj = self
+                .sessions
+                .get(sid)
+                .map(|e| e.read(cx).cwd.clone())
+                .and_then(|c| self.projects.membership_for_cwd(&c).project())
+                .or_else(|| self.active_project(cx))
+                .unwrap_or_else(|| self.workspace.inherited_project());
+            self.workspace.open_ephemeral_tab_in(App::Agent(tile), proj);
         }
         // You're now looking at this session — clear its "waiting on you" mark
         // eagerly (the pump also clears it, but this makes the dot update on the
@@ -711,9 +746,17 @@ impl YaldaGpuiView {
             return;
         }
         // Fresh ephemeral workspace holding one unbound agent tile, now focused;
-        // the attach path binds the session into that focused tile.
+        // the attach path binds the session into that focused tile. UXI-Project-6:
+        // pin the workspace to the SESSION's own project so the bind is
+        // intra-project (and `picker_attach_existing`'s cross-project guard passes).
+        let proj = self
+            .projects
+            .membership_for_cwd(&info.cwd)
+            .project()
+            .or_else(|| self.active_project(cx))
+            .unwrap_or_else(|| self.workspace.inherited_project());
         self.workspace
-            .open_ephemeral_tab(App::Agent(AgentTile::new()));
+            .open_ephemeral_tab_in(App::Agent(AgentTile::new()), proj);
         self.picker_attach_existing(
             info.cwd,
             info.session_id,
@@ -999,6 +1042,25 @@ impl YaldaGpuiView {
     /// only covers the degenerate no-tab state.
     pub(crate) fn agent_base_cwd(&self) -> PathBuf {
         self.active_workspace_cwd().unwrap_or_else(process_cwd)
+    }
+
+    /// The id-level twin of `active_workspace_cwd`/`agent_base_cwd` (UXI-Project-7):
+    /// there is NO stored "current project" — derive it. The project of the focused
+    /// workspace, else the focused (bound) session's project, else the first
+    /// project. In practice the workspace branch dominates (an active tab always
+    /// carries a project), but the session + first fallbacks keep the derivation
+    /// total for spec fidelity — the NC short-circuits to `first()` so focus stops
+    /// moving it.
+    pub(crate) fn active_project(&self, cx: &GpuiApp) -> Option<ProjectId> {
+        self.workspace
+            .active_tab()
+            .map(|t| t.project())
+            .or_else(|| {
+                let id = self.focused_bound_session()?;
+                let cwd = self.sessions.get(id)?.read(cx).cwd.clone();
+                self.projects.membership_for_cwd(&cwd).project()
+            })
+            .or_else(|| self.projects.first())
     }
 
     pub(crate) fn new_agent_session(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
