@@ -57,6 +57,10 @@ pub(crate) struct AgentRow {
     /// here), so the phase is unknown and the dot stays neutral. Drives the
     /// status-dot color in `render_jump_panel`.
     pub(crate) awaiting: Option<bool>,
+    /// The session finished a turn whose output the user hasn't looked at
+    /// ("waiting on you") — `AgentState.unread`. `false` for roster-only sessions
+    /// not opened in this GUI (unknown). Drives the ● green + italic row.
+    pub(crate) unread: bool,
     /// The sid this row occupies in the user's drag order (`jump_session_order`).
     /// For a roster row that is its own sid. For a local-only placeholder it is
     /// its PREDECESSOR's sid when the placeholder continues a killed session
@@ -115,27 +119,30 @@ impl Render for JumpDragPreview {
 /// the mapping is unit-testable headlessly (the actual hue is a paint detail).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum AgentDotStatus {
-    /// A reply is in flight — the agent is busy. Warm accent.
+    /// A reply is in flight — the agent is doing something right now.
+    /// Rendered ● **orange**.
     Working,
-    /// The turn finished; it's the user's move. Green.
+    /// The agent finished a turn whose output you haven't read — it's waiting on
+    /// you. Rendered ● **green**, and the session label goes **italic**.
     WaitingForYou,
-    /// Phase unknown (roster-only, not open here) or the agent is disconnected.
-    /// Dim chrome color.
+    /// Idle with nothing unread (you've read it), or disconnected, or a
+    /// roster-only session whose phase we can't know. Rendered ○ **dim**.
     Neutral,
 }
 
 impl AgentRow {
     /// Map this row to its status-dot meaning (UXI-JumpPanel-1). Disconnected wins
-    /// (nothing is happening); otherwise a known phase chooses working vs your-
-    /// turn, and an unknown phase stays neutral.
+    /// (nothing is happening); otherwise a reply in flight is **working**, an idle
+    /// turn with unread output is **waiting on you**, and anything else (idle +
+    /// read, or unknown phase) is **neutral**.
     pub(crate) fn dot_status(&self) -> AgentDotStatus {
         if !self.connected {
             return AgentDotStatus::Neutral;
         }
         match self.awaiting {
             Some(true) => AgentDotStatus::Working,
-            Some(false) => AgentDotStatus::WaitingForYou,
-            None => AgentDotStatus::Neutral,
+            Some(false) if self.unread => AgentDotStatus::WaitingForYou,
+            _ => AgentDotStatus::Neutral,
         }
     }
 }
@@ -166,6 +173,7 @@ impl YaldaGpuiView {
                 .map(|e| e.read(cx).label.clone())
                 .unwrap_or_else(|| info.label.clone());
             let awaiting = opened.map(|e| e.read(cx).state.turn_phase.is_awaiting());
+            let unread = opened.map(|e| e.read(cx).state.unread).unwrap_or(false);
             rows.push(AgentRow {
                 target: JumpTarget::Roster(info.session_id.clone()),
                 label,
@@ -173,6 +181,7 @@ impl YaldaGpuiView {
                 bound,
                 connected: info.connected,
                 awaiting,
+                unread,
                 order_sid: Some(info.session_id.clone()),
             });
         }
@@ -192,6 +201,7 @@ impl YaldaGpuiView {
                 bound: self.agent_tile_id_bound_to(id).is_some(),
                 connected: true,
                 awaiting: Some(ent.read(cx).state.turn_phase.is_awaiting()),
+                unread: ent.read(cx).state.unread,
                 // Its own sid when it has one (bound but the roster hasn't listed
                 // it yet), else — for a `/clear` placeholder — the killed
                 // session's sid, whose order slot it inherits.
@@ -418,13 +428,28 @@ impl YaldaGpuiView {
             base: px(13.0),
             pt: 13.0,
         };
-        let mut sel_bg = st.accent;
-        sel_bg.a = 0.18;
+        // The "active / selection" hue is the theme's cool primary accent
+        // (`frozen_bar` — cyan/teal across all themes), NOT the warm accent. A
+        // low-alpha cool tint reads as a clean editor-sidebar selection; the old
+        // warm_accent tint muddied to brown/olive over the background, and the
+        // "you are here" mark is now this same accent as a left bar rather than a
+        // bright red bounding box (UXI-JumpPanel-5).
+        let active_accent = nc(self.theme.agent.frozen_bar);
+        let mut sel_bg = active_accent;
+        sel_bg.a = 0.15;
         let panel_bg = self.editor_bg();
         let border = st.dim;
         // "Waiting for you" status-dot color (turn finished, your move). The
         // tool-completed green reads as ready/done across both themes.
         let ready = nc(self.theme.agent.tool_completed);
+        // Header palette: top-level section headers are RED (`st.err`); per-cwd
+        // subheaders are ELECTRIC BLUE (`0x3b9eff`, a vivid theme-neutral blue).
+        // Italic is reserved for the "waiting on you" session state (below), so
+        // headers carry no italic.
+        let electric: Hsla = rgb(0x3b9eff).into();
+        // Orange "working" status-dot (a reply is in flight). Fixed warm orange,
+        // distinct from the warm gold `warm_accent` and legible on every theme.
+        let working_orange: Hsla = rgb(0xff9e64).into();
 
         // Snapshot the rows up-front (releases the session-entity reads before we
         // wire listeners). Workspaces: non-ephemeral tabs, active marked.
@@ -461,7 +486,7 @@ impl YaldaGpuiView {
             .py_2();
 
         // ── Pinned (placeholder; pinning mechanics land later) ───────────────
-        col = col.child(section_heading("Pinned", &st).px_3());
+        col = col.child(section_heading("Pinned", &st).px_3().text_color(st.err));
         col = col.child(
             div()
                 .px_3()
@@ -477,14 +502,22 @@ impl YaldaGpuiView {
         // `ctrl-<n>` switches to (`goto_workspace_number`). Non-ephemeral tabs
         // occupy indices `0..N` contiguously (ephemeral virtual workspaces sort
         // last; see the goto-workspace menu), so `idx + 1` is a stable number.
-        col = col.child(section_heading("Workspaces", &st).px_3());
+        col = col.child(section_heading("Workspaces", &st).px_3().text_color(st.err));
         for (idx, label, active) in workspaces {
             let row_id = SharedString::from(format!("jump-ws-{idx}"));
             let num = format!("{}", idx + 1);
             col = col.child(
-                // Active workspace gets the red "you are here" box (UXI-JumpPanel-5),
-                // additive over the accent label + selection tint.
-                jump_nav_row(row_id, &label, active, active, Some(&num), None, &st, sel_bg, active)
+                // Active workspace wears the "you are here" mark (UXI-JumpPanel-5):
+                // a left accent bar + accent label + selection tint.
+                jump_nav_row(
+                    row_id,
+                    &label,
+                    Some(&num),
+                    None,
+                    &st,
+                    sel_bg,
+                    active.then_some(active_accent),
+                )
                     .on_click(
                         cx.listener(move |this, _ev, _window, cx| this.select_tab(idx, cx)),
                     ),
@@ -492,7 +525,7 @@ impl YaldaGpuiView {
         }
 
         // ── Agent sessions ─────────────────────────────────────────────────—
-        col = col.child(section_heading("Agent sessions", &st).px_3());
+        col = col.child(section_heading("Agent sessions", &st).px_3().text_color(st.err));
         // A discoverable create-affordance for a FREE (tile-less) session
         // (UXI-JumpPanel-3): clicking opens the cwd picker (UXI-JumpPanel-4), then
         // spawns a session bound to no tile/workspace via
@@ -504,13 +537,11 @@ impl YaldaGpuiView {
             jump_nav_row(
                 SharedString::from("jump-new-agent"),
                 "New agent session",
-                false,
-                false,
                 Some("＋"),
-                Some(st.accent),
+                Some(active_accent),
                 &st,
                 sel_bg,
-                false,
+                None,
             )
             .on_click(
                 cx.listener(|this, _ev, _window, cx| {
@@ -552,12 +583,22 @@ impl YaldaGpuiView {
             // drop TARGET for other headers. It's a plain heading turned into a
             // stateful div (needs an id for drag/drop + a drop-highlight).
             let header_id = SharedString::from(format!("jump-cwd-{cwd_label}"));
-            let header = section_heading(&cwd_label, &st)
+            // A cwd subheader is a SECONDARY grouping label — electric blue, real
+            // path casing (not the bold red uppercased top-level `section_heading`),
+            // so the two header tiers read as a clear hierarchy. No italic (italic
+            // is reserved for the "waiting on you" session state).
+            let header = div()
                 .id(header_id)
+                .w_full()
+                .pt_2()
+                .pb_1()
                 .pl(px(20.0))
                 .pr_3()
+                .text_color(electric)
+                .font_family(st.mono.clone())
                 .text_size(px(st.pt * 0.85))
                 .cursor_pointer()
+                .child(SharedString::from(cwd_label.clone()))
                 .on_drag(CwdDrag { cwd_key: cwd_key.clone() }, {
                     let label: SharedString = cwd_label.clone().into();
                     let (fg, bg, font) = (drag_fg, sel_bg, drag_font.clone());
@@ -579,39 +620,37 @@ impl YaldaGpuiView {
                 }));
             col = col.child(header);
             for (i, row) in group {
-                // Bound (in-use) sessions jump to their existing tile; free ones
-                // open in an ephemeral virtual workspace. ● = in use, ○ = free.
-                //
-                // The dot's COLOR is a per-session status light (universal-agent-
-                // list gives the row; the open session gives the phase):
-                //   • working (a reply is in flight)      → warm accent (`st.accent`)
-                //   • waiting for you (turn finished, idle) → green   (`ready`)
-                //   • unknown phase (roster-only, not open here) or disconnected → dim
-                // A disconnected session is also dimmed wholesale (the label too).
-                let badge = if row.bound { "●" } else { "○" };
-                let badge_color = match row.dot_status() {
-                    AgentDotStatus::Working => st.accent,
-                    AgentDotStatus::WaitingForYou => ready,
-                    AgentDotStatus::Neutral => st.dim,
+                // The status dot encodes what the AGENT is doing (not binding):
+                //   • working  (reply in flight)                 → ● orange
+                //   • waiting on you (idle + unread output)       → ● green + italic
+                //   • idle+read / disconnected / unknown phase    → ○ dim
+                let status = row.dot_status();
+                let (badge, badge_color) = match status {
+                    AgentDotStatus::Working => ("●", working_orange),
+                    AgentDotStatus::WaitingForYou => ("●", ready),
+                    AgentDotStatus::Neutral => ("○", st.dim),
                 };
                 let row_id = SharedString::from(format!("jump-sess-{i}"));
                 let target = row.target.clone();
-                // Red active box when this row is the focused tile's bound session
+                // Left accent bar when this row is the focused tile's bound session
                 // (UXI-JumpPanel-5).
                 let active = jump_target_is_active(&row.target, active_local, active_sid.as_deref());
                 let mut r = jump_nav_row(
                     row_id,
                     &row.label,
-                    false,
-                    false,
                     Some(badge),
                     Some(badge_color),
                     &st,
                     sel_bg,
-                    active,
+                    active.then_some(active_accent),
                 );
                 if !row.connected {
                     r = r.text_color(st.dim);
+                }
+                // Italic == "waiting on you" (idle with unread output). The one
+                // meaning italic carries in the panel.
+                if status == AgentDotStatus::WaitingForYou {
+                    r = r.italic();
                 }
                 r = r.on_click(cx.listener({
                     let target = target.clone();
@@ -664,25 +703,23 @@ impl YaldaGpuiView {
 
 }
 
-/// One selectable row: optional leading badge glyph + label, tinted when
-/// `selected`. Returns a `Stateful<Div>` (has an `id`, so it supports
-/// `hover`/`on_click`); the caller attaches the click listener. `accent_text`
-/// draws the label in the accent color (used to mark the active workspace).
-/// `badge_color` colors the leading badge cell (a status light for agent rows);
-/// `None` falls back to the dim chrome color (workspace numbers). `active_box`
-/// wraps the row in the red "you are here" active box (UXI-JumpPanel-5) — the
-/// active workspace and/or the focused bound session; additive over `selected`.
-#[allow(clippy::too_many_arguments)]
+/// One selectable row: optional leading badge glyph + label. Returns a
+/// `Stateful<Div>` (has an `id`, so it supports `hover`/`on_click`); the caller
+/// attaches the click listener. `badge_color` colors the leading badge cell (a
+/// status light for agent rows); `None` falls back to the dim chrome color
+/// (workspace numbers). `active` marks "this is where you are" (UXI-JumpPanel-5):
+/// `Some(accent)` draws a left accent bar in that hue, tints the row background,
+/// and colors the label with the accent; `None` is a plain row (hover still
+/// tints). Every row reserves the 2px left-bar gutter (transparent when inactive)
+/// so the mark never shifts row geometry.
 fn jump_nav_row(
     id: impl Into<ElementId>,
     label: &str,
-    selected: bool,
-    accent_text: bool,
     badge: Option<&str>,
     badge_color: Option<Hsla>,
     st: &DetailStyle,
     sel_bg: Hsla,
-    active_box: bool,
+    active: Option<Hsla>,
 ) -> gpui::Stateful<gpui::Div> {
     let transparent: Hsla = rgba(0x00000000).into();
     let label = if label.trim().is_empty() {
@@ -690,7 +727,7 @@ fn jump_nav_row(
     } else {
         label.to_string()
     };
-    let mut row = div()
+    div()
         .id(id)
         .flex()
         .flex_row()
@@ -702,15 +739,12 @@ fn jump_nav_row(
         .cursor_pointer()
         .text_size(st.base)
         .font_family(st.mono.clone())
-        .bg(if selected { sel_bg } else { transparent })
-        .hover(|s| s.bg(sel_bg));
-    // The red active box marking "this is where you are" (UXI-JumpPanel-5). A
-    // 1px border keeps the row's height/geometry effectively unchanged and reads
-    // as a bounding box over the existing selection tint.
-    if active_box {
-        row = row.border_1().border_color(st.err).rounded_md();
-    }
-    row
+        // Left accent bar for the active row; a transparent bar of the same width
+        // on every other row keeps content alignment identical.
+        .border_l_2()
+        .border_color(active.unwrap_or(transparent))
+        .bg(if active.is_some() { sel_bg } else { transparent })
+        .hover(|s| s.bg(sel_bg))
         .child(
             div()
                 .w(px(16.0))
@@ -722,7 +756,7 @@ fn jump_nav_row(
             div()
                 .flex_1()
                 .min_w_0()
-                .text_color(if accent_text { st.accent } else { st.fg })
+                .text_color(active.unwrap_or(st.fg))
                 .child(SharedString::from(label)),
         )
 }

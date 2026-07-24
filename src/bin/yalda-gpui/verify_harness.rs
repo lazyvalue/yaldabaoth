@@ -1043,10 +1043,10 @@ fn workspace_number_skips_ephemeral(cx: &mut TestAppContext) {
     });
 }
 
-/// UXI-JumpPanel-1: the jump-panel agent status dot reflects the session's turn phase.
-/// `dot_status` is the headless-verifiable mapping (the actual hue is a paint
-/// detail — gap 1). Working while a reply is in flight; waiting-for-you once the
-/// turn finishes; neutral when disconnected.
+/// UXI-JumpPanel-1: the jump-panel agent status dot reflects the session's turn
+/// phase + unread state. `dot_status` is the headless-verifiable mapping (the
+/// actual hue is a paint detail — gap 1). Idle-and-read is neutral; idle-with-
+/// unread-output waits for you; a reply in flight is working.
 #[gpui::test]
 fn agent_status_dot_reflects_turn_phase(cx: &mut TestAppContext) {
     use crate::AgentDotStatus;
@@ -1061,14 +1061,22 @@ fn agent_status_dot_reflects_turn_phase(cx: &mut TestAppContext) {
         })
     };
 
-    // Idle (fresh session, turn finished) → it's the user's move.
+    // Idle with nothing unread → neutral (not waiting on you).
+    assert_eq!(
+        status(&view, vcx),
+        AgentDotStatus::Neutral,
+        "a fresh idle session with nothing unread is neutral"
+    );
+
+    // Mark unread (a turn finished while you were elsewhere) → waiting on you.
+    view.update(vcx, |v, cx| v.with_session(id, cx, |c| c.unread = true));
     assert_eq!(
         status(&view, vcx),
         AgentDotStatus::WaitingForYou,
-        "an idle session waits for you"
+        "an idle session with unread output waits for you"
     );
 
-    // A reply in flight → working.
+    // A reply in flight → working (regardless of unread).
     view.update(vcx, |v, cx| {
         v.with_session(id, cx, |c| {
             c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now())
@@ -1086,7 +1094,7 @@ fn agent_status_dot_reflects_turn_phase(cx: &mut TestAppContext) {
 #[test]
 fn agent_dot_status_mapping() {
     use crate::{AgentDotStatus, AgentRow, JumpTarget};
-    let row = |connected, awaiting| AgentRow {
+    let row = |connected, awaiting, unread| AgentRow {
         order_sid: None,
         target: JumpTarget::Roster("s".into()),
         label: "x".into(),
@@ -1094,14 +1102,103 @@ fn agent_dot_status_mapping() {
         bound: false,
         connected,
         awaiting,
+        unread,
     };
-    assert_eq!(row(true, Some(true)).dot_status(), AgentDotStatus::Working);
+    // Reply in flight → working (unread irrelevant while working).
+    assert_eq!(row(true, Some(true), false).dot_status(), AgentDotStatus::Working);
+    // Idle + unread output → waiting on you.
     assert_eq!(
-        row(true, Some(false)).dot_status(),
+        row(true, Some(false), true).dot_status(),
         AgentDotStatus::WaitingForYou
     );
-    assert_eq!(row(true, None).dot_status(), AgentDotStatus::Neutral);
-    assert_eq!(row(false, Some(true)).dot_status(), AgentDotStatus::Neutral);
+    // Idle + already read → neutral (not waiting).
+    assert_eq!(row(true, Some(false), false).dot_status(), AgentDotStatus::Neutral);
+    // Unknown phase (roster-only) → neutral.
+    assert_eq!(row(true, None, false).dot_status(), AgentDotStatus::Neutral);
+    // Disconnected wins even if it was mid-turn / had unread.
+    assert_eq!(row(false, Some(true), true).dot_status(), AgentDotStatus::Neutral);
+}
+
+/// UXI-JumpPanel-6 (unread "waiting on you" dot): a turn that finalizes on a
+/// session you are NOT focused on marks it unread → its jump-panel row reads
+/// `WaitingForYou` (● green + italic). A turn that finalizes on the session you
+/// ARE focused on stays read → `Neutral`. Drives the REAL turn-end path
+/// (`apply_server_batch` → `ServerNotification::TurnEnded` →
+/// `finalize_agent_turn_idem`, which sets `unread`; the batch's focused-clear
+/// keeps the focused session read), then asserts through the REAL
+/// `jump_panel_agent_rows` + `dot_status` derivation the render uses.
+///
+/// Negative control (observed RED): remove `self.unread = true` in
+/// `finalize_agent_turn_idem` → S1 reads `Neutral` (assert fails). Remove the
+/// focused-clear in `apply_server_batch` → S2 reads `WaitingForYou` (assert fails).
+#[gpui::test]
+fn jump_dot_unread_on_background_turn_end_read_on_focused(cx: &mut TestAppContext) {
+    use crate::{AgentDotStatus, AgentSession, AgentState, AgentTile, App};
+    use yalda::session_proto::Notification as ServerNotification;
+
+    let (view, vcx) = boot_browser(cx);
+
+    // Two bound server-managed sessions. Installing S2 second leaves S2 as the
+    // focused tile's session; S1 is unfocused but still in the store.
+    let (s1, s2) = view.update(vcx, |v, cx| {
+        let mk = |sid: &str| AgentSession {
+            state: AgentState::new_server_managed(None),
+            label: format!("sess-{sid}"),
+            cwd: PathBuf::from("."),
+            resume_id: None,
+        };
+        v.set_screen(App::Agent(AgentTile::new()));
+        let s1 = v.show_local_session(mk("S1"), cx);
+        v.sessions.bind_sid(s1, ServerSid::new("S1")).expect("S1 binds");
+        v.set_screen(App::Agent(AgentTile::new()));
+        let s2 = v.show_local_session(mk("S2"), cx);
+        v.sessions.bind_sid(s2, ServerSid::new("S2")).expect("S2 binds");
+        (s1, s2)
+    });
+    vcx.run_until_parked();
+
+    // Sanity: S2 is the focused session, S1 is not.
+    view.update(vcx, |v, _cx| {
+        assert_eq!(v.jump_active_session().0, Some(s2), "S2 is focused");
+        assert_ne!(v.jump_active_session().0, Some(s1), "S1 is backgrounded");
+    });
+
+    // End a turn on BOTH via the real server path.
+    let end_turn = |v: &mut YaldaGpuiView, sid: &str, cx: &mut gpui::Context<YaldaGpuiView>| {
+        v.apply_server_batch(
+            vec![ServerNotification::TurnEnded {
+                session_id: sid.into(),
+                turn_count: 1,
+                generation: 1,
+            }],
+            cx,
+        );
+    };
+    view.update(vcx, |v, cx| {
+        end_turn(v, "S1", cx);
+        end_turn(v, "S2", cx);
+    });
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, cx| {
+        let rows = v.jump_panel_agent_rows(cx);
+        let dot = |sid: &str| {
+            rows.iter()
+                .find(|r| r.order_sid.as_deref() == Some(sid))
+                .unwrap_or_else(|| panic!("row for {sid}"))
+                .dot_status()
+        };
+        assert_eq!(
+            dot("S1"),
+            AgentDotStatus::WaitingForYou,
+            "a backgrounded session's finished turn is unread → waiting on you"
+        );
+        assert_eq!(
+            dot("S2"),
+            AgentDotStatus::Neutral,
+            "the focused session's finished turn stays read → neutral"
+        );
+    });
 }
 
 /// UXI-AgentTile-23 (ADR-0027): the transcript row-background selector gives a
@@ -6112,6 +6209,7 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
         bound: false,
         connected: true,
         awaiting: None,
+        unread: false,
         order_sid: Some(sid.into()),
     };
     // Two projects; alpha has two sessions (incoming by-label a,b), beta one.
@@ -6384,6 +6482,7 @@ fn jump_panel_groups_agent_rows_by_cwd() {
         bound: false,
         connected: true,
         awaiting: None,
+        unread: false,
     };
     // Two projects, one with two sessions; input order is by-label (a,b,c).
     let rows = vec![

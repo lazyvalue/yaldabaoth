@@ -661,7 +661,24 @@ impl YaldaGpuiView {
             tile.bind(sid);
             self.workspace.open_ephemeral_tab(App::Agent(tile));
         }
+        // You're now looking at this session — clear its "waiting on you" mark
+        // eagerly (the pump also clears it, but this makes the dot update on the
+        // same frame as the jump).
+        self.mark_session_read(sid, cx);
         cx.notify();
+    }
+
+    /// Clear a session's `unread` ("waiting on you") flag — it's being viewed.
+    /// Idempotent; only touches the entity when the flag is actually set.
+    pub(crate) fn mark_session_read(&mut self, sid: SessionId, cx: &mut Context<Self>) {
+        if let Some(ent) = self.session_entity(sid) {
+            ent.update(cx, |session, scx| {
+                if session.state.unread {
+                    session.state.unread = false;
+                    scx.notify();
+                }
+            });
+        }
     }
 
     /// Jump-panel selection dispatcher (universal-agent-list). A row may target
@@ -1623,6 +1640,7 @@ impl YaldaGpuiView {
             finalized: std::collections::HashSet::new(),
             replay_prefix_finalized: false,
             agent_stream_authoritative: false,
+            unread: false,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         };
@@ -2422,6 +2440,13 @@ impl YaldaGpuiView {
         // re-reveal — it runs for every live transcript view, focused or not,
         // so unfocused tiles stay pinned without a pump-side poke.
         let _ = &scrolled_sessions;
+        // A turn that finalized this batch set `unread` (via
+        // `finalize_agent_turn_idem`). If it was the session you're focused on,
+        // you're reading it live — clear it so only backgrounded sessions carry
+        // the "waiting on you" mark.
+        if let Some(focused) = self.jump_active_session().0 {
+            self.mark_session_read(focused, cx);
+        }
         if did_work {
             cx.notify();
         }
@@ -2441,6 +2466,11 @@ impl YaldaGpuiView {
         // exit (session gone / disconnected), or `Some((has_events,
         // more_pending, attached_with_id))` to continue with the post-borrow
         // persistence below.
+        // Is this session the one the focused tile is showing? Drives unread
+        // ("waiting on you") accounting: a turn that ends while you're watching
+        // stays read; while you're elsewhere it flips unread. Computed before the
+        // entity borrow below.
+        let is_focused = self.jump_active_session().0 == Some(id);
         let Some(ent) = self.session_entity(id) else {
             return false; // session gone: pump task should exit
         };
@@ -2565,6 +2595,14 @@ impl YaldaGpuiView {
                 // re-reveal. The session notify below buses the transcript view
                 // to re-render this same effect-flush, so the reveal lands on
                 // the very frame this chunk scheduled (no stale tail).
+            }
+
+            // If this is the session you're focused on, you're reading it live —
+            // so any turn that just finalized (which set `unread` in the shared
+            // `finalize_agent_turn_idem` ledger) is already read. Clearing here,
+            // after the drain, overrides that set on the SAME tick (no flicker).
+            if is_focused && claude.unread {
+                claude.unread = false;
             }
 
             // Mutation-site notify on the session entity (load-bearing after

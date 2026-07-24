@@ -3450,6 +3450,14 @@ pub(crate) struct AgentState {
     /// to `false` on `reset_for_replay` so a logless reconnect falls back to
     /// inference until the new channel forwards its first boundary.
     pub(crate) agent_stream_authoritative: bool,
+    /// Whether this session has finished a turn whose output the user hasn't
+    /// looked at yet — "unread, waiting on you" (jump-panel status dot). Set
+    /// `true` when a turn ends while the session is NOT the focused one; cleared
+    /// to `false` the moment the session becomes focused (both in
+    /// `pump_session`, plus an eager clear in `jump_to_session`). Drives the
+    /// jump panel's ● green + italic "waiting on you" row; a turn that ends while
+    /// you're watching it stays read (`false`).
+    pub(crate) unread: bool,
     /// Background polling task that drains the ACP channel into the editor
     /// every ~50ms. Held only so that dropping `AgentState` (e.g. on
     /// `back_to_doc`) cancels the task. The leading `_` mutes unused-field
@@ -3718,6 +3726,7 @@ impl AgentState {
             finalized: std::collections::HashSet::new(),
             replay_prefix_finalized: false,
             agent_stream_authoritative: false,
+            unread: false,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         }
@@ -3782,6 +3791,7 @@ impl AgentState {
             finalized: std::collections::HashSet::new(),
             replay_prefix_finalized: false,
             agent_stream_authoritative: false,
+            unread: false,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
             _pump: None,
         };
@@ -4079,6 +4089,12 @@ impl AgentState {
                 self.focus = AgentFocus::Compose;
             }
         }
+        // A turn just finalized → its output is unread ("waiting on you") by
+        // default. The entry points (pump_session / apply_server_batch) clear
+        // this again for the session the user is currently focused on, so a turn
+        // that ends while you're watching it stays read. Central here because
+        // this idempotent ledger is the one place every turn-end path converges.
+        self.unread = true;
         true
     }
 
