@@ -3368,6 +3368,25 @@ pub(crate) struct AgentState {
     /// jump panel's ● green + italic "waiting on you" row; a turn that ends while
     /// you're watching it stays read (`false`).
     pub(crate) unread: bool,
+    /// Where this session's `label` came from (`UXI-AgentTile-27`). `User` is a
+    /// latch set by the rename command: once set, autonaming can never fire and
+    /// a late autoname result is dropped. Lives here (not on `AgentSession`)
+    /// only because `AgentSession` derefs to `AgentState` and this is the one
+    /// place every construction path funnels through.
+    pub(crate) name_origin: NameOrigin,
+    /// The autonamer's two-sentence summary of what this session is about, or
+    /// `None` until one lands. Rendered under the label in the jump panel.
+    pub(crate) summary: Option<String>,
+    /// One-shot autoname lifecycle. Defaults to `Done` — a session must be
+    /// explicitly ARMED (`armed_for_autoname`) at a genuinely-fresh creation
+    /// point. Defaulting the other way would let an attach/restore path
+    /// autoname a session that already has a real name.
+    pub(crate) autoname: AutonameState,
+    /// Set by `finalize_agent_turn_idem` when a turn completes while `autoname`
+    /// is `Pending`; drained by `drain_autoname_requests` on the view, which is
+    /// the layer that can actually spawn the HTTP call. This flag exists because
+    /// the turn-finalize chokepoint is on `AgentState` (no `cx`, no view).
+    pub(crate) autoname_due: bool,
     /// Background polling task that drains the ACP channel into the editor
     /// every ~50ms. Held only so that dropping `AgentState` (e.g. on
     /// `back_to_doc`) cancels the task. The leading `_` mutes unused-field
@@ -3377,6 +3396,16 @@ pub(crate) struct AgentState {
 }
 
 impl AgentState {
+    /// Arm this session for one-shot autonaming (`UXI-AgentTile-27`). Call at a
+    /// genuinely-fresh creation point ONLY — a session that already exists
+    /// server-side (attach / restore / resume) must stay `Done`, and `/clear`
+    /// carries the old session's state across rather than re-arming, so a
+    /// cleared session is never renamed a second time.
+    pub(crate) fn armed_for_autoname(mut self) -> Self {
+        self.autoname = AutonameState::Pending;
+        self
+    }
+
     /// The transcript-structure generation counter — bumped on every mutation
     /// to the tool-call cluster (`calls`/`order`/`expanded`). Ticket 021's
     /// observe filter compares it across renders so a tool start / update /
@@ -3638,6 +3667,14 @@ impl AgentState {
             agent_stream_authoritative: false,
             unread: false,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
+            name_origin: NameOrigin::Auto,
+            summary: None,
+            // Autoname is OPT-IN: a session must be explicitly armed at a
+            // genuinely-fresh creation point (`armed_for_autoname`). Defaulting
+            // to `Done` means an attach/restore path can never autoname a
+            // session that already carries a real name.
+            autoname: AutonameState::Done,
+            autoname_due: false,
             _pump: None,
         }
     }
@@ -3703,6 +3740,14 @@ impl AgentState {
             agent_stream_authoritative: false,
             unread: false,
             follow_output: std::rc::Rc::new(std::cell::Cell::new(true)),
+            name_origin: NameOrigin::Auto,
+            summary: None,
+            // Autoname is OPT-IN: a session must be explicitly armed at a
+            // genuinely-fresh creation point (`armed_for_autoname`). Defaulting
+            // to `Done` means an attach/restore path can never autoname a
+            // session that already carries a real name.
+            autoname: AutonameState::Done,
+            autoname_due: false,
             _pump: None,
         };
         // The follow-output scroll handler is wired by the owning
@@ -3977,6 +4022,14 @@ impl AgentState {
     pub(crate) fn finalize_agent_turn_idem(&mut self, generation: u64, turn: usize) -> bool {
         if !self.finalized.insert((generation, turn)) {
             return false; // already finalized this (generation, turn)
+        }
+        // UXI-AgentTile-27 property 1: the FIRST completed turn of an armed
+        // session is what triggers autonaming. This is the one chokepoint every
+        // turn-completion path funnels through (forwarded `AgentEvent`, legacy
+        // inference, and the replay boundary all land here), so arming the flag
+        // here rather than at the four call sites keeps "exactly once" honest.
+        if self.autoname == AutonameState::Pending {
+            self.autoname_due = true;
         }
         finalize_agent_turn(&mut self.editor);
         // In Worksheet mode the caret IS the compose point, so once a turn

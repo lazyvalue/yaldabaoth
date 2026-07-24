@@ -68,6 +68,7 @@
 //!     q / Esc              close browser (returns to doc, or quits)
 
 mod agent;
+mod agent_naming;
 mod agent_roster;
 mod agent_sessions;
 mod agent_ui;
@@ -95,6 +96,7 @@ mod verify_harness;
 /// All UX work is built from here; see `yux/CLAUDE.md`.
 mod yux;
 pub(crate) use agent::*;
+pub(crate) use agent_naming::*;
 pub(crate) use agent_roster::*;
 pub(crate) use agent_sessions::*;
 pub(crate) use jump_panel_view::*;
@@ -2065,6 +2067,7 @@ impl YaldaGpuiView {
                                 sidepanel_hidden: false,
                                 cwd: None,
                                 compose_draft: None,
+                                summary: None,
                             }
                         })),
                         _ if any_identity => None,
@@ -2085,14 +2088,24 @@ impl YaldaGpuiView {
                         let label = crate::persist::unique_label(&slot.label, &used_labels);
                         used_labels.insert(label.clone());
                         let make_cwd = slot_cwd.clone();
+                        // UXI-AgentTile-27: carry the persisted autoname summary
+                        // across the restart. The session is NOT re-armed for
+                        // autonaming (property 1 — a restored session already has
+                        // history and is never retro-named), so this is the only
+                        // way its jump-panel summary line survives.
+                        let slot_summary = slot.summary.clone();
                         let bind = self.sessions.open_or_focus(&slot.id, |_id| {
-                            cx.new(|_| AgentSession {
-                                state: AgentState::new_server_managed(Some(
+                            cx.new(|_| {
+                                let mut state = AgentState::new_server_managed(Some(
                                     "reconnecting…".into(),
-                                )),
-                                label,
-                                cwd: make_cwd,
-                                resume_id: Some(slot.id.clone()),
+                                ));
+                                state.summary = slot_summary;
+                                AgentSession {
+                                    state,
+                                    label,
+                                    cwd: make_cwd,
+                                    resume_id: Some(slot.id.clone()),
+                                }
                             })
                         });
                         match bind {
@@ -2164,7 +2177,9 @@ impl YaldaGpuiView {
                 self.focus_window_for_restore(*leaf_id);
                 let id = match persisted.get(i).cloned() {
                     None => {
-                        let state = self.create_agent_session(None, proc_cwd.clone(), cx);
+                        let state = self
+                            .create_agent_session(None, proc_cwd.clone(), cx)
+                            .armed_for_autoname();
                         // bug-0005: unique label, never a bare/duplicate "claude".
                         let label = crate::persist::unique_label("", &used_labels);
                         used_labels.insert(label.clone());
@@ -5994,6 +6009,12 @@ impl YaldaGpuiView {
                 if let Some(ent) = self.session_entity(id) {
                     ent.update(cx, |session, scx| {
                         session.label = new_label.clone();
+                        // UXI-AgentTile-27 property 3: an explicit rename latches
+                        // the origin to `User`, permanently. Autonaming can never
+                        // fire afterwards, and an autoname already in flight is
+                        // dropped when it lands (`finish_autoname`) rather than
+                        // overwriting the name just typed.
+                        session.state.name_origin = NameOrigin::User;
                         scx.notify();
                     });
                 }
@@ -7978,6 +7999,10 @@ fn main() {
     // reparented to PID 1). Graceful exits reap via kill_on_drop; this catches
     // the crash/SIGKILL path that accumulated ~70 idle adapters over weeks.
     let _ = yalda::acp_channel::reap_orphaned_adapters();
+    // Load `.env` (gitignored) BEFORE anything reads the environment, so
+    // `ANTHROPIC_API_KEY` for session autonaming (UXI-AgentTile-27) can live in
+    // the repo root instead of the launching shell. Real env vars always win.
+    load_dotenv();
     // Relocate state written by older builds under <cache_dir>/yalda into the
     // durable `~/.yalda` home (ADR-0018), BEFORE any persisted state (prefs,
     // workspace, client_id, acp_sessions) is read. One-time, idempotent.

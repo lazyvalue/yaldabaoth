@@ -1208,6 +1208,7 @@ fn agent_dot_status_mapping() {
         order_sid: None,
         target: JumpTarget::Roster("s".into()),
         label: "x".into(),
+        summary: None,
         cwd: std::path::PathBuf::from("/"),
         bound: false,
         connected,
@@ -4264,6 +4265,7 @@ fn multi_session_persistence_round_trips_distinct_sids() {
             sidepanel_hidden: false,
             cwd: cwd.clone(),
             compose_draft: None,
+            summary: None,
         },
         SessionSnapshot {
             id: "SID-B".into(),
@@ -4276,6 +4278,7 @@ fn multi_session_persistence_round_trips_distinct_sids() {
             sidepanel_hidden: true,
             cwd: cwd.clone(),
             compose_draft: None,
+            summary: None,
         },
     ];
 
@@ -6527,6 +6530,7 @@ fn jump_reorder_ordering_applies_and_defaults_to_alpha() {
     let row = |sid: &str, label: &str, cwd: &str| AgentRow {
         target: JumpTarget::Roster(sid.into()),
         label: label.into(),
+        summary: None,
         cwd: std::path::PathBuf::from(cwd),
         bound: false,
         connected: true,
@@ -6800,6 +6804,7 @@ fn jump_panel_groups_agent_rows_by_cwd() {
         order_sid: Some(label.into()),
         target: JumpTarget::Roster(label.into()),
         label: label.into(),
+        summary: None,
         cwd: std::path::PathBuf::from(cwd),
         bound: false,
         connected: true,
@@ -12402,6 +12407,7 @@ fn renamed_session_label_round_trips_unchanged() {
             sidepanel_hidden: false,
             cwd: cwd.clone(),
             compose_draft: None,
+            summary: None,
         },
         SessionSnapshot {
             id: "sid-beta".into(),
@@ -12413,6 +12419,7 @@ fn renamed_session_label_round_trips_unchanged() {
             sidepanel_hidden: false,
             cwd: cwd.clone(),
             compose_draft: None,
+            summary: None,
         },
     ];
     let loaded = with_acp_persist_path(file.clone(), || {
@@ -13716,4 +13723,255 @@ fn closing_a_free_session_lands_in_the_same_project(cx: &mut TestAppContext) {
             "…shown in its own bare agent view"
         );
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UXI-AgentTile-27 — session autonaming + summary
+//
+// The live Haiku HTTP call is dev-system verification gap 2 (a real subprocess /
+// network round-trip), so `spawn_autoname_worker` is suppressed under
+// `cfg(test)` exactly as `spawn_recap_worker` is. These tests drive the REAL
+// turn-completion path into the REAL arming logic, then hand the reducer the
+// result the worker would have delivered.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Boot one bound, server-managed session ARMED for autonaming, with a seeded
+/// opening exchange. Returns the view, its context, and the session's id.
+fn boot_armed_autoname_session(
+    cx: &mut TestAppContext,
+) -> (gpui::Entity<YaldaGpuiView>, &mut gpui::VisualTestContext, crate::SessionId) {
+    use crate::{AgentSession, AgentState, AgentTile, App};
+
+    let (view, vcx) = boot_browser(cx);
+    let id = view.update(vcx, |v, cx| {
+        v.set_screen(App::Agent(AgentTile::new()));
+        let id = v.show_local_session(
+            AgentSession {
+                // The REAL arming call every fresh-create path uses.
+                state: AgentState::new_server_managed(None).armed_for_autoname(),
+                label: "claude-3".into(),
+                cwd: PathBuf::from("."),
+                resume_id: None,
+            },
+            cx,
+        );
+        v.sessions.bind_sid(id, ServerSid::new("S1")).expect("S1 binds");
+        id
+    });
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |s| {
+            s.editor
+                .programmatic_insert(0, "user: rip out the payments adapter\nagent: on it\n");
+        });
+    });
+    vcx.run_until_parked();
+    (view, vcx, id)
+}
+
+/// End a turn on session `sid` through the REAL server path.
+fn end_turn_for(
+    view: &gpui::Entity<YaldaGpuiView>,
+    vcx: &mut gpui::VisualTestContext,
+    sid: &str,
+    turn_count: usize,
+) {
+    use yalda::session_proto::Notification as ServerNotification;
+    view.update(vcx, |v, cx| {
+        v.apply_server_batch(
+            vec![ServerNotification::TurnEnded {
+                session_id: sid.into(),
+                turn_count,
+                generation: 1,
+            }],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+}
+
+/// UXI-AgentTile-27 property 1: the FIRST completed turn of an armed session
+/// arms exactly one naming request, and a SECOND completed turn arms nothing —
+/// the derivation is one-shot per session, ever.
+///
+/// Drives the real path the user's turn actually runs (`apply_server_batch` →
+/// `ServerNotification::TurnEnded` → `finalize_agent_turn_idem` → the
+/// `drain_autoname_requests` call at the end of the batch), NOT a hand-built
+/// state.
+///
+/// Negative control (observed RED): delete the `autoname_due = true` arm in
+/// `finalize_agent_turn_idem` → the post-turn-1 assert reads `Pending`, not
+/// `Requested`. Separately, delete the `autoname = Requested` flip in
+/// `drain_autoname_requests` → the same assert fails.
+#[gpui::test]
+fn autoname_fires_once_on_first_turn_completion(cx: &mut TestAppContext) {
+    let (view, vcx, id) = boot_armed_autoname_session(cx);
+
+    // Before any turn: still owed, nothing requested.
+    let before = view.update(vcx, |v, cx| Some(v.sessions.get(id).unwrap().read(cx).state.autoname));
+    assert_eq!(
+        before,
+        Some(crate::AutonameState::Pending),
+        "a freshly armed session owes an autoname"
+    );
+
+    end_turn_for(&view, vcx, "S1", 1);
+    let after_first = view.update(vcx, |v, cx| Some(v.sessions.get(id).unwrap().read(cx).state.autoname));
+    assert_eq!(
+        after_first,
+        Some(crate::AutonameState::Requested),
+        "the first completed turn must arm exactly one naming request"
+    );
+
+    // A second turn must NOT re-arm: settle the first request as the worker
+    // would (no name came back), then end another turn.
+    view.update(vcx, |v, cx| v.finish_autoname(id, None, cx));
+    end_turn_for(&view, vcx, "S1", 2);
+    let after_second = view.update(vcx, |v, cx| {
+        Some((v.sessions.get(id).unwrap().read(cx).state.autoname, v.sessions.get(id).unwrap().read(cx).state.autoname_due))
+    });
+    assert_eq!(
+        after_second,
+        Some((crate::AutonameState::Done, false)),
+        "a later turn must never re-arm autonaming (one shot, ever)"
+    );
+}
+
+/// UXI-AgentTile-27: the result the worker brings back installs the name AND the
+/// summary, and settles the one-shot.
+///
+/// Negative control (observed RED): drop the `s.label = name` assignment in
+/// `finish_autoname` → the label stays `claude-3`. Drop the summary assignment →
+/// the summary assert fails.
+#[gpui::test]
+fn autoname_result_renames_the_session(cx: &mut TestAppContext) {
+    let (view, vcx, id) = boot_armed_autoname_session(cx);
+    end_turn_for(&view, vcx, "S1", 1);
+
+    view.update(vcx, |v, cx| {
+        v.finish_autoname(
+            id,
+            Some(crate::SessionNaming {
+                name: Some("payments adapter".into()),
+                summary: Some("Ripping out the payments adapter.".into()),
+            }),
+            cx,
+        )
+    });
+    vcx.run_until_parked();
+
+    let (label, summary, state) = view
+        .update(vcx, |v, cx| {
+            let s = v.sessions.get(id).unwrap().read(cx);
+            Some((s.label.clone(), s.state.summary.clone(), s.state.autoname))
+        })
+        .expect("session present");
+    assert_eq!(label, "payments adapter", "the derived name replaces claude-N");
+    assert_eq!(
+        summary.as_deref(),
+        Some("Ripping out the payments adapter."),
+        "the derived summary is installed for the jump panel"
+    );
+    assert_eq!(state, crate::AutonameState::Done, "the one-shot is settled");
+}
+
+/// UXI-AgentTile-27 property 3 (early half): renaming BEFORE the first turn ends
+/// latches the origin to `User`, and the completed turn then arms nothing.
+///
+/// Drives the REAL rename entry point the user's command runs
+/// (`open_rename_agent_session` → `commit_rename_overlay`), not a hand-set field.
+///
+/// Negative control (observed RED): remove the `name_origin = NameOrigin::User`
+/// latch in `commit_rename_overlay` → the session flips to `Requested` and the
+/// assert fails.
+#[gpui::test]
+fn rename_latches_origin_and_blocks_autoname(cx: &mut TestAppContext) {
+    let (view, vcx, id) = boot_armed_autoname_session(cx);
+
+    // The REAL rename path: open the overlay for this session, type, commit.
+    view.update(vcx, |v, cx| {
+        v.open_rename_overlay(cx);
+        if let Some(o) = v.rename_mut() {
+            o.text = "my own name".into();
+        }
+        v.commit_rename_overlay(cx);
+    });
+    vcx.run_until_parked();
+
+    let origin = view.update(vcx, |v, cx| Some(v.sessions.get(id).unwrap().read(cx).state.name_origin));
+    assert_eq!(
+        origin,
+        Some(crate::NameOrigin::User),
+        "an explicit rename latches the origin to User"
+    );
+
+    end_turn_for(&view, vcx, "S1", 1);
+    let (autoname, label) = view
+        .update(vcx, |v, cx| {
+            let s = v.sessions.get(id).unwrap().read(cx);
+            Some((s.state.autoname, s.label.clone()))
+        })
+        .expect("session present");
+    assert_eq!(
+        autoname,
+        crate::AutonameState::Done,
+        "a user-named session must never request an autoname"
+    );
+    assert_eq!(label, "my own name", "the user's name survives the turn");
+}
+
+/// UXI-AgentTile-27 property 3 (late half): a naming result that lands AFTER the
+/// user renamed is DROPPED, never applied. This is the race the typed origin
+/// exists for — the request was in flight when the user typed a name.
+///
+/// Negative control (observed RED): remove the `renamed_by_user` guard in
+/// `finish_autoname` → the label is overwritten with `derived name` and the
+/// assert fails.
+#[gpui::test]
+fn late_autoname_result_never_clobbers_a_user_rename(cx: &mut TestAppContext) {
+    let (view, vcx, id) = boot_armed_autoname_session(cx);
+    end_turn_for(&view, vcx, "S1", 1);
+    let armed = view.update(vcx, |v, cx| Some(v.sessions.get(id).unwrap().read(cx).state.autoname));
+    assert_eq!(
+        armed,
+        Some(crate::AutonameState::Requested),
+        "precondition: a naming request is in flight"
+    );
+
+    // The user renames WHILE the call is in flight (real entry point).
+    view.update(vcx, |v, cx| {
+        v.open_rename_overlay(cx);
+        if let Some(o) = v.rename_mut() {
+            o.text = "typed by hand".into();
+        }
+        v.commit_rename_overlay(cx);
+    });
+    vcx.run_until_parked();
+
+    // …and only now does the worker come back with its answer.
+    view.update(vcx, |v, cx| {
+        v.finish_autoname(
+            id,
+            Some(crate::SessionNaming {
+                name: Some("derived name".into()),
+                summary: Some("Should not be installed.".into()),
+            }),
+            cx,
+        )
+    });
+    vcx.run_until_parked();
+
+    let (label, summary) = view
+        .update(vcx, |v, cx| {
+            let s = v.sessions.get(id).unwrap().read(cx);
+            Some((s.label.clone(), s.state.summary.clone()))
+        })
+        .expect("session present");
+    assert_eq!(
+        label, "typed by hand",
+        "a late autoname must never overwrite the name the user typed"
+    );
+    assert_eq!(
+        summary, None,
+        "…and it must not sneak its summary in either"
+    );
 }

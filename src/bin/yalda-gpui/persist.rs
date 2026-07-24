@@ -1211,6 +1211,11 @@ pub(crate) struct PersistedSlot {
     /// app restart (it already survives a reconnect, since replay rebuilds only
     /// the transcript, not the compose).
     pub(crate) compose_draft: Option<String>,
+    /// The autonamer's summary (`UXI-AgentTile-27`). Absent (old file, or a
+    /// session that never got one) => `None`. Persisted so the jump panel's
+    /// italic summary line survives a restart — the naming call is one-shot per
+    /// session and is never re-run to rebuild it.
+    pub(crate) summary: Option<String>,
 }
 
 /// Load the persisted slot list for `cwd`. Returns an empty vec if no
@@ -1250,6 +1255,7 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
             sidepanel_hidden: false,
             cwd: None,
             compose_draft: None,
+            summary: None,
         }];
     }
     let Some(arr) = entry.as_array() else {
@@ -1303,6 +1309,11 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
                 .get("compose_draft")
                 .and_then(|c| c.as_str())
                 .map(|s| s.to_string());
+            // UXI-AgentTile-27: the autoname summary. Absent (old file) => None.
+            let summary = obj
+                .get("summary")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string());
             Some(PersistedSlot {
                 id,
                 label,
@@ -1313,6 +1324,7 @@ pub(crate) fn load_persisted_acp_sessions(cwd: &std::path::Path) -> Vec<Persiste
                 sidepanel_hidden,
                 cwd,
                 compose_draft,
+                summary,
             })
         })
         .collect();
@@ -1452,6 +1464,8 @@ pub(crate) struct SessionSnapshot {
     /// The unsent compose draft (Model C — `design-c.md` §4.4). `None`/empty is
     /// not written; a non-empty draft round-trips through `compose_draft`.
     pub(crate) compose_draft: Option<String>,
+    /// The autonamer's summary (`UXI-AgentTile-27`); `None`/empty is not written.
+    pub(crate) summary: Option<String>,
 }
 
 pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[SessionSnapshot]) {
@@ -1513,6 +1527,15 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[Sessio
                     serde_json::Value::String(draft.clone()),
                 );
             }
+            // UXI-AgentTile-27: persist the autoname summary so the jump panel's
+            // italic line survives a restart. Same downgrade contract as the
+            // fields above — only written when present.
+            if let Some(summary) = snap.summary.as_ref().filter(|s| !s.is_empty()) {
+                obj.insert(
+                    "summary".into(),
+                    serde_json::Value::String(summary.clone()),
+                );
+            }
             serde_json::Value::Object(obj)
         })
         .collect();
@@ -1548,4 +1571,66 @@ pub(crate) fn save_persisted_acp_sessions(cwd: &std::path::Path, snaps: &[Sessio
 #[cfg(test)]
 thread_local! {
     pub(crate) static VIEW_MODEL_REBUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Load `.env` from the current directory (walking up to the filesystem root)
+/// into the process environment, for `UXI-AgentTile-27`'s `ANTHROPIC_API_KEY`.
+///
+/// Deliberately tiny — no new dependency for `KEY=value`. Three rules:
+/// **real environment variables always win** (a `.env` never overrides what the
+/// launching shell exported), the first `.env` found walking up wins, and any
+/// malformed line is skipped rather than failing the load. `export KEY=v` and
+/// surrounding quotes are tolerated because that's how people actually write
+/// these files.
+pub(crate) fn load_dotenv() {
+    let Ok(mut dir) = std::env::current_dir() else {
+        return;
+    };
+    let path = loop {
+        let candidate = dir.join(".env");
+        if candidate.is_file() {
+            break candidate;
+        }
+        if !dir.pop() {
+            return;
+        }
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    for (key, value) in parse_dotenv(&contents) {
+        // SAFETY: single-threaded startup, before any thread is spawned.
+        if std::env::var_os(&key).is_none() {
+            unsafe { std::env::set_var(&key, &value) };
+        }
+    }
+}
+
+/// Pure `KEY=value` parser for [`load_dotenv`], split out so it is unit-testable
+/// without touching the process environment or the filesystem.
+pub(crate) fn parse_dotenv(contents: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = value.trim();
+        // Strip one layer of matching quotes, if present.
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        out.push((key.to_string(), value.to_string()));
+    }
+    out
 }
