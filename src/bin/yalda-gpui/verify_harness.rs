@@ -6360,6 +6360,72 @@ fn project_menu_opens_on_name_click_and_actions_dispatch(cx: &mut TestAppContext
     });
 }
 
+/// bug-0019 (UXI-JumpPanel-8): a REAL mouse click on a project context-menu item
+/// must run its action. The sibling test above drives `project_menu_action`
+/// directly — a hand-built proxy (anti-circling rule 1) that stayed green while
+/// the mouse path was dead: the full-window click-away backdrop's hitbox is ALSO
+/// hovered under the (non-occluding) popup, so pressing an item fired the
+/// backdrop's `on_mouse_down` → `clear_overlay()`, and the item was gone before
+/// mouse-up, so `on_click` (down-then-up on the same element) never fired.
+///
+/// This drives the window's real mouse dispatch (`simulate_click`) at the item's
+/// REAL painted bounds, so the backdrop/popup hit-test ordering is under test.
+///
+/// Negative control: drop `.occlude()` from the popup in `render_project_menu` →
+/// the press dismisses the menu, no workspace is created, and the count assert
+/// fails.
+#[gpui::test]
+fn project_menu_item_click_runs_the_action(cx: &mut TestAppContext) {
+    let (view, vcx) = boot_browser(cx);
+    let pa = PathBuf::from("/tmp/yalda-projmenu-click");
+    let pid =
+        view.update(vcx, |v, _cx| v.projects.create("Click".into(), pa.clone()).expect("create"));
+
+    view.update(vcx, |v, cx| v.open_project_menu(pid, (60.0, 80.0), cx));
+    vcx.run_until_parked();
+
+    // The item's REAL painted rect — clicking a computed guess would prove nothing.
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let rect = crate::layout_probe_get("proj-menu-new-ws");
+    let backdrop_open = view.read_with(vcx, |v, _| v.overlay_is_project_menu());
+    crate::layout_probe_end();
+
+    assert!(backdrop_open, "the project menu must still be open when we click it");
+    let (x, y, w, h) = rect.expect("the New workspace menu item never painted");
+    assert!(w > 4.0 && h > 4.0, "menu item painted with no area ({w}x{h}) — nothing to click");
+    let at = point(px(x + w / 2.0), px(y + h / 2.0));
+
+    let before = view
+        .read_with(vcx, |v, _| v.workspace.workspaces.iter().filter(|t| t.project() == pid).count());
+
+    vcx.simulate_mouse_move(at, None, gpui::Modifiers::default());
+    vcx.simulate_click(at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    view.read_with(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.workspaces.iter().filter(|t| t.project() == pid).count(),
+            before + 1,
+            "clicking 'New workspace' did NOTHING — the menu item's on_click never fired (bug-0019)"
+        );
+        assert!(!v.overlay_is_project_menu(), "the menu dismisses once the action runs");
+    });
+
+    // …and occluding the popup must NOT cost click-away: a press anywhere else
+    // still hits the backdrop and dismisses.
+    view.update(vcx, |v, cx| v.open_project_menu(pid, (60.0, 80.0), cx));
+    vcx.run_until_parked();
+    let away = point(px(x + w + 240.0), px(y + h + 240.0));
+    vcx.simulate_mouse_move(away, None, gpui::Modifiers::default());
+    vcx.simulate_click(away, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    view.read_with(vcx, |v, _| {
+        assert!(!v.overlay_is_project_menu(), "clicking outside the popup dismisses the menu");
+    });
+}
+
 /// UXI-JumpPanel-7 (create relocation): the jump panel no longer carries a
 /// top-level ＋ New project row — project creation moved to the GLOBAL menu. The
 /// menu offers a "new project" entry, and dispatching `new-project` opens the REAL

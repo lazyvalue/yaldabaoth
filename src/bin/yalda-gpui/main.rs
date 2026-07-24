@@ -7190,9 +7190,30 @@ impl YaldaGpuiView {
                     this.project_menu_action(pid, action, cx)
                 }))
         };
+        // Tag each item with its painted bounds so the harness can click the REAL
+        // rect (bug-0019) instead of a computed guess.
+        let item = |id: &str,
+                    glyph: &str,
+                    glyph_color: Hsla,
+                    label: &str,
+                    label_color: Hsla,
+                    action: ProjectMenuAction| {
+            probe_bounds_dyn(
+                id.to_string(),
+                item(id, glyph, glyph_color, label, label_color, action).into_any_element(),
+            )
+        };
 
         let popup = div()
             .absolute()
+            // MUST occlude (bug-0019). GPUI's hit test collects EVERY hitbox under
+            // the pointer (front-to-back, `Frame::hit_test`) and only stops at a
+            // `BlockMouse` one — so without this the full-window backdrop below is
+            // ALSO hovered: pressing an item fired the backdrop's `on_mouse_down`,
+            // dismissing the menu on mouse DOWN, and `on_click` (down-then-up on the
+            // same element) never fired. Occluding blocks the backdrop behind the
+            // popup while leaving clicks elsewhere to dismiss as before.
+            .occlude()
             .left(px(x))
             .top(px(y))
             .min_w(px(184.0))

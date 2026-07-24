@@ -510,6 +510,11 @@ RED). The removed rows' absence + the literal glyphs/colors are gap #1.
 The menu is a lightweight popup layered over the still-visible panel (not an opaque
 body swap): a transparent full-window **click-away backdrop** under a positioned
 popup, so a click on the popup hits an item and a click anywhere else dismisses.
+The popup **must `.occlude()`** (bug-0019): GPUI's hit test collects *every* hitbox
+under the pointer and stops only at a `BlockMouse` one, so a non-occluding popup
+leaves the backdrop hovered underneath — pressing an item dismissed the menu on
+mouse **down**, and `on_click` (down-then-up on the same element) never fired, i.e.
+every item was inert to the mouse while the `w`/`a`/`d` accelerators still worked.
 **Esc** closes; single-key accelerators (`w`/`a`/`d`) fire the items. Choosing an
 item **dismisses the menu first**, then runs the action (so each action's
 `has_overlay()` guard passes). The menu opens at the click position, nudged a hair
@@ -529,16 +534,21 @@ badly (three affordances per project). A single click-to-open menu on the name i
 discoverable, precise (scoped to the clicked project), and keeps the panel body
 clean (`UXI-JumpPanel-7`).
 
-**Status.** `implemented` — the open + action-dispatch are headless; the popup's
-placement/hover pixels and the mouse click-away GESTURE are harness gap #1/#2
-(the layout probe could pin placement later; the action wiring is what's guarded).
+**Status.** `implemented` — open, action-dispatch AND the real mouse click (press
+→ release on the item's painted rect, through the window's mouse dispatch) are all
+headless. Only the popup's placement/hover **pixels** remain harness gap #1.
 
 **Enforcement.** `verify_harness.rs::project_menu_opens_on_name_click_and_actions_dispatch`
 (drives the REAL `open_project_menu` → the overlay is `ProjectMenu` for that pid →
 `project_menu_action(NewWorkspace)` creates a workspace in the project and closes
 the menu → re-open + `DeleteProject` arms the confirm overlay; NCs: skip
 `open_overlay(ProjectMenu…)` → menu never opens; no-op `new_workspace_in` in the
-action → count assert fails).
+action → count assert fails). Plus
+`verify_harness.rs::project_menu_item_click_runs_the_action` (bug-0019 — the MOUSE
+path: probe the item's painted bounds, `simulate_click` at its centre through the
+real window dispatch → a workspace is created and the menu dismisses; a click far
+outside still dismisses. NC: drop `.occlude()` → the press is swallowed by the
+backdrop and the count assert fails).
 
 **Deviation from plan.** The requested menu named only "New workspace / New agent
 session"; **Delete project** was added as a third item (separated by a rule) so
