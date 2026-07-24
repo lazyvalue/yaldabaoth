@@ -1,7 +1,7 @@
 # Agent Tile — Transcript
 
 Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-4..8`,
-`UXI-AgentTile-23`, `UXI-AgentTile-25`.
+`UXI-AgentTile-23`, `UXI-AgentTile-25`, `UXI-AgentTile-26`.
 
 ## Description
 
@@ -344,3 +344,47 @@ focused-subagent view is a transient surface — so per-frame reparse is bounded
 The cache is a clean follow-up if a wall-clock `sample` shows jank on a huge report
 (gap #3). `Todos`/`Terminal` rich variants were also left out of scope (TodoWrite is
 `HeaderOnly`; terminals render as a placeholder as before).
+
+### UXI-AgentTile-26 — Tool-body markdown wraps at the pane width; Task output is readable text, never escaped JSON
+
+**Statement.** Two guarantees for the tool-body sections of UXI-AgentTile-25,
+each a live-screenshot regression:
+
+- **Markdown wraps at the pane width — never one glyph per line.** Every block a
+  tool-body markdown section renders (`render_markdown_column`) gets a **definite
+  full-pane width**, so a bullet-list item holding a long, unbroken string (a file
+  path, a URL) wraps horizontally at the pane edge like any paragraph. It must NOT
+  collapse into a vertical column of single characters. (Root cause: a list item's
+  inner content column carries `flex_1().min_w_0()`, whose min-content floor is 0;
+  without a definite width above it — which the doc view's `block_element` supplies
+  via `w_full()` + a `flex_1().min_w_0()` content column but `render_markdown_column`
+  did not — `flex_1` distributes 0, so the text wraps char-by-char.)
+- **A subagent's output renders as readable text, not escaped JSON.** The Task /
+  subagent tool returns its result as a **bare** top-level content-block array
+  (`[ {type:"text", text:"…"} ]`), not wrapped in `{content:[…]}`. That text — with
+  its real newlines — is extracted (`extract_output_text`) and rendered as the
+  markdown **report**, not dumped as a `\n`-riddled escaped-JSON blob. Genuinely
+  unknown shapes still fall through to pretty-printed JSON (UXI-AgentTile-25).
+
+**Applies to.** `render_blocks.rs::render_markdown_column` (each block wrapped in a
+`w_full()` flex row + `flex_1().min_w_0()` content column, mirroring `block_element`;
+`list_item_element`'s row also carries `w_full()` + a `flex_none()` marker) and
+`agent.rs::extract_output_text` (a `Value::Array(items)` arm joining bare
+content-blocks, shared with the `{content:[…]}` arm via `join_content_blocks`).
+
+**Why.** A subagent pane in the live app rendered the `Files:` bullet list as a
+vertical stack of single characters and dumped the Task result as a raw escaped
+JSON array — both unreadable (see the 2026-07-23 screenshot).
+
+**Status.** `implemented` (headless for the layout geometry + the extraction; exact
+painted glyphs/theme colors are gap #1, human eye).
+
+**Enforcement.** `verify_harness.rs::subagent_markdown_list_wraps_at_pane_width`
+focuses a real subagent whose prompt is a long-path bullet list, paints it, and via
+the layout probe asserts the painted list block (`md-block-0`) spans > 50% of the
+pane width (non-vacuous: pane > 400px, path far too long to fit) — NC observed RED
+by reverting the `w_full()`/`flex_1()` width fix (block collapses to the ~24px
+marker column). `tests.rs::extract_output_text_handles_bare_content_block_array` and
+`plan_tool_sections_bare_array_output_is_markdown_not_json` cover the bare-array
+extraction + its Markdown (not Json) planning — NC observed RED by deleting the
+`Value::Array(items) =>` arm (bare array → `None` → raw JSON dump).

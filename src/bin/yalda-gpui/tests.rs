@@ -3768,6 +3768,35 @@ fn extract_output_text_pulls_text_from_common_shapes() {
     assert_eq!(extract_output_text(&json!(null)), None);
 }
 
+/// UXI-AgentTile-26: the Task/subagent tool returns its result as a BARE
+/// top-level content-block array `[ {type:"text", text:"…"} ]` (NOT wrapped in
+/// `{content:[…]}`). `extract_output_text` must pull the readable text out of it
+/// — with the inner `text`'s REAL newlines — instead of falling through to an
+/// escaped-JSON dump (the ugly OUTPUT section in the live screenshot).
+///
+/// Negative control (observed RED): delete the `Value::Array(items) =>
+/// join_content_blocks(items)` arm → the bare array returns `None`, the caller
+/// dumps raw JSON, and the `Some("…real text…")` assert fails.
+#[test]
+fn extract_output_text_handles_bare_content_block_array() {
+    use crate::extract_output_text;
+    use serde_json::json;
+    // Bare array with a multiline text field — the inner `\n` must become a real
+    // newline in the extracted string (no escaped JSON).
+    let out = extract_output_text(&json!([
+        {"type": "text", "text": "line one\nline two"}
+    ]));
+    assert_eq!(out.as_deref(), Some("line one\nline two"));
+    // Multiple blocks join with a blank line, like the `{content:[…]}` shape.
+    let joined = extract_output_text(&json!([
+        {"type": "text", "text": "# Report"},
+        {"type": "text", "text": "body"}
+    ]));
+    assert_eq!(joined.as_deref(), Some("# Report\n\nbody"));
+    // A bare array with no text payload still falls through to None (JSON).
+    assert_eq!(extract_output_text(&json!([{"type": "image"}])), None);
+}
+
 /// A subagent renders its prompt and its report as MARKDOWN sections (not JSON),
 /// with agent-type + description surfaced separately. This is the showcase.
 ///
@@ -3799,6 +3828,42 @@ fn plan_tool_sections_subagent_prompt_and_report_are_markdown() {
     assert_eq!(report.role, SectionRole::Output);
     assert!(matches!(report.body, SectionBody::Markdown{..}), "report renders as markdown, not json");
     assert!(report.emphasis, "the subagent report is emphasized");
+}
+
+/// UXI-AgentTile-26: a subagent whose `raw_output` is a BARE content-block array
+/// (`[ {type:"text", text:"…"} ]`, the real Task-tool shape) renders its report
+/// as MARKDOWN — NOT a raw escaped-JSON dump. This is the OUTPUT section from the
+/// live screenshot, where the array fell through to `SectionBody::Json`.
+///
+/// Negative control (observed RED): delete the `Value::Array(items) =>` arm in
+/// `extract_output_text` → the array yields `None`, `plan_tool_sections` emits a
+/// `SectionBody::Json` "output" section, and the "no Json / report is Markdown"
+/// asserts fail.
+#[test]
+fn plan_tool_sections_bare_array_output_is_markdown_not_json() {
+    use crate::{plan_tool_sections, SectionBody, ToolRenderPolicy};
+    use serde_json::json;
+    let tc = mk_tc(
+        "Explore the repo",
+        yalda::acp_channel::ToolKind::Think,
+        Some(json!({"subagent_type":"Explore","prompt":"go"})),
+        // BARE array (not `{content:[…]}`) — the shape the screenshot showed raw.
+        Some(json!([{"type":"text","text":"## Findings\n- one\n- two"}])),
+        vec![],
+    );
+    let sections = plan_tool_sections(&tc, ToolRenderPolicy::Full);
+    let report = sections
+        .iter()
+        .find(|s| s.label == "report")
+        .expect("a report section from the bare-array output");
+    assert!(
+        matches!(report.body, SectionBody::Markdown { text: _ }),
+        "the bare-array output renders as markdown, not raw JSON"
+    );
+    assert!(
+        !sections.iter().any(|s| matches!(s.body, SectionBody::Json(_))),
+        "no raw-JSON section for a bare content-block array output"
+    );
 }
 
 /// A Bash command renders as a code section (not JSON); terminal output stays

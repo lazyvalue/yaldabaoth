@@ -1681,10 +1681,12 @@ pub(crate) fn list_item_element(
         .flex()
         .flex_row()
         .items_start()
+        .w_full()
         .gap_2()
         .child(
             div()
                 .min_w(px(24.0))
+                .flex_none()
                 .text_color(fg_or(marker_style, 0x50fa7b))
                 .font_weight(FontWeight::BOLD)
                 .child(marker),
@@ -2003,9 +2005,25 @@ pub(crate) fn render_markdown_column(
     };
     let cap = max_blocks.unwrap_or(blocks.len());
     let gap = paragraph_gap(text_scale);
-    let mut col = div().flex().flex_col().min_w_0();
-    for b in blocks.iter().take(cap) {
-        col = col.child(div().pt(gap).child(block_inner(&ctx, b)));
+    let mut col = div().flex().flex_col().w_full().min_w_0();
+    for (i, b) in blocks.iter().enumerate().take(cap) {
+        // Each block gets a DEFINITE full-pane width — the same `w_full` +
+        // `flex_1().min_w_0()` content-column shape `block_element` gives blocks
+        // in the doc view. Without it a bullet-list item's inner `flex_1` column
+        // (which carries `min_w_0`, so its min-content floor is 0) has no width
+        // to distribute against and collapses to ~0, so a long unbroken file
+        // path wraps ONE GLYPH PER LINE (UXI-AgentTile-26). Paragraphs happened
+        // to survive on shrink-to-fit; lists did not.
+        let inner = div()
+            .flex_1()
+            .min_w_0()
+            .child(block_inner(&ctx, b))
+            .into_any_element();
+        #[cfg(test)]
+        let inner = probe_bounds_dyn(format!("md-block-{i}"), inner);
+        #[cfg(not(test))]
+        let _ = i;
+        col = col.child(div().flex().flex_row().w_full().pt(gap).child(inner));
     }
     if blocks.len() > cap {
         col = col.child(
