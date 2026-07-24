@@ -1009,6 +1009,12 @@ impl YaldaGpuiView {
                 // churn this fix targets.
                 if !dead_sids.is_empty() {
                     forget_persisted_acp_session_ids(&dead_sids);
+                    // bug-0020: the summary sidecar is id-keyed and would otherwise
+                    // grow forever — drop the dead ids there too.
+                    for sid in &dead_sids {
+                        this.session_summaries.remove(sid);
+                    }
+                    crate::persist::forget_session_summaries(&dead_sids);
                 }
                 cx.notify();
             });
@@ -4772,11 +4778,12 @@ impl YaldaGpuiView {
         let Some(ent) = self.sessions.get(id).cloned() else {
             return;
         };
-        let new_label = ent.update(cx, |s, scx| {
+        let (new_label, new_summary) = ent.update(cx, |s, scx| {
             s.autoname = AutonameState::Done;
             s.autoname_due = false;
             let renamed_by_user = s.name_origin == NameOrigin::User;
             let mut installed = None;
+            let mut summary = None;
             if let Some(naming) = naming
                 && !renamed_by_user
             {
@@ -4785,11 +4792,12 @@ impl YaldaGpuiView {
                     installed = Some(name);
                 }
                 if naming.summary.is_some() {
-                    s.summary = naming.summary;
+                    s.summary = naming.summary.clone();
+                    summary = naming.summary;
                 }
             }
             scx.notify();
-            installed
+            (installed, summary)
         });
         // Push the derived name to the session server so it survives a restart,
         // exactly as a manual rename does (the WAL is the durable home).
@@ -4798,6 +4806,17 @@ impl YaldaGpuiView {
             if let (Some(server), Some(sid)) = (&self.session_server, server_sid) {
                 let _ = server.rename_session(&sid, &label);
             }
+        }
+        // bug-0020: the SUMMARY has no home on the server, and `acp_sessions.json`
+        // (cwd-keyed, tile-bound sessions only) drops it for every free session —
+        // so the explainer line vanished on reload. Record it id-keyed, the same
+        // durability the label gets from the WAL.
+        if let Some(summary) = new_summary
+            && let Some(sid) = self.sessions.sid_of(id).cloned()
+        {
+            self.session_summaries
+                .insert(sid.to_string(), summary.clone());
+            crate::persist::save_session_summary(&sid, &summary);
         }
         self.save_agent_ring(cx);
         cx.notify();

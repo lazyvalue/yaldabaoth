@@ -1,7 +1,7 @@
 # Agent Tile — Transcript
 
 Facet of the [Agent Tile](README.md) component. Owns `UXI-AgentTile-4..8`,
-`UXI-AgentTile-23`, `UXI-AgentTile-25`, `UXI-AgentTile-26`.
+`UXI-AgentTile-23`, `UXI-AgentTile-25`, `UXI-AgentTile-26`, `UXI-AgentTile-28`.
 
 ## Description
 
@@ -388,3 +388,44 @@ marker column). `tests.rs::extract_output_text_handles_bare_content_block_array`
 `plan_tool_sections_bare_array_output_is_markdown_not_json` cover the bare-array
 extraction + its Markdown (not Json) planning — NC observed RED by deleting the
 `Value::Array(items) =>` arm (bare array → `None` → raw JSON dump).
+
+### UXI-AgentTile-28 — The tile says whether the agent is working or waiting on you
+
+**Statement.** The agent tile's header strip carries a **status pill** stating the
+session's live state in the **same vocabulary the jump panel uses**
+(`UXI-JumpPanel-10` — same glyph, same word, from the same pure
+`agent_row_marks`):
+
+| Condition | Pill |
+|---|---|
+| A reply is in flight (`turn_phase.is_awaiting()`) | **`◆ working`** — text, tint α 0.15 and hairline outline α 0.55, all in `agent.jump_working` |
+| Idle, at least one turn has run (`display_turn > 0`) | **`✦ your turn`** — same treatment in `agent.tool_completed` |
+| Idle, no turn has ever run | *(no pill)* — a virgin session says nothing |
+
+The pill sits in the header's right group, before the `turn N · M:SS` counter and
+the `■ Stop ⌘.` button (which is unchanged and still only appears while awaiting).
+The old dim `· …awaiting reply` tail in the left status strip stays — the pill is
+the loud signal; that line remains for the details-oriented read.
+
+Note the tile's "your turn" is **not** gated on `unread` the way the jump panel's is
+(`UXI-JumpPanel-6`): unread means "finished while you weren't looking", which is
+meaningless for the tile you are looking at.
+
+**Applies to.** `screens.rs`: `render_agent`'s `header_right` (the pill, wrapped in
+`probe_bounds("agent-status-pill", …)`); `jump_panel_view.rs::agent_row_marks` (the
+shared mapping).
+
+**Why.** With a wall of transcript above it, the only "the agent is running" signals
+were a dim status-strip suffix and an elapsed clock — easy to miss, and there was no
+positive "it's finished, it's on you" signal at all. One loud, colored, worded pill
+in a fixed place answers both questions without reading the transcript.
+
+**Status.** `implemented` — presence/absence is PAINT-guarded; the hue and the pill
+as pixels are harness gap #1.
+
+**Enforcement.** `verify_harness.rs::agent_tile_paints_a_status_pill_while_working`
+— layout probe `"agent-status-pill"` on the REAL `render_agent`: absent on a virgin
+session, painted with real size (`w > 20`, `h > 6`) once a turn is in flight.
+**NC observed RED**: drop the pill child → "the working pill must paint while a reply
+is in flight". The word/glyph mapping is pinned by
+`agent_row_marks_name_the_live_states`.

@@ -1753,6 +1753,14 @@ struct YaldaGpuiView {
     /// of a generation. Rendered inside the agent tile, above the subagents/tasks
     /// panels (`render_agent`), NOT in the global jump panel.
     recaps: HashMap<SessionId, RecapState>,
+    /// Durable autoname summaries, keyed by SERVER session id (`bug-0020`).
+    /// Loaded once at construction from the id-keyed sidecar
+    /// (`session_summaries.json`) and written at `finish_autoname`. The live
+    /// `AgentState::summary` is authoritative when a session is open here; this
+    /// map is what makes the jump panel's italic explainer line survive a GUI
+    /// restart, including for sessions no tile is bound to (which
+    /// `acp_sessions.json` — cwd-keyed, tile-bound-only — never persisted).
+    session_summaries: HashMap<String, String>,
 }
 
 impl YaldaGpuiView {
@@ -1806,6 +1814,8 @@ impl YaldaGpuiView {
             jump_session_order: Vec::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
+            // bug-0020: id-keyed autoname summaries, durable across restarts.
+            session_summaries: crate::persist::load_session_summaries(),
         }
     }
 
@@ -1850,6 +1860,8 @@ impl YaldaGpuiView {
             jump_session_order: Vec::new(),
             jump_order_succession: HashMap::new(),
             recaps: HashMap::new(),
+            // bug-0020: id-keyed autoname summaries, durable across restarts.
+            session_summaries: crate::persist::load_session_summaries(),
         }
     }
 
@@ -2102,7 +2114,13 @@ impl YaldaGpuiView {
                         // autonaming (property 1 — a restored session already has
                         // history and is never retro-named), so this is the only
                         // way its jump-panel summary line survives.
-                        let slot_summary = slot.summary.clone();
+                        // bug-0020: prefer the slot's copy, fall back to the
+                        // id-keyed sidecar (the durable home — `acp_sessions.json`
+                        // only ever held tile-bound sessions, and old files have
+                        // no `summary` key at all).
+                        let slot_summary = slot.summary.clone().or_else(|| {
+                            self.session_summaries.get(slot.id.as_str()).cloned()
+                        });
                         let bind = self.sessions.open_or_focus(&slot.id, |_id| {
                             cx.new(|_| {
                                 let mut state = AgentState::new_server_managed(Some(

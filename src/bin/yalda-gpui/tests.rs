@@ -15,18 +15,12 @@ fn nightfox_jump_panel_colors_are_art_directed() {
     use yalda::style::Color;
     use yalda::theme::AgentTheme;
     let nf = AgentTheme::nightfox();
-    assert_eq!(
-        nf.jump_panel_bg,
-        Some(Color::Rgb(0x0d, 0x11, 0x19)),
-        "Nightfox art-directs an explicit recessed panel background"
-    );
     assert_eq!(nf.jump_header, Color::Rgb(0xc9, 0x4f, 0x6d), "Nightfox red header");
     assert_eq!(nf.jump_subheader, Color::Rgb(0x71, 0x9c, 0xd6), "Nightfox blue subheader");
     assert_eq!(nf.jump_working, Color::Rgb(0xf4, 0xa2, 0x61), "Nightfox orange working star");
     // Distinct from the legacy theme-neutral constants the other themes fall back to.
     assert_ne!(nf.jump_header, Color::Rgb(0xff, 0x6b, 0x6b), "not the legacy #ff6b6b header");
     let dr = AgentTheme::dracula();
-    assert_eq!(dr.jump_panel_bg, None, "Dracula still derives its panel shade from editor_bg");
     assert_eq!(
         dr.jump_header,
         Color::Rgb(0xff, 0x6b, 0x6b),

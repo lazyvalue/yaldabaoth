@@ -46,6 +46,91 @@ pub(crate) fn with_acp_persist_path<R>(path: PathBuf, f: impl FnOnce() -> R) -> 
     r
 }
 
+/// Path to the id-keyed session-summary sidecar (`bug-0020`).
+///
+/// The autoname SUMMARY cannot live only in `acp_sessions.json`: that file is
+/// keyed by cwd and only ever holds the sessions **bound to a tile** at save
+/// time, so every free session's summary died on restart (and the jump panel
+/// lists free sessions too). This file is a flat `{server session id → summary}`
+/// map — the same durability the LABEL gets from the server WAL, for the one
+/// piece of session metadata the server doesn't know about.
+///
+/// Same `cfg(test)` fail-safe as [`acp_session_persist_path`]: `None` under test
+/// unless a test opts in via [`with_session_summaries_path`].
+pub(crate) fn session_summaries_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        return SUMMARIES_PATH_OVERRIDE.with(|c| c.borrow().clone());
+    }
+    #[cfg(not(test))]
+    {
+        yalda::paths::yalda_home().map(|d| d.join("session_summaries.json"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SUMMARIES_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_session_summaries_path<R>(path: PathBuf, f: impl FnOnce() -> R) -> R {
+    SUMMARIES_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+    let r = f();
+    SUMMARIES_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    r
+}
+
+/// Load the whole `sid → summary` map (`bug-0020`). Missing/unparseable file =>
+/// empty map; a summary is a nicety, never a reason to fail a boot.
+pub(crate) fn load_session_summaries() -> std::collections::HashMap<String, String> {
+    let Some(path) = session_summaries_path() else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return std::collections::HashMap::new();
+    };
+    serde_json::from_slice::<std::collections::HashMap<String, String>>(&bytes).unwrap_or_default()
+}
+
+/// Record one session's summary durably (`bug-0020`). Read-modify-write so
+/// concurrent yalda instances only clobber the key they touched (last-writer-
+/// wins per session, matching the ACP-slot file). Best-effort.
+pub(crate) fn save_session_summary(sid: &ServerSid, summary: &str) {
+    if summary.trim().is_empty() {
+        return;
+    }
+    let Some(path) = session_summaries_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut map = load_session_summaries();
+    map.insert(sid.to_string(), summary.to_string());
+    if let Ok(serialized) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(&path, serialized);
+    }
+}
+
+/// Drop summaries for sessions that are gone (`bug-0020`) — called from the same
+/// place the dead persisted ids are scrubbed, so the sidecar can't grow forever.
+pub(crate) fn forget_session_summaries(sids: &[String]) {
+    let Some(path) = session_summaries_path() else {
+        return;
+    };
+    let mut map = load_session_summaries();
+    let before = map.len();
+    map.retain(|k, _| !sids.iter().any(|s| s == k));
+    if map.len() == before {
+        return;
+    }
+    if let Ok(serialized) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(&path, serialized);
+    }
+}
+
 /// Yalda's process cwd, with a safe fallback. Used both as the default
 /// per-session cwd for new agent slots (spec-agent-cwd.md §1) and as the
 /// top-level key in `acp_sessions.json` / `workspace.json`.

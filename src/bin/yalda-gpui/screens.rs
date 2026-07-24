@@ -1235,6 +1235,47 @@ impl YaldaGpuiView {
         // the strip's trailing edge regardless of how much status sits left.
         let mut header_right = div().flex().flex_row().items_center().gap_2();
         let mut header_right_has_content = false;
+        // UXI-AgentTile-28: the tile says IN WORDS whether the agent is running or
+        // waiting on you — a filled pill in the same vocabulary the jump panel
+        // uses (`◆ working` / `✦ your turn`), so the two surfaces read as one
+        // language. The dim "· …awaiting reply" in the status strip was easy to
+        // miss with a wall of transcript above it.
+        if c.turn_phase.is_awaiting() || display_turn > 0 {
+            let working = c.turn_phase.is_awaiting();
+            let hue: Hsla = if working {
+                nc(at.jump_working)
+            } else {
+                nc(at.tool_completed)
+            };
+            // ONE vocabulary with the jump panel: same glyph, same word, derived
+            // from the same pure mapping (`agent_row_marks`).
+            let (glyph, word) = {
+                let (g, w) = agent_row_marks(if working {
+                    AgentDotStatus::Working
+                } else {
+                    AgentDotStatus::WaitingForYou
+                });
+                (g, w.unwrap_or(""))
+            };
+            let mut pill_bg = hue;
+            pill_bg.a = 0.15;
+            let mut pill_edge = hue;
+            pill_edge.a = 0.55;
+            header_right = header_right.child(probe_bounds(
+                "agent-status-pill",
+                div()
+                    .px_2()
+                    .py(px(1.0))
+                    .rounded_md()
+                    .bg(pill_bg)
+                    .border_1()
+                    .border_color(pill_edge)
+                    .text_color(hue)
+                    .child(SharedString::from(format!("{glyph} {word}")))
+                    .into_any_element(),
+            ));
+            header_right_has_content = true;
+        }
         if display_turn > 0 || turn_started.is_some() {
             let elapsed_str = if let Some(t) = turn_started {
                 let s = t.elapsed().as_secs();

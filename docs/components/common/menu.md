@@ -152,13 +152,18 @@ top + left edges are unchanged. The accent-bar *color* is the documented pixel g
 
 **Statement.** The card background is an **elevated surface**: derived from the live
 `editor_bg` (what tiles + the workspace paint) and lifted in lightness at the same
-hue + saturation, so it stands out from both the tiles/workspace AND the recessed
-jump bar (`jump_panel_bg`, which shifts the *opposite* way). It lifts on both dark
-and light themes and never converges with the jump bar's shade.
+hue + saturation, so it stands out from the tiles/workspace. It lifts on both dark
+and light themes.
+
+> **Amended by `UXI-JumpPanel-11`.** The original statement also required the card to
+> diverge from the *recessed* jump bar (`jump_panel_bg`, which shifted the opposite
+> way). That clause is **retired**: the jump panel now paints on this very surface
+> (`jump_panel_surface == menu_panel_bg`) on purpose — sidebar, command card and
+> palette are one material. The elevation-above-the-editor half still holds.
 
 **Applies to.** `menu_panel_bg` (pure fn, `main.rs`); `render_menu_overlay`'s
-`menu_bg` (was `overlay.bg`, now `menu_panel_bg(self.editor_bg())`); `jump_panel_bg`
-(the recessed counterpart it must not match).
+`menu_bg` (was `overlay.bg`, now `menu_panel_bg(self.editor_bg())`);
+`jump_panel_surface` (the jump panel, which now shares it).
 
 **Why.** With the flat `overlay.bg` the card didn't read as distinct from the
 workspace on some themes. Tying it to the live editor bg guarantees the separation on
@@ -167,11 +172,11 @@ jump bar sunk, tiles level, command card raised.
 
 **Status.** `implemented`
 
-**Enforcement.** `verify_harness.rs::menu_panel_bg_is_elevated_and_distinct_from_jump_bar`
-— the pure fn lifts lightness above `editor` on dark + light themes, preserves
-hue/sat/alpha, and lands clearly lighter than `jump_panel_bg` of the same editor.
-Negative control: return `editor` unchanged (or darken like the jump bar) ⇒ RED. The
-exact resulting color per theme is the documented pixel gap.
+**Enforcement.** `verify_harness.rs::menu_panel_bg_is_elevated_above_the_editor`
+— the pure fn lifts lightness above `editor` on dark + light themes and preserves
+hue/sat/alpha. Negative control: return `editor` unchanged ⇒ RED. The shared-surface
+half is pinned by `jump_panel_surface_matches_the_command_menu`. The exact resulting
+color per theme is the documented pixel gap.
 
 ## Deviations from the design brief (Fable, "The Sigil Card")
 

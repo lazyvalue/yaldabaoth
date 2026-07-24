@@ -74,6 +74,17 @@ without the user asking. Five hard properties:
    summary renders **only** in the jump panel, on its own line under the label,
    in a smaller italic dim style — chrome-class, so document zoom does not
    scale it.
+6. **Durability (bug-0020).** Because the call is one-shot and never re-run, the
+   summary must survive a GUI restart **unconditionally** — including for a
+   session no tile is bound to. Its durable home is the **id-keyed sidecar**
+   `~/.yalda/session_summaries.json` (`{server session id → summary}`), written at
+   `finish_autoname` and read at construction into
+   `YaldaGpuiView.session_summaries`; the live `AgentState::summary` wins whenever
+   the session is open here, and the sidecar is the fallback everywhere a summary
+   is shown or restored. (The cwd-keyed `acp_sessions.json` `summary` key still
+   round-trips for tile-bound sessions, but it CANNOT carry a free session — which
+   is what made the line vanish on reload.) The NAME needs none of this: it is
+   pushed to the session server, whose WAL is its durable home.
 
 **Applies to.** `agent.rs` — `NameOrigin`, `AgentSession::{name_origin, summary,
 autoname_state}`; `agent_naming.rs` — the pure `build_naming_prompt` /
@@ -83,8 +94,10 @@ https://api.anthropic.com/v1/messages`, `anthropic-version: 2023-06-01`);
 `agent_ui.rs` — `maybe_autoname_session` (fired from the turn-finalize
 chokepoint) / `spawn_autoname_worker` / `apply_autoname_result`;
 `main.rs::commit_rename_overlay` (`RenameTarget::AgentSession`) — the latch;
-`persist.rs` — `dotenv` load at startup plus persistence of `name_origin` and
-`summary`; `jump_panel_view.rs` — the italic summary line.
+`persist.rs` — `dotenv` load at startup, the `acp_sessions.json` `summary` key, and
+the id-keyed summary sidecar (`session_summaries_path` / `load_session_summaries` /
+`save_session_summary` / `forget_session_summaries`, bug-0020);
+`jump_panel_view.rs` — the italic summary line (+ its sidecar fallback).
 
 **Why.** A list of `claude-N` placeholders is unnavigable, and hand-renaming
 every session is friction the user should not have to pay. Property 3 is the
@@ -104,6 +117,10 @@ path — `apply_server_batch` → `ServerNotification::TurnEnded` →
 `finalize_agent_turn_idem` → `drain_autoname_requests` — and asserts the request
 is armed on turn 1 and NOT re-armed on turn 2),
 `autoname_result_renames_the_session`,
+`autoname_summary_survives_a_restart` + `autoname_summary_survives_a_gui_reload`
+(property 6 / bug-0020 — the settle path's write round-trips, and a SECOND view
+that knows the session only from the roster still shows its summary; NC observed
+RED: drop `save_session_summary` → the reloaded row's summary is `None`),
 `rename_latches_origin_and_blocks_autoname` (drives the REAL
 `open_rename_overlay` → `commit_rename_overlay` entry point), and
 `late_autoname_result_never_clobbers_a_user_rename`. `tests.rs`:

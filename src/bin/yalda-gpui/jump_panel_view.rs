@@ -136,6 +136,23 @@ pub(crate) enum AgentDotStatus {
     Neutral,
 }
 
+/// The row marks a live session wears (`UXI-JumpPanel-10`): `(badge glyph,
+/// right-edge status word)`. Color alone was too quiet to catch while scanning a
+/// list of sessions, so each live state also gets a WORD and its own glyph SHAPE
+/// — legible without relying on hue at all. A quiet session (idle+read,
+/// disconnected, or roster-only) keeps the plain `✦` and says nothing.
+///
+/// Pure so the mapping is headlessly guarded; the tint/outline/italic that go
+/// with it are paint (harness gap #1).
+pub(crate) fn agent_row_marks(status: AgentDotStatus) -> (&'static str, Option<&'static str>) {
+    match status {
+        // A filled diamond reads as "lit up / running"; the word removes any doubt.
+        AgentDotStatus::Working => ("◆", Some("working")),
+        AgentDotStatus::WaitingForYou => ("✦", Some("your turn")),
+        AgentDotStatus::Neutral => ("✦", None),
+    }
+}
+
 impl AgentRow {
     /// Map this row to its status-dot meaning (UXI-JumpPanel-1). Disconnected wins
     /// (nothing is happening); otherwise a reply in flight is **working**, an idle
@@ -180,7 +197,13 @@ impl YaldaGpuiView {
                 .unwrap_or_else(|| info.label.clone());
             let awaiting = opened.map(|e| e.read(cx).state.turn_phase.is_awaiting());
             let unread = opened.map(|e| e.read(cx).state.unread).unwrap_or(false);
-            let summary = opened.and_then(|e| e.read(cx).state.summary.clone());
+            // bug-0020: the live session is authoritative, but a session that is
+            // NOT open here (free, or freshly restored before attach) still has a
+            // durable summary in the id-keyed sidecar. Without this fallback the
+            // explainer line only existed for the run that generated it.
+            let summary = opened
+                .and_then(|e| e.read(cx).state.summary.clone())
+                .or_else(|| self.session_summaries.get(&info.session_id).cloned());
             rows.push(AgentRow {
                 target: JumpTarget::Roster(info.session_id.clone()),
                 label,
@@ -205,7 +228,13 @@ impl YaldaGpuiView {
             rows.push(AgentRow {
                 target: JumpTarget::Local(id),
                 label: ent.read(cx).label.clone(),
-                summary: ent.read(cx).state.summary.clone(),
+                // bug-0020: same sidecar fallback as the roster rows above, for a
+                // session whose sid the roster hasn't listed yet.
+                summary: ent.read(cx).state.summary.clone().or_else(|| {
+                    self.sessions
+                        .sid_of(id)
+                        .and_then(|s| self.session_summaries.get(s.as_str()).cloned())
+                }),
                 cwd: ent.read(cx).cwd.clone(),
                 bound: self.agent_tile_id_bound_to(id).is_some(),
                 connected: true,
@@ -526,17 +555,13 @@ impl YaldaGpuiView {
         let active_accent = nc(self.theme.agent.frozen_bar);
         let mut sel_bg = active_accent;
         sel_bg.a = 0.15;
-        // The panel is a recessed room. A theme may art-direct its exact shade
-        // (`agent.jump_panel_bg = Some(...)`, e.g. Nightfox); otherwise it's
-        // derived from the editor bg: same hue + saturation, a touch darker in
-        // lightness (a lighten-flip on near-black themes so the seam never
-        // vanishes) — `jump_panel_bg`. Untouched s keeps it from muddying
-        // (dropping saturation is what browns a blue-tinted bg).
-        let panel_bg = match self.theme.agent.jump_panel_bg {
-            Some(c) => nc(c),
-            None => jump_panel_bg(self.editor_bg()),
-        };
-        let border = st.dim;
+        // UXI-JumpPanel-11 (reverses UXI-JumpPanel-7's recessed shade): the panel
+        // wears the SAME surface as the command menu / jump palette — the theme's
+        // `overlay.bg`. The derived recessed shade read muddy on paper-toned
+        // themes (Folio); sharing the menu surface makes every chrome popup and
+        // the sidebar one material.
+        let panel_bg = jump_panel_surface(self.editor_bg());
+        let border = nc(self.theme.overlay.border);
         // Inter-section hairline (a rule ABOVE each project header): the dim
         // border color at low alpha, so internal structure stays quieter than
         // the panel's outer right border.
@@ -766,18 +791,40 @@ fn jump_session_row_el(
         AgentDotStatus::WaitingForYou => ready,
         AgentDotStatus::Neutral => st.dim,
     };
+    let (badge_glyph, hint) = agent_row_marks(status);
     let row_id = SharedString::from(format!("jump-sess-{i}"));
     let target = row.target.clone();
-    let mut r = jump_nav_row(
+    let mut r = jump_nav_row_hinted(
         row_id,
         &row.label,
-        Some("✦"),
+        Some(badge_glyph),
         Some(badge_color),
-        None,
+        hint,
+        // The hint IS the status, so it wears the status hue (the workspace
+        // rows' `ctrl-<n>` digits stay dim).
+        Some(badge_color),
         st,
         sel_bg,
         active.then_some(active_accent),
     );
+    if let Some(hue) = match status {
+        AgentDotStatus::Working => Some(working_orange),
+        AgentDotStatus::WaitingForYou => Some(ready),
+        AgentDotStatus::Neutral => None,
+    } {
+        // The chip: a tint of the status hue behind the row plus a hairline
+        // outline in the same hue. Both are alpha-derived from the theme color,
+        // so a re-themed palette carries through with no new theme fields. The
+        // ACTIVE row keeps its own accent background (you-are-here wins).
+        let mut tint = hue;
+        tint.a = 0.12;
+        let mut edge = hue;
+        edge.a = 0.55;
+        if !active {
+            r = r.bg(tint);
+        }
+        r = r.border_1().border_color(edge).rounded_md();
+    }
     if !row.connected {
         r = r.text_color(st.dim);
     }
@@ -874,6 +921,24 @@ fn jump_nav_row(
     sel_bg: Hsla,
     active: Option<Hsla>,
 ) -> gpui::Stateful<gpui::Div> {
+    jump_nav_row_hinted(id, label, badge, badge_color, hint, None, st, sel_bg, active)
+}
+
+/// [`jump_nav_row`] with an explicit color for the right-edge hint: agent rows
+/// put their status word there in the status hue (`UXI-JumpPanel-10`), while a
+/// workspace's `ctrl-<n>` digit stays dim (`None`).
+#[allow(clippy::too_many_arguments)]
+fn jump_nav_row_hinted(
+    id: impl Into<ElementId>,
+    label: &str,
+    badge: Option<&str>,
+    badge_color: Option<Hsla>,
+    hint: Option<&str>,
+    hint_color: Option<Hsla>,
+    st: &DetailStyle,
+    sel_bg: Hsla,
+    active: Option<Hsla>,
+) -> gpui::Stateful<gpui::Div> {
     let transparent: Hsla = rgba(0x00000000).into();
     let label = if label.trim().is_empty() {
         "(untitled)".to_string()
@@ -917,7 +982,7 @@ fn jump_nav_row(
         row = row.child(
             div()
                 .flex_none()
-                .text_color(st.dim)
+                .text_color(hint_color.unwrap_or(st.dim))
                 .text_size(px(st.pt * 0.85))
                 .child(SharedString::from(hint.to_string())),
         );
@@ -925,20 +990,18 @@ fn jump_nav_row(
     row
 }
 
-/// Panel background: the editor background, a touch darker in lightness (with a
-/// lighten-flip on near-black themes so the seam never disappears) at the SAME
-/// hue + saturation (dropping saturation is what muddies a tinted background).
-/// A fixed ΔL — not a multiply/black-composite, which vanish at low L and
-/// overshoot at high L. The recessed shade also makes the cyan selection tint pop.
-pub(crate) fn jump_panel_bg(editor: Hsla) -> Hsla {
-    let l = if editor.l >= 0.5 {
-        editor.l - 0.045 // light themes: darken (paper needs the bigger step)
-    } else if editor.l - 0.035 >= 0.055 {
-        editor.l - 0.035 // dark themes: darken
-    } else {
-        (editor.l + 0.04).min(1.0) // near-black: darker is invisible → lighten
-    };
-    Hsla { l, ..editor }
+/// Panel background (`UXI-JumpPanel-11`): the **command-menu surface** —
+/// literally `menu_panel_bg`, the elevated card the `?`/`.`/space menus are
+/// painted on.
+///
+/// This REVERSES `UXI-JumpPanel-7`'s "recessed shade" (a ΔL DARKEN of the editor
+/// bg, plus a per-theme `agent.jump_panel_bg` art-direction override, both now
+/// gone). The recessed derivation read muddy on paper-toned themes (Folio) and
+/// made the sidebar a third material next to the editor and the menus; sharing
+/// the menu's elevated surface makes all chrome one material and needs no
+/// per-theme tuning.
+pub(crate) fn jump_panel_surface(editor: Hsla) -> Hsla {
+    menu_panel_bg(editor)
 }
 
 /// The inter-section hairline drawn above each project header (inset both sides

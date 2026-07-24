@@ -71,3 +71,4 @@ strip**, the **transcript** (a cached child, `TranscriptView`), the **compose** 
 | UXI-AgentTile-22 | session-binding | Closing a session requires a typed `yes` confirmation | implemented (rule 1 amended by `-23`) |
 | UXI-AgentTile-23 | session-binding | Arming the close confirm drops you into insert, unless a draft is at risk | implemented |
 | UXI-AgentTile-27 | naming | A session names + summarizes itself once; an explicit rename wins forever | implemented |
+| UXI-AgentTile-28 | transcript | The tile says whether the agent is working or waiting on you | implemented |

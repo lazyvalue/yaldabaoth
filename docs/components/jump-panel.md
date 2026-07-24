@@ -444,7 +444,9 @@ The panel's **look** is:
 - **Weight.** Row labels render at **`SEMIBOLD`** (they read too thin at normal
   weight; still a step under the `BOLD` uppercase project headers, so the header >
   row hierarchy holds). The project-name red is softened to α 0.9.
-- **Recessed background.** The panel background is `agent.jump_panel_bg` when a
+- **Recessed background.** _(SUPERSEDED by `UXI-JumpPanel-11` — the panel now wears
+  the command-menu surface, `menu_panel_bg`, and `agent.jump_panel_bg` is gone.
+  Kept here for the record.)_ The panel background is `agent.jump_panel_bg` when a
   theme art-directs one (e.g. **Nightfox** `#0d1119`), else `jump_panel_bg(editor_bg())`
   — a touch darker in **lightness** than the editor at the **same hue + saturation**
   (dropping saturation is what muddies a tinted bg), with a **lighten-flip** on
@@ -657,3 +659,83 @@ own reverted-fix mutation:
 3. **`JumpTarget` gained `Debug, PartialEq, Eq` derives** (`jump_panel_view.rs`) so
    `PaletteTarget` could be compared and printed in test failures — the only edit
    outside the palette's own files and the wiring.
+
+### UXI-JumpPanel-10 — A live session says what it is doing, in words and in shape
+
+**Statement.** In the jump panel, the two **live** session states are unmistakable
+while scanning — each one carries a **status word**, its own **glyph shape**, and a
+**tinted, outlined chip** around the row, not a hue on a single tiny glyph:
+
+| State (`AgentDotStatus`) | Glyph | Right-edge word | Row |
+|---|---|---|---|
+| **Working** — a reply is in flight | `◆` (filled) | `working`, in the working hue | tint α 0.12 + hairline outline α 0.55, both in `agent.jump_working` |
+| **Waiting for you** — a backgrounded turn finished, unread (`UXI-JumpPanel-6`) | `✦` | `your turn`, in the ready hue | tint + outline in `agent.tool_completed`, label **italic** |
+| **Neutral** — idle+read, disconnected, or roster-only | `✦` (dim) | *(nothing)* | plain row |
+
+Both live tints/outlines are **alpha-derived from the existing theme colors** — no
+new theme fields, so a re-themed palette carries through. The **active row**
+(`UXI-JumpPanel-5`, "you are here") keeps its own accent background — the you-are-
+here mark wins over the status tint; the status outline still draws.
+
+The **glyph shapes differ** so working vs waiting is legible with no color
+perception at all, and italic still carries exactly one meaning
+(`UXI-JumpPanel-6`): waiting on you.
+
+The `(glyph, word)` mapping is the pure `agent_row_marks(status)`, and the **agent
+tile reuses it** (`UXI-AgentTile-28`) so both surfaces speak one vocabulary.
+
+**Applies to.** `jump_panel_view.rs`: `agent_row_marks` (new pure fn),
+`jump_session_row_el` (chip + hinted row), `jump_nav_row_hinted` (`jump_nav_row`
+plus a hint color, so a workspace's `ctrl-<n>` digit stays dim while a session's
+status word takes the status hue).
+
+**Why.** A colored `✦` was the *only* signal, at ~10px, in a list of otherwise
+identical rows — too quiet to catch out of the corner of the eye, and useless if
+you don't remember which hue means which. Words plus shapes plus a chip make "this
+one is running" and "this one needs me" readable at a glance.
+
+**Status.** `implemented` — the mapping is headless-guarded; the tint/outline/
+italic as *pixels* are harness gap #1 (human eye).
+
+**Enforcement.** `verify_harness.rs::agent_row_marks_name_the_live_states` (each
+status' glyph + word, and that the two live glyphs differ; NC: return `("✦", None)`
+for every status → RED). `dot_status` itself stays pinned by
+`agent_dot_status_mapping` + `jump_panel_agent_dot_reflects_turn_phase`.
+
+### UXI-JumpPanel-11 — The panel wears the command-menu surface (reverses -7's recessed shade)
+
+**Statement.** The jump panel's background is **exactly the command menu's
+surface** — `jump_panel_surface(editor_bg) == menu_panel_bg(editor_bg)`, the
+elevated card the `?` / `.` / space menus are painted on: a fixed ΔL **lighter**
+than the editor at the same hue + saturation. Its right border is the theme's
+`overlay.border`.
+
+This **reverses** two `UXI-JumpPanel-7` decisions:
+
+1. the derived **recessed** shade (a ΔL *darken* of the editor bg, lighten-flipped
+   on near-black themes) — gone; and
+2. the per-theme art-direction hook `AgentTheme.jump_panel_bg` (Nightfox's
+   `#0d1119`) — the **field is removed**, so panel shade is no longer theme-owned.
+   The jump panel's *accent* colors (`jump_header` / `jump_subheader` /
+   `jump_working`) stay theme-owned and unchanged.
+
+`UXI-Menu-5`'s "the card goes the opposite direction from the recessed jump bar"
+clause is retired with it — the two now share a surface **on purpose**.
+
+**Applies to.** `jump_panel_view.rs`: `jump_panel_surface` (replaces
+`jump_panel_bg`), `render_jump_panel` (bg + border). `theme.rs`:
+`AgentTheme.jump_panel_bg` removed from the struct and all 8 themes.
+
+**Why.** The recessed derivation read **muddy** on paper-toned themes (Folio) and
+made the sidebar a *third* material next to the editor and the menus. One shared
+chrome surface — sidebar, command menu, palette — reads cleaner, is lighter (the
+ask), and needs no per-theme tuning.
+
+**Status.** `implemented` — the surface derivation is headless-guarded; the shade
+as *pixels* is harness gap #1.
+
+**Enforcement.** `verify_harness.rs::jump_panel_surface_matches_the_command_menu`
+(on a Folio-ish paper bg and a dark bg: panel == `menu_panel_bg`, lighter than the
+editor, hue+saturation preserved; **NC observed RED**: restore the old
+`editor.l - 0.035` recessed derivation → `left: L 0.905` vs `right: L 0.98`).
+`menu_panel_bg_is_elevated_above_the_editor` keeps the menu card's own contract.

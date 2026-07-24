@@ -6242,45 +6242,126 @@ fn delete_nonempty_project_confirms_then_cascades(cx: &mut TestAppContext) {
     });
 }
 
-/// UXI-JumpPanel-7 (panel background): the jump panel sits a touch darker than
-/// the editor on dark/light themes, and LIGHTENS on near-black themes so the seam
-/// never vanishes — always at the same hue + saturation (no muddying). Pure fn.
+/// UXI-JumpPanel-10: a live session names its state in WORDS and in a distinct
+/// GLYPH SHAPE, not by hue alone — `◆ working` while a reply is in flight,
+/// `✦ your turn` when a backgrounded turn finished, and nothing at all for a
+/// quiet session. Pure mapping (the tint/outline/italic that carry it are paint,
+/// harness gap #1).
 ///
-/// Negative control: make `jump_panel_bg` return `editor` unchanged → the
-/// dark-darker and near-black-lighter asserts fail.
+/// Negative control: return `("✦", None)` for every status → the working and
+/// waiting asserts both fail.
 #[test]
-fn jump_panel_bg_shades_by_theme_and_preserves_hue() {
-    use crate::jump_panel_bg;
-    use gpui::Hsla;
-    // Dark theme (Dracula editor_bg L≈0.184): panel is darker.
-    let dark = Hsla { h: 0.63, s: 0.11, l: 0.184, a: 1.0 };
-    let d = jump_panel_bg(dark);
-    assert!(d.l < dark.l - 0.02, "dark bg → darker panel (got L {} vs {})", d.l, dark.l);
-    assert!(
-        (d.h - dark.h).abs() < 1e-6 && (d.s - dark.s).abs() < 1e-6 && d.a == dark.a,
-        "hue + saturation + alpha preserved (no muddying)"
+fn agent_row_marks_name_the_live_states() {
+    use crate::{AgentDotStatus, agent_row_marks};
+    assert_eq!(
+        agent_row_marks(AgentDotStatus::Working),
+        ("◆", Some("working")),
+        "a running agent says so, with its own glyph"
     );
-    // Near-black (OLED): darker would be invisible → LIGHTEN.
-    let black = Hsla { h: 0.0, s: 0.0, l: 0.02, a: 1.0 };
-    let b = jump_panel_bg(black);
-    assert!(b.l > black.l, "near-black bg → lighter panel (seam stays visible), got L {}", b.l);
-    // Light theme (paper L≈0.94): darker.
-    let light = Hsla { h: 0.12, s: 0.5, l: 0.94, a: 1.0 };
-    let l = jump_panel_bg(light);
-    assert!(l.l < light.l - 0.02, "light bg → darker panel, got L {}", l.l);
+    assert_eq!(
+        agent_row_marks(AgentDotStatus::WaitingForYou),
+        ("✦", Some("your turn")),
+        "a finished-but-unread turn says it is your move"
+    );
+    assert_eq!(
+        agent_row_marks(AgentDotStatus::Neutral),
+        ("✦", None),
+        "a quiet session stays quiet — no status word"
+    );
+    // The two live states must not be confusable by shape alone.
+    assert_ne!(
+        agent_row_marks(AgentDotStatus::Working).0,
+        agent_row_marks(AgentDotStatus::WaitingForYou).0
+    );
+}
+
+/// UXI-AgentTile-28: the agent TILE paints a status pill (the same `◆ working` /
+/// `✦ your turn` vocabulary as the jump panel) — it PAINTS while a reply is in
+/// flight, and a session that has never run a turn shows none. Layout probe on
+/// the real `render_agent` header (paint, not state).
+///
+/// Negative control: drop the pill child in `render_agent` → the painted assert
+/// fails (probe returns `None`).
+#[gpui::test]
+fn agent_tile_paints_a_status_pill_while_working(cx: &mut TestAppContext) {
+    let (view, vcx, id, _session) = boot_with_transcript(cx);
+
+    // A virgin session (no turn ever started, none completed): no pill.
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let quiet = crate::layout_probe_get("agent-status-pill");
+    crate::layout_probe_end();
+    assert!(
+        quiet.is_none(),
+        "a session that has never run a turn shows no status pill (got {quiet:?})"
+    );
+
+    // A reply in flight: the pill paints, with real size.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            c.turn_phase = crate::TurnPhase::begin(std::time::Instant::now());
+        });
+    });
+    crate::layout_probe_begin();
+    view.update(vcx, |_, cx| cx.notify());
+    vcx.run_until_parked();
+    let working = crate::layout_probe_get("agent-status-pill");
+    crate::layout_probe_end();
+    let (_, _, w, h) = working.expect("the working pill must paint while a reply is in flight");
+    assert!(
+        w > 20.0 && h > 6.0,
+        "the pill must have real painted size, got {w}x{h}"
+    );
+}
+
+/// UXI-JumpPanel-11: the jump panel is painted on the SAME surface as the
+/// command menu — `jump_panel_surface` IS `menu_panel_bg`, so the sidebar and the
+/// `?`/`.`/space menu card are one material, and both sit LIGHTER than the editor
+/// (this reverses UXI-JumpPanel-7's recessed darken, which read muddy on Folio).
+/// Pure fn.
+///
+/// Negative control: restore the old recessed derivation (`editor.l - 0.035`) →
+/// the "same as the menu card" and "lighter than the editor" asserts both fail.
+#[test]
+fn jump_panel_surface_matches_the_command_menu() {
+    use crate::{jump_panel_surface, menu_panel_bg};
+    use gpui::Hsla;
+    // Folio-ish paper (the theme that prompted the reversal) and a dark theme.
+    for editor in [
+        Hsla { h: 0.12, s: 0.30, l: 0.94, a: 1.0 },
+        Hsla { h: 0.62, s: 0.30, l: 0.17, a: 1.0 },
+    ] {
+        let panel = jump_panel_surface(editor);
+        assert_eq!(
+            panel,
+            menu_panel_bg(editor),
+            "the panel wears the command menu's surface, exactly"
+        );
+        assert!(
+            panel.l > editor.l,
+            "…which is LIGHTER than the editor (got L {} vs {})",
+            panel.l,
+            editor.l
+        );
+        assert!(
+            (panel.h - editor.h).abs() < 1e-6 && (panel.s - editor.s).abs() < 1e-6,
+            "hue + saturation preserved (no muddying)"
+        );
+    }
 }
 
 /// UXI-Menu-5: the command panel is an ELEVATED surface — lighter than the editor
 /// (tiles/workspace) at the same hue + saturation — so it stands out. It lifts on
-/// both dark and light themes, and crucially goes the OPPOSITE direction from the
-/// recessed jump bar, so the two never converge. Pure fn.
+/// both dark and light themes. (As of `UXI-JumpPanel-11` the jump panel shares
+/// this surface deliberately — see `jump_panel_surface_matches_the_command_menu`;
+/// the old "diverges from the recessed jump bar" clause is retired.)
 ///
 /// Negative control: make `menu_panel_bg` return `editor` unchanged → the
-/// lighter-than-editor asserts fail; make it darken (like `jump_panel_bg`) → the
-/// "opposite direction from the jump bar" assert fails.
+/// lighter-than-editor asserts fail.
 #[test]
-fn menu_panel_bg_is_elevated_and_distinct_from_jump_bar() {
-    use crate::{jump_panel_bg, menu_panel_bg};
+fn menu_panel_bg_is_elevated_above_the_editor() {
+    use crate::menu_panel_bg;
     use gpui::Hsla;
     // Dark theme (Nightfox-ish editor_bg L≈0.17): card lifts above the bg.
     let dark = Hsla { h: 0.62, s: 0.30, l: 0.17, a: 1.0 };
@@ -6289,13 +6370,6 @@ fn menu_panel_bg_is_elevated_and_distinct_from_jump_bar() {
     assert!(
         (d.h - dark.h).abs() < 1e-6 && (d.s - dark.s).abs() < 1e-6 && d.a == dark.a,
         "hue + saturation + alpha preserved (no muddying)"
-    );
-    // The card and the jump bar diverge from the same editor bg (elevated vs recessed).
-    assert!(
-        d.l > jump_panel_bg(dark).l + 0.05,
-        "card ({}) must be clearly lighter than the recessed jump bar ({})",
-        d.l,
-        jump_panel_bg(dark).l
     );
     // Light theme (paper L≈0.94): still lifts (a near-white elevated card).
     let light = Hsla { h: 0.12, s: 0.5, l: 0.94, a: 1.0 };
@@ -13938,6 +14012,113 @@ fn autoname_result_renames_the_session(cx: &mut TestAppContext) {
         "the derived summary is installed for the jump panel"
     );
     assert_eq!(state, crate::AutonameState::Done, "the one-shot is settled");
+}
+
+/// bug-0020 / UXI-AgentTile-27: the autoname summary must round-trip through
+/// `acp_sessions.json` — the naming call is one-shot, so a summary that isn't
+/// written at settle time is gone forever after a restart (the jump panel's
+/// italic explainer line vanishes on reload).
+///
+/// Drives the REAL settle entry point (`finish_autoname`, which the naming
+/// worker calls) with the persist path overridden, then reads the file back
+/// through the REAL loader.
+#[gpui::test]
+fn autoname_summary_survives_a_restart(cx: &mut TestAppContext) {
+    let (view, vcx, id) = boot_armed_autoname_session(cx);
+    end_turn_for(&view, vcx, "S1", 1);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("acp_sessions.json");
+
+    view.update(vcx, |v, cx| {
+        crate::persist::with_acp_persist_path(file.clone(), || {
+            v.finish_autoname(
+                id,
+                Some(crate::SessionNaming {
+                    name: Some("payments adapter".into()),
+                    summary: Some("Ripping out the payments adapter.".into()),
+                }),
+                cx,
+            )
+        })
+    });
+    vcx.run_until_parked();
+
+    let slots = crate::persist::with_acp_persist_path(file.clone(), || {
+        crate::persist::load_persisted_acp_sessions(&crate::persist::process_cwd())
+    });
+    let slot = slots
+        .iter()
+        .find(|s| s.id.as_str() == "S1")
+        .expect("the bound session is persisted");
+    assert_eq!(
+        slot.label, "payments adapter",
+        "the derived name is persisted (it already was)"
+    );
+    assert_eq!(
+        slot.summary.as_deref(),
+        Some("Ripping out the payments adapter."),
+        "the derived summary must be persisted too, or it dies on reload"
+    );
+}
+
+/// bug-0020: the jump panel's explainer line survives a GUI RELOAD — including
+/// for a session no tile is bound to.
+///
+/// `acp_sessions.json` is cwd-keyed and only holds sessions bound to a tile at
+/// save time, so it can never carry a free session's summary. This drives the
+/// REAL settle path (`finish_autoname`) in one view, then boots a SECOND view
+/// (the "reload") that only knows the session from the roster, and asserts the
+/// row it builds still carries the summary.
+///
+/// Negative control: drop `save_session_summary` in `finish_autoname` (or the
+/// `session_summaries` fallback in `jump_panel_agent_rows`) → the reloaded row's
+/// summary is `None` → RED.
+#[gpui::test]
+fn autoname_summary_survives_a_gui_reload(cx: &mut TestAppContext) {
+    use yalda::session_proto::SessionInfo;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("session_summaries.json");
+
+    // Session 1: a bound, armed session settles its autoname.
+    let (view, vcx, id) = boot_armed_autoname_session(cx);
+    end_turn_for(&view, vcx, "S1", 1);
+    view.update(vcx, |v, cx| {
+        crate::persist::with_session_summaries_path(file.clone(), || {
+            v.finish_autoname(
+                id,
+                Some(crate::SessionNaming {
+                    name: Some("payments adapter".into()),
+                    summary: Some("Ripping out the payments adapter.".into()),
+                }),
+                cx,
+            )
+        })
+    });
+    vcx.run_until_parked();
+
+    // Session 2 ("reload"): a fresh view that loads the sidecar at construction
+    // and knows S1 only from the server roster — nothing is bound to it.
+    let (view2, vcx2) = crate::persist::with_session_summaries_path(file.clone(), || boot_browser(cx));
+    let row_summary = view2.update(vcx2, |v, cx| {
+        v.agent_roster.upsert(SessionInfo {
+            session_id: "S1".into(),
+            acp_session_id: None,
+            label: "payments adapter".into(),
+            cwd: PathBuf::from("."),
+            turns: 1,
+            connected: true,
+            permission_mode: yalda::acp_channel::DEFAULT_PERMISSION_MODE,
+        });
+        v.jump_panel_agent_rows(cx)
+            .into_iter()
+            .find(|r| matches!(&r.target, crate::JumpTarget::Roster(s) if s == "S1"))
+            .and_then(|r| r.summary)
+    });
+    assert_eq!(
+        row_summary.as_deref(),
+        Some("Ripping out the payments adapter."),
+        "the autoname summary must survive a reload, even unbound"
+    );
 }
 
 /// UXI-AgentTile-27 property 3 (early half): renaming BEFORE the first turn ends
