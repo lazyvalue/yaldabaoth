@@ -13,6 +13,25 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 ---
 
+- **Jump panel redesign (declutter + context menu + shading)** — `NEEDS-RUNTIME`
+  (branch `jump-panel-redesign`, 2026-07-23 via `/new-ux`, autonomous, Fable
+  advising UX + color; `UXI-JumpPanel-7`, `-8`). The panel loses its inline
+  create/delete chrome: no CWD subtext line, no ＋New project / ＋New workspace /
+  ＋New agent session rows, no ✕ close-project glyph. Project creation moved to the
+  GLOBAL menu ("new project"); the per-project create + delete actions moved to a
+  **context menu** opened by clicking the project NAME (New workspace / New agent
+  session / Delete project, anchored at the cursor, Esc / click-away to close).
+  Aesthetics: an inter-section **hairline rule above** each project header
+  (replacing the underline); **icons** — `⊞` workspaces / status-colored `✦`
+  agent sessions (the ●/○ dot is folded into the star's color; the ctrl-<n> number
+  moves to a dim right-edge hint); **SEMIBOLD** row labels; and a **slightly
+  darker panel background** derived per-theme (`jump_panel_bg`: fixed ΔL with a
+  lighten-flip on near-black themes, hue+sat preserved). Guards in
+  `verify_harness.rs`: `jump_panel_bg_shades_by_theme_and_preserves_hue`,
+  `project_menu_opens_on_name_click_and_actions_dispatch`,
+  `new_project_relocated_to_global_menu` (NCs noted). **Runtime check:** the
+  literal glyphs / colors / popup placement are harness gap #1 (human eye).
+
 - **Beautiful subagent / tool-call content rendering** — `NEEDS-RUNTIME` (built
   2026-07-23 via `/new-ux`, autonomous, Fable advising; `UXI-AgentTile-25`). Tool
   inputs/outputs now render as typed semantic sections instead of raw JSON: a

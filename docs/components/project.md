@@ -115,6 +115,14 @@ is additionally covered by the pre-existing `workspace_cwd_inheritance` /
 
 ### UXI-Project-3 — The jump panel renders the project hierarchy
 
+> **Chrome updated by `UXI-JumpPanel-7/-8`.** The inline create affordances
+> described below moved OFF the panel: the top-level **＋ New project** row → the
+> global menu; the per-project **＋ New workspace / ＋ New agent session** rows and
+> the dim **cwd subtext** → gone, with create/delete now in the project **context
+> menu** (click the name). The per-project *grouping* (one section per project,
+> WORKSPACES + AGENT SESSIONS sublists, global `ctrl-<n>` numbering) is unchanged —
+> only the create/delete entry points and the visual treatment moved.
+
 **Statement.** The jump panel is grouped by project: a top-level **＋ New
 project** row, then one section per project (header = project name, dim cwd
 subtext), each expanding into a **WORKSPACES** sublist and an **AGENT SESSIONS**
@@ -169,6 +177,11 @@ construction. (The earlier stand-alone `jump_group_header` helper + its
 empty name cancels. The per-project **＋ New workspace / ＋ New agent session**
 create into *that* project (no cwd prompt — the cwd is the project's).
 
+> **Entry points moved (`UXI-JumpPanel-7/-8`).** The `Projects::create` +
+> `new_workspace_in` / `new_agent_session_in` methods below are unchanged; only
+> where they're invoked moved — **New project** to the global menu, **New
+> workspace / New agent session** to the project name's context menu.
+
 **Applies to.** `main.rs`: a new `RenameTarget::NewProject`-style overlay (name +
 cwd), its open + commit routing → `Projects::create`; `jump_panel_view.rs` the
 ＋ rows. The per-project create rows call `new_workspace_in(project)` /
@@ -208,8 +221,10 @@ affordance). Persistence drops the project from `projects.json`.
 workspaces/sessions pointing at a dead project; persisting empty projects lets a
 project be a durable place you set up before filling.
 
-**Status.** `implemented` (T005). The jump-panel project header carries a ✕
-affordance → `request_delete_project`: a non-empty project arms
+**Status.** `implemented` (T005). The delete entry point is now the project
+**context menu's** "✕ Delete project" item (`UXI-JumpPanel-8`), not a ✕ glyph on
+the header (`UXI-JumpPanel-7` removed that); it still calls the same
+`request_delete_project`: a non-empty project arms
 `ActiveOverlay::ConfirmProjectDelete(pid)`, an empty one deletes directly.
 `perform_delete_project` kills the project's sessions (local via
 `AgentSessions::close` + off-thread `spawn_close_session`; roster-only sids
