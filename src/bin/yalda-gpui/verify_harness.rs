@@ -12639,7 +12639,19 @@ fn close_session_requires_typed_yes_confirmation(cx: &mut TestAppContext) {
 
     // 2. A non-`yes` submit CANCELS: nothing on the wire, session still bound,
     //    draft still sitting in the compose.
-    worksheet_real_submit(&view, vcx, "nope");
+    //    Type DIRECTLY rather than via `worksheet_real_submit` — that helper
+    //    presses `i` first, and since UXI-AgentTile-23 the arm has already put an
+    //    empty compose in Insert, so the `i` would be typed as literal text
+    //    (`inope`). A real user doesn't press it either.
+    view.update(vcx, |v, cx| {
+        v.with_session(id, cx, |c| {
+            for ch in "nope".chars() {
+                c.input_surface.compose_mut().editor.insert_char(ch);
+            }
+        });
+    });
+    view.update(vcx, |v, cx| v.submit_agent(cx));
+    vcx.run_until_parked();
     assert!(
         controls.prompt_rx.try_recv().is_err(),
         "a submit consumed by the confirm must never reach the agent"
@@ -13273,4 +13285,295 @@ fn delete_last_project_mints_a_fresh_default(cx: &mut TestAppContext) {
             "the active project resolves to a live project"
         );
     });
+}
+
+/// Count the tiles (leaves) in the active workspace's layout.
+#[cfg(test)]
+fn active_tile_count(view: &gpui::Entity<YaldaGpuiView>, vcx: &mut gpui::VisualTestContext) -> usize {
+    view.update(vcx, |v, _| {
+        let mut n = 0;
+        if let Some(wsp) = v.workspace.active_workspace() {
+            wsp.layout.for_each_leaf(&mut |_| n += 1);
+        }
+        n
+    })
+}
+
+/// UXI-Workspace-8: "new agent" (`.` → `n` → `a`) is CONTEXTUAL. In a real
+/// workspace it adds a tile; in a bare agent view (an ephemeral virtual workspace)
+/// it swaps that single tile IN PLACE — no split — and the session it was showing
+/// survives as a free, re-pickable session. Both branches land on the picker.
+///
+/// Drives the REAL `dispatch_menu_command("new-agent-tile")` — the exact command
+/// string the menu entry carries — in both contexts.
+///
+/// Negative control: route the ephemeral branch back to the split path (delete the
+/// `active_is_ephemeral()` arm in `"new-agent-tile"`) → the "no new tile" assert
+/// fires RED.
+#[gpui::test]
+fn new_agent_splits_in_a_workspace_and_swaps_in_place_in_a_bare_agent_view(
+    cx: &mut TestAppContext,
+) {
+    use crate::App;
+    let (view, vcx) = boot_browser(cx);
+    let sid = add_free_session(&view, vcx, "claude-1");
+
+    // ── A. Real workspace: a NEW tile appears, on the picker. ──────────────
+    let before = active_tile_count(&view, vcx);
+    view.update(vcx, |v, cx| v.dispatch_menu_command("new-agent-tile", cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        active_tile_count(&view, vcx),
+        before + 1,
+        "in a real workspace, new agent ADDS a tile"
+    );
+    view.update(vcx, |v, _| {
+        // The new tile is an agent tile. (Whether it rests on the picker or is
+        // pre-bound is the server-vs-direct-spawn split inside `open_agent_inner`:
+        // production runs the server path and lands on the picker; this harness has
+        // no daemon, so it takes the legacy direct-spawn branch. The PLACEMENT is
+        // what this guard pins.)
+        assert!(
+            matches!(v.workspace.focused_content(), Some(App::Agent(_))),
+            "the new tile is an agent tile, got {:?}",
+            v.workspace.focused_content().map(std::mem::discriminant)
+        );
+    });
+
+    // ── B. Bare agent view: swap IN PLACE, no split. ───────────────────────
+    // Jump to the free session → an ephemeral virtual workspace showing it.
+    view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
+    vcx.run_until_parked();
+    let workspaces_before = view.update(vcx, |v, _| {
+        assert!(v.workspace.active_is_ephemeral(), "the jump opened a bare agent view");
+        assert_eq!(v.focused_bound_session(), Some(sid), "showing the jumped session");
+        v.workspace.workspaces.len()
+    });
+    assert_eq!(active_tile_count(&view, vcx), 1, "a bare agent view is one tile");
+
+    view.update(vcx, |v, cx| v.dispatch_menu_command("new-agent-tile", cx));
+    vcx.run_until_parked();
+
+    assert_eq!(
+        active_tile_count(&view, vcx),
+        1,
+        "in a bare agent view, new agent must NOT split — it swaps the one tile in place"
+    );
+    view.update(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.workspaces.len(),
+            workspaces_before,
+            "no workspace is created or destroyed by the in-place swap"
+        );
+        assert!(
+            v.workspace.active_is_ephemeral(),
+            "the bare agent view stays ephemeral"
+        );
+        assert!(
+            matches!(v.workspace.focused_content(), Some(App::Agent(t)) if t.session().is_none()),
+            "the tile swapped to an UNBOUND agent tile (the picker)"
+        );
+        // Clause 3: the session we were looking at is FREED, not killed.
+        assert!(
+            v.sessions.contains(sid),
+            "the session that was showing must still be running (unbound, re-pickable)"
+        );
+        assert_eq!(
+            v.focused_bound_session(),
+            None,
+            "…and bound by no tile — the swap unbinds, it does not close"
+        );
+    });
+}
+
+/// UXI-Workspace-9: closing the session a BARE AGENT VIEW exists to show also
+/// dismisses the view, returning to the workspace the jump came from — so the user
+/// doesn't have to close the same thing twice (`<space> x … yes`, then `.` `x`).
+/// In a real workspace the tile stays put as an unbound selector (clause 1).
+///
+/// Drives the REAL close path end to end: `dispatch_menu_command("claude-close")`
+/// then a REAL `yes` submit through `submit_agent` → `consume_close_confirm` →
+/// `close_active_agent_session`.
+///
+/// Negative control: drop the `dismiss_ephemeral_workspace` call in
+/// `close_active_agent_session` → the "ephemeral view is gone" assert fires RED.
+#[gpui::test]
+fn closing_the_session_in_a_bare_agent_view_dismisses_it(cx: &mut TestAppContext) {
+    use crate::App;
+    let (view, vcx) = boot_browser(cx);
+    // Two real workspaces, so "returned to the ORIGIN" is distinguishable from
+    // "landed on the last workspace in the list".
+    view.update(vcx, |v, _| v.push_empty_workspace());
+    let sid = add_free_session(&view, vcx, "claude-1");
+
+    // Sit on workspace 0, then jump to the free session from there. 0 is the origin
+    // AND is NOT the last workspace — the fallback would land on 1.
+    view.update(vcx, |v, cx| {
+        v.workspace.set_active_workspace(0);
+        cx.notify();
+    });
+    let (origin_windows, workspaces_before) = view.update(vcx, |v, _| {
+        (v.workspace.focused_window_id(), v.workspace.workspaces.len())
+    });
+    view.update(vcx, |v, cx| v.jump_to_session(sid, cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, _| {
+        assert!(v.workspace.active_is_ephemeral(), "jumped into a bare agent view");
+    });
+
+    // Arm + answer `yes` on the REAL paths.
+    view.update(vcx, |v, cx| v.dispatch_menu_command("claude-close", cx));
+    vcx.run_until_parked();
+    view.update(vcx, |v, cx| {
+        v.with_session(sid, cx, |c| {
+            for ch in "yes".chars() {
+                c.input_surface.compose_mut().editor.insert_char(ch);
+            }
+        });
+    });
+    view.update(vcx, |v, cx| v.submit_agent(cx));
+    vcx.run_until_parked();
+
+    view.update(vcx, |v, _| {
+        assert_eq!(
+            v.workspace.workspaces.len(),
+            workspaces_before,
+            "the ephemeral view is gone — the workspace count is back to pre-jump"
+        );
+        assert!(
+            !v.workspace.active_is_ephemeral(),
+            "we are on a real workspace again, not a leftover selector view"
+        );
+        assert_eq!(
+            v.workspace.active_workspace, 0,
+            "we land back on the ORIGIN workspace we jumped from, not merely the last one"
+        );
+        assert_eq!(
+            v.workspace.focused_window_id(),
+            origin_windows,
+            "…the very tile we left"
+        );
+    });
+
+    // Clause 1 — the contrasting REAL-workspace close (tile stays, workspace stays)
+    // is asserted by `arming_close_drops_into_insert_unless_a_draft_is_at_risk`
+    // part A, which closes a session on a properly-bound tile in a real workspace.
+}
+
+/// UXI-AgentTile-23: arming the close confirm ALSO drops the user into insert when
+/// the compose is empty — so closing is `<space> x yes ⏎` with no manual focus
+/// step — but changes nothing when a draft is at risk (UXI-AgentTile-22 rule 1
+/// still governs that case, because `yes` appended to a draft would silently
+/// cancel and clearing the draft would destroy the user's work).
+///
+/// Drives the REAL `dispatch_menu_command("claude-close")`, then types `yes` WITHOUT
+/// any focus/insert call and submits through the real path — if the auto-insert
+/// didn't happen, the typing wouldn't be in a live compose.
+///
+/// Negative control: delete the auto-insert block in `arm_close_confirm` → the
+/// focus/mode asserts fire RED; make it unconditional → the draft-case asserts fire.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn arming_close_drops_into_insert_unless_a_draft_is_at_risk(cx: &mut TestAppContext) {
+    use crate::EditMode;
+
+    // ── A. Empty compose (idle worksheet, resting in nav) → typeable. ──────
+    {
+        let (view, vcx, id, _controls) = boot_worksheet_channel(cx);
+        view.update(vcx, |v, cx| {
+            v.with_session(id, cx, |c| {
+                assert_eq!(c.focus, crate::AgentFocus::Transcript, "worksheet rests in nav");
+                assert!(c.input_surface.compose().text().is_empty(), "no draft");
+            });
+        });
+
+        view.update(vcx, |v, cx| v.dispatch_menu_command("claude-close", cx));
+        vcx.run_until_parked();
+        view.update(vcx, |v, cx| {
+            v.with_session(id, cx, |c| {
+                assert_eq!(
+                    c.focus,
+                    crate::AgentFocus::Compose,
+                    "arming with an empty compose focuses it"
+                );
+                assert_eq!(
+                    c.input_surface.compose().mode,
+                    EditMode::Insert,
+                    "…in INSERT, so `yes` can just be typed"
+                );
+                assert!(c.you_block_open, "the idle worksheet's typeable surface is a You-block");
+            });
+        });
+
+        // Type `yes` with NO focus/insert call of our own, and submit for real.
+        view.update(vcx, |v, cx| {
+            v.with_session(id, cx, |c| {
+                for ch in "yes".chars() {
+                    c.input_surface.compose_mut().editor.insert_char(ch);
+                }
+            });
+        });
+        let workspaces_before = view.update(vcx, |v, _| v.workspace.workspaces.len());
+        view.update(vcx, |v, cx| v.submit_agent(cx));
+        vcx.run_until_parked();
+        view.update(vcx, |v, _| {
+            assert_eq!(
+                v.focused_bound_session(),
+                None,
+                "<space> x yes ⏎ closes the session with no manual focus step"
+            );
+            // UXI-Workspace-9 clause 1 (the contrast to
+            // `closing_the_session_in_a_bare_agent_view_dismisses_it`): this is a
+            // REAL workspace, so nothing is dismissed — the tile stays an agent tile
+            // showing the unbound selector.
+            assert_eq!(
+                v.workspace.workspaces.len(),
+                workspaces_before,
+                "closing in a REAL workspace destroys no workspace"
+            );
+            assert!(
+                matches!(v.workspace.focused_content(), Some(crate::App::Agent(t)) if t.session().is_none()),
+                "the real-workspace tile stays an agent tile, now the unbound selector"
+            );
+        });
+    }
+
+    // ── B. A draft is at risk → arming changes nothing (rule 1 preserved). ─
+    {
+        let (view, vcx, id, _controls) = boot_worksheet_channel(cx);
+        // Put a draft in the compose the way the user would, then step back out to
+        // transcript navigation so "no focus move" is observable.
+        view.update(vcx, |v, cx| {
+            v.with_session(id, cx, |c| {
+                c.open_you_block_at_cursor();
+                for ch in "half a thought".chars() {
+                    c.input_surface.compose_mut().editor.insert_char(ch);
+                }
+                c.focus = crate::AgentFocus::Transcript;
+                c.input_surface.compose_mut().mode = EditMode::Normal;
+            });
+        });
+
+        view.update(vcx, |v, cx| v.dispatch_menu_command("claude-close", cx));
+        vcx.run_until_parked();
+        view.update(vcx, |v, cx| {
+            v.with_session(id, cx, |c| {
+                assert_eq!(
+                    c.focus,
+                    crate::AgentFocus::Transcript,
+                    "with a draft at risk, arming must NOT move focus"
+                );
+                assert_eq!(
+                    c.input_surface.compose().mode,
+                    EditMode::Normal,
+                    "…and must NOT enter insert"
+                );
+                assert_eq!(
+                    c.input_surface.compose().text(),
+                    "half a thought",
+                    "…and must never clear the draft"
+                );
+            });
+        });
+    }
 }
