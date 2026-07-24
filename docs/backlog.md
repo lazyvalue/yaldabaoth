@@ -21,6 +21,23 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
   `u` pops. Guard `worksheet_esc_u_backs_out_reply_block` (real keystrokes; NC
   observed RED). Headless — no runtime gap beyond painted glyphs (#1).
 
+- **Projects as the top-level organizational primitive** — `NEEDS-DECISION`
+  (captured 2026-07-23 via `/new-ux`; interrogation in progress). User: "Change our
+  organizational primitive vocabulary and hierarchy. Projects are at the top.
+  Projects have a CWD, and a map of other parameters. Workspaces belong to projects;
+  Tiles are in workspaces. Agent sessions belong to projects; they can also be bound
+  to tiles. A Project can have no workspaces and all agent sessions, or no agent
+  sessions and a bunch of workspaces with tiles (all Linear or Buffer). The jump
+  panel should represent this hierarchy. As part of the migration, change all active
+  CWDs `ws/yaldabaoth` and `ws/fulcrum` to projects Yaldabaoth and Fulcrum
+  respectively. This will allow us to set other configurations on projects as well."
+  Big architectural change: introduces `Project` above the current cwd-keyed grouping;
+  today the cwd IS the implicit project axis (jump panel groups sessions by cwd; each
+  Tab carries a `WorkspaceCwd`). Likely spawns `/spec` + `/decision` + `/plan`.
+  Owning components: `JumpPanel`, `Workspace`, `AgentTile` (session ownership),
+  plus a new `Project` component. Status stays `NEEDS-DECISION` until interrogation
+  resolves the model.
+
 - **Extra vertical spacing between paragraphs / blocks / bullets in text tiles** —
   `NEEDS-RUNTIME` (built 2026-07-23 via `/new-ux`; `UXI-ParagraphSpacing-1`). User:
   "a few extra pixels between every newline … to break up paragraphs" + "space
