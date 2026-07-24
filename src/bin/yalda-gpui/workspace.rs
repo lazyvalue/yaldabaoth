@@ -17,6 +17,7 @@ use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::project::ProjectId;
 use yalda::editor::EditorCore;
 use yalda::file_browser::FileBrowser;
 
@@ -1115,48 +1116,30 @@ pub struct Tab<C> {
     /// layout tree above remains the content owner. Kept (not cleared) when
     /// switching away from Desktop so the arrangement survives round-trips.
     pub desktop: DesktopState,
-    /// The workspace's working directory (spec-agent-cwd.md). **Private and
-    /// required**: a `Tab` cannot be constructed without one (build via
-    /// [`Tab::with_layout`]), so no workspace — real or ephemeral — can exist
-    /// without a cwd. An agent created in this workspace inherits it
-    /// (`agent_base_cwd`); read via [`Tab::cwd`], changed via [`Tab::set_cwd`]
-    /// ("Set CWD"). Replaced a stringly `kv["cwd"]` whose omission silently fell
-    /// back to the process dir — the cwd-inheritance regression (ADR-0023).
-    cwd: WorkspaceCwd,
-}
-
-/// A workspace's working directory: a required, typed wrapper around a path.
-/// Exists so "a workspace without a cwd" is **unrepresentable** — every [`Tab`]
-/// holds one and every creation path must supply it. The process-dir default is
-/// chosen once by the binary at the root workspace's creation, never silently at
-/// read time.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkspaceCwd(PathBuf);
-
-impl WorkspaceCwd {
-    pub fn new(path: PathBuf) -> Self {
-        Self(path)
-    }
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-    pub fn to_path_buf(&self) -> PathBuf {
-        self.0.clone()
-    }
+    /// The **project** this workspace belongs to (ADR-0028, `UXI-Project-2`).
+    /// **Private and required**: a `Tab` cannot be constructed without one (build
+    /// via [`Tab::with_layout`]), so no workspace — real or ephemeral — can exist
+    /// without a project. This is a **foreign key** (a `ProjectId`), NOT a cwd:
+    /// the working directory is owned by the project and resolved at the point of
+    /// use (`projects.cwd_of(tab.project())`), never cached here — so a project
+    /// cwd repoint is picked up live with nothing to keep in sync. Replaced the
+    /// per-tab `WorkspaceCwd` field (ADR-0023, lifted to the project); the
+    /// same "unrepresentable without one" typed-required-field discipline.
+    project: ProjectId,
 }
 
 impl<C> Tab<C> {
-    /// THE `Tab` constructor (the cwd field is private, so this is the only way
-    /// to build one outside this module). Requires a [`WorkspaceCwd`] — that is
-    /// what makes a cwd-less workspace unrepresentable. Non-cwd fields default
-    /// (no rail, not ephemeral, Desktop layout, empty tags); callers set the
-    /// public ones they need afterward (e.g. restore sets rail/desktop, the
+    /// THE `Tab` constructor (the project field is private, so this is the only
+    /// way to build one outside this module). Requires a [`ProjectId`] — that is
+    /// what makes a project-less workspace unrepresentable. Non-project fields
+    /// default (no rail, not ephemeral, Desktop layout, empty tags); callers set
+    /// the public ones they need afterward (e.g. restore sets rail/desktop, the
     /// ephemeral path sets `ephemeral = true`).
     pub fn with_layout(
         auto_name: String,
         layout: Layout<C>,
         focused: WindowId,
-        cwd: WorkspaceCwd,
+        project: ProjectId,
     ) -> Self {
         Self {
             auto_name,
@@ -1170,7 +1153,7 @@ impl<C> Tab<C> {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
-            cwd,
+            project,
         }
     }
 
@@ -1178,16 +1161,17 @@ impl<C> Tab<C> {
         self.display_name.as_deref().unwrap_or(&self.auto_name)
     }
 
-    /// The workspace's working directory. Always present (the type guarantees
-    /// it). An agent created here inherits this (`agent_base_cwd`).
-    pub fn cwd(&self) -> &WorkspaceCwd {
-        &self.cwd
+    /// The project this workspace belongs to. Always present (the type guarantees
+    /// it). Resolve its cwd via the `Projects` store at the point of use; an agent
+    /// created here inherits this project's cwd (`agent_base_cwd`).
+    pub fn project(&self) -> ProjectId {
+        self.project
     }
 
-    /// Change the working directory ("Set CWD"). Caller is responsible for
-    /// `cx.notify()` + persist.
-    pub fn set_cwd(&mut self, cwd: WorkspaceCwd) {
-        self.cwd = cwd;
+    /// Reassign this workspace to another project ("Set project" / move). Caller
+    /// is responsible for `cx.notify()` + persist.
+    pub fn set_project(&mut self, project: ProjectId) {
+        self.project = project;
     }
 }
 
@@ -1234,19 +1218,23 @@ pub struct Workspace<C> {
     /// Shortcut keys bound to tag names (Phase 3). `Ctrl-W t {key}` views
     /// the tag mapped to `{key}`.
     pub tag_shortcuts: HashMap<char, String>,
-    /// The cwd a newly-created tab inherits when there is no active tab to copy
-    /// from (the first/root tab). Set once by the binary at construction
-    /// (`with_initial`); thereafter new tabs inherit the *active* tab's cwd.
-    /// Keeps `workspace.rs` free of any process-dir knowledge.
-    default_cwd: WorkspaceCwd,
+    /// The **project** a newly-created tab inherits when there is no active tab to
+    /// copy from (the first/root tab). Set by the binary at construction
+    /// (`with_initial`) / restore from the migrated `Projects` store; thereafter
+    /// new tabs inherit the *active* tab's project. A `ProjectId` FK — the
+    /// migration guarantees at least one project exists at boot, so a real id is
+    /// always available (ADR-0028 §3).
+    default_project: ProjectId,
 }
 
 impl<C> Workspace<C> {
-    /// Bare workspace with no tabs. `default_cwd` is a last-resort placeholder
-    /// (`.`) only ever read if a tab is created before any exists AND without an
-    /// explicit cwd — in practice the first tab comes via `with_initial` (real
-    /// cwd) or restore (per-tab cwd), so it is never the live source.
-    pub fn new() -> Self {
+    /// Bare workspace with no tabs, rooted at `default_project` (the project a
+    /// tab created before any exists — or without an explicit project — inherits;
+    /// in practice the first tab comes via `with_initial` or restore, so it is
+    /// rarely the live source). The caller supplies a real `ProjectId` from the
+    /// (already-built) `Projects` store — ADR-0028's "projects before workspace"
+    /// boot ordering.
+    pub fn new(default_project: ProjectId) -> Self {
         Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -1257,15 +1245,16 @@ impl<C> Workspace<C> {
             next_tab_index: 1,
             marks: MarkTable::new(),
             tag_shortcuts: HashMap::new(),
-            default_cwd: WorkspaceCwd::new(PathBuf::from(".")),
+            default_project,
         }
     }
 
-    /// The cwd a new tab should inherit: the active tab's, else `default_cwd`.
-    pub fn inherited_cwd(&self) -> WorkspaceCwd {
+    /// The project a new tab should inherit: the active tab's, else
+    /// `default_project`.
+    pub fn inherited_project(&self) -> ProjectId {
         self.active_tab()
-            .map(|t| t.cwd().clone())
-            .unwrap_or_else(|| self.default_cwd.clone())
+            .map(|t| t.project())
+            .unwrap_or(self.default_project)
     }
 
     pub fn active_tab(&self) -> Option<&Tab<C>> {
@@ -1306,27 +1295,35 @@ impl<C> Workspace<C> {
 
     /// Construct a workspace pre-populated with one tab containing one
     /// window of `content`. Tab name is auto-assigned to `tab-1`.
-    pub fn with_initial(content: C, cwd: WorkspaceCwd) -> Self {
-        let mut ws = Self::new();
-        // This cwd seeds the root tab AND becomes the fallback every later tab
+    pub fn with_initial(content: C, project: ProjectId) -> Self {
+        // This project seeds the root tab AND is the fallback every later tab
         // inherits from when there's nothing active to copy.
-        ws.default_cwd = cwd.clone();
-        ws.push_initial_tab(content, cwd);
+        let mut ws = Self::new(project);
+        ws.push_initial_tab(content, project);
         ws
     }
 
-    /// Append a new tab containing a single window with `content`, with working
-    /// directory `cwd`. Becomes the active tab. Returns the new window's id.
-    /// (Callers wanting "inherit the current workspace's cwd" pass
-    /// [`Workspace::inherited_cwd`].)
-    pub fn push_initial_tab(&mut self, content: C, cwd: WorkspaceCwd) -> WindowId {
+    /// Append a new tab containing a single window with `content`, belonging to
+    /// `project`. Becomes the active tab. Returns the new window's id. (Callers
+    /// wanting "inherit the current workspace's project" pass
+    /// [`Workspace::inherited_project`].)
+    pub fn push_initial_tab(&mut self, content: C, project: ProjectId) -> WindowId {
         let id = self.alloc_window_id();
         let name = auto_tab_name(self.next_tab_index);
         self.next_tab_index += 1;
         self.tabs
-            .push(Tab::with_layout(name, Layout::Leaf(Window { id, content }), id, cwd));
+            .push(Tab::with_layout(name, Layout::Leaf(Window { id, content }), id, project));
         self.active_tab = self.tabs.len() - 1;
         id
+    }
+
+    /// Append a tab inheriting the **active** workspace's project (else the
+    /// `default_project`). Convenience over [`push_initial_tab`] for the common
+    /// "new workspace beside this one" case, resolving the project in one `&mut
+    /// self` borrow.
+    pub fn push_tab_inheriting(&mut self, content: C) -> WindowId {
+        let project = self.inherited_project();
+        self.push_initial_tab(content, project)
     }
 
     /// Close the tab at index `idx`. The active-tab pointer adjusts to stay
@@ -1393,7 +1390,7 @@ impl<C> Workspace<C> {
         // an agent created in the virtual workspace lands in the same dir as the
         // workspace you jumped from — not the process dir (the regression this
         // typed cwd makes impossible; ADR-0023).
-        let cwd = self.inherited_cwd();
+        let project = self.inherited_project();
         // Replace any existing virtual workspace rather than stacking.
         if self.active_is_ephemeral() {
             let cur = self.active_tab;
@@ -1402,7 +1399,7 @@ impl<C> Workspace<C> {
         let id = self.alloc_window_id();
         let name = auto_tab_name(self.next_tab_index);
         self.next_tab_index += 1;
-        let mut tab = Tab::with_layout(name, Layout::Leaf(Window { id, content }), id, cwd);
+        let mut tab = Tab::with_layout(name, Layout::Leaf(Window { id, content }), id, project);
         tab.ephemeral = true;
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
@@ -1919,7 +1916,9 @@ impl<C> Workspace<C> {
 
 impl<C> Default for Workspace<C> {
     fn default() -> Self {
-        Self::new()
+        // Sentinel default project (`ProjectId(0)`); real construction passes an
+        // id from the migrated `Projects` store (ADR-0028 boot ordering).
+        Self::new(ProjectId(0))
     }
 }
 
@@ -2422,7 +2421,7 @@ mod tests {
         let path = dir.join("shared.md");
         std::fs::write(&path, "hello\n").unwrap();
 
-        let mut ws: Workspace<TestContent> = Workspace::new();
+        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
         let (id1, core1) = ws.open_and_retain(&path).unwrap();
         let (id2, core2) = ws.open_and_retain(&path).unwrap();
 
@@ -2502,7 +2501,7 @@ mod tests {
 
     #[test]
     fn alloc_ids_are_monotonic() {
-        let mut ws: Workspace<TestContent> = Workspace::new();
+        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
         assert_eq!(ws.alloc_window_id(), 1);
         assert_eq!(ws.alloc_window_id(), 2);
         assert_eq!(ws.alloc_buffer_id(), 1);
@@ -2518,7 +2517,7 @@ mod tests {
 
     #[test]
     fn open_buffer_pools_by_canonical_path() {
-        let mut ws: Workspace<TestContent> = Workspace::new();
+        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
         // Use a path that probably doesn't exist on the FS so we exercise the
         // empty-buffer branch.
         let p = std::env::temp_dir().join("yalda-workspace-test-buffer.md");
@@ -2532,7 +2531,7 @@ mod tests {
     // --- Mutation methods (split / close / only / resize / equalize) ---
 
     fn ws_with_layout(layout: Layout<TestContent>, focused: WindowId) -> Workspace<TestContent> {
-        let mut ws: Workspace<TestContent> = Workspace::new();
+        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
         ws.tabs.push(Tab {
             auto_name: "tab-1".into(),
             display_name: None,
@@ -2545,7 +2544,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
-            cwd: WorkspaceCwd::new(PathBuf::from(".")),
+            project: ProjectId(0),
         });
         // Ensure window-id allocator skips past the ids we hand-rolled.
         let max_id = ws.tabs[0].layout.leaf_ids().into_iter().max().unwrap_or(0);
@@ -2712,7 +2711,7 @@ mod tests {
 
     #[test]
     fn buffer_retain_release_lifecycle() {
-        let mut ws: Workspace<TestContent> = Workspace::new();
+        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
         let p = std::env::temp_dir().join("yalda-workspace-test-refcount.md");
         let _ = std::fs::remove_file(&p);
         let id = ws.open_buffer(&p).unwrap();
@@ -2738,7 +2737,7 @@ mod tests {
         // Two windows of one file get two clones of the SAME core; an edit
         // through one is visible through the other, and the document's
         // `edit_seq` (the perf-cache key) advances for both since it's one doc.
-        let mut ws: Workspace<TestContent> = Workspace::new();
+        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
         let p = std::env::temp_dir().join("yalda-shared-edit-test.md");
         let _ = std::fs::remove_file(&p);
 
@@ -2758,7 +2757,7 @@ mod tests {
 
     #[test]
     fn gc_reaps_unreferenced_clean_buffers_keeps_dirty() {
-        let mut ws: Workspace<TestContent> = Workspace::new();
+        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
         let clean = std::env::temp_dir().join("yalda-gc-clean.md");
         let dirty = std::env::temp_dir().join("yalda-gc-dirty.md");
         let _ = std::fs::remove_file(&clean);
@@ -2787,7 +2786,7 @@ mod tests {
 
     #[test]
     fn gc_keeps_buffers_a_view_still_holds() {
-        let mut ws: Workspace<TestContent> = Workspace::new();
+        let mut ws: Workspace<TestContent> = Workspace::new(ProjectId(0));
         let p = std::env::temp_dir().join("yalda-gc-live.md");
         let _ = std::fs::remove_file(&p);
         let (id, core) = ws.open_and_retain(&p).unwrap();
@@ -2847,7 +2846,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
-            cwd: WorkspaceCwd::new(PathBuf::from(".")),
+            project: ProjectId(0),
         });
         let w = Window {
             id: 9,
@@ -2876,7 +2875,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
-            cwd: WorkspaceCwd::new(PathBuf::from(".")),
+            project: ProjectId(0),
         });
         let w = Window {
             id: 9,
@@ -2914,7 +2913,7 @@ mod tests {
             master_count: 1,
             tag_view: BTreeSet::new(),
             desktop: DesktopState::default(),
-            cwd: WorkspaceCwd::new(PathBuf::from(".")),
+            project: ProjectId(0),
         });
         let (window, empty) = ws.detach_focused().unwrap();
         assert!(!empty);

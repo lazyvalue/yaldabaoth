@@ -354,6 +354,8 @@ impl YaldaGpuiView {
     /// Toggle-logic for the file-browser rail, shared by the keybinding action
     /// and the command menu (`rail-files`).
     pub(crate) fn toggle_file_browser_rail_impl(&mut self, cx: &mut Context<Self>) {
+        // Resolve the active workspace's (project) cwd before the mutable borrow.
+        let cwd = self.active_workspace_cwd().unwrap_or_else(process_cwd);
         let Some(tab) = self.workspace.active_tab_mut() else {
             return;
         };
@@ -364,7 +366,6 @@ impl YaldaGpuiView {
             existing => {
                 let side = existing.as_ref().map(|r| r.side).unwrap_or_default();
                 let pinned_to = tab.focused;
-                let cwd = tab.cwd().to_path_buf();
                 let content = workspace::RailContent::FileBrowser(FileBrowser::new(cwd));
                 tab.rail = Some(workspace::RailState::new(content, side, pinned_to));
             }

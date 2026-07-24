@@ -285,7 +285,7 @@ fn re_render_one_doc_sources_live_core_not_disk() {
     // Disk holds a single paragraph → exactly one rendered block.
     std::fs::write(&path, "disk only\n").unwrap();
 
-    let mut ws: workspace::Workspace<App> = workspace::Workspace::new();
+    let mut ws: workspace::Workspace<App> = workspace::Workspace::new(ProjectId(0));
     let (id, core) = ws.open_and_retain(&path).unwrap();
 
     // A pool-bound Doc, rendered at the disk content (rendered_seq stamped at
@@ -3484,7 +3484,7 @@ fn agent_tile_persists_session_identity_not_index() {
 
     // Restore side: each leaf comes back paired with ITS OWN id — identity
     // travels with the leaf, independent of any session-list ordering.
-    let mut ws = workspace::Workspace::<App>::new();
+    let mut ws = workspace::Workspace::<App>::new(ProjectId(0));
     let theme = Theme::default();
     let (_lay, _max, agents) = restore_layout(&mut ws, &theme, snap);
 

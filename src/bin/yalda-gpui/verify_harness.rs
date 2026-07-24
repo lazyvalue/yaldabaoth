@@ -78,7 +78,6 @@ fn constructs_and_renders_real_view(cx: &mut TestAppContext) {
 /// falling back to the process dir.
 #[gpui::test]
 fn workspace_cwd_inheritance(cx: &mut TestAppContext) {
-    use crate::workspace::WorkspaceCwd;
     let start = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let (view, vcx) = cx.add_window_view({
         let start = start.clone();
@@ -96,10 +95,7 @@ fn workspace_cwd_inheritance(cx: &mut TestAppContext) {
 
     // Set CWD → both the surfaced cwd and what a new agent inherits move.
     view.update(vcx, |v, _cx| {
-        v.workspace
-            .active_tab_mut()
-            .expect("active tab")
-            .set_cwd(WorkspaceCwd::new(PathBuf::from("/Users/scott/ws/fulcrum")));
+        v.test_set_active_workspace_cwd(PathBuf::from("/Users/scott/ws/fulcrum"));
     });
     let base = view.read_with(vcx, |v, _| v.agent_base_cwd());
     assert_eq!(
@@ -157,10 +153,7 @@ fn browser_start_dir_resolution(cx: &mut TestAppContext) {
     // (2) Workspace cwd set, still no file-backed buffer → the workspace cwd.
     let ws_dir = std::env::temp_dir();
     view.update(vcx, |v, _cx| {
-        v.workspace
-            .active_tab_mut()
-            .expect("active tab")
-            .set_cwd(crate::workspace::WorkspaceCwd::new(ws_dir.clone()));
+        v.test_set_active_workspace_cwd(ws_dir.clone());
     });
     let from_ws = view.read_with(vcx, |v, _| v.browser_start_dir());
     assert_eq!(from_ws, ws_dir, "workspace cwd wins over process dir");
@@ -868,7 +861,6 @@ fn jump_panel_renders_with_sessions(cx: &mut TestAppContext) {
 /// past the last workspace is a no-op (no panic, no spurious switch).
 #[gpui::test]
 fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
-    use crate::workspace::WorkspaceCwd;
     use crate::{App, BrowserWindow, BufferApp};
     cx.update(crate::register_keymap);
     let (view, vcx) = boot_browser(cx);
@@ -880,9 +872,8 @@ fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
     view.update(vcx, |v, _| {
         let cwd = PathBuf::from(".");
         for _ in 0..3 {
-            v.workspace.push_initial_tab(
+            v.workspace.push_tab_inheriting(
                 App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
-                WorkspaceCwd::new(cwd.clone()),
             );
         }
         assert_eq!(v.workspace.tabs.len(), 4);
@@ -924,7 +915,6 @@ fn ctrl_digit_switches_workspace(cx: &mut TestAppContext) {
 /// (the picker root wires workspace_nav): `active_tab` stays 0.
 #[gpui::test]
 fn agent_picker_does_not_eat_workspace_switch_keys(cx: &mut TestAppContext) {
-    use crate::workspace::WorkspaceCwd;
     use crate::{App, BrowserWindow, BufferApp};
     cx.update(crate::register_keymap);
     let (view, vcx) = boot_browser(cx);
@@ -933,9 +923,8 @@ fn agent_picker_does_not_eat_workspace_switch_keys(cx: &mut TestAppContext) {
     view.update(vcx, |v, _| {
         let cwd = PathBuf::from(".");
         for _ in 0..3 {
-            v.workspace.push_initial_tab(
+            v.workspace.push_tab_inheriting(
                 App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
-                WorkspaceCwd::new(cwd.clone()),
             );
         }
         v.workspace.set_active_tab(0);
@@ -988,16 +977,14 @@ fn agent_picker_does_not_eat_workspace_switch_keys(cx: &mut TestAppContext) {
 /// folding next_tab/prev_tab into `workspace_nav`.
 #[gpui::test]
 fn workspace_cycle_works_from_the_agent_screen(cx: &mut TestAppContext) {
-    use crate::workspace::WorkspaceCwd;
     use crate::{App, BrowserWindow, BufferApp};
     cx.update(crate::register_keymap);
     let (view, vcx) = boot_worksheet_nav(cx); // FOCUSED on an agent/worksheet tile
     view.update(vcx, |v, _| {
         let cwd = PathBuf::from(".");
         for _ in 0..2 {
-            v.workspace.push_initial_tab(
+            v.workspace.push_tab_inheriting(
                 App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
-                WorkspaceCwd::new(cwd.clone()),
             );
         }
         assert_eq!(v.workspace.tabs.len(), 3, "agent workspace + 2 more");
@@ -1397,9 +1384,8 @@ fn jump_to_bound_session_focuses_existing_tile(cx: &mut TestAppContext) {
     });
     // Add a second workspace and switch to it, so jumping must cross back.
     view.update(vcx, |v, cx| {
-        v.workspace.push_initial_tab(
+        v.workspace.push_tab_inheriting(
             App::Buffer(BufferApp::Picking(BrowserWindow::standalone(PathBuf::from(".")))),
-            crate::workspace::WorkspaceCwd::new(PathBuf::from(".")),
         );
         cx.notify();
     });
@@ -1448,9 +1434,8 @@ fn agent_session_binds_at_most_one_tile(cx: &mut TestAppContext) {
 
     // Workspace 1: a fresh agent tile, now focused.
     view.update(vcx, |v, _cx| {
-        v.workspace.push_initial_tab(
+        v.workspace.push_tab_inheriting(
             App::Agent(AgentTile::new()),
-            crate::workspace::WorkspaceCwd::new(PathBuf::from(".")),
         );
     });
 
@@ -3654,7 +3639,6 @@ fn selector_projection_reflects_binding_across_tiles(cx: &mut TestAppContext) {
 #[gpui::test]
 fn workspace_cwd_persists_across_restart(cx: &mut TestAppContext) {
     use crate::persist::with_workspace_path;
-    use crate::workspace::WorkspaceCwd;
     let dir = tempfile::tempdir().expect("tempdir");
     let file = dir.path().join("workspace.json");
     let set = std::env::temp_dir().join("yalda-persisted-cwd");
@@ -3664,10 +3648,7 @@ fn workspace_cwd_persists_across_restart(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     with_workspace_path(file.clone(), || {
         view.update(vcx, |v, _cx| {
-            v.workspace
-                .active_tab_mut()
-                .expect("active tab")
-                .set_cwd(WorkspaceCwd::new(set.clone()));
+            v.test_set_active_workspace_cwd(set.clone());
             v.save_workspace_state();
         });
     });
@@ -3696,7 +3677,6 @@ fn workspace_cwd_persists_across_restart(cx: &mut TestAppContext) {
 /// `Start a new session` reads `agent_base_cwd` live.
 #[gpui::test]
 fn new_agent_uses_live_workspace_cwd_after_set_cwd(cx: &mut TestAppContext) {
-    use crate::workspace::WorkspaceCwd;
     use crate::{AgentTile, App, SessionPicker};
     let (view, vcx) = cx.add_window_view(hermetic_browser_view);
     vcx.run_until_parked();
@@ -3711,10 +3691,7 @@ fn new_agent_uses_live_workspace_cwd_after_set_cwd(cx: &mut TestAppContext) {
     // Now Set CWD on the active workspace — AFTER the selector is already open.
     let target = PathBuf::from("/tmp/yalda-live-cwd-test");
     view.update(vcx, |v, _cx| {
-        v.workspace
-            .active_tab_mut()
-            .expect("active tab")
-            .set_cwd(WorkspaceCwd::new(target.clone()));
+        v.test_set_active_workspace_cwd(target.clone());
     });
 
     // Activate row 0 ("Start a new session"). Hermetic: the create round-trip is
@@ -5781,11 +5758,10 @@ fn global_menu_lists_and_switches_workspaces(cx: &mut TestAppContext) {
 
     // Add two more workspaces (3 total). A bare Linear tile needs no args.
     view.update(vcx, |v, _cx| {
-        let cwd = crate::workspace::WorkspaceCwd::new(PathBuf::from("."));
         v.workspace
-            .push_initial_tab(crate::App::Linear(crate::LinearTile::new()), cwd.clone());
+            .push_tab_inheriting(crate::App::Linear(crate::LinearTile::new()));
         v.workspace
-            .push_initial_tab(crate::App::Linear(crate::LinearTile::new()), cwd);
+            .push_tab_inheriting(crate::App::Linear(crate::LinearTile::new()));
     });
 
     // The menu enumerates each workspace + the name/new commands.
@@ -12429,5 +12405,54 @@ fn code_block_selection_is_painted_and_aligned(cx: &mut TestAppContext) {
     assert!(
         clip.contains("fn main() {") && clip.contains("let x = 1;"),
         "a drag across the code block copies its lines; got {clip:?}"
+    );
+}
+
+#[cfg(test)]
+impl YaldaGpuiView {
+    /// Test helper (ADR-0028): point the active workspace at a project rooted at
+    /// `cwd`, creating that project if absent, so `active_workspace_cwd()` /
+    /// `agent_base_cwd()` resolve to `cwd`. Mirrors the production "assign the
+    /// workspace's project" — the FK replacement for the old `Tab::set_cwd`.
+    pub(crate) fn test_set_active_workspace_cwd(&mut self, cwd: std::path::PathBuf) {
+        let pid = self
+            .projects
+            .ensure_at_cwd(cwd.clone(), &crate::persist::project_name_for_cwd(&cwd));
+        if let Some(t) = self.workspace.active_tab_mut() {
+            t.set_project(pid);
+        }
+    }
+}
+
+/// UXI-Project-2 — a workspace's cwd is DERIVED from its project (a `ProjectId`
+/// foreign key), resolved live at the point of use and never cached. Repointing
+/// the project's cwd moves what the workspace (and a new agent) inherits, with
+/// nothing to keep in sync.
+///
+/// Negative control: comment out `p.cwd = cwd;` in `Projects::set_cwd`
+/// (`project.rs`) → the repoint doesn't take, `agent_base_cwd()` stays at A, and
+/// the second assert fails — proving the value is read live from the project.
+#[gpui::test]
+fn workspace_and_session_cwd_derive_from_project(cx: &mut TestAppContext) {
+    let a = PathBuf::from("/tmp/yalda-proj-a");
+    let b = PathBuf::from("/tmp/yalda-proj-b");
+    let (view, vcx) = cx.add_window_view(hermetic_browser_view);
+    vcx.run_until_parked();
+
+    // Point the active workspace at a project rooted at A; it inherits A.
+    view.update(vcx, |v, _| v.test_set_active_workspace_cwd(a.clone()));
+    let at_a = view.read_with(vcx, |v, _| v.agent_base_cwd());
+    assert_eq!(at_a, a, "workspace inherits its project's cwd");
+
+    // Repoint THAT project's cwd to B — the workspace's cwd follows LIVE, because
+    // it is derived from the project (no cwd cached on the tab).
+    view.update(vcx, |v, _| {
+        let pid = v.workspace.active_tab().expect("active tab").project();
+        v.projects.set_cwd(pid, b.clone()).expect("repoint");
+    });
+    let at_b = view.read_with(vcx, |v, _| v.agent_base_cwd());
+    assert_eq!(
+        at_b, b,
+        "repointing the project moves the workspace's cwd — derived, not cached"
     );
 }

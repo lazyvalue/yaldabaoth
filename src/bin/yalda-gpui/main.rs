@@ -1553,6 +1553,12 @@ struct YaldaGpuiView {
     /// Tabs + n-ary split tree (spec-tabs-and-splits.md). The focused
     /// window's content is the authoritative live state for the workspace.
     workspace: workspace::Workspace<App>,
+    /// The top-level **Project** registry (ADR-0028, `docs/components/project.md`).
+    /// Owns every project's name + cwd + params; workspaces hold a `ProjectId`
+    /// foreign key into this and resolve their cwd here at the point of use.
+    /// Built before the workspace at boot (loaded from `projects.json`, else
+    /// migrated from existing cwds) so a real `ProjectId` is always available.
+    projects: Projects,
     /// Active mouse-driven text selection in the doc view. Spans block/line/char.
     /// `None` when nothing is selected. Cleared on Esc, on a fresh MouseDown
     /// without modifier, and when entering edit mode.
@@ -1658,6 +1664,10 @@ impl YaldaGpuiView {
         let label: SharedString = file_label.into();
         let initial =
             App::Buffer(BufferApp::Viewing(DocState::viewing(blocks, label.clone(), None)));
+        // ADR-0028: build the Project registry before the workspace so the root
+        // workspace has a real `ProjectId` to belong to.
+        let cwd = process_cwd();
+        let (projects, seed_project) = boot_projects(&cwd, [cwd.clone()]);
         Self {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
@@ -1674,10 +1684,8 @@ impl YaldaGpuiView {
             focus_handle,
             active_overlay: ActiveOverlay::None,
             transient_status: None,
-            workspace: workspace::Workspace::with_initial(
-                initial,
-                workspace::WorkspaceCwd::new(process_cwd()),
-            ),
+            workspace: workspace::Workspace::with_initial(initial, seed_project),
+            projects,
             doc_selection: None,
             line_layouts: Rc::new(RefCell::new(HashMap::new())),
             session_server: connect_session_server(),
@@ -1701,8 +1709,9 @@ impl YaldaGpuiView {
     fn new_browser(start_dir: PathBuf, theme: Theme, focus_handle: FocusHandle) -> Self {
         let syntect_hl =
             Rc::new(yalda::highlight::Highlighter::with_syntect_theme(theme.name.syntect_theme()));
-        let cwd = workspace::WorkspaceCwd::new(start_dir.clone());
-        let initial = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(start_dir)));
+        let initial = App::Buffer(BufferApp::Picking(BrowserWindow::standalone(start_dir.clone())));
+        // ADR-0028: projects before workspace.
+        let (projects, seed_project) = boot_projects(&start_dir, [start_dir.clone()]);
         Self {
             theme,
             body_font: SharedString::new_static(".SystemUIFont"),
@@ -1719,7 +1728,8 @@ impl YaldaGpuiView {
             focus_handle,
             active_overlay: ActiveOverlay::None,
             transient_status: None,
-            workspace: workspace::Workspace::with_initial(initial, cwd),
+            workspace: workspace::Workspace::with_initial(initial, seed_project),
+            projects,
             doc_selection: None,
             line_layouts: Rc::new(RefCell::new(HashMap::new())),
             session_server: connect_session_server(),
@@ -1762,7 +1772,7 @@ impl YaldaGpuiView {
         // `&self.workspace` snapshot borrow).
         let sessions = &self.sessions;
         let resolve = |id| sessions.sid_of(id).cloned();
-        save_persisted_workspace(&cwd, &self.workspace, &resolve);
+        save_persisted_workspace(&cwd, &self.workspace, &self.projects, &resolve);
     }
 
     /// Replace `self.workspace` with one rebuilt from the persisted snapshot
@@ -1775,7 +1785,12 @@ impl YaldaGpuiView {
         let Some(snap) = load_persisted_workspace(&cwd) else {
             return false;
         };
-        let mut ws: workspace::Workspace<App> = workspace::Workspace::new();
+        // Rebuild onto the already-migrated project registry; each restored
+        // workspace re-points at the project rooting its persisted cwd
+        // (ADR-0028 §7 self-healing load). `default_project` is the first project
+        // (migration guarantees ≥1 exists).
+        let default_project = self.projects.first().unwrap_or(ProjectId(0));
+        let mut ws: workspace::Workspace<App> = workspace::Workspace::new(default_project);
         // Each agent leaf carries its persisted session id (identity), so restore
         // rebinds it to ITS OWN session (UXI-AgentTile-18), not by index.
         let mut agent_leaf_ids: Vec<(workspace::WindowId, Option<ServerSid>)> = Vec::new();
@@ -1783,19 +1798,24 @@ impl YaldaGpuiView {
             let (layout, max_id, agents) = restore_layout(&mut ws, &self.theme, ptab.layout);
             ws.next_window_id = ws.next_window_id.max(max_id + 1);
             agent_leaf_ids.extend(agents);
-            // Working directory: typed field if present, else migrate from the
-            // legacy `kv["cwd"]`, else the process dir (ADR-0023).
-            let cwd = workspace::WorkspaceCwd::new(
-                ptab.cwd
-                    .map(PathBuf::from)
-                    .or_else(|| ptab.legacy_kv.get("cwd").map(PathBuf::from))
-                    .unwrap_or_else(process_cwd),
-            );
+            // Working directory → project: resolve the persisted cwd (typed field
+            // if present, else the legacy `kv["cwd"]`, else the process dir) to a
+            // project in the registry, creating one if the migration hasn't
+            // (ADR-0028 §7 self-heal — the cwd the record carries is always
+            // enough to recover membership).
+            let tab_cwd = ptab
+                .cwd
+                .map(PathBuf::from)
+                .or_else(|| ptab.legacy_kv.get("cwd").map(PathBuf::from))
+                .unwrap_or_else(process_cwd);
+            let project = self
+                .projects
+                .ensure_at_cwd(tab_cwd.clone(), &project_name_for_cwd(&tab_cwd));
             let mut tab = workspace::Tab::with_layout(
                 ptab.auto_name,
                 layout,
                 ptab.focused_window,
-                cwd,
+                project,
             );
             tab.display_name = ptab.display_name;
             tab.rail = ptab.rail.map(|r| restore_rail(r, ptab.focused_window));
@@ -2404,8 +2424,8 @@ impl YaldaGpuiView {
         if replace_in_place {
             self.set_screen(new_content);
         } else {
-            let cwd = self.workspace.inherited_cwd();
-            self.workspace.push_initial_tab(new_content, cwd);
+            let project = self.workspace.inherited_project();
+            self.workspace.push_initial_tab(new_content, project);
         }
         self.save_workspace_state();
         true
@@ -3453,10 +3473,11 @@ impl YaldaGpuiView {
     /// no-arg `:tabnew` / `Cmd-T` creates a browser tab so the user can pick
     /// what to load.
     fn new_tab(&mut self, _: &NewTab, _w: &mut Window, cx: &mut Context<Self>) {
+        let project = self.workspace.inherited_project();
         let cwd = self.active_workspace_cwd().unwrap_or_else(process_cwd);
         self.workspace.push_initial_tab(
-            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd.clone()))),
-            workspace::WorkspaceCwd::new(cwd),
+            App::Buffer(BufferApp::Picking(BrowserWindow::standalone(cwd))),
+            project,
         );
         self.save_workspace_state();
         cx.notify();
@@ -4643,10 +4664,13 @@ impl YaldaGpuiView {
                 cx.notify();
             }
             "new-tab" => {
-                let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let project = self.workspace.inherited_project();
+                let dir = self
+                    .active_workspace_cwd()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
                 self.workspace.push_initial_tab(
-                    App::Buffer(BufferApp::Picking(BrowserWindow::standalone(dir.clone()))),
-                    workspace::WorkspaceCwd::new(dir),
+                    App::Buffer(BufferApp::Picking(BrowserWindow::standalone(dir))),
+                    project,
                 );
                 self.save_workspace_state();
                 cx.notify();
@@ -4870,8 +4894,8 @@ impl YaldaGpuiView {
                 match sel {
                     Some((path, false)) => {
                         if let Some(content) = self.make_doc_content(&path) {
-                            let cwd = self.workspace.inherited_cwd();
-                            self.workspace.push_initial_tab(content, cwd);
+                            let project = self.workspace.inherited_project();
+                            self.workspace.push_initial_tab(content, project);
                             self.save_workspace_state();
                             cx.notify();
                         }
@@ -5155,13 +5179,13 @@ impl YaldaGpuiView {
     fn push_empty_workspace(&mut self) {
         let name = workspace::auto_tab_name(self.workspace.next_tab_index);
         self.workspace.next_tab_index += 1;
-        // A new workspace inherits the current one's cwd (ADR-0023).
-        let cwd = self.workspace.inherited_cwd();
+        // A new workspace inherits the current one's project (ADR-0028 §3).
+        let project = self.workspace.inherited_project();
         self.workspace.tabs.push(workspace::Tab::with_layout(
             name,
             workspace::Layout::Empty,
             0,
-            cwd,
+            project,
         ));
     }
 
@@ -5480,7 +5504,11 @@ impl YaldaGpuiView {
         let Some(tab) = self.workspace.tabs.get(idx) else {
             return;
         };
-        let text = tab.cwd().path().display().to_string();
+        let text = self
+            .projects
+            .cwd_of(tab.project())
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         self.open_overlay(ActiveOverlay::Rename(RenameOverlay {
             text,
             target: RenameTarget::WorkspaceCwd { index: idx },
@@ -5602,10 +5630,26 @@ impl YaldaGpuiView {
                 Ok(resolved) => {
                     self.close_rename_overlay();
                     let path = resolved.display().to_string();
-                    if let Some(tab) = self.workspace.tabs.get_mut(index) {
-                        tab.set_cwd(workspace::WorkspaceCwd::new(resolved));
+                    // "Set workspace cwd" now repoints the workspace's PROJECT cwd
+                    // (ADR-0028 §3 — cwd lives on the project). Refused if another
+                    // project already roots there.
+                    let outcome = self
+                        .workspace
+                        .tabs
+                        .get(index)
+                        .map(|t| t.project())
+                        .map(|pid| self.projects.set_cwd(pid, resolved));
+                    match outcome {
+                        Some(Ok(())) => {
+                            save_persisted_projects(&self.projects);
+                            self.transient_status = Some(format!("project cwd → {path}").into());
+                        }
+                        Some(Err(_)) => {
+                            self.transient_status =
+                                Some("another project already roots that directory".into());
+                        }
+                        None => {}
                     }
-                    self.transient_status = Some(format!("workspace cwd → {path}").into());
                     self.save_workspace_state();
                     cx.notify();
                 }

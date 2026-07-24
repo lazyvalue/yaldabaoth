@@ -983,7 +983,12 @@ impl YaldaGpuiView {
     /// write time; a since-deleted dir surfaces as a spawn error
     /// (spec-agent-cwd.md §9), not here.
     pub(crate) fn active_workspace_cwd(&self) -> Option<PathBuf> {
-        self.workspace.active_tab().map(|t| t.cwd().to_path_buf())
+        // The workspace's cwd is its project's cwd, resolved at the point of use
+        // (ADR-0028 §3 — no cwd is cached on the workspace).
+        self.workspace
+            .active_tab()
+            .map(|t| t.project())
+            .and_then(|pid| self.projects.cwd_of(pid).map(|p| p.to_path_buf()))
     }
 
     /// The CWD a new agent session inherits when the caller gives no explicit

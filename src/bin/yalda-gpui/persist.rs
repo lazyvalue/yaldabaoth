@@ -591,6 +591,25 @@ pub(crate) fn project_name_for_cwd(cwd: &std::path::Path) -> String {
 /// the two known cwds). **Total + panic-proof**: every cwd yields a project and
 /// nothing is dropped, so an old snapshot with no `projects.json` never loses
 /// data.
+/// Build the Project registry at boot (ADR-0028 "projects before workspace"):
+/// load `projects.json` if present, else migrate from `seed_cwds` (the cwds found
+/// across persisted workspaces + sessions). Then ensure a project exists at
+/// `primary` (the root workspace's cwd) and return the store plus that project's
+/// id, persisting the (possibly newly-migrated) store. Under `cfg(test)` the
+/// load/save no-op (path seam), so a boot migrates purely in memory.
+pub(crate) fn boot_projects(
+    primary: &std::path::Path,
+    seed_cwds: impl IntoIterator<Item = PathBuf>,
+) -> (Projects, ProjectId) {
+    let mut projects = match load_persisted_projects() {
+        Some(doc) if !doc.projects.is_empty() => projects_from_persisted(&doc),
+        _ => migrate_cwds_to_projects(seed_cwds),
+    };
+    let pid = projects.ensure_at_cwd(primary.to_path_buf(), &project_name_for_cwd(primary));
+    save_persisted_projects(&projects);
+    (projects, pid)
+}
+
 pub(crate) fn migrate_cwds_to_projects(cwds: impl IntoIterator<Item = PathBuf>) -> Projects {
     let mut ps = Projects::new();
     for cwd in cwds {
@@ -1044,6 +1063,7 @@ pub(crate) fn restore_content(
 /// Snapshot a live workspace into a fully serializable shape.
 pub(crate) fn snapshot_workspace(
     ws: &workspace::Workspace<App>,
+    projects: &Projects,
     resolve: SidResolver,
 ) -> PersistedWorkspace {
     // Ephemeral virtual workspaces (ADR-0021) are transient and never persisted;
@@ -1086,7 +1106,11 @@ pub(crate) fn snapshot_workspace(
                     pan: t.desktop.camera.pan,
                     zoom: t.desktop.camera.zoom,
                 }),
-                cwd: Some(t.cwd().path().display().to_string()),
+                // Persist the workspace's PROJECT cwd (ADR-0028): the cwd lives on
+                // the project now, so we resolve `t.project()` through the store.
+                // Restore re-points the workspace at whatever project roots this
+                // cwd (self-heal); project *names* survive via `projects.json`.
+                cwd: projects.cwd_of(t.project()).map(|p| p.display().to_string()),
                 legacy_kv: HashMap::new(),
             })
             .collect(),
@@ -1113,6 +1137,7 @@ pub(crate) fn snapshot_workspace(
 pub(crate) fn save_persisted_workspace(
     cwd: &std::path::Path,
     ws: &workspace::Workspace<App>,
+    projects: &Projects,
     resolve: SidResolver,
 ) {
     let Some(path) = workspace_persist_path() else {
@@ -1128,7 +1153,7 @@ pub(crate) fn save_persisted_workspace(
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
-    let snap = snapshot_workspace(ws, resolve);
+    let snap = snapshot_workspace(ws, projects, resolve);
     if let Ok(v) = serde_json::to_value(&snap) {
         // Drop any entry saved under the old raw spelling so the file doesn't
         // accumulate a canonical + raw duplicate for the same dir (ADR-0010:
