@@ -15,7 +15,8 @@ possible." State-level behavior is testable headlessly via `verify_harness.rs`).
 
 - **Command panel (leader menu) aesthetic redesign** — `NEEDS-RUNTIME` (branch
   `main`, 2026-07-23 via `/new-ux`, autonomous, Fable advising UX + aesthetics +
-  architecture; `UXI-Menu-1..4`, spec `docs/components/common/menu.md`). The old
+  architecture; `UXI-Menu-1..5`, spec `docs/components/common/menu.md`, rationale
+  `ADR-0029`). The old
   full-width (`.w_full().top_0()`) opaque drop-down bar is replaced by **"The Sigil
   Card"**: a floating, content-sized card (`[340, 720]px` band) in the workspace
   region right of the jump panel, horizontally centered, pinned 48px below the top.

@@ -42,6 +42,9 @@ level — a menu whose goal is its own obsolescence.
 
 ## References
 
+- `docs/decisions/0029-command-panel-is-a-floating-elevated-sigil-card.md` — the ADR
+  recording *why* each of these visual decisions was made (placement, elevation,
+  scope hues, the keystroke trail, keyboard-only) and the alternatives rejected.
 - `docs/specs/spec-menu-scopes.md` — the leader model + behavior (global `.` /
   local `space` / global `?`, breadcrumb, Esc, disabled entries, scopes). This spec
   renders that state machine; it does not alter it.
