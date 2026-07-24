@@ -3,6 +3,15 @@
 Status: DRAFT (supersedes the binding/lifecycle parts of `spec-multi-session.md`
 and the multi-subscriber/lease parts of `spec-session-server-actor.md`).
 
+> **Extended by ADR-0028 / `docs/components/project.md` (Projects primitive):** a
+> session now also has a **project membership** — `Assigned` (a stored
+> `ProjectId`) or `Inferred` (`Projects::by_cwd(session.cwd)`) or `Unfiled`. The
+> 1:1 tile binding (INV-2 below) is additionally **gated to intra-project**: a
+> session may bind only to a tile whose workspace shares the session's project
+> (`UXI-Project-6`). A session keeps its immutable spawn `cwd` (server-side ground
+> truth); only its *project* is derived. The store patterns here are the model the
+> `Projects` store mirrors.
+
 ## Why we keep breaking this
 
 Every agent-session bug for months — duplicate attaches, two tiles mirroring

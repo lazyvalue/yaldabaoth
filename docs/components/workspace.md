@@ -5,25 +5,40 @@
 
 ## Description
 
-A **Workspace** (`Workspace<App>`) is a single tab-strip + buffer-pool container,
-one per OS-level **Frame**. Each entry in its tab strip is a **Tab** (`Tab<App>`),
-which owns an n-ary **layout tree** of tiles and a focused-tile pointer. Interior
-nodes of that tree are **Splits** (`Layout::Split`) — a direction (`H` = stacked,
-`V` = side-by-side) plus weighted children — and each leaf is a **Tile**
-(`Window<App>`, a stable `WindowId` holding exactly one `App`: `Buffer`, `Agent`,
-or `Linear`). The code-level struct is still called `Window`, but in discussion we
-say **tile** to avoid confusion with the OS-level frame.
+A **Workspace** (`Workspace<App>`, formerly `Tab<App>` — the `tab` vocabulary was
+eradicated in ADR-0028 §5 / T007) is a plane of tiles: it owns an n-ary **layout
+tree**, a focused-tile pointer, and a required-private **`project: ProjectId`**
+foreign key into the `Projects` store. Interior nodes of the tree are **Splits**
+(`Layout::Split`) — a direction (`H` = stacked, `V` = side-by-side) plus weighted
+children — and each leaf is a **Tile** (`Window<App>`, a stable `WindowId` holding
+exactly one `App`: `Buffer`, `Agent`, or `Linear`). The code-level struct for a
+tile is still called `Window`, but in discussion we say **tile**.
 
-Above the tiles, the tab strip carries the workspace's tabs (per-tab label, active
-marker, click-to-select, rename, next/prev, new/close, and `ctrl-<n>` jump by
-number); the tag bar drives tile tags and the automatic **layout modes** (layout-
-mode cycle, desktop tile size, promote-to-master, master-count +/-). Non-ephemeral
-workspaces are numbered `1..N` in the jump panel, and those numbers are the jump
-targets.
+A workspace **belongs to a project** and does NOT carry its own cwd: its working
+directory is the project's, resolved at the point of use (`projects.cwd_of(
+workspace.project())`) and **never cached** (`UXI-Project-2`, ADR-0028 §3). A new
+workspace inherits the active one's project.
+
+The container that owns the list of workspaces (one per OS-level **Frame**) is
+**`Frame<App>`** (formerly the code's `Workspace<App>` — renamed in T007 so the
+type name matches the user-facing "workspace" = the plane). The frame carries the
+workspace strip (per-workspace label, active marker, click-to-select, rename,
+next/prev, new/close, `ctrl-<n>` jump by number) and the buffer pool; the tag bar
+drives tile tags. Non-ephemeral workspaces are numbered `1..N` in the jump panel
+(globally, across all projects), and those numbers are the jump targets.
+
+The full hierarchy: **`Frame` → `Project`s → `Workspace`s → `Window` tiles**, with
+`Project` the ownership axis over workspaces and agent sessions
+(`docs/components/project.md`).
 
 ## References
 
-- `docs/specs/spec-tabs-and-splits.md` — tabs + the n-ary split/layout tree.
+- `docs/components/project.md` (`UXI-Project-1..8`) — the `Project` a workspace
+  belongs to; the `ProjectId` FK + derived-cwd contract (`UXI-Project-2`).
+- ADR-0028 — Projects as the top-level primitive + the `Tab`→`Workspace`,
+  container→`Frame` rename (§5) this Description now reflects.
+- `docs/specs/spec-tabs-and-splits.md` — the n-ary split/layout tree (its "tab"
+  prose predates the rename; read "tab" as "workspace", the container as "frame").
 - `docs/specs/spec-layout-patterns.md` — tile tags + automatic layout modes.
 - `docs/specs/spec-desktop-mode.md` — desktop tile sizing / master layout; the
   tile/slot geometry engine (`Slot`, `Span`, `DesktopState`, occupancy,
@@ -84,8 +99,9 @@ of slots addressed by *signed* coordinates `Slot { row: i32, col: i32 }`, origin
 slot and occupies a `Span` (`rows × cols`, each ≥ 1) rectangle; **no two tiles'
 rectangles overlap**. There is no split tree, no layout-mode choice, and no `0`
 wall — the plane is the only interior. Multiple planes = multiple workspaces
-(the code's `Tab`s); tab-management gestures re-cast as new/close/switch **plane**
-(`NewTab`→new plane, `CloseTab`→close plane, `next_tab`/`prev_tab`→switch plane).
+(the code's `Workspace`s, formerly `Tab`s); workspace-management gestures re-cast
+as new/close/switch **plane** (`NewWorkspace`→new plane, `CloseWorkspace`→close
+plane, `next_workspace`/`prev_workspace`→switch plane; T007 rename).
 
 **Applies to.** `workspace.rs`: `Slot` widened `u32→i32`; `DesktopState` becomes
 the plane; `occupied_extent` returns a signed min+max bounding box (not a lone
